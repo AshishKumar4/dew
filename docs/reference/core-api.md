@@ -47,16 +47,17 @@ InputSpec(sample, conditions={}, mask=None)
 Import these from `dew.training`:
 
 ```text
-MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
-Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
+MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, explicit=())
+Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=(), data_axes=())
 MeshSpec(...).build(devices=None)
 ```
 
-`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(microbatches=...)` sets a pipelined step's microbatches, a positive multiple of a stage axis above 1; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
 
 `Layout` has these fields:
 
-- `rules` is an ordered sequence of logical-axis rules, or a mapping of overrides that update the default table. When dimensions compete for one mesh axis, rule order decides which one gets it, and a dimension the axis size does not divide cannot use that axis. The valid parameter mesh axes are `fsdp`, `expert` and `tensor`.
+- `rules` is an ordered sequence of logical-axis rules, or a mapping of overrides that update the default table. When dimensions compete for one mesh axis, rule order decides which one gets it, and a dimension the axis size does not divide cannot use that axis. A rule may name any axis of the mesh, a native mesh's own names included; a parameter splits over any axis but `data`, `sequence` and `stage`, and a rule naming an axis the mesh lacks is refused unless it is one of Dew's six, which a mesh without them treats as size 1.
+- `data_axes` names the axes a batch's rows split over, ahead of the rules' own `activation_batch` entries; the run's data shares, its batch placement and its row counts read them. Empty leaves the rules as they are.
 - `min_shard` is the size, in elements and not bytes, below which a parameter stays replicated, because sharding it would cost more in collectives than it saves in memory.
 - `tolerance` is the fraction of shardable parameter elements a layout may leave replicated before `check` refuses it.
 - `host` names train-state fields out of `params`, `opt_state` and `ema`. A named `opt_state` or `ema` stays in pinned host memory between steps, and the step fetches it to the device. Naming `params` instead puts the whole `TrainState` on the CPU, including optimizer state, EMA and accumulation. The optimizer transaction then runs on a CPU companion of the mesh, and on every process the runtime CPU device count must match the accelerator count before JAX initializes.
@@ -70,12 +71,12 @@ Import `Trainer` from `dew` or `dew.training`.
 
 ```text
 Trainer(objective, optimizer, *, key,
-        mesh=MeshSpec(), layout=Layout(), accumulation=1,
+        mesh=MeshSpec(), layout=Layout(), microbatches=None, accumulation=1,
         dynamic_scale=False, checkpoints=None, tracker=None,
         step=None, rollout=None, profile=None)
 ```
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh`, a `MeshSpec` or a native `jax.sharding.Mesh`, and `layout` describe placement; `microbatches` is how many a pipelined step feeds through the mesh's stage axis, one a stage when unset. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
@@ -129,45 +130,56 @@ Import `TrainState` from `dew.training`.
 
 `state.averaged` overlays EMA leaves onto `state.variables` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
-## Dataset and Loading
+## Dataset, Loader and Loading
 
-Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
+Import stores, chains, `load` and `Loading` from `dew.data`, `compile` from `dew.data.compile`, and run specs and `loader` from `dew.config.data`. `Loader` and `DataPartition` are in `dew.data.dataset`.
 
 ```text
-Dataset(train, val, records, batch, ramp=None)
-Dataset.from_records(records, *, batch, seed=0, validation=None, loading=Loading())
-Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())
-Dataset.from_torch(dataset, *, batch, fields=None, seed=0, validation=None, loading=Loading())
+load(name_or_dataset, *, batch, tokenizer=None, seq_len=None, read=None,
+     provision=True, seed=0, loading=None) -> Loader
+loader(spec_or_alias, *, batch, read="indexed", provision=False, cache=None,
+     objective=None, validation_records=None, seed=0, loading=Loading(workers="auto"), host=())
+spec.load(**options)  # loader(spec, **options)
+compile(train, *, validation=None, host=(), objective=None, read=None,
+        provision=False, loading=None, seed=0) -> Loader
+Loader(train, val, records, batch, ramp=None)
 DataPartition(index=0, count=1, readers=1, reader=0)
-Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
+Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
 ```
 
-`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order. `from_torch` reads a map-style `torch.utils.data.Dataset` as `from_records` reads a source, naming a tuple sample's entries with `fields`; it refuses a `DataLoader` and an `IterableDataset`.
+`load("hf/<repo>")` and `load("tfds/<builder>")` read a dataset by name: packed language-model rows where `tokenizer=` or `seq_len=` asks for them, batched records otherwise. Text holds out 1% of document identities before tokenization; records hold out the first 256. `hf/<repo>@<revision>` pins a Hub revision and `tfds/<builder>:<version>` a TFDS version. A `Dataset` is also accepted. Other source locations use `Hub()`, `TFDS()` or `Files()`.
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass; `val` is `None` when there is no validation data. Each iterator reads the share of every global batch that its `DataPartition` names. The partition splits each batch into `count` disjoint shares; `index` is the share to read; `readers` is the number of processes that read that share alike; and `reader` is which of those processes this one is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row.
+A run spec is a frozen value implementing `RunData.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. Every data spec has `.load(**options)`, which calls `loader` with that spec. Each spec has an alias in `dew.registry.datasets`, such as `records`, `text`, `chat`, `images` or `video`. Source URLs belong in `source`; `loader` refuses a bare URI. `TextData` defaults to EOS and a 1% token-axis holdout when no validation is named, keeping a token store's own validation split. `ImageData` defaults to a 256-record holdout.
 
-`records` is the known training-record count or `None`, and `batch` is the global batch size. `steps_per_epoch` is records divided by batch with integer division, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records, and `batch` is then the batch size the ramp ends at.
+`spec.load(batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
 
-Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
+`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
-`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership of `iterator` once construction succeeds, and starts its worker on the first `next()`. Restoring a saved position also happens there, so a restoration failure unwinds through the iterator it already owns. Closing an unused iterator only finalizes it, without a read or a restoration. Use it in a `with` block, or call `close(timeout=5.0)`, even when a loop consumes only a fixed number of batches.
+Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 
-Depth must be positive. At most `depth` device batches are queued, plus at most one in flight, not counting the consumer and upstream buffers. `source_state` describes the last delivered batch, never speculative read-ahead. An EOF or a source failure is reported after the batches queued before it. An early close discards unread data and speculative failures, but reports finalization failures.
+`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `dew.data.load` provisions what the read needs, logging each artifact it prepares; with `provision=False`, a missing artifact is a named error.
 
-The prefetch worker runs the iteration, the checkpoint operations and the final close of the source. Closing requests cancellation, discards queued batches and joins the worker. A `TimeoutError` means the source read, placement or finalization did not stop when asked. The thread is not killed, and its in-flight references may remain. Cancellation stays requested, and you can retry the close. After close, further iteration stops.
+`Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps and host batch steps for each branch. `ObjectiveData.pack` optionally packs those records into fixed windows, and `ObjectiveData.packed` runs record steps on each window before batching. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
-Grain limits how cleanly Dew can shut a loader down. The installed `DataLoaderIterator` has no public close, so Dew releases the references it owns without reaching into private iterators or changing the sampling pipeline. In local-record probes the source and child processes are released, but Grain does not promise a deterministic shutdown. Grain also keeps a process-wide thread pool that deletes shared memory. Dew calls `DatasetIterator.close()` on the iteration thread, but shutting down the read executor does not wait for record reads already running. So a blocked upstream read is outside Dew's shutdown guarantee.
+`HoldOut(records=N)` reserves the source's head, `HoldOut(fraction=f, by="hash")` splits immutable record identities, and `Split(name)` opens a named split. An explicit source or Pipeline is also valid. `validation_records` caps accepted records before the share cut.
 
-`Loading` sets Grain's concurrency and buffers for the built-in specifications. The default, which is also Grain's, starts no worker processes and reads with threads of the training process. Raise `workers` once you have measured that the input pipeline is the bottleneck. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
+`train(partition)` opens a new training iterator. `val(partition)` opens one finite pass, or is `None` without validation. Its final partial batch is filled with repeats marked by `valid_rows=False`. `DataPartition.of(mesh)` selects the process's share; `DataPartition()` reads all rows.
 
-Every dataset specification has `seed` and `loading` as keyword-only fields from `DatasetSpec`, and every one loads with `spec.load(batch=, tokenize=None)`. A specification that writes no captions raises `TypeError` when given a `tokenize` reader, because it cannot use one.
+`records` is the known accepted training-record count or `None`. `batch` is global. `steps_per_epoch` and `epoch_steps` require an authoritative finite count. The compiled `plan` records source snapshots, transforms, ordering, derived order and packing facts, cache generations and topology constraints.
 
-An image specification takes its validation data from `val_split`, one of the dataset's own splits, limited to `val_batches` batches. With `val_split` unset, it holds out the first `val_batches * batch` records of the training source instead.
+A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines the caller assembled. A `MapDataset` is repeated and cut into the reader's share, and its position is saved as one global record count. A pipeline that is read as it comes is passed as a function of the `DataPartition` that builds the `IterDataset` of that share. That pipeline is batched where it is and reports Grain's own iterator state.
+`Loading` changes concurrency without changing record order or draws. `dew.data.load` defaults to `Loading(workers=0)`, which reads in the training process; spec `.load()` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
 
-A token corpus is a directory of `train` and `val` files, either `.bin` files or ArrayRecord shards of token arrays, beside the `meta.json` that `TokenCorpus` reads and writes. `TokenWindows` reads `path` as such a directory and takes whichever store the suffix names, so the same corpus gives the same windows and the same packing plan (`pack=True`) in both. `TokenWindows(hub=HubText(name, split=, column=, tokenizer=, options=))` reads a Hugging Face text split instead, tokenized once into `dew_cache_dir()/tokens`, which is what `dew.data.load("hf/<name>", tokenizer=, seq_len=)` builds.
+Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 
+`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
+
+Depth is positive. The queue contains at most that many device batches plus one in flight. Saved source state names the last delivered batch, not speculative read-ahead. EOF or failure follows already queued batches; early close discards unread work and reports finalization errors.
+
+The prefetch worker owns iteration, restore and finalization. A timeout leaves cancellation requested and permits retrying close; it does not kill a running source. Grain's read executor does not promise to stop a blocked upstream read, so that remains outside Dew's shutdown guarantee.
+
+`export` writes committed Parquet or ArrayRecord shards and indexes. `publish` fills a deterministic cache prefix and certifies one generation. A filling run never adopts a newly published generation implicitly; a later run names `Generation` explicitly. See [training data](../concepts/data.md) for layouts, sources and publication.
 
 ## Checkpoints
 

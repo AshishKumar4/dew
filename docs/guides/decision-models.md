@@ -46,7 +46,7 @@ decide.systemone({
 #   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
 ```
 
-The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, as Clef's does, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a Clef release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a joint-head release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
 
 Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
 
@@ -55,7 +55,7 @@ uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew"
 python examples/serve_decisions.py --model convaiinnovations/laya --port 8000
 ```
 
-llama.cpp (release b11445) serves decision models natively at the same `POST /v1/systemone`, with images as `data:` URLs: its converter reads Laya's checkpoint layout (ModernBERT with Laya's head) and Clef's (a Qwen 3.5 backbone with `joint_head.safetensors`). `decide.save_pretrained(directory)` writes a ModernBERT task in Laya's layout, temperatures included, which `Decide.from_pretrained` reads back and llama.cpp converts:
+llama.cpp (release b11445) serves decision models natively at the same `POST /v1/systemone`, with images as `data:` URLs: its converter reads Laya's checkpoint layout (ModernBERT with Laya's head) and the joint-head one (a Qwen 3.5 backbone with `joint_head.safetensors`). `decide.save_pretrained(directory)` writes a ModernBERT task in Laya's layout, temperatures included, which `Decide.from_pretrained` reads back and llama.cpp converts:
 
 ```bash
 python convert_hf_to_gguf.py directory --outfile laya.gguf
@@ -84,16 +84,19 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 ```python
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, DecisionTable, LogLoss
+from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, Decisions, LogLoss
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.data import Hub
+from dew.config.data import HoldOut, loader
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
-banking77 = DecisionTable(path="mteb/banking77", label="label_text", question="intent",
-                          instructions="Which banking request is this?")
+banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question="intent",
+                      instructions="Which banking request is this?",
+                      validation=HoldOut(fraction=0.1, by="random", most=400))
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = objective.dataset(banking77, batch=32)  # a tenth held out, for validation and calibration
+data = loader(banking77, batch=32, read="memory", provision=True, objective=objective.data())
 state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 
@@ -106,14 +109,14 @@ Examples need not come from a table: `objective.dataset` takes any labelled exam
 
 Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenStates`): a `CausalTransformer`, causal or bidirectional as ModernBERT is, the text path of a multimodal model such as Qwen 3.5, or DiffusionGemma, whose encoder reads each clean row once whole. A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
 
-The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. Clef's `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `Decide.from_pretrained("Cloudflare/clef-flash")` reads a Clef release, its Qwen 3.5 backbone with the head beside it and the backbone's processor, and answers as Clef's own model does, images included, which the processor lays out before the state (`tests/test_decision_clef.py` holds the layout, the head and the two together to Clef's code, with and without images). Clef reports an answer's top probability as its confidence, where `systemone` reports Jev's; `replace(decide, confidence=TopProbability())` answers with Clef's. A release fine-tunes like Laya's, its head and layout coming with it. Training pads every row to the layout's `max_len`, and Clef's is the 16384 tokens it serves, so set one that fits the data:
+The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. The `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `DecisionRunConfig(pretrained=backbone, head=JointShape())` draws one over a fresh backbone, which `backbone` names: a Hugging Face model, not a Laya checkpoint, since a Laya checkpoint trains under its own head. `Decide.from_pretrained` also reads a released joint-head checkpoint (`JointCheckpoint`), a Qwen 3.5 backbone with `joint_head_config.json` and `joint_head.safetensors` beside it, and the backbone's processor, and answers as the release's own model does, images included, which the processor lays out before the state (`tests/test_decision_joint_checkpoint.py` holds the layout, the head and the two together to the release's code, with and without images). Such a release reports an answer's top probability as its confidence, where `systemone` reports Jev's; `replace(decide, confidence=TopProbability())` answers with the top probability. A release fine-tunes like Laya's, its head and layout coming with it. Training pads every row to the layout's `max_len`, and a release's is the 16384 tokens it serves, so set one that fits the data:
 
-<!-- not run: loads Clef, a 9B model, beyond a CI container's memory -->
+<!-- not run: a fragment; the release is the reader's own, a directory or a Hub repo id -->
 ```python
-objective = DecisionObjective(Decide.from_pretrained("Cloudflare/clef-flash"), layout=JointLayout(max_len=2048))
+objective = DecisionObjective(Decide.from_pretrained(release), layout=JointLayout(max_len=2048))
 ```
 
-Every row is padded to the layout's `max_len`, which on a mix of short and long requests is most of a step's compute. `bucket=64` batches rows of like length together and cuts each batch just past its longest row, rounded up to a multiple of 64. On Dew's gold mix at `max_len=1280` that takes a step from 2.6 tokens computed per real token to 1.07. Each length compiles its own step, and the stream is read by one process. A recipe takes it as `--objective.bucket 64`.
+Training and validation pack rows first-fit into windows of the layout's `max_len` tokens, each row a segment the backbone and the head read apart from the others, so a step pays for its rows' tokens rather than `max_len` per row and every batch has one shape: a run compiles one step. A window holds as many rows, questions and options as the layout's token costs let `max_len` tokens hold (`Layout.bounds`), and the packer closes a window at whichever comes first. The loss is the mean over the batch's scored questions: every scored question in a batch weighs the same, however many tokens its row spends, where a token budget's loss once weighed a question by its batch's budget. `tests/test_decision_packing.py` holds each row of a window to what it decides alone, through Qwen 3.5's Gated DeltaNet and attention.
 
 The loss is a proper scoring rule: its expected value is smallest when the forecast is the true distribution, so it rewards honest probabilities. The rules are `LogLoss`, `Brier`, `Spherical` and `RankedProbability` (for score questions, whose levels are ordered), and they can be added and scaled. `label_smoothing` spreads part of the target over every option. During training a choice's options are reshuffled every time a row is read, so the model cannot learn their positions, and `none_of_the_above=p` adds a "none of the above" option to a share of rows, half of which lose their right answer to it. The same rules, with `Accuracy`, `ECE` and `AURC`, score the validation pass.
 
@@ -134,52 +137,11 @@ A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebui
 `recipes/decision/train.py` is `laya-train --data tickets.csv`:
 
 ```bash
-python recipes/decision/train.py --data.path tickets.csv --data.text text --data.label label \
+python recipes/decision/train.py --data.source tickets.csv --data.text text --data.label label \
     --trainer.batch-size 32 --trainer.epochs 4
 ```
 
-It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `DecisionTable` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
-
-## Train a general decision model
-
-Two recipes train a model that answers questions it has not seen, as Jev, Laya and Clef do:
-
-- `recipes/decision/encoder.py` trains ModernBERT-large whole under a fresh Laya head, as Laya and OpenDecider-nano are built.
-- `recipes/decision/clef.py` trains a fresh joint schema head with LoRA factors over a frozen Qwen3.5-4B, as Clef is built, on 4,096-token rows. `--pretrained Qwen/Qwen3.5-9B --lora.rank 256` gives Clef-flash's size.
-
-```bash
-python recipes/decision/contamination.py --out eval-index.npz --jsonl suite-rows.jsonl.gz \
-    --hub LocalLLaMA/typed-decisions@d0e2f0c4:all/test-00000-of-00001.parquet
-python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
-python recipes/decision/encoder.py --mixture.root data/mixture --trainer.checkpoint-dir runs
-```
-
-`sources.py` writes the sets both recipes train on, each pinned to a commit, as JSON-lines rows that `Example.of` reads:
-
-- Open-Jev's typed decisions;
-- typed-decisions' train split;
-- gliclass;
-- BANKING77, CLINC150, WANLI, HellaSwag, ARC, BoolQ and GSM8K;
-- your own rows (`--mixture.rows.path`).
-
-It records their weights beside them, in `mixture.json`. Benchmark-style items are framed both ways requests carry them: the content in the state or in the question, and the options by name or by letter. Where a set's gold is a distribution, as Open-Jev's and typed-decisions' are, the example carries it as `targets`, and training scores against that distribution rather than its most likely option.
-
-`contamination.py` reduces evaluation items to hashes, and `--decontaminate` drops every training example that repeats one:
-
-- A decision, meaning a state with a question and its options, that is an evaluation decision is dropped, however short its state.
-- Content an evaluation item shares is dropped too: a state, or the instructions of a request with no state. A synthetic set's examples are compared whole. Natural text is also compared line by line and by 13-word runs.
-- A question and its options alone are a task's schema, which every row of a table shares, so rows of other states asked the same question are kept.
-
-What was dropped is recorded with the sets.
-
-The recipes are default `DecisionRunConfig`s, so every value is a flag. `mixture` (a `DecisionMixture`) reads the sets at their shares of every step through `DecisionObjective.dataset`. `--mixture.weights mine 0.1` adds a set of your own from the same directory. `head` draws Clef's joint head. An example a joint row cannot hold is dropped and counted in the run's summary.
-
-The loss is the log loss plus half the Brier score, plus the ranked probability score on ordered levels: the proper scoring rules that Laya's RLCD and Clef's post-training reward.
-
-A trained run is measured where a decision model is used, at `/v1/systemone`. Serve it with `examples/serve_decisions.py --run runs/... --whole`; `--whole` refuses, rather than cuts, a request too long to answer whole, as Decision Index requires. Then:
-
-- Decision Index runs through its own kit (`python -m decision_index pipeline --engine http`).
-- typed-decisions, Open-Jev's test and OOD splits, and Laya's application battery run through `recipes/decision/benchmark.py`, whose typed-decisions scorer reproduces the dataset card's reference row.
+It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `Decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
 
 ## How this relates to Laya
 

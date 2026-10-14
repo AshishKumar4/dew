@@ -24,6 +24,7 @@ from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -174,7 +175,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", params: Variables | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         height: int | None = None, width: int | None = None):
         """The pipeline's conditioning; `height` and `width` replace the image size its
         time ids state, which is the size the pipeline renders unless a load gave another."""
@@ -358,7 +359,7 @@ def _residual_states(decoder, ids):
     `scaled_embeddings`; the decoders this reads run one residual stream.
     """
     return decoder.stack(decoder.scaled_embeddings(decoder.token_embeddings(ids)), train=False,
-                         decode=False, positions=None, segment_ids=None, per_layer_input=None)
+                         decode=False, per_layer_input=None)
 
 
 @dataclass(eq=False)
@@ -382,7 +383,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None, mesh: MeshSpec | None = None,
+                        params: Variables | None = None, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
@@ -538,9 +539,13 @@ class HiddenStatesConditioner(_LanguageText):
     def encode(self, params, tokens) -> DenoisingCondition:
         from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 
+        ids = jnp.asarray(tokens["input_ids"])
+        # The pipelines call their encoder without position ids, so transformers numbers every slot,
+        # the right padding included, by its index; Dew would rank the real tokens and hold the pads.
         _, kept = self.tower.apply(
-            {"params": params["text_encoder"]["params"]}, jnp.asarray(tokens["input_ids"]),
-            attention_mask=jnp.asarray(tokens["attention_mask"], bool), method="hidden_states",
+            {"params": params["text_encoder"]["params"]}, ids,
+            attention_mask=jnp.asarray(tokens["attention_mask"], bool),
+            positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape), method="hidden_states",
             capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
         states = [layer_output(kept[INTERMEDIATES], layer - 1) for layer in self.layers]
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)

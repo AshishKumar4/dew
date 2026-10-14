@@ -32,13 +32,15 @@ from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
+
     from dew.training.distributed import Layout, MeshSpec
 
 
 def pipeline(
     source: str,
     *,
-    mesh: MeshSpec | None = None,
+    mesh: MeshSpec | Mesh | None = None,
     layout: Layout | None = None,
     dtype: DTypeLike | None = None,
     param_dtype: DTypeLike | Literal["auto"] | None = None,
@@ -79,11 +81,12 @@ def pipeline(
     if not root.is_dir():
         # A Hub source is read at the commit its metadata resolved; one holding
         # a run (`HfApi().upload_folder`) is pulled whole and loads as the run.
+        from huggingface_hub import snapshot_download
+
         from dew.interop import sources
-        from dew.interop.hub import pull_from_hub
         metadata = sources.snapshot(source, revision, weights=False)
         if (metadata / RUN_FILE).is_file():
-            root, revision = epath.Path(pull_from_hub(source, metadata.name)), None
+            root, revision = epath.Path(snapshot_download(repo_id=source, revision=metadata.name)), None
         else:
             revision = metadata.name
     if root.is_dir() and not (root / RUN_FILE).is_file() and any(path.name.isdecimal()
@@ -103,7 +106,7 @@ def pipeline(
                         revision=revision)
 
 
-def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
+def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
     """The task the run's recorded objective declares (`Objective.saved_task`)."""
@@ -121,7 +124,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
                          dtype=dtype, param_dtype=param_dtype)
 
 
-def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
+def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.inference.projections import inference_projections
@@ -132,12 +135,12 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
         PretrainedMaskedDecoder,
         PretrainedPipeline,
     )
-    from dew.training.distributed import MeshSpec as DefaultMesh
+    from dew.training.distributed import MeshSpec as DefaultMesh, device_mesh
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
     def prepared(model, variables):
-        with jax.set_mesh(placement.build()):
+        with jax.set_mesh(device_mesh(placement)):
             return inference_projections(model, variables)
     loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
                               prepare=prepared)
@@ -154,8 +157,9 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
     raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
 
 
-def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) -> Variables:
-    """Place `variables` on the mesh `mesh` describes, one leaf at a time.
+def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None) -> Variables:
+    """Place `variables` on `mesh`, a native mesh or the one a `MeshSpec`
+    describes, one leaf at a time.
 
     The sharding is the one the trainer gives a train state's parameters under
     `layout`; `dew.training.host.stream` places the leaves, updating the
@@ -163,14 +167,14 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
     a frozen node can't be updated, so frozen nodes are first rebuilt as
     dicts over the same leaves.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
     from dew.training.host import stream
 
     variables = _updatable(variables)
-    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
+    placed_on = device_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout
-    shardings = chosen_layout.shardings(device_mesh, variables)
-    chosen_layout.check(variables, shardings, device_mesh)
+    shardings = chosen_layout.shardings(placed_on, variables)
+    chosen_layout.check(variables, shardings, placed_on)
     return stream(variables, shardings)
 
 

@@ -96,12 +96,13 @@ def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation,
 
 
 @on_gpu
-@pytest.mark.parametrize("q_len, kv_len, causal", [
-    (1024, 77, False),   # every cross-attention over CLIP's 77 text tokens
-    (9, 7, False),       # short enough that one attended pad key would move an eighth of the mass
-    (333, 333, True),    # the concatenated text-plus-image sequence, causal
+@pytest.mark.parametrize("q_len, kv_len, causal, head_dim", [
+    (1024, 77, False, 64),   # every cross-attention over CLIP's 77 text tokens
+    (9, 7, False, 64),       # short enough that one attended pad key would move an eighth of the mass
+    (333, 333, True, 64),    # the concatenated text-plus-image sequence, causal
+    (3072, 3072, True, 256),  # Qwen3.5's 256-wide heads, which cudnn takes from Hopper on
 ])
-def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
+def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim,
                                                       without_deterministic_ops):
     """cudnn's kernel has no backward pass for an odd length; the padded call
     trains, and what it computes for the real rows is what the xla kernel
@@ -109,8 +110,11 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
     which is also how far the two kernels sit apart at an even length. A pad
     key left unmasked shifts every output by 1/(kv+1) of the value mass, 12%
     at 7 keys, and a pad query row left in the output changes its shape."""
-    query, _, _ = qkv((2, q_len, 4, 64))
-    _, key, value = qkv((2, kv_len, 4, 64), seed=1)
+    from dew.nn.attention import cudnn_max_head_dim
+    if head_dim > cudnn_max_head_dim():
+        pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
+    query, _, _ = qkv((2, q_len, 4, head_dim))
+    _, key, value = qkv((2, kv_len, 4, head_dim), seed=1)
 
     fused = value_and_grads('cudnn', query, key, value, causal=causal)
     reference = value_and_grads('xla', query, key, value, causal=causal)
@@ -177,14 +181,30 @@ def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_d
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-def float64_attention(query, key, value, causal):
-    """Attention of `[S, H, D]` arrays as float64 math, key heads repeated over their group."""
+def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
+    """Attention of `[S, H, D]` arrays as float64 math, key heads repeated over their group: a
+    query keeps the keys `window` `(left, right)` reaches (-1 bounding neither side), and a head's
+    sink logit joins each row's denominator with no value."""
     group = query.shape[1] // key.shape[1]
     key, value = jnp.repeat(key, group, axis=1), jnp.repeat(value, group, axis=1)
     logits = jnp.einsum('qhd,khd->hqk', query, key) / np.sqrt(query.shape[-1])
+    offset = jnp.arange(key.shape[0])[None, :] - jnp.arange(query.shape[0])[:, None]
+    kept = jnp.ones(offset.shape, bool)
     if causal:
-        logits = jnp.where(jnp.tril(jnp.ones(logits.shape[1:], bool)), logits, -jnp.inf)
-    return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
+        kept &= offset <= 0
+    if window[0] >= 0:
+        kept &= offset >= -window[0]
+    if window[1] >= 0:
+        kept &= offset <= window[1]
+    logits = jnp.where(kept, logits, -jnp.inf)
+    if sinks is None:
+        weights = jax.nn.softmax(logits, axis=-1)
+    else:
+        sink = sinks[:, None, None]
+        top = jnp.maximum(jnp.max(logits, axis=-1, keepdims=True), sink)
+        exponents = jnp.exp(logits - top)
+        weights = exponents / (jnp.sum(exponents, axis=-1, keepdims=True) + jnp.exp(sink - top))
+    return jnp.einsum('hqk,khd->qhd', weights, value)
 
 
 def output_and_gradients(attend, cotangent, *arrays):
@@ -196,11 +216,13 @@ def output_and_gradients(attend, cotangent, *arrays):
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("sunk", [False, True])
 def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
-        head_dim, causal, without_deterministic_ops):
+        head_dim, causal, sunk, without_deterministic_ops):
     """Documents packed back to back, one a single token, with an empty sequence between two: each
     document's output and its three input gradients lie within tests/reference_error.py's rule of
-    FlashAttention-2's own on that document alone, both measured from float64. Not bitwise: on one
+    FlashAttention's own on that document alone, both measured from float64, and with a 64-key
+    window and sinks so does the sinks' gradient summed over the documents. Not bitwise: on one
     short document the dense forward splits its keys across blocks (`_splits`) and the packed one
     does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
     flash = flash_here()
@@ -211,27 +233,39 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
     query, _, _ = qkv((int(starts[-1]), 8, head_dim))
     _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
     cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
+    logits = jnp.asarray(np.random.default_rng(3).normal(size=(8,)) * 2, jnp.float32)
+    window = (63, 0 if causal else 63) if sunk else (-1, -1)
+
+    def options(sinks):
+        return {"is_causal": causal, "window_size": window, "sinks": sinks if sunk else None}
 
     packed = output_and_gradients(
-        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
-        cotangent, query, key, value)
+        lambda q, k, v, s: flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(s)),
+        cotangent, query, key, value, logits)
+    dense_sinks, true_sinks = [], []
     for begin, end in itertools.pairwise(starts):
         if begin == end:
             continue
         pieces = (query[begin:end], key[begin:end], value[begin:end])
         dense = output_and_gradients(
-            lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
-            cotangent[begin:end], *pieces)
+            lambda q, k, v, s: flash.flash_mha(q[None], k[None], v[None], **options(s))[0],
+            cotangent[begin:end], *pieces, logits)
         with jax.enable_x64(new_val=True):
-            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
-            truth = output_and_gradients(functools.partial(float64_attention, causal=causal), wide[3],
-                                         *wide[:3])
-        for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed), dense,
-                                           truth, strict=True):
+            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end], logits)]
+            truth = output_and_gradients(
+                lambda q, k, v, s: float64_attention(q, k, v, causal, window, s if sunk else None),
+                wide[3], *wide[:3], wide[4])
+        dense_sinks.append(dense[4])
+        true_sinks.append(truth[4])
+        for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed[:4]),
+                                           dense[:4], truth[:4], strict=True):
             if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
                 np.testing.assert_array_equal(got, theirs)
             else:
                 assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
+    if sunk:
+        assert_as_exact_as_the_reference(packed[4], np.sum(dense_sinks, axis=0), np.sum(true_sinks, axis=0),
+                                         "dsinks")
 
 
 @on_gpu
@@ -268,14 +302,20 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
 
 
 @on_gpu
+@pytest.mark.parametrize("implementation", ["flash", "cudnn"])
 @pytest.mark.parametrize("head_dim", [128, 256])
-def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_deterministic_ops):
-    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's output and its
-    three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
-    measured from float64; on Hopper that holds FlashAttention-3 to it."""
-    flash_here()
-    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
-        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
+                                                                   without_deterministic_ops):
+    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
+    and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
+    measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
+    from dew.nn.attention import cudnn_max_head_dim
+    if implementation == 'flash':
+        flash_here()
+        if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+            pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+    elif head_dim > cudnn_max_head_dim():
+        pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
     query, _, _ = qkv((1, 1024, 8, head_dim))
     _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
     cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
@@ -284,7 +324,7 @@ def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_dete
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=True))
 
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    fused = output_and_gradients(kernel(implementation), cotangent, query, key, value)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
@@ -292,6 +332,102 @@ def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_dete
                                      *wide[:3])
     for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused, reference, truth, strict=True):
         assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
+
+
+@on_gpu
+@pytest.mark.parametrize("width, value_width, kv_heads, causal, window, sinks", [
+    (64, 64, 2, True, None, True),        # gpt-oss-20b's full layers
+    (64, 64, 2, True, 128, True),         # and its sliding ones
+    (192, 128, 2, True, 128, True),       # MiMo-V2-Flash's sliding layers
+    (64, 64, 8, False, 65, False),        # ModernBERT's local layers, both sides
+])
+def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
+        width, value_width, kv_heads, causal, window, sinks, without_deterministic_ops):
+    """FlashAttention with a sliding window, attention sinks or a value narrower than the query, as
+    'auto' sends such calls on sm80, sm89 and sm90: its output and the gradients of the query, key,
+    value and sinks lie within tests/reference_error.py's rule of the xla kernel's, both measured
+    from float64."""
+    flash_here()
+    rng = np.random.default_rng(57)
+    query = jnp.asarray(rng.normal(size=(1, 1024, 8, width)), jnp.bfloat16)
+    key = jnp.asarray(rng.normal(size=(1, 1024, kv_heads, width)), jnp.bfloat16)
+    value = jnp.asarray(rng.normal(size=(1, 1024, kv_heads, value_width)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(1, 1024, 8, value_width)), jnp.bfloat16)
+    logits = jnp.asarray(rng.normal(size=(8,)) * 2, jnp.float32)
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v, s: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, causal=causal, sliding_window=window,
+            sinks=s if sinks else None))
+
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
+    sides = (-1, -1) if window is None else (window - 1, 0 if causal else window - 1)
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
+        wide_sinks = jnp.asarray(np.asarray(logits, np.float64))
+        truth = output_and_gradients(
+            lambda q, k, v, s: float64_attention(q, k, v, causal, sides, s if sinks else None),
+            wide[3], *wide[:3], wide_sinks)
+    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused[:4], reference[:4], truth[:4],
+                                       strict=True):
+        assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
+    if sinks:
+        assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
+
+
+@on_gpu
+@pytest.mark.parametrize("window, sinks", [(None, False), (128, True)])
+def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, sinks,
+                                                                             without_deterministic_ops):
+    """Rows packing documents of uneven lengths, padding after them, through flash as its varlen
+    sequences (`segment_ids` with their declared `max_segments`), causal, also with a 128-key window
+    and sinks: every real token's output and query gradient, and every key and value gradient, lie
+    within tests/reference_error.py's rule of the xla kernel's under the document mask, both measured
+    from float64 per document. The padding attends among itself on flash and to nothing under the
+    mask, and its rows carry no gradient."""
+    flash_here()
+    rng = np.random.default_rng(23)
+    lengths = [[700, 1, 220, 103], [129, 383, 400, 112]]
+    segments = np.stack([np.concatenate([np.repeat(np.arange(1, len(row)), row[:-1]),
+                                         np.zeros(row[-1], int)]) for row in lengths]).astype(np.int32)
+    real = segments != 0
+    query = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
+    key = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
+    value = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)) * real[:, :, None, None], jnp.bfloat16)
+    logits = jnp.asarray(rng.normal(size=(8,)) * 2, jnp.float32)
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v, s: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, causal=True, sliding_window=window,
+            sinks=s if sinks else None, segment_ids=jnp.asarray(segments), max_segments=3))
+
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
+    sides = (-1, -1) if window is None else (window - 1, 0)
+    truth = [np.zeros_like(x) for x in fused]
+    with jax.enable_x64(new_val=True):
+        for row in range(2):
+            begin = 0
+            for length in lengths[row][:-1]:
+                piece = slice(begin, begin + length)
+                wide = [jnp.asarray(np.asarray(x[row, piece], np.float64))
+                        for x in (query, key, value, cotangent)]
+                exact = output_and_gradients(
+                    lambda q, k, v, s: float64_attention(q, k, v, causal=True, window=sides,
+                                                         sinks=s if sinks else None),
+                    wide[3], *wide[:3], jnp.asarray(np.asarray(logits, np.float64)))
+                for whole, part in zip(truth[:4], exact[:4], strict=True):
+                    whole[row, piece] = part
+                truth[4] += exact[4]
+                begin += length
+    for name, index in (("o", 0), ("dq", 1)):
+        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
+    for name, index in (("dk", 2), ("dv", 3)):
+        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+    if sinks:
+        assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):

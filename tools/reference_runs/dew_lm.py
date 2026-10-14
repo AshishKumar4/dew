@@ -40,6 +40,7 @@ from common import (
     git_head,
     host,
     peak_flops,
+    run_arguments,
     sha256,
     steps_for,
     throughput,
@@ -67,12 +68,7 @@ def recorded_norm() -> optax.GradientTransformation:
 
 
 def arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--data", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--work", required=True, help="write the native workload count for the reference")
-    parser.add_argument("--batch", type=int, required=True, help="global rows per step")
+    parser = argparse.ArgumentParser(parents=[run_arguments()])
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--mesh", choices=("data", "fsdp", "expert"), default="data",
                         help="the axis the devices form; data=1 device is the single-GPU run")
@@ -81,30 +77,14 @@ def arguments() -> argparse.Namespace:
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
-    parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--lr-peak", type=float, default=2e-5)
-    parser.add_argument("--lr-init", type=float, default=2e-6)
-    parser.add_argument("--lr-end", type=float, default=2e-6)
-    parser.add_argument("--warmup", type=int, default=16)
-    parser.add_argument("--b1", type=float, default=0.9)
-    parser.add_argument("--b2", type=float, default=0.95)
-    parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None,
                         help="the decoder's starting remat policy, a name in REMAT_POLICIES")
-    parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
                         help="MoE: the per-sequence balance loss instead of the batch-wide one")
-    parser.add_argument("--probe-every", type=int, default=None,
-                        help="MoE: router loads and entropy on a fixed batch every this many steps")
-    parser.add_argument("--probe-rows", type=int, default=4)
-    parser.add_argument("--timing-warmup", type=int, default=10)
-    parser.add_argument("--profile-steps", type=int, default=5)
-    parser.add_argument("--trace-dir", default=None)
     return parser.parse_args()
 
 
@@ -308,7 +288,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "compile_seconds": run.compile_seconds,
         "flops_per_token": flops_token,
         "work": dataclasses.asdict(run.work),
-        "hlo_flops_per_step": run.trainer.flops_per_step,
+        "hlo_flops_per_step": (run.trainer.step_flops and run.trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
             / curves.window_seconds / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],

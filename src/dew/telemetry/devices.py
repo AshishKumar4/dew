@@ -102,6 +102,28 @@ def unpartition_gpu_pool() -> None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
+def divide_exactly() -> None:
+    """Have the GPU divide fp32 to the nearest float, unless the run named
+    XLA's backend options.
+
+    XLA:GPU lowers an fp32 division to PTX `div.full`, up to 2 ulps off
+    (`-nvptx-prec-divf32=1`, xla/service/gpu/llvm_gpu_backend/nvptx_backend.cc),
+    where a CPU and the references Dew is held to round to the nearest
+    (`div.rn`, `-nvptx-prec-divf32=2`). Over a sampler's walk, a schedule's
+    weights or a loss those ulps compound: on an H100 adaptive projected
+    guidance's Euler walk sat 4.6 times Diffusers' distance from float64, the
+    min-SNR weights 2.8 times and a Z-Image flow's forward 5.5e-5 from its
+    source, each within the float64 rule with division rounded. XLA reads
+    the option from `xla_backend_extra_options` when it compiles, so
+    `import dew` sets it before the first computation, as it does
+    `keep_roundings`."""
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge is not None and bridge.backends_are_initialized():
+        return
+    if cuda_plugin() and xla_flag("xla_backend_extra_options") is None:
+        apply_xla_flags("--xla_backend_extra_options=-nvptx-prec-divf32=2")
+
+
 def preallocate_gpu_pool() -> None:
     """Preallocate 95% of each GPU as XLA's pool for a training process,
     unless the run named its pool (fraction, preallocation or allocator).

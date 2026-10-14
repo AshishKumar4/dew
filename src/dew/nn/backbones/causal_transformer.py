@@ -16,9 +16,10 @@ dew.interop.hf_decoders does that rename. A model family is supported only after
 its translator and a same-weight parity test against the reference have landed.
 
 The block holds its token mixer in a slot. Any module with the
-(x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention can be self_attn without changes to the block, and that is
-where a linear-attention mixer goes.
+(x, decode=..., attention_metadata=...) -> x signature of CausalSelfAttention,
+reading its tokens' places and documents off the metadata's `Coordinates`, can
+be self_attn without changes to the block, and that is where a linear-attention
+mixer goes.
 """
 
 import dataclasses
@@ -34,8 +35,9 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.objectives.base import merge
 from dew.records import JSON
-from dew.registry import from_record, mixers
+from dew.registry import from_record, read_arguments
 
 from ..activations import ungated_activation
 from ..attention import RMSNorm
@@ -70,6 +72,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
+from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
@@ -85,17 +88,20 @@ from ..sharding import (
 )
 from .decoder_block import (
     DECODER_REMAT,
+    MLP_RESIDUALS,
+    NORM_SITES,
+    RESIDUALS,
     BlockWiring,
     DecoderBlock,
-    GatedMLP,
     Mixture,
     MTPBlock,
+    NormSpec,
     RematPolicy,
     decoder_norm,
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, _merged, run_pipeline, run_stack
+from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -209,6 +215,10 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
+    norms: Mapping[str, NormSpec] | None = None
+    """The norms that differ from the model's others, by module name
+    (`decoder_block.NORM_SITES`): K2 Horizon's grouped statistics, an
+    epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
     first_attention_norm: bool = True
@@ -246,6 +256,11 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    residual_in_fp32: bool = False
+    """Whether the residual stream between layers sums in at least fp32 whatever
+    the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
+    Mamba, Mamba2 and FalconMamba blocks): each sublayer reads the stream in the
+    compute dtype and its output adds to the stream in fp32 (`stack`)."""
     logits_scaling: float = 1.0
     """The divisor of the logits: lm-engine's m_width (`lm_logits *
     (1 / m_width)`), and GraniteMoeHybrid's `logits_scaling`. The division is
@@ -383,34 +398,32 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "activation_sparsity_pattern",
                                tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
         # A value arrives as a record from a config and as itself from code,
-        # and `models.build` already reads one; doing it here too means the
-        # plain constructor takes the same records, as a test or a notebook
-        # writes them.
-        for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
-                             ("mtp_hyper_connections", HyperConnections),
-                             ("attention_residuals", AttentionResiduals), ("engram", Engram),
-                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture), ("loop", Loop)):
-            value = getattr(self, name)
-            if isinstance(value, Mapping):
-                object.__setattr__(self, name, record(**value))
+        # and `models.build` already reads one; reading every field that holds
+        # a record here too, as its annotation declares (`read_arguments`),
+        # means the plain constructor takes the same records, as a test or a
+        # notebook writes them. A bare rotary record and SiTU's betas name no
+        # class, so their own readers take them.
+        records = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                   if field.name not in ("rope_scaling", "mlp")
+                   and isinstance(getattr(self, field.name), Mapping)}
+        for name, value in read_arguments(type(self), records).items():
+            object.__setattr__(self, name, value)
         if isinstance(self.rope_scaling, Mapping):
             object.__setattr__(self, 'rope_scaling', rope_scaling_from_record(self.rope_scaling))
         if isinstance(self.mlp, Mapping):
             # A config states SiTU's betas as a record in the activation's place.
             object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
-        if self.kinds is not None:
+        if self.norms is not None:
+            unknown = sorted(set(self.norms) - set(NORM_SITES))
+            if unknown:
+                raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
+                                 f"it builds {list(NORM_SITES)}")
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
-            object.__setattr__(self, "kinds", flax.core.freeze({
-                name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
-                for name, kind in self.kinds.items()}))
-        # A mixer arrives as a kind value from code and as a {"name": ...,
-        # "fields": ...} record from a config; the record dispatches on its
-        # name through the same `mixers.build` a value is constructed with,
-        # so an unknown kind or field raises either way. Anything else is neither.
-        if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
-        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
+            object.__setattr__(self, "norms", flax.core.freeze(dict(self.norms)))
+        if self.kinds is not None:
+            object.__setattr__(self, "kinds", flax.core.freeze(dict(self.kinds)))
+        if self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         object.__setattr__(self, "remat", remat_policy(self.remat))
@@ -1076,7 +1089,7 @@ class CausalTransformer(nn.Module):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='embedding_layernorm')
+                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1146,7 +1159,7 @@ class CausalTransformer(nn.Module):
         self.norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)(name='norm')
+            dtype=self.dtype, specs=self.norms)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1164,7 +1177,7 @@ class CausalTransformer(nn.Module):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='head_norm')
+                dtype=self.dtype, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
@@ -1199,8 +1212,8 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
-                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
-                                 else self.dspark.target_layers.index(index)),
+                prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
+                                   else None),
                 attention_norm=index > 0 or self.first_attention_norm)
             for index, layer_type in enumerate(types))
 
@@ -1236,13 +1249,14 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
-            prediction_slot=spec.prediction_slot,
+            prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
             norm_bias=self.norm_bias,
+            norms=self.norms,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,
@@ -1449,7 +1463,8 @@ class CausalTransformer(nn.Module):
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
-                          image_groups=None, rotary_positions=None):
+                          image_groups=None, rotary_positions=None,
+                          coordinates: Coordinates | None = None):
         """Return one final-normed state array per shifted prediction depth.
 
         Each depth combines the preceding hidden state with the next token's
@@ -1461,6 +1476,13 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
+        if coordinates is None and (segment_ids is not None or attention_mask is not None
+                                    or positions is not None):
+            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
+                                            positions=positions)
+        if coordinates is not None:
+            segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
+                                                     coordinates.valid)
         embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
@@ -1477,14 +1499,16 @@ class CausalTransformer(nn.Module):
                     valid = valid & attention_mask[:, depth:]
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
+            segments, places = (None if field is None else field[:, depth:]
+                                for field in (segment_ids, positions))
             metadata = AttentionMetadata(
-                coordinates=None if valid is None else build_coordinates(valid=valid),
+                # Cross-document pairs leave holes even when the token rows were right-padded.
+                coordinates=None if coordinates is None else build_coordinates(
+                    (hidden.shape[0], hidden.shape[1] - 1), segments=segments, valid=valid, positions=places,
+                    max_segments=coordinates.max_segments),
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
-            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train,
-                           positions=None if positions is None else positions[:, depth:],
-                           segment_ids=None if segment_ids is None else segment_ids[:, depth:],
-                           attention_metadata=metadata)
+            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
         return states
 
@@ -1516,11 +1540,13 @@ class CausalTransformer(nn.Module):
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
         embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
+        given = attention_mask is not None or positions is not None
         state, prediction = self.mtp[depth].states(
-            hidden, embeds, positions=positions, decode=decode,
+            hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
             attention_metadata=AttentionMetadata(
-                coordinates=None if attention_mask is None else build_coordinates(valid=attention_mask),
+                coordinates=build_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions)
+                if given else None,
                 rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
@@ -1644,7 +1670,8 @@ class CausalTransformer(nn.Module):
 
         V4's depth reads the raw residual streams from before the collapse head
         and the final norm; other depths read the final normalized states.
-        Packed `positions` and `segment_ids` are passed on to the layers.
+        Packed `positions` and `segment_ids` reach the layers as the call's
+        `Coordinates`, the one description of its tokens every layer reads.
 
         - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
           for a caller that fuses in another encoder's output. The token ids
@@ -1672,13 +1699,12 @@ class CausalTransformer(nn.Module):
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         """
-        if coordinates is not None and coordinates.segments is not None:
-            # Attention still reads the documents and their positions as fields of its own.
-            segment_ids, positions = coordinates.segments, coordinates.positions
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             coordinates)
+        if attention_metadata is not None and attention_metadata.coordinates is not None:
+            positions = attention_metadata.coordinates.positions
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1710,8 +1736,6 @@ class CausalTransformer(nn.Module):
             self._expand(x),
             train=train,
             decode=decode,
-            positions=positions,
-            segment_ids=segment_ids,
             per_layer_input=ple,
             attention_metadata=attention_metadata,
         )
@@ -1749,11 +1773,17 @@ class CausalTransformer(nn.Module):
                 raise ValueError("explicit pairwise masks require ordinary attention mixers")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        engram_ids = (None if self.engram is None
-                      else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
-        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded):
+        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
+                                    or positions is not None):
             coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
                                             positions=positions, right_padded=right_padded)
+        if decode and coordinates is not None and coordinates.max_segments > 1:
+            raise ValueError(
+                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
+                "call would attend across documents; prefill each document into a row of its own")
+        engram_ids = (None if self.engram is None else self.engram_hashes(
+            tokens, attention_mask, None if coordinates is None else coordinates.positions, decode,
+            media_mask))
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):
@@ -1809,8 +1839,8 @@ class CausalTransformer(nn.Module):
         if not self.is_initializing():
             self.sow('exits', 'logits', logit)
 
-    def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
-              per_layer_input, attention_metadata=None, span: tuple[int, int] | None = None):
+    def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
+              span: tuple[int, int] | None = None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
 
         `span` runs layers [first, end) alone, as a `Loop` over a block runs its
@@ -1824,8 +1854,13 @@ class CausalTransformer(nn.Module):
         settles in (`residual_dtype`). A store built bank by bank
         (`dew.inference.banks`) already holds one array per run, and the view
         leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
-        for a banked store.
+        for a banked store. With `residual_in_fp32` the stream enters widened,
+        so every sublayer's output adds to it in fp32 whichever loop runs.
         """
+        if self.residual_in_fp32 and isinstance(x, Carried):
+            x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
+        elif self.residual_in_fp32:
+            x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
         spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
@@ -1839,14 +1874,12 @@ class CausalTransformer(nn.Module):
                 view = StackView(groups)
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                        trans_out_fn=view.unstack, init=True, mutable=True)
-                return run(self, view, x, train, decode, positions, segment_ids,
-                           per_layer_input, attention_metadata)
+                return run(self, view, x, train, decode, per_layer_input, attention_metadata)
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -1903,13 +1936,13 @@ class CausalTransformer(nn.Module):
                 # loop creates (the routers' sowing) comes out per iteration.
                 broadcast=tuple(name for name, tree in self.variables.items() if tree))
         dtype = self.residual_dtype(
-            x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+            x, train=train, decode=decode, per_layer_input=per_layer_input,
+            attention_metadata=attention_metadata)
         # A carried collapse stays fp32, as the reference keeps it.
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
+        return run(self, view, x, train, decode, per_layer_input, attention_metadata)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1957,8 +1990,8 @@ class CausalTransformer(nn.Module):
             banked.append(collection)
         return tuple(banked)
 
-    def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
-                       per_layer_input, attention_metadata=None) -> jnp.dtype:
+    def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
+                       attention_metadata=None) -> jnp.dtype:
         """Return the dtype the residual stream settles in: `x`'s promoted with the first layer's output.
 
         A scan carries one dtype through, and each pipeline stage takes the
@@ -1974,8 +2007,7 @@ class CausalTransformer(nn.Module):
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=True, rngs=rngs,
-            train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            kv_store={} if self.sharing_layers else None,
+            train=train, decode=decode, kv_store={} if self.sharing_layers else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         output = output.streams if isinstance(output, Carried) else output
@@ -2008,7 +2040,7 @@ class CausalTransformer(nn.Module):
             if stacked and first in tree:
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
             if 'layers_0' in tree:
-                held = _merged(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
+                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             if held:
                 variables[collection] = held
         return variables
@@ -2041,14 +2073,13 @@ class CausalTransformer(nn.Module):
         return count
 
     @nn.compact
-    def _stacked(self, view: StackView, x, train: bool, decode: bool, positions,
-                 segment_ids, per_layer_input, attention_metadata=None):
+    def _stacked(self, view: StackView, x, train: bool, decode: bool, per_layer_input,
+                 attention_metadata=None):
         """The stack inside `view`: scanned runs, or the pipeline over stages."""
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
-                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return run_pipeline(
@@ -2056,8 +2087,6 @@ class CausalTransformer(nn.Module):
             view,
             x,
             train=train,
-            positions=positions,
-            segment_ids=segment_ids,
             per_layer_input=per_layer_input,
             attention_metadata=attention_metadata,
         )
@@ -2193,10 +2222,34 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """One rung up `DECODER_REMAT`; None at its top or off it."""
+        """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
+        these layers mark than the rung above it (`MixerBase.residuals`), whose step would
+        compile the same; None at the top or off the ladder."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
-        return self.clone(remat=DECODER_REMAT[DECODER_REMAT.index(self.remat) + 1])
+        marked = self.marked_residuals()
+
+        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], frozenset[str]] | None:
+            return None if policy is None else (frozenset(policy.save) & marked,
+                                                frozenset(policy.offload) & marked)
+
+        index = DECODER_REMAT.index(self.remat) + 1
+        while (index < len(DECODER_REMAT) - 1
+               and kept(DECODER_REMAT[index]) == kept(DECODER_REMAT[index + 1])):
+            index += 1
+        return self.clone(remat=DECODER_REMAT[index])
+
+    @nn.nowrap
+    def marked_residuals(self) -> frozenset[str]:
+        """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
+        (`MixerBase.residuals`, every name where a kind does not say) and the MLP's."""
+        types = self.per_layer_types
+        mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
+        if any(mixer is not None and mixer.residuals is None for mixer in mixers):
+            return frozenset(RESIDUALS)
+        default = AttentionMixer.residuals or ()
+        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.residuals or ()
+                                                for mixer in mixers))
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:

@@ -22,7 +22,9 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
+from dew.config.data import ImageData as ImageRecipe, VideoData
+from dew.data import ByteTokenizer
+from dew.data.dataset import Loader
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
@@ -44,7 +46,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=RES),
+        data=ImageRecipe(source="tfds://oxford_flowers102", split="all", image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
@@ -93,7 +95,7 @@ def make_run(
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                       checkpoints=checkpoints)
-    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=steps, log_every=100, checkpoint_every=steps)
     checkpoints.wait()
     config.save(str(directory))
@@ -253,7 +255,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     factories read that grid there, and an image-only metric raises a
     ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=VideoDataset(frame_size=8, frames=2),
+                                data=VideoData(source="clips", frame_size=8, frames=2),
                                 val_metrics=("psnr",))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
@@ -305,7 +307,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints,
                       mesh=MeshSpec() if mesh is None else mesh)
-    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
@@ -381,16 +383,17 @@ def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp
     (the name of the snapshot directory), with checkpoints selected by step."""
     import huggingface_hub
 
-    import dew.interop.hub as hub
     from dew.sampling import Sampling
 
     snapshot = tmp_path / "3f2a9c"
     make_lm_run(snapshot)
     resolved, pulled = [], []
-    monkeypatch.setattr(huggingface_hub, "snapshot_download",
-                        lambda repo_id, revision, allow_patterns: resolved.append(revision) or snapshot)
-    monkeypatch.setattr(hub, "snapshot_download",
-                        lambda repo_id, revision: pulled.append(revision) or snapshot)
+
+    def downloaded(repo_id, revision, allow_patterns=None):
+        (pulled if allow_patterns is None else resolved).append(revision)
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", downloaded)
     task = dew.pipeline("user/byte-lm", revision="main", step=2)
     assert isinstance(task, TextGeneration)
     assert (resolved, pulled) == (["main"], ["3f2a9c"])
@@ -459,7 +462,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
-                         Dataset(lambda partition: Stream(), None, None, batch), name="run")
+                         Loader(lambda partition: Stream(), None, None, batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
     record = json.loads((tmp_path / "run" / "run.json").read_text())["fields"]
@@ -478,7 +481,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     """Placed under the trainer's layout, the weights shard over the mesh,
     prompts split over its batch axes, the result keeps that sharding, and
     `host()` reads back exactly what the single device draws."""
-    from dew.nn.inputs import BATCH_AXES
+    from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
 
     make_run(tmp_path)
@@ -487,7 +490,8 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables)}
     assert any("fsdp" in str(spec) for spec in specs)
     result = placed(["a", "b", "c"], steps=3, key=7)
-    assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    placed_on = result.images.sharding
+    assert placed_on.spec == jax.sharding.PartitionSpec(request_axes(placed_on.mesh))
     assert result.rows == 3
     np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, key=7).host().images,
                                atol=2e-5, rtol=2e-5)

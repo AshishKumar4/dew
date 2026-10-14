@@ -65,6 +65,7 @@ import dataclasses
 import functools
 import logging
 import math
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -75,13 +76,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import unfreeze
 from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
-from dew.inference.projections import pack_projections, projection_groups
+from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
     Dense,
@@ -106,6 +106,7 @@ from dew.inference.tasks import (
     prepared_inputs,
     shape_bucket,
 )
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
@@ -391,7 +392,10 @@ class Server:
     prefills. A request whose prompt and budget do not fit the capacity is
     refused at `submit`, with the error `TextGeneration` raises for a request
     over the model's context. Over a mesh, the slots and the admission split
-    evenly over the groups of rows, and so do the pages of a paged pool.
+    evenly over the groups of rows, and so do the pages of a paged pool. The
+    server holds the weights at their decoding storage
+    (`dew.interop.weights.decoding_storage`), to which `reload` casts the
+    weights it is handed.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
@@ -406,6 +410,7 @@ class Server:
                                chunked=rows.chunk is not None, mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
+        variables = decoding_storage(model, variables)
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
@@ -429,6 +434,11 @@ class Server:
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
+        self._incoming: deque[_Row] = deque()
+        """Requests `submit` took since the last step. The next step moves
+        them into the queue, so a submitting thread never waits for a step."""
+        self._ingress = threading.Lock()
+        """Orders a submission's append with a failure's sweep."""
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
         self._failed: BaseException | None = None
@@ -441,18 +451,8 @@ class Server:
         )
 
         with self._context():
-            source_shapes = unfreeze(dict(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-            for group in projection_groups(model, variables):
-                node = source_shapes["params"]
-                for part in group.path:
-                    node = node[part]
-                if group.packed in node:
-                    packed = node.pop(group.packed)
-                    for projection, width in zip(group.members, group.widths, strict=True):
-                        node[projection] = {field: jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype)
-                                            for field, leaf in packed.items()}
-                    self._weight_groups.append(group)
+            groups, source_shapes = packed_layout(model, variables)
+            self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
@@ -524,14 +524,14 @@ class Server:
         """
         mesh = mesh_of(task.variables)
         if mesh is not None:
-            if mesh.shape[STAGE_AXIS] > 1:
+            if mesh.shape.get(STAGE_AXIS, 1) > 1:
                 raise ValueError(
                     "a server decodes through the whole layer stack every step; the stage axis "
                     "runs the stack as the training pipeline, which the decoder refuses to decode "
                     "through (one token a step leaves no microbatches to pipeline). Serve on a "
                     "mesh with stage=1"
                 )
-            if mesh.shape[SEQUENCE_AXIS] > 1:
+            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
                 raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
                                  "and a decoder refuses to decode under a sequence axis, which splits a "
                                  "sequence's positions. Serve on a mesh with sequence=1")
@@ -613,7 +613,7 @@ class Server:
 
     @property
     def queued(self) -> int:
-        return len(self._queue)
+        return len(self._queue) + len(self._incoming)
 
     def reload(self, variables: Variables) -> None:
         """Serve `variables` from the next step on, in place of the current weights.
@@ -666,19 +666,22 @@ class Server:
         against the server's capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies. A
         request with a zero budget resolves at once, with the prompt alone.
+        Another thread may submit while one steps. The request is validated
+        here and joins the queue at the next step.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
         return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int) -> Ticket:
-        if self._failed is not None:
-            raise RuntimeError("the server stopped after a device check failed") from self._failed
         row = self._prepared(prompt, max_new_tokens, seed, fold)
-        if row.budget == 0:
+        with self._ingress:
+            if self._failed is not None:
+                raise RuntimeError("the server stopped after a device check failed") from self._failed
+            if row.budget:
+                self._incoming.append(row)
+        if not row.budget:
             self._finish(row, terminated=False)
-        else:
-            self._queue.append(row)
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
@@ -716,6 +719,8 @@ class Server:
         """
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
+        while self._incoming:
+            self._queue.append(self._incoming.popleft())
         admission = self._admit()
         with self._context():
             program = self._step if admission is None else self._admitting
@@ -728,7 +733,7 @@ class Server:
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
-        while self._queue or self._rows:
+        while self._queue or self._incoming or self._rows:
             self.step()
         self._settle()
 
@@ -869,11 +874,14 @@ class Server:
             row.ticket._drew(row.tokens)
 
     def _fail(self, failure: BaseException) -> None:
-        self._failed = failure
-        for row in [*self._rows.values(), *self._queue]:
+        with self._ingress:
+            self._failed = failure
+            waiting = [*self._rows.values(), *self._queue, *self._incoming]
+            self._rows.clear()
+            self._queue.clear()
+            self._incoming.clear()
+        for row in waiting:
             row.ticket.set_exception(failure)
-        self._rows.clear()
-        self._queue.clear()
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget

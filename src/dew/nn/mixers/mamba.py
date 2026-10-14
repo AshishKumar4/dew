@@ -167,9 +167,9 @@ class Mamba(nn.Module):
             self.init_std if self.output_init_std is None else self.output_init_std))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, segment_ids, kv_store
+        del kv_store
         batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
         valid = tokens.valid
@@ -265,6 +265,8 @@ class MambaMixer(MixerBase):
     (configuration_mamba.py). It ignores the context's attention geometry: an
     SSM has no keys to cache or positions to rotate.
     """
+
+    residuals = ('context', 'conv')
 
     intermediate_size: int = 1536
     state_size: int = 16

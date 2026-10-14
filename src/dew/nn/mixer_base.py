@@ -1,7 +1,8 @@
 """Token mixers: what a decoder layer mixes across the sequence, by kind.
 
 A mixer is the module a `DecoderBlock` holds as `self_attn`, with the `(x,
-decode=..., positions=..., segment_ids=...) -> x` signature. Grouped-query
+decode=..., attention_metadata=...) -> x` signature, its tokens' places and
+documents the metadata's `Coordinates` (`dew.nn.inputs.coordinates_of`). Grouped-query
 causal attention is the `attention` kind; MLA, the gated delta rule and the
 rest sit beside it as frozen dataclass values under the reference's
 field names. A kind builds its `DecoderBlock` factory with `mixer.build(ctx)`
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
+from typing import ClassVar
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -136,6 +138,12 @@ class MixerBase:
     keeps_triton_gemm = False
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
     `gpu_target().kernels['xla_triton_gemm']` turns them off."""
+
+    residuals: ClassVar[tuple[str, ...] | None] = None
+    """The names (`dew.nn.backbones.decoder_block.RESIDUALS`) the mixer this kind
+    builds marks for a remat policy to keep, or every name where None: a
+    decoder skips a remat rung that keeps nothing more of its layers' names
+    than the next (`CausalTransformer.recompute_more`)."""
 
     mixed_step = False
     """Whether the mixer this kind builds runs a server's mixed call

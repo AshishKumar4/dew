@@ -24,9 +24,11 @@ BATCH = 8
 TINY_SHARD = 256
 
 
-def packed_batch(seed: int = 0) -> dict[str, np.ndarray]:
+def packed_batch(seed: int = 0):
     """Two documents a row, the boundary moving from row to row, and the tail
     of the last row padding (segment 0)."""
+    from dew.nn.inputs import coordinates
+
     rng = np.random.default_rng(seed)
     text = rng.integers(1, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)
     segments = np.ones((BATCH, SEQ_LEN + 1), np.int32)
@@ -37,7 +39,8 @@ def packed_batch(seed: int = 0) -> dict[str, np.ndarray]:
         positions[row, :boundary] = np.arange(boundary)
         positions[row, boundary:] = np.arange(SEQ_LEN + 1 - boundary)
     segments[-1, -3:] = 0
-    return {"text": text, "text_segment_ids": segments, "text_positions": positions}
+    return {"text": text, "text_coordinates": coordinates(
+        segments=segments, positions=positions, max_segments=SEQ_LEN + 1, right_padded=True, xp=np)}
 
 
 def fsdp_group_processes(mesh) -> list[list[int]]:
@@ -90,7 +93,7 @@ def main() -> None:
     from sharded import split_axes
 
     from dew.checkpoints import Checkpoints
-    from dew.data import DataPartition, Dataset
+    from dew.data.dataset import DataPartition, Loader
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
@@ -101,8 +104,8 @@ def main() -> None:
         readers read, whole in every other dimension, for ever; or on
         process 1 with --fail-at, until that batch."""
         rows = partition.rows(BATCH)
-        mine = {name: leaf[partition.index * rows:(partition.index + 1) * rows]
-                for name, leaf in packed_batch().items()}
+        mine = jax.tree.map(lambda leaf: leaf[partition.index * rows:(partition.index + 1) * rows],
+                            packed_batch())
         read = 0
         while True:
             if read == args.fail_at and jax.process_index() == 1:
@@ -126,8 +129,8 @@ def main() -> None:
             rows = self.partition.rows(BATCH)
             batch = packed_batch(self.read)
             self.read += 1
-            return {name: leaf[self.partition.index * rows:(self.partition.index + 1) * rows]
-                    for name, leaf in batch.items()}
+            return jax.tree.map(
+                lambda leaf: leaf[self.partition.index * rows:(self.partition.index + 1) * rows], batch)
 
         def get_state(self) -> bytes:
             return str(self.read).encode()
@@ -142,7 +145,7 @@ def main() -> None:
                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
                       checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
                       tracker=losses)
-    state = trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
+    state = trainer.fit(Loader(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
                         steps=args.steps, log_every=1)
     # Every leaf of the trained state whole, in a fixed order, so two runs'
     # states compare by one hash.

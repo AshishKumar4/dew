@@ -18,11 +18,12 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 from test_objective_inputs import cases, corpus_windows
 
-from dew import Dataset, Evaluation
+from dew import Evaluation
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, Loading, TFDSImages
+from dew.config.data import ImageData, RecordsData, loader
+from dew.data import Loading
 from dew.data.chat import Role
-from dew.data.dataset import rows_of
+from dew.data.dataset import DataPartition, rows_of
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import TEACHER, VALID_ROWS, Step
@@ -52,7 +53,8 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=8), preset=Flow(), val_metrics=(),
+        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(),
+            val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2,
@@ -102,8 +104,8 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
-    data = Dataset.from_records({"id": np.arange(8)}, batch=4, validation={"id": np.arange(held)},
-                                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = loader(RecordsData(source={"id": np.arange(8)}, validation={"id": np.arange(held)}), batch=4,
+        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
     for count in (1, 2):
         seen = []
         for index in range(count):
@@ -122,7 +124,7 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 
 def evaluated(name: str, windows, tmp_path) -> dict:
     """`name`'s pass over a split of `RECORDS` in batches of `ROWS`, run on
-    every process of the pool: once through `Dataset.from_records`, whose
+    every process of the pool: once through `loader(RecordsData(...))`, whose
     repeats fill the last batch with its own rows, and once with the repeats
     another record's. Each pass's scores and counts, and for a loss that draws
     nothing (the same under two keys) the loss of every record in one batch
@@ -133,8 +135,8 @@ def evaluated(name: str, windows, tmp_path) -> dict:
         drawn = objective.init(jax.random.key(0))
         variables, averaged = moved(drawn, 1), moved(drawn, 2)
         records = wide(records)
-        data = Dataset.from_records(records, batch=ROWS, validation=records,
-                                    loading=Loading(workers=0, threads=1, read_buffer=1))
+        data = loader(RecordsData(source=records, validation=records), batch=ROWS, loading=Loading(workers=0,
+            threads=1, read_buffer=1), read="memory")
         tail = len(records) - ROWS
         batches = [{**stacked(records[:ROWS]), VALID_ROWS: np.ones(ROWS, bool)},
                    {**stacked(records[ROWS:] + [records[0]] * (ROWS - tail)),
@@ -255,8 +257,8 @@ def perplexity(windows, count: int = RECORDS) -> dict:
     records = records_of(batch, count)
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 1)
-        data = Dataset.from_records(records_of(batch, ROWS), batch=ROWS, validation=records,
-                                    loading=Loading(workers=0, threads=1, read_buffer=1))
+        data = loader(RecordsData(source=records_of(batch, ROWS), validation=records), batch=ROWS,
+            loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
         result = Evaluation.run(objective, variables, data.val, key=3, metrics=(Perplexity(),))
         whole = stacked(records)
         step = Step(jnp.asarray(0), jax.random.key(1), None)
@@ -281,3 +283,43 @@ def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
     """On one process (`tests/test_multiprocess.py` runs the same on two,
     where one record leaves process 1's share empty)."""
     assert_the_metric_over_every_record(perplexity(windows, count), count)
+
+
+def test_a_metric_reads_the_fields_no_device_holds():
+    """A held record's name, a string no accelerator holds, reaches the
+    metrics with the rest of its batch: the objective's programs read what a
+    device holds, and a metric reads the whole batch, its last batch's
+    repeats left out."""
+    from affine_run import FEATURES, Features
+
+    from dew.artifacts import Representations
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Memory
+
+    records = Memory(tuple({"x": np.full(FEATURES, index, np.float32), "y": np.full(2, index, np.float32),
+                            "index": np.int32(index), "name": f"record {index}"} for index in range(RECORDS)))
+    data = compile(Pipeline(records).repeat().batch(ROWS), validation=Pipeline(records).batch(ROWS),
+                   objective=Features().data(), read="memory",
+                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+
+    class Names:
+        name, reads = "names", Representations
+
+        def __init__(self):
+            self.seen = []
+
+        def __call__(self, artifact, batch):
+            self.seen += [(str(name), int(index)) for name, index in zip(batch["name"], artifact.labels,
+                                                                         strict=True)]
+            return 0.0, 1
+
+        def merge(self, accumulated, contribution):
+            return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+        def finalize(self, accumulated):
+            return accumulated[0] / accumulated[1]
+
+    objective, names = Features(), Names()
+    Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(names,))
+    assert names.seen == [(f"record {index}", index) for index in range(RECORDS)]

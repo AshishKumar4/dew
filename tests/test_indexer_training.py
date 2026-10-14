@@ -21,8 +21,9 @@ import pytest
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
 
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import FROZEN, Step
@@ -275,8 +276,9 @@ def packed_row(*documents):
 
 
 def packed_batch(rows):
-    ids, segments, positions = (jnp.asarray(np.stack(column)) for column in zip(*rows, strict=True))
-    return {"text": ids, "text_segment_ids": segments, "text_positions": positions}
+    ids, segments, positions = (np.stack(column) for column in zip(*rows, strict=True))
+    return {"text": jnp.asarray(ids), "text_coordinates": coordinates(
+        segments=segments, positions=positions, max_segments=ids.shape[1], right_padded=True, xp=np)}
 
 
 def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
@@ -302,12 +304,11 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
 def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     """Either phase reads a packed row's documents off its `ModelInputs` as
-    it reads them off the batch's packing columns, to the bit, padding
+    it reads them off the batch's coordinates, to the bit, padding
     queries included, which count nothing either way."""
     tokens = np.random.default_rng(3).integers(1, VOCAB, size=(SEQ + 1,))
     columns = packed_batch([packed_row(tokens[:7], tokens[7:13])])
-    carried = {"text": ModelInputs(columns["text"], {"segment_ids": columns["text_segment_ids"],
-                                                     "positions": columns["text_positions"]})}
+    carried = {"text": ModelInputs(columns["text"], {"coordinates": columns["text_coordinates"]})}
     objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
     params = objective.init(jax.random.key(0))
 
@@ -399,15 +400,6 @@ def test_evaluation_and_scoring_read_the_split_tree():
     assert objective.ema.select(("params", "layers_0"))
 
 
-class Data:
-    def __init__(self, batches):
-        self._batches = batches
-
-    def train(self, partition):
-        return self._batches()
-
-    val, batch, records, steps_per_epoch = None, 8, None, None
-
 
 def token_batches():
     rng = np.random.default_rng(0)
@@ -431,7 +423,8 @@ def test_the_warmup_trains_through_the_trainer():
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()
 
-    state = trainer.fit(Data(token_batches), steps=3, log_every=1)
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
+                        steps=3, log_every=1)
 
     assert jax.tree.structure(state.opt_state) == jax.tree.structure(
         optax.adam(1e-2).init(initial.variables["params"]))

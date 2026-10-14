@@ -3,7 +3,7 @@
 The config readers (`base_config`, `translated`), the maps between Dew's
 parameter paths and a checkpoint's tensor names (`dew_path`,
 `hf_tensor_name`, `Renames`), tensors a checkpoint stores packed (`Packed`),
-the shared export writer (`decoder_tensors`) and the entry type
+the shared export writer (`decoder_tensors`, `leaf_layouts`) and the entry type
 (`DecoderFamily`). Each module in `dew.interop.families` builds its entries
 from these, `decoder_families` orders the entries, and `hf_decoders` reads
 and writes checkpoints through that table: each imports only what precedes it.
@@ -390,7 +390,7 @@ class _Rope:
 
 
 def _rope_entry(entry: Mapping[str, object] | None, field: str,
-                yarn_max_pos: int | None = None) -> _Rope:
+                yarn_max_pos: int | None = None, *, ramps: tuple[str, ...] | None = None) -> _Rope:
     """Read one rope_parameters entry, if it names a base or a ramp.
 
     Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
@@ -406,10 +406,14 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
     entry needs for the factor the reference falls back to. Passing it is
     how a family whose attention builds the YaRN frequencies opts in; the
     families that only rotate plainly leave it None and refuse the type.
+    `ramps` restricts the scaled types to those the caller's family computes.
     """
     if entry is None:
         return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if ramps is not None and rope_type not in ('default', 'none', *ramps):
+        refuse(f"{field} (rope_type {rope_type!r})",
+                f"this family applies plain rotary positions or {list(ramps)} ramps")
     theta = entry.get('rope_theta')
     theta = None if theta is None else records.number(theta, 'rope_theta')
     if rope_type == 'llama3':
@@ -452,8 +456,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
 def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
     """Read one plain rope base frequency.
 
-    A llama3 entry refuses where only plain rope has a place: the DeepSeek and
-    Gemma 4 readers.
+    A llama3 entry refuses where only plain rope has a place, as in Gemma 4.
     """
     rope = _rope_entry(entry, field)
     if rope.scaling is not None:
@@ -576,7 +579,8 @@ def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
 
 
 def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
-              spelling: RopeSpelling = PLAIN_SPELLING) -> Ropes:
+              spelling: RopeSpelling = PLAIN_SPELLING, *,
+              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
     The class's records come first (`RopeSpelling`): flat rope_theta with a
@@ -585,19 +589,22 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
     a record that names its type as plain clearing an earlier ramp. Each is
     then parsed once (`_rope_entry`): the full layers' base and ramp are the
     model's, the sliding layers' their kind's where they differ. YaRN reads
-    `yarn_max_pos`, as `_rope_entry` describes.
+    `yarn_max_pos`, as `_rope_entry` describes. `ramps` names the scaling
+    types the family computes; `per_kind=False` refuses nested records.
     """
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
     if spelling.local_field is not None:
         used.add(spelling.local_field)
     (full_field, full_record), sliding = _rope_records(hf_config, spelling)
-    full = _rope_entry(full_record, full_field, yarn_max_pos)
+    if not per_kind and '.' in full_field:
+        refuse(full_field, 'this family reads one rotary record for every layer')
+    full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
     full_ramp = _at_base(full.scaling, theta)
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
-    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos)
+    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
     sliding_ramp = _at_base(local.scaling, sliding_theta)
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
@@ -924,7 +931,8 @@ _SANDWICH_NORMS = {
     'pre_feedforward_layernorm': 'post_attention_layernorm',
     'post_feedforward_layernorm': 'mlp_output_norm',
 }
-_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
+# An attention gate_proj is Muse Glimmer's output gate (`CausalSelfAttention.gate_projection`).
+_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'gate_proj', 'o_proj'),
                 'mlp': ('gate_proj', 'up_proj', 'down_proj', 'gate')}
 _HEAD_NORMS = ('q_norm', 'k_norm')
 # The MLA projections and norms live under self_attn beside the standard
@@ -940,6 +948,21 @@ MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 # does; its Linear leaves transpose like any other, and the rest keep the
 # checkpoint's names and shapes (GatedDeltaNet in dew.nn.linear). Qwen3-Next
 # stores the same projections fused as in_proj_qkvz and in_proj_ba.
+type Leaves = Mapping[str, tuple[str, ...]]
+"""A family's own tensors, by their dotted names, onto their paths."""
+
+
+KDA_LEAVES: Leaves = {
+    'self_attn.A_log': ('self_attn', 'A_log'), 'self_attn.dt_bias': ('self_attn', 'dt_bias'),
+    'self_attn.o_norm.weight': ('self_attn', 'o_norm', 'weight'),
+    **{f'self_attn.{conv}.weight': ('self_attn', conv, 'weight')
+       for conv in ('q_conv1d', 'k_conv1d', 'v_conv1d')},
+    **{f'self_attn.{projection}.weight': ('self_attn', projection, 'kernel')
+       for projection in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj')},
+}
+"""Kimi Delta Attention's tensors below its layer, beside the shared q, k and v
+projections: the decay, its bias, the output norm, the short convolutions and
+the gate projections, which Kimi Linear, Kimi K3 and GLM-5 Next hold alike."""
 _LINEAR_PROJECTIONS = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a',
                        'in_proj_qkvz', 'in_proj_ba', 'out_proj')
 _LINEAR_LEAVES: frozenset[tuple[str, ...]] = frozenset(
@@ -1033,9 +1056,21 @@ def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
     return '.'.join(spelled)
 
 
-def renamed_path(renames: Renames, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """`dew_path` of a family whose names differ from the shared ones by `renames`."""
-    return dew_path(renamed(name, renames), config)
+def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, leaves: Leaves | None = None,
+                 layer_leaves: Leaves | None = None) -> tuple[str, ...] | None:
+    """`dew_path` of a family whose names differ from the shared ones by
+    `renames`, and that holds tensors the shared map has no place for:
+    `leaves` by their whole name, `layer_leaves` by their name below
+    `model.layers.N.`, each spelled after the renames and placed under
+    `params`, a layer's in its own."""
+    spelled = renamed(name, renames)
+    if leaves is not None and spelled in leaves:
+        return ('params', *leaves[spelled])
+    parts = spelled.split('.', 3)
+    if (layer_leaves is not None and len(parts) == 4 and parts[:2] == ['model', 'layers']
+            and parts[2].isdigit() and parts[3] in layer_leaves):
+        return ('params', f'layers_{parts[2]}', *layer_leaves[parts[3]])
+    return dew_path(spelled, config)
 
 
 def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -1187,13 +1222,9 @@ def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
             return (f'{site}_hc', suffix)
     if module == 'self_attn':
         tail = tuple(parts[4:])
-        if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
-            return (module, *tail)
-        if len(tail) == 2 and tail[1] == 'weight':
-            if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                return (module, *tail)
-            if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
-                return (module, tail[0], 'kernel')
+        kda = KDA_LEAVES.get('.'.join(parts[3:]))
+        if kda is not None:
+            return kda
         if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
                 'index_kpool_compress_ape', 'index_kpool_compress_gate'):
             return (module, *tail)
@@ -1255,38 +1286,63 @@ def _dense_decoder_weights(family: "DecoderFamily", model: CausalTransformer, va
 
 def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
                     config: Mapping[str, object]) -> LazyTensors:
-    """Write every leaf under the name `family` gives it (`DecoderFamily.tensor_name`).
+    """Write every parameter under the name `family` gives it (`DecoderFamily.tensor_name`).
 
-    Each leaf is stored as the load oriented it, a 2-D kernel transposed, and
-    the family's `packed` tensors are built from their parts. Gemma 4's layer
-    scalars are read from the collection `model.layer_scalar` names.
+    Each is bound by `leaf_layouts`, and the family's `packed` tensors are
+    built from their parts. Gemma 4's layer scalars are read from the
+    collection `model.layer_scalar` names.
     """
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
     tree = variables if 'params' in variables else {'params': params}
-    leaves = dict(flatten_dict(dict(params), sep='.'))
+    leaves: dict[tuple[str, ...], object] = {
+        ('params', *path): value for path, value in flatten_dict(dict(params)).items()}
     constants = tree.get('constants')
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
-        leaves.update((name, value) for name, value in flatten_dict(dict(constants), sep='.').items()
-                      if name.endswith('.layer_scalar'))
+        leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
+                       if path[-1] == 'layer_scalar'})
+    layouts = leaf_layouts(leaves, lambda path: family.tensor_name('.'.join(path[1:]), config))
+    # A packed tensor's geometry is the model's, read as a translated config spells it.
+    geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
+                'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
+    return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+
+
+def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
+                 names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
+    """Bind each leaf, by its path collection first, to the source tensor `names` gives it.
+
+    A leaf is stored as the load oriented it, a 2-D kernel transposed. None
+    writes nothing, as for the tied head. A tuple names one source tensor per
+    expert of a stacked leaf, in expert order: the slices the load stacked
+    (`hf_decoders._stack_experts`).
+    """
     layouts: dict[str, WeightLayout] = {}
-    for name, value in leaves.items():
-        target = family.tensor_name(name, config)
-        if target is None:
+    for path, value in leaves.items():
+        named = names(path)
+        if named is None:
             continue
         if not isinstance(value, (jax.Array, np.ndarray)):
-            raise TypeError(f'{name} is a {type(value).__name__}, not an array')
-        if target in layouts:
-            raise ValueError(f'{name} and {layouts[target].paths[0]} both write {target}')
-        kernel = name.endswith('.kernel') and value.ndim == 2
-        layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
-                                       if kernel else value.shape, (1, 0) if kernel else None)
-    return layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
+            raise TypeError(f"{'.'.join(path)} is a {type(value).__name__}, not an array")
+        if isinstance(named, str):
+            slices, shape = [(named, None)], value.shape
+        elif value.shape[:1] == (len(named),):
+            slices, shape = [(name, expert) for expert, name in enumerate(named)], value.shape[1:]
+        else:
+            raise ValueError(f"{'.'.join(path)} holds {value.shape}, not one slice for each of "
+                             f"{len(named)} named experts")
+        kernel = path[-1] == 'kernel' and len(shape) == 2
+        for target, expert in slices:
+            if target in layouts:
+                raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
+            layouts[target] = WeightLayout(target, (path,), shape[::-1] if kernel else shape,
+                                           (1, 0) if kernel else None, expert_index=expert)
+    return layouts
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout],
-                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
     """`layouts` with each `packed` source tensor built from its parts' layouts,
     in the place of its first part."""
     source: dict[str, WeightLayout] = {}
@@ -1303,7 +1359,7 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
-                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+                stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
 
 
@@ -1361,7 +1417,10 @@ class Packed:
     Each name is a suffix after the stem a tensor and its parts share. A load
     splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
     and an export packs their leaves back (`layout`), so the one entry is
-    both directions.
+    both directions. With `chunks` the tensor is that many equal runs on
+    `axis`, each holding its share of every part in turn, as a checkpoint
+    pre-sharded for as many tensor-parallel ranks stores them; each part is
+    its shares in run order.
     """
 
     name: str
@@ -1369,25 +1428,38 @@ class Packed:
     axis: int = -1
     transpose: tuple[int, ...] | None = None
     widths: Callable[[Mapping[str, object]], tuple[int, ...]] | None = None
-    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv."""
+    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv;
+    with `chunks`, one run's."""
+    chunks: Callable[[Mapping[str, object]], int] | None = None
+    """Config-derived count of the runs the parts are interleaved in, as in
+    MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
-        """The parts of the source tensor `name`, as views of it."""
+        """The parts of the source tensor `name`, as views of it, or copies
+        where they are interleaved in runs."""
         stem = name.removesuffix(self.name)
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        if (self.widths is not None or self.chunks is not None) and config is None:
+            raise ValueError(f'{name} needs translated geometry to split its projections')
+        axis = self.axis % stored.ndim
+        runs = 1 if self.chunks is None or config is None else self.chunks(config)
+        if runs < 1 or stored.shape[axis] % runs:
+            raise ValueError(f'{name} has shape {stored.shape}, which {runs} equal runs do not divide')
+        run = stored.reshape(*stored.shape[:axis], runs, stored.shape[axis] // runs, *stored.shape[axis + 1:])
         sections: int | np.ndarray = len(self.parts)
-        if self.widths is not None:
-            if config is None:
-                raise ValueError(f'{name} needs translated geometry to split its projections')
+        if self.widths is not None and config is not None:
             widths = self.widths(config)
-            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != stored.shape[self.axis]:
-                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths}')
+            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != run.shape[axis + 1]:
+                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths} '
+                                 f'in {runs} runs')
             sections = np.cumsum(widths[:-1])
-        return {stem + part: piece for part, piece in
-                zip(self.parts, np.split(stored, sections, axis=self.axis), strict=True)}
+        pieces = np.split(run, sections, axis=axis + 1)
+        return {stem + part: piece.reshape(*stored.shape[:axis], -1, *stored.shape[axis + 1:])
+                for part, piece in zip(self.parts, pieces, strict=True)}
 
-    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+    def layout(self, name: str, parts: Sequence[WeightLayout],
+               config: Mapping[str, object] | None = None) -> WeightLayout:
         """The layout of the source tensor `name`, from each part's one-leaf layout."""
         ndim = len(parts[0].shape)
         # A part's axis k is its leaf's axis order[k].
@@ -1398,10 +1470,41 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
-                            None if len(parts) == 1 else order[axis] - ndim)
+                            None if len(parts) == 1 else order[axis] - ndim,
+                            chunks=None if runs == 1 else runs)
+
+
+_QKV = ('q_proj', 'k_proj', 'v_proj')
+
+
+def _key_runs(config: Mapping[str, object]) -> int:
+    """A grouped qkv's runs: one a key head."""
+    return records.integer(config['num_kv_heads'], 'num_kv_heads')
+
+
+def _key_run_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
+    """One run's query, key and value rows: its key head's group of query heads, then the key and
+    value head."""
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    return (records.integer(config['num_heads'], 'num_heads') // _key_runs(config) * head_dim, head_dim,
+            records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
+
+
+def grouped_qkv(name: str) -> tuple[Packed, Packed]:
+    """The weight and bias of a fused q, k and v projection under `name`
+    (`.attention.query_key_value`), stored in one run a key head, each run
+    its group's query rows, then its key's and its value's. GPT-NeoX's and
+    BLOOM's per-head interleave is the run of a model whose every head keys
+    itself, Falcon-7B's and GPTBigCode's multi-query [q | k | v] the one run
+    of one key head, and MiMo-V2.6's fused qkv the run vLLM pre-shards it in
+    (`_shard_fp8_qkv_proj`)."""
+    weight, bias = (Packed(f'{name}.{leaf}', tuple(f'.self_attn.{part}.{leaf}' for part in _QKV), 0,
+                           widths=_key_run_widths, chunks=_key_runs) for leaf in ('weight', 'bias'))
+    return weight, bias
 
 
 # Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch
@@ -1444,7 +1547,8 @@ class DecoderFamily:
     export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
     """Whole-variable encoder, given its family; the families with one add
-    their checks or storage to the shared writer (`decoder_tensors`)."""
+    their checks, storage or names to the shared writer (`decoder_tensors`,
+    `leaf_layouts`)."""
     sandwich_norms: bool = False
     prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """Storage the path map cannot read as stored that no `packed` entry
@@ -1478,14 +1582,29 @@ class DecoderFamily:
     def prepare_weights(self, tensors: Mapping[str, np.ndarray],
                         config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The checkpoint's tensors as the path map reads them: `prepare`'s, with
-        every `packed` tensor split into its parts."""
+        every `packed` tensor split into its parts.
+
+        A fused tensor and a part stored under its own name, such as Qwen's
+        `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
+        part, and one leaf reads it, so the two must be the same tensor, of
+        one dtype and equal values; any other pair is refused, whichever the
+        checkpoint lists first. A quantized copy reaches this decoded at the
+        load's storage dtype (`Pretrained.load`), so a dense copy beside it
+        must hold the decoded values in that dtype."""
         prepared = self.prepare(tensors, config)
         if not self.packed:
             return prepared
         split: dict[str, np.ndarray] = {}
         for name, tensor in prepared.items():
             packing = self.packing(name)
-            split.update({name: tensor} if packing is None else packing.split(name, tensor, config))
+            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+            for part, value in parts.items():
+                held = split.setdefault(part, value)
+                if held is not value:
+                    held, value = np.asarray(held), np.asarray(value)
+                    if held.dtype != value.dtype or not np.array_equal(held, value):
+                        raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
+                                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
         return split
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
@@ -1497,6 +1616,20 @@ class DecoderFamily:
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
         return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+
+    def source_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        """The leaf the source tensor `name` fills: its own (`weight_path`), or
+        for a tied head, which has no leaf of its own, the embedding it copies.
+        A checked copy of the embedding beside it is dropped before it is
+        placed; a head stored alone, as SFconvertbot's conversion of OPT-125m
+        keeps it, fills the embedding."""
+        head_name, embedding_name = self.tied_head_names
+        if name != head_name or not config['tie_embeddings']:
+            return self.weight_path(name, config)
+        embedding = self.weight_path(embedding_name, config)
+        if embedding is None:
+            raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
+        return embedding
 
 
 def kind_mixers(fields: CausalTransformer) -> list[MixerBase]:

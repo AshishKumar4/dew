@@ -113,6 +113,19 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
 
 
 @pytest.mark.distributed
+
+def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
+    """Each process places its share of the rows, so a batch as placed is
+    bigger than as read; the read mask is found by the placed signature, and
+    the step runs on the batch with its unread field left on the host."""
+    for report in run_pool("reads", tmp_path / "out", 2):
+        # The batch as read has a share of the rows, so its own signature names no mask.
+        assert report["read_differs_from_placed"]
+        assert report["unused_on_host"] and report["x_placed"]
+        # A stand-in of the placed rows, which the executable checks and drops.
+        assert report["unused_shape"] == [DEVICES]
+        assert report["sum"] == 3 * DEVICES
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus, timeout=60)
@@ -479,7 +492,7 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
 
 @pytest.fixture(scope="module")
 def elastic_checkpoint(tmp_path_factory):
-    """A three-step fit on two processes over `train_stream`, saved."""
+    """A three-step fit on two processes over a compiled global order, saved."""
     directory = tmp_path_factory.mktemp("elastic-checkpoint")
     reports = run_pool("fit", directory / "out", 2, name="elastic", elastic=True,
                        run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
@@ -540,7 +553,17 @@ def packed_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    assert "PackedWindows" in saved["order"], "the order has to name the packing"
+    # The token store states its documents' lengths, so the run reads it through a plan over the
+    # whole store (`PackedSource`), and no Pack stage is left to run per share.
+    from dew.config.data import TextData
+    from dew.data.analysis import _promoted
+    from dew.data.packing import PackedSource
+    from dew.data.pipeline import Pack
+
+    train, _, _ = TextData(source=str(corpus), pack="first-fit", seq_len=PACKED_SEQ_LEN).pipelines()
+    read = _promoted(train)
+    assert isinstance(read.source, PackedSource) and isinstance(read.source.plan.pack, Pack)
+    assert not any(isinstance(stage, Pack) for stage in read.stages)
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 
@@ -1052,6 +1075,24 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
 
 
 @pytest.mark.distributed
+def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
+    """The frozen FP8 sites decide which kernels a rank's train state holds
+    packed, so process 0 decides them for the pool: on CPUs it refuses for
+    want of FP8 tensor cores and its peer hears of it at the agreement,
+    deciding nothing itself. A tree that lacks a site on process 1 alone is
+    refused there and heard of on process 0, and both pass the next
+    agreement."""
+    reports = run_pool("fp8_sites", tmp_path / "pool", 2, timeout=180)
+    unsupported = [report["unsupported"] for report in reports]
+    assert unsupported[0].startswith("ValueError") and "no FP8 tensor cores" in unsupported[0]
+    assert unsupported[1].startswith("PeerFailure")
+    missing = [report["missing"] for report in reports]
+    assert missing[0].startswith("PeerFailure")
+    assert missing[1].startswith("ValueError") and "frozen FP8 site narrow" in missing[1]
+    assert [report["after"] for report in reports] == [True, True]
+
+
+@pytest.mark.distributed
 def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     """Identical user code on one device and on a two-process pool: the run's
     weights land on the mesh under the trainer's layout, each rank hands in
@@ -1285,8 +1326,9 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
     its batches on its own prefetch thread and lists the checkpoints itself.
-    Where one process's corpus holds other records under the same name and
-    length, or another count of them, where its first read fails, where its
+    Where one process's corpus holds other records of the same length, under
+    its own description or one name both copies share, or another count of
+    them, where its first read fails, where its
     stream (one Dew does not know endless) runs out a step before its peers',
     where its batch lacks a field, or where its listing has not yet seen the
     newest checkpoint a resume reads, every process refuses with the cause,
@@ -1297,7 +1339,9 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     for rank, report in enumerate(reports):
         assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
         assert "training data differs between the processes" in report["content"], report
-        assert "64 records" in report["count"] and "96 records" in report["count"], report
+        assert "training data differs between the processes" in report["named"], report
+        # A pool compares what its processes hold, not where each mounted it: no description is named.
+        assert "training data differs between the processes" in report["count"], report
         assert "holds no rows" in report["first_read"], report
         assert "StopIteration" in report["eof"], report
         assert "training batch layout differs" in report["layout"], report

@@ -83,3 +83,73 @@ def test_the_published_run_reads_back_as_it_was_written(live):
     stated = held["fields"]["objective"]["fields"]
     built = RunConfig.read(held).objective.arguments
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
+
+
+LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
+
+
+def published_layout() -> tuple[dict, dict]:
+    """The published run's checkpoint record and its variables as abstract
+    arrays, nested as the checkpoint stores them (`layout.json`)."""
+    import jax
+    from flax.traverse_util import unflatten_dict
+
+    fixture = json.loads(LAYOUT.read_text())
+    variables = unflatten_dict({path: jax.ShapeDtypeStruct(tuple(shape), dtype)
+                                for path, (shape, dtype) in fixture["variables"].items()}, sep="/")
+    return fixture["artifact"], variables
+
+
+def test_the_published_runs_weights_are_the_ones_its_models_read():
+    """dewml/hybrid-dit-176m's checkpoint layout (layout.json: each array's
+    path, shape and dtype, and the model record beside them) is what the
+    run's denoiser and autoencoder read: both trace over arrays of that
+    layout. A parameter renamed, moved or reshaped in either fails here, and
+    the fix is to republish the run in the same change, since the site, the
+    quick start and the live sampler all load it."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.inference.tasks import saved_model
+    from dew.nn.autoencoders import AutoEncoder
+    from dew.nn.dit import TextContext
+
+    artifact, variables = published_layout()
+    model = saved_model(artifact, None).build()
+    autoencoder = AutoEncoder.from_json(artifact["autoencoder"], params=variables["autoencoder"])
+    sample = tuple(artifact["inputs"]["sample"]["shape"])
+    latents = jax.ShapeDtypeStruct((1, *autoencoder.latent_shape(sample)), jnp.float32)
+    # CLIP ViT-L/14's 77 tokens of 768 features, the published run's text condition.
+    text = TextContext(jax.ShapeDtypeStruct((1, 77, 768), jnp.float32),
+                       jax.ShapeDtypeStruct((1, 77), jnp.float32))
+    denoiser = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
+    predicted = jax.eval_shape(lambda held, x, t, text: model.apply(held, x, t, textcontext=text),
+                               denoiser, latents, jax.ShapeDtypeStruct((1,), jnp.float32), text)
+    assert predicted.shape == latents.shape
+    assert jax.eval_shape(autoencoder.decode, variables["autoencoder"], latents).shape == (1, *sample)
+
+
+@pytest.mark.network
+def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
+    """The revision the live image pins holds exactly the committed layout,
+    and loads and samples an image, its text tower included, on the lane's
+    backend: the CPU unless the run sets JAX_PLATFORMS, as the live sampler
+    runs it."""
+    import jax
+    import numpy as np
+    from flax.core import unfreeze
+
+    from dew.sampling import TextToImage
+
+    repo, revision = LIVE_PIN.read_text().strip().split("@")
+    pipe = TextToImage.from_pretrained(repo, revision=revision)
+    artifact, expected = published_layout()
+    held = unfreeze(pipe.variables)
+    assert jax.tree.structure(held) == jax.tree.structure(expected)
+    def same(held, wanted) -> bool:
+        return (held.shape, held.dtype) == (wanted.shape, wanted.dtype)
+
+    assert jax.tree.all(jax.tree.map(same, held, expected))
+    images = pipe(["a watercolor painting of a mountain lake at sunrise"], steps=1, key=0).host().images
+    assert images.shape == (1, *artifact["inputs"]["sample"]["shape"])
+    assert np.all(np.isfinite(np.asarray(images, np.float32)))

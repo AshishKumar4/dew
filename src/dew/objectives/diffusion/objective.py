@@ -77,6 +77,7 @@ from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
+    from dew.data.pipeline import ObjectiveData
     from dew.inference.tasks import Processor
 
 # Samples a validation batch draws, conditioned or not.
@@ -239,6 +240,19 @@ class DiffusionObjective(Objective[Ratio]):
     resolved = ("solver", "guidance", "steps")
 
     counts_tokens = False
+
+    def data(self, tokenizer=None) -> ObjectiveData:
+        """Each batch's captions tokenized for the conditions, on the host, as
+        the step reads them, and the fields other conditions read (a clip's
+        sound) encoded; without text conditions, captions are dropped."""
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.image import EncodeCaptions, EncodeFields
+
+        conditions = self.inputs.conditions.values()
+        steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),
+                 *((EncodeFields(self.inputs.encode_fields),)
+                   if any(not condition.encoder.reads_captions for condition in conditions) else ()))
+        return ObjectiveData(train_batch=steps, evaluate_batch=steps)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
@@ -429,9 +443,6 @@ class DiffusionObjective(Objective[Ratio]):
         self.autoencoder = autoencoder
         self.variables = variables
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
-        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
-            None if variables is None else variables.get(REPRESENTATION))
-        self.end_to_end = end_to_end
         if end_to_end is not None:
             if alignment is None or autoencoder is None or inputs.mask is not None:
                 raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
@@ -440,6 +451,11 @@ class DiffusionObjective(Objective[Ratio]):
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
+        check_solver(self.process, solver, steps)
+        # Refusals come first: resolving the alignment's encoder may download its weights.
+        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
+            None if variables is None else variables.get(REPRESENTATION))
+        self.end_to_end = end_to_end
         self.unconditional_prob = unconditional_prob
         self.solver = solver
         self.guidance = guidance
@@ -448,11 +464,10 @@ class DiffusionObjective(Objective[Ratio]):
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, solver, steps)
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The process, input encoders, autoencoder and sampling convention."""
@@ -661,23 +676,12 @@ class DiffusionObjective(Objective[Ratio]):
         return self.process.denoiser(self.model, self.model_variables(params), given,
                                      None if self.guidance is None else unconditional)
 
-    def _conditions(self, params, batch, key, *, dropout):
+    def _conditions(self, params, batch, key):
         """The batch's conditions and the blank ones, the blank aligned to and
-        broadcast over the batch's rows. `dropout` blanks a drawn share of
-        the batch's own rows, classifier-free guidance's training dropout."""
+        broadcast over the batch's rows."""
         given = self.encoded_conditions(params, batch)
-        unconditional = self.blank_conditions(params, given)
-        if dropout:
-            count = batch[self.inputs.sample.key].shape[0]
-            # A float32 draw, as the step's others are, at any precision.
-            dropped = jax.random.bernoulli(key, jnp.float32(self.unconditional_prob), (count,))
-            given = jax.tree.map(
-                lambda value, blank: jnp.where(
-                    expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-                given, aligned_conditions(given, unconditional))
-        else:
-            unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                                         given, aligned_conditions(given, unconditional))
+        unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
+                                     given, aligned_conditions(given, self.blank_conditions(params, given)))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
             spatial = latent_image_conditions(
@@ -690,6 +694,14 @@ class DiffusionObjective(Objective[Ratio]):
             return {**given, **spatial}, {**unconditional, **spatial}
         return given, unconditional
 
+    def _dropped(self, given, blank, batch, key):
+        """`given` with a drawn share of the batch's rows `blank`, classifier-free guidance's training
+        dropout."""
+        count = batch[self.inputs.sample.key].shape[0]
+        # A float32 draw, as the step's others are, at any precision.
+        dropped = jax.random.bernoulli(key, jnp.float32(self.unconditional_prob), (count,))
+        return jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value), given, blank)
+
     def _sampling_batch(self, batch):
         fields = [condition.field for condition in self.inputs.conditions.values()]
         if self.inputs.mask is not None:
@@ -699,7 +711,8 @@ class DiffusionObjective(Objective[Ratio]):
     def loss(self, variables, batch, step: Step):
         images = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
-        conditions, _ = self._conditions(variables, batch, drop_key, dropout=True)
+        given, blank = self._conditions(variables, batch, drop_key)
+        conditions = self._dropped(given, blank, batch, drop_key)
         schedule = self.process.schedule
         count = images.shape[0]
         t = schedule.sample_t(time_key, count)
@@ -715,8 +728,11 @@ class DiffusionObjective(Objective[Ratio]):
         t = t.astype(jnp.promote_types(samples.dtype, t.dtype))
 
         call = {**conditions, "train": step.training, "rngs": model_rngs(dropout_key, training=step.training)}
+        # The representation's features of the clean images, which both alignments read.
+        targets = (None if self.alignment is None
+                   else self.alignment.targets(variables[REPRESENTATION], images))
         losses, aligned = self._denoised(variables, self.model_variables(variables), samples, t, noise, call,
-                                         images, batch)
+                                         targets, batch)
         weighted = losses * expand(self.process.weight(t), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
@@ -739,9 +755,8 @@ class DiffusionObjective(Objective[Ratio]):
         # times and noise.
         latents = self.end_to_end.normalized(end_to_end.raw, variables[LATENT_STATS])
         frozen = jax.lax.stop_gradient(variables)
-        given, _ = self._conditions(variables, batch, drop_key, dropout=False)
         _, through = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
-                                    {**given, "train": False}, images, batch)
+                                    {**given, "train": False}, targets, batch)
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
@@ -749,9 +764,10 @@ class DiffusionObjective(Objective[Ratio]):
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
         return Ratio(total, mass), Aux(metrics=metrics, variables=updates)
 
-    def _denoised(self, params, variables, samples, t, noise, call, images, batch: Batch):
+    def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch):
         """The per-element denoising loss at `(t, noise)` and, under
-        `alignment`, the REPA loss of the model's hidden tokens."""
+        `alignment`, the REPA loss of the model's hidden tokens against the
+        representation's `targets`."""
         schedule = self.process.schedule
         rates = broadcast_rates(schedule, t, samples)
         noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
@@ -763,7 +779,7 @@ class DiffusionObjective(Objective[Ratio]):
             preds, captured = self.model.apply(*inputs, **call, mutable=["intermediates"],
                                                capture_intermediates=self.alignment.captures)
             aligned = self.alignment.loss({"params": params["params"][ALIGNMENT]}, self._captured(captured),
-                                          self.alignment.targets(params[REPRESENTATION], images), batch)
+                                          targets, batch)
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         return optax.l2_loss(preds, target), aligned
 
@@ -798,7 +814,7 @@ class DiffusionObjective(Objective[Ratio]):
         return self.end_to_end.tuned(self.autoencoder, variables)
 
     def _sample_impl(self, params, batch, key, *, count: int):
-        given, unconditional = self._conditions(params, batch, key, dropout=False)
+        given, unconditional = self._conditions(params, batch, key)
         denoise = self.denoiser(params, given, unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))

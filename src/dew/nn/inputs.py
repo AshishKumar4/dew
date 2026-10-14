@@ -16,7 +16,7 @@ from flax import struct
 from jax.core import Tracer
 
 from dew.coordination import agreed
-from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -43,8 +43,6 @@ type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
-BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
-"""The mesh axes a request's rows split over: every axis but sequence and stage."""
 
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
@@ -181,9 +179,11 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
+        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
         return replace(self,
             tokens=self.tokens[:, selection],
-            token_fields={name: value[:, selection] for name, value in self.token_fields.items()})
+            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
+                          for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
@@ -242,36 +242,60 @@ class ModelInputs:
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
-    `positions` `[B, S]` is each real token's place in its document, counted
-    over real tokens. `segments` numbers each row's packed documents from 1,
-    0 on the padding slots after them, which run as a document of their own,
-    so no layer carries a real document's state or history into them or
-    back; `valid` is the caller's mask of real tokens; `starts` marks each
-    document's first real token but a
-    row's first, which continues whatever state the row holds. Each is None
-    where it holds nothing (one document a row, every token real, no start),
-    which a layer's fast path reads as a static fact. `slots` is where a cache
-    writes each real token, -1 for padding, which the model fills from its
-    cache's cursor; None for an uncached call. `max_segments` bounds the
+    `positions` `[B, S]` is each real token's logical place in its document,
+    counted over real tokens: a packed batch's or the caller's own, None
+    where none is given, each token's place then its rank among its row's
+    real tokens (`places`) or, in a cached call, the slot its cache writes it
+    at. Rotation, NoPE's temperature, chunked attention and ALiBi read the
+    logical places; a cache addresses keys by slot. `segments` numbers each
+    row's packed documents from 1, 0 on the padding slots after them, which
+    run as a document of their own, so no layer carries a real document's
+    state or history into them or back; `valid` is the caller's mask of real
+    tokens; `starts` marks each document's first real token but a row's
+    first, which continues whatever state the row holds. Each is None where
+    it holds nothing (one document a row, every token real, no start), which
+    a layer's fast path reads as a static fact. `max_segments` bounds the
     documents a row holds (the packer's static plan, else the row length) and
     `right_padded` says every row's real tokens come first.
     """
 
-    positions: jax.Array
+    positions: jax.Array | None = None
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
-    slots: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
+    def places(self) -> jax.Array | None:
+        """Each token's logical place in an uncached call: the given `positions`, else its rank among
+        its row's real tokens `[B, S]` (a padding slot's the rank before it, 0 before any); None
+        where every token is real and none is given, each token's place its index. A cached call's
+        places are the slots its cache writes them at where none are given."""
+        if self.positions is not None or self.valid is None:
+            return self.positions
+        return jnp.maximum(jnp.cumsum(self.valid, axis=1, dtype=jnp.int32) - 1, 0)
+
+
+def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
+    """The cumulative offsets of the varlen sequences over the `[B * S]`
+    tokens of `begins` `[B, S]`, which marks each sequence's first token: a
+    kernel's `cu_seqlens` `[sequences + 1]`, the sequences past the marked
+    ones empty at the end. Every row's first token begins one."""
+    rows, length = begins.shape
+    first = begins.at[:, 0].set(True).reshape(-1)
+    starts = jnp.nonzero(first, size=sequences, fill_value=rows * length)[0]
+    return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
+
 
 def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
-                max_segments: int | None = None, right_padded: bool = False) -> Coordinates:
+                max_segments: int | None = None, right_padded: bool = False, xp=jnp) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
     (one document a row where None), a `valid` mask (every token real where None), explicit
-    `positions` (each document's real tokens counted from 0 where None) and the packer's
-    `max_segments` (the row length where None). `shape` is the first given field's where None."""
+    `positions` (with `segments`, each document's real tokens counted from 0 where None; without,
+    None, each token's place its row index or cache slot) and the packer's `max_segments` (the row
+    length where None). `shape` is the first given field's where None. `xp` is the array module the
+    fields are built with: jax.numpy in a traced call, numpy where a data reader builds a batch's on
+    the host."""
     if shape is None:
         given = [x for x in (segments, valid, positions) if x is not None]
         if not given:
@@ -279,20 +303,22 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         batch, length = jnp.shape(given[0])[:2]
         shape = (batch, length)
     length = shape[1]
-    segments = None if segments is None else jnp.asarray(segments, jnp.int32)
-    valid = None if valid is None else jnp.asarray(valid, bool)
+    segments = None if segments is None else xp.asarray(segments, np.int32)
+    valid = None if valid is None else xp.asarray(valid, bool)
     for name, field in (("segments", segments), ("valid", valid)):
         if field is not None and field.shape != shape:
             raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
     starts = None if segments is None else document_starts(
-        segments, jnp.ones(shape, bool) if valid is None else valid)
-    if positions is None:
-        real = jnp.ones(shape, bool) if valid is None else valid
-        real = real if segments is None else real & (segments != 0)
-        rank = jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1
-        first = 0 if starts is None else jax.lax.cummax(jnp.where(starts, rank, 0), axis=1)
-        positions = jnp.where(real, rank - first, 0)
-    return Coordinates(jnp.asarray(positions, jnp.int32), segments, valid, starts,
+        segments, xp.ones(shape, bool) if valid is None else valid, xp=xp)
+    if positions is None and segments is not None:
+        real = xp.ones(shape, bool) if valid is None else valid
+        real = real & (segments != 0)
+        rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
+        begun = xp.where(starts, rank, 0)
+        first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
+        positions = xp.where(real, rank - first, 0)
+    positions = None if positions is None else xp.asarray(positions, np.int32)
+    return Coordinates(positions, segments, valid, starts,
                        max_segments=(1 if segments is None else length) if max_segments is None
                        else max_segments,
                        right_padded=right_padded)
@@ -305,15 +331,15 @@ def coordinates_of(metadata: AttentionMetadata | None, batch: int, length: int) 
     return coordinates((batch, length))
 
 
-def document_starts(segments, valid):
+def document_starts(segments, valid, *, xp=jnp):
     """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
     row's first real token continuing what precedes the row and a padding slot starting nothing."""
-    order, _ = valid_order(valid)
-    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
-    compact = jnp.take_along_axis(segments, order, axis=1)
-    changed = jnp.concatenate([jnp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
-                              axis=1)
-    return valid & jnp.take_along_axis(changed, jnp.maximum(rank, 0), axis=1)
+    order, _ = valid_order(valid, xp=xp)
+    rank = xp.cumsum(valid, axis=1, dtype=np.int32) - 1
+    compact = xp.take_along_axis(segments, order, axis=1)
+    changed = xp.concatenate([xp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
+                             axis=1)
+    return valid & xp.take_along_axis(changed, xp.maximum(rank, 0), axis=1)
 
 
 @struct.dataclass
@@ -429,14 +455,14 @@ VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
 
-def valid_order(valid: jax.Array) -> tuple[jax.Array, jax.Array]:
+def valid_order(valid: jax.Array, *, xp=jnp) -> tuple[jax.Array, jax.Array]:
     """Each row's real slots first, in order, then its padding slots: the
     physical slot behind each compact column `[rows, slots]`, and how many
     slots of each row are real `[rows]`. A stable sort of the validity, so a
     row's tokens keep their order; a caller says what its columns past the
-    count hold (decoding's -1 history tokens, a convolution's zero column)."""
-    valid = jnp.asarray(valid, bool)
-    return jnp.argsort(~valid, axis=-1, stable=True), jnp.sum(valid, axis=-1, dtype=jnp.int32)
+    count hold (decoding's -1 history tokens, a convolution's zero column). `xp` is the array module."""
+    valid = xp.asarray(valid, bool)
+    return xp.argsort(~valid, axis=-1, stable=True), xp.sum(valid, axis=-1, dtype=np.int32)
 
 
 def _last_real(value: jax.Array, valid: jax.Array) -> jax.Array:
@@ -664,12 +690,21 @@ def mesh_of(tree) -> jax.sharding.Mesh | None:
     return None
 
 
+def request_axes(mesh: jax.sharding.Mesh) -> tuple[str, ...]:
+    """The mesh axes a request's rows split over: every axis but sequence and
+    stage, so each process places rows of its own requests on its own
+    devices. A training batch's rows split over the data axes alone
+    (`dew.nn.sharding.batch_axes`): every process of a share reads the same
+    rows there, where each process here brings its own."""
+    return tuple(axis for axis in mesh.axis_names if axis not in (SEQUENCE_AXIS, STAGE_AXIS))
+
+
 @dataclass(frozen=True)
 class RowPlan:
     """Where one request's rows sit while a task runs.
 
     Without a mesh every array stays on the default device. On a mesh, rows
-    split over its batch axes. Each process contributes ``count`` rows, its
+    split over its request axes (`request_axes`). Each process contributes ``count`` rows, its
     ``rows`` real ones followed by repeats that pad them to a multiple of its
     devices on those axes, so every device holds the same shape and every
     collective lines up. Results keep that sharding, and ``host`` reads a
@@ -687,7 +722,7 @@ class RowPlan:
         if mesh is None:
             return cls(None, rows, rows, 0, 1)
         processes, process = jax.process_count(), jax.process_index()
-        batch_devices = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+        batch_devices = math.prod(mesh.shape[axis] for axis in request_axes(mesh))
         if batch_devices % processes:
             raise ValueError("the batch axes of the mesh do not split evenly over the processes")
         local_devices = batch_devices // processes
@@ -697,7 +732,7 @@ class RowPlan:
     def sharding(self) -> jax.sharding.NamedSharding | None:
         if self.mesh is None:
             return None
-        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(BATCH_AXES))
+        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(request_axes(self.mesh)))
 
     @property
     def global_rows(self) -> int:

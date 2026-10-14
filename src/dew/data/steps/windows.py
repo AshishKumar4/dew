@@ -1,0 +1,186 @@
+"""Overlapping causal windows, with the boundary target retained.
+
+Grain's concat-and-split packer has disjoint windows. Causal LM windows
+share their boundary token so every target is predicted exactly once.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Mapping, Sequence
+from typing import Protocol
+
+import grain.python as grain
+import numpy as np
+
+from dew.data.dataset import Batch
+from dew.data.pipeline import Windows
+from dew.data.sources.base import Read, Shard, ShardManifest
+from dew.data.sources.tokens import TokenFiles
+from dew.records import integers, record
+
+
+def _aligned(row: Batch, fields: tuple[str, ...]) -> Batch:
+    """The fields of one document, refusing alignment drift before joining documents."""
+    tokens = {name: np.asarray(row[name]) for name in fields}
+    if len({len(value) for value in tokens.values()}) != 1:
+        raise ValueError("causal window fields have different record lengths")
+    return tokens
+
+
+class TokenSpan(Protocol):
+    def __len__(self) -> int: ...
+    def __getitem__(self, span: slice) -> np.ndarray: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class IndexedWindows:
+    """Complete causal windows of aligned fields backed by contiguous token spans."""
+
+    tokens: Mapping[str, TokenSpan | np.ndarray]
+    length: int
+    stride: int
+    dtype: str | None = None
+
+    @classmethod
+    def from_records(cls, rows: Sequence[Batch], windows: Windows) -> IndexedWindows:
+        aligned = [_aligned(row, windows.fields) for row in rows]
+        tokens = {
+            name: np.concatenate([row[name] for row in aligned]) if aligned else np.zeros(0, np.int32)
+            for name in windows.fields
+        }
+        return cls(tokens, windows.seq_len, windows.stride or windows.seq_len)
+
+    @property
+    def size(self) -> int:
+        return len(next(iter(self.tokens.values())))
+
+    def __len__(self) -> int:
+        return max(0, (self.size - self.length - 1) // self.stride + 1)
+
+    def __getitem__(self, index: int) -> Batch:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        start = index * self.stride
+        return {name: np.asarray(tokens[start : start + self.length + 1], dtype=self.dtype)
+                for name, tokens in self.tokens.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class WindowSource:
+    original: TokenFiles
+    tokens: TokenSpan
+    length: int
+    stride: int
+
+    def describe(self) -> str:
+        return f"{self.original.describe()} causal windows={self.length},stride={self.stride}"
+
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.original.fingerprint(), "window": self.length, "stride": self.stride}
+
+    def supports(self, read: Read) -> bool:
+        return self.original.supports(read)
+
+    def can_provision(self, read: Read) -> bool:
+        return self.original.can_provision(read)
+
+    def provision(self) -> WindowSource:
+        """Provision the token store, whose length index these windows need
+        to read it by span."""
+        self.original.provision()
+        return self
+
+    def records(self, read: Read) -> IndexedWindows:
+        if read == "memory":
+            self.original.records(read)
+        return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
+
+    def metadata(self) -> Mapping[str, object]:
+        count = len(self.records("indexed"))
+        return {**self.original.metadata(), "rows": count, "valid_targets": count * self.length}
+
+    def lengths(self) -> np.ndarray | None:
+        return None
+
+    def manifest(self) -> ShardManifest:
+        count = len(self.records("indexed"))
+        return ShardManifest(
+            tuple(
+                Shard(
+                    f"{self.describe()}:{start}",
+                    self.describe(),
+                    start,
+                    min(start + 1024, count),
+                    min(1024, count - start),
+                )
+                for start in range(0, count, 1024)
+            ),
+            self._reader,
+        )
+
+    def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+
+
+class _WindowIterator(grain.DatasetIterator[Batch]):
+    def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows):
+        super().__init__(parent)
+        self._read, self._windows = parent, windows
+        self._held: Batch = {name: np.zeros(0, np.int32) for name in windows.fields}
+        self._skip = 0
+
+    def __next__(self) -> Batch:
+        while True:
+            windows = IndexedWindows(
+                {name: value[self._skip :] for name, value in self._held.items()},
+                self._windows.seq_len,
+                self._windows.stride or self._windows.seq_len,
+            )
+            if len(windows):
+                break
+            row = _aligned(next(self._read), self._windows.fields)
+            self._held = {
+                name: np.concatenate([self._held[name], row[name]])
+                for name in self._windows.fields
+            }
+        emitted = windows[0]
+        self._held = {name: value[self._skip + windows.stride :] for name, value in self._held.items()}
+        self._skip = max(0, windows.stride - windows.size)
+        return emitted
+
+    def get_state(self) -> Mapping[str, object]:
+        return {
+            "parent": self._read.get_state(),
+            "skip": self._skip,
+            "held": {
+                name: {"dtype": value.dtype.str, "tokens": value.tolist()}
+                for name, value in self._held.items()
+            },
+        }
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._read.set_state(record(state["parent"], "window parent"))
+        held = record(state["held"], "window carry")
+        self._held = {
+            name: np.asarray(
+                integers(record(tokens, name)["tokens"], name), dtype=str(record(tokens, name)["dtype"])
+            )
+            for name, tokens in held.items()
+        }
+        skip = state["skip"]
+        if not isinstance(skip, int) or skip < 0:
+            raise ValueError("saved causal window skip is invalid")
+        self._skip = skip
+
+    def close(self) -> None:
+        self._read.close()
+
+
+class CausalWindows(grain.IterDataset[Batch]):
+    def __init__(self, parent: grain.IterDataset[Batch], windows: Windows):
+        super().__init__(parent)
+        self._records, self._windows = parent, windows
+
+    def __iter__(self) -> grain.DatasetIterator[Batch]:
+        return _WindowIterator(iter(self._records), self._windows)

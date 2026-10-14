@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 
+import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -150,9 +151,9 @@ class KimiDeltaAttention(nn.Module):
         return -rate * jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(jnp.minimum(gate, 20.0))))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, segment_ids, kv_store
+        del kv_store
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid
@@ -160,7 +161,12 @@ class KimiDeltaAttention(nn.Module):
             # The reference zeroes padded rows before projecting them
             # (apply_mask_to_padding_states, modeling_glm5_next.py:361-370).
             x = jnp.where(valid[:, :, None], x, 0)
-        projected = jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1)
+        projections = (self.q_proj(x), self.k_proj(x), self.v_proj(x))
+        if decode:
+            # At one row XLA lowers each projection to a reduction and fuses the three into their
+            # concatenate, which ran 34 of an H100's 151 us a step (`held_conv1d`'s barrier, behind it).
+            projections = jax.lax.optimization_barrier(projections)
+        projected = jnp.concatenate(projections, axis=-1)
         wide = at_least_fp32(projected.dtype)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         g = self._decay(x)
@@ -179,8 +185,7 @@ class KimiDeltaAttention(nn.Module):
             if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          projected=projected.dtype if ported else None, starts=starts,
-                                          max_segments=tokens.max_segments)
+                                          projected=projected.dtype if ported else None, starts=starts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
@@ -207,6 +212,8 @@ class KimiDeltaAttentionMixer(MixerBase):
     `linear_num_heads` heads of `linear_head_dim`, the depthwise conv's
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
+
+    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse')
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

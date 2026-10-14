@@ -16,13 +16,14 @@ from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
-from dew.nn.attention import local_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.llama4 import Llama4Mixer
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
@@ -91,7 +92,9 @@ def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, argument
         x = jax.random.randint(jax.random.key(0), (2, 16), 0, 64)
     else:
         x = jax.random.normal(jax.random.key(0), (2, 16, 32))
-    call = {} if layer == "window" else {"segment_ids": PACKED}
+    call = {} if layer == "window" else {
+        "segment_ids": PACKED} if layer == "packed" else {
+        "attention_metadata": AttentionMetadata(coordinates=coordinates(segments=PACKED))}
     if layer == "kpool":
         call = {"attention_metadata": AttentionMetadata(coordinates=coordinates(valid=PACKED != 0))}
     variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
@@ -386,6 +389,38 @@ def test_a_rounding_survives_the_reduction_it_feeds(helper):
     assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
+@pytest.mark.parametrize("configured, default", [("F32_F32_F32", False), ("BF16_BF16_F32", False),
+                                                  ("TF32_TF32_F32_X3", False), ("tensorfloat32", False),
+                                                  ("highest", False), ("bfloat16", True), ("default", True)])
+def test_a_configured_dot_algorithm_reads_as_the_precision_it_asks(configured, default):
+    """`jax_default_matmul_precision` takes a dot algorithm preset's name as well as a precision's, and
+    a product without a precision of its own asks for the default only where the configured one is
+    the default."""
+    from dew.nn import precision
+    with jax.default_matmul_precision(configured):
+        assert precision.asks_default_precision(None, configured=True) is default
+
+
+def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
+    """Chained `compensated_add`s keep the pair renormalised: after -1 and 63 additions of -2^-25,
+    each a quarter of a float32 step of the running sum and so lost from a plain one, the high half
+    is the exact sum rounded once and the low half what that rounding dropped."""
+    from dew.nn import precision
+    tokens = np.full(64, -2.0 ** -25, np.float32)
+    tokens[0] = -1
+    zero = jnp.zeros((), jnp.float32)
+
+    def running(values):
+        return jax.lax.fori_loop(0, 64, lambda i, total: precision.compensated_add(total, (values[i], zero)),
+                                 (zero, zero))
+
+    high, low = (np.asarray(x) for x in jax.jit(running)(tokens))
+    exact = -1 - 63 * 2.0 ** -25
+    assert np.cumsum(tokens, dtype=np.float32)[-1] == -1
+    assert high == np.float32(exact)
+    assert np.float64(high) + np.float64(low) == exact
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
@@ -408,3 +443,17 @@ def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     if jax.default_backend() == "gpu":
         text = jax.jit(jax.value_and_grad(loss(bf16_logits))).lower(x).compile().as_text()
         assert "reduce-precision" not in text and "bf16[16,512]" in text
+
+
+@pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
+def test_the_gpu_divides_fp32_to_the_nearest_float():
+    """`import dew` has XLA:GPU divide fp32 to the nearest float
+    (`dew.telemetry.devices.divide_exactly`): over 2^20 quotients of operands
+    from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a
+    CPU's and the references' are. XLA's own `div.full` left 28% of them off
+    by up to 2 ulps on an H100."""
+    rng = np.random.default_rng(0)
+    numerator, denominator = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))
+    quotient = np.asarray(jax.jit(jnp.divide)(numerator, denominator))
+    nearest = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(quotient, nearest)

@@ -24,11 +24,12 @@ import optax
 import pytest
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import TFDSImages
+from dew.config.data import ImageData
+from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -40,6 +41,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training.model_flops import model_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -386,12 +388,10 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
-    class Data:
-        train = staticmethod(lambda partition: source())
-        val = staticmethod(lambda partition: (batch for batch in [next(source())]))
-        batch = BATCH
-
-    state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
+    data = Loader(train=lambda partition: source(),
+                   val=lambda partition: (batch for batch in [next(source())]),
+                   batch=BATCH, records=None)
+    state = trainer.fit(data, steps=2, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {"data": (devices or jax.device_count()) // fsdp, "expert": 1,
@@ -410,25 +410,49 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
     return trainer, state, losses
 
 
+def wide(case: Case, batch):
+    """A batch as the float64 runs read it: its samples float64, so their
+    conversion and the diffusion noising do not share the float32 runs' roundings."""
+    return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
+
+
+def widened_state(state):
+    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                        else jnp.copy(leaf), state)
+
+
 def truth(case: Case, tmp_path, initial):
     """The case's two steps on one device in float64, from `initial`
-    widened: the same rows, keys and draws, every float wider. The
-    samples arrive as float64, so their conversion and the diffusion
-    noising do not share the float32 runs' roundings."""
+    widened: the same rows, keys and draws, every float wider."""
     trainer, encoder = make_trainer(case, tmp_path / "truth", 1, RecordingTracker(), 1)
     source = batches(case, encoder)
 
-    def wide(batch):
-        return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
+    data = Loader(train=lambda partition: (wide(case, batch) for batch in source()),
+                  val=lambda partition: (wide(case, batch) for batch in [next(source())]),
+                  batch=BATCH, records=None)
+    return trainer.fit(data, steps=2, state=widened_state(initial))
 
-    class Data:
-        train = staticmethod(lambda partition: map(wide, source()))
-        val = staticmethod(lambda partition: (wide(batch) for batch in [next(source())]))
-        batch = BATCH
 
-    wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                         else jnp.copy(leaf), initial)
-    return trainer.fit(Data(), steps=2, state=wider)
+def update_terms(case: Case, tmp_path, initial):
+    """The terms of each leaf the case's two steps write (`float64_terms`), in float64 from
+    `initial`: the trainer's own step body, its transaction (the loss's gradient at each step's
+    parameters, the momentum update, the EMA), over the rows `truth` trains on. A parameter's
+    terms are its updates' sums and the momentum's the gradients', never the parameter it started
+    from, whose own size floors it."""
+    trainer, encoder = make_trainer(case, tmp_path / "terms", 1, devices=1)
+    source = batches(case, encoder)()
+    rows = [model_batch(wide(case, next(source))) for _ in range(2)]
+    state = widened_state(initial)
+    with trainer._traced_on(trainer.device_mesh):
+        body = trainer._step_body(trainer._loss_shape(state, rows[0]), {}, 1)
+
+        def two_steps(state):
+            for batch in rows:
+                advanced, *_ = body(state, batch, 0)
+                state = replace(advanced, step=state.step + 1)
+            return state
+
+        return float64_terms(two_steps, state)[1]
 
 
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
@@ -468,8 +492,8 @@ def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...]
     return terms
 
 
-def decay_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[str, float]]:
-    """`assert_leaves_as_exact`'s invariants for each gated delta net's decay
+def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
+    """The declared terms (`raised`) of each gated delta net's decay
     parameters over a language model's two SGD steps, by state tree. The
     momentum holds momentum g1 + g2, and a parameter that starts at zero
     moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
@@ -499,17 +523,23 @@ def decay_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[str
             leaf = leaf[part]
         return not np.any(np.asarray(leaf))
 
-    scales = {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
-                            for path in first if starts_at_zero(path)},
-              "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
-    declared = {}
-    for name, by_path in scales.items():
-        for key, _ in jax.tree_util.tree_leaves_with_path(getattr(exact, name)):
+    return {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
+                          for path in first if starts_at_zero(path)},
+            "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
+
+
+def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
+    """`terms` with each leaf whose path ends in a declared parameter's at least
+    its declared terms (`decay_invariants`), leaf by leaf."""
+    def raise_tree(name, tree):
+        def leaf(key, value):
             text = jax.tree_util.keystr(key)
-            for path, scale in by_path.items():
+            for path, scale in scales.get(name, {}).items():
                 if text.endswith("".join(f"['{part}']" for part in path)):
-                    declared.setdefault(name, {})[text] = float(np.sqrt(np.mean(scale ** 2)))
-    return declared
+                    value = np.maximum(value, scale)
+            return value
+        return jax.tree_util.tree_map_with_path(leaf, tree)
+    return replace(terms, **{name: raise_tree(name, getattr(terms, name)) for name in scales})
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)
@@ -554,12 +584,15 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
-    invariants = decay_invariants(case, tmp_path, initial, exact)
+    with jax.enable_x64(new_val=True):
+        terms = jax.device_get(update_terms(case, tmp_path, copied()))
+    # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
+    # rule's cumulative sums of the decay, which the step's own terms do not see.
+    terms = raised(terms, decay_invariants(case, tmp_path, initial))
     for layout in (replicated, state):
         for name in ("variables", "opt_state", "ema"):
             assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                   getattr(exact, name), reductions=reductions,
-                                   invariants=invariants.get(name))
+                                   getattr(exact, name), reductions=reductions, terms=getattr(terms, name))
 
 
 # --------------------------------------------------------------------------
@@ -577,7 +610,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=8), text=None,
+        data=ImageData(source="tfds://oxford_flowers102", image_size=8), text=None,
         objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 

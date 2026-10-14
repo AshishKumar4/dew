@@ -46,8 +46,6 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
-from collections.abc import Mapping
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -143,50 +141,252 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
 
 
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
-                           invariants: Mapping[str, float] | None = None) -> None:
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
     A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of a leaf's size in RMS,
+    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
     so the reference's distance counts as at least that: one draw of
     rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude.
-
-    `invariants` declares leaves by `jax.tree_util.keystr` path, with the RMS
-    of the sum of absolute terms that cancel in each leaf. For a bias these
-    are the loss's cotangents of the biased projection, before their sum
-    over batch and positions: the bias broadcasts over those axes, so its
-    gradient sums those cotangents. Their absolute sum measures the size
-    before cancellation, and a test measures it in float64 from the same
-    computation, never from a constant. Only these leaves get
-    sqrt(reductions) eps32 of that size as a floor, the summation bound
-    |fl(sum x) - sum x| <= gamma_n sum |x|; a declared leaf's float64 RMS
-    must not exceed its terms', as no sum exceeds its absolute terms, or the
-    declaration fails. Every other leaf's floor uses its own float64 RMS, however small
-    a representable gradient is."""
+    fails by orders of magnitude. What a leaf sums is its own float64 size,
+    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
+    the larger of that and their root sum of squares, the size of the
+    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
+    bias's gradient does under the softmax's shift invariance, is held to
+    its terms' rounding, not to its own near-zero size; one whose terms'
+    signs are independent keeps about its own."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
-    invariants = invariants or {}
-    paths = jax.tree_util.tree_leaves_with_path(dew)
-    missing = invariants.keys() - {jax.tree_util.keystr(path) for path, _ in paths}
-    assert not missing, f"declared invariant leaves absent from the tree: {sorted(missing)}"
+    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
     over = []
-    leaves = zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth), strict=True)
-    for (path, mine), theirs, true in leaves:
-        name = jax.tree_util.keystr(path)
-        size = distance(true, 0)
-        scale = invariants.get(name, size)
-        if name in invariants:
-            assert within(size, scale), (
-                f"{name}: declared invariant has float64 RMS {size:.3e}, above its terms' {scale:.3e}")
-        own = spread * unit * scale
-        bar = FACTOR * max(distance(theirs, true), own)
+    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                 sizes, strict=True)
+    for (path, mine), theirs, true, summed in leaves:
+        scale = max(distance(true, 0), distance(summed, 0))
+        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
         if not within(distance(mine, true), bar):
-            over.append(f"{name}: {distance(mine, true):.3e} from float64 (rms), "
+            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
     assert not over, "\n".join(over)
+
+
+SUMS = frozenset({"dot_general", "reduce_sum", "conv_general_dilated", "cumsum", "scatter-add"})
+"""The operations that sum terms: a leaf's terms are those its own sums add,
+taken at their float64 values (`float64_terms`)."""
+
+CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
+                     "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
+                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier"})
+"""The operations that carry the terms of sums into a leaf without making
+new ones: sums combined (tied weights, accumulated microbatches, an update
+added to a parameter) and moved. A product or quotient of a sum by a value
+that is none carries them too, scaled element by element (`_applied`), as
+`s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
+
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
+                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+"""The calls whose bodies are evaluated op by op, as the computation's own:
+a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
+shard_map's per-device program or a Pallas kernel, is one operation, its
+outputs their own size."""
+
+
+def float64_terms(fn, *args):
+    """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
+    each output leaf's terms, alike: the root sum of squares of the terms its
+    final sums add (`SUMS`), at their operands' values, carried into the leaf
+    (`CARRIES`). That is the size of the sum's partial sums, which its
+    rounding scales with in any order: about the leaf's own size where the
+    terms' signs are independent, far above it where they cancel by design
+    (a softmax's shift invariance). A leaf made by any other operation is
+    its own size, and an input carries no terms, so a parameter's terms
+    after an update are the update's. Nothing propagates through the layers
+    behind a sum, which would bound the whole computation."""
+    closed = jax.make_jaxpr(fn)(*args)
+    values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
+    tree = jax.tree.structure(jax.eval_shape(fn, *args))
+    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
+                                                   for energy, value in zip(energies, values, strict=True)])
+
+
+def _evaluated(jaxpr, consts, args, given=None):
+    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
+    (`float64_terms`), from `args` and the energies `given` for them (none for
+    a computation's own inputs). A value no sum made has none."""
+    from jax.extend.core import Literal
+
+    wanted = _carrying(jaxpr)
+    values, energies = {}, {}
+    for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
+                                  [None] * len(consts) + list(given or [None] * len(args)), strict=True):
+        values[var], energies[var] = value, energy
+
+    def read(var):
+        return var.val if isinstance(var, Literal) else values[var]
+
+    def energy(var):
+        return None if isinstance(var, Literal) else energies.get(var)
+
+    # Each value and energy goes once its last reader has run, as an execution
+    # frees it: a chunked scan's float64 intermediates would otherwise all stay.
+    last = {var: index for index, equation in enumerate(jaxpr.eqns)
+            for var in equation.invars if not isinstance(var, Literal)}
+    for var in jaxpr.outvars:
+        if not isinstance(var, Literal):
+            last.pop(var, None)
+    for index, equation in enumerate(jaxpr.eqns):
+        inputs = [read(var) for var in equation.invars]
+        with equation.ctx.manager:
+            outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
+                                     any(var in wanted for var in equation.outvars))
+        for var in equation.invars:
+            if not isinstance(var, Literal) and last.get(var) == index:
+                values.pop(var, None)
+                energies.pop(var, None)
+        for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
+            values[var], energies[var] = value, made_energy
+    return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
+
+
+def _carrying(jaxpr) -> set:
+    """The variables whose terms reach an output of `jaxpr`."""
+    from jax.extend.core import Var
+
+    wanted = {var for var in jaxpr.outvars if isinstance(var, Var)}
+    for equation in reversed(jaxpr.eqns):
+        if any(var in wanted for var in equation.outvars):
+            wanted.update(equation.invars[index] for index in _carried(equation)
+                          if isinstance(equation.invars[index], Var))
+    return wanted
+
+
+def _real(var) -> bool:
+    return jnp.issubdtype(var.aval.dtype, jnp.floating)
+
+
+def _carried(equation) -> list[int]:
+    """The operands whose terms `equation` carries to its outputs: real floats
+    alone, as a complex value's terms have no order to sum in."""
+    name, operands = equation.primitive.name, equation.invars
+    if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
+        return []
+    floats = [index for index, var in enumerate(operands) if _real(var)]
+    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
+        return floats
+    if name == "reduce_sum":
+        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
+        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
+    if name in ("mul", "div"):
+        return floats
+    return []
+
+
+def _body(equation):
+    """The jaxpr and constants a call runs (`CALLS`), or None."""
+    if equation.primitive.name not in CALLS:
+        return None
+    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
+        body = equation.params.get(name)
+        if body is not None:
+            return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
+    return None
+
+
+def _squared(value):
+    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+
+
+def _applied(equation, inputs, given, wanted: bool):
+    """`equation`'s outputs from `inputs`, and their energies where `wanted`."""
+    name, params = equation.primitive.name, equation.params
+    body = _body(equation)
+    if wanted and body is not None:
+        return _evaluated(*body, inputs, given)
+    if wanted and name == "scan":
+        return _scanned(params, inputs, given)
+    if wanted and name == "while":
+        return _looped(params, inputs, given)
+    if wanted and name == "cond":
+        branch = params["branches"][int(inputs[0])]
+        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
+    outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
+    outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
+    if not wanted:
+        return outputs, [None] * len(outputs)
+    carried = _carried(equation)
+    if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
+        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
+                   else value for var, value in zip(equation.invars, inputs, strict=True)]
+        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
+    if not carried:
+        return outputs, [None] * len(outputs)
+    if name in ("mul", "div"):
+        summed = [index for index in carried if given[index] is not None]
+        if len(summed) != 1 or (name == "div" and summed != [0]):
+            return outputs, [None] * len(outputs)
+        (index,) = summed
+        scale = jnp.square(jnp.abs(inputs[1 - index]))
+        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
+    if all(given[index] is None for index in carried):
+        return outputs, [None] * len(outputs)
+    operands = [_or_zero(given[index], value) if index in carried else value
+                for index, value in enumerate(inputs)]
+    primitive = jax.lax.add_p if name == "sub" else equation.primitive
+    made = (primitive.bind(*operands) if name == "sub" else
+            operands[0] if name == "neg" else
+            primitive.bind(*operands, **primitive.get_bind_params(params)))
+    made = list(made) if primitive.multiple_results else [made]
+    return outputs, [energy if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+                     for energy, value in zip(made, outputs, strict=True)]
+
+
+def _scanned(params, inputs, given):
+    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
+    body = params["jaxpr"]
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
+    consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
+                         inputs[constants + carries:])
+    held, carry_terms, xs_terms = (given[:constants], given[constants:constants + carries],
+                                   given[constants + carries:])
+    ys, ys_terms = [], []
+    steps = range(params["length"])
+    for step in reversed(steps) if params["reverse"] else steps:
+        outputs, made = _evaluated(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)],
+                                   [*held, *carry_terms, *(None if t is None else t[step] for t in xs_terms)])
+        carry, carry_terms = outputs[:carries], made[:carries]
+        ys.append(outputs[carries:])
+        ys_terms.append(made[carries:])
+    if params["reverse"]:
+        ys.reverse()
+        ys_terms.reverse()
+    stacked = [jnp.stack(column) for column in zip(*ys, strict=True)] if ys else []
+    stacked_terms = [None if any(t is None for t in column) else jnp.stack(column)
+                     for column in zip(*ys_terms, strict=True)] if ys_terms else []
+    return [*carry, *stacked], [*carry_terms, *stacked_terms]
+
+
+def _looped(params, inputs, given):
+    """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time."""
+    condition, body = params["cond_jaxpr"], params["body_jaxpr"]
+    tested, run = params["cond_nconsts"], params["body_nconsts"]
+    condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
+    body_terms, carry_terms = given[tested:tested + run], given[tested + run:]
+    while bool(_evaluated(condition.jaxpr, condition.consts, [*condition_consts, *carry])[0][0]):
+        carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
+                                        [*body_terms, *carry_terms])
+    return carry, carry_terms
+
+
+def _or_zero(energy, value):
+    return jnp.zeros_like(value) if energy is None else energy
+
+
+def _or_size(energy, value):
+    """An output's energy: the one its sums carried, else its own size's square."""
+    if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
+        return np.zeros(np.shape(value))
+    return _squared(value) if energy is None else energy
 
 
 FALSE_FAILURE = 1e-6

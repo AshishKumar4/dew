@@ -714,7 +714,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     rows = np.random.default_rng(0).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
     batch = {"text": rows}
 
-    def run(spec):
+    def run(spec, microbatches=None):
         objective = LMObjective(qmodel, SEQ_LEN)
         mesh = spec.build()
         placed = jax.device_put(
@@ -727,13 +727,13 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
             return objective.scalar_loss({**variables, "params": params},
                                   placed_batch, info)
 
-        with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
             (value, _), grads = jax.jit(
                 jax.value_and_grad(loss, has_aux=True))(placed["params"])
         return float(value), jax.tree.map(np.asarray, grads)
 
     loss, _grads = run(MeshSpec(fsdp=8))
-    piped, piped_grads = run(MeshSpec(fsdp=4, stage=2, microbatches=2))
+    piped, piped_grads = run(MeshSpec(fsdp=4, stage=2), 2)
     assert np.isfinite(loss) and np.isfinite(piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
     assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
@@ -818,13 +818,14 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import TFDSImages
+    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=TFDSImages(image_size=RES), text=None, val_metrics=(),
+        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+            val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
@@ -839,14 +840,14 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     rules reached the matmuls. Observed on CPU: 2.7e-05 on activations of
     order 1e-2, against 0.0 for a run trained without the knob."""
     pytest.importorskip("qwix")
-    from dew.data import Dataset
+    from dew.data.dataset import Loader
 
     batch = RUN_BATCH
     config = diffusion_run(tmp_path, batch, quantization=Quantization())
     objective = config.build()
     plain = config.build()
 
-    state = config.train(objective, Dataset(lambda partition: image_batches(batch)(), None, None, batch),
+    state = config.train(objective, Loader(lambda partition: image_batches(batch)(), None, None, batch),
                          name="quantized")
 
     assert int(state.step) == 1

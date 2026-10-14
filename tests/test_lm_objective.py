@@ -17,12 +17,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data
+from affine_run import dataset
 from flax import linen as nn
 from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
+from dew.nn.inputs import coordinates
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
@@ -261,7 +262,7 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     scored = jax.jit(lambda params: trainer.objective.scalar_loss(params, batch, step_at())[0])
     before = float(scored(trainer.initial_state().variables))
 
-    state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
+    state = trainer.fit(dataset(cycle_batches), steps=STEPS, log_every=50)
     after = float(scored(state.variables))
 
     specs = [p.sharding.spec for p in jax.tree.leaves(state.variables)]
@@ -403,7 +404,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+    state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
                         eval_every=1, metrics=(Perplexity(),))
 
     total, count = 0.0, 0.0
@@ -429,7 +430,9 @@ class PackedTinyLM(TinyCausalLM):
 
     @nn.compact
     def hidden_states(self, tokens, train: bool = False, positions=None,
-                      segment_ids=None):
+                      segment_ids=None, coordinates=None):
+        if coordinates is not None:
+            positions, segment_ids = coordinates.positions, coordinates.segments
         length = tokens.shape[1]
         table = self.param("positions", nn.initializers.normal(0.02),
                            (self.max_seq_len, self.emb_features))
@@ -556,8 +559,9 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, _ = documents()
-    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
-             "text_positions": positions}
+    batch = {TEXT_KEY: tokens, "text_coordinates": coordinates(
+        segments=segment_ids, positions=positions, max_segments=tokens.shape[1],
+        right_padded=True, xp=np)}
 
     packed, _ = objective.scalar_loss(params, batch, step_at())
     unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
@@ -568,6 +572,21 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     assert float(packed) == pytest.approx(weighted_mean(losses, weights))
     assert abs(float(packed) - float(unpacked)) > 1e-3, (
         "the packed keys made no difference to the loss")
+
+
+@pytest.mark.parametrize("stale", [("text_segment_ids",), ("text_positions",),
+                                  ("text_segment_ids", "text_positions")])
+def test_a_packed_batch_refuses_the_old_packing_columns(stale):
+    objective = packed_objective()
+    params = objective.init(jax.random.key(0))
+    tokens, segments, positions, _ = documents()
+    columns = {"text_segment_ids": segments, "text_positions": positions}
+    batch = {TEXT_KEY: tokens, **{name: columns[name] for name in stale}}
+
+    with pytest.raises(ValueError, match="text_coordinates"):
+        objective.scalar_loss(params, batch, step_at())
+    with pytest.raises(ValueError, match="text_coordinates"):
+        objective.evaluate(params, batch, step_at())
 
 
 # --- loss_role: SFT on the chat data path --------------------------------------
@@ -713,3 +732,59 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
         expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
     np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
+
+
+@pytest.mark.parametrize("tile_tokens", [4, 16])
+def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
+        tile_tokens):
+    """A training step whose head is tiled takes the head's gradient in the
+    forward (`fused_head_loss`), a tile's tokens a chunk: beside blocks
+    recomputed in the backward, the step contracts the whole vocabulary
+    three times, the logits, the states' gradient and the head's, none again,
+    and its loss and gradients are the per-token tiled head's, z-loss and
+    padding included. A tile that holds all 16 tokens would make one chunk
+    holding every logit, so the step keeps the tiled head, contracting the
+    vocabulary as it does without a z-loss, which never fuses."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    vocab = 61
+    model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
+                              max_seq_len=8, tie_embeddings=False, remat="full", qk_norm=False,
+                              attention_impl="reference")
+    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, vocab).at[1, 6:].set(0)
+    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
+    params = fused.init(jax.random.key(0))
+
+    def loss(objective, *, training):
+        step = Step(jnp.asarray(0), jax.random.key(1), None, training=training)
+
+        def scalar(params):
+            stats, _ = objective.loss(params, {TEXT_KEY: tokens}, step)
+            return objective.reduce_loss(stats)[0]
+        return scalar
+
+    def products(jaxpr) -> int:
+        """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
+        count = 0
+        for eqn in jaxpr.eqns:
+            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
+            count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
+            for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                         or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
+                inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
+                if hasattr(inner, "eqns"):
+                    count += products(inner)
+        return count
+
+    def step_products(objective) -> int:
+        return products(jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params).jaxpr)
+
+    if tile_tokens == 4:
+        assert step_products(fused) == 3
+    else:
+        tiled = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(tile_tokens, 16))
+        assert step_products(fused) == step_products(tiled) != 3
+    with jax.default_matmul_precision("highest"):
+        mine = jax.value_and_grad(loss(fused, training=True))(params)
+        theirs = jax.value_and_grad(loss(fused, training=False))(params)
+    for left, right in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
+        np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-6)

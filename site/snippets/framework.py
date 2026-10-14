@@ -12,7 +12,6 @@ small offline fixtures.
 import argparse
 import json
 import os
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -44,13 +43,15 @@ def diffusion():
     # Begin snippet: diffusion
     from dew import Field, InputSpec, Trainer
     from dew.config import OptimConfig
-    from dew.data import HFImages
+    from dew.config.data import ImageData
+    from dew.data import Hub, Loading
     from dew.diffusion.presets import Flow
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.sampling import Euler
 
-    data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
+    data = ImageData(Hub("uoft-cs/cifar10"), field="img", image_size=32).load(
+        batch=64, read="memory", provision=True, loading=Loading(workers=0))
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (32, 32, 3))),
                                    solver=Euler(), steps=4)
@@ -64,10 +65,12 @@ def jepa():
     # Begin snippet: jepa
     from dew import Field, Trainer
     from dew.config import OptimConfig
-    from dew.data import HFImages
+    from dew.config.data import ImageData
+    from dew.data import Hub, Loading
     from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 
-    data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
+    data = ImageData(Hub("uoft-cs/cifar10"), field="img", image_size=32).load(
+        batch=64, read="memory", provision=True, loading=Loading(workers=0))
     encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=1, num_heads=2)
     predictor = JepaPredictor(grid=(8, 8), emb_features=32, predictor_features=16,
                               num_layers=1, num_heads=2)
@@ -82,13 +85,13 @@ def jepa():
 def grpo():
     # Begin snippet: grpo
     import itertools
-    import json
 
     import numpy as np
 
     from dew import LocalTracker, Trainer
     from dew.config import OptimConfig
-    from dew.data import Prompts
+    from dew.config.data import PromptData
+    from dew.data import Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
     from dew.sampling import Sampling
@@ -99,8 +102,9 @@ def grpo():
         return sum(b == (a + 1) % 13 for a, b in pairs) / max(len(pairs), 1)
 
     rng = np.random.default_rng(0)
-    records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
-    data = Prompts(tokenizer="byte", records=records, max_prompt_len=4).load(batch=8)
+    records = tuple({"prompt": rng.integers(0, 13, 4).tolist()} for _ in range(512))
+    data = PromptData(records, tokenizer="byte", max_prompt_len=4).load(
+        batch=8, read="memory", loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=13, emb_features=64, num_layers=2, num_heads=4,
                               head_dim=16, mlp_features=128, max_seq_len=16)
     objective = GRPOObjective(model, seq_len=11, beta=0.02)
@@ -308,7 +312,7 @@ def profile():
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                       profile=ProfileWindow("profile", steps=2))
-    state = trainer.fit(data, steps=5)
+    trainer.fit(data, steps=5)
     # End snippet: profile
     assert any(Path("profile").rglob("*.xplane.pb"))
     return {"profile": "profile"}
@@ -321,28 +325,49 @@ SECTIONS = {function.__name__: function for function in
 
 def offline(out):
     """Serve the Hub names the cells read from small fixtures, without the network."""
+    from types import SimpleNamespace
+
     import datasets
+    import huggingface_hub
+    from huggingface_hub import HfApi
     from PIL import Image
 
-    import dew.data.text
-    import dew.interop.hub as hub
-    from dew.data import ByteTokenizer, HFOptions
+    from dew.data import ByteTokenizer
     from dew.decision import Decide
-    from dew.diffusion.presets import Flow
     from dew.inference import RunProcessor
     from dew.interop import PretrainedDecoder
 
-    # The cells tokenize into dew's cache, which must not keep these fixtures.
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
-    # More images than the four validation batches HFImages holds out.
     images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
-    tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
+    tables = {"winglian/tiny-shakespeare": {
+        "text": ["token5 token7 token9 token11 " * 20 + f"token{index}" for index in range(320)]},
               "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
-    HFOptions.load = lambda self, path, split, *, streaming: datasets.Dataset.from_dict(tables[path])
-    # One tiny decoder, which reads bytes, stands in for each the cells load.
+    builder = datasets.load_dataset_builder
+    builders = {}
+    for repo, columns in tables.items():
+        directory = out / "data" / repo.replace("/", "--")
+        directory.mkdir(parents=True, exist_ok=True)
+        parquet = directory / "train.parquet"
+        datasets.Dataset.from_dict(columns).to_parquet(parquet)
+        prepared = builder("parquet", data_files={"train": str(parquet)}, cache_dir=str(directory / "arrow"))
+        prepared.download_and_prepare()
+        builders[repo] = prepared
+    info = HfApi.dataset_info
+    HfApi.dataset_info = lambda self, repo, **options: (
+        SimpleNamespace(sha="offline-fixture") if repo in builders else info(self, repo, **options))
+    listing = HfApi.list_repo_files
+    HfApi.list_repo_files = lambda self, repo, **options: (
+        ["train.parquet"] if repo in builders else listing(self, repo, **options))
+    datasets.load_dataset_builder = lambda repo, **options: (
+        builders[repo] if repo in builders else builder(repo, **options))
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
-    tokenizer_for = dew.data.text.tokenizer_for
-    dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name in decoders else name)
+    # Its 256 word ids fit the decoder fixture, with distinct targets in the fixture corpus.
+    tokenizer_files = ROOT / "tests/fixtures/hf/qwen35-native-tiny"
+    model_info, snapshot = HfApi.model_info, huggingface_hub.snapshot_download
+    HfApi.model_info = lambda self, repo, **options: (
+        SimpleNamespace(sha="offline-fixture") if repo in decoders else model_info(self, repo, **options))
+    huggingface_hub.snapshot_download = lambda repo, **options: (
+        str(tokenizer_files) if repo in decoders else snapshot(repo, **options))
     load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
 
     def tiny(cls, name, **options):
@@ -353,17 +378,9 @@ def offline(out):
     def byte_text(self, **options):
         return replace(generation(self, **options), processor=RunProcessor(ByteTokenizer()))
 
-    def run(repo_id, revision=None):
-        sys.path.insert(0, str(ROOT / "tests"))
-        from test_inference import make_run
-        if not (out / "run").exists():
-            make_run(out / "run", preset=Flow())
-        return out / "run"
-
     PretrainedDecoder.load, PretrainedDecoder.text_generation = classmethod(tiny), byte_text
     laya, tiny_laya = Decide.from_pretrained.__func__, ROOT / "tests/fixtures/laya/tiny"
     Decide.from_pretrained = classmethod(lambda cls, name, **options: laya(cls, tiny_laya, **options))
-    hub.pull_from_hub = run
 
 
 def main():

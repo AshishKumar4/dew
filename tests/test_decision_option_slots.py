@@ -1,4 +1,4 @@
-"""A batch's real options compacted (`DecisionInputs.option_slots`): Clef's joint head computes those alone.
+"""A batch's real options compacted (`DecisionInputs.option_slots`): the joint head computes those alone.
 
 A batch pads every row to the most questions times the most options, and a
 row's real options are a few of them. The joint head computes each option on
@@ -16,11 +16,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
-from reference_error import assert_leaves_as_exact, distance, widened
+from reference_error import assert_leaves_as_exact, float64_terms, widened
 from safetensors.numpy import load_file
 
-from dew.data import DataPartition
+from dew.config.data import loader
+from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
     Choice,
@@ -32,20 +32,21 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.clef import ClefHead
+from dew.decision.data import Decisions as DecisionRecipe
+from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Step
 
 FIXTURES = Path(__file__).parent / "fixtures"
-TINY = FIXTURES / "clef" / "tiny"
+TINY = FIXTURES / "joint_checkpoint" / "tiny"
 BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
 
-def clef_batch():
-    """Clef's tiny head, its output table, the five cases laid out in one
+def stored_batch():
+    """The stored tiny joint head, its output table, the five cases laid out in one
     batch and their states padded to it."""
     tokenizer = HFTokenizer(str(BACKBONE), local_files_only=True)
     rows = []
@@ -57,7 +58,7 @@ def clef_batch():
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in CASES])
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    return ClefHead.load(TINY, attention_impl="xla"), table, inputs, padded
+    return StoredJointHead.load(TINY, attention_impl="xla"), table, inputs, padded
 
 
 def with_slots(inputs: DecisionInputs, slots: int | None) -> DecisionInputs:
@@ -78,15 +79,15 @@ def test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused(
         compacted(options, 4)
 
 
-def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
-    """Clef's trained tiny head over the five cases: every real option's
+def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
+    """The stored tiny joint head over the five cases: every real option's
     logit as over the grid at two numbers of option slots, to float32
     rounding (on armada's CPUs they moved by up to 6.6e-7 in logits of about 0.6
     at two numbers of slots); a slot with no real option scores zero,
     which the model's logits mask (`DecisionModel.logits`). The head's
     parameters do not depend on the number of slots, so a checkpoint trained
     at one serves at another."""
-    loaded, table, inputs, states = clef_batch()
+    loaded, table, inputs, states = stored_batch()
     most = int(np.max(np.sum(np.asarray(inputs.options).reshape(len(states), -1), axis=1)))
     assert most < inputs.options.shape[1] * inputs.options.shape[2]
 
@@ -105,8 +106,8 @@ def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
 
 
 def ragged() -> list[Example]:
-    """Rows of E1's mixture's shapes: one question of a hundred options
-    (LEDGAR), seventeen of three (ContractNLI) and one of twenty-four (CLINC150)."""
+    """Ragged rows: one question of a hundred options, seventeen of three and one of
+    twenty-four."""
     clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
     hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
@@ -115,37 +116,10 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-def bias_cancellation_scales(loss, variables, rows, paths) -> dict[str, float]:
-    """The absolute cotangents each declared bias sums, before cancellation.
-
-    An independent offset at each projection position exposes the terms of
-    its broadcast bias's gradient. Measure them in float64 so cancellation
-    noise in the tested float32 paths never determines their bound.
-    """
-    shapes = {}
-
-    def shifted(offsets):
-        def project(next_fun, args, kwargs, context):
-            value = next_fun(*args, **kwargs)
-            path = context.module.scope.path
-            if context.method_name == "__call__" and path in paths:
-                shapes[path] = value.shape
-                return value + offsets.get(path, 0)
-            return value
-
-        with nn.intercept_methods(project):
-            return loss(variables, rows)
-
-    shifted({})
-    terms = jax.grad(shifted)({path: jnp.zeros(shapes[path], jnp.float64) for path in paths})
-    return {jax.tree_util.keystr(tuple(jax.tree_util.DictKey(key)
-                                     for key in ("params", "head", *path, "bias"))):
-            distance(np.sum(np.abs(term), axis=(0, 1)), 0) for path, term in terms.items()}
-
-
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """A batch of 100, 17 x 3 and 24 real options in a 17 x 100 grid, which
-    the encoding compacts into 128 slots: the loss and every parameter's
+    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid
+    as many questions deep as a window holds, which the packing compacts into
+    the slots its bounds allow: the loss and every parameter's
     gradient, backbone's and head's, as over the grid to float32 rounding,
     and the loss reads only the real options."""
     tokenizer = ByteTokenizer()
@@ -162,14 +136,21 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
-    data = objective.dataset(examples, batch=len(examples), validation=examples)
+    data = loader(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
+                read="memory", objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])
-    assert options.shape[1:] == (17, 100)
-    assert sorted(options.reshape(len(examples), -1).sum(axis=1).tolist()) == [24, 51, 100]
-    # The encoding compacts the 100 real options of its widest row into 128 slots.
-    assert laid_out(slotted).option_slots.shape == (3, 128)
+    bounds = objective.bounds
+    assert options.shape[1:] == (bounds.questions, 100)
+    starts = np.asarray(slotted["spans"])[..., 0]
+    owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
+    totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
+              for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
+    assert sorted(totals) == [24, 51, 100]
+    # A window's real options compact into the slots its bounds allow, a multiple of 128.
+    capacity = -(-bounds.options // 128) * 128
+    assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
@@ -180,33 +161,26 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
                                                       for rows in (batch, slotted))
     # Float64 truth: the grid's step in float64 (the head and its scoring rule
-    # keep a float64 input's dtype). The compacted step is held to it as the
-    # grid is, per tensor (tests/reference_error.py).
-    invariant_paths = (
-        ("evidence_layers_0", "attention", "to_k"),  # q.b shifts every key's logit alike.
-        ("evidence_layers_1", "attention", "to_k"),  # q.b shifts every key's logit alike.
-        ("layers_0", "self_attn", "to_k"),  # q.b shifts every key's logit alike.
-        ("layers_0", "multihead_attn", "to_k"),  # q.b shifts every key's logit alike.
-        ("scorer_out",),  # The shared residual gate gives every option the same bias shift.
-    )
-    # These head keys are unrotated and unnormalized. The backbone has no
-    # attention biases, and its normalized, rotated keys would not share q.b.
+    # keep a float64 input's dtype), with each gradient leaf's terms: a key
+    # bias's and the scorer's shared bias gradients cancel (q.b shifts every
+    # key's logit alike; the residual gate shifts every option's), so their
+    # terms, not their near-zero sizes, are their rounding's scale. The
+    # compacted step is held to it as the grid is, per tensor
+    # (tests/reference_error.py).
     with jax.enable_x64(new_val=True):
         wide_variables, wide_batch = widened((variables, batch))
-        truth, truth_gradient = jax.value_and_grad(loss)(wide_variables, wide_batch)
-        invariants = bias_cancellation_scales(loss, wide_variables, wide_batch, invariant_paths)
+        (truth, truth_gradient), (_, terms) = float64_terms(jax.value_and_grad(loss), wide_variables,
+                                                            wide_batch)
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
     # The compaction reorders the sums over the grid's option slots.
     slots = options.shape[1] * options.shape[2]
     assert_leaves_as_exact(fewer, grid, truth, reductions=slots)
-    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots,
-                           invariants=invariants)
+    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots, terms=terms)
     # A NaN in one gradient leaf fails the same comparison.
     leaves, structure = jax.tree.flatten(fewer_gradient)
     poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots,
-                               invariants=invariants)
+        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots, terms=terms)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.

@@ -110,23 +110,26 @@ class SampledRollout:
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
         """Draw `groups` completions per prompt and pack them as GRPO rows.
 
-        Every group is drawn from one policy snapshot and scored by
-        `reward`, and the advantages are computed within each prompt's
-        group. The returned columns are the batch a GRPO loss reads.
+        A prompt's group is the policy's `groups` continuations of one
+        request under `key` (`TextGeneration`'s `n`), drawn from one policy
+        snapshot over one prefill and scored by `reward`, and the advantages
+        are computed within each prompt's group. The returned columns are the
+        batch a GRPO loss reads.
         """
         # Validation completes on every rank before generation enters collectives.
         prepared = (agreed("rollout input preparation", lambda: self._prepared(batch, key))
                     if mesh_of(state.variables) is not None else self._prepared(batch, key))
         prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
-        policy = self.objective.policy(state.variables, self.sampling)
-        generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group)).host()
-                     for group in range(self.groups)]
-        sampled = np.stack([generation.tokens[:, width:] for generation in generated], axis=1)
-        lengths = np.stack([generation.lengths for generation in generated], axis=1)
-        terminated = np.stack([generation.terminated for generation in generated], axis=1)
-        raw = np.stack([generation.raw_log_probs for generation in generated], axis=1)
-        behavior = np.stack([generation.behavior_log_probs for generation in generated], axis=1)
+        generated = self.objective.policy(state.variables, self.sampling)(
+            inputs, self.max_new_tokens, key=key, n=self.groups).host()
+
+        def grouped(values: np.ndarray) -> np.ndarray:
+            return values.reshape(rows, self.groups, *values.shape[1:])
+
+        sampled = grouped(generated.tokens[:, width:])
+        lengths, terminated = grouped(generated.lengths), grouped(generated.terminated)
+        raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
         rewards = np.asarray([
             [self.reward(sources[row], self.decode(sampled[row, group,
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),

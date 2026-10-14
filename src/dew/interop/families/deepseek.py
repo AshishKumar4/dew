@@ -33,7 +33,7 @@ from dew.interop.decoder_parts import (
     dew_path,
     layer_depth_path,
     prediction_path,
-    read_rope_theta,
+    read_rope,
     record_float,
     record_int,
     refuse,
@@ -116,40 +116,6 @@ _MINIMAX_M2_NAMES = (
     ('mlp.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
     ('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj'),
 )
-
-
-def deepseek_rope(hf_config: Mapping[str, object], used: set
-                   ) -> tuple[float, Ramp | None]:
-    """Return (rope_theta, yarn record) from either rope spelling.
-
-    Both released DeepSeek configs spell it with `rope_scaling` of
-    `type: yarn`; transformers prefers `rope_scaling` when both are
-    present (convert_rope_params_to_dict), so this does too. Plain rope
-    reuses the shared reader; anything but plain or YaRN changes the
-    frequencies and refuses with the entry named.
-    """
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
-    scaling = hf_config.get('rope_scaling')
-    parameters = hf_config.get('rope_parameters')
-    entry = (scaling if isinstance(scaling, Mapping)
-             else parameters if isinstance(parameters, Mapping) else None)
-    theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
-    max_pos = records.integer(hf_config.get('max_position_embeddings',
-                                DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings')
-    if entry is None:
-        return theta, None
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    field = ('rope_scaling' if scaling is entry else 'rope_parameters')
-    if rope_type in ('default', 'none'):
-        plain = read_rope_theta(dict(entry, rope_theta=entry.get(
-            'rope_theta', theta)), field)
-        return plain or theta, None
-    if rope_type != 'yarn':
-        refuse(f"rope scaling (rope_type {rope_type!r})",
-                "the mixer applies plain or YaRN rotary positions")
-    entry_theta = float(entry.get('rope_theta', theta))
-    return entry_theta, yarn_record(
-        dict(entry, rope_theta=entry_theta), field, entry_theta, max_pos)
 
 
 def deepseek_mixture(hf_config: Mapping[str, object], layers: int,
@@ -292,8 +258,10 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    rope_theta, yarn = deepseek_rope(hf_config, used)
-    config = base_config(hf_config, used, rope=Ropes(rope_theta))
+    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        ramps=('yarn',), per_kind=False)
+    config = base_config(hf_config, used, rope=Ropes(ropes.theta))
     layer_types = records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
@@ -369,7 +337,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'qk_rope_head_dim': rope,
             'v_head_dim': records.integer(v_dim, 'v_head_dim'),
             'rope_interleave': bool(interleave),
-            'yarn': yarn,
+            'yarn': ropes.scaling,
             'index_topk': None if index is None else index['index_topk'],
             'index_n_heads': None if index is None else index['index_n_heads'],
             'index_head_dim': (None if index is None
@@ -1040,16 +1008,31 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
         return prediction_path(name, 'mtp', parts[1] if len(parts) >= 3 else None,
                                record_int(config, "num_nextn_predict_layers", 0), '.'.join(parts[2:]),
                                _V4_PREDICTION_LEAVES, block)
+    return dew_path(_v4_spelling(name), config)
+
+
+def _v4_spelling(name: str) -> str:
+    """`name` as transformers' modules spell it: the trunk's tensors under
+    `model.`, and a layer's or a prediction block's tail renamed
+    (`_DEEPSEEK_V4_NAMES`). The path map and the storage preparation both
+    read a tensor under this one name, so the release's spelling, an
+    export's and the reference model's own state dict's are one tensor to
+    each. The renames run over a block's own tail, where the trunk's
+    `norm.weight` cannot meet the compressors' pattern."""
     name = _DEEPSEEK_V4_TRUNK.get(name, name)
     if name.startswith('layers.'):
         name = 'model.' + name
     parts = name.split('.')
-    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()):
-        return dew_path(name, config)
-    tail = '.' + '.'.join(parts[3:])
+    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+        block, tail = '.'.join(parts[:3]), parts[3:]
+    elif len(parts) >= 3 and parts[0] == 'mtp' and parts[1].isdigit():
+        block, tail = '.'.join(parts[:2]), parts[2:]
+    else:
+        return name
+    renamed = '.' + '.'.join(tail)
     for theirs, ours in _DEEPSEEK_V4_NAMES:
-        tail = tail.replace(theirs, ours)
-    return dew_path(f"model.layers.{parts[2]}{tail}", config)
+        renamed = renamed.replace(theirs, ours)
+    return block + renamed
 
 
 def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
@@ -1065,21 +1048,23 @@ def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
     the int32 the router's collection holds (:1062).
     """
     prepared = dict(tensors)
+    spelled = {_v4_spelling(name): name for name in tensors}
     for name, tensor in tensors.items():
-        if name.endswith('.attn.wo_a.weight'):
-            partner = name.removesuffix('wo_a.weight') + 'wq_b.weight'
-            stacked = tensors.get(partner)
-            if stacked is None:
-                raise ValueError(f"{name} needs {partner} to name its head groups")
-            groups = stacked.shape[0] // tensor.shape[1]
+        spelling = _v4_spelling(name)
+        if spelling.endswith('.self_attn.o_a_proj.weight'):
+            partner = spelled.get(spelling.removesuffix('o_a_proj.weight') + 'q_b_proj.weight')
+            if partner is None:
+                raise ValueError(f"{name} needs its block's query projection (wq_b) to name its head groups")
+            groups = tensors[partner].shape[0] // tensor.shape[1]
             prepared[name] = np.ascontiguousarray(
                 tensor.reshape(groups, -1, tensor.shape[1]).transpose(0, 2, 1))
-        elif name.endswith('.gate.tid2eid'):
+        elif spelling.endswith('.gate.tid2eid'):
             if not np.issubdtype(tensor.dtype, np.integer):
                 raise ValueError(f"{name} must contain integer expert indices")
-            router = tensors.get(name.removesuffix('tid2eid') + 'weight')
-            if router is None:
+            router_name = spelled.get(spelling.removesuffix('tid2eid') + 'weight')
+            if router_name is None:
                 raise ValueError(f"{name} has no gate.weight declaring its expert count")
+            router = tensors[router_name]
             if tensor.size:
                 lower, upper = np.min(tensor), np.max(tensor)
                 limits = np.iinfo(np.int32)

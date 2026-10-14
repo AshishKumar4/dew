@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, Prepared, RunConfig
-from dew.data import ImageDataset, OnlineImages, OnlineVideos, TFDSImages, VideoDataset
+from dew.config.data import Augment, HoldOut, ImageData, VideoData, loader
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
@@ -47,7 +47,6 @@ from .few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
 from .objective import LOSS_HEADS, DiffusionObjective
 
 if TYPE_CHECKING:
-    from flax import linen as nn
 
     from dew.diffusion.presets import Preset
 
@@ -56,9 +55,7 @@ if TYPE_CHECKING:
     # is parsed, find it. Statically the fields are typed as the kinds' base
     # classes, which a reader and a checker need.
     PresetSpec = Preset
-    # The run reads captions through `load(tokenize=)`, which the token
-    # datasets do not take; `sample_field` refuses those at runtime.
-    CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
+    CaptionedSpec = ImageData | VideoData
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
@@ -124,9 +121,9 @@ class AudioCondition:
     """Audio conditioning on each clip, through the video dataset's own audio model.
 
     The dataset's `audio_model` names the `hf_audio` tower, whose feature
-    extractor already wrote the batch's `audio` field. The dataset's clip length
-    sets the waveform length used to encode every clip and the silent
-    unconditional input, so the two always agree.
+    extractor encodes the waveform in the batch's `audio` field on the host.
+    The dataset's clip length sets the waveform length used to encode every
+    clip and the silent unconditional input, so the two always agree.
     """
 
     encoder: ClassVar[str] = "hf_audio"
@@ -135,11 +132,12 @@ class AudioCondition:
     param_dtype: DtypeName = "float32"
     """The storage dtype when loading source weights; supplied params keep theirs."""
 
-    def build(self, clips: VideoDataset, *, params: Variables | None = None,
+    def build(self, clips: VideoData, *, params: Variables | None = None,
               dtype: DtypeName | None = None) -> Condition:
         """Build the tower over supplied params, without loading source weights or casting storage."""
         return Condition(
-            rebuild(self.encoder, {"checkpoint": clips.audio_model, "seconds": clips.audio_seconds,
+            rebuild(self.encoder, {"checkpoint": clips.audio_model,
+                                   "seconds": (clips.frames + 2 * clips.audio_padding) / 25.0,
                                    "dtype": dtype if self.dtype is None else self.dtype,
                                    "param_dtype": self.param_dtype}, params=params),
             field="audio", unconditional=0.0)
@@ -177,7 +175,9 @@ class DiffusionRunConfig(RunConfig):
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    data: CaptionedSpec = dataclasses.field(default_factory=TFDSImages)
+    data: CaptionedSpec = dataclasses.field(default_factory=lambda: ImageData(
+        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
+        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with.
 
@@ -201,7 +201,7 @@ class DiffusionRunConfig(RunConfig):
     audio: AudioCondition | None = None
     """The audio condition, passed under its encoder's keyword in place of text.
 
-    It needs `text` to be None and a `VideoDataset`, whose clips hold the audio.
+    It needs `text` to be None and a `Video` recipe, whose clips hold the audio.
     """
     autoencoder: PretrainedAutoencoder | None = None
     """The autoencoder for latent diffusion; None trains in pixel space."""
@@ -274,19 +274,17 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
                 "text and audio; set text to None to condition on audio")
-        if self.audio is not None and not isinstance(self.data, VideoDataset):
+        if self.audio is not None and not isinstance(self.data, VideoData):
             raise ValueError(
-                f"audio conditioning reads the audio of a VideoDataset's clips, and "
+                f"audio conditioning reads the audio of a VideoData recipe's clips, and "
                 f"{type(self.data).__name__} carries none")
 
     def sample_field(self) -> Field:
         """Return the batch field the model generates, at the resolution the data comes in."""
         spec = self.data
-        if isinstance(spec, VideoDataset):
+        if isinstance(spec, VideoData):
             return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
-        if isinstance(spec, OnlineVideos):
-            return Field("video", (spec.frames, spec.image_size, spec.image_size, 3))
-        if isinstance(spec, (ImageDataset, OnlineImages)):
+        if isinstance(spec, ImageData):
             return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(f"a diffusion run trains on image or video datasets, not {type(spec).__name__}")
 
@@ -333,26 +331,28 @@ class DiffusionRunConfig(RunConfig):
         if self.lora is not None and variables is not None:
             raise ValueError("a --lora run's saved variables hold its factors, which "
                              "TextToImage.from_run binds through the run's own adapter record")
-        objective = self._objective(variables, None)
+        objective = self._objective(variables)
         if self.lora is None or self.pretrained is not None:
             return objective
         # The objective's own init draws the denoiser beside its heads and
         # towers; the adapter freezes the denoiser's weights, and the heads
-        # stay under `params` to train, beside their own `constants`.
+        # stay under `params` to train, beside their own `constants`. The
+        # adapted denoiser takes the drawn one's place (`substitute`), and the
+        # towers, the autoencoder and any frozen teacher stay as built.
         key = jax.random.key(self.trainer.key)
         drawn = objective.init(key)
         adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
                                   key=jax.random.fold_in(key, 1))
         heads = {collection: {name: tree for name, tree in drawn[collection].items() if name in LOSS_HEADS}
                  for collection in ("params", "constants") if collection in drawn}
-        return self._objective(merge({**drawn, **adapter.variables}, heads), adapter.model)
+        objective.substitute((adapter.model, *(entry.module for entry in objective.program_key()[1:])))
+        objective.variables = merge({**drawn, **adapter.variables}, heads)
+        return objective
 
-    def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
-        """The configured objective over `variables`, with `adapted` in place
-        of the model a run from scratch builds."""
+    def _objective(self, variables: Variables | None) -> DiffusionObjective:
+        """The configured objective over `variables`."""
         if self.pretrained is None:
-            base, conditions, autoencoder = self._scratch(variables)
-            model = base if adapted is None else adapted
+            model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
@@ -385,7 +385,10 @@ class DiffusionRunConfig(RunConfig):
 
         run = self.pinned()
         objective = run.build()
-        dataset = run.data.load(batch=run.trainer.batch_size, tokenize=objective.inputs.tokenize)
+        dataset = loader(run.data, batch=run.trainer.batch_size, tokens=run.trainer.batch_tokens,
+                       read=run.data_read, provision=run.provision,
+                       seed=run.data_seed, loading=run.loading,
+                       validation_records=run.validation_records, objective=objective.data())
         metrics = run.build_eval_metrics()
         rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
@@ -428,8 +431,7 @@ class DiffusionRunConfig(RunConfig):
             if self.text is not None:
                 conditions[keyword] = self.text.build(params=params, dtype=self._compute)
             else:
-                # __post_init__ holds audio to a VideoDataset.
-                assert self.audio is not None and isinstance(self.data, VideoDataset)
+                assert self.audio is not None and isinstance(self.data, VideoData)
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self._compute)
         model = self.model.build(**self.model_fields(autoencoder))
         return model, conditions, autoencoder
@@ -508,4 +510,4 @@ class DiffusionRunConfig(RunConfig):
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union
-    CaptionedSpec = datasets.union
+    CaptionedSpec = datasets.subcommands

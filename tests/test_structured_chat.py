@@ -12,15 +12,20 @@ transformers' own generation-marker mask over the same template; nothing
 reads a field back out of the parsed value.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
+from hub_support import native_builder
 from transformers import AutoTokenizer
 
-from dew.data import ChatMessages, Checkpointable, DataPartition, HFOptions, Loading
+from dew.config.data import ChatData, loader
+from dew.data import Loading
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
+from dew.data.dataset import Checkpointable, DataPartition
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
 TOOLS_TOKENIZER = TOKENIZERS / "tiny-tools"
@@ -109,10 +114,9 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
                          hf["assistant_masks"]))
     path = tmp_path / "sft.parquet"
     pq.write_table(pa.Table.from_pylist(rows), path)
-    spec = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
-                        seq_len=511, packing_bins=1, val_batches=None,
-                        loading=Loading(workers=0))
-    data = spec.load(batch=1)
+    spec = ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+        validation=str(path), long="chunk")
+    data = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
     assert data.val is not None
     stream = data.val(DataPartition())
     assert isinstance(stream, Checkpointable)
@@ -120,7 +124,7 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
     first = next(stream)
     position = stream.get_state()
     remaining = list(stream)
-    fresh = spec.load(batch=1)
+    fresh = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
     assert fresh.val is not None
     restored = fresh.val(DataPartition())
     assert isinstance(restored, Checkpointable)
@@ -129,14 +133,15 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
 
     assert len(resumed) == len(remaining) == 2
     for uninterrupted, restarted in zip(remaining, resumed, strict=True):
-        for key in uninterrupted:
-            np.testing.assert_array_equal(uninterrupted[key], restarted[key])
+        assert jax.tree.structure(uninterrupted) == jax.tree.structure(restarted)
+        for left, right in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(restarted), strict=True):
+            np.testing.assert_array_equal(left, right)
     for batch, (ids, assistant_mask) in zip([first, *resumed], expected, strict=True):
         np.testing.assert_array_equal(batch["text"][0, :len(ids)], ids)
         np.testing.assert_array_equal(batch["text_roles"][0, :len(ids)] == Role.ASSISTANT,
                                       assistant_mask)
-        np.testing.assert_array_equal(batch["text_positions"][0, :len(ids)], np.arange(len(ids)))
-        np.testing.assert_array_equal(batch["text_segment_ids"][0, :len(ids)], 1)
+        np.testing.assert_array_equal(batch["text_coordinates"].positions[0, :len(ids)], np.arange(len(ids)))
+        np.testing.assert_array_equal(batch["text_coordinates"].segments[0, :len(ids)], 1)
         np.testing.assert_array_equal(batch["text_roles"][0, len(ids):], 0)
 
 
@@ -207,8 +212,9 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
     pq.write_table(pa.table({"prompt": [messages]}), path)
     ids, roles = render(tools_tokenizer, messages)
 
-    data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
-                        seq_len=511, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
+    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
     assert data.val is not None
     batch = next(iter(data.val(DataPartition())))
 
@@ -226,8 +232,9 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
         json.dumps({"messages": messages, "tools": [WEATHER]}) + "\n" for _ in range(2)))
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
 
-    data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
-                        seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
+    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1,
+        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
 
     assert data.val is not None
     batch = next(iter(data.val(DataPartition())))
@@ -235,39 +242,37 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
     # Two conversations, one window: the second starts where the first ends.
     np.testing.assert_array_equal(batch["text"][0][len(ids):2 * len(ids)], ids)
-    np.testing.assert_array_equal(batch["text_segment_ids"][0][len(ids):2 * len(ids)], 2)
+    np.testing.assert_array_equal(batch["text_coordinates"].segments[0][len(ids):2 * len(ids)], 2)
 
 
-def test_a_hub_dataset_id_reads_through_load_dataset(monkeypatch, tools_tokenizer):
-    """A path that is no file is a repo id, and `HFOptions` resolves it:
-    `datasets.load_dataset` is called with the id, the split and the
-    library's own arguments, and its rows pack like any others."""
+def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch, tools_tokenizer):
+    from types import SimpleNamespace
+
     import datasets as hf_datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import Hub
 
     messages = parquet_conversation()
     split = hf_datasets.Dataset.from_dict(
         {"messages": [messages], "tools": [json.dumps([WEATHER])], "id": ["row-0"]})
-    asked = {}
-
-    def load_dataset(path, **arguments):
-        asked.update(path=path, **arguments)
-        return split
-
-    monkeypatch.setattr(hf_datasets, "load_dataset", load_dataset)
-    ids, roles = render(tools_tokenizer, messages, [WEATHER])
-
-    data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path="allenai/tulu-3-sft-mixture",
-                        val_path="allenai/tulu-3-sft-mixture", val_split="test",
-                        options=HFOptions(config="default", revision="abc123"),
-                        seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
-
+    builder = native_builder({"train": split, "test": split}, tmp_path, tmp_path / "arrow")
+    builder.download_and_prepare()
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="abc123"))
+    monkeypatch.setattr(hf_datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    source = Hub("acme/chat", revision="abc123", cache_dir=str(tmp_path / "arrow"))
+    data = loader(ChatData(source=source, validation=dataclasses.replace(source, split="test"),
+                     tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1, long="chunk"),
+                batch=1, read="memory", loading=Loading(workers=0))
     assert data.val is not None
-    batch = next(iter(data.val(DataPartition())))
+    reader = data.val(DataPartition())
+    try:
+        batch = next(reader)
+    finally:
+        reader.close()
+    ids, roles = render(tools_tokenizer, messages, [WEATHER])
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
-    assert asked["path"] == "allenai/tulu-3-sft-mixture" and asked["split"] == "test"
-    assert asked["name"] == "default" and asked["revision"] == "abc123"
-    assert asked["streaming"] is False
 
 
 # --- refusals ------------------------------------------------------------------

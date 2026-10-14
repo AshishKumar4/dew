@@ -32,6 +32,7 @@ from dew.nn.attention import (
     gathered_keys_attention,
     scaled_dot_product_attention,
 )
+from dew.nn.inputs import coordinates
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 
@@ -65,8 +66,8 @@ def packed_batch():
         positions[row, :boundary] = np.arange(boundary)
         positions[row, boundary:] = np.arange(SEQ_LEN + 1 - boundary)
     segments[-1, -3:] = 0
-    batch["text_segment_ids"] = segments
-    batch["text_positions"] = positions
+    batch["text_coordinates"] = coordinates(
+        segments=segments, positions=positions, max_segments=SEQ_LEN + 1, right_padded=True, xp=np)
     return batch
 
 
@@ -96,7 +97,7 @@ def packed_mask(segments):
 CALLS = {
     "causal": {"causal": True},
     "window": {"causal": True, "sliding_window": 5},
-    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))},
+    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_coordinates"].segments[:, :-1]))},
     # Query-broadcast rows must survive the reorder without being expanded.
     "broadcast_mask": {
         "causal": True, "mask": (jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]},
@@ -228,7 +229,7 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
     """Equal temporal and spatial coordinates reduce M-RoPE to plain RoPE,
     including the keys a later layer shares. Both must read the same table.
     """
-    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.inputs import AttentionMetadata, coordinates as token_coordinates
     from dew.nn.mixers.attention import CausalSelfAttention
 
     plain = CausalSelfAttention(emb_features=16, num_heads=2, num_kv_heads=1,
@@ -237,18 +238,19 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
     multimodal = plain.clone(mrope_section=(16, 24, 24))
     hidden = jax.random.normal(jax.random.key(1), (1, 3, 16))
     positions = jnp.asarray([[0, 1, 4093]], jnp.int32)
-    variables = plain.init(jax.random.key(2), hidden, positions=positions)
+    places = token_coordinates(positions=positions)
+    variables = plain.init(jax.random.key(2), hidden,
+                           attention_metadata=AttentionMetadata(coordinates=places))
     coordinates = jnp.repeat(positions[..., None], 3, axis=-1)
 
     def shared_keys(layer, metadata):
         store = {}
-        layer.apply(variables, hidden, positions=positions, kv_store=store,
-                    attention_metadata=metadata)
+        layer.apply(variables, hidden, kv_store=store, attention_metadata=metadata)
         return store["shared"][0]
 
     np.testing.assert_array_equal(
-        shared_keys(multimodal, AttentionMetadata(rotary_positions=coordinates)),
-        shared_keys(plain, None))
+        shared_keys(multimodal, AttentionMetadata(coordinates=places, rotary_positions=coordinates)),
+        shared_keys(plain, AttentionMetadata(coordinates=places)))
 
 
 @pytest.mark.mesh

@@ -15,16 +15,17 @@ import numpy as np
 import optax
 import pytest
 import sharded
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
 
-from dew.data import Dataset
+from dew.checkpoints import Checkpoints
+from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declared_axes
+from dew.nn.sharding import declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -168,9 +169,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
                       for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
+    declared = declarations(shardings)
     specs = {jax.tree_util.keystr(path): sharding.spec
              for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
+             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
@@ -183,6 +185,87 @@ def test_a_delta_net_step_over_fsdp_and_tensor_trains_what_one_device_trains():
     axis splits their kernels by, its other projections their width whole."""
     assert_trains_alike(stepped(MeshSpec(fsdp=2, tensor=2), 4, **delta_layers(fused=False))[2],
                         stepped(MeshSpec(), 1, **delta_layers(fused=False))[2])
+
+
+NATIVE_RULES = {"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv": "zero", "vocab": "zero",
+                "linear": "zero"}
+"""A layout of a native mesh's own axes: two fsdp levels, `zero` and
+`zero2`, beside a `replica` axis no parameter takes."""
+
+
+def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **hybrid)
+    return Trainer(LMObjective(model, LENGTH), optax.sgd(1e-2), key=jax.random.key(0), mesh=mesh,
+                   layout=layout, checkpoints=None if directory is None else Checkpoints(str(directory)),
+                   tracker=None)
+
+
+def token_windows(directory):
+    """Eight-row batches of windows over a token file, a stream fit
+    checkpoints and resumes."""
+    from dew.config.data import TextData, loader
+    from dew.data import Loading
+
+    directory.mkdir(exist_ok=True)
+    tokens = (np.arange(400) * 7 % VOCAB).astype(np.uint16)
+    for split in ("train", "val"):
+        tokens.tofile(directory / f"{split}.bin")
+    return loader(TextData(source=str(directory), seq_len=LENGTH, stride=1), batch=8, read="memory", seed=7,
+                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=32)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("hybrid", [False, True], ids=["attention", "delta-net"])
+def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tmp_path, hybrid):
+    """A `jax.sharding.Mesh` of axes Dew does not name, two fsdp levels and
+    a replica axis, under a layout whose rules name them and whose
+    `data_axes` split the rows over all three: fit splits the parameters
+    over both fsdp levels and the rows over all three axes, and two steps,
+    a checkpoint and a resumed third step train what one device trains in
+    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
+    is refused before anything is placed."""
+    layers = delta_layers(fused=False) if hybrid else {}
+    native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
+    layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
+    data = token_windows(tmp_path / "tokens")
+
+    def run(steps):
+        return native_trainer(native, layout, tmp_path / "run", **layers).fit(data, steps=steps,
+                                                                               checkpoint_every=2)
+
+    assert {"zero", "zero2"} <= sharded.split_axes(run(2).variables["params"])
+    resumed = run(3)
+    assert int(resumed.step) == 3
+
+    plain = Layout(min_shard=TINY_SHARD)
+    whole = native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None, **layers).fit(
+        data, steps=3)
+    spec = native_trainer(MeshSpec(fsdp=2), plain, None, **layers).fit(data, steps=3)
+    for state in (resumed, spec):
+        assert_trains_alike(*jax.device_get((state.variables["params"], whole.variables["params"])))
+
+    misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
+    with pytest.raises(ValueError):
+        native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_meshs_explicit_axes_split_rows_and_hold_no_parameter(tmp_path):
+    """`jax.make_mesh`'s axes are Explicit unless named otherwise. The rows
+    split over one as their type places them and train what one device
+    trains; a parameter the rules put on one is refused by name, since the
+    partitioner places parameters."""
+    data = token_windows(tmp_path / "tokens")
+    plain = Layout(min_shard=TINY_SHARD)
+    whole = native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None).fit(data, steps=3)
+    typed = native_trainer(jax.make_mesh((8,), ("data",), axis_types=(AxisType.Explicit,)), plain,
+                           None).fit(data, steps=3)
+    assert_trains_alike(*jax.device_get((typed.variables["params"], whole.variables["params"])))
+
+    explicit = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Explicit,) * 3)
+    layout = Layout(rules=NATIVE_RULES, data_axes=explicit.axis_names, min_shard=TINY_SHARD)
+    with pytest.raises(ValueError):
+        native_trainer(explicit, layout, None).fit(data, steps=1)
 
 
 @pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
@@ -251,12 +334,12 @@ def token_batches():
         yield batch
 
 
-def run_losses(mesh, layout, steps):
+def run_losses(mesh, layout, steps, microbatches=None):
     tracker = RecordingTracker()
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-        mesh=mesh, layout=layout, tracker=tracker)
-    state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
+        mesh=mesh, layout=layout, microbatches=microbatches, tracker=tracker)
+    state = trainer.fit(Loader(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
     return [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
@@ -280,15 +363,15 @@ TOPOLOGIES = {
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
     "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
     "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), dense_layout()),
-    "stage": (MeshSpec(fsdp=2, stage=2, microbatches=2), dense_layout()),
-    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), dense_layout()),
+    "stage": (MeshSpec(fsdp=2, stage=2), dense_layout(), 2),
+    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2), dense_layout(), 2),
 }
 
 
 def test_topologies_agree_with_data_parallel():
     """Every topology converges along the same finite loss trajectory."""
     steps = 30
-    runs = {name: np.array(run_losses(*spec, steps)) for name, spec in TOPOLOGIES.items()}
+    runs = {name: np.array(run_losses(*spec[:2], steps, *spec[2:])) for name, spec in TOPOLOGIES.items()}
 
     for losses in runs.values():
         assert len(losses) == steps and np.all(np.isfinite(losses))

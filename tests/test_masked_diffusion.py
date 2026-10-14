@@ -22,12 +22,13 @@ from flax import linen as nn
 from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
-from dew.data import ByteTokenizer, Dataset
+from dew.data import ByteTokenizer
+from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.nn.inputs import BATCH_AXES, ModelInputs
+from dew.nn.inputs import ModelInputs, request_axes
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -92,6 +93,32 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     np.testing.assert_array_equal(real, slots < 0)
     assert not counted[:, :2].any() and counted[:, 2:].any()
     assert not np.allclose(losses[:, 2:], plain[:, 2:])
+
+
+def test_padding_that_holds_the_mask_token_scores_nothing():
+    """A padded row whose padding slots hold the mask token, as a tokenizer padding with it writes
+    them: the loss, its gradient and the evaluation's per-token scores are finite and the same as
+    with any other token there, since padding is neither masked nor scored."""
+    model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
+                         num_heads=2, mlp_features=16, max_seq_len=4, causal=False, qk_norm=False,
+                         attention_impl='reference', dtype=jnp.float32)
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=31)(), seq_len=4, head_chunks=4,
+                                         ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    mask = jnp.asarray([[1, 1, 0, 0]], bool)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+
+    def scored(padding):
+        tokens = jnp.asarray([[2, 5, padding, padding]], jnp.int32)
+        batch = {"text": ModelInputs(tokens, {"attention_mask": mask})}
+        loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
+        return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
+
+    mask_padded, other_padded = scored(31), scored(7)
+    assert np.isfinite(float(mask_padded[0]))
+    assert all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(mask_padded[1]))
+    np.testing.assert_array_equal(np.asarray(mask_padded[2].losses), np.asarray(other_padded[2].losses))
+    assert float(mask_padded[0]) == float(other_padded[0])
 
 
 def loaded(name: str):
@@ -249,7 +276,7 @@ def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     expected = task(inputs, 8, key=7, steps=5, n=2).host()
     placed = task.bind(variables)(inputs, 8, key=7, steps=5, n=2)
     actual = placed.host()
-    assert placed.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert placed.tokens.sharding.spec == jax.sharding.PartitionSpec(request_axes(mesh))
     assert placed.tokens.shape[0] == jax.device_count() * 2
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(left, right)
@@ -265,7 +292,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     rows = jax.device_count()
     batch = {"text": np.full((rows, 8), 7, np.int32)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
-    data = Dataset(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     key = jax.random.key(19)
     Trainer(objective, optax.sgd(0.05), key=key, checkpoints=checkpoints).fit(

@@ -28,10 +28,8 @@ its PIL image processor.
 """
 
 import functools
-import json
 import math
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict
 
 import jax
@@ -41,18 +39,19 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.components import bind_component, component_source
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
-CONFIG_FILE = "config.json"
 DEFAULT_MODEL = "openai/clip-vit-large-patch14"
 
 
@@ -543,85 +542,30 @@ def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> N
             f"unexpected {unexpected}, mismatched {mismatched}")
 
 
-def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = True) -> Path:
-    """The directory holding config.json and the safetensors weights.
-
-    A local directory is taken as it is. A repo id fetches the config and
-    the weights `dew.interop.safetensors_io.weight_files` selects: the one
-    `model.safetensors` or the shards its index names (T5-XXL). openai's
-    repos also carry torch, TensorFlow and Flax copies of the same weights,
-    and a pipeline's encoders their fp16 variants, which are never fetched.
-    """
-    from dew.interop.sources import snapshot
-
-    return snapshot(name_or_dir, revision, weights=weights)
-
-
-def _read_config(directory: Path) -> Mapping[str, object]:
-    with open(directory / CONFIG_FILE) as handle:
-        return records.record(json.load(handle), CONFIG_FILE)
-
-
-def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
-    """Every tensor of the checkpoint in `directory` by its Hugging Face
-    name, from the one weights file or from the shards its index names."""
-    from dew.interop.safetensors_io import read_weights
-
-    return read_weights(directory)
-
-
-def _bind_text_tower[Tower: nn.Module](
+def bind_text_tower[Tower: nn.Module](
     name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],
-    translate_tensors: Callable[..., ParamTree], name_or_dir: str, revision: str | None,
-    variables: Mapping[str, object] | None, dtype: Dtype | None, param_dtype: str,
-) -> tuple[Tower, Mapping[str, object], NativeFields[Tower]]:
-    """A text tower at `dtype` with its config and the variables it accepts:
-    those supplied, bound unchanged, or the checkpoint's at `param_dtype`."""
-    directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
-    config = translate(_read_config(directory))
+    path_of: Callable[[str], tuple[str, ...] | None], name_or_dir: str, revision: str | None,
+    variables: Mapping[str, object] | None, dtype: Dtype | None, param_dtype: str, *,
+    validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+) -> tuple[Tower, Mapping[str, object]]:
+    """A text tower at `dtype` and the variables it accepts: those supplied,
+    bound unchanged with only the configuration read, or the checkpoint's at
+    `param_dtype`, FP32 masters by default whatever the checkpoint stores."""
+    directory, stored_config = component_source(name_or_dir, revision, weights=variables is None)
+    config = translate(records.record(stored_config, "config.json"))
     transformer = config.value.clone(dtype=resolve_dtype(dtype))
-    if variables is None:
-        params = translate_tensors(_read_tensors(directory), param_dtype=param_dtype)
-        variables = {"params": jax.tree.map(jnp.asarray, params)}
-    params = variables["params"]
-    if not isinstance(params, Mapping):
-        raise ValueError(f"{name} variables require a params collection")
-    check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
-    return transformer, variables, config
-
-
-class CLIPTextModel:
-    """A CLIP text tower with its weights, callable the way the encoder calls it.
-
-    `dew.inputs.encoders.CLIPText.from_pretrained` loads its tower and
-    weights from this. Call it with `input_ids` and the tokenizer's
-    `attention_mask` and read `last_hidden_state` off the result.
-    """
-
-    def __init__(self, transformer: CLIPTextTransformer, variables, config):
-        self.transformer = transformer
-        self.variables = variables
-        self.config = config
-        self._apply = jax.jit(transformer.apply)
-
-    @classmethod
-    def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Dtype | None = None, param_dtype: str = "float32",
-                        revision: str | None = None,
-                        variables: Mapping[str, object] | None = None) -> "CLIPTextModel":
-        """Load a checkpoint from the Hub or a local directory.
-
-        dtype selects computation; param_dtype selects weight storage and
-        defaults to FP32 masters independently of the checkpoint dtype.
-        Supplied variables are bound unchanged; only configuration is read.
-        """
-        return cls(*_bind_text_tower("CLIP text", translate_config, translate_weights, name_or_dir,
-                                     revision, variables, dtype, param_dtype))
-
-    def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:
-        if attention_mask is not None:
-            attention_mask = jnp.asarray(attention_mask)
-        return self._apply(self.variables, jnp.asarray(input_ids), attention_mask)
+    params = None
+    if variables is not None:
+        params = variables["params"]
+        if not isinstance(params, Mapping):
+            raise ValueError(f"{name} variables require a params collection")
+    bound, _, _, _ = bind_component(
+        directory, name, stored_config, transformer, lambda name, rank: path_of(name),
+        lambda bound: (transformer, variables if variables is not None else {
+            "params": jax.tree.map(jnp.asarray, bound)}),
+        prefix=(), params=params, param_dtype=param_dtype, validate=validate,
+        inputs=(jax.ShapeDtypeStruct((1, 2), jnp.int32),))
+    return bound
 
 
 class CLIPModel:
@@ -648,21 +592,22 @@ class CLIPModel:
                         dtype: Dtype | None = None, param_dtype: str = "float32",
                         revision: str | None = None) -> "CLIPModel":
         """Load full CLIP with independent compute and parameter precision."""
-        directory = _checkpoint_dir(name_or_dir, revision)
-        config = translate_clip_config(_read_config(directory))
+        directory, stored_config = component_source(name_or_dir, revision, weights=True)
+        config = translate_clip_config(records.record(stored_config, "config.json"))
 
         module = CLIP(
             text_model=config["text"].value.clone(dtype=dtype),
             vision_model=config["vision"].value.clone(dtype=dtype),
             projection_dim=config["projection_dim"], dtype=dtype)
-        params = translate_clip_weights(_read_tensors(directory), param_dtype=param_dtype)
         vision = config["vision"].value
-        check_tree(
-            {"params": params}, module,
-            jnp.zeros((1, vision.num_channels, vision.image_size, vision.image_size),
-                      jnp.float32),
-            jnp.zeros((1, 2), jnp.int32))
-        return cls(module, {"params": jax.tree.map(jnp.asarray, params)}, config)
+        bound, _, _, _ = bind_component(
+            directory, "clip", stored_config, module, lambda name, rank: _clip_path(name),
+            lambda bound: cls(module, {"params": jax.tree.map(jnp.asarray, bound)}, config),
+            prefix=(), param_dtype=param_dtype, inputs=(
+                jax.ShapeDtypeStruct(
+                    (1, vision.num_channels, vision.image_size, vision.image_size), jnp.float32),
+                jax.ShapeDtypeStruct((1, 2), jnp.int32)))
+        return bound
 
     def get_image_features(self, pixel_values) -> jax.Array:
         return self._image_features(self.variables, jnp.asarray(pixel_values))
@@ -893,38 +838,3 @@ def translate_t5_weights(
     """
     t5_embedding(hf_tensors)
     return translate_parameters(hf_tensors, _t5_path, param_dtype)
-
-
-class T5EncoderModel:
-    """A T5 encoder with its weights, callable the way the encoder calls it.
-
-    This is what `dew.inputs.encoders.T5Text` holds: call it with `input_ids`
-    and the tokenizer's `attention_mask`, read the last hidden states off the
-    result.
-    """
-
-    def __init__(self, transformer: T5EncoderTransformer, variables, config):
-        self.transformer = transformer
-        self.variables = variables
-        self.config = config
-        self._apply = jax.jit(transformer.apply)
-
-    @classmethod
-    def from_pretrained(cls, name_or_dir: str = DEFAULT_T5_MODEL, *,
-                        dtype: Dtype | None = None, param_dtype: str = "float32",
-                        revision: str | None = None,
-                        variables: Mapping[str, object] | None = None) -> "T5EncoderModel":
-        """Load a checkpoint from the Hub or a local directory, encoder
-        tensors only.
-
-        dtype selects computation; param_dtype selects weight storage and
-        defaults to FP32 masters. Sharded checkpoints load as one tower.
-        Supplied variables are bound unchanged; only configuration is read.
-        """
-        return cls(*_bind_text_tower("T5", translate_t5_config, translate_t5_weights, name_or_dir,
-                                     revision, variables, dtype, param_dtype))
-
-    def __call__(self, input_ids, attention_mask=None) -> jax.Array:
-        if attention_mask is not None:
-            attention_mask = jnp.asarray(attention_mask)
-        return self._apply(self.variables, jnp.asarray(input_ids), attention_mask)

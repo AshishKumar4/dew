@@ -18,6 +18,7 @@ from flax import linen as nn
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
+from dew.data.dataset import Loader
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
@@ -27,7 +28,7 @@ from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
+from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
@@ -44,12 +45,14 @@ from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels.generation import assumed
 from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
@@ -59,14 +62,7 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import (
-    FORWARD_FLOPS,
-    TOKENS,
-    TRAINING_FLOPS,
-    _TokenCount,
-    prepare_counts,
-    step_counts,
-)
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -218,15 +214,15 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     laya = DecisionHead(8, layers=1)
     expected = 24 * 8 * 8 * 7 + 4 * 8 * 29 + (2 * 8 * 8 + 2 * 8) * 8
     assert laya.decision_flops(LENGTHS, questions, options) == expected
-    clef = JointSchemaHead(8, width=16, routing_layers=1, layers=0, feedforward=32)
+    joint = JointSchemaHead(8, width=16, routing_layers=1, layers=0, feedforward=32)
     projected = 2 * 8 * 16 * (7 + 2 * 3 + 2 * 8 + 2)
     evidence = 4 * 16 * 16 * (7 + 8) + 4 * 16 * (2 * 2 + 5 * 6) + 4 * 16 * 32 * 8
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
     pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
-    assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
-    assert isinstance(clef, CountedDecisions) and not isinstance(clef, Counted)
+    assert joint.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
+    assert isinstance(joint, CountedDecisions) and not isinstance(joint, Counted)
     with pytest.raises(MissingFlopsCount):
-        counted_flops(clef, LENGTHS)
+        counted_flops(joint, LENGTHS)
 
 
 def test_host_row_counts_add_to_objectives_total_without_padding():
@@ -234,10 +230,17 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
     np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
-    assert counted[FORWARD_FLOPS].sum() == objective.model_flops(None, batch)
+    assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
         prepare_counts(objective, counted, count_model=True)
+
+
+def packed_windows(questions: int = 2) -> dict[str, np.ndarray]:
+    """Two packed windows of eight tokens, each holding one row of `LENGTHS`
+    tokens whose questions all start at its first token."""
+    return {"segments": (np.arange(8)[None, :] < LENGTHS[:, None]).astype(np.int32),
+            "spans": np.zeros((2, questions, 2), np.int32)}
 
 
 def test_decision_objective_supplies_the_layout_geometry_to_the_head():
@@ -247,8 +250,7 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
                                   layout=StateFirstLayout(max_len=16))
-    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
-             "questions": np.array([[True, False], [True, True]]),
+    batch = {**packed_windows(), "questions": np.array([[True, False], [True, True]]),
              "options": np.array([[[True, True, False], [False, False, False]],
                                   [[True, True, True], [True, True, True]]])}
     np.testing.assert_array_equal(objective.real_lengths(batch), LENGTHS)
@@ -288,8 +290,8 @@ def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_h
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
                                   layout=StateFirstLayout(max_len=8))
-    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
-             "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
+    batch = {**packed_windows(questions=1), "questions": np.ones((2, 1), bool),
+             "options": np.ones((2, 1, 2), bool)}
     frozen = 4 * 8 * 8 * np.sum(LENGTHS)
     factors = 6 * (8 + 8) * np.sum(LENGTHS)
     head_work = head.decision_flops(LENGTHS, np.ones(2, np.int64), np.full(2, 2, np.int64))
@@ -344,24 +346,33 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
         assert _TokenCount.host(measured[TOKENS]) == 7
-        assert float(measured[FORWARD_FLOPS]) == objective.model_flops(None, batch)
+        assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
 
 def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
-    interval = Interval(last_log_time=0, last_saved=None)
+    """A log takes the interval's work and tokens and starts the next
+    interval's at zero, and the run's lifetime tokens keep both logs'."""
+    interval = Interval(last_log_time=0, last_saved=None, tokens_before_log=5)
     loss = jnp.asarray(1.0)
-    for forward, tokens in ((100, 4), (200, 3)):
-        interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                        jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
-                                                   TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                   TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    def counted(steps):
+        for forward, tokens in steps:
+            interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
+                           jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
+                                                      TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    counted(((100, 4), (200, 3)))
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
-    interval.logged(3.0)
+    taken = interval.take(3, loss, {}, jnp.asarray(a=True), (None, None), {}, {})
+    assert float(taken.reading.training) == 900 and _TokenCount.host(taken.reading.tokens) == 7
     assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
+    assert interval.real_tokens == 12
+    counted(((50, 2),))
+    assert interval.real_tokens == 14
 
 
 def forward_products(function, *operands, state_mac: bool = False):
@@ -371,8 +382,12 @@ def forward_products(function, *operands, state_mac: bool = False):
     hide a missing Dense. Noncausal, unpadded fixtures make attention's
     logical product equal its executed product; chunked recurrence model
     FLOPs instead follow their documented algorithm-independent formula.
+    The forward is traced on its reference path, as on a CPU, on every
+    device: a GPU's kernels are custom calls, whose products no jaxpr shows.
     """
-    return float(jaxpr_products(jax.make_jaxpr(function)(*operands), state_mac=state_mac))
+    with assumed("cpu"):
+        traced = jax.make_jaxpr(function)(*operands)
+    return float(jaxpr_products(traced, state_mac=state_mac))
 
 
 def jaxpr_products(graph, *, state_mac=False):
@@ -546,12 +561,16 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
 
 
-@pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])
+@pytest.mark.parametrize("kind", ["sparse", "latent", "gpt_oss", "gemma4"])
 def test_active_expert_products_match_the_executed_forward(kind):
+    """A latent MoE combines its experts' outputs at the latent width, before
+    projecting them up to the residual's."""
     lengths = np.array([4, 4])
     x = jnp.ones((2, 4, 8))
     if kind == "sparse":
         model = SparseMLP(4, 2, 16, 8, implementation="xla")
+    elif kind == "latent":
+        model = SparseMLP(4, 2, 16, 8, implementation="xla", latent_features=4)
     elif kind == "gpt_oss":
         model = GptOssMLP(8, 16, 4, 2, implementation="xla")
     else:
@@ -568,18 +587,15 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
 
     from dew.training import Trainer
 
-    class Batches:
-        batch, records, val, steps_per_epoch = 8, 16, None, 2
-
-        def train(self, partition):
-            for length in (3, 5):
-                row = np.arange(7) < length
-                yield {"text": np.broadcast_to(row.astype(np.int32), (self.batch, 7))}
+    def batches(partition):
+        for length in (3, 5):
+            row = np.arange(7) < length
+            yield {"text": np.broadcast_to(row.astype(np.int32), (8, 7))}
 
     tracker = RecordingTracker()
     objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
-    trainer.fit(Batches(), steps=2, log_every=2)
+    trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1
     assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)
@@ -599,21 +615,21 @@ def test_s5_write_read_matches_the_native_scanned_path():
     assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)
 
 
-@pytest.mark.parametrize("kind", ["laya", "clef"])
+@pytest.mark.parametrize("kind", ["laya", "joint"])
 def test_decision_heads_match_every_forward_product_including_pooling(kind):
     states = jnp.ones((1, 4, 8))
-    inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), valid=jnp.ones((1, 4), bool),
+    inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), segments=jnp.ones((1, 4), jnp.int32),
         kinds=jnp.zeros((1, 1), jnp.int32), questions=jnp.ones((1, 1), bool),
         spans=jnp.array([[[0, 2]]]), option_spans=jnp.array([[[[2, 3], [3, 4]]]]),
         options=jnp.ones((1, 1, 2), bool))
     model = (DecisionHead(8, layers=1, attention_impl="reference") if kind == "laya" else
              JointSchemaHead(8, width=8, heads=2, layers=1, routing_layers=1, feedforward=16,
                               attention_impl="reference"))
-    table = jnp.ones((16, 8)) if kind == "clef" else None
+    table = jnp.ones((16, 8)) if kind == "joint" else None
     variables = model.init(jax.random.key(205), states, inputs, table)
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
-    # Clef writes its field/option cosine as multiply+reduce, not dot_general.
-    scalar_cosine = 2 * 8 * 2 if kind == "clef" else 0
+    # The joint head writes its field/option cosine as multiply+reduce, not dot_general.
+    scalar_cosine = 2 * 8 * 2 if kind == "joint" else 0
     assert count == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
 
 

@@ -24,7 +24,7 @@ import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from safetensors.numpy import load_file, save_file
 
-from dew.nn.autoencoders.dc_ae import load_dc_ae
+from dew.nn.autoencoders.dc_ae import DCAE, load_dc_ae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -174,7 +174,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Dataset, TFDSImages
+    from dew.config.data import ImageData
+    from dew.data.dataset import Loader
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -185,7 +186,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
              "dtype": "float32", "attention_impl": "reference"},
         ),
-        data=TFDSImages(image_size=16),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
         trainer=TrainerConfig(batch_size=8, steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
@@ -200,7 +201,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
     state = trainer.fit(
-        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        Loader(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=2,
         log_every=100,
     )
@@ -216,3 +217,19 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
         )
     ]
     assert any(moved)
+
+
+def test_a_level_without_blocks_resamples_nothing_and_the_factor_counts_it():
+    """DC-AE resamples between two levels only after one with blocks (and at the image where the first
+    has none): with three equal-width levels of 1, 0 and 1 blocks a 16 x 16 image encodes to an
+    8 x 8 latent, the factor reports that one resampling, and the latent decodes back to 16 x 16."""
+    model = DCAE(image_channels=3, latent_channels=4, head_dim=8, encoder_blocks=("ResBlock",) * 3,
+                 decoder_blocks=("ResBlock",) * 3, encoder_channels=(8, 8, 8), decoder_channels=(8, 8, 8),
+                 encoder_layers=(1, 0, 1), decoder_layers=(1, 0, 1), encoder_scales=((),) * 3,
+                 decoder_scales=((),) * 3, decoder_norms=("rms_norm",) * 3, decoder_activations=("silu",) * 3)
+    image = jnp.zeros((1, 16, 16, 3))
+    variables = model.init(jax.random.key(0), image)
+    latent = model.apply(variables, image, method=DCAE.encode)
+    assert model.downscale_factor == 2
+    assert latent.shape[1:3] == (16 // model.downscale_factor,) * 2
+    assert model.apply(variables, latent, method=DCAE.decode).shape == image.shape

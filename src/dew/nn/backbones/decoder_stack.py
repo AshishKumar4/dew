@@ -19,21 +19,12 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.objectives.base import merge
+
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
-
-
-def _merged(bank: Mapping, rows: Mapping) -> dict:
-    """`bank` with every leaf `rows` holds added beside its own."""
-    merged = dict(bank)
-    for key, value in rows.items():
-        held = merged.get(key)
-        merged[key] = (_merged(held, value) if isinstance(held, Mapping) and isinstance(value, Mapping)
-                       else value)
-    return merged
-
 
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
@@ -190,8 +181,7 @@ class PassView:
 
 
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
-                  train: bool, decode: bool, positions, segment_ids, kv_store, per_layer_input,
-                  attention_metadata):
+                  train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
     scan. Training through host-resident banks scans with the fetch mapped
@@ -201,8 +191,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
         store = kv_store if count == 1 or specs[first].kv_shared else None
 
         def step(layer, carry, per_layer_input, *, store=store):
-            return layer(carry, train=train, decode=decode, positions=positions,
-                         segment_ids=segment_ids, kv_store=store,
+            return layer(carry, train=train, decode=decode, kv_store=store,
                          per_layer_input=per_layer_input,
                          attention_metadata=attention_metadata), None
 
@@ -224,8 +213,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              positions, segment_ids, kv_store, per_layer_input, attention_metadata=None,
-              banked: bool = False):
+              kv_store, per_layer_input, attention_metadata=None, banked: bool = False):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -253,8 +241,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
-                             positions=positions, segment_ids=segment_ids, kv_store=kv_store,
-                             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+                             kv_store=kv_store, per_layer_input=per_layer_input,
+                             attention_metadata=attention_metadata)
 
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
@@ -288,8 +276,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
             hidden, changed = run.apply(
-                variables, hidden, mutable=mutable, train=train, decode=decode,
-                positions=positions, segment_ids=segment_ids, kv_store=store,
+                variables, hidden, mutable=mutable, train=train, decode=decode, kv_store=store,
                 per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
             return hidden, dict(changed)
 
@@ -363,11 +350,9 @@ class PipelineStage(nn.Module):
         self.layers = [self.block(index, f'layers_{index}') for index in range(len(self.specs))]
 
     @nn.compact
-    def __call__(self, x, train: bool = False, positions=None, segment_ids=None,
-                 per_layer_input=None, attention_metadata=None):
+    def __call__(self, x, train: bool = False, per_layer_input=None, attention_metadata=None):
         return run_stack(self.layers, self.block, self.specs, self.groups, x,
-                         train=train, decode=False, positions=positions,
-                         segment_ids=segment_ids, kv_store=None,
+                         train=train, decode=False, kv_store=None,
                          per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
 
@@ -462,7 +447,7 @@ class StackView:
                     # A bank already stored under the run's name holds the
                     # leaves its rows lack (`banked_collections`); the rows
                     # stack into it.
-                    tree[name] = _merged(tree[name], runs[0]) if name in tree else runs[0]
+                    tree[name] = merge(tree[name], runs[0]) if name in tree else runs[0]
                 else:
                     stages[name] = jax.tree.map(_on_stage_axis, _stack_leaves(*runs))
             if stages:
@@ -549,8 +534,8 @@ def _whole(value, axis: int):
     return moved.reshape((*shape[:axis], shape[axis] * shape[axis + 1], *shape[axis + 2:]))
 
 
-def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions, segment_ids,
-                 per_layer_input, attention_metadata=None):
+def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, per_layer_input,
+                 attention_metadata=None):
     """GPipe over the stage axis, as MaxText's `layers/pipeline.py` runs it.
 
     Iteration t runs stage s on microbatch t - s, the layers stacked over the
@@ -571,8 +556,6 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions
     batch_axis = 1 if model.altup is not None else 0
     micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
-    per_row = [None if value is None else micro(jnp.asarray(value), 0)
-               for value in (positions, segment_ids)]
     inputs = (
         None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
     )
@@ -604,9 +587,8 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions
         return _on_stage_axis(jax.vmap(
             lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
 
-    def call_stage(stage, x, positions, segment_ids, per_layer_input, attention_metadata):
-        return stage(x, train=train, positions=positions, segment_ids=segment_ids,
-                     per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+    def call_stage(stage, x, per_layer_input, attention_metadata):
+        return stage(x, train=train, per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
     def iteration(module, carry, step):
         state_io, shift = carry
@@ -623,8 +605,7 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions
                               groups=view.groups, name='stages')
         run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
                       in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
-        out = _on_stage_axis(run(stage, stages_in, gather(per_row[0], ids),
-                                 gather(per_row[1], ids), stage_inputs,
+        out = _on_stage_axis(run(stage, stages_in, stage_inputs,
                                  jax.tree.map(lambda value: gather(value, ids), metadata)))
         state_io = jax.lax.dynamic_update_index_in_dim(
             state_io, rotate_up(stream, out), slot, 1)

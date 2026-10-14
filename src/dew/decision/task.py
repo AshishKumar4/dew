@@ -22,10 +22,10 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures
-from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
+from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -59,6 +59,9 @@ from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
+
+    from dew.decision.objective import DecisionObjective
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -142,19 +145,20 @@ class Decide:
     def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya (`LayaCheckpoint`) or Clef (`ClefCheckpoint`) checkpoint as a task.
+        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
+        checkpoint (`JointCheckpoint`) as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
-        `rl_agent_config.json`; Clef ships none. Either answers with Jev's
-        confidence; `replace(task, confidence=...)` selects Laya's
-        (`EntropyConfidence`) or Clef's (`TopProbability`).
+        `rl_agent_config.json`; a joint-head release ships none. Either
+        answers with Jev's confidence; `replace(task, confidence=...)` selects
+        Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
         label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and ClefCheckpoint.exists(name, revision=revision):
-            clef = ClefCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                       attention_impl=attention_impl)
-            return cls(clef.model, clef.variables, JointLayout(), clef.tokenizer, clef.specials, name=label,
-                       processor=clef.processor)
+        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
+            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
+                                           attention_impl=attention_impl)
+            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
+                       name=label, processor=release.processor)
         checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl)
         choice, score, noul = checkpoint.temperatures
@@ -165,7 +169,7 @@ class Decide:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: "MeshSpec | None" = None, layout: "Placement | None" = None,
+                 mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
         """Load the `DecisionObjective` run in `directory` as a task.
 
@@ -263,7 +267,7 @@ class Decide:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
         Images need a layout with a place for them (`Layout.image`) and the
-        backbone's processor, as a Clef release brings.
+        backbone's processor, as a joint-head release brings.
         """
         return self._seen(state, questions, images)[0] if images else self.batch([(state, questions)])[0][0]
 
@@ -309,6 +313,11 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = ()) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in rows:
+            if not self.layout.fits(row):
+                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
+                                 f"the maximum context length, max_len={self.layout.max_len}")
+        self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
@@ -354,7 +363,7 @@ class Decide:
         length = _bucket(inputs.tokens.shape[1])
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
-            valid=_widened(inputs.valid, length),
+            segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = _bucket(len(rows), smallest=1)
@@ -401,7 +410,7 @@ class Decide:
         If asked, it also fits a binning map and abstention thresholds that keep the
         error of the accepted answers at `target_error`, as `Calibration`'s parts fit
         them. `held_out` is labelled examples, or a dataset's validation reader
-        (`DecisionObjective.dataset(...).val`), whose rows are already laid out. The
+        (``load(recipe, objective=...).val``), whose rows are already laid out. The
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
@@ -424,20 +433,31 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
-        from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
-        objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
+        objective = self._scoring
         # A batch is one pass within the budget, as `batch` packs its rows, on
         # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        reader = validation(held, batch=rows, objective=objective.data(), read="memory")
+        evaluation = Evaluation.run(objective, self.variables, reader,
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
+
+    @functools.cached_property
+    def _scoring(self) -> "DecisionObjective":
+        """The objective `score` evaluates through, one for the task, so a
+        later call runs the forward the first compiled (`Objective.program`)."""
+        from dew.decision.objective import DecisionObjective
+
+        return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
@@ -455,8 +475,9 @@ class Decide:
 
     def _scored_reader(self, reader: Reader) -> list[Scored]:
         scored = []
+        segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch)
+            inputs = laid_out(batch, segments)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -491,7 +512,7 @@ class Decide:
         reports whether it abstained when the calibration gates, and `usage` reports
         how much of the state it kept.
 
-        Beyond Jev's fields a request may carry `images`, as Clef's does: a list of
+        Beyond Jev's fields a request may carry `images`: a list of
         images, each a PIL image, encoded image bytes, or a base64 string, bare or as
         a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
         extension fields are dropped and the response holds Jev's fields alone.
@@ -578,18 +599,21 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
-    """The `DecisionInputs` of a batch the decision dataset laid out (`Encoding`)."""
+def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+    """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
+    holding at most `max_segments` rows."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
-    return DecisionInputs(tokens=array("tokens"), valid=array("valid"), kinds=array("kinds"),
+    def given(name: str) -> jax.Array | None:
+        return array(name) if name in batch else None
+
+    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), kinds=array("kinds"),
                           questions=array("questions"), spans=array("spans"),
                           option_spans=array("option_spans"), options=array("options"),
-                          positions=array("positions") if "positions" in batch else None,
-                          slots=array("slots") if "slots" in batch else None,
-                          option_slots=array("option_slots") if "option_slots" in batch else None,
-                          slotted=array("slotted") if "slotted" in batch else None)
+                          positions=array("positions"), slots=given("slots"),
+                          option_slots=given("option_slots"), slotted=given("slotted"),
+                          max_segments=max_segments)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:

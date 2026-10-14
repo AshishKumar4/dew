@@ -180,6 +180,9 @@ KV_HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_kv
 """A `[batch, length, kv_heads, head_dim]` key or value. Grouped heads the
 tensor axis does not divide are computed whole on every tensor shard, the
 way Megatron repeats them."""
+SCORES: LogicalAxes = ("activation_batch", "activation_heads", "activation_length", None)
+"""A `[batch, heads, queries, keys]` attention mask or bias, any of whose
+leading three may broadcast."""
 SPREAD: LogicalAxes = ("activation_batch", "activation_spread", None)
 """A `[batch, length, width]` activation whose per-token work splits no
 tensor width, multi-head latent attention's down-projections and their
@@ -192,11 +195,9 @@ LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_voca
 """`[batch, length, vocab]` scores."""
 
 
-DECLARED: dict[type, dict[Suffix, LogicalAxes]] = {}
-"""Each decorated module class's own declarations."""
 _OWNERS: dict[Suffix, tuple[LogicalAxes, type]] = {}
 """Every declaration by its suffix, with the class that made it: the table
-`declared_axes` matches, one set of axes per suffix across all classes."""
+`declarations` matches, one set of axes per suffix across all classes."""
 
 @dataclasses.dataclass
 class Schedule:
@@ -304,7 +305,7 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
 def trace_context() -> tuple:
     """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
     pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
-    its arguments' shapes is reused only under the same (`Objective._compiled_program`)."""
+    its arguments' shapes is reused only under the same (`Objective.program`)."""
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
                          for axis, link in _LINKS.get().items()))
@@ -470,6 +471,19 @@ def axis_rules() -> LogicalAxisRules:
     return tuple(nn.get_logical_axis_rules()) or DEFAULT_RULES
 
 
+def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
+    """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
+    (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
+    rule's key heads, Mamba-2's B and C), so no group's gradient is summed across shards: a
+    per-shard kernel's placement (`manual_map`)."""
+    spec = logical_spec(HEADS, shape)
+    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    mesh = jax.sharding.get_abstract_mesh()
+    if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
+    return rows, heads
+
+
 def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
                  rules: LogicalAxisRules | None = None,
                  mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
@@ -539,9 +553,10 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     weight. With it fsdp gathers weights and splits rows, as fully sharded
     data parallelism is defined. No mesh in context leaves `x` as it is, and
     under a pipeline's vmap the stage axis takes the vmapped dimension. An
-    Explicit axis stays where `x`'s type places it (`auto_part`)."""
+    Explicit axis stays where `x`'s type places it (`auto_part`), so a mesh
+    of Explicit axes alone leaves `x` as it is too."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty:
+    if mesh.empty or mesh.are_all_axes_explicit:
         return x
     return jax.lax.with_sharding_constraint(x, auto_part(logical_spec(axes, x.shape), mesh))
 
@@ -654,7 +669,6 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
                     f"{held[0]} by {_qualified(held[1])}; a suffix has one set of axes")
         for suffix, axes in declared.items():
             _OWNERS.setdefault(suffix, (axes, cls))
-        DECLARED.setdefault(cls, {}).update(declared)
         return cls
 
     return decorate
@@ -726,32 +740,36 @@ def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
         _BOXED.reset(token)
 
 
-def declared_axes(path, ndim: int) -> LogicalAxes | None:
-    """The declared axes of the parameter at `path`, or None for an unnamed one.
+def declarations(tree) -> dict[Suffix, LogicalAxes]:
+    """The axes `logical_axes` declares for each leaf of `tree`, by the
+    leaf's parameter path, the one place the declarations are read: a
+    declaration names a module, whose parameters share its axes, or one
+    parameter under its module, for a module whose leaves have different
+    axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    """
+    table: dict[Suffix, LogicalAxes] = {}
+    for path, _ in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
+        names = parameter_path(path)
+        suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
+        if suffix is not None:
+            table[names] = _OWNERS[suffix][0]
+    return table
 
-    A parameter its module boxed with its axes (`boxed`) takes exactly
-    those, matched by its whole path: a variables leaf by its own, a leaf of
-    a tree that mirrors the params collection (an optimizer moment, a
-    gradient) under `params`. Otherwise a declaration names a module, whose
-    parameters share its axes, or one parameter under its module, for a
-    module whose leaves have different axes (GPT OSS's fused experts). The
-    parameter's own path is tried first.
+
+def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+    """The axes of the parameter at `path`, or None for an unnamed one: the
+    axes its module boxed on it (`boxed`), matched by its whole path, a
+    variables leaf by its own and a leaf of a tree that mirrors the params
+    collection (an optimizer moment, a gradient) under `params`; else those
+    `declared`, the `declarations` of the tree it is a leaf of, give it.
     """
     names = parameter_path(path)
     held = _BOXED.get()
-    own = held.get(names) or held.get(("params", *names))
-    if own is not None:
-        if ndim > len(own):
-            raise ValueError(f"{'/'.join(names)} is boxed {own}, which cannot name its {ndim} dimensions")
-        return own[len(own) - ndim:]
-    suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
-    if suffix is None:
+    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
+    if axes is None:
         return None
-    axes, owner = _OWNERS[suffix]
     if ndim > len(axes):
-        raise ValueError(
-            f"{'/'.join(suffix)} is declared {axes} by {_qualified(owner)}, which cannot "
-            f"name the {ndim} dimensions of {'/'.join(names)}")
+        raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
     return axes[len(axes) - ndim:]
 
 

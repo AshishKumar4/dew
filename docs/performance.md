@@ -189,8 +189,8 @@ Cost, at list prices on 2026-10-08:
 - A container costs $0.000020 per vCPU-second of active CPU, $0.0000025 per GiB-second of memory and $0.00000007 per
   GB-second of disk ([Cloudflare](https://developers.cloudflare.com/containers/pricing/)). That is $0.401 an hour for
   a standard-4 with its CPU busy.
-- An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) through $2.79
-  ([Lambda](https://lambda.ai/pricing)) to $5.07 for GCP's a2-ultragpu-1g in us-central1
+- An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) to $5.07 for GCP's
+  a2-ultragpu-1g in us-central1
   ([Google Cloud](https://cloud.google.com/products/compute/pricing/accelerator-optimized)). The run here was on an
   A100 40GB, so the 80GB's price is an upper bound on it.
 
@@ -350,14 +350,15 @@ reference-run rows into one table.
 | implementation | step | MFU | peak | Dew / torch throughput |
 |---|---:|---:|---:|---:|
 | torch.compile, transformers 5.3.0 + FLA/Liger, measured | 646.6 ms | 40.2% | 45.5 GiB, torch steady-window allocated peak | 1.00 |
-| Dew, estimated backbone from c50 E1 minus decision head | approximately 901 ms | approximately 28.8% | not measured head-free | approximately 0.72 |
+| Dew, estimated backbone: a full fine-tune's step minus its task head | approximately 901 ms | approximately 28.8% | not measured head-free | approximately 0.72 |
 
 The torch reference (`229677367e29043fa1cafa080747d71db923fa7a`) measured
 the 8 x 3072 full-fine-tune workload above on an A100-SXM4-80GB. Dew's
-figure is **an estimate, not a matched rerun**: E1's 951.7 ms includes the
-decision head, whose profile attributed 50.3 ms. Subtracting that gives
-901.4 ms; the head-free step and its peak have not been measured. E1 also
-used different data and a decision loss; the old torch run drew its rows
+figure is **an estimate, not a matched rerun**: Dew's 951.7 ms step at this
+shape includes a task head over the backbone, whose profile attributed
+50.3 ms. Subtracting that gives 901.4 ms; the head-free step and its peak
+have not been measured. That step also used different data and another loss;
+the old torch run drew its rows
 with torch.randint. Shared NumPy rows apply to the new paired runner only.
 The estimate makes Dew about 0.72 times the reference's throughput, not
 faster. The next same-session pair replaces this estimate; until then no
@@ -1049,7 +1050,7 @@ library, built from flash-attn3-jax's torch-free port of Dao-AILab's hopper/ ker
 paged and appended caches, softcap, sliding windows, packed GQA, fp8 and the 96 and 192 widths,
 which round up to 128 and 256.
 
-E1's attention call, 8 x 3072 tokens, causal, bf16, forward and backward, on an H100 SXM (jax
+Qwen3.5-0.8B's attention call, 8 x 3072 tokens, causal, bf16, forward and backward, on an H100 SXM (jax
 0.11.2, one session, median of 20):
 
 | kernel | ms |
@@ -1065,10 +1066,10 @@ E1's attention call, 8 x 3072 tokens, causal, bf16, forward and backward, on an 
 | torch 2.14 FlashAttention-3 (kernels-community build) | 2.58 |
 
 Every output and gradient lay at the same distance from float64 (1.59e-4 and 1.68e-4 RMS for the
-output and the query gradient). E1 itself at 8 x 3072 on the H100 SXM went from 396.1 to 336.7 ms
-a step, its attention from 92.0 to 29.4 ms of device time, with `tools/attribute_step.py`.
-Calls with key lengths, such as Clef's decision head, stay on cuDNN: FlashAttention-3 ends keys at
-lengths only through packed offsets, and on E1 it took 1.29 ms where cuDNN took 1.10. So
+output and the query gradient). A Qwen3.5-0.8B fine-tune at 8 x 3072, bf16, on the H100 SXM went
+from 396.1 to 336.7 ms a step, its attention from 92.0 to 29.4 ms of device time, with
+`tools/attribute_step.py`. Calls with key lengths stay on cuDNN: FlashAttention-3 ends keys at
+lengths only through packed offsets, and at that shape it took 1.29 ms where cuDNN took 1.10. So
 `KERNELS['attention']` names flash for sm90. The xla, jax.nn cuDNN, tokamax Triton and
 FlashAttention-3 rows reproduce with `PYTHONPATH=src python tools/benchmark_attention.py
 --implementations xla jax_cudnn triton flash --sequence-lengths 3072 --head-dims 256 --batch-size 8
@@ -1078,12 +1079,102 @@ Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source fo
 FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
 backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
+### Heads of 64 on the H100, 2026-10-13
+
+'auto' sends a call of heads up to 64 wide that cuDNN would take to tokamax's Pallas-Triton kernel
+(`triton_runs`), measured faster than cuDNN on an RTX 4080 and as fast as FlashAttention-2 on an
+A100. On an H100 SXM at Llama-3.2-1B's attention (4 x 4096 tokens, 32 query heads over 8 of 64,
+causal, bf16, jax 0.11.2, tokamax 0.0.15) forward and backward took 4.44 ms on it, 2.78 on cuDNN and
+2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So sm90's row
+names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHONPATH=src python
+tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
+--head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
+
+### Heads of 64 on the A100, 2026-10-14
+
+FlashAttention-2 (`dew_flash_attn` 0.3.0) now beats tokamax's Pallas-Triton kernel at every 64-wide
+shape on an A100-SXM4-40GB, forward and backward, so sm80's row names flash for those heads too
+(`attention_narrow`). Milliseconds, bf16, jax 0.11.2, tokamax 0.0.15, the median of seven
+20-call windows:
+
+| shape | Triton | FlashAttention-2 | cuDNN |
+|---|---|---|---|
+| 8 x 2048 causal, 32 query heads over 4 | 5.34 | 3.63 | 5.14 |
+| 8 x 2048 causal, 32 heads | 5.17 | 3.53 | 5.02 |
+| 8 x 2048 bidirectional, 32 query heads over 4 | 9.12 | 5.89 | 7.99 |
+| 32 x 256 bidirectional, 12 heads (SimpleDiT-B) | 0.439 | 0.380 | 0.540 |
+| 8 x 1024 bidirectional, 12 heads | 1.356 | 0.702 | 0.979 |
+| 4 x 4096 causal, 16 heads | 4.89 | 3.48 | 4.45 |
+
+'auto' took Triton for the first shape in a 1.1B Llama-style step (22 layers of the first row's
+attention, 8 x 2048 tokens, AdamW), where attention was 120 of its 652.6 ms.
+
 ### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
 
 At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
 cuDNN refuses heads over 128, the wheel's sm120 build ran forward and backward in 3.27 and 6.32 ms
 against XLA's 9.84 and 19.34 on a G4, its float64 distances those of FlashAttention-2 in torch, so
 sm120's row names 'flash'.
+
+### Sliding windows and attention sinks on FlashAttention, 2026-10-12
+
+A call with a window or attention sinks did not reach FlashAttention: sinks ran XLA's composed
+attention, dense for a full layer, and a window ran cuDNN's where it took the call or XLA's band
+of blocks. dew_flash_attn 0.3.0 passes FlashAttention's window to both kernels, builds
+FlashAttention-3 with sliding windows and 192-wide heads (a narrower value is padded to the
+query's width, `widen_value_heads`: the FA3 port sets the value's strides from the query's
+width, so its 192-by-128 kernels ran out of bounds and returned NaN on an H100), and composes
+sinks over the kernel's log-sum-exp. A sink adds `e^s` to each row's denominator, so the output
+is the kernel's times the share the keys keep, `sigmoid(lse - s)`; the kernel's own backward
+takes the gradient times that share, and the sink's logit takes minus the rest of the share
+times each row's gradient along the output.
+
+Forward and backward in ms, bf16, Dew's path for the call against flash, the A100 and the H100
+SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
+
+| call | Dew's path | A100 | A100 flash | H100 | H100 flash | RTX 4080 | 4080 flash |
+|---|---|---:|---:|---:|---:|---:|---:|
+| gpt-oss-20b full layer: 4096 tokens, 64 query heads over 8 of 64, causal, sinks | xla | 80.98 | 8.38 | 51.99 | 2.24 | out of memory | 7.33 |
+| gpt-oss-20b sliding layer: the same with a 128-key window | xla | 11.06 | 2.45 | 4.27 | 0.90 | 8.01 | 2.16 |
+| MiMo-V2-Flash sliding layer: 128 query heads over 8 of 192, values 128, 128 keys, sinks | xla | 19.03 | 10.54 | 8.13 | 4.10 | 18.35 | 11.61 |
+| Mistral-7B v0.1: 8192 tokens, 32 over 8 of 128, 4096 keys | cudnn | 13.56 | 10.22 | 3.08 | 2.59 | 21.29 | 18.44 |
+| Gemma 3: 4096 tokens, 8 over 4 of 256, 1024 keys | xla | 9.17 | 2.63 | 4.16 | 0.84 | | |
+| ModernBERT local layer: 8192 tokens, 12 heads of 64, 64 keys either side | xla | 46.96 | 1.12 | 26.61 | 0.40 | 47.23 | 0.59 |
+
+The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. Flash's output and
+its query, key, value and sink gradients lie within tests/reference_error.py's rule of the xla
+kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So the
+target rows of sm80, sm89 and sm90 name flash for `attention_window` and `attention_sinks`; sm120
+keeps its windows on cuDNN and its sinks on XLA until a G4 measures them. A packed or key-masked
+windowed call keeps its band on cuDNN, which takes the band's mask as a bias. Each row reproduces
+with `tools/benchmark_attention.py`, for example the MiMo row with `PYTHONPATH=src python
+tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096 --head-dims 192
+--value-dim 128 --batch-size 2 --heads 128 --kv-groups 16 --causal True --sliding-window 128
+--sinks`.
+
+### Packed rows on FlashAttention's varlen kernel, 2026-10-13
+
+A packed call ran XLA's attention under the document mask. Flash's varlen kernel takes the rows as
+sequences instead, each document and each row's padding after them one sequence over the flattened
+tokens, so `cu_seqlens` holds `B * (max_segments + 1)` sequences whatever the rows hold: the cap is
+a static size, and the sequences past a row's documents are empty but still launch. At Qwen3.5-0.8B's
+attention (8 x 3072 tokens, 8 query heads over 2 of 256, causal, 64 padding tokens a row), forward
+and backward in ms, median of 20, jax 0.11.2:
+
+| documents a row | xla, document mask | flash, cap = documents | flash, cap 64 | flash, cap 3072 |
+|---|---:|---:|---:|---:|
+| H100 SXM, 1 | 12.58 | 2.63 | 4.19 | 81.61 |
+| H100 SXM, 4 | 12.68 | 1.71 | 3.22 | 81.03 |
+| H100 SXM, 16 | 12.27 | 1.45 | 2.66 | 79.94 |
+| A100 40GB, 1 | 22.75 | 8.23 | 13.69 | 162.51 |
+| A100 40GB, 4 | 22.73 | 5.77 | 9.19 | 159.02 |
+| A100 40GB, 16 | 24.65 | 3.94 | 6.69 | 157.13 |
+
+An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
+loses to the mask, and 64 wins at every document count. The target rows of sm80 and sm90 name
+flash for `attention_packed`, and `flash_refusal` takes a packed call there when its
+`Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`); a cap the data does not declare
+is the row length, which stays on the mask.
 
 ### Splash's tiles on the TPU, 2026-10-02
 
@@ -1755,10 +1846,9 @@ Over an fsdp mesh GSPMD placed the gated delta net's projections head-split
 with the rows gathered: each device ran both rows' delta rule, and the step
 moved 8.4 GiB of all-to-alls and 2.8 GiB of activation gathers. Each
 projection now keeps the residual's placement
-(`GatedDeltaNet._project`). Qwen3.5-9B with its middle eight layers (12 to
-20) run twice, rank-256 factors over a frozen bf16 base, one 3072-token row
-a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
-102918039, the median of steps 100 to 220:
+(`GatedDeltaNet._project`). Qwen3.5-9B, LoRA rank 256 over a frozen bf16
+base, FSDP 2, one 3072-token row a GPU, minimal remat, two H100 80GB HBM3
+SXMs over NVLink, land/gdn-unit 102918039, the median of steps 100 to 220:
 
 | run | step ms | peak GiB |
 |---|---|---|
@@ -1768,15 +1858,6 @@ a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
 
 The profile's delta-net time fell from 175 to 95 ms over both devices, and
 every all-to-all and activation gather left the step.
-
-```
-cd <dew checkout> && PYTHONPATH=src python recipes/decision/clef.py --mixture.root <mix> --trainer.name run \
-  --pretrained Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --max-len 3072 \
-  --max-state-tokens 1024 --trainer.batch-size 2 --trainer.steps 220 --trainer.eval-every 220 \
-  --trainer.checkpoint-every None --trainer.log-every 1 --no-calibrate --optim.schedule.warmup-steps 10 \
-  --lora.rank 256 --param-dtype bfloat16 --loop-steps 2 --loop-layers 12 20 --remat minimal \
-  --trainer.mesh.fsdp 2
-```
 
 ## UNet batch scaling
 
@@ -1819,8 +1900,9 @@ nine of them in under an hour.
 ```
 curl -o data/shakespeare.txt --create-dirs \
     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-dew tokenize --input data/shakespeare.txt \
-    --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
+dew data export records data/shakespeare-byte \
+    --fields '{"source": "data/shakespeare.txt"}' \
+    --format array_record --tokenizer byte --read memory
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \
     --steps 2000 --emb-features 128 --num-layers 2 --num-heads 2 --seed 0 \
@@ -2940,7 +3022,7 @@ To check training quality, I trained for 2000 steps on wikitext-103 Qwen3 tokens
 
 The high half existed for layout parity. With the gradient rounded once, a 4 x RTX 3090 bf16 run read 1.75 times its bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the high half. Why the MoE's gap is that large is not yet established. A run that compares layouts in bf16 sets `matmul_precision="highest"`, which keeps the head fp32, and `tools/layout_parity.py` does so for bf16 decoders.
 
-On sm80 and sm89 the trainer compiles without XLA's Triton GEMM fusions, unless the run sets that flag explicitly or the model has an SSD mixer (`KERNELS['xla_triton_gemm']`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s against 47.5 s, because there is no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5. Standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. A Mamba-2 step lost 7.7% (127.9 to 138.6 ms), because its SSD scan's small batched dots gain from the fusions.
+On sm80 and sm89 the trainer compiles without XLA's Triton GEMM fusions, unless the run sets that flag explicitly or the model has an SSD mixer whose scan runs on XLA (`KERNELS['xla_triton_gemm']`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s against 47.5 s, because there is no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5. Standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. A Mamba-2 step lost 7.7% (127.9 to 138.6 ms), because its SSD scan's small batched dots gain from the fusions. On mamba_ssm's ported kernels (sm80 and sm90) the scan has no batched dots left, and Mamba-2 130M's step at 4 x 1024 tokens ran 86.3k tokens/s without the fusions against 83.7k with them (A100, 2026-10-13).
 
 On the RTX 4080, two-layer steps at 2048, 4080 and 16384 tokens go from 56.7 to 53.5, 103.8 to 94.0 and 420.5 to 406.3 ms, and tiled heads run 3-6% faster. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936 and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a cliff at 4096 tokens, where a training step took 286.0 ms with the fusions and takes 93.4 ms without. At other shapes the unfused step can use more temporary memory, so before tiling the head or recomputing blocks, the trainer tries a step that does not fit with XLA's default options. At 8192 tokens only that whole-logits step fits (178.7 ms, against 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
 
@@ -3094,6 +3176,49 @@ mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 `PYTHONPATH=src python tools/benchmark_kernels.py lora --tokens 768 --tiles 128,128,32,4,3
 128,128,64,4,3 128,256,64,8,3 64,128,32,4,4` (jax 0.11.2). The G4 (sm120) was not measured.
 
+### A LoRA run's frozen base in FP8, 2026-10-13
+
+A frozen projection takes part in two products a step, its forward and its input's gradient, and
+neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
+(`dew.training.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
+operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
+rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
+rows costs a read and a write of them each product, so FP8 pays where the product is wide in both
+widths. Forward plus input gradient of one projection on an H100 80GB HBM3, bf16 against FP8,
+jitted medians of five interleaved groups of thirty calls, 8192 tokens (jax 0.11.2):
+
+| in x out | bf16 ms | FP8 ms | ratio |
+|---|---:|---:|---:|
+| 1024 x 1024 | 0.131 | 0.187 | 0.70 |
+| 1024 x 3584 | 0.273 | 0.364 | 0.75 |
+| 2048 x 2048 | 0.292 | 0.341 | 0.86 |
+| 4096 x 1024 | 0.304 | 0.392 | 0.78 |
+| 2048 x 8192 | 0.894 | 0.844 | 1.06 |
+| 4096 x 4096 | 0.839 | 0.766 | 1.10 |
+| 4096 x 8192 | 1.741 | 1.332 | 1.31 |
+| 4096 x 12288 | 2.609 | 1.779 | 1.47 |
+| 12288 x 4096 | 2.639 | 1.820 | 1.45 |
+
+So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention and MLP
+projections gain. Which sites run FP8 is that measurement on the run's own GPU and token count
+(`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
+refused rather than reusing it. The function changes by E4M3's rounding of both operands.
+
+The packed codes stand in the train state in place of the frozen kernels they encode, two bytes a
+parameter as bf16's are, and a merge decodes them (`frozen_fp8_kernel`). A whole run, Qwen3.5-9B
+under a rank-16 LoRA on its attention and MLP projections, 2 x 2048 fineweb-edu tokens a step, 300
+steps on an H100 80GB HBM3 (jax 0.11.2), each arm on the same windows:
+
+| base | step ms | peak GiB | loss over bf16's, last 50 steps |
+|---|---:|---:|---:|
+| bf16 | 299.8 | 44.59 | |
+| bf16, another LoRA seed | 299.8 | 44.59 | under 0.02% |
+| FP8 at the 189 sites measured faster | 255.3 | 44.83 | +0.40% |
+
+The FP8 run's loss sits about 0.4% above bf16's from the first step on, the rounding of both
+operands, where another seed of the bf16 run moves it by under 0.02%; a run that wants bf16's
+function keeps its base in bf16.
+
 ### Faster kernels not adopted
 
 Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each of these needs a kernel or a dependency that Dew does not have yet:
@@ -3119,7 +3244,28 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 | TPU v6e | 128 | 4096 | 0.632 ms | 0.705 ms |
 | RTX 4080 | 256 | 4096 to 65536 | 2.28 to 33.63 ms | does not compile: 590 KB of shared memory asked, 101 KB available |
 
-On the RTX 4080 the Triton kernel ran 6x to 12x slower than XLA wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. So the scan takes the kernel on TPU only.
+On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. So it runs on TPU only, and a GPU runs mamba_ssm's own decomposition.
+
+### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
+
+`dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a tuner `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `8ccb9cdfd`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
+
+| GPU | shape (batch x tokens; heads of 64 over groups, state 128, chunk) | XLA | port | mamba_ssm |
+|---|---|---|---|---|
+| H100 80GB HBM3 | Nemotron 3 Ultra, 1 x 4096; 256 over 8, chunk 128 | 4.74 / 12.83 ms | 0.71 / 2.06 ms | 0.76 / 3.53 ms |
+| H100 80GB HBM3 | the same, 1 x 8192 | 9.53 / 35.76 | 1.31 / 3.98 | 1.37 / 6.65 |
+| H100 80GB HBM3 | the same, 4 x 4096 | 19.22 / 58.31 | 2.64 / 7.89 | 2.68 / 13.16 |
+| H100 80GB HBM3 | Mamba-2 2.7B, 2 x 4096; 80 over 1, chunk 256 | 3.82 / 9.34 | 0.46 / 1.38 | 0.58 / 2.43 |
+| A100-SXM4-40GB | Nemotron 3 Ultra, 1 x 4096 | 9.41 / 35.27 | 1.93 / 5.40 | 1.50 / 6.78 |
+| A100-SXM4-40GB | the same, 1 x 8192 | 17.74 / 73.84 | 3.62 / 9.87 | 2.75 / 12.83 |
+| A100-SXM4-40GB | the same, 4 x 4096 | 35.89 / 119.92 | 7.09 / 17.34 | 5.30 / 25.39 |
+| A100-SXM4-40GB | Mamba-2 2.7B, 2 x 4096 | 6.75 / 70.40 | 1.02 / 2.89 | 1.08 / 4.51 |
+
+The heuristic configs are the tuner's picks on an H100 at Ultra's shape. There, every launch timed alone at each config of its space (the tuner's own measurement) took 2.03 ms summed at its best against mamba_ssm's autotuned picks on the port's kernels, whose chunk state ran 0.267 against 0.157 ms. On the A100 at the H100's picks the launches summed 5.18 ms against 4.73 at their own best; there the port's forward runs behind mamba_ssm's at Ultra's shapes and its forward plus backward ahead. fp32 operands, which an fp32 model hands, take TF32x3 products where mamba_ssm takes one TF32 pass: 1.70 / 5.26 ms at Ultra 1 x 4096 on the H100 against XLA's 4.89 / 12.59, and 9.33 / 19.52 against 9.67 / 36.42 on the A100 at the H100's picks, whose fp32 launches the A100's own picks take from 26.9 to 17.0 ms summed.
+
+Through the trainer (`tools/reference_runs/dew_lm.py`, bf16 compute, AdamW, 4 x 1024 tokens, 40 steps on synthetic token windows), Mamba-2 130M ran 71.2k tokens/s on main and 174.7k on the port on the H100 (MFU 6.0% to 14.7%, peak memory 18.6 to 5.9 GiB), and 33.9k and 83.5k on the A100 (MFU 9.0% to 22.2%). Mamba-2 2.7B on the H100 ran 5.47k and 16.5k tokens/s (MFU 9.2% to 27.8%). The losses after 40 steps agree to the third decimal (130M 11.182 and 11.174, 2.7B 10.924 and 10.918). The conv handing the scan `x`, `B` and `C` as three arrays (`causal_conv1d`'s `parts`) would save the copies at the port's edge, but the conv runs one kernel a part and the 130M step lost 6% with it (164.4k), so the conv hands one array that XLA splits. The scan's output is stored in fp32, so that a sequence-sharded scan adds the earlier shards' state before any rounding; that costs the 130M step 3% (169.4k with a bf16 output).
+
+Against float64 on the same inputs (ragged rows, packed documents, an initial state; forward, final state and every gradient), the port's bf16 RMS distance is mamba_ssm's on both GPUs, at four geometries (Mamba-2 130M's and 2.7B's heads, Ultra's state, ragged packed documents): the ratio is 1.00 on the final state and the gradients of `x`, `dt`, `B` and `C`, 1.00 to 1.06 on `A`'s, 0.70 to 0.72 on the initial state's, 0.67 to 1.73 on `D`'s (a sum over every token that cancels, whose mamba_ssm value moves between runs with its atomic adds), and 0.70 on the output, which the port stores in fp32 where mamba_ssm rounds it to bf16. Its fp32 distance is about a thousandth of mamba_ssm's TF32 and of XLA's default-precision einsums. A bf16 model's scan now sits where mamba_ssm's does, about 8 times XLA's fp32 scan's distance on the output, where it used to take fp32 operands from a wide conv, as transformers' torch path does.
 
 ### Packed sliding-window attention on GPU: `local_attention`
 
@@ -3181,7 +3327,7 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal_with_conv'` (MaxText's `'minimal'` and a linear-attention or SSM layer's short conv output kept; a decoder without such layers skips it, as it would compile the same step) to `'minimal'` (every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
 
 The trainer also plans the batch (`dew.training.planning`). Unless the run fixes `--trainer.split`, a step that does not fit whole is read in microbatches, every split-th row so no row leaves its device, with a window that pools them into the same update. The search compiles the batch whole, then the largest split at each rung until one fits, then halves toward the fewest microbatches at that rung. When the plan splits, `fit` also compiles the batch whole one remat rung up with the head tiled, times both for 10 steps after 2 of warmup, and keeps the faster one. Fewer rows do not always win. On an A100-40, Qwen3.5-0.8B's full fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without remat and 1174.1 ms whole under `'minimal'`. The plan, every compile it made and both times are in `StepCompiled.plan`, and the choice is recorded beside the compilation cache.
 

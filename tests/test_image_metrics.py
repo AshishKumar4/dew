@@ -42,6 +42,19 @@ def _uint8_batch(shape, key):
     return {'image': jnp.round((x + 1.0) * 127.5).clip(0, 255).astype(jnp.uint8)}
 
 
+def test_psnr_of_uint8_pixels_is_the_closed_form_of_their_difference():
+    """uint8 frames at `data_range` 255, as the docstring offers them, score as their pixel values do,
+    skimage's `10 log10(255^2 / MSE)` in float64: white against black is 0 dB, and random frames
+    match the float64 formula over the same pixels."""
+    white, black = jnp.full((1, 4, 4, 3), 255, jnp.uint8), jnp.zeros((1, 4, 4, 3), jnp.uint8)
+    assert float(psnr(white, black, 255.0)) == 0.0
+    draws = np.random.default_rng(0)
+    a, b = (jnp.asarray(draws.integers(0, 256, (2, 8, 8, 3)), jnp.uint8) for _ in range(2))
+    mse = np.mean((np.asarray(a, np.float64) - np.asarray(b, np.float64)) ** 2, axis=(1, 2, 3))
+    np.testing.assert_allclose(np.asarray(psnr(a, b, 255.0, per_example=True)),
+                               10 * np.log10(255.0 ** 2 / mse), rtol=1e-6)
+
+
 def test_ssim_falls_under_blur_and_noise(rng):
     """The point of SSIM: both degradations score below a perfect match."""
     x = _ramp_image((2, 32, 32, 3), rng)

@@ -13,6 +13,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew.interop.mamba2 import config_from_hf
@@ -38,6 +39,38 @@ def test_the_public_loader_reads_the_fixture(tensors):
     logits = source.model.apply(source.variables, ids)
     reference = np.load(FIXTURE / "logits.npy")
     assert largest(logits, reference) < 1e-5
+
+
+def test_a_bf16_mamba2_sums_its_residual_stream_in_fp32(tmp_path, tensors):
+    """`residual_in_fp32` (transformers' Mamba2Block and mamba_ssm's Block): in bf16 each layer reads
+    the stream in bf16 and adds its output to it in fp32. With the fixture's weights rounded to bf16
+    values (so the float64 port runs the same ones) and its embeddings scaled 256 times, so that the
+    stream dwarfs the mixers' outputs as Mamba-2 130M's massive activations do, each layer's stream
+    is held to the float64 port's by the float64 rule against transformers' own bf16 forward. A
+    stream rounded to bf16 sat 27 and 34 times farther."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    narrow = {name: np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32)
+              for name, value in tensors.items()}
+    narrow["backbone.embeddings.weight"] = narrow["backbone.embeddings.weight"] * 256
+    save_file(narrow, tmp_path / "model.safetensors")
+    (tmp_path / "config.json").write_text((FIXTURE / "config.json").read_text())
+    ids = np.load(FIXTURE / "input_ids.npy")
+
+    def port(dtype):
+        model = transformers.Mamba2ForCausalLM.from_pretrained(tmp_path, dtype=dtype).eval()
+        with torch.no_grad():
+            out = model(torch.from_numpy(ids.astype(np.int64)), output_hidden_states=True)
+        # Each layer's output, then the final norm's.
+        return [state.double().numpy() for state in out.hidden_states[:-1]]
+
+    truth, theirs = port(torch.float64), port(torch.bfloat16)
+    loaded = Pretrained.load(tmp_path, dtype="bfloat16", param_dtype="bfloat16")
+    _, state = loaded.model.apply(loaded.variables, jnp.asarray(ids), capture_intermediates=True,
+                                  mutable=["intermediates"])
+    for layer, (wide, narrow) in enumerate(zip(truth, theirs, strict=True)):
+        mine = np.asarray(state["intermediates"][f"layers_{layer}"]["__call__"][0], np.float64)
+        assert_as_exact_as_the_reference(mine, narrow, wide, f"layer {layer}'s residual stream")
 
 
 def mamba_ssm_config() -> dict:
@@ -81,9 +114,10 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     common 13 tokens.
 
     Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
-    equal; tolerance 1e-3, about twice that. Dew computing and storing
-    bfloat16 sits 4.8 from the fp32 reference, where the reference's own
-    bfloat16 forward sits 9.1; tolerance 10, about twice Dew's.
+    equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
+    the conv's bf16 output, as the reference's own bfloat16 forward does, and
+    is held to that forward's RMS distance from the fp32 logits
+    (`assert_as_exact_as_the_reference`).
     """
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
@@ -105,4 +139,7 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
     assert largest(logits, reference) < 1e-3
     assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    assert largest(bf16.model.apply(bf16.variables, ids), reference) < 10
+    with torch.no_grad():
+        theirs = port.to(torch.bfloat16)(torch.from_numpy(ids.astype(np.int64))).logits.float().numpy()
+    mine = np.asarray(bf16.model.apply(bf16.variables, ids), np.float32)
+    assert_as_exact_as_the_reference(mine, theirs, reference, "bf16 logits against the fp32 port's")

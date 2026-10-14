@@ -42,7 +42,17 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.rl",
                     "dew.objectives.rl.flow",
                     "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.harbor"]),
-    ("Data", ["dew.data", "dew.data.chat", "dew.data.dataset", "dew.data.images"]),
+    ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
+              "dew.data.dataset", "dew.data.plan", "dew.data.mixing", "dew.data.cache",
+              "dew.data.storage", "dew.data.sinks",
+              "dew.data.sources", "dew.data.sources.base", "dew.data.sources.files", "dew.data.sources.memory",
+              "dew.data.sources.hub", "dew.data.sources.tfds", "dew.data.sources.pytorch", "dew.data.sources.hf",
+              "dew.data.sources.grain", "dew.data.sources.iterator", "dew.data.sources.codec",
+              "dew.data.sources.urls", "dew.data.sources.av_utils",
+              "dew.data.steps.generic", "dew.data.steps.text", "dew.data.steps.windows", "dew.data.steps.chat",
+              "dew.data.steps.image", "dew.data.steps.video", "dew.data.chat", "dew.data.images", "dew.data.tokens",
+              "dew.data.text", "dew.data.video", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
+              "dew.data.image_codec"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
                 "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
@@ -50,7 +60,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
                 "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
-                "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
+                "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
                                 "dew.diffusion.presets", "dew.diffusion.discrete", "dew.sampling",
@@ -58,10 +69,11 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                                 "dew.sampling.decoding"]),
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
                               "dew.interop", "dew.interop.diffusion_gemma"]),
-    ("Decision models", ["dew.decision", "dew.decision.config"]),
+    ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
+                         "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
-    ("Configuration", ["dew.config", "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.telemetry.profile"]),
+    ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.
@@ -525,7 +537,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     bound.update(built)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
-    # Each outermost dotted name once: `dew.interop.hub.pull_from_hub`, not also `dew.interop.hub`.
+    # Only the outermost dotted name counts, so a method and its class are not counted twice.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     seen = set()
     for node in ast.walk(tree):

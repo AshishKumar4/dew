@@ -39,6 +39,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from dew.config.data import loader
+
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
           "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt")
 """TinyStories' validation split, about 19 MB of English, at a pinned revision."""
@@ -53,16 +55,19 @@ SHAPES = {
                       "mixture": {"experts": 64, "top_k": 2, "expert_features": 512, "layers": (1, 3, 5)}},
             "mesh": {"expert": -1}, "batch": 256, "lr": 1e-3, "target": 1.2},
     "pipe": {"model": {"emb_features": 512, "num_layers": 32, "num_heads": 8, "mlp_features": 2048},
-             "mesh": {"stage": -1, "microbatches": 16}, "batch": 128, "lr": 5e-4, "target": 1.2},
+             "mesh": {"stage": -1}, "microbatches": 16, "batch": 128, "lr": 5e-4, "target": 1.2},
 }
 
 
 def corpus(cache: Path) -> Path:
-    """The pinned text as byte tokens, train.bin and val.bin, written once."""
-    from dew.data import TokenCorpus
+    """The pinned text as a produced ArrayRecord token store."""
+    import numpy as np
+
+    from dew.data import ByteTokenizer
+    from dew.data.sinks import export
 
     tokens = cache / "tokens"
-    if (tokens / "meta.json").is_file():
+    if (tokens / "_dew_manifest.json").is_file():
         return tokens
     cache.mkdir(parents=True, exist_ok=True)
     text = cache / "TinyStories-valid.txt"
@@ -71,7 +76,13 @@ def corpus(cache: Path) -> Path:
         urllib.request.urlretrieve(CORPUS, part)
         part.rename(text)
     print("corpus sha256", hashlib.sha256(text.read_bytes()).hexdigest(), flush=True)
-    TokenCorpus.write(str(text), str(tokens), tokenizer="byte", val_fraction=0.01)
+    ids = np.asarray(ByteTokenizer().encode(text.read_text()), np.int32)
+    held = int(len(ids) * 0.01)
+    metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
+                "dtype": "int32", "eos_id": None}
+    export([{"text": ids[held:]}], str(tokens), format="array_record", metadata=metadata, length_field="text")
+    export([{"text": ids[:held]}], str(cache / "held_tokens"), format="array_record", metadata=metadata,
+           length_field="text")
     return tokens
 
 
@@ -202,7 +213,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import TokenWindows
+    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -215,13 +226,14 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
+    data = loader(TextData(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
+        validation_records=4 * (batch_size))
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
-    mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
-                      optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0), mesh=mesh,
-                      layout=Layout(), checkpoints=None, tracker=None)
+                      optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0),
+                      mesh=MeshSpec(**mesh_of(shape["mesh"], jax.device_count())),
+                      microbatches=shape.get("microbatches"), layout=Layout(), checkpoints=None, tracker=None)
     if args.diloco:
         # Each host's own devices: its steps sum nothing over the hosts.
         trainer.device_mesh = MeshSpec().build(jax.local_devices())

@@ -477,8 +477,8 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
             f"{share.index} of {share.count}. A position is where one share of "
             f"the data stopped and cannot be translated to another share, so "
             f"resume it on a mesh whose processes read those shares; a stream "
-            f"that reads its records globally, as every `train_stream` dataset "
-            f"does, saves a position that resumes on any partition.")
+            f"that reads its records globally, as every dataset compiled to a global "
+            f"order does, saves a position that resumes on any partition.")
     if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
             f"The checkpoint at {where} holds positions for share {share.index} "
@@ -953,8 +953,10 @@ class Checkpoints:
 
     def _custom(self, step: int) -> dict:
         """The custom metadata `step` was saved with, as this process cached
-        it or from its committed metadata."""
-        return self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+        it or from its committed metadata, which Orbax reads opening no manager."""
+        if step in self._custom_cache:
+            return self._custom_cache[step]
+        return ocp.metadata.get_step_metadata(self.path(step)).custom_metadata or {}
 
     def kept(self) -> list[Kept]:
         """Return the committed retained steps, oldest first; their immutable metadata is cached."""
@@ -1140,19 +1142,16 @@ class Checkpoints:
 
     @property
     def latest(self) -> int | None:
-        """Return the newest committed step a resume can read, local or persistent."""
-        persistent = self._open().latest_step()
-        if persistent is not None and (not self._complete(persistent) or
-                (self._step_metadata(persistent).custom_metadata or {}).get('weights_only', False)):
-            persistent = max(
-                (
-                    step
-                    for step in self._open().all_steps()
-                    if self._complete(step)
-                    and not (self._step_metadata(step).custom_metadata or {}).get("weights_only", False)
-                ),
-                default=None,
-            )
+        """Return the newest committed step a resume can read, local or persistent.
+
+        Asking opens and writes nothing: until this process writes, Orbax's
+        step format lists the committed steps read-only, and once it has, its
+        manager's view, which holds this process's own saves, does."""
+        steps = (self._manager.all_steps() if self._manager is not None
+                 else [found.step for found in ocp.step.standard_name_format().find_all(self.directory)])
+        resumable = (step for step in sorted(steps, reverse=True)
+                     if self._complete(step) and not self._custom(step).get("weights_only", False))
+        persistent = next(resumable, None)
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent
@@ -1563,7 +1562,11 @@ class Checkpoints:
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
         from dew.objectives.base import FROZEN, merge
         from dew.registry import resolve_dtype
-        from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
+        from dew.training.distributed import (
+            Layout as DefaultLayout,
+            MeshSpec as DefaultMesh,
+            device_mesh as resolve_mesh,
+        )
 
         target = resolve_dtype(param_dtype)
         step = self.pinned(step)
@@ -1574,7 +1577,7 @@ class Checkpoints:
         averaged = stored.get("ema") is not None if ema is None else ema
         if averaged:
             template["ema"] = stored["ema"]
-        device_mesh = (DefaultMesh() if mesh is None else mesh).build()
+        device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
         # its layers, and each bank reads onto its first layer's placement.

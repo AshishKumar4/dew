@@ -10,7 +10,7 @@ run into one group.
 import dataclasses
 from collections.abc import Mapping, Sequence
 
-from dew.registry import mixers
+from dew.registry import read_arguments
 
 from ..attention_residuals import ResidualSite
 from ..mixers import MixerBase
@@ -74,17 +74,18 @@ class LayerKind:
 
     def __post_init__(self):
         # A kind's mixer and ramp arrive as values from code and as records
-        # from a config, like the model's own; anything else is neither.
-        if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
-        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
+        # from a config, like the model's own (`read_arguments`); a bare rotary
+        # record names no class, so its own reader takes it.
+        records = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                   if field.name != "rope_scaling" and isinstance(getattr(self, field.name), Mapping)}
+        for name, value in read_arguments(type(self), records).items():
+            object.__setattr__(self, name, value)
+        if self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"a kind's mixer is a mixer value, its record, or None, "
                 f"not {self.mixer!r}")
         if isinstance(self.rope_scaling, Mapping):
             object.__setattr__(self, "rope_scaling", rope_scaling_from_record(self.rope_scaling))
-        if isinstance(self.yarn, Mapping):
-            object.__setattr__(self, "yarn", YarnScaling(**self.yarn))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,9 +150,11 @@ class LayerSpec:
     engram: int | None = None
     """The layer's place among the engram layers, whose bucket ids it reads
     before its attention; None for a layer without a lookup."""
-    prediction_slot: int | None = None
-    """The layer's place among the DSpark drafter's target layers, whose
-    input streams' mean it records; None for the rest."""
+    prediction_target: int | None = None
+    """The layer's own index when it is one of the DSpark drafter's target
+    layers, whose input streams' mean it records under its own name
+    (`CausalTransformer.draft_context` reads `layers_{index}`), so it runs
+    unrolled, as a `provider` does; None for the rest."""
     attention_norm: bool = True
     """Whether the block norms its attention input; ModernBERT's first block does not."""
 
