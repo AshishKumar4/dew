@@ -18,10 +18,8 @@ class Images:
 
     That is the tokens it expands them to, which a layout places in the row
     (`Layout.image`), each of its per-token fields over those tokens, and its
-    pixel fields. This is what Clef's `_encode_media` (joint_schema_model.py at
-    Cloudflare/clef 2f3de3dd) does: it runs the processor over the images'
-    texts and a newline, and the row's text tokens take 0 in every per-token
-    field.
+    pixel fields. The processor runs over the images' texts and a newline,
+    and the row's text tokens take 0 in every per-token field.
     """
 
     tokens: tuple[int, ...]
