@@ -159,6 +159,27 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
 
 
+def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_its_devices(monkeypatch):
+    """Each launch of a step's lowering, the plain one and the one that
+    describes its launches to `tune`, reads its config and its GPU model
+    without asking a traced array for its devices. That question raises an
+    error whose message walks the whole trace so far to say where the array
+    came from, once per array of each launch: quadratic in the step, it was
+    111 s of the packed Qwen3.5-0.8B step's 330 s compile on an A100."""
+    raised = []
+    made = jax.errors.ConcretizationTypeError.__init__
+
+    def counted(self, *args, **kwargs):
+        raised.append(type(self))
+        made(self, *args, **kwargs)
+
+    monkeypatch.setattr(jax.errors.ConcretizationTypeError, "__init__", counted)
+    with tuning.launches():
+        step().lower(*operands(15))
+    step().lower(*operands(15))
+    assert raised == []
+
+
 TRAINED = """
 import json, os, sys
 import jax, numpy as np, optax
