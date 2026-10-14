@@ -75,7 +75,13 @@ from dew.nn.protocols import (
 )
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
-from dew.training.quantization import QUANTIZATION, InputQuantization, measured_fp8_sites
+from dew.training.quantization import (
+    FROZEN_FP8,
+    QUANTIZATION,
+    InputQuantization,
+    frozen_fp8_kernel,
+    measured_fp8_sites,
+)
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -333,7 +339,7 @@ class Adapter:
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel, a, b = node["kernel"], node["lora_A"], node["lora_B"]
+            kernel, a, b = _base_kernel(variables, path), node["lora_A"], node["lora_B"]
             dtype = jnp.promote_types(kernel.dtype, jnp.float32)
             delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
                                   precision=jax.lax.Precision.HIGHEST)
@@ -458,9 +464,13 @@ class _Branch:
         else:
             axes = (-1,)
         axes = tuple(sorted(axis % x.ndim for axis in axes))
-        kernel = module.get_variable("params", "kernel")
-        a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
-        b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
+        if module.has_variable("params", "lora_A"):
+            # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
+            a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
+        else:
+            kernel = module.get_variable("params", "kernel")
+            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
+            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
@@ -590,13 +600,17 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
 def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
     """`variables` with the frozen FP8 kernels of the record `model` computes
     under packed from its `FROZEN` base (`InputQuantization.packed`), the
-    only kernels an adapter never trains."""
+    only kernels an adapter never trains, in place of those kernels: the
+    product never reads them (`frozen_fp8_dense`), and a merge decodes them
+    (`frozen_fp8_kernel`)."""
     records = [layer._dew_wrapper() for layer in wrapper_layers(type(model))[1]]
     record = next((wrapper for wrapper in records if isinstance(wrapper, InputQuantization)), None)
     if record is None or not record.frozen_fp8:
         return dict(variables)
     packed = record.packed(variables[FROZEN])
-    return {**variables, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
+    sites = {tuple(site.split("/")) for site in record.frozen_fp8}
+    frozen = select(variables[FROZEN], lambda path: not (path[-1] == "kernel" and path[:-1] in sites))
+    return {**variables, FROZEN: frozen, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
 
 
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
@@ -708,6 +722,19 @@ def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
                           for path in sorted(targets) if path in bindings})
 
 
+def _base_kernel(variables: Variables, path: Path, *, decoded: bool = True):
+    """The kernel of the module at `path` (under `params`): its own, or a
+    frozen FP8 site's from its packed codes (`frozen_fp8_kernel`), whose
+    shape alone is read where `decoded` is False."""
+    node = _node(variables, path)
+    if "kernel" in node:
+        return node["kernel"]
+    leaves = _node(variables[QUANTIZATION], path[1:])
+    if not decoded:
+        return jax.ShapeDtypeStruct(np.shape(leaves[FROZEN_FP8[0]])[::-1], jnp.float32)
+    return jnp.asarray(frozen_fp8_kernel(leaves))
+
+
 def _node(tree: Mapping, path: Path) -> Mapping:
     node = tree
     for name in path:
@@ -764,7 +791,7 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
             "delta on the assembled tensor does not split into one per leaf")
     if len(layout.shape) != 2:
         raise ValueError(f"{name} stores {layout.shape}, not a [out, in] matrix")
-    kernel_shape = _node(variables, layout.paths[0][:-1])["kernel"].shape
+    kernel_shape = tuple(np.shape(_base_kernel(variables, layout.paths[0][:-1], decoded=False)))
     out, inner = layout.shape
     transpose = layout.transpose or tuple(range(len(kernel_shape)))
     stored = tuple(kernel_shape[axis] for axis in transpose)

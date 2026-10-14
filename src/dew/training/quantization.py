@@ -242,8 +242,9 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
     contracting-axis scale of the other direction, so the two are quantized
-    apart. Two E4M3 copies are two bytes a parameter, a bf16 kernel's, so
-    the gain is the products' rate, not memory."""
+    apart. The two E4M3 copies replace the kernel in the train state
+    (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
+    kernel's, so the gain over a bf16 base is the products' rate."""
     from dew.interop.codecs import quantize_fp8_blocks
 
     kernel = np.asarray(kernel, np.float32)
@@ -252,6 +253,16 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
     forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
     dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
+
+
+def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> np.ndarray:
+    """The `[in, out]` kernel a frozen FP8 site's `leaves` hold, in float32:
+    the forward codes decoded under their row scales (`frozen_fp8_leaves`),
+    for a merge or an export, which read the kernel the products ran on."""
+    from dew.interop.codecs import dequantize_fp8_blocks
+
+    forward = np.asarray(leaves[FROZEN_FP8[0]])
+    return dequantize_fp8_blocks(forward, np.asarray(leaves[FROZEN_FP8[1]]), (1, forward.shape[1])).T
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
