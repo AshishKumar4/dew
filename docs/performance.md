@@ -350,14 +350,15 @@ reference-run rows into one table.
 | implementation | step | MFU | peak | Dew / torch throughput |
 |---|---:|---:|---:|---:|
 | torch.compile, transformers 5.3.0 + FLA/Liger, measured | 646.6 ms | 40.2% | 45.5 GiB, torch steady-window allocated peak | 1.00 |
-| Dew, estimated backbone from c50 Qwen3.5-0.8B minus decision head | approximately 901 ms | approximately 28.8% | not measured head-free | approximately 0.72 |
+| Dew, estimated backbone: a full fine-tune's step minus its task head | approximately 901 ms | approximately 28.8% | not measured head-free | approximately 0.72 |
 
 The torch reference (`229677367e29043fa1cafa080747d71db923fa7a`) measured
 the 8 x 3072 full-fine-tune workload above on an A100-SXM4-80GB. Dew's
-figure is **an estimate, not a matched rerun**: Qwen3.5-0.8B's 951.7 ms includes the
-decision head, whose profile attributed 50.3 ms. Subtracting that gives
-901.4 ms; the head-free step and its peak have not been measured. Qwen3.5-0.8B also
-used different data and a decision loss; the old torch run drew its rows
+figure is **an estimate, not a matched rerun**: Dew's 951.7 ms step at this
+shape includes a task head over the backbone, whose profile attributed
+50.3 ms. Subtracting that gives 901.4 ms; the head-free step and its peak
+have not been measured. That step also used different data and another loss;
+the old torch run drew its rows
 with torch.randint. Shared NumPy rows apply to the new paired runner only.
 The estimate makes Dew about 0.72 times the reference's throughput, not
 faster. The next same-session pair replaces this estimate; until then no
@@ -1065,10 +1066,10 @@ Qwen3.5-0.8B's attention call, 8 x 3072 tokens, causal, bf16, forward and backwa
 | torch 2.14 FlashAttention-3 (kernels-community build) | 2.58 |
 
 Every output and gradient lay at the same distance from float64 (1.59e-4 and 1.68e-4 RMS for the
-output and the query gradient). Qwen3.5-0.8B itself at 8 x 3072 on the H100 SXM went from 396.1 to 336.7 ms
-a step, its attention from 92.0 to 29.4 ms of device time, with `tools/attribute_step.py`.
-Calls with key lengths, such as Clef's decision head, stay on cuDNN: FlashAttention-3 ends keys at
-lengths only through packed offsets, and on Qwen3.5-0.8B it took 1.29 ms where cuDNN took 1.10. So
+output and the query gradient). A Qwen3.5-0.8B fine-tune at 8 x 3072, bf16, on the H100 SXM went
+from 396.1 to 336.7 ms a step, its attention from 92.0 to 29.4 ms of device time, with
+`tools/attribute_step.py`. Calls with key lengths stay on cuDNN: FlashAttention-3 ends keys at
+lengths only through packed offsets, and at that shape it took 1.29 ms where cuDNN took 1.10. So
 `KERNELS['attention']` names flash for sm90. The xla, jax.nn cuDNN, tokamax Triton and
 FlashAttention-3 rows reproduce with `PYTHONPATH=src python tools/benchmark_attention.py
 --implementations xla jax_cudnn triton flash --sequence-lengths 3072 --head-dims 256 --batch-size 8

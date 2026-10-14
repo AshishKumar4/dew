@@ -719,11 +719,11 @@ _fused.defvjp(_fused_fwd, _fused_bwd)
 FUSED_LOGIT_BYTES = 2 << 30
 """The fp32 logits one chunk of `fused_head_loss` holds, when no tile asks
 for fewer tokens: the most tokens, a power of two, whose logits fit. On an
-A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320, 12288 tokens,
-bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against 1024's 129.3 and
-56.3 and 4096's 126.3, and at the 8B's (4096 wide, 128256, 4096 tokens)
-the one chunk this allows took 58.1 ms on the A100 against 2048's 70.8
-(tools/benchmark_lm_head.py fused)."""
+A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320,
+12288 tokens, bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against
+1024's 129.3 and 56.3 and 4096's 126.3, and at the 8B's (4096 wide,
+128256, 4096 tokens) the one chunk this allows took 58.1 ms on the A100
+against 2048's 70.8 (tools/benchmark_lm_head.py fused)."""
 
 
 def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -> int:
