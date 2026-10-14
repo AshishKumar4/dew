@@ -67,6 +67,7 @@ def _spec(kind, augment=FLIP_JITTER):
     return ImageData(source=Memory([_element_for(kind)] * DRAWS), image_size=SCALE,
                      caption_templates=CAPTION_TEMPLATES if kind == "tfds" else (),
                      classes=LABELS if kind == "tfds" else (),
+                     validation=None,
                      augment=None if augment is None else Augment(augment.flip, augment.jitter,
                                                                   backend="host"))
 
@@ -174,7 +175,8 @@ _READERS = "\n".join([
     "    buffer, format='PNG')",
     "PNG = buffer.getvalue()",
     "",
-    "SPEC = ImageData(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16, augment=None)",
+    "SPEC = ImageData(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16,",
+    "                 augment=None, validation=None)",
 ])
 
 
@@ -268,7 +270,7 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind):
 
 def test_a_record_with_no_caption_keeps_an_empty_host_caption():
     row = {"image": _synthetic_image(), "url": "x"}
-    out = _read(ImageData(source=Memory([row]), image_size=SCALE, augment=None), batch=1)[0]
+    out = _read(ImageData(source=Memory([row]), image_size=SCALE, augment=None, validation=None), batch=1)[0]
     assert out["caption"] == "" and out["url"] == "x"
     np.testing.assert_array_equal(out["image"], images.resize_image(row["image"], SCALE))
 
@@ -277,7 +279,8 @@ def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
     element = {"image": _synthetic_image(0), "caption": "a yellow tulip"}
-    out = _read(ImageData(source=Memory([element]), image_size=SCALE, augment=None), batch=1)[0]
+    out = _read(ImageData(source=Memory([element]), image_size=SCALE, augment=None,
+                          validation=None), batch=1)[0]
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (SCALE, SCALE),
@@ -292,11 +295,13 @@ def test_a_host_crop_reaches_the_output_size_without_a_flip_or_a_jitter():
     image = np.random.default_rng(0).integers(0, 256, (2 * SCALE, 2 * SCALE, 3), dtype=np.uint8)
     for crop in ((1.0, 1.0), (0.8, 1.0)):
         spec = ImageData(source=Memory([{"image": image}]), image_size=SCALE, staging_size=2 * SCALE,
+                         validation=None,
                          augment=Augment(flip=False, jitter=False, crop_scale=crop, backend="host"))
         out = _read(spec, batch=1)[0]
         assert out["image"].shape == (SCALE, SCALE, 3)
     small = image[:SCALE, :SCALE]
     spec = ImageData(source=Memory([{"image": small}]), image_size=SCALE,
+                     validation=None,
                      augment=Augment(flip=False, jitter=False, crop_scale=(0.5, 0.5), backend="host"))
     cropped = _read(spec, batch=1)[0]
     assert cropped["image"].shape == (SCALE, SCALE, 3) and not np.array_equal(cropped["image"], small)
