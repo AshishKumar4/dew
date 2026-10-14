@@ -364,16 +364,21 @@ def test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it(bridge,
                                               "code": "sleep 30"}))
             await asyncio.sleep(1)
             await socket.send(json.dumps({"op": "interrupt", "cell": "c0"}))
-            # Each running cell restarted; their fresh contexts wait on the gateway.
+            # The stopped cell ends in its error before its restart.
+            assert (await answer(socket, "run-0"))[-1]["status"] == "error"
+            # Each cell restarted; their fresh contexts wait on the gateway.
             kernels.held.add("create")
             for index in range(bridge.MAX_CELLS):
                 await socket.send(json.dumps({"op": "restart", "id": f"restart-{index}",
                                               "cell": f"c{index}"}))
             await asyncio.wait_for(kernels.entered["create"].wait(), 30)
-            # The stopped cell ended in its error; the others, the restart aborted.
-            ended = [(await answer(socket, f"run-{index}"))[-1]["status"]
-                     for index in range(bridge.MAX_CELLS)]
-            assert ended == ["error", *["aborted"] * (bridge.MAX_CELLS - 1)]
+            # The running ones, the restart aborted, in whatever order they end.
+            ended = {}
+            while len(ended) < bridge.MAX_CELLS - 1:
+                message = json.loads(await asyncio.wait_for(socket.recv(), 30))
+                if message["type"] == "done" and message["id"].startswith("run-"):
+                    ended[message["id"]] = message["status"]
+            assert ended == {f"run-{index}": "aborted" for index in range(1, bridge.MAX_CELLS)}
             # A restart of a restarting cell is refused, and the restarts count as the page's cells.
             await socket.send(json.dumps({"op": "restart", "id": "again", "cell": "c1"}))
             assert "restarting already" in (await answer(socket, "again"))[0]["evalue"]
