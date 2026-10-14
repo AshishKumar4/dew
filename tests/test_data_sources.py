@@ -1239,8 +1239,9 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
             self.file.close()
             events.append(("close", self.index))
 
+    # Without a native position, the stream resumes by replay, which it declares.
     options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
-               if native_state else {})
+               if native_state else {"replay": True})
     source = from_iter(Native, name="native-file@1", **options)
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
@@ -1265,18 +1266,24 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
     opened = []
     closed = []
     owned = []
+    finalizers = []
+    both_started = threading.Event()
 
-    def native():
-        identity = len(opened)
+    def native(identity, finalized):
         opened.append(identity)
+        if len(opened) == 2:
+            both_started.set()
         try:
             yield from ({"id": index} for index in range(64))
         finally:
             closed.append(identity)
+            finalized.set()
 
     def factory():
-        iterator = native()
+        finalized = threading.Event()
+        iterator = native(len(owned), finalized)
         owned.append(iterator)
+        finalizers.append(finalized)
         return iterator
 
     source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
@@ -1284,11 +1291,14 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
                      ).train(DataPartition())
     try:
         assert next(reader)["id"].tolist() == [0, 1]
-        assert opened and not closed
+        assert both_started.wait(timeout=5)
+        assert sorted(opened) == [0, 1] and not closed
     finally:
         reader.close()
         reader.close()
-    assert sorted(closed) == opened
+    # Grain finalizes the unconsumed lookahead on its iterator-making executor.
+    assert all(finalized.wait(timeout=5) for finalized in finalizers)
+    assert sorted(closed) == sorted(opened) == [0, 1]
 
 
 def test_from_iter_forwards_a_native_stop_request():
@@ -1618,3 +1628,19 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
     loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
+
+
+def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
+    """A producer's manifest states each file's bytes and checksum; a copy on this host's disk
+    that holds other bytes (a cut of the files under the whole set's manifest) is refused, naming
+    both, and one that holds what it declares is read."""
+    import hashlib
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+    url = str(path)
+    held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
+        with pytest.raises(ValueError):
+            Files(url, file_info={url: stale}).fingerprint()
