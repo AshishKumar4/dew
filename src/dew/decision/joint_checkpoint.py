@@ -1,10 +1,12 @@
-"""Clef's released checkpoint, read into Dew's backbone and `JointSchemaHead`.
+"""A released joint-head checkpoint, read into Dew's backbone and `JointSchemaHead`.
 
-Cloudflare/clef ships its Qwen 3.5 backbone as a standard Hugging Face
+Such a release ships its Qwen 3.5 backbone as a standard Hugging Face
 checkpoint and its joint schema head beside it, as `joint_head_config.json`
-(the head's sizes) and `joint_head.safetensors` (joint_schema_model.py
-`load_release_model` at Cloudflare/clef 2f3de3dd). `ClefHead` reads those
-two files and `ClefCheckpoint` the whole release.
+(the head's sizes) and `joint_head.safetensors`, with the head's tensors
+named by its own modules (the release and the commit the parity fixtures
+reproduce are in tests/fixtures/joint_checkpoint/tiny/source.json).
+`StoredJointHead` reads those two files and `JointCheckpoint` the whole
+release.
 """
 
 import json
@@ -55,7 +57,7 @@ _PARTS = {
 
 
 def _path(name: str) -> tuple[str, ...]:
-    """A Clef head tensor's place in `JointSchemaHead`'s parameters."""
+    """A stored joint head tensor's place in `JointSchemaHead`'s parameters."""
     if name in ("prior_logit_scale", "joint_logit_scale", "residual_gate"):
         return (name,)
     if name in _NAMED:
@@ -67,14 +69,14 @@ def _path(name: str) -> tuple[str, ...]:
     elif stem in _NAMED or stem in _NORMS:
         module = _NAMED.get(stem, (stem,))
     else:
-        raise ValueError(f"unknown Clef head tensor {name!r}")
+        raise ValueError(f"unknown joint head tensor {name!r}")
     norm = module[-1].endswith("norm") or module[-1].startswith("norm")
     return (*module, "scale" if norm and leaf == "weight" else {"weight": "kernel", "bias": "bias"}[leaf])
 
 
 @dataclass(frozen=True)
-class ClefHead:
-    """Clef's joint schema head and its parameters, as a release stores them."""
+class StoredJointHead:
+    """A joint schema head and its parameters, as a release stores them."""
 
     head: JointSchemaHead
     params: dict
@@ -86,7 +88,7 @@ class ClefHead:
         root = Path(directory)
         config = records.record(json.loads((root / HEAD_CONFIG).read_text()), HEAD_CONFIG)
         if records.number(config.get("dropout", 0.0), "dropout"):
-            raise ValueError("Clef's head drops out at a rate Dew's head does not train with")
+            raise ValueError("the stored head drops out at a rate Dew's head does not train with")
         head = JointSchemaHead.rebuilt(records.integer(config["hidden_size"], "hidden_size"), config,
                                        dtype=dtype, attention_impl=attention_impl)
         tensors = unpacked_attention(read_file(root / HEAD_WEIGHTS)[0])
@@ -109,13 +111,14 @@ def _shaped(head: JointSchemaHead, params: dict) -> dict:
                 for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
     missing = set(flat_shapes) - set(reshaped)
     if missing:
-        raise ValueError(f"Clef's head weights leave {sorted(map(jax.tree_util.keystr, missing))} unset")
+        unset = sorted(map(jax.tree_util.keystr, missing))
+        raise ValueError(f"the stored head's weights leave {unset} unset")
     return jax.tree_util.tree_unflatten(jax.tree.structure(shapes), [reshaped[path] for path in flat_shapes])
 
 
 @dataclass(frozen=True)
-class ClefCheckpoint:
-    """One released Clef checkpoint: its backbone and head, their variables, and its tokenizer."""
+class JointCheckpoint:
+    """One released joint-head checkpoint: its backbone and head, their variables, and its tokenizer."""
 
     model: DecisionModel
     variables: Variables
@@ -126,9 +129,9 @@ class ClefCheckpoint:
 
     @staticmethod
     def exists(name_or_dir: str | Path, *, revision: str | None = None) -> bool:
-        """Return whether `name_or_dir` holds a Clef checkpoint.
+        """Return whether `name_or_dir` holds a joint-head checkpoint.
 
-        A Clef checkpoint is a backbone with a `joint_head_config.json` beside it.
+        A joint-head checkpoint is a backbone with a `joint_head_config.json` beside it.
         For a Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
         """
         if Path(name_or_dir).is_dir():
@@ -136,7 +139,7 @@ class ClefCheckpoint:
         return sources.has_file(str(name_or_dir), HEAD_CONFIG, revision=revision)
 
     @classmethod
-    def load(cls, name_or_dir: str | Path = "Cloudflare/clef-flash", *, revision: str | None = None,
+    def load(cls, name_or_dir: str | Path, *, revision: str | None = None,
              dtype: str = "float32", param_dtype: str = "float32", attention_impl: str = "auto") -> Self:
         """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.
 
@@ -153,7 +156,8 @@ class ClefCheckpoint:
             hf_hub_download(str(name_or_dir), HEAD_WEIGHTS, revision=root.name)
         bundle = Pretrained.load(root, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl)
         _, head_dtype = DecisionModel.head_size(bundle.model)
-        head = ClefHead.load(root, dtype=head_dtype, param_dtype=param_dtype, attention_impl=attention_impl)
+        head = StoredJointHead.load(root, dtype=head_dtype, param_dtype=param_dtype,
+                                    attention_impl=attention_impl)
         tokenizer = HFTokenizer(str(root), local_files_only=True)
         return cls(DecisionModel(bundle.model, head.head),
                    joined({"backbone": bundle.variables, "head": {"params": head.params}}),
