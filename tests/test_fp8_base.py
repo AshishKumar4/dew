@@ -241,11 +241,15 @@ def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
 
 
 def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
+    """The scanned stack computes the looped one's output from the same
+    variables, both jitted with the variables as arguments, as a step passes
+    its state: closed over, the packed codes fold into a float32 GEMM where a
+    scan's traced ones take the FP8 one, which rounds its sums otherwise."""
     _, fp8 = adapters()
     _, scanned = adapters(decoder(scan_layers=True))
-    looped = np.asarray(fp8.model.apply(fp8.variables, ids()), np.float32)
-    np.testing.assert_allclose(np.asarray(scanned.model.apply(fp8.variables, ids()), np.float32), looped,
-                               rtol=1e-6, atol=1e-6)
+    looped = np.asarray(jax.jit(fp8.model.apply)(fp8.variables, ids()), np.float32)
+    np.testing.assert_allclose(np.asarray(jax.jit(scanned.model.apply)(fp8.variables, ids()), np.float32),
+                               looped, rtol=1e-6, atol=1e-6)
 
 
 def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
@@ -292,12 +296,23 @@ def test_a_device_without_fp8_tensor_cores_measures_no_site():
 def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm():
     """On a GPU with FP8 tensor cores the wide projection measures faster in
     FP8 and the narrow one does not (H100: 1.47x and 0.70x), and the frozen
-    product's forward and input gradient compile to cuBLASLt FP8 GEMMs."""
+    product's forward and input gradient compile to cuBLASLt FP8 GEMMs at
+    that width. The packed leaves and the gradient are the step's arguments,
+    as a train state's are: XLA folds widened constant codes into a float32
+    GEMM."""
     variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
                             "narrow": {"kernel": jnp.zeros((1024, 1024), jnp.float32)}}}
     measured = measured_fp8_sites(variables, ("wide", "narrow"), 8192)
     assert measured.frozen_fp8 == ("wide",) and measured.measured_on == device_generation()
-    leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(np.ones((256, 512), np.float32)).values()]
-    text = jax.jit(jax.value_and_grad(lambda x: jnp.sum(frozen_fp8_product(x, *leaves)))).lower(
-        jnp.ones((1024, 256), jnp.bfloat16)).compile().as_text()
-    assert text.count("f8e4m3fn") and text.count("__cublas$lt$matmul$f8") == 2
+    rng = np.random.default_rng(3)
+    leaves = [jnp.asarray(value) for value in
+              frozen_fp8_leaves(rng.standard_normal((4096, 12288)).astype(np.float32) * 0.02).values()]
+
+    def step(x, cotangent, *leaves):
+        output, pull = jax.vjp(lambda x: frozen_fp8_product(x, *leaves), x)
+        return output, pull(cotangent.astype(output.dtype))[0]
+
+    x = jnp.asarray(rng.standard_normal((8192, 4096)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.standard_normal((8192, 12288)), jnp.bfloat16)
+    text = jax.jit(step).lower(x, cotangent, *leaves).compile().as_text()
+    assert text.count("__cublas$lt$matmul$f8") == 2
