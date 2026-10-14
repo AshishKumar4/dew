@@ -72,7 +72,6 @@ from dew.data.pipeline import (
     Record,
     Rejected,
     Repeat,
-    ShardByHost,
     Shuffle,
     Slice,
     Stage,
@@ -377,6 +376,30 @@ class _TokenSplit(_WrappingDataset):
         }
 
 
+def _dies_with_parent(index: int, count: int) -> None:
+    """Ends this Grain worker once the process that started it has ended, however it ended.
+
+    A worker reads until its parent sets a stop event, so a parent killed, timed out or crashed
+    left its workers reading into a queue no one empties: 81 of them on one host, 47 GB between
+    them, a day later. A spawned worker holds its parent's sentinel, a pipe only the parent
+    writes, which reads as ended once the parent has exited; a thread waits on it and ends the
+    worker."""
+    import multiprocessing.connection
+    import os
+    import threading
+
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch() -> None:
+        multiprocessing.connection.wait([parent.sentinel])
+        os._exit(1)
+
+    watcher = f"dew worker {index} of {count} watching its parent"
+    threading.Thread(target=watch, name=watcher, daemon=True).start()
+
+
 def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
     return (
         rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
@@ -391,8 +414,10 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     if stage.policy == "concat":
         return gx.ConcatThenSplitIterDataset(documents, length_struct=sizes)
     packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
+    # Fields cut alike with the first share its segments and positions, as the indexed planner's
+    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
-                  max_sequences_per_bin=stage.segments)
+                  max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
 
 
 def _reordered(stage: Shuffle | Repeat | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
@@ -572,7 +597,7 @@ class _Build:
             rows = gx.WindowShuffleIterDataset(
                 _as_iter(rows, self.loading), window_size=stage.window, seed=stage.seed
             )
-        elif isinstance(stage, (Shuffle, Slice, ShardByHost)):
+        elif isinstance(stage, (Shuffle, Slice)):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
         elif isinstance(stage, Repeat):
@@ -587,7 +612,8 @@ class _Build:
             rows = _as_iter(rows, self.loading).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
-                )
+                ),
+                worker_init_fn=_dies_with_parent,
             )
         elif isinstance(stage, Rebatch):
             rows = gx.RebatchIterDataset(
@@ -796,7 +822,8 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
     """A mixture's weights, as shares of its corpora's stated valid target
-    tokens when it mixes by tokens."""
+    tokens when it mixes by tokens, from the rows and valid targets each
+    corpus states as it is read."""
     if mixture.tokens is None:
         return mixture.weights
     leaves = [child.source for child in mixture.pipelines if not isinstance(child.source, (Mixture, Phases))]
@@ -804,7 +831,7 @@ def _weights(mixture: Mixture) -> Sequence[float]:
     return token_weights(
         [_name(child) for child in mixture.pipelines],
         mixture.weights,
-        [integer(stated["windows"], "windows") for stated in facts],
+        [integer(stated["rows"], "rows") for stated in facts],
         [integer(stated["valid_targets"], "valid_targets") for stated in facts],
     )
 

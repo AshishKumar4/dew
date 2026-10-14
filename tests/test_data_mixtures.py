@@ -30,9 +30,9 @@ from token_support import write_token_corpus
 
 from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
-from dew.data.compile import compile, validation
+from dew.data.compile import compile, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
-from dew.data.pipeline import Pipeline, mix
+from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
@@ -887,7 +887,7 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     six microbatches hold batches of twenty-four, six rows a device, and
     stages of eight and sixteen are not ones."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(stage=2, microbatches=6),
+                      mesh=MeshSpec(stage=2), microbatches=6,
                       layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(ValueError):
@@ -905,7 +905,7 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     from dew.nn.sharding import LayoutRefused
 
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, stage=2, microbatches=4),
+                      mesh=MeshSpec(fsdp=2, stage=2), microbatches=4,
                       layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(LayoutRefused):
@@ -1000,3 +1000,56 @@ def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
     finally:
         resumed.close()
     assert later == whole
+
+
+def _plus_one(batch):
+    return {**batch, "x": batch["x"] + 1}
+
+
+def test_a_mixture_refuses_a_batched_member_rather_than_drop_its_stages():
+    """A mixture reads its members' records and batches once, after mix: a member batched
+    before it, with a step after its batch, is refused, where the mixture once read the
+    member's records and the step never ran."""
+    first = Memory([{"x": np.int32(0)}], identity="first").batch(1).map(_plus_one)
+    second = Memory([{"x": np.int32(0)}], identity="second")
+    with pytest.raises(ValueError):
+        compile(mix([first, second]).batch(1), read="indexed", loading=READ)
+
+
+class _DevicePlusOne(DeviceStep):
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"] + 1}
+
+
+def test_phases_that_end_in_other_device_steps_are_refused():
+    """A run applies one set of device steps to every batch it reads, so a phase whose own
+    device steps differ from the first phase's is refused, where it once ran the first's."""
+    from dew.data.pipeline import Phases
+
+    def phase(name: str) -> Pipeline:
+        return Pipeline(Memory([{"x": np.int32(0)}] * 4, identity=name)).repeat().batch(1)
+
+    with pytest.raises(ValueError):
+        compile(Pipeline(Phases((phase("plain"), phase("stepped").map(_DevicePlusOne())), (1, None))),
+                read="memory", loading=READ)
+
+
+def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_each_states(tmp_path):
+    """Published generations mix by tokens from the rows and valid targets each states, where
+    the weighting once looked for a windows count no generation states."""
+    from dew.data.cache import Cache
+    from dew.data.steps.text import CountTargets, Tokenize
+
+    def published(name: str, documents: int) -> Pipeline:
+        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
+        generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
+                             Cache(str(tmp_path / name)), read="indexed", loading=READ)
+        return Pipeline(generation.source(), name=name)
+
+    data = compile(mix([published("short", 4), published("long", 8)], by="tokens").repeat().batch(2),
+                   read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert len(list(itertools.islice(stream, 4))) == 4
+    finally:
+        stream.close()

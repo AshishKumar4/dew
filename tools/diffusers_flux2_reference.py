@@ -206,23 +206,6 @@ PROMPTS = ["a red cat on a mat", "tiny photo"]
 HEIGHT, WIDTH, STEPS = 16, 24, 4
 
 
-def tokenizer():
-    """A byte-level Qwen2 tokenizer carrying the published special tokens and
-    chat template: every character is one piece."""
-    from tokenizers.pre_tokenizers import ByteLevel
-    from transformers import Qwen2Tokenizer
-
-    metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
-    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
-    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
-    for word in special:
-        vocab.setdefault(word, len(vocab))
-    made = Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"], pad_token=metadata["pad_token"],
-                          additional_special_tokens=special)
-    made.chat_template = (SOURCE / "tokenizer" / "chat_template.jinja").read_text()
-    return made
-
-
 def text_encoder(tok):
     """The published Qwen3 config, narrowed but as deep as the layers the
     pipeline reads (9, 18, 27); every field it does not name is the
@@ -251,8 +234,10 @@ def build_pipeline(root: Path):
         Flux2KleinPipeline,
         Flux2Transformer2DModel,
     )
+    from make_tiny_tokenizer import qwen_byte_tokenizer
 
-    tok = tokenizer()
+    tok = qwen_byte_tokenizer(json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text()),
+                              chat_template=(SOURCE / "tokenizer" / "chat_template.jinja").read_text())
     encoder = text_encoder(tok)
     torch.manual_seed(SEED + 7)
     vae = AutoencoderKLFlux2(**PIPELINE_VAE).eval()
