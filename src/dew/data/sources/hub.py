@@ -90,7 +90,7 @@ class Hub(Dataset):
             if self.revision is not None:
                 raise FileNotFoundError(
                     f"HF {self.repo!r}@{self.commit} split {self.split!r} "
-                    "has no native Parquet, Arrow or JSONL files; "
+                    "has no native Parquet or JSONL files; "
                     "pin the converted branch's own commit explicitly, "
                     "or provision=True for Arrow at this revision"
                 )
@@ -106,7 +106,10 @@ class Hub(Dataset):
         from huggingface_hub import HfApi
 
         paths = HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
-        formats: tuple[Format, ...] = ("parquet", "arrow", "jsonl")
+        # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
+        # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
+        # without reading it whole; such a split streams its Parquet conversion, or is prepared.
+        formats: tuple[Format, ...] = ("parquet", "jsonl")
         for format in formats:
             matches = [
                 path

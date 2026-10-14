@@ -126,62 +126,78 @@ def rows_of(batch) -> list[tuple[int, int]]:
             for row in range(1, int(segments.max()) + 1)]
 
 
-def decided(objective, variables, batch, segments: int):
-    """The batch's logits and the gradient of its summed loss."""
+def apart(batch) -> dict:
+    """Each row of the batch's windows in a window of its own, as the packer lays out a window that
+    holds one row: the row, then segment-0 padding to the window's length, and its question slots
+    first. Every row's window has one shape, so the rows alone run as one batch."""
+    length, questions = batch["tokens"].shape[1], batch["kinds"].shape[1]
+
+    def widened(name, value):
+        """`value` padded with zeros along the row's tokens or questions to the window's."""
+        wanted = length if name in ("tokens", "positions", "slots", "segments") else questions
+        return np.pad(value, [(0, 0), (0, wanted - value.shape[1]), *[(0, 0)] * (value.ndim - 2)])
+
+    ones = []
+    for window, row in rows_of(batch):
+        one = {name: widened(name, value) for name, value in alone(batch, window, row).items()
+               if name not in ("option_slots", "slotted")}
+        if "option_slots" in batch:
+            slots, real = compacted(one["options"][0], batch["option_slots"].shape[1])
+            one["option_slots"], one["slotted"] = slots[None], real[None]
+        ones.append(one)
+    return {name: np.concatenate([one[name] for one in ones]) for name in ones[0]}
+
+
+def gradient(objective, variables, batch):
+    """The gradient of the batch's summed loss."""
     step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
 
     def total(variables):
         loss, _ = objective.loss(variables, batch, step)
         return loss.total
 
-    logits = objective.model.logits(variables, laid_out(batch, segments))
-    return logits, jax.grad(total)(variables)
+    return jax.grad(total)(variables)
 
 
-def separately(objective, variables, batch):
-    """Each row's logits on its real options, alone, and the gradient summed over the rows."""
-    logits = [np.asarray(objective.model.logits(variables, laid_out(one, 1)))[one["options"]]
-              for one in (alone(batch, window, row) for window, row in rows_of(batch))]
-    return np.concatenate(logits), summed_gradient(objective, variables, batch)
-
-
-def summed_gradient(objective, variables, batch):
-    """The gradient of the rows' losses, each row alone, summed over the rows."""
-    rows = [decided(objective, variables, alone(batch, window, row), 1)[1] for window, row in rows_of(batch)]
-    return jax.tree.map(lambda *leaves: sum(leaves), *rows)
+def decided(objective, variables, batch, segments: int):
+    """The batch's logits and the gradient of its summed loss."""
+    return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
 @pytest.mark.parametrize("arm", sorted(ARMS))
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
-    question's logits and the parameters' gradients the rows give one at a time, through Qwen3.5's
-    Gated DeltaNet conv and state and its attention, and through the head, within the float64 gate:
-    no state, attention, pooled span or last-token feature crosses a row. The float64 truth is the
-    rows run alone in float64."""
+    question's logits and the parameters' gradients each row gives in a window of its own, through
+    Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within the
+    float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
+    truth is the rows in windows of their own in float64."""
     objective = objective_for(arm)
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel holds as many documents as the coordinates bound, each row's first and its
     # padding among them (`dew.nn.linear._cu_seqlens`).
-    laid = laid_out(batch, objective.bounds.segments).coordinates()
+    segments = objective.bounds.segments
+    laid = laid_out(batch, segments).coordinates()
     assert 1 + int(np.sum(np.asarray(laid.starts)[:, 1:], axis=1).max()) <= laid.max_segments
     variables = objective.init(jax.random.key(0))
-    packed_logits, packed_grads = decided(objective, variables, batch, objective.bounds.segments)
+    packed_logits, packed_grads = decided(objective, variables, batch, segments)
     order = [owners(batch)[window] == row for window, row in rows_of(batch)]
     packed = np.concatenate([np.asarray(packed_logits)[window][asked][batch["options"][window][asked]]
                              for (window, _), asked in zip(rows_of(batch), order, strict=True)])
-    logits, grads = separately(objective, variables, batch)
+    rows = apart(batch)
+    logits, grads = decided(objective, variables, rows, segments)
     with jax.enable_x64(new_val=True):
         wide = copy.copy(objective)
         wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
                          objective.model.head.clone(dtype=jnp.float64)))
         widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        truth, _ = separately(wide, widened, batch)
         # Each gradient leaf's terms in float64: a key bias's and the scorer's shared bias
         # gradients cancel (q.b shifts every key's logit alike; the residual gate shifts every
         # option's), and a scalar scale sums every option's terms, so their terms, not their
         # near-zero sizes, are their rounding's scale (tests/reference_error.py).
-        truth_grads, terms = float64_terms(lambda held: summed_gradient(wide, held, batch), widened)
+        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
+        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
+    logits = np.asarray(logits)[rows["options"]]
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
                            {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
                            terms={"logits": truth, "grads": terms})
