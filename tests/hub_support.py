@@ -27,8 +27,8 @@ def native_hub(monkeypatch, directory: Path, repo: str, splits: dict[str, dict[s
 
     built = native_builder(directory, splits)
 
-    def builder(name, *, revision, **options):
-        assert name == repo and revision == commit
+    def builder(path, *, revision, **options):
+        assert path == repo and revision == commit
         return built
 
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, name, revision=None, **options: SimpleNamespace(
