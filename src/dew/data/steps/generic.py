@@ -29,26 +29,6 @@ class Fields(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
-class Placed(grain.MapTransform):
-    """A training or validation batch without the fields an accelerator cannot
-    hold: strings, bytes and Python objects, such as an image's catalog URL
-    and content hash. The host steps before it read them; what remains is
-    what the prefetcher places."""
-
-    def map(self, element: Batch) -> Batch:
-        return {name: (self.map(value) if isinstance(value, Mapping) else value)
-                for name, value in element.items() if _placeable(value)}
-
-
-def _placeable[Field](value: np.ndarray | str | bytes | Mapping[str, Field] | Field) -> bool:
-    if isinstance(value, np.ndarray):
-        return value.dtype.kind not in "OSUV"
-    if isinstance(value, (list, tuple)):
-        return all(_placeable(entry) for entry in value)
-    return not isinstance(value, (str, bytes))
-
-
-@dataclasses.dataclass(frozen=True)
 class Keep(grain.MapTransform):
     predicate: Callable[[Batch], bool]
     reason: str = "filtered"

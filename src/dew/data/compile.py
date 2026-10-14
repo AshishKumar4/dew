@@ -95,7 +95,6 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.generic import Placed
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -789,8 +788,9 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
-    # The objective's batch goes to the accelerator: its string and object fields stay here.
-    return branch.then(*(MapBatch(step) for step in steps), MapBatch(Placed()))
+    # A string or object field stays in the batch for the host code and metrics that read it; the
+    # prefetcher places the rest (`dew.training.distributed.device_fields`).
+    return branch.then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
