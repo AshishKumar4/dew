@@ -38,6 +38,7 @@ from dew.training.quantization import (
     QUANTIZATION,
     InputQuantization,
     InputQuantizer,
+    frozen_fp8_kernel,
     frozen_fp8_leaves,
     frozen_fp8_product,
     measured_fp8_sites,
@@ -204,19 +205,27 @@ def fit(adapter, steps, directory=None):
                        checkpoint_every=None if directory is None else 2)
 
 
-def test_lora_packs_the_frozen_base_once_and_training_moves_neither():
-    """The packed leaves are the frozen kernels' (`frozen_fp8_leaves`), and a
-    run trains the factors alone: the frozen kernels and their packing come
-    out as they went in."""
-    _, fp8 = adapters()
+def test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_moves_neither():
+    """The packed leaves are the frozen kernels' (`frozen_fp8_leaves`) and
+    stand in their place, so the state holds no FP8 site's kernel; a merge
+    reads the kernel the products ran on (`frozen_fp8_kernel`); and a run
+    trains the factors alone: the frozen tree and the packing come out as
+    they went in."""
+    plain, fp8 = adapters()
+    base = flatten_dict(plain.variables[FROZEN], sep="/")
     frozen = flatten_dict(fp8.variables[FROZEN], sep="/")
     packed = flatten_dict(fp8.variables[QUANTIZATION], sep="/")
+    merged = flatten_dict(fp8.merge(fp8.variables)["params"], sep="/")
     for site in sites(fp8):
-        for leaf, value in frozen_fp8_leaves(frozen[f"{site}/kernel"]).items():
+        assert f"{site}/kernel" not in frozen
+        leaves = frozen_fp8_leaves(base[f"{site}/kernel"])
+        for leaf, value in leaves.items():
             np.testing.assert_array_equal(np.asarray(packed[f"{site}/{leaf}"]).view(np.uint8),
                                           np.asarray(value).view(np.uint8))
+        np.testing.assert_array_equal(np.asarray(merged[f"{site}/kernel"]), frozen_fp8_kernel(leaves))
     state = fit(fp8, 3)
     for tree, before in ((state.variables[FROZEN], frozen), (state.variables[QUANTIZATION], packed)):
+        assert set(flatten_dict(tree, sep="/")) == set(before)
         for path, value in flatten_dict(tree, sep="/").items():
             np.testing.assert_array_equal(np.asarray(value).view(np.uint8),
                                           np.asarray(before[path]).view(np.uint8))
