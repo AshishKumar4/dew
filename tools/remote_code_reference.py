@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the llada-tiny and dream-tiny logits with the released model code.
+"""Write the llada-tiny, dream-tiny and mimo-v2-tiny logits with the released model code.
 
 LLaDA and Dream ship no transformers class: their Hub repos carry their own
 configuration and modeling files, loaded with trust_remote_code. This fetches
@@ -24,6 +24,14 @@ reads), so run it there:
   uv pip install --python /tmp/remote/bin/python transformers==4.46.3 \
       safetensors numpy huggingface_hub
   /tmp/remote/bin/python tools/remote_code_reference.py
+
+MiMo-V2.6's code reads transformers 5's masking and rotary utilities (its
+config records 5.3.0), so mimo-v2-tiny runs under Dew's locked environment
+(transformers 5.16.1), with --draw the first time: the release's own class
+draws the fixture's weights (every parameter, the sinks and the balancing
+bias too, from N(0, 0.1^2) at seed 0, as the class leaves the sinks empty)
+and its token ids, written in the class's split layout:
+  python tools/remote_code_reference.py mimo-v2-tiny --draw
 """
 
 import argparse
@@ -34,33 +42,53 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
-from transformers import AutoConfig, AutoModel
+from safetensors.torch import load_file, save_file
+from transformers import AutoConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RELEASES = {
     "llada-tiny": ("GSAI-ML/LLaDA-8B-Base", "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
-                   ("configuration_llada.py", "modeling_llada.py")),
+                   ("configuration_llada.py", "modeling_llada.py"), "AutoModel", False),
     "dream-tiny": ("Dream-org/Dream-v0-Base-7B", "6572adb5535263e4d1a337b56942ba48b6dee2a9",
-                   ("configuration_dream.py", "modeling_dream.py", "generation_utils.py")),
+                   ("configuration_dream.py", "modeling_dream.py", "generation_utils.py"),
+                   "AutoModel", False),
+    "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
+                     ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM", True),
 }
-"""Each fixture's release: the Hub repo, the commit its code is read at and
-the files that code is."""
+"""Each fixture's release: the Hub repo, the commit its code is read at, the
+files that code is, the auto class its language model registers as, and
+whether the code pins float32 (MiMo's router casts its logits with
+`.type(torch.float32)`), so its float64 run is built and run under
+`diffusers_wan_reference.float64`, which widens those pins and the rotary
+tables built at init."""
 
 
-def released_model(name: str, scratch: Path) -> torch.nn.Module:
-    """The release's own model class over the fixture's config and weights."""
-    repo, revision, files = RELEASES[name]
+def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
+    """The release's own model class over the fixture's config and weights,
+    or, with `draw`, weights it draws and writes as the fixture's."""
+    repo, revision, files, auto, _ = RELEASES[name]
     directory = scratch / name
-    directory.mkdir()
+    directory.mkdir(parents=True)
     for file in files:
         shutil.copy(hf_hub_download(repo, file, revision=revision), directory / file)
     released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
     config = json.loads((FIXTURES / name / "config.json").read_text())
     (directory / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
-    model = AutoModel.from_config(AutoConfig.from_pretrained(str(directory), trust_remote_code=True),
-                                  trust_remote_code=True)
+    reader = getattr(transformers, auto)
+    model = reader.from_config(AutoConfig.from_pretrained(str(directory), trust_remote_code=True),
+                               trust_remote_code=True, attn_implementation="eager")
+    if draw:
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.copy_(torch.randn_like(parameter) * 0.1)
+        save_file({key: value.contiguous() for key, value in model.state_dict().items()},
+                  str(FIXTURES / name / "model.safetensors"))
+        vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
+        ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
+        np.save(FIXTURES / name / "input_ids.npy", ids)
     model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")), strict=True)
     return model.eval()
 
@@ -69,14 +97,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("names", nargs="*", default=sorted(RELEASES))
     parser.add_argument("--check", action="store_true", help="compare with logits.npy instead of writing")
+    parser.add_argument("--draw", action="store_true", help="draw the fixture's weights and ids first")
     arguments = parser.parse_args()
     with tempfile.TemporaryDirectory() as scratch:
         for name in arguments.names:
-            model = released_model(name, Path(scratch))
+            model = released_model(name, Path(scratch) / "fp32", arguments.draw)
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
             with torch.no_grad():
                 fp32 = model.float()(input_ids=ids).logits.numpy()
-                f64 = model.double()(input_ids=ids).logits.numpy()
+                if RELEASES[name][4]:
+                    from diffusers_wan_reference import float64
+
+                    with float64():
+                        wide = released_model(name, Path(scratch) / "f64").double()
+                        f64 = wide(input_ids=ids).logits.numpy()
+                else:
+                    f64 = model.double()(input_ids=ids).logits.numpy()
             if arguments.check:
                 same = np.array_equal(np.load(FIXTURES / name / "logits.npy"), fp32)
                 print(name, "logits.npy bitwise" if same else "logits.npy differs")

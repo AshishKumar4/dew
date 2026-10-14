@@ -86,12 +86,15 @@ def _config(name: str) -> dict:
 
 
 def _checkpoint(directory: Path) -> bool:
-    """Whether `directory` is a tiny source of a registered decoder family."""
+    """Whether `directory` is a tiny source of a registered decoder family: a
+    decoder's config, or a wrapper's whose text_config names its decoder. A
+    tower fixture's text_config states the width its projector reads and no
+    decoder (mimo-vision-tiny, under MiMo-V2's own model_type)."""
     if not (directory / "config.json").is_file() or not (directory / "model.safetensors").is_file():
         return False
     config, families = _config(directory.name), hf_decoders.families()
     text = config.get("text_config") or {}
-    return ("architectures" in config or bool(text)) and (
+    return ("architectures" in config or "model_type" in text) and (
         config.get("model_type") in families or text.get("model_type") in families)
 
 

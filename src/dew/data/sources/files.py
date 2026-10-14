@@ -753,12 +753,16 @@ class _Lines(grain.IterDataset):
 
 
 class _LineIterator(grain.DatasetIterator):
+    # Whether `file` is open: an iterator whose opening failed has nothing to close.
+    _opened = False
+
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
         self.fs, self.path = Store(shard.uri, source.storage_options).resolve()
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
+        self._opened = True
         self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
         if self.csv is not None:
             _ = self.csv.fieldnames
@@ -799,4 +803,5 @@ class _LineIterator(grain.DatasetIterator):
         _seek_lines(self.file, offset)
 
     def close(self) -> None:
-        self.file.close()
+        if self._opened:
+            self.file.close()
