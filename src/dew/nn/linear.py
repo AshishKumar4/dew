@@ -349,7 +349,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                       held=None if held is None else held.value)
     if held is not None:
         held.value = final.astype(held.value.dtype)
-    return out
+    # The scan's output, attention's 'context' (a remat policy's `RESIDUALS`).
+    return checkpoint_name(out, 'context')
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):
@@ -1125,8 +1126,6 @@ class GatedDeltaNet(nn.Module):
                         parts=heads, dtype=operand if ported else wide)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
-        # The rule's output, attention's 'context' (a remat policy's `RESIDUALS`).
-        out = checkpoint_name(out, 'context')
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates

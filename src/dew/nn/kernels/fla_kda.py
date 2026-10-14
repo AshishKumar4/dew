@@ -29,6 +29,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import fla_gdn
@@ -861,8 +862,10 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     (`fla_gdn.chunk_fwd_h`'s USE_GK branch), then the output. Saves what fla saves."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    gc = fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels)
+    # Named as the gated delta rule's port names them (`fla_gdn._rule_fwd`) for a remat policy.
+    gc = checkpoint_name(fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
     aqk, akk = intra_solve(q, k, gc, beta, scale=scale, **kernels)
+    akk = checkpoint_name(akk, 'delta_inverse')
     w, u, kg, _ = recompute_w_u(k, v, beta, akk, gc, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, gc, h0, **kernels)
     o = chunk_fwd_o(q, corrected, gc, aqk, h, scale=scale, **kernels)
