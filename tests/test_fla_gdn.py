@@ -492,8 +492,8 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
     not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
                             "is fla's own distance (test_fla_kda's packed case)"))])
-def test_dews_fla_rule_runs_packed_documents_as_flas_varlen_sequences(per_key):
-    """Packed documents (`starts`, at most `max_segments` a row) as fla's varlen sequences, with a
+def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
+    """Packed documents (`starts`, each first token forgetting the memory, `linear.FORGET`), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
     and gradients within fp32 rounding of the token recurrence run document by document in float64.
@@ -513,7 +513,7 @@ def test_dews_fla_rule_runs_packed_documents_as_flas_varlen_sequences(per_key):
     do = jax.random.normal(keys[6], v.shape)
     dht = 0.1 * jax.random.normal(keys[7], h0.shape)
 
-    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=3)
+    packed = functools.partial(fla_rule, starts=jnp.asarray(starts))
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
         operands = widened((q, k, v, g, beta, h0, do, dht))
