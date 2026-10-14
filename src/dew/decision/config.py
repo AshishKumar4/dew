@@ -128,7 +128,6 @@ class DecisionRunConfig(RunConfig):
         chooses its layer recomputation before looping or attaching LoRA."""
         from dew.interop import Pretrained, sources
 
-        self = dataclasses.replace(self, trainer=self.trainer.derived())
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
             raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "

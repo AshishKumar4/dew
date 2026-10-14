@@ -382,7 +382,7 @@ class DiffusionRunConfig(RunConfig):
         the batches it trains on (`FlowGRPOObjective.rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
 
-        run = dataclasses.replace(self.pinned(), trainer=self.trainer.derived())
+        run = self.pinned()
         objective = run.build()
         dataset = loader(run.data, batch=run.trainer.batch_size, tokens=run.trainer.batch_tokens,
                        read=run.data_read, provision=run.provision,
