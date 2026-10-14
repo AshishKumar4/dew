@@ -612,21 +612,21 @@ def marked(python: str) -> dict[str, int]:
 GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
 fragmentation, which can leave a share its own size short of a block it needs."""
-GPU_UNRECORDED = 4
-"""A file no record has a peak for runs on this part of the lane's share."""
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
-    """Run `tests` on this process's share of the one GPU it sees, each file as a task of its own
-    (`tested`), and write their verdict rows to `out`.
+    """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
+    own (`tested`), and write their verdict rows to `out`.
 
     A file's process may hold the peak memory its last run on this GPU's class held
-    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`, and one without a peak
-    a `GPU_UNRECORDED`th of the share. Files start heaviest first while their shares fit the share
-    this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most
-    `processes` at once. A file that runs out of its share is red: it took more than its last run,
-    or more than a file no run has measured is given, and its next run has the share it reached."""
+    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`; files so measured
+    start heaviest first while their shares fit the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file no
+    run has measured, one that started another process (its children's memory is measured nowhere,
+    and they size what they run by the device they see) and one whose last run left no report each
+    run alone with the whole share. A file that runs out of a measured share is red: it took more
+    than its last run, whose peak its next run is given."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
@@ -634,9 +634,12 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
 
     def needs(name: str) -> float:
         record = cache_request(cache_url(python, row(python, name, ""), held), token)
-        peak = json.loads(record).get("peak") if record else None
+        recorded = json.loads(record) if record else {"depends": None, "peak": None}
+        peak = recorded["peak"]
+        if recorded["depends"] is None or peak is None:
+            return budget
         factor, slack = GPU_HEADROOM
-        return budget / GPU_UNRECORDED if peak is None else min(peak * factor + slack, budget)
+        return min(peak * factor + slack, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         shares = dict(zip(tests, pool.map(needs, tests), strict=True))
