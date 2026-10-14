@@ -36,7 +36,7 @@ from dew.inputs.diffusion import (
     T5Segment,
     WanConditioner,
 )
-from dew.interop import decoder_parts, hf_decoders as decoders, sources, weights as checkpoint_weights
+from dew.interop import decoder_parts, hf_decoders as decoders, sources
 from dew.interop.components import bind_component
 from dew.interop.processors import (
     HostProcessor as HostProcessor,
@@ -950,31 +950,20 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
     layouts and the two configs it ships; supplied `params` are bound without
     a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
-    from dew.interop import diffusion
     from dew.nn.text_encoders import translate_vision_config
 
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
         transform = json.load(handle)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "safety_checker")
-        # The root scoring vectors and thresholds are state, not tower/projection
-        # weights. Preserve their FP32 contract without post-casting a whole tree.
-        state = {name: value for name, value in tensors.items()
-                 if (path := _safety_path(name)) is not None and len(path) == 1}
-        weights = {name: value for name, value in tensors.items() if name not in state}
-        params, layouts = checkpoint_weights.record_layouts(
-            "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype,
-            lazy=lazy)
-        scoring, state_layouts = checkpoint_weights.record_layouts(
-            "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32", lazy=lazy)
-        params.update(scoring)
-        layouts += state_layouts
     head = CLIPSafetyHead(translate_vision_config(config).value.clone(dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
-    return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
-            {"safety_checker": config, "feature_extractor": transform})
+    finish, params, layouts, _ = bind_component(
+        directory / "safety_checker", "safety_checker", config, head, lambda name, rank: _safety_path(name),
+        lambda bound: ImageSafety(head, CLIPImageTransform.from_config(transform)),
+        prefix=("encoders", "safety"), params=params, param_dtype=param_dtype, lazy=lazy,
+        # The root scoring vectors and thresholds, the head's only one-name paths.
+        state=lambda name: (path := _safety_path(name)) is not None and len(path) == 1)
+    return finish, params, layouts, {"safety_checker": config, "feature_extractor": transform}
 
 
 def _text_head_path(name: str):
