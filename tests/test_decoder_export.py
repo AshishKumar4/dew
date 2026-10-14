@@ -768,18 +768,21 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
 
 
-COPIES = {"equal": (1. + 1. / 1024, True), "equal-in-bfloat16": (1. + 2. / 1024, True),
-          "different": (1. + 1. / 64, False)}
-"""Copies of a gate whose FP8 packing decodes to 1 + 1/1024, and whether each loads."""
+COPIES = {"equal": (1. + 1. / 1024, "float32", True), "different": (1. + 2. / 1024, "float32", False),
+          "equal-narrowed": (1. + 1. / 1024, "bfloat16", False)}
+"""A dense copy of a gate whose FP8 packing decodes to 1 + 1/1024, the
+storage it loads at, and whether it loads."""
 
 
-@pytest.mark.parametrize("copy, loads", list(COPIES.values()), ids=list(COPIES))
-def test_a_quantized_packed_tensor_and_its_part_stored_apart_load_one_leaf(tmp_path, copy, loads):
-    """Phi-3's gate_up_proj stored in FP8 decodes to 1 + 1/1024, which the
-    bfloat16 storage rounds to 1, beside a dense float32 gate_proj. A copy
-    of the gate that bfloat16 holds as the same value, the decoded one or
-    1 + 2/1024, loads as the packed tensor alone does; 1 + 1/64, which
-    bfloat16 holds apart, is refused."""
+@pytest.mark.parametrize("copy, storage, loads", list(COPIES.values()), ids=list(COPIES))
+def test_a_quantized_packed_tensor_and_its_part_stored_apart_must_be_one_tensor(
+        tmp_path, copy, storage, loads):
+    """Phi-3's gate_up_proj stored in FP8 decodes to 1 + 1/1024, beside a
+    dense float32 gate_proj. At float32 storage the decode is the dense
+    copy's tensor: an equal copy loads as the packed tensor alone does, and
+    1 + 2/1024 is refused. At bfloat16 storage the codec has rounded the
+    packed one, so even an equal copy is a different tensor and is refused
+    by name rather than loading whichever copy came first."""
     from dew.interop.codecs import E4M3
 
     fixture = FIXTURES / "phi3-tiny"
@@ -796,10 +799,10 @@ def test_a_quantized_packed_tensor_and_its_part_stored_apart_load_one_leaf(tmp_p
                    tmp_path / "apart")
     if not loads:
         with pytest.raises(ValueError, match=r"holds model\.layers\.0\.mlp\.gate_proj\.weight"):
-            Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+            Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype=storage, attention_impl="xla")
         return
-    apart = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
-    alone = Pretrained.load(tmp_path / "alone", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    apart = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype=storage, attention_impl="xla")
+    alone = Pretrained.load(tmp_path / "alone", dtype="float32", param_dtype=storage, attention_impl="xla")
     assert jax.tree.structure(apart.variables) == jax.tree.structure(alone.variables)
     for ours, theirs in zip(jax.tree.leaves(apart.variables), jax.tree.leaves(alone.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
