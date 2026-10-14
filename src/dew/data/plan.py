@@ -291,6 +291,16 @@ class Manifest:
         return all(step.exact for step in (*self.ran, *self.steps))
 
 
+def _digests(value: JSON) -> JSON:
+    """`value` as digests short enough to read beside another process's: a
+    mapping's values each apart, a list's entries one by one."""
+    if isinstance(value, dict):
+        return {name: _digests(entry) for name, entry in value.items()}
+    if isinstance(value, list):
+        return [fingerprint(entry)[:12] for entry in value]
+    return fingerprint(value)[:12]
+
+
 def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
@@ -332,18 +342,27 @@ class Plan:
 
     def identity(self) -> str:
         """What every process of a pool reads, which the pool agrees before any
-        reads: the order, as a reader can follow it, then a digest of the rest
-        of the plan but its environment and the share this process reads,
-        which only the position it saves keeps. The order's sources are named
-        by the manifest's content, not by their descriptions: hosts that mount
-        one dataset at different paths read the same records."""
+        reads: the order, as a reader can follow it, then the rest of the plan
+        as its parts' digests (`parts`), so a pool that disagrees is shown
+        which part differs. The order's sources are named by the manifest's
+        content, not by their descriptions: hosts that mount one dataset at
+        different paths read the same records."""
+        order = _unplaced(json_value(self.order, "order"))
+        return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
+
+    def parts(self) -> dict[str, JSON]:
+        """A digest of each part of the plan but its order, its environment and
+        the share this process reads, which only the position it saves keeps:
+        the manifest's parts each apart, and a list's entries, such as each
+        source's content and each step's identity, one by one."""
         recorded = self.record()
-        del recorded["environment"]
-        recorded["order"] = _unplaced(recorded["order"])
+        for name in ("order", "environment", "manifest"):
+            del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
         )
-        return f"{json.dumps(recorded['order'], sort_keys=True)} under plan {fingerprint(recorded)}"
+        return {**{name: _digests(value) for name, value in recorded.items()},
+                **{f"manifest {name}": _digests(value) for name, value in self.manifest.semantic().items()}}
 
     def check(
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"

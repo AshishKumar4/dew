@@ -1067,6 +1067,30 @@ def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, fo
     assert first_identity == second_identity
 
 
+def test_a_pool_is_shown_which_part_of_its_plan_differs():
+    """Processes whose plans differ are refused with each one's plan, part by
+    part, a digest each: a step's identity or a source's content shows as the
+    one entry that differs, not as one digest of everything."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    def parts(rows, version):
+        doubled = Pipeline(Memory(rows)).map(lambda row: {"x": row["x"] * 2}, identity=f"doubled@{version}")
+        return compile(doubled.repeat().batch(2), read="memory", loading=Loading(workers=0)).plan.parts()
+
+    rows = tuple({"x": np.int32(index)} for index in range(4))
+    base, stepped = parts(rows, 1), parts(rows, 2)
+    changed = parts((*rows[:3], {"x": np.int32(9)}), 1)
+
+    def differing(other) -> set[str]:
+        return {name for name in base if base[name] != other[name]}
+
+    assert differing(stepped) == {"manifest steps"}
+    assert [old == new for old, new in zip(base["manifest steps"], stepped["manifest steps"], strict=True)
+            ].count(False) == 1
+    assert "manifest source" in differing(changed) and "manifest steps" not in differing(changed)
+
+
 def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):
     """An exact multifile reader identifies bytes between every shard's endpoints."""
     from dew.data.compile import compile
