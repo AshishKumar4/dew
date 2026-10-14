@@ -24,7 +24,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
+from interop_support import (
+    assert_autoencoder_vjp,
+    assert_layout_tensors,
+    extract_fixture,
+    fixture_arrays,
+    scaled_gap,
+)
 
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.rae import UNREAD, load_dinov2, load_rae
@@ -90,24 +96,13 @@ def test_the_pixel_gradient_through_the_frozen_encoder_matches_the_source(varian
 
 
 def test_decoder_gradients_match_the_source(variant):
-    _, (autoencoder, params, layouts, config), reference = variant
-    probe = channels_last(reference["probe"])
-
-    def objective(params, code):
-        return jnp.sum((autoencoder.decode(params, code) + 1) / 2 * probe)
-
-    grad_params, grad_code = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["code"]))
-    code_gap = scaled_gap(grad_code, channels_last(reference["decode.grad_code"]))
-    gaps = {layout.name: scaled_gap(layout.export({"autoencoder": grad_params}),
-                                    reference[f"decode.grad.{layout.name.removeprefix('vae/')}"])
-            for layout in layouts if layout.name.startswith("vae/decoder.")}
-    worst = max(gaps, key=gaps.get)
-    print(
-        f"{config['encoder_type']}: latent gradient gap {code_gap:.3g}; "
-        f"worst parameter {worst} {gaps[worst]:.3g}"
-    )
-    assert code_gap < GRADIENT
-    assert gaps[worst] < GRADIENT, worst
+    """The decoder's parameters; the encoder is frozen."""
+    _, (autoencoder, params, layouts, _), reference = variant
+    assert_autoencoder_vjp(
+        "decode", lambda params, code: (autoencoder.decode(params, code) + 1) / 2, params,
+        channels_last(reference["code"]), [channels_last(reference["probe"])],
+        [layout for layout in layouts if layout.name.startswith("vae/decoder.")], reference,
+        channels_last(reference["decode.grad_code"]), GRADIENT)
 
 
 @pytest.mark.network

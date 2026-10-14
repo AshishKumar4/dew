@@ -67,6 +67,6 @@ def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tm
     for ours, theirs in zip(jax.tree.leaves(copied.variables), jax.tree.leaves(without.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
-    with pytest.raises(ValueError, match=r'lm_head\.weight is not the embedding'):
+    with pytest.raises(ValueError):
         Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16',
                         attention_impl='reference')

@@ -7,7 +7,7 @@ export class StubPool extends DurableObject {
 	async hold(id: string, held: boolean) { await this.ctx.storage.put(`held:${id}`, held); }
 	async held() { return [...(await this.ctx.storage.list<boolean>({ prefix: 'held:' })).entries()].filter(([, held]) => held).map(([key]) => key.slice(5)); }
 }
-interface Env { COORDINATOR: DurableObjectNamespace<Coordinator>; POOL: DurableObjectNamespace<StubPool>; }
+interface Env { COORDINATOR: DurableObjectNamespace<Coordinator>; POOL: DurableObjectNamespace<StubPool>; WALL_SECONDS: string; }
 const T0 = Date.parse('2026-09-24T10:00:00Z');
 const at = (seconds: number) => T0 + seconds * 1000;
 const IMAGE = 'snapshot-a';
@@ -26,6 +26,14 @@ export default {
 		if (scenario === 'late') await coordinator.status(at(121));
 		const counted = await coordinator.started(opened.id, at(scenario === 'late' ? 122 : 4), IMAGE);
 		await pool.hold(opened.id, true);
+		if (scenario === 'reconnect') {
+			// The page reconnects ten seconds before its end, with nobody asking the status in between.
+			const wall = Number(env.WALL_SECONDS);
+			const again = await coordinator.started(opened.id, at(4 + wall - 10), IMAGE);
+			const past = await coordinator.started(opened.id, at(4 + wall + 1), IMAGE);
+			return Response.json({ counted, again, past, open: await coordinator.isOpen(opened.id),
+				status: await coordinator.status(at(4 + wall + 2)) });
+		}
 		if (scenario === 'ended') {
 			// The pool no longer holds the session, as after its host closed the context.
 			await pool.hold(opened.id, false);
