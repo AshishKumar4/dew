@@ -1,6 +1,7 @@
 """`DecisionObjective`: training a decision model on labelled questions."""
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
