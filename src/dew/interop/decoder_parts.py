@@ -1566,8 +1566,8 @@ class DecoderFamily:
         part, and one leaf reads it, so the two must be the same tensor, of
         one dtype and equal values; any other pair is refused, whichever the
         checkpoint lists first. A quantized copy reaches this decoded at the
-        load's storage dtype (`Pretrained.load`), so beside a dense copy it
-        loads at float32 storage alone."""
+        load's storage dtype (`Pretrained.load`), so a dense copy beside it
+        must hold the decoded values in that dtype."""
         prepared = self.prepare(tensors, config)
         if not self.packed:
             return prepared
