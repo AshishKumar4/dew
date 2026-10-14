@@ -12,52 +12,14 @@ value: bit-identical before and after.
 """
 
 import dataclasses
-import json
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
-from affine_run import FEATURES, Regression
+from affine_run import Counting, frozen_trainer
 
 from dew.data.dataset import Loader
-from dew.training import Checkpoints, Layout, Trainer
-
-
-class Counting:
-    """A deterministic, checkpointable stream of regression batches."""
-
-    def __init__(self, batch=8):
-        self.index = 0
-        self.batch = batch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        rng = np.random.default_rng(self.index)
-        self.index += 1
-        x = rng.normal(size=(self.batch, FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2]}
-
-    def get_state(self):
-        return json.dumps({"index": self.index}).encode()
-
-    def set_state(self, state):
-        self.index = json.loads(state)["index"]
-
-
-def make_trainer(tmp_path=None, **kwargs):
-    checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
-    return Trainer(
-        Regression(ema_decay=1.0),
-        optax.sgd(0.1),
-        key=jax.random.key(0),
-        layout=Layout(min_shard=1, tolerance=1.0),
-        checkpoints=checkpoints,
-        **kwargs,
-    )
 
 
 def frozen_bytes(state):
@@ -80,7 +42,7 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     """One compiled step over infinite parameters, with and without the
     mixed-precision gate. The parameters may go wherever the update takes
     them; the frozen tree stays bitwise where it was."""
-    trainer = make_trainer(dynamic_scale=dynamic_scale)
+    trainer = frozen_trainer(dynamic_scale=dynamic_scale)
     state = poison(trainer.initial_state())
     before = frozen_bytes(state)
     batch = next(Counting())
@@ -95,14 +57,14 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
 def test_a_resumed_run_restores_the_frozen_reference(tmp_path):
     """Two steps freeze the reference at init; the checkpoint carries those
     bytes and the resumed run trains on."""
-    trainer = make_trainer(tmp_path)
+    trainer = frozen_trainer(tmp_path)
     # The placed init is what fit starts from; the eager init rounds the
     # random draws differently on a GPU.
     initial = frozen_bytes(trainer.place()[0])
     data = Loader(lambda partition: Counting(), None, batch=8, records=None)
     trainer.fit(data, steps=2, log_every=1)
 
-    resumed = make_trainer(tmp_path)
+    resumed = frozen_trainer(tmp_path)
     state, _, _ = resumed.place()
 
     assert int(state.step) == 2

@@ -36,8 +36,39 @@ test('idle scale-in never removes the two minimum warm hosts', async () => {
 	assert.equal(result.idle.ready, 2);
 	assert.equal(result.idle.active, 0);
 });
+test('an operator retires a host through the pool, which assigns it no session from then', async () => {
+	const result = await scenario('retire');
+	assert.match(result.busy, /holds 1 sessions/, 'a host with a session is refused');
+	assert.ok(result.hosts.includes(result.held));
+	if (result.retired === 'fulfilled') {
+		assert.equal(result.stopped, true);
+		assert.ok(!result.hosts.includes(result.other));
+		assert.notEqual(result.assigned, result.other, 'no session went to the host retired meanwhile');
+	} else {
+		assert.equal(result.assigned, result.other, 'the retirement was refused because the session took the host first');
+		assert.equal(result.stopped, false);
+	}
+});
 test('a generation handed over after a newer one does not replace it', async () => {
 	assert.equal((await scenario('older')).desired, 'newer');
+});
+test('a host that fails its health check restarts at once when idle, and at its third miss when busy', async () => {
+	const { restarts } = await scenario('health');
+	assert.deepEqual(restarts, [{ idle: 1, held: 0, ready: 1 }, { idle: 1, held: 0, ready: 1 }, { idle: 1, held: 1, ready: 2 }]);
+});
+test('a session that attaches while its host fails a health check keeps the host from restarting', async () => {
+	const result = await scenario('race');
+	assert.equal(result.held, result.first);
+	assert.equal(result.restarts, 0);
+	assert.equal(result.has, true);
+});
+test('a pool the Worker no longer binds retires each host once its sessions end', async () => {
+	const result = await scenario('drain');
+	assert.deepEqual(result.busy.retired, [false, true], 'the host with a session keeps running');
+	assert.deepEqual(result.busy.left.pool.hosts.map((host) => host.id), ['old:a']);
+	assert.notEqual(result.busy.left.alarm, null);
+	assert.equal(result.retired, true);
+	assert.deepEqual(result.left, { pool: null, alarm: null });
 });
 test('a pool the Worker no longer binds retires its hosts and stops', async () => {
 	const result = await scenario('orphan');
