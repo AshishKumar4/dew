@@ -760,10 +760,10 @@ def _objective_records(
             pipeline = pipeline.flat_map(step)
         elif isinstance(step, Configured):
             pipeline = pipeline.then(step)
+        elif isinstance(step, pygrain.RandomMapTransform):
+            pipeline = pipeline.random_filter_map(step) if _rejects(step) else pipeline.random_map(step)
         elif _rejects(step):
             pipeline = pipeline.filter_map(step)
-        elif isinstance(step, pygrain.RandomMapTransform):
-            pipeline = pipeline.random_map(step)
         else:
             pipeline = pipeline.map(step)
     return pipeline
