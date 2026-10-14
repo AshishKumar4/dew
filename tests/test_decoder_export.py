@@ -769,11 +769,11 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
 
 
 def test_a_tied_head_stored_with_its_depths_copies_and_no_trunk_embedding_loads_as_tied(tmp_path):
-    """DeepSeek V3's released layout stores each prediction depth's copies of
-    the trunk embedding and head. A tied source that keeps those copies and
-    the head but no trunk embedding still holds the embedding twice over;
-    it loads leaf for leaf as the same source with the trunk embedding."""
-    fixture = FIXTURES / "deepseek-v3-tiny"
+    """GLM's released layout stores each prediction depth's copies of the
+    trunk embedding and head. A tied source that keeps those copies and the
+    head but no trunk embedding still holds the embedding twice over; it
+    loads leaf for leaf as the same source with the trunk embedding."""
+    fixture = FIXTURES / "glm4-moe-tiny"
     tensors = tool.source_tensors(fixture)
     config = json.loads((fixture / "config.json").read_text())
     config["tie_word_embeddings"] = True
