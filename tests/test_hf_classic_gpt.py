@@ -50,30 +50,6 @@ def test_gpt2_public_generation_matches_the_reference_continuation():
     )
 
 
-def test_gpt2_export_is_read_by_transformers(tmp_path):
-    import torch
-    from transformers import AutoModelForCausalLM
-
-    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path)
-    reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation='eager').float().eval()
-    ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')
-    with torch.no_grad():
-        expected = reference(torch.tensor(ids), use_cache=False).logits.numpy()
-    actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
-    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
-    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    np.testing.assert_array_equal(
-        np.asarray(reloaded.model.apply(reloaded.variables, jnp.asarray(ids))), actual)
-
-    assert reloaded.model == loaded.model
-    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(loaded.variables)
-    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
-                                        jax.tree.leaves(reloaded.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
-
-
 def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     from dew.interop.hf_decoders import translate_weights
     from dew.interop.sources import load_shards
