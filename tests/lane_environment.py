@@ -11,18 +11,22 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
-REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true",)
+REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions, and with them jax 0.11.2's XLA measures no kernels:
 each instruction takes the first configuration that compiles, the same in
 every process (xla/service/gpu/autotuning/config_assigner_pass.cc,
 `GetConfigAssignerOptions`). `dew.cache.enable_compilation_cache` keeps
-such a run off stored picks, which XLA would take instead. Turning
-autotuning off as well (`--xla_gpu_autotune_level=0`) skips that choice for
-cuBLAS and cuDNN calls (`GetShouldAssignConfigToInstructionFn`), which keep
-the configuration they were emitted with: cuDNN refused an fp8 convolution's
-on an H100 (CUDNN_STATUS_NOT_SUPPORTED), and a jvp dot of the mean-flow
-hybrid DiT found no supported configuration."""
+such a run off stored picks, which XLA would take instead. Deterministic ops
+also take Triton out of the GEMM configurations (`GetEnabledBackends`) while
+XLA still fuses dots for Triton, and cuBLAS takes back most of them but not
+the mean-flow hybrid DiT's jvp dot over a concatenation ("No supported
+config found"); with Triton GEMMs off every dot is a cuBLAS call from the
+start. Turning autotuning off (`--xla_gpu_autotune_level=0`) is not needed
+and skips the choice for cuBLAS and cuDNN calls
+(`GetShouldAssignConfigToInstructionFn`), which keep the configuration they
+were emitted with: cuDNN refused an fp8 convolution's on an H100
+(CUDNN_STATUS_NOT_SUPPORTED)."""
 
 
 def configure_lane(environ: MutableMapping[str, str]) -> None:

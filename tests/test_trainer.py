@@ -595,10 +595,10 @@ def test_a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels
     from lane_environment import REPEATABLE_GPU_FLAGS
 
     root = Path(__file__).resolve().parents[1]
-    # The lane's own picks settings, which conftest and gpu-run named, stay out of the three runs.
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_per_fusion_autotune_cache_dir",
-                                     "--xla_gpu_experimental_autotune_cache_mode"))]
+    # The lane's flags and the picks settings conftest and gpu-run named stay out of the three runs.
+    named = (*(flag.split("=")[0] for flag in REPEATABLE_GPU_FLAGS),
+             "--xla_gpu_per_fusion_autotune_cache_dir", "--xla_gpu_experimental_autotune_cache_mode")
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split() if not flag.startswith(named)]
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_ENABLE_COMPILATION_CACHE": "false"}
     lane = {**environment, "XLA_FLAGS": " ".join([*flags, *REPEATABLE_GPU_FLAGS])}
