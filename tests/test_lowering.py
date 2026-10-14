@@ -1,5 +1,6 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
+import json
 from pathlib import Path
 
 import jax
@@ -100,6 +101,41 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
     assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
+
+
+def _step_lowered(generation: str):
+    """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
+    delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
+    model's and the short conv's kernels take), lowered for `generation` from abstract state as
+    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
+    import optax
+
+    from dew.interop.hf_decoders import translate_config
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered
+
+    config = json.loads((ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny" / "config.json").read_text())
+    fields = translate_config({**config.get("text_config", config), "linear_key_head_dim": 32,
+                               "linear_value_head_dim": 32})
+    model = CausalTransformer(**{**fields, "dtype": jnp.bfloat16})
+    trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                      lower_for=generation)
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with pytest.raises(Lowered) as lowered:
+        # A row for each of the host's devices, which the trainer's data axis splits.
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+    return lowered.value.lowered
+
+
+@pytest.mark.parametrize("generation", GPUS)
+def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation):
+    """A Qwen 3.5 hybrid's training step, lowered on this CPU for the GPU, calls the short conv's
+    kernels and those of every Pallas choice the generation's row names for a step's layers (the
+    norms, SwiGLU and the gated delta rule's port), so none was interpreted or refused there."""
+    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    assert set(triton_kernels(_step_lowered(generation))) == expected
 
 
 def _experts_lowered(generation: str, implementation: str):
