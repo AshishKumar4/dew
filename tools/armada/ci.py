@@ -612,47 +612,37 @@ def marked(python: str) -> dict[str, int]:
 GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
 fragmentation, which can leave a share its own size short of a block it needs."""
-GPU_UNRECORDED = 4
-"""A file no run has measured the peak of first runs on this part of the lane's share."""
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
-    """Run `tests` on this process's share of the one GPU it sees, each file as a task of its own
-    (`tested`), and write their verdict rows to `out`.
+    """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
+    own (`tested`), and write their verdict rows to `out`.
 
     A file's process may hold the peak memory its last run on this GPU's class held
-    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`. A file that started
-    another process, or whose last run left no report, holds the whole share, alone: its children's
-    memory is measured nowhere, and they size what they run by the device they see. A file no run
-    has measured is given a guess, a `GPU_UNRECORDED`th of the share; if it runs red on the guess,
-    it runs again at once with the whole share, alone, and that run's row and peak are its own. Files
+    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`; files so measured
     start heaviest first while their shares fit the share this process was given
-    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
-    runs out of a measured share is red: it took more than its last run."""
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file no
+    run has measured, one that started another process (its children's memory is measured nowhere,
+    and they size what they run by the device they see) and one whose last run left no report each
+    run alone with the whole share. A file that runs out of a measured share is red: it took more
+    than its last run, whose peak its next run is given."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def needs(name: str) -> tuple[float, bool]:
-        """A file's share, and whether it is a guess."""
+    def needs(name: str) -> float:
         record = cache_request(cache_url(python, row(python, name, ""), held), token)
-        if record is None:
-            return budget / GPU_UNRECORDED, True
-        recorded = json.loads(record)
-        if recorded["depends"] is None:
-            return budget, False
-        if recorded["peak"] is None:
-            return budget / GPU_UNRECORDED, True
+        recorded = json.loads(record) if record else {"depends": None, "peak": None}
+        peak = recorded["peak"]
+        if recorded["depends"] is None or peak is None:
+            return budget
         factor, slack = GPU_HEADROOM
-        return min(recorded["peak"] * factor + slack, budget), False
+        return min(peak * factor + slack, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        sized = dict(zip(tests, pool.map(needs, tests), strict=True))
-    shares = {name: share for name, (share, _) in sized.items()}
-    guessed = {name for name, (_, guess) in sized.items() if guess}
-    retried: set[str] = set()
+        shares = dict(zip(tests, pool.map(needs, tests), strict=True))
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
     waiting = sorted(tests, key=lambda name: -shares[name])
@@ -665,20 +655,13 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
-                # A retry runs: the red run's record may not have reached the Worker over a green one.
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline,
-                                    cache and fits not in retried, 60.0, common, environ)] = fits
+                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
+                                    environ)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
                 future.result()
-                name = running.pop(future)
-                red = any(verdict["exitCode"] for verdict in json.loads(verdicts[name].read_text())["rows"])
-                if name in guessed and red:
-                    guessed.remove(name)
-                    retried.add(name)
-                    shares[name] = budget
-                    waiting.insert(0, name)
+                del running[future]
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0
