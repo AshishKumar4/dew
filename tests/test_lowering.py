@@ -122,7 +122,8 @@ def _step_lowered(generation: str):
                       lower_for=generation)
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with pytest.raises(Lowered) as lowered:
-        trainer.compile(state, {"text": jax.ShapeDtypeStruct((2, 129), jnp.int32)})
+        # A row for each of the host's devices, which the trainer's data axis splits.
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
     return lowered.value.lowered
 
 
