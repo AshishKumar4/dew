@@ -667,12 +667,20 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     rank's train state holds packed, so ranks timing their own would build
     different states. A process beside other work on its GPU measures
     unfairly (`dew.cache.measures_picks`) and is refused, where a recorded
-    `InputQuantization` reproduces the choice instead.
+    `InputQuantization` reproduces the choice instead. Every rank looks the
+    sites up in its own tree first, and the pool agrees on what they found,
+    so a rank whose tree lacks one is refused with its peers rather than
+    leaving them at the measurement's agreement.
     """
     from dew import cache, coordination
     from dew.nn.kernels.generation import device_generation, gpu_target
 
-    shapes = {site: tuple(np.shape(_site_kernel(variables["params"], site))) for site in sites}
+    def planned() -> dict:
+        return {"tokens": tokens,
+                "shapes": {site: list(np.shape(_site_kernel(variables["params"], site))) for site in sites}}
+
+    plan = coordination.agreed_same("frozen FP8 sites to measure", planned)
+    shapes = {site: tuple(shape) for site, shape in plan["shapes"].items()}
 
     def decided() -> dict | None:
         if jax.process_index() != 0:

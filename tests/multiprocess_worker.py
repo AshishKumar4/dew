@@ -753,29 +753,30 @@ def mode_pool_refusals(args) -> dict:
 
 
 def mode_fp8_sites(args) -> dict:
-    """The frozen FP8 record each rank holds after `measured_fp8_sites`,
-    its GPU taken for an H100 (sm90) and its timer made to split the pool as
-    two GPUs' noise can on a close call: process 0 times FP8 faster, every
-    other process slower. bf16 is timed before FP8 for each shape."""
+    """How the pool ends `measured_fp8_sites` on CPUs, which have no FP8
+    tensor cores, and when process 1's tree lacks a site the others hold:
+    each outcome is the error's type and text, and every process then
+    passes one more agreement, which a rank left behind would block."""
     import jax
 
-    from dew.nn.kernels import tuning
-    from dew.nn.kernels.generation import assumed
+    from dew import coordination
     from dew.training.quantization import measured_fp8_sites
 
-    timed: list[object] = []
+    full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
+                       "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}
+    lacking = {"params": {"wide": full["params"]["wide"]}}
 
-    def samples(fn, *operands, repeats):
-        timed.append(fn)
-        fp8 = len(timed) % 2 == 0
-        return [1.0 if fp8 == (jax.process_index() == 0) else 2.0]
+    def outcome(variables) -> str:
+        try:
+            measured_fp8_sites(variables, ("wide", "narrow"), 8)
+        except (ValueError, coordination.PeerFailure) as error:
+            return f"{type(error).__name__}: {error}"
+        return "measured"
 
-    tuning.samples = samples
-    variables = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
-                            "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}
-    with assumed("sm90"):
-        record = measured_fp8_sites(variables, ("wide", "narrow"), 8)
-    return {"sites": list(record.frozen_fp8), "generation": record.measured_on, "timed": len(timed)}
+    unsupported = outcome(full)
+    missing = outcome(lacking if jax.process_index() == 1 else full)
+    after = coordination.agreed("after the refusals", lambda: True)
+    return {"unsupported": unsupported, "missing": missing, "after": after}
 
 
 def mode_profile_failure(args) -> dict:
