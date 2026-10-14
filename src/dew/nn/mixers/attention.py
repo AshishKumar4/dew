@@ -595,8 +595,7 @@ class CausalSelfAttention(nn.Module):
                 query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
                 positions=None if logical_positions is None else positions,
                 segment_ids=segment_ids,
-                max_segments=(None if attention_metadata is None or attention_metadata.coordinates is None
-                              else attention_metadata.coordinates.max_segments),
+                max_segments=None if segment_ids is None else tokens.max_segments,
                 valid=None if attention_metadata is None else attention_metadata.valid,
                 dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -804,8 +803,7 @@ class CausalSelfAttention(nn.Module):
             mask = chunked if base is None else base & chunked
             causal, window = False, None
             implementation = masked
-        coordinates = None if attention_metadata is None else attention_metadata.coordinates
-        max_segments = None if documents is None or coordinates is None else coordinates.max_segments
+        max_segments = None if documents is None else coordinates_of(attention_metadata, B, S).max_segments
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor)
 
