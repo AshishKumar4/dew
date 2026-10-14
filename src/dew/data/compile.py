@@ -35,6 +35,7 @@ from dew.data.analysis import (
     _name,
     _preferred_read,
     _promoted,
+    _Ran,
     _steps,
     _until,
     _written,
@@ -557,12 +558,17 @@ def _coordinated(pipeline: Pipeline) -> tuple[Coordinated, ...]:
     """The step that lays each packed window's documents out as the model
     reads them (`Coordinated`), one per packed ids field, before the stages
     that pack are planned away: a window holds no more documents than tokens.
-    A source that reads its windows by plan (`PackedSource`) packs as its pack
-    stage would."""
+    A pack counts wherever it runs: as a stage, in the stages a memory read
+    already ran, or as the plan a source reads its windows by (`PackedSource`)."""
     from dew.data.packing import PackedSource
 
     packs = [stage for stage in _steps(pipeline) if isinstance(stage, Pack)]
-    packs += [source.plan.pack for _, source in _leaves(pipeline) if isinstance(source, PackedSource)]
+    for _, source in _leaves(pipeline):
+        packs += [stage for stage in _written(source, ()) if isinstance(stage, Pack)]
+        while isinstance(source, (_Facts, _Ran)):
+            source = source.source if isinstance(source, _Facts) else source.original
+        if isinstance(source, PackedSource):
+            packs.append(source.plan.pack)
     caps: dict[tuple[str, ...], int] = {}
     for stage in packs:
         caps[stage.fields] = max(caps.get(stage.fields, 0), stage.seq_len)
