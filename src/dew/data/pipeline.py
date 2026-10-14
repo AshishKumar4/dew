@@ -7,7 +7,7 @@ import inspect
 import itertools
 import math
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
 
 import grain.python as pygrain
@@ -18,8 +18,9 @@ from dew.data.dataset import Batch, LengthGroups
 if TYPE_CHECKING:
     import jax
 
-    from dew.data.cache import Cache, Generation
+    from dew.data.cache import Cache
     from dew.data.dataset import Loading
+    from dew.data.generation import Generation
     from dew.data.sources.base import Read, Source
 
 
@@ -113,6 +114,9 @@ class Expansion(Protocol):
     def flat_map(self, element: Batch, /) -> Sequence[Batch | Rejected]: ...
 
 
+type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
+
+
 @dataclasses.dataclass(frozen=True)
 class Configured:
     """Resolve one record step from source facts before any record reader opens."""
@@ -191,7 +195,7 @@ class Filter:
 
 @dataclasses.dataclass(frozen=True)
 class FlatMap:
-    step: Expansion
+    step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
 
@@ -497,7 +501,7 @@ class Dataset:
         `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
         return self.then(Filter(predicate, reason or _reason(predicate), identity))
 
-    def flat_map(self, step: Expansion | ColumnStep, *, batched: bool = False,
+    def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
                  batch_size: int = 1000, identity: str | None = None) -> Pipeline:
         """One record to any number: the step returns a record's records. With
         `batched`, it reads `batch_size` records at a time as a dict of columns
@@ -505,8 +509,8 @@ class Dataset:
         if batched:
             (columns,) = _columns((step,))
             return self.then(Batched(columns, batch_size, identity, same_rows=False))
-        if not isinstance(step, Expansion):
-            raise TypeError(f"{_named_step(step)} is a function of columns; flat_map reads it batched=True")
+        if not _expands(step):
+            raise TypeError(f"{_named_step(step)} is not a record expansion function or transform")
         return self.then(FlatMap(step, identity))
 
     @property
@@ -618,17 +622,23 @@ class Dataset:
         return export(chain, url, format=format, rows_per_shard=rows_per_shard)
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
-        """Each record with its field `old` under the name `new`, as `rename_columns({"txt": "caption"})`."""
-        moves = tuple((new, old) for old, new in names.items())
-        return self.map(_Renamed(moves), identity=f"dew.rename_columns:{sorted(moves)}")
+        """Each record with its fields renamed, as `rename_columns({"txt": "caption"})`."""
+        from dew.data.steps.generic import Fields
+
+        moves = tuple(names.items())
+        return self.map(Fields(rename=moves), identity=f"dew.rename_columns:{sorted(moves)}")
 
     def select_columns(self, *names: str) -> Pipeline:
         """Each record with the fields `names` alone."""
-        return self.map(_Kept(names), identity=f"dew.select_columns:{list(names)}")
+        from dew.data.steps.generic import Fields
+
+        return self.map(Fields(names), identity=f"dew.select_columns:{list(names)}")
 
     def remove_columns(self, *names: str) -> Pipeline:
         """Each record without the fields `names`."""
-        return self.map(_Removed(names), identity=f"dew.remove_columns:{list(names)}")
+        from dew.data.steps.generic import Fields
+
+        return self.map(Fields(remove=names), identity=f"dew.remove_columns:{list(names)}")
 
     def grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
                                             pygrain.MapDataset | pygrain.IterDataset],
@@ -641,23 +651,27 @@ class Dataset:
         return self.then(Native(function, identity))
 
     def stats(self, records: int = 1000) -> dict[str, float]:
-        """The counts a run logs, from a fresh reader's first `records`
-        records: attempted, accepted, and dropped by reason, per source."""
-        from dew.data.compile import compile
-        from dew.data.dataset import Closeable, DataPartition
+        """The counts a run logs from a fresh, lazy pass over at most
+        `records` accepted records: attempted, accepted and dropped by reason."""
+        from dew.data.compile import _diagnostic
+        from dew.data.mixing import state_counts
+        from dew.records import record
 
         chain = self.chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
             raise ValueError("stats counts records; take them before the batch")
-        loader = compile(chain.repeat().batch(1), read=chain.mode, provision=True, loading=chain.loading)
-        reader = loader.train(DataPartition())
+        if records < 0:
+            raise ValueError("stats records must be nonnegative")
+        if records == 0:
+            return {}
+        reader = _diagnostic(chain, records=records)
         try:
-            for _ in range(records):
-                next(reader)
-            return dict(loader.statistics())
+            for _ in reader:
+                pass
+            counted = state_counts(record(reader.get_state(), "diagnostic state"))
+            return {name: value for counts in counted.values() for name, value in counts.metrics().items()}
         finally:
-            if isinstance(reader, Closeable):
-                reader.close()
+            reader.close()
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -677,11 +691,9 @@ class Dataset:
 
     def iterate(self) -> Iterator[Batch]:
         """This dataset's records, or its batches where it batches: one pass,
-        as a validation pass reads it, or endlessly after a `repeat`, as
-        training reads it, where random steps after a shuffle or a drop may
-        draw."""
-        from dew.data.compile import _batch_steps, compile, validation
-        from dew.data.dataset import Closeable, DataPartition, Loading
+        or the passes its `repeat` asks for, with training's random draws."""
+        from dew.data.compile import _batch_steps, _diagnostic
+        from dew.data.dataset import take_batch
         from dew.objectives.base import VALID_ROWS
 
         chain = self.chain()
@@ -691,24 +703,15 @@ class Dataset:
         chain = dataclasses.replace(chain, stages=tuple(
             stage for stage in chain.stages
             if not (isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep))))
-        read = chain if batched else chain.batch(1, drop_remainder=False)
-        if any(isinstance(stage, Repeat) for stage in chain.stages):
-            # An endless chain reads as training reads it, random steps drawing as they draw there.
-            reader = compile(read, read=chain.mode, provision=True,
-                             loading=chain.loading).train(DataPartition())
-        else:
-            # One pass, as a validation pass reads it.
-            reader = validation(read, batch=1, read=chain.mode, provision=True,
-                                loading=chain.loading or Loading())(DataPartition())
+        reader = _diagnostic(chain)
         try:
             for batch in reader:
                 for step in device:
                     batch = step(batch)
-                yield batch if batched else {
-                    name: value[0] for name, value in batch.items() if name != VALID_ROWS}
+                yield batch if batched else take_batch(
+                    {name: value for name, value in batch.items() if name != VALID_ROWS}, 0)
         finally:
-            if isinstance(reader, Closeable):
-                reader.close()
+            reader.close()
 
     def show(self, count: int = 8) -> None:
         """Print the first `count` records."""
@@ -734,32 +737,6 @@ class Pipeline(Dataset):
 
     def chain(self) -> Pipeline:
         return self
-
-
-@dataclasses.dataclass(frozen=True)
-class _Renamed:
-    names: tuple[tuple[str, str], ...]
-
-    def __call__(self, record: Batch) -> Batch:
-        moved = {old for _, old in self.names}
-        return {**{key: value for key, value in record.items() if key not in moved},
-                **{new: record[old] for new, old in self.names}}
-
-
-@dataclasses.dataclass(frozen=True)
-class _Removed:
-    fields: tuple[str, ...]
-
-    def __call__(self, record: Batch) -> Batch:
-        return {name: value for name, value in record.items() if name not in self.fields}
-
-
-@dataclasses.dataclass(frozen=True)
-class _Kept:
-    fields: tuple[str, ...]
-
-    def __call__(self, record: Batch) -> Batch:
-        return {name: record[name] for name in self.fields}
 
 
 def concat(datasets: Sequence[Dataset]) -> Pipeline:
@@ -813,7 +790,7 @@ class ObjectiveData:
     evaluate_batch: tuple[HostStep, ...] = ()
 
 
-type _Step = RecordStep | RandomStep | HostStep | Configured | Expansion | ColumnStep
+type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
 
 
 def _named_step(step: _Step) -> str:
@@ -843,6 +820,10 @@ def _columns(steps: Sequence[_Step]) -> list[ColumnStep]:
 def _reads_columns(step: _Step) -> TypeGuard[ColumnStep]:
     return callable(step) and not isinstance(
         step, pygrain.MapTransform | pygrain.RandomMapTransform | Configured | Expansion)
+
+
+def _expands(step: ExpandStep | ColumnStep) -> TypeGuard[ExpandStep]:
+    return isinstance(step, Expansion) or _reads_columns(step)
 
 
 def _declares_rejects(step: _Step) -> bool:
