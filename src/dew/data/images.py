@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import importlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -81,41 +80,6 @@ def resize_image(image: np.ndarray, size: int) -> np.ndarray:
         return image
     interpolation = cv2.INTER_AREA if max(image.shape[:2]) > size else cv2.INTER_CUBIC
     return cv2.resize(image, (size, size), interpolation=interpolation)
-
-
-@dataclasses.dataclass(frozen=True)
-class Augment:
-    """The host augmentations `augment_image` applies: a random horizontal
-    flip with `flip` and a colour jitter with `jitter`. No Augment at all
-    leaves the image as it is.
-    """
-
-    flip: bool
-    jitter: bool
-
-
-def augment_image(augment: Augment | None, image: np.ndarray,
-                  rng: np.random.Generator) -> np.ndarray:
-    """Flips and colour-jitters `image`, seeded by the record's own rng.
-
-    Every draw comes from grain's per-record rng, a Philox keyed by the
-    record index, so a record's augmentation is the same however many
-    workers, threads or processes produced its batch. The jitter is
-    torchvision's float ColorJitter (`jitter_host`); uint8 pixels go through
-    float32 and are rounded once at the end.
-    """
-    if augment is None:
-        return image
-    if augment.flip and rng.random() < 0.5:
-        image = image[:, ::-1]
-    if not augment.jitter:
-        return np.ascontiguousarray(image)
-
-    from .image_augmentation import jitter_host, jitter_ranges
-
-    factors = np.asarray([rng.uniform(low, high) for low, high in jitter_ranges()])
-    pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
-    return np.rint(pixels).astype(np.uint8)
 
 
 def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20) -> Fetch:
