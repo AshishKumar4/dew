@@ -118,7 +118,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
-        ci, tmp_path, monkeypatch, cache_worker):
+        ci, tmp_path, monkeypatch, cache_worker, capsys):
     """A task keeps, beside each green file's key, where its run read the
     backend and its GPU marks (executed.py), and the GPU tier is each file
     with either, each whose inputs changed since, and each without a record
@@ -127,7 +127,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process has no key, so it is in, and no task reuses
-    its row. Under pytest-xdist, the workers' reports join."""
+    its row. Under pytest-xdist, the workers' reports join. The command line
+    spreads the tier over its shards, each file once, torchax files in
+    sessions of their own."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -193,6 +195,15 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_spawns.py")] == [True, False]
+    (tmp_path / "tests/test_marked.py").write_text("import pytest\npytestmark = pytest.mark.torchax\n"
+                                                  "@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n")
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
+    capsys.readouterr()
+    assert ci.main() == 0
+    sessions = [line.split() for line in capsys.readouterr().out.splitlines()]
+    assert {shard for shard, *_ in sessions} == {"0", "1"}
+    assert sorted(name for _, *names in sessions for name in names) == sorted(ci.gpu_tier("3.12"))
+    assert ["tests/test_marked.py"] in [names for _, *names in sessions]
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):

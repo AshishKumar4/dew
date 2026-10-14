@@ -4,7 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT...
-    python3 tools/armada/ci.py gpu-tier [--evidence]
+    python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -313,6 +313,16 @@ the whole process, so a torch.compile in a later file of its task fails (test_re
 MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked."""
 
 
+def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]]]:
+    """The names of `weights` packed heaviest first into the lightest of `count` bins: each bin's
+    weight and its names, sorted, in bin order."""
+    bins: list[tuple[float, int, list[str]]] = [(0.0, index, []) for index in range(count)]
+    for name in sorted(weights, key=lambda name: (-weights[name], name)):
+        held, index, names = heapq.heappop(bins)
+        heapq.heappush(bins, (held + weights[name], index, [*names, name]))
+    return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
+
+
 def torchax_files(names: Iterable[str]) -> set[str]:
     """The files of `names` marked `torchax` (`APART`)."""
     return {name for name in names if APART.search(Path(name).read_text())}
@@ -342,12 +352,8 @@ def plan(target: float, timings: dict) -> list[dict]:
         apart = torchax_files(light)
         for family in (sorted(set(light) - apart), sorted(apart)):
             count = max(math.ceil(sum(light[name] for name in family) / target), 1)
-            bins: list[tuple[float, int, list[str]]] = [(0.0, index, []) for index in range(count)]
-            for name in sorted(family, key=lambda name: (-light[name], name)):
-                held, index, names = heapq.heappop(bins)
-                heapq.heappush(bins, (held + light[name], index, [*names, name]))
-            tasks += [(sorted(names), "", held) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])
-                      if names]
+            tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
+                                                                  count) if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
@@ -608,6 +614,7 @@ def main() -> int:
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     choosing = operations.add_parser("gpu-tier")
     choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
+    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
@@ -623,11 +630,14 @@ def main() -> int:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
             return 0
-        # A pytest session a line: files marked `torchax` run apart from the rest, as in the plan.
-        apart = torchax_files(tier)
-        for session in (sorted(set(tier) - apart), sorted(apart)):
-            if session:
-                print(*session)
+        # A pytest session a line, after its shard: files marked `torchax` run apart from the rest, as
+        # in the plan, each set spread over the shards by its tests' recorded times.
+        apart, recorded = torchax_files(tier), recorded_tests()
+        for session in (set(tier) - apart, apart):
+            weights = {name: sum(recorded.get(name, [1.0])) for name in session}
+            for shard, (_, names) in enumerate(packed(weights, args.shards)):
+                if names:
+                    print(shard, *names)
         return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
