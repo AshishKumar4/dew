@@ -595,7 +595,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
             if isinstance(stage, Pack):
                 declare(stage, stage.segments)
         for _, source in _leaves(pipeline):
-            packed = source.documents if isinstance(source, _Memory) else None
+            packed = _packed_documents(source)
             for stage in _written(source, ()):
                 if isinstance(stage, Pack):
                     declare(stage, stage.segments if packed is None else packed)
@@ -604,6 +604,11 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
             if isinstance(source, PackedSource):
                 declare(source.plan.pack, source.plan.most_documents)
     return tuple(Coordinated(fields, bound) for fields, bound in bounds.items())
+
+
+def _packed_documents(source: Source) -> int | None:
+    """The most documents a window of a memory read's packed windows holds, None where it packed none."""
+    return source.documents if isinstance(source, _Memory) else None
 
 
 def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:

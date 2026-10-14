@@ -226,7 +226,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter,
                                       stage.fields[0])
             ids = f"{stage.fields[0]}_segment_ids"
-            documents = max((int(np.max(record(value, "packed window")[ids], initial=0))
+            documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
