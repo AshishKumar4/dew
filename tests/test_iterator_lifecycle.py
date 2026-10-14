@@ -722,11 +722,18 @@ def _running(pid: int) -> bool:
     return status.rsplit(")", 1)[1].split()[0] != "Z"
 
 
-@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads process states from /proc")
+def _segments() -> set[str]:
+    """The shared memory segments Python's processes have made on this host (`psm_` names)."""
+    return {name for name in os.listdir("/dev/shm") if name.startswith("psm_")}
+
+
+@pytest.mark.skipif(not (Path("/proc/self/stat").exists() and Path("/dev/shm").is_dir()),
+                    reason="reads process states from /proc and shared memory from /dev/shm")
 def test_a_killed_program_leaves_no_loading_worker_running():
     """A program killed mid-read, as a timeout or the kernel kills one, takes its loading workers
-    with it. Each worker read until its parent asked it to stop, so a killed parent left them
-    reading into a queue no one empties, holding their memory until the host was rebooted."""
+    with it, and the shared memory its batches were handed over in. Each worker read until its
+    parent asked it to stop, so a killed parent left them reading into a queue no one empties,
+    holding their memory until the host was rebooted."""
     program = (
         "import multiprocessing, time\n"
         "import numpy as np\n"
@@ -742,6 +749,7 @@ def test_a_killed_program_leaves_no_loading_worker_running():
         "print(' '.join(str(child.pid) for child in multiprocessing.active_children()), flush=True)\n"
         "time.sleep(600)\n")
     root = Path(__file__).resolve().parents[1]
+    before = _segments()
     parent = subprocess.Popen(
         [sys.executable, "-c", program], cwd=root, stdout=subprocess.PIPE, text=True,
         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
@@ -750,14 +758,18 @@ def test_a_killed_program_leaves_no_loading_worker_running():
         assert parent.stdout is not None
         workers = [int(pid) for pid in parent.stdout.readline().split()]
         assert len(workers) >= 2, "the program started no loading workers"
+        assert _segments() - before, "the program's workers handed over no batch in shared memory"
         parent.send_signal(signal.SIGKILL)
         parent.wait(timeout=30)
         deadline = time.monotonic() + 60
-        while any(map(_running, workers)) and time.monotonic() < deadline:
+        while (any(map(_running, workers)) or _segments() - before) and time.monotonic() < deadline:
             time.sleep(0.5)
         assert [pid for pid in workers if _running(pid)] == []
+        assert _segments() - before == set()
     finally:
         parent.kill()
         for pid in workers:
             if _running(pid):
                 os.kill(pid, signal.SIGKILL)
+        for name in _segments() - before:
+            Path("/dev/shm", name).unlink(missing_ok=True)
