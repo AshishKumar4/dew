@@ -1,5 +1,6 @@
 """The pipeline's observable order, branch scope and exact positions."""
 
+import contextlib
 import dataclasses
 import importlib
 import itertools
@@ -193,6 +194,37 @@ def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(
     rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
     compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
     assert chosen == [4]
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts this process's pipes in /proc")
+def test_a_validation_pass_reads_with_at_most_one_worker_per_batch():
+    """A held pass of two batches leaves as many pipes open under four
+    training workers as under two: each worker past its last batch would
+    start a process that keeps its pipes until the reader is collected."""
+
+    def pipes() -> int:
+        count = 0
+        for name in os.listdir("/proc/self/fd"):
+            with contextlib.suppress(OSError):
+                count += os.readlink(f"/proc/self/fd/{name}").startswith("pipe:")
+        return count
+
+    def held(workers: int) -> int:
+        """The pipes a whole pass holds while its reader lives."""
+        prefix = Pipeline(source(8))
+        data = compile(prefix.repeat().batch(4), validation=prefix.batch(4),
+                       loading=Loading(workers=workers, threads=1, read_buffer=1, worker_buffer=1))
+        before = pipes()
+        reader = data.val(DataPartition())
+        try:
+            assert [row["id"].tolist() for row in reader] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+            return pipes() - before
+        finally:
+            reader.close()
+
+    # The first pass also opens the pipes a process opens once, so the second may hold fewer.
+    two = held(2)
+    assert held(4) <= two
 
 
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
