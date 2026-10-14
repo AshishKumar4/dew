@@ -434,62 +434,31 @@ def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray],
     return text, conditioning, tuple(aliases)
 
 
-def _packed_parts(names: Collection[str], read: Callable[[str], np.ndarray], config,
-                  family: "DecoderFamily") -> tuple[tuple[str, str], ...]:
-    """Return each part of a packed tensor that the source also stores under
-    its own name, as (part, packed) pairs, checked equal to the packed
-    tensor's piece of it. `DecoderFamily.prepare_weights` compares the two
-    again where the path map reads them."""
-    present, pairs = set(names), []
-    for name in names:
-        packing = family.packing(name)
-        if packing is None:
-            continue
-        stem = name.removesuffix(packing.name)
-        stored = [stem + part for part in packing.parts if stem + part in present and stem + part != name]
-        if not stored:
-            continue
-        pieces = packing.split(name, read(name), config)
-        for part in stored:
-            if not np.array_equal(read(part), pieces[part]):
-                raise ValueError(f"{part} differs from the piece of it {name} holds")
-            pairs.append((part, name))
-    return tuple(pairs)
-
-
 def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
-                            config: Mapping[str, object], *, media: bool
-                            ) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
-    """Return the pairs of source tensor names that hold equal values, and
-    the (part, packed) pairs of a packed tensor's parts the source also
-    stores apart (`_packed_parts`).
+                            config: Mapping[str, object], *, media: bool) -> tuple[tuple[str, str], ...]:
+    """Return the pairs of source tensor names that hold equal values.
 
     `read` decodes one tensor at a time in FP32, so no whole-checkpoint FP32
     copy is built. The pairs are checked before any narrowing cast, so a
-    quantized weight and its unquantized copy can share one leaf, or one
-    rounding, instead of rounding to different values. `media` is the
-    loader's own reading of the source as a media wrapper, its decoder under
-    text_config, which a registered family reading a nested config whole
-    (Kimi K3) is not.
+    quantized weight and its unquantized copy can share one leaf instead of
+    rounding to different values. `media` is the loader's own reading of the
+    source as a media wrapper, its decoder under text_config, which a
+    registered family reading a nested config whole (Kimi K3) is not.
     """
     if config.get("model_type") == "diffusion_gemma":
         from dew.interop.diffusion_gemma import text_config
         text, _, aliases = _denoiser_sources(names, read, text_only=False)
         tied = _text_aliases(text, lambda name: read(text[name]), translate_config(text_config(config)))
-        return aliases + tuple((text[a], text[b]) for a, b in tied), ()
+        return aliases + tuple((text[a], text[b]) for a, b in tied)
     if media:
         record = translate_wrapper_config(config)
         sources, aliases = _wrapper_sources(names, read, record)
         text = sources["language_model"]
         tied = _text_aliases(text, lambda name: read(text[name]), record["text"])
-        parts = _packed_parts(text, lambda name: read(text[name]), record["text"],
-                              _family_for_config(record["text"]))
-        return (aliases + tuple((text[a], text[b]) for a, b in tied),
-                tuple((text[a], text[b]) for a, b in parts))
+        return aliases + tuple((text[a], text[b]) for a, b in tied)
     record = translate_config(config)
     family = _family_for_config(record)
-    return (_text_aliases(names, read, record, _tied_names(family, record, names)),
-            _packed_parts(names, read, record, family))
+    return _text_aliases(names, read, record, _tied_names(family, record, names))
 
 
 def translate_wrapper_weights(
