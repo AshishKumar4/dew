@@ -490,20 +490,27 @@ def _indexed(named):
     return held
 
 
-def _reference_gradients(trip: RoundTrip):
-    """The reference's gradients of the same loss: `upstream` by module
-    name, `converted` by the release's own tensor names through
-    transformers' reversal (and the release spellings DeepSeek V4 and Kimi
-    K2.5 use), and the prefixes an MTP depth owns, which are not compared.
-    The reference is checked to hold a gradient for every parameter the
-    trunk loss reaches and none for the ones it does not."""
+def _reference_gradients(trip: RoundTrip, *, wide: bool = False):
+    """The reference's gradients of the same loss, in fp32 or `wide` in
+    float64 (`reference_logits`'s float64): `upstream` by module name,
+    `converted` by the release's own tensor names through transformers'
+    reversal (and the release spellings DeepSeek V4 and Kimi K2.5 use), and
+    the prefixes an MTP depth owns, which are not compared. The reference is
+    checked to hold a gradient for every parameter the trunk loss reaches
+    and none for the ones it does not."""
+    import contextlib
+
     import torch
 
-    model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture)
-    model.train(False)
-    model.set_attn_implementation("eager")
-    labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
-    model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
+    from tools.diffusers_wan_reference import float64
+
+    with float64() if wide else contextlib.nullcontext():
+        model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture,
+                                   torch.float64 if wide else torch.float32)
+        model.train(False)
+        model.set_attn_implementation("eager")
+        labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
+        model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
     from transformers.core_model_loading import revert_weight_conversion
 
     parameters = dict(model.named_parameters())
@@ -540,10 +547,11 @@ def _reference_gradients(trip: RoundTrip):
     return upstream, converted, prediction_prefixes
 
 
-def gradient_parity(trip: RoundTrip) -> dict[str, float]:
+def gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """The two implementations' gradients of the mean next-token cross
-    entropy over the source checkpoint, per source tensor, as
-    `max |ours - theirs| / max(1, |ours|, |theirs|)`.
+    entropy over the source checkpoint, per source tensor, each one's
+    deviation from the reference's gradient in float64, entry by entry
+    relative to max(1, |truth|): (ours, theirs).
 
     Each bound layout writes dew's gradient tree back into the source's
     own tensor layout the way the export writes the weights, so the same
@@ -583,6 +591,7 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
 
     grads = {"params": jax.grad(loss)(source.variables["params"])}
     upstream, converted, prediction_prefixes = _reference_gradients(trip)
+    upstream_truth, truths, _ = _reference_gradients(trip, wide=True)
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
     # exclude their declared source prefix as well as independent MTP paths.
     layouts = _indexed(
@@ -610,6 +619,10 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
         if path[0] == 'params' and ('indexer' in path or path[1].startswith('mtp_')):
             if np.any(layout.export(grads) != 0):
                 raise ValueError(f'{layout.name} has an unexpected trunk-loss gradient')
+    named_truth = {id(grad): name for name, grad in upstream_truth.items() if _bare(name) in layouts}
+    truth = _indexed((named_truth.get(id(value), name), value) for name, value in truths.items())
+    if set(truth) != set(reference):
+        raise ValueError('the float64 reference names its gradients otherwise than the fp32 one')
     errors = {}
     for key, (_, upstream_grad) in reference.items():
         name, layout = layouts[key]
@@ -617,24 +630,34 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
         theirs = upstream_grad.to(torch.float32).numpy()
         if ours.shape != theirs.shape:
             raise ValueError(f'{name} gradient shapes differ: {ours.shape} versus {theirs.shape}')
-        errors[name] = float(np.max(
-            np.abs(ours - theirs) / np.maximum(1.0, np.maximum(np.abs(ours), np.abs(theirs)))))
+        errors[name] = _from_truth(ours, theirs, truth[key][1].to(torch.float64).numpy())
     return errors
 
 
-def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
-    """Actual LMObjective gradients, including V4's raw-stream prediction loss.
+def _from_truth(ours, theirs, truth) -> tuple[np.ndarray, np.ndarray]:
+    """`ours` and `theirs` each as `(gradient - truth) / max(1, |truth|)`, flat."""
+    scale = np.maximum(1.0, np.abs(truth))
+    return (np.ravel((np.asarray(ours, np.float64) - truth) / scale),
+            np.ravel((np.asarray(theirs, np.float64) - truth) / scale))
+
+
+def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Actual LMObjective gradients, including V4's raw-stream prediction loss,
+    each one's distance from the reference's in float64 (`gradient_parity`).
 
     The CPU reference composes unchanged Transformers modules according to
     the released inference/model.py MTPBlock. Name coverage is the full
     loaded parameter tree, except selector parameters proven to have no
     gradient through top-k; missing reference gradients are errors.
     """
+    import contextlib
+
     import torch
     from transformers.core_model_loading import revert_weight_conversion
 
     from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
+    from tools.diffusers_wan_reference import float64
 
     source, case = trip.source, trip.case
     weight = case.mtp_weight
@@ -649,61 +672,68 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
         return objective.scalar_loss({**source.variables, 'params': variables}, batch, step)[0]
 
     our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
-    model, _ = reference_model(case, FIXTURES / case.fixture)
-    model.eval()
-    model.set_attn_implementation('eager')
-    depth = load_mtp_reference(FIXTURES / case.fixture, model.config)
-    tokens = torch.from_numpy(trip.ids.astype(np.int64))
-    streams: list[torch.Tensor] = []
 
-    def capture(module, args, output):
-        if not isinstance(output, torch.Tensor):
-            raise TypeError('V4 decoder layer must return raw residual streams')
-        streams.append(output)
+    def reference(*, wide: bool):
+        """The reference's loss and gradients by source name, fp32 or `wide` in float64."""
+        with float64() if wide else contextlib.nullcontext():
+            model, _ = reference_model(case, FIXTURES / case.fixture, torch.float64 if wide else None)
+            model.eval()
+            model.set_attn_implementation('eager')
+            depth = load_mtp_reference(FIXTURES / case.fixture, model.config, model.dtype)
+            tokens = torch.from_numpy(trip.ids.astype(np.int64))
+            streams: list[torch.Tensor] = []
 
-    handle = model.model.layers[-1].register_forward_hook(capture)
-    try:
-        logits = model(input_ids=tokens[:, :-1], use_cache=False).logits
-    finally:
-        handle.remove()
-    predicted = depth(model, streams[0][:, :-1], tokens[:, 1:-1])
-    denominator = tokens[:, 1:].numel()
-    main_loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]), tokens[:, 1:].reshape(-1), reduction='sum')
-    prediction_loss = torch.nn.functional.cross_entropy(
-        predicted.reshape(-1, predicted.shape[-1]), tokens[:, 2:].reshape(-1), reduction='sum')
-    reference_loss = (main_loss + weight * prediction_loss) / denominator
-    reference_loss.backward()
-    if abs(float(our_loss) - float(reference_loss.detach())) > 1e-4:
+            def capture(module, args, output):
+                if not isinstance(output, torch.Tensor):
+                    raise TypeError('V4 decoder layer must return raw residual streams')
+                streams.append(output)
+
+            handle = model.model.layers[-1].register_forward_hook(capture)
+            try:
+                logits = model(input_ids=tokens[:, :-1], use_cache=False).logits
+            finally:
+                handle.remove()
+            predicted = depth(model, streams[0][:, :-1], tokens[:, 1:-1])
+            denominator = tokens[:, 1:].numel()
+            main_loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]), tokens[:, 1:].reshape(-1), reduction='sum')
+            prediction_loss = torch.nn.functional.cross_entropy(
+                predicted.reshape(-1, predicted.shape[-1]), tokens[:, 2:].reshape(-1), reduction='sum')
+            reference_loss = (main_loss + weight * prediction_loss) / denominator
+            reference_loss.backward()
+
+        def converted(reference):
+            grads = {name: parameter.grad for name, parameter in reference.named_parameters()
+                     if parameter.grad is not None}
+            return {deepseek_v4_source_name(name): value
+                    for name, value in revert_weight_conversion(reference, grads).items()}
+
+        expected = converted(model)
+        for name, value in converted(depth.reference_model).items():
+            if name.startswith('layers.0.'):
+                expected['mtp.0.' + name.removeprefix('layers.0.')] = value
+            elif name.startswith('hc_head_') or name == 'norm.weight':
+                expected['mtp.0.' + name] = value
+        for name in ('e_proj', 'h_proj', 'enorm', 'hnorm'):
+            for leaf, parameter in getattr(depth, name).named_parameters():
+                if parameter.grad is not None:
+                    expected[f'mtp.0.{name}.{leaf}'] = parameter.grad
+        return float(reference_loss.detach()), expected
+
+    reference_loss, expected = reference(wide=False)
+    if abs(float(our_loss) - reference_loss) > 1e-4:
         raise ValueError('V4 LMObjective and reference prediction losses differ')
-
-    def converted(reference):
-        grads = {name: parameter.grad for name, parameter in reference.named_parameters()
-                 if parameter.grad is not None}
-        return {deepseek_v4_source_name(name): value
-                for name, value in revert_weight_conversion(reference, grads).items()}
-
-    expected = converted(model)
-    for name, value in converted(depth.reference_model).items():
-        if name.startswith('layers.0.'):
-            expected['mtp.0.' + name.removeprefix('layers.0.')] = value
-        elif name.startswith('hc_head_') or name == 'norm.weight':
-            expected['mtp.0.' + name] = value
-    for name in ('e_proj', 'h_proj', 'enorm', 'hnorm'):
-        for leaf, parameter in getattr(depth, name).named_parameters():
-            if parameter.grad is not None:
-                expected[f'mtp.0.{name}.{leaf}'] = parameter.grad
+    _, truth = reference(wide=True)
     layouts = {layout.name: layout for layout in source.weight_layouts
                if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]}
-    if set(expected) != set(layouts):
+    if set(expected) != set(layouts) or set(truth) != set(layouts):
         raise ValueError(f"V4 gradient coverage mismatch: missing {sorted(set(layouts) - set(expected))}, "
                          f"unexpected {sorted(set(expected) - set(layouts))}")
     errors = {}
     for name, layout in layouts.items():
-        ours = layout.export({'params': gradients})
-        theirs = expected[name].detach().float().numpy()
-        errors[name] = float(np.max(np.abs(ours - theirs) /
-                                   np.maximum(1.0, np.maximum(np.abs(ours), np.abs(theirs)))))
+        errors[name] = _from_truth(layout.export({'params': gradients}),
+                                   expected[name].detach().float().numpy(),
+                                   truth[name].detach().to(torch.float64).numpy())
     for layout in source.weight_layouts:
         if layout.paths[0][0] == 'params' and 'indexer' in layout.paths[0]:
             if np.any(layout.export({'params': gradients}) != 0):

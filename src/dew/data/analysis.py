@@ -76,9 +76,16 @@ class _Wrapping(Protocol):
     source: Source
 
 
+@runtime_checkable
+class _RestrictedReads(Protocol):
+    reads: tuple[Read, ...]
+
+
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
     """The source that can prepare `read`, through any split or slice wrapping it."""
     while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
+        if isinstance(source, _RestrictedReads) and read not in source.reads:
+            return None
         source = source.source
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 

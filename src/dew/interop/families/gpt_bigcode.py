@@ -4,19 +4,17 @@ queries, keys and values fused in one `c_attn`, multi-query by default."""
 from collections.abc import Mapping
 from functools import partial
 
-import numpy as np
-
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
+    decoder_tensors,
+    grouped_qkv,
     hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
 )
 from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_config, gpt2_export
-from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
-from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -41,25 +39,9 @@ def _gpt_bigcode_config(hf: Mapping[str, object], used: set[str]) -> DecoderFiel
 
 
 def _gpt_bigcode_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    # The fused qkv has three leaves, split by `_gpt_bigcode_prepare`.
+    # The fused qkv has three leaves, the query's heads, then the one key head
+    # and the one value head (`GPTBigCodeAttention.forward`), split by `packed`.
     return None if '.attn.c_attn.' in name else renamed_path(GPT2_NAMES, name, config)
-
-
-def _gpt_bigcode_prepare(tensors: Mapping[str, np.ndarray],
-                         config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-    """`c_attn` split into q, k and v: the query's heads, then the one key
-    head and the one value head under multi-query, each head's query, key
-    and value side by side otherwise (`GPTBigCodeAttention.forward`)."""
-    if config is None:
-        raise ValueError('GPTBigCode fused qkv requires translated head geometry')
-    return gpt_neox_prepare(tensors, config, attention_name='attn', fused_name='c_attn',
-                            interleaved=config['num_kv_heads'] != 1)
-
-
-def _gpt_bigcode_export_weights(family: DecoderFamily, model: CausalTransformer,
-                                variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
-    return gpt_neox_export_weights(family, model, variables, config, attention_name='attn',
-                                   fused_name='c_attn', interleaved=model.kv_heads != 1)
 
 
 def _gpt_bigcode_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -75,6 +57,6 @@ GPT_BIGCODE = DecoderFamily(
     lambda fields: fields.position_embedding == 'learned' and fields.kv_heads == 1 < fields.num_heads,
     'gpt_bigcode', 'GPTBigCodeForCausalLM', _gpt_bigcode_export,
     weight_path=_gpt_bigcode_path, export_path=partial(renamed_name, GPT2_NAMES),
-    prepare=_gpt_bigcode_prepare, export_weights=_gpt_bigcode_export_weights, preserve_source_layout=False,
+    packed=grouped_qkv('.attn.c_attn'), export_weights=decoder_tensors, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
