@@ -2,14 +2,12 @@
 a stand-in for the dew-xla-cache Worker and against no Worker at all."""
 
 import http.server
-import json
 import socket
 import threading
 import time
 import urllib.parse
 import urllib.request
 
-import pytest
 import remote_cache
 
 
@@ -32,62 +30,6 @@ def entry(seconds: int) -> bytes:
 
     return compilation_cache.compress_executable(
         compilation_cache.combine_executable_and_time(b"executable", seconds))
-
-
-@pytest.fixture
-def worker():
-    """The Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on a miss, a
-    401 without the token, and Cloudflare's 403 for urllib's own User-Agent, which never reaches
-    the Worker. Each request's path is kept."""
-    stored, seen = {}, []
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def _authorized(self):
-            seen.append(self.path)
-            if self.headers.get("User-Agent", "").startswith("Python-urllib"):
-                self.send_response(403)
-                self.end_headers()
-                return False
-            if self.headers.get("Authorization") == "Bearer token":
-                return True
-            self.send_response(401)
-            self.end_headers()
-            return False
-
-        def do_GET(self):
-            if not self._authorized():
-                return
-            url = urllib.parse.urlparse(self.path)
-            if url.path == "/":
-                query = urllib.parse.parse_qs(url.query)
-                prefix, start = "/" + query["list"][0], int(query.get("cursor", ["0"])[0])
-                keys = sorted(key[len(prefix):] for key in stored if key.startswith(prefix))
-                body = json.dumps({"keys": keys[start:start + 2],
-                                   "cursor": str(start + 2) if start + 2 < len(keys) else None}).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            value = stored.get(self.path)
-            self.send_response(404 if value is None else 200)
-            self.end_headers()
-            if value is not None:
-                self.wfile.write(value)
-
-        def do_PUT(self):
-            if not self._authorized():
-                return
-            stored[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
-            self.send_response(204)
-            self.end_headers()
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{server.server_address[1]}", stored, seen
-    server.shutdown()
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypatch):
@@ -113,7 +55,7 @@ def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypat
     assert all(cache.base.get(f"jit_step-{index}") == entry(2) for index in range(10))
 
 
-def test_a_process_compiles_through_the_shared_layer_and_the_next_reads_it(worker, tmp_path):
+def test_a_process_compiles_through_the_shared_layer_and_the_next_reads_it(cache_worker, tmp_path):
     """With jax as Dew pins it: `install` wraps JAX's own persistent cache, a
     process's compilation reaches the Worker under the version prefix, and a
     process with an empty local cache reads it back instead of compiling."""
@@ -121,7 +63,7 @@ def test_a_process_compiles_through_the_shared_layer_and_the_next_reads_it(worke
     import subprocess
     import sys
 
-    url, stored, _ = worker
+    url, stored, _ = cache_worker
     script = """
 import sys
 import jax

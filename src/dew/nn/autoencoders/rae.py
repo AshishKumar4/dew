@@ -19,7 +19,6 @@ zero class row first.
 """
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
@@ -37,7 +36,6 @@ from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.mlp import GatedMLP
-from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from ..conv import Conv
@@ -482,10 +480,7 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     `module.clone(input_size=224)` resizes the table to the 16x16 grid as
     `Dinov2Model` does. Supplied `params` are bound unchanged, only the config
     is read, and no layouts are returned."""
-    from dew.interop import diffusion, sources, weights
-
-    directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)
-    config = json.loads((directory / "config.json").read_text())
+    directory, config = component_source(name_or_dir, revision, weights=params is None)
     if (
         config.get("model_type") != "dinov2"
         or config.get("use_swiglu_ffn")
@@ -502,16 +497,13 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         )
     module = RepresentationEncoder("dinov2_plain", config["hidden_size"], config["num_hidden_layers"],
                                    config["patch_size"], config["image_size"], compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "")
 
-        def path_of(name: str) -> tuple[str, ...] | None:
-            path = rae_path(f"encoder.{name}", np.ndim(tensors[name]))
-            return None if path is None else path[1:]
+    def path_of(name: str, rank: int) -> tuple[str, ...] | None:
+        path = rae_path(f"encoder.{name}", rank)
+        return None if path is None else path[1:]
 
-        params, layouts = weights.record_layouts("dinov2", tensors, path_of, ("representation",),
-                                                   param_dtype=param_dtype)
-    check_tree({"params": params}, module,
-               jax.ShapeDtypeStruct((1, module.input_size, module.input_size, 3), jnp.float32))
-    return module, params, layouts
+    bound, tree, layouts, _ = bind_component(
+        directory, "dinov2", config, module, path_of, lambda bound: module,
+        prefix=("representation",), params=params, param_dtype=param_dtype,
+        inputs=(jax.ShapeDtypeStruct((1, module.input_size, module.input_size, 3), jnp.float32),))
+    return bound, tree, layouts

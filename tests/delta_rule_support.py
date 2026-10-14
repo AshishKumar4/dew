@@ -7,6 +7,10 @@ import itertools
 import jax
 import jax.numpy as jnp
 
+CHUNKED = 64
+"""The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
+math's distance (`assert_leaves_as_exact`'s `reductions`)."""
+
 
 def rule_math(q, k, v, g, beta, h0):
     """The gated delta rule token by token, in whatever dtype it is given: the reference both paths

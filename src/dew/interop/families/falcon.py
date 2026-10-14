@@ -3,22 +3,20 @@
 from collections.abc import Mapping
 from functools import partial
 
-import numpy as np
-
 from dew import records
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
     base_config,
+    decoder_tensors,
+    grouped_qkv,
     hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
     ungated_mlp,
 )
-from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
-from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -67,20 +65,6 @@ def _falcon_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
     return renamed_path(_FALCON_NAMES, name, config)
 
 
-def _falcon_prepare(tensors: Mapping[str, np.ndarray],
-                    config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-    if config is None:
-        raise ValueError('Falcon fused qkv requires translated head geometry')
-    return gpt_neox_prepare(tensors, config, attention_name='self_attention',
-                              interleaved=config['num_kv_heads'] != 1)
-
-
-def _falcon_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> LazyTensors:
-    return gpt_neox_export_weights(family, model, variables, config, attention_name='self_attention',
-                                    interleaved=model.kv_heads != 1)
-
-
 def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
         'alibi': False, 'new_decoder_architecture': False, 'multi_query': model.kv_heads == 1,
@@ -100,6 +84,7 @@ FALCON = DecoderFamily(
                    and fields.partial_rotary_factor is None,
     'falcon', 'FalconForCausalLM', _falcon_export,
     weight_path=_falcon_path, export_path=partial(renamed_name, _FALCON_NAMES),
-    prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
+    packed=grouped_qkv('.self_attention.query_key_value'), export_weights=decoder_tensors,
+    preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
 )

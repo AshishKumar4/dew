@@ -440,7 +440,7 @@ class DecoderBlock(nn.Module):
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
     the metadata's `engram_ids` at `engram_index`. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads, or
+    (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
     """
@@ -475,8 +475,8 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
-    prediction_slot: int | None = None  # records its streams' mean for DSpark
-    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_slot` records
+    prediction_target: bool = False  # records its streams' mean for DSpark
+    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
@@ -868,7 +868,7 @@ class DecoderBlock(nn.Module):
     def _record_prediction(self, streams):
         """Sow a DSpark target layer's streams averaged over the copies, when
         the caller collects `prediction_inputs`."""
-        if (self.prediction_slot is not None and not self.is_initializing()
+        if (self.prediction_target and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             mean = jnp.mean(streams, axis=2)
             self.sow('prediction_inputs', 'draft_context', mean,
