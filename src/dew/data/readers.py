@@ -55,7 +55,10 @@ class _Host(Forwarding):
         try:
             super().close()
         finally:
-            self._source = None
+            if not isinstance(self._source, GlobalReader):
+                # A global reader keeps its position and reads on from it once
+                # opened again, as a phased run reads a finished phase's state.
+                self._source = None
 
     def get_state(self) -> Position:
         if not isinstance(self._source, Checkpointable):
