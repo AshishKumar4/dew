@@ -399,7 +399,6 @@ class DecisionObjective(Objective[Ratio]):
     run loads as a `Decide` task.
     """
 
-    artifact = Decisions
     saved_task = Decide
     _held_parts = True
 

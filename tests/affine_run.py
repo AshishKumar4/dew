@@ -102,8 +102,6 @@ def raw_leaf(leaf):
 class Features(Regression):
     """An objective whose evaluation returns its predictions as representations."""
 
-    artifact = Representations
-
     def evaluate(self, params, batch, step):
         params = params if step.ema is None else step.ema
         return Representations(features=self.model.apply(params, batch["x"]),

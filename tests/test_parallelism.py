@@ -58,8 +58,6 @@ class DeterministicObjective(Objective):
     parameters, and a partitioned run the same losses as a single-device one.
     """
 
-    artifact = Representations
-
     def __init__(self, decay=_DEFAULT_INIT_DECAY, emb_features=32):
         self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
                                num_heads=2, mlp_ratio=1)

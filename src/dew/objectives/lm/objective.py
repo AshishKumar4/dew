@@ -634,7 +634,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
     """
 
-    artifact = TokenScores
     saved_task = TextGeneration
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
