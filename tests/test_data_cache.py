@@ -133,6 +133,8 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
 
 
 def test_missing_input_completion_refuses_publication():
+    """A writer that never read row 1 leaves it uncovered and publication is
+    refused; a second writer that reads it completes the generation."""
     source = Memory([{"id": index} for index in range(3)])
     cache, key = _cache(), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
@@ -140,9 +142,14 @@ def test_missing_input_completion_refuses_publication():
     assert rows[2] == {"id": 2}
     rows.finish()
     rows.close()
-    with pytest.raises(ValueError, match="1 missing"):
+    with pytest.raises(ValueError):
         cache.publish(key, source)
     assert cache.generation(key) is None
+    rest = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    assert rest[1] == {"id": 1}
+    rest.finish()
+    rest.close()
+    assert len(cache.publish(key, source)) == 3
 
 
 def test_unsealed_writer_cannot_certify_coverage():
@@ -150,7 +157,7 @@ def test_unsealed_writer_cannot_certify_coverage():
     cache, key = _cache(shard_bytes=1), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     rows[0]
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError):
         cache.publish(key, source)
     rows[1]
     rows.finish()
@@ -158,17 +165,23 @@ def test_unsealed_writer_cannot_certify_coverage():
     assert len(cache.publish(key, source)) == 2
 
 
-def test_conflicting_duplicate_writers_refuse_publication():
+@pytest.mark.parametrize("second_row", [{"id": 0}, {"id": 999}], ids=["agreeing", "conflicting"])
+def test_conflicting_duplicate_writers_refuse_publication(second_row):
+    """Two writers of one row publish it where they wrote the same row, and
+    are refused where they wrote different ones."""
     source = Memory([{"id": 0}])
     cache, key = _cache(), Manifest()
     first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key, source)
-    second = cache.mapped(grain.MapDataset.source([{"id": 999}]), key, source)
+    second = cache.mapped(grain.MapDataset.source([second_row]), key, source)
     first[0], second[0]
     first.finish()
     first.close()
     second.finish()
     second.close()
-    with pytest.raises(ValueError, match="conflicting cache duplicate"):
+    if second_row == {"id": 0}:
+        assert cache.publish(key, source)[0] == {"id": 0}
+        return
+    with pytest.raises(ValueError):
         cache.publish(key, source)
 
 
@@ -180,10 +193,14 @@ def test_corrupt_shard_never_reaches_current():
     rows.finish()
     rows.close()
     fs, path = Store(cache.url + "/" + key.key + "/shards").resolve()
-    fs.pipe_file(fs.find(path)[0], b"corrupt")
-    with pytest.raises(OSError, match="corrupt"):
+    shard = fs.find(path)[0]
+    intact = fs.cat_file(shard)
+    fs.pipe_file(shard, b"corrupt")
+    with pytest.raises(OSError):
         cache.publish(key, source)
     assert cache.generation(key) is None
+    fs.pipe_file(shard, intact)
+    assert cache.publish(key, source)[0] == {"id": 0}
 
 
 def test_corrupt_committed_index_is_an_error_without_fallback():
@@ -195,31 +212,40 @@ def test_corrupt_committed_index_is_an_error_without_fallback():
     rows.close()
     generation = cache.publish(key, source)
     manifest = json.loads(Store(generation.url + "/manifest.json").read())
-    page = next(iter(manifest["pages"].values()))["path"]
-    Store(generation.url + "/" + page).write(b"wrong index")
-    with pytest.raises(OSError, match="corrupt"):
+    page = Store(generation.url + "/" + next(iter(manifest["pages"].values()))["path"])
+    intact = page.read()
+    page.write(b"wrong index")
+    with pytest.raises(OSError):
         generation.outputs(0)
+    page.write(intact)
+    assert list(cache.generation(key).outputs(0)) == [{"id": 0}]
 
 
-def test_full_spool_stops_admitting_and_training_continues():
+@pytest.mark.parametrize("spool_bytes", [256, 1 << 20])
+def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
+    """A row larger than the spool is served but not admitted, so its cache
+    cannot be published; a spool that holds it publishes."""
     source = Memory([{"bytes": b"x" * 2048}])
-    cache, key = _cache(spool_bytes=256, shard_bytes=128), Manifest()
+    cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     assert rows[0] == source.records("indexed")[0]
-    assert not rows.writer.admitting
+    assert rows.writer.admitting is (spool_bytes > 2048)
     rows.finish()
     rows.close()
-    with pytest.raises(ValueError, match="missing"):
+    if spool_bytes > 2048:
+        assert len(cache.publish(key, source)) == 1
+        return
+    with pytest.raises(ValueError):
         cache.publish(key, source)
 
 
-def test_cache_identity_and_clean_revision_are_required():
+@pytest.mark.parametrize("refused", [{"clean": False}, {"exact": False}], ids=["dirty revision", "unstable"])
+def test_cache_identity_and_clean_revision_are_required(refused):
     source = Memory([{"id": 0}])
     rows = grain.MapDataset.source(source.records("indexed"))
-    with pytest.raises(ValueError, match="clean Dew revision"):
-        _cache().mapped(rows, Manifest(clean=False), source)
-    with pytest.raises(ValueError, match="stable identity"):
-        _cache().mapped(rows, Manifest(exact=False), source)
+    _cache().mapped(rows, Manifest(), source).close()
+    with pytest.raises(ValueError):
+        _cache().mapped(rows, Manifest(**refused), source)
     assert Manifest().key != Manifest(b'{"revision":"changed"}').key
 
 
@@ -265,7 +291,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
         fs.pipe_file(
             bucket + "/cache/" + key.key + "/" + next(iter(generation.manifest["shards"])), b"broken"
         )
-        with pytest.raises(OSError, match="corrupt"):
+        with pytest.raises(OSError):
             cache.publish(key, source)
     finally:
         server.stop()
@@ -323,12 +349,14 @@ def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     resumed.close()
 
 
-def test_cache_refuses_stochastic_prefix_by_step_name():
+def test_cache_refuses_a_stochastic_prefix():
+    """A random step after the cache compiles; the same step before it is refused."""
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(8)])
-    with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
+    compile(Pipeline(source).cache(_cache()).random_map(Draw()).batch(2))
+    with pytest.raises(ValueError):
         compile(Pipeline(source).random_map(Draw()).cache(_cache()).batch(2))
 
 
@@ -386,7 +414,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     assert transient[0][0].reason == "transient"
     transient.finish()
     transient.close()
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError):
         cache.publish(key, source)
     permanent = cache.mapped(
         grain.MapDataset.source(source.records("indexed")),
@@ -417,7 +445,7 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     second.finish()
     second.close()
     assert generation[0] == {"id": 0}
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError):
         cache.publish(second_key, source)
     generation.close()
     retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)

@@ -20,6 +20,8 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
+- SLOP011 is about the suite. A test proves behaviour, not wording or source.
+- SLOP012 runs everywhere but the suite, which SLOP008 covers.
 - SLOP013 is about what importing `src/<package>` does to the process.
 
 Every rule fails the gate, and none has a per-finding suppression.
@@ -31,6 +33,8 @@ class bases, and Flax's Module from its installed source (never importing
 it), to know which classes are models. It sees what Python spells, not what
 dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
+SLOP011 and SLOP012 read each name through the imports of its own lexical
+scope (tools/lint_scopes.py).
 SLOP004's isinstance half fires only when the annotation it needs is written in
 the same scope; a value whose type arrives from another module is not narrowed
 by this checker and is not reported. SLOP006 walks the handler body it can see,
@@ -50,6 +54,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_scopes as scopes  # noqa: E402
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
@@ -97,6 +103,11 @@ SEAMS = ("subprocess", "socket", "urllib", "request", "http", "download", "hub",
          "fetch", "client", "urlopen", "snapshot")
 NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "tuple", "str",
              "int", "float", "bool", "bytes"}
+# The hooks Python documents as set by assignment.
+INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "sys.displayhook", "sys.breakpointhook",
+                     "threading.excepthook"}
+# The calls that hand a test a function's source text.
+SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
                  "register_event_listener", "filterwarnings", "simplefilter")
@@ -207,17 +218,6 @@ def _parses(function: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) ->
     return tested and refuses
 
 
-def _annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
-    """Every annotation in a signature, paired with the name it belongs to."""
-    arguments = function.args
-    for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                     arguments.vararg, arguments.kwarg):
-        if argument is not None and argument.annotation is not None:
-            yield argument.arg, argument.annotation
-    if function.returns is not None:
-        yield "return", function.returns
-
-
 def _alias_value(node: ast.stmt) -> tuple[str, ast.expr] | None:
     """The name and target of a type alias, in any of the three spellings."""
     if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
@@ -273,7 +273,7 @@ def contracts(module: Module) -> Iterator[Finding]:
             continue
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        for name, annotation in _annotations(node):
+        for name, annotation in scopes.annotations(node):
             claimed, open_dictionaries = _mappings(annotation)
             for mapping in open_dictionaries:
                 yield report(mapping, "SLOP002",
@@ -305,15 +305,6 @@ def suppressions(module: Module) -> Iterator[Finding]:
                           f"{hit.strip()} asserts what the code did not prove")
 
 
-def _own(scope: ast.AST) -> Iterator[ast.AST]:
-    """Every node in one scope, without descending into a nested scope."""
-    for node in ast.iter_child_nodes(scope):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
-            continue
-        yield node
-        yield from _own(node)
-
-
 def probes(module: Module) -> Iterator[Finding]:
     """SLOP004: asking a value at runtime what its type already said."""
     modules = {alias.asname or alias.name.split(".")[0]
@@ -329,7 +320,7 @@ def probes(module: Module) -> Iterator[Finding]:
             if function.name.startswith("_") and "boundary" in (own + document).lower():
                 continue
         declared = _declared(function, unions)
-        for node in _own(function or module.tree):
+        for node in scopes.own(function or module.tree):
             if not isinstance(node, ast.Call):
                 continue
             name = _named(node.func)
@@ -365,8 +356,8 @@ def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
     """
     if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
         return {}
-    written: dict[str, ast.expr] = dict(_annotations(function))
-    for node in _own(function):
+    written: dict[str, ast.expr] = dict(scopes.annotations(function))
+    for node in scopes.own(function):
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             written[node.target.id] = node.annotation
     resolved = {}
@@ -562,24 +553,10 @@ def _module_name(module: Module) -> str:
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
 
-def _imports(tree: ast.Module, name: str, package: bool) -> dict[str, str]:
-    """What each name a module imports stands for, as a dotted path: every
-    import in it, those inside functions and type-checking blocks included."""
-    bound: dict[str, str] = {}
-    parent = name.split(".") if package else name.split(".")[:-1]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                head = alias.name.split(".")[0]
-                bound[alias.asname or head] = alias.name if alias.asname else head
-        elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if node.level:
-                base = ".".join([*parent[:len(parent) - node.level + 1], *([base] if base else [])])
-            for alias in node.names:
-                if alias.name != "*":
-                    bound[alias.asname or alias.name] = f"{base}.{alias.name}"
-    return bound
+def _parent(module: Module) -> list[str]:
+    """The package a module's relative imports start from, as its parts."""
+    name = _module_name(module)
+    return name.split(".") if module.path.name == "__init__.py" else name.split(".")[:-1]
 
 
 def _aliased(node: ast.stmt) -> tuple[str, ast.expr] | None:
@@ -603,7 +580,7 @@ def _members(body: Sequence[ast.stmt]) -> set[str]:
             declared |= {node.attr for node in ast.walk(statement) if isinstance(node, ast.Attribute)
                          and isinstance(node.ctx, ast.Store) and _named(node.value) == "self"}
         elif not isinstance(statement, ast.ClassDef):
-            declared |= {node.id for node in [statement, *_own(statement)]
+            declared |= {node.id for node in [statement, *scopes.own(statement)]
                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
     return {name for name in declared if name.startswith("_") and not name.startswith("__") and name != "_"}
 
@@ -632,7 +609,7 @@ class ModelIndex:
         bodies: dict[str, list[ast.stmt]] = {}
         for module in modules:
             name = _module_name(module)
-            index.imports[name] = _imports(module.tree, name, module.path.name == "__init__.py")
+            index.imports[name] = scopes.imports(module.tree, _parent(module))
             index.aliases[name] = {}
             for node in module.tree.body:
                 if isinstance(node, ast.ClassDef):
@@ -784,6 +761,45 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
+def wording(module: Module) -> Iterator[Finding]:
+    """SLOP011: a test that checks wording or source text instead of behaviour."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if isinstance(node, ast.Call):
+            called = scopes.resolved(node.func, table)
+            if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                              "matches an error's wording; assert the refusal, not its text")
+            elif called in SOURCE_READERS:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                              "reads source text; test what the code does")
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and node.value.startswith(f"src/{module.package}/") and node.value.endswith(".py")):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                          f"names {node.value}; test what the code does, not its source")
+
+
+def patches(module: Module) -> Iterator[Finding]:
+    """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
+            owner, attribute = node.value, node.attr
+        elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
+              and len(node.args) > 1):
+            owner, named = node.args[:2]
+            spelled = isinstance(named, ast.Constant) and isinstance(named.value, str)
+            attribute = named.value if spelled else "*"
+        else:
+            continue
+        origin = scopes.resolved(owner, table)
+        target = f"{origin}.{attribute}"
+        # The library rebinds nothing it imported but the interpreter's own hooks; a
+        # script, nothing of our package.
+        if origin and target not in INTERPRETER_HOOKS and (
+                module.is_source or origin.split(".")[0] == module.package):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP012",
+                          f"rebinds {target} for every caller; pass the behaviour in")
+
+
 def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
     """The statements an import executes: every block but function bodies and the
     script guard's body (its `else` still runs), class bodies included."""
@@ -830,8 +846,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    if module.relative.startswith("tests/"):
-        rules = (*rules, mocks)
+    rules = (*rules, mocks, wording) if module.relative.startswith("tests/") else (*rules, patches)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
