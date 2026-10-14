@@ -250,7 +250,7 @@ def test_a_failed_cleanup_never_hides_why_a_start_ended(bridge, monkeypatch):
             await socket.close()
             kernels.release["preload"].set()
             for _ in range(100):
-                if session not in gateway.connected and session not in gateway.contexts:
+                if session not in gateway.connected and session not in gateway.contexts and len(kernels.live) == 1:
                     break
                 await asyncio.sleep(0.1)
             assert session not in gateway.connected and session not in gateway.contexts
