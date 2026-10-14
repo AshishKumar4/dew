@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.artifacts import TextSamples, TokenScores
+from dew.artifacts import TokenScores
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
@@ -68,7 +68,6 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
     """
 
-    artifact = TextSamples
     saved_task = MaskedGeneration
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}

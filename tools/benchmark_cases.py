@@ -11,6 +11,17 @@ from typing import Literal
 TEXT_TOKENS = 77
 TEXT_FEATURES = 768
 
+# The two decoders the performance gate and the kernel benchmarks step: a
+# dense one 24 layers deep and 1024 wide, and a 12-layer, 768-wide one whose
+# every second layer routes eight experts top-2, Qwen3-MoE's
+# decoder_sparse_step 2.
+LM_DENSE: dict[str, object] = {"vocab_size": 50304, "emb_features": 1024, "num_layers": 24, "num_heads": 16,
+                               "mlp_features": 2816, "max_seq_len": 1024}
+LM_MOE: dict[str, object] = {
+    "vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
+    "max_seq_len": 1024,
+    "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
+
 @dataclass(frozen=True)
 class Case:
     """One measurement: what to build, how much to feed it, how to shard it."""
