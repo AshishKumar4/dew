@@ -1617,6 +1617,20 @@ class DecoderFamily:
         """The `packed` entry the source tensor `name` is, if any."""
         return next((packing for packing in self.packed if name.endswith(packing.name)), None)
 
+    def source_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        """The leaf the source tensor `name` fills: its own (`weight_path`), or
+        for a tied head, which has no leaf of its own, the embedding it copies.
+        A checked copy of the embedding beside it is dropped before it is
+        placed; a head stored alone, as SFconvertbot's conversion of OPT-125m
+        keeps it, fills the embedding."""
+        head_name, embedding_name = self.tied_head_names
+        if name != head_name or not config['tie_embeddings']:
+            return self.weight_path(name, config)
+        embedding = self.weight_path(embedding_name, config)
+        if embedding is None:
+            raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
+        return embedding
+
 
 def kind_mixers(fields: CausalTransformer) -> list[MixerBase]:
     """Return the mixer values of the model's named kinds."""
