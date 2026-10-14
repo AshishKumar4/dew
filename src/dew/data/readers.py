@@ -18,6 +18,7 @@ from dew.data.dataset import (
     FilledBatch,
     Forwarding,
     GlobalReader,
+    Position,
     Reader,
     _CheckpointableMapping,
     rows_of,
@@ -44,14 +45,21 @@ class _HostSteps:
 class _Host(_CheckpointableMapping):
     def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
         super().__init__(source, _HostSteps(steps))
+        self._stopped: GlobalReader | None = None
 
     def close(self) -> None:
         source = self._source
-        super().close()
-        if isinstance(source, GlobalReader):
-            # A global reader keeps its position and reads on from it once
-            # opened again, as a phased run reads a finished phase's state.
-            self._source = source
+        try:
+            super().close()
+        finally:
+            # A closed global reader still states where it stopped, which a
+            # phased run reads of a finished phase; it reads nothing more.
+            self._stopped = source if isinstance(source, GlobalReader) else None
+
+    def get_state(self) -> Position:
+        if self._source is None and self._stopped is not None:
+            return self._stopped.get_state()
+        return super().get_state()
 
     @property
     def records(self) -> int:

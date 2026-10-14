@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
+import jax
 import numpy as np
 import pytest
 from token_support import write_token_corpus
@@ -289,6 +290,6 @@ def test_each_run_spec_loads_the_same_batches_and_plan_as_loader(kind, tmp_path)
         left, right = batches(method, held=held), batches(direct, held=held)
         assert len(left) == len(right)
         for actual, expected in zip(left, right, strict=True):
-            assert actual.keys() == expected.keys()
-            for field in actual:
-                np.testing.assert_array_equal(actual[field], expected[field])
+            # A packed batch's coordinates are a pytree; compare it leaf by leaf.
+            assert jax.tree.structure(actual) == jax.tree.structure(expected)
+            jax.tree.map(np.testing.assert_array_equal, actual, expected)
