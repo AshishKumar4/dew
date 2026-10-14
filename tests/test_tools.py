@@ -590,7 +590,10 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
             "    import inspect\n"
             "    assert [inspect.getsource() for inspect in readers]\n"
             "def test_lambda_default(text=(lambda inspect: inspect.getsource())(graph)):\n"
-            "    assert text\n"),
+            "    assert text\n"
+            "class TestClassComprehension:\n"
+            "    from inspect import getsource as graph\n"
+            "    texts = [graph.edges({}) for _ in range(1)]\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
 

@@ -34,8 +34,7 @@ it), to know which classes are models. It sees what Python spells, not what
 dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
-scope, flow-insensitively: a name a scope both imports and assigns counts as
-assigned throughout it.
+scope (tools/lint_scopes.py).
 SLOP004's isinstance half fires only when the annotation it needs is written in
 the same scope; a value whose type arrives from another module is not narrowed
 by this checker and is not reported. SLOP006 walks the handler body it can see,
@@ -50,11 +49,13 @@ import io
 import re
 import sys
 import tokenize
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_scopes as scopes  # noqa: E402
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
@@ -217,22 +218,6 @@ def _parses(function: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) ->
     return tested and refuses
 
 
-def _arguments(function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> list[ast.arg]:
-    """Every parameter in a signature."""
-    arguments = function.args
-    return [argument for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                                      arguments.vararg, arguments.kwarg) if argument is not None]
-
-
-def _annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
-    """Every annotation in a signature, paired with the name it belongs to."""
-    for argument in _arguments(function):
-        if argument.annotation is not None:
-            yield argument.arg, argument.annotation
-    if function.returns is not None:
-        yield "return", function.returns
-
-
 def _alias_value(node: ast.stmt) -> tuple[str, ast.expr] | None:
     """The name and target of a type alias, in any of the three spellings."""
     if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
@@ -288,7 +273,7 @@ def contracts(module: Module) -> Iterator[Finding]:
             continue
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        for name, annotation in _annotations(node):
+        for name, annotation in scopes.annotations(node):
             claimed, open_dictionaries = _mappings(annotation)
             for mapping in open_dictionaries:
                 yield report(mapping, "SLOP002",
@@ -320,17 +305,6 @@ def suppressions(module: Module) -> Iterator[Finding]:
                           f"{hit.strip()} asserts what the code did not prove")
 
 
-SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-
-
-def _own(scope: ast.AST) -> Iterator[ast.AST]:
-    """Every node in one scope, a nested scope's own node but not its contents."""
-    for node in ast.iter_child_nodes(scope):
-        yield node
-        if not isinstance(node, SCOPES):
-            yield from _own(node)
-
-
 def probes(module: Module) -> Iterator[Finding]:
     """SLOP004: asking a value at runtime what its type already said."""
     modules = {alias.asname or alias.name.split(".")[0]
@@ -346,7 +320,7 @@ def probes(module: Module) -> Iterator[Finding]:
             if function.name.startswith("_") and "boundary" in (own + document).lower():
                 continue
         declared = _declared(function, unions)
-        for node in _own(function or module.tree):
+        for node in scopes.own(function or module.tree):
             if not isinstance(node, ast.Call):
                 continue
             name = _named(node.func)
@@ -382,8 +356,8 @@ def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
     """
     if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
         return {}
-    written: dict[str, ast.expr] = dict(_annotations(function))
-    for node in _own(function):
+    written: dict[str, ast.expr] = dict(scopes.annotations(function))
+    for node in scopes.own(function):
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             written[node.target.id] = node.annotation
     resolved = {}
@@ -585,28 +559,6 @@ def _parent(module: Module) -> list[str]:
     return name.split(".") if module.path.name == "__init__.py" else name.split(".")[:-1]
 
 
-def _bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[str, str]:
-    """What each name one import statement binds stands for, as a dotted path."""
-    if isinstance(node, ast.Import):
-        heads = {alias: alias.name.split(".")[0] for alias in node.names}
-        return {alias.asname or head: alias.name if alias.asname else head for alias, head in heads.items()}
-    base = node.module or ""
-    if node.level:
-        base = ".".join([*parent[:len(parent) - node.level + 1], *([base] if base else [])])
-    return {alias.asname or alias.name: f"{base}.{alias.name}" for alias in node.names if alias.name != "*"}
-
-
-def _imports(tree: ast.Module, parent: Sequence[str]) -> dict[str, str]:
-    """What each name a module imports stands for, as a dotted path: every
-    import in it, those inside functions and type-checking blocks included.
-    `parent` is the package its relative imports start from (`_parent`)."""
-    bound: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            bound |= _bound_by(node, parent)
-    return bound
-
-
 def _aliased(node: ast.stmt) -> tuple[str, ast.expr] | None:
     """A module-level name bound to other names: `Decoders = A | B`, a tuple of them, a type alias."""
     if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
@@ -628,7 +580,7 @@ def _members(body: Sequence[ast.stmt]) -> set[str]:
             declared |= {node.attr for node in ast.walk(statement) if isinstance(node, ast.Attribute)
                          and isinstance(node.ctx, ast.Store) and _named(node.value) == "self"}
         elif not isinstance(statement, ast.ClassDef):
-            declared |= {node.id for node in [statement, *_own(statement)]
+            declared |= {node.id for node in [statement, *scopes.own(statement)]
                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
     return {name for name in declared if name.startswith("_") and not name.startswith("__") and name != "_"}
 
@@ -657,7 +609,7 @@ class ModelIndex:
         bodies: dict[str, list[ast.stmt]] = {}
         for module in modules:
             name = _module_name(module)
-            index.imports[name] = _imports(module.tree, _parent(module))
+            index.imports[name] = scopes.imports(module.tree, _parent(module))
             index.aliases[name] = {}
             for node in module.tree.body:
                 if isinstance(node, ast.ClassDef):
@@ -809,87 +761,11 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
-def _outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef) -> list[ast.AST]:
-    """The parts of a nested scope's statement its enclosing scope evaluates:
-    decorators, defaults, annotations, a class's bases and keywords."""
-    if isinstance(scope, ast.ClassDef):
-        return [*scope.decorator_list, *scope.bases, *scope.keywords]
-    defaults = [*scope.args.defaults, *(default for default in scope.args.kw_defaults if default is not None)]
-    if isinstance(scope, ast.Lambda):
-        return defaults
-    return [*scope.decorator_list, *defaults, *(annotation for _, annotation in _annotations(scope))]
-
-
-def _comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str]) -> dict[int, Mapping[str, str]]:
-    """The table each node inside a comprehension reads, its targets bound
-    there (and in comprehensions inside it) but not in its first iterable,
-    which the enclosing scope evaluates. Keyed by node identity."""
-    tables: dict[int, Mapping[str, str]] = {}
-    for node in nodes:
-        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
-            around = tables.get(id(node), table)
-            names = {name.id for generator in node.generators for name in ast.walk(generator.target)
-                     if isinstance(name, ast.Name)}
-            inside = {name: target for name, target in around.items() if name not in names}
-            first = {id(child) for child in ast.walk(node.generators[0].iter)}
-            for child in ast.walk(node):
-                if child is not node and id(child) not in first:
-                    tables[id(child)] = inside
-    return tables
-
-
-def _scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
-            parameters: frozenset[str] = frozenset(), class_body: bool = False
-            ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
-    """Every node of a scope's `body` and of the scopes in it, with what each
-    name imported there stands for (`visible` around it). A scope's own
-    import replaces its `parameters`; a name it otherwise binds (an
-    assignment, a definition) stands for no import. A comprehension's
-    targets are its own, and a class body's names reach no scope inside it."""
-    nodes = [node for statement in body
-             for node in (statement, *(() if isinstance(statement, SCOPES) else _own(statement)))]
-    targets = {id(name) for node in nodes if isinstance(node, ast.comprehension)
-               for name in ast.walk(node.target)}
-    local = {node.id for node in nodes
-             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
-    local |= {node.name for node in nodes
-              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
-    imported: dict[str, str] = {}
-    for node in nodes:
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            imported |= _bound_by(node, parent)
-    around = {name: target for name, target in visible.items() if name not in parameters}
-    table = {name: target for name, target in {**around, **imported}.items() if name not in local}
-    inside = _comprehended(nodes, table)
-    for node in nodes:
-        here = inside.get(id(node), table)
-        yield node, here
-        if isinstance(node, SCOPES):
-            yield from _scoped(_outside(node), here, parent)
-            inner = node.body if isinstance(node.body, list) else [node.body]
-            arguments = frozenset() if isinstance(node, ast.ClassDef) else frozenset(
-                argument.arg for argument in _arguments(node))
-            yield from _scoped(inner, visible if class_body else here, parent, arguments,
-                               isinstance(node, ast.ClassDef))
-
-
-def _resolved(node: ast.expr, table: Mapping[str, str]) -> str:
-    """The dotted path an attribute chain from a name spells, its name read as
-    the import `table` gives it (`_scoped`), or "" for anything else."""
-    attributes = []
-    while isinstance(node, ast.Attribute):
-        attributes.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name) or node.id not in table:
-        return ""
-    return ".".join([table[node.id], *reversed(attributes)])
-
-
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour."""
-    for node, table in _scoped(module.tree.body, {}, _parent(module)):
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Call):
-            called = _resolved(node.func, table)
+            called = scopes.resolved(node.func, table)
             if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "matches an error's wording; assert the refusal, not its text")
@@ -904,7 +780,7 @@ def wording(module: Module) -> Iterator[Finding]:
 
 def patches(module: Module) -> Iterator[Finding]:
     """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
-    for node, table in _scoped(module.tree.body, {}, _parent(module)):
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
             owner, attribute = node.value, node.attr
         elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
@@ -914,7 +790,7 @@ def patches(module: Module) -> Iterator[Finding]:
             attribute = named.value if spelled else "*"
         else:
             continue
-        origin = _resolved(owner, table)
+        origin = scopes.resolved(owner, table)
         target = f"{origin}.{attribute}"
         # The library rebinds nothing it imported but the interpreter's own hooks; a
         # script, nothing of our package.
