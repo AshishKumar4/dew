@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import json
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -8,6 +9,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
+from dew.interop.sources import load_shards
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'phi3-tiny'
@@ -118,3 +120,28 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
         alone = task(prompt[None], 8, key=index).host()
         np.testing.assert_array_equal(served.tokens, alone.tokens)
         np.testing.assert_array_equal(served.lengths, alone.lengths)
+
+
+def test_a_fused_projection_and_its_part_stored_apart_must_agree(tmp_path):
+    """Phi-3 fuses gate and up as gate_up_proj, so a checkpoint that also
+    stores the gate under its own name holds that part twice. An equal copy
+    loads as the fused tensor alone does; an unequal one is refused rather
+    than one of the two silently winning."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    tensors = load_shards(DIRECTORY)
+    config = json.loads((DIRECTORY / 'config.json').read_text())
+    fused = tensors['model.layers.0.mlp.gate_up_proj.weight']
+    gate = fused[: fused.shape[0] // 2]
+    ids = np.load(DIRECTORY / 'input_ids.npy')
+    alone = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+
+    part = 'model.layers.0.mlp.gate_proj.weight'
+    save_hf_layout({**tensors, part: gate.copy()}, config, tmp_path / 'equal')
+    twice = Pretrained.load(tmp_path / 'equal', dtype='float32', attention_impl='reference')
+    np.testing.assert_array_equal(twice.model.apply(twice.variables, ids),
+                                  alone.model.apply(alone.variables, ids))
+
+    save_hf_layout({**tensors, part: gate + 1}, config, tmp_path / 'unequal')
+    with pytest.raises(ValueError, match='gate_proj'):
+        Pretrained.load(tmp_path / 'unequal', dtype='float32', attention_impl='reference')
