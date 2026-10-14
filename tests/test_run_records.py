@@ -137,17 +137,19 @@ def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
     runs it."""
     import jax
     import numpy as np
+    from flax.core import unfreeze
 
     from dew.sampling import TextToImage
 
     repo, revision = LIVE_PIN.read_text().strip().split("@")
     pipe = TextToImage.from_pretrained(repo, revision=revision)
     artifact, expected = published_layout()
-    assert jax.tree.structure(pipe.variables) == jax.tree.structure(expected)
+    held = unfreeze(pipe.variables)
+    assert jax.tree.structure(held) == jax.tree.structure(expected)
     def same(held, wanted) -> bool:
         return (held.shape, held.dtype) == (wanted.shape, wanted.dtype)
 
-    assert jax.tree.all(jax.tree.map(same, pipe.variables, expected))
+    assert jax.tree.all(jax.tree.map(same, held, expected))
     images = pipe(["a watercolor painting of a mountain lake at sunrise"], steps=1, key=0).host().images
     assert images.shape == (1, *artifact["inputs"]["sample"]["shape"])
     assert np.all(np.isfinite(np.asarray(images, np.float32)))
