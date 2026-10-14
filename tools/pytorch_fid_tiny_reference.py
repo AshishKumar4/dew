@@ -23,22 +23,21 @@ Run with the Dew test environment's torch and torchvision, on CPU:
     python tools/pytorch_fid_tiny_reference.py OUTPUT.npz
 """
 
-import hashlib
 import importlib.util
 import json
 import sys
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 import torchvision
 from torchvision.models import inception as torchvision_inception
+from reference_source import CACHE as UPSTREAM, verified
 
 REPO, COMMIT = "mseitzer/pytorch-fid", "0a754fb8e66021700478fd365b79c2eaa316e31b"
 PATH = "src/pytorch_fid/inception.py"
 DIGEST = "5c5af6e5f71dfdad17d85c3b87b6751c0cc515ca8e389ae90211573e520abf17"
-CACHE = Path.home() / ".cache" / "dew" / "upstream" / "pytorch-fid" / COMMIT
+CACHE = UPSTREAM / "pytorch-fid" / COMMIT
 DIVISOR = 16
 SIZES = (64, 320)
 BATCH = 2
@@ -55,14 +54,7 @@ class NarrowConv2d(torchvision_inception.BasicConv2d):
 
 def pytorch_fid():
     """pytorch-fid's inception module at `COMMIT`."""
-    local = CACHE / PATH
-    if not local.is_file():
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(urllib.request.urlopen(
-            f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}").read())
-    found = hashlib.sha256(local.read_bytes()).hexdigest()
-    if found != DIGEST:
-        raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {DIGEST}")
+    local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}", CACHE / PATH, DIGEST)
     spec = importlib.util.spec_from_file_location("pytorch_fid_inception", local)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

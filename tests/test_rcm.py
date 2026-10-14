@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -237,23 +236,6 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
                                   .host().images, expected)
 
 
-TRAINING = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "training.npz")
-
-
-class Weighted(nn.Module):
-    """`tools/rcm_reference.py`'s trained velocity network, four terms with
-    a weight per entry, at Dew's model time (rf time times 1000), its label
-    the condition's second token's table entry."""
-
-    @nn.compact
-    def __call__(self, x, time, textcontext):
-        time = time.reshape(-1, 1, 1, 1, 1) / 1000
-        label = textcontext.hidden[:, 1, 0].reshape(-1, 1, 1, 1, 1)
-        w = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
-        return (jnp.tanh(x) * w[0] + jnp.sin(2 * time) * x * w[1] + (0.1 + time) * label * w[2]
-                + jnp.cos(x) * time * w[3])
-
-
 def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
     """`--pretrained <pipeline> --objective rcm` with no teacher run: the
     teacher is the model the run loads, its weights bitwise the source's,
@@ -285,57 +267,6 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
         assert jax.tree.structure(tree) == jax.tree.structure(expected)
         for got, want in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-
-
-def discrete_fields(prefix: str) -> dict:
-    """rCM's dCM settings as the objective's arguments, none for sCM."""
-    if not prefix:
-        return {}
-    settings = json.loads(str(TRAINING["dcm"]))
-    return {"consistency": "discrete", "discrete_steps": settings["dcm_total_steps"],
-            "discrete_skip": settings["dcm_skipping_interval_steps"],
-            "discrete_shift": settings["dcm_timestep_shift"]}
-
-
-def distilled(monkeypatch, optimizer, prefix=""):
-    """`ConsistencyDistillationObjective` over the fixture's network, labels
-    and settings, trained by `Trainer` with `optimizer` for the fixture's
-    iterations on the reference's draws: the objective and its final state.
-    `prefix` "dcm/" trains rCM's discrete-time consistency on its draws."""
-    from diffusion_stubs import label_table
-
-    from dew.diffusion import presets
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.objectives.base import TEACHER
-    from dew.objectives.diffusion import ConsistencyDistillationObjective
-    from dew.objectives.diffusion.consistency import _Draws
-    from dew.training import Trainer
-    from dew.training.posthoc import power_decay
-
-    config = json.loads(str(TRAINING["config"]))
-    pixels, labels = TRAINING["pixels"], TRAINING["label"]
-    names = [str(row) for row in range(pixels.shape[0])]
-    table = label_table(labels)
-    inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
-    (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
-    teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
-    task = ConsistencyDistillationObjective(
-        Weighted(), presets.Flow()(), inputs, consistency_weight=config["loss_scale"],
-        dmd_weight=config["loss_scale_dmd"], teacher_guidance=config["teacher_guidance"],
-        tangent_warmup=config["tangent_warmup"], student_update_freq=config["student_update_freq"],
-        max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
-        critic_times=(mean_d, std_d), **discrete_fields(prefix), variables={TEACHER: teacher},
-        ema_decay=power_decay(config["ema_rate"]))
-    drawn = {name: jnp.asarray(TRAINING[f"{prefix}draws/{name}"]) for name in _Draws._fields}
-    monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
-        **{name: value[step.step] for name, value in drawn.items()}))
-    trainer = Trainer(task, optimizer, key=jax.random.PRNGKey(0))
-    state = trainer.initial_state()
-    batch = {"image": pixels, **inputs.tokenize(names)}
-    step = trainer.compile(state, batch)
-    for _ in range(config["iterations"]):
-        state, *_ = step(state, batch)
-    return task, state
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():

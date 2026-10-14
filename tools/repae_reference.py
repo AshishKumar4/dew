@@ -22,7 +22,7 @@ and `build_mlp`, `ReconstructionLoss_Single_Stage` and the script's
 (loss/discriminator.py), all as published. The autoencoder's encoder,
 decoder and 1x1 convolutions are tests/fixtures/tiny_diffusers' SD VAE,
 run by diffusers; LPIPS's VGG16 and linear heads are
-`lpips_reference.drawn_weights()`, which the test draws too; the
+`lpips_weights.drawn_weights()`, which the test draws too; the
 discriminator is built at `ndf=8` (the published 64 at an eighth of the
 width) and the fixture carries its weights; the SiT's embedders, blocks
 and final layer are small stand-ins (`Patches`, `Times`, `Block`, `Final`)
@@ -65,6 +65,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
+from lpips_weights import drawn_weights
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
 from torchvision import models
@@ -325,7 +326,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
          "ReconstructionLoss_Single_Stage"},
         {"torch": torch, "nn": torch.nn, "F": F, "rearrange": rearrange,
          "autocast": lambda enabled=True: (lambda method: method),
-         "PerceptualLoss": perceptual(*lpips_reference.drawn_weights()),
+         "PerceptualLoss": perceptual(*drawn_weights()),
          "NLayerDiscriminator": functools.partial(
              defined_in(source("loss/discriminator.py"), {"ActNorm", "NLayerDiscriminator"},
                         {"torch": torch, "nn": torch.nn, "functools": functools})["NLayerDiscriminator"],

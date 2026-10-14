@@ -10,7 +10,7 @@ from dew.data.compile import compile
 from dew.data.pipeline import Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
-from dew.training import Trainer
+from dew.training import Checkpoints, Trainer
 
 
 class ScalarRegression(Objective):
@@ -45,8 +45,8 @@ def data(width=2):
         [{'x': np.ones(width, np.float32)}] * 32))).repeat().batch(8), read="indexed")
 
 
-def trainer(auxiliary=False, tracker=None, statistics='ratio'):
-    return Trainer(ScalarRegression(auxiliary, statistics), optax.sgd(.1), key=0, tracker=tracker)
+def trainer(auxiliary=False, tracker=None, statistics='ratio', **settings):
+    return Trainer(ScalarRegression(auxiliary, statistics), optax.sgd(.1), key=0, tracker=tracker, **settings)
 
 
 @pytest.mark.parametrize('statistics', ('ratio', 'scalar', 'composite'))
@@ -63,10 +63,28 @@ def test_stats_only_loss_matches_auxiliary_loss_and_direct_differentiation(stati
     np.testing.assert_array_equal(gradient['params']['weight'], jnp.full(2, -2.))
 
 
-def test_supplied_state_continues_instead_of_initializing_again():
+def test_a_supplied_state_is_the_runs_initial_state_and_its_checkpoint_the_continuation(tmp_path):
+    """A run handed another run's state starts from it rather than a fresh
+    initialization: on a stream that reads the same batch throughout, two steps
+    from a two-step state equal four from scratch. A checkpoint is the one
+    continuation: beside a checkpoint at step 2, a run handed the initial state
+    trains from step 0, and the same run handed none resumes at step 2."""
     direct = trainer(auxiliary=True).fit(data(), steps=4, log_every=4)
     running = trainer(auxiliary=True)
     middle = running.fit(data(), steps=2, log_every=2)
     resumed = running.fit(data(), state=middle, steps=4, log_every=4)
     assert int(resumed.step) == 4
     jax.tree.map(np.testing.assert_array_equal, direct.variables, resumed.variables)
+
+    def checkpointed():
+        return trainer(auxiliary=True, checkpoints=Checkpoints(str(tmp_path / "run")))
+
+    checkpointed().fit(data(), steps=2, log_every=2)
+    beside = checkpointed()
+    restarted = beside.fit(data(), state=beside.initial_state(), steps=1, log_every=1, checkpoint_final=False)
+    assert int(restarted.step) == 1
+    once = trainer(auxiliary=True).fit(data(), steps=1, log_every=1)
+    jax.tree.map(np.testing.assert_array_equal, once.variables, restarted.variables)
+    continued = checkpointed().fit(data(), steps=4, log_every=4)
+    assert int(continued.step) == 4
+    jax.tree.map(np.testing.assert_array_equal, direct.variables, continued.variables)

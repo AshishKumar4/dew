@@ -1478,6 +1478,56 @@ class Packed:
                             chunks=None if runs == 1 else runs)
 
 
+def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
+                 config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
+    """`tensors` with each one a `packed` record names split into its parts
+    (`Packed.split`), the rest as they are.
+
+    A fused tensor and a part stored under its own name, such as Qwen's
+    `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
+    so the two must be the same tensor, of one dtype and equal values; any
+    other pair is refused, whichever comes first."""
+    split: dict[str, np.ndarray] = {}
+    for name, tensor in tensors.items():
+        packing = next((packing for packing in packed if name.endswith(packing.name)), None)
+        parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+        for part, value in parts.items():
+            held = split.setdefault(part, value)
+            if held is not value:
+                held, value = np.asarray(held), np.asarray(value)
+                if held.dtype != value.dtype or not np.array_equal(held, value):
+                    raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
+                                     f"checkpoint's tensors holds as a different {held.dtype} tensor")
+    return split
+
+
+def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -> dict[str, np.ndarray]:
+    """`split_packed`'s inverse for parts held in memory: each `packed`
+    record's parts under one stem concatenated on its axis into the tensor it
+    names, the rest as they are. A record that transposes or interleaves its
+    parts in runs is exported through its layout (`Packed.layout`) instead."""
+    joined: dict[str, np.ndarray] = {}
+    held: dict[tuple[str, Packed], dict[str, np.ndarray]] = {}
+    for name, tensor in tensors.items():
+        found = next(((packing, part) for packing in packed for part in packing.parts if name.endswith(part)),
+                     None)
+        if found is None:
+            joined[name] = tensor
+        else:
+            packing, part = found
+            held.setdefault((name.removesuffix(part), packing), {})[part] = tensor
+    for (stem, packing), parts in held.items():
+        if packing.transpose is not None or packing.widths is not None or packing.chunks is not None:
+            raise ValueError(f"{stem}{packing.name} transposes or interleaves its parts; "
+                             "export it by its layout")
+        if set(parts) != set(packing.parts):
+            raise ValueError(f"{stem}{packing.name} needs {packing.parts}, "
+                             f"and the tensors hold {sorted(parts)}")
+        joined[stem + packing.name] = np.concatenate([parts[part] for part in packing.parts],
+                                                     axis=packing.axis)
+    return joined
+
+
 _QKV = ('q_proj', 'k_proj', 'v_proj')
 
 
@@ -1592,20 +1642,7 @@ class DecoderFamily:
         load's storage dtype (`Pretrained.load`), so a dense copy beside it
         must hold the decoded values in that dtype."""
         prepared = self.prepare(tensors, config)
-        if not self.packed:
-            return prepared
-        split: dict[str, np.ndarray] = {}
-        for name, tensor in prepared.items():
-            packing = self.packing(name)
-            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-            for part, value in parts.items():
-                held = split.setdefault(part, value)
-                if held is not value:
-                    held, value = np.asarray(held), np.asarray(value)
-                    if held.dtype != value.dtype or not np.array_equal(held, value):
-                        raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
-                                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
-        return split
+        return split_packed(prepared, self.packed, config) if self.packed else prepared
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""

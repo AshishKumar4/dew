@@ -35,17 +35,16 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchmark_cases import LM_DENSE, LM_MOE
 
 FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
 
-DENSE = {"vocab_size": 50304, "emb_features": 1024, "num_layers": 24, "num_heads": 16,
-         "mlp_features": 2816, "max_seq_len": 1024}
-MOE = {"vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
-       "max_seq_len": 1024,
-       "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
 DIT = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_ratio": 4}
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
 # rotary, the joint attention and the modulated feed-forwards of the hot path.
@@ -54,9 +53,9 @@ FLUX2 = {"num_layers": 2, "num_single_layers": 4, "heads": 12, "head_dim": 128,
 WAN = {"num_attention_heads": 12, "attention_head_dim": 128, "text_dim": 768, "ffn_dim": 8960,
        "num_layers": 4}
 STEP_CASES = {
-    "step lm-dense 4x1024": {"architecture": "causal_transformer", "config": DENSE, "dtype": "bfloat16",
+    "step lm-dense 4x1024": {"architecture": "causal_transformer", "config": LM_DENSE, "dtype": "bfloat16",
                              "batch_size": 4, "seq_len": 1024},
-    "step lm-moe 4x1024": {"architecture": "causal_transformer", "config": MOE, "dtype": "bfloat16",
+    "step lm-moe 4x1024": {"architecture": "causal_transformer", "config": LM_MOE, "dtype": "bfloat16",
                            "batch_size": 4, "seq_len": 1024},
     "step simple-dit-b 32x64px": {"architecture": "simple_dit", "config": DIT, "dtype": "bfloat16",
                                   "batch_size": 32, "image_size": 64},
@@ -70,6 +69,10 @@ STEP_CASES = {
 # Forward passes of inference modules at their published sizes, random weights.
 FORWARD_CASES = ("vision siglip-400m 384px b8", "vision qwen3.5 448px b8", "vision gemma4 672px b4",
                  "vae decode sd 512px b4")
+SLOTS = (32, 128)
+"""The serving rows' slot counts."""
+ATTENTION = ("cudnn", "xla")
+"""The attention rows' implementations."""
 
 # A checkpoint of lm-dense's whole training state, saved and then restored onto its shardings.
 CHECKPOINT = """
@@ -116,22 +119,89 @@ class Row:
     """Compare the head with an external reference, not with the base tree."""
 
 
-BATTERY = [
-    *[Row(name, "ms", "benchmark_step.py") for name in STEP_CASES],
-    *[Row(name, "ms", "benchmark_forward.py") for name in FORWARD_CASES],
-    Row("serve qwen3-0.6b 32 slots", "items/s", "benchmark_lm_serving.py"),
-    Row("serve qwen3-0.6b 128 slots", "items/s", "benchmark_lm_serving.py"),
-    # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
-    Row("serve qwen3-0.6b 32 slots, median repeat", "items/s", "benchmark_lm_serving.py", gated=False),
-    Row("serve qwen3-0.6b 128 slots, median repeat", "items/s", "benchmark_lm_serving.py", gated=False),
-    Row("attention cudnn S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py"),
-    Row("attention xla S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py"),
-    Row("image pipeline flowers 128px, device crop+flip+jitter", "items/s", "benchmark_image_pipeline.py"),
-    Row("checkpoint lm-dense save", "ms", ""),
-    Row("checkpoint lm-dense restore", "ms", ""),
-    Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
-        hardware="A100-SXM4-80GB", head_only=True),
+@dataclass(frozen=True)
+class Probe:
+    """One process of the battery: the rows it measures, the arguments of the
+    tool they name, and how that tool's output reads into their values."""
+
+    rows: tuple[Row, ...]
+    arguments: Callable[[argparse.Namespace, Path], list[str]]
+    """The tool's arguments, from the run's and the file the tool writes."""
+    read: Callable[[str, Path], tuple]
+    """Each row's value in the rows' order, from the tool's standard output
+    and the file it wrote."""
+
+    @property
+    def tool(self) -> str:
+        """The tools/ file the probe's rows run."""
+        return self.rows[0].tool
+
+
+def _served(out: Path) -> tuple:
+    """Each slot count's best repeat, then its median repeat. A host-bound
+    row's noise only ever slows it (32 slots spread 33% by median)."""
+    repeats = {entry["slots"]: [repeat["output_tokens_per_second"] for repeat in entry["repeats"]]
+               for entry in json.loads(out.read_text())["sweep"]}
+    return (*[max(repeats[slots]) for slots in SLOTS],
+            *[statistics.median(repeats[slots]) for slots in SLOTS])
+
+
+def _attended(out: Path) -> tuple:
+    """Each implementation's forward and backward time."""
+    timed = {row["implementation"]: row["forward_backward_ms"]
+             for row in json.loads(out.read_text()) if "forward_backward_ms" in row}
+    return tuple(timed[implementation] for implementation in ATTENTION)
+
+
+def _qwen35_comparison(out: Path) -> tuple:
+    """Translate the paired tool's record into an external-reference row's result."""
+    record = json.loads(out.read_text())
+    comparison = record["comparison"]
+    return ({"value": comparison["dew_tokens_per_s"], "ratio": comparison["dew_over_torch"],
+             "tolerance": comparison["tolerance"], "passed": comparison["performance_claim_passed"]}
+            if comparison is not None else {"error": record.get("error", "incomplete pair")},)
+
+
+PROBES = [
+    *[Probe((Row(name, "ms", "benchmark_step.py"),),
+            lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
+                                       "--json-out", str(out)],
+            lambda _, out: (json.loads(out.read_text())[0]["ms_per_step"],))
+      for name, case in STEP_CASES.items()],
+    # A process for each forward, so a module one tree lacks costs that row alone.
+    *[Probe((Row(name, "ms", "benchmark_forward.py"),),
+            lambda _, out, name=name: ["--cases", name, "--json-out", str(out)],
+            lambda _, out, name=name: (json.loads(out.read_text())[name],))
+      for name in FORWARD_CASES],
+    Probe((*[Row(f"serve qwen3-0.6b {slots} slots", "items/s", "benchmark_lm_serving.py") for slots in SLOTS],
+           # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
+           *[Row(f"serve qwen3-0.6b {slots} slots, median repeat", "items/s", "benchmark_lm_serving.py",
+                 gated=False) for slots in SLOTS]),
+          lambda args, out: ["--backend", "dew", "--model", args.model, "--slots", ",".join(map(str, SLOTS)),
+                             "--repeats", "5", "--out", str(out)],
+          lambda _, out: _served(out)),
+    Probe(tuple(Row(f"attention {implementation} S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py")
+                for implementation in ATTENTION),
+          lambda _, out: ["--implementations", *ATTENTION, "--sequence-lengths", "2048", "--head-dims", "128",
+                          "--causal", "True", "--json-out", str(out)],
+          lambda _, out: _attended(out)),
+    Probe((Row("image pipeline flowers 128px, device crop+flip+jitter", "items/s",
+               "benchmark_image_pipeline.py"),),
+          lambda args, out: ["--flowers", args.flowers, "--images", "512", "--repeats", "3", "--no-training",
+                             "--out", str(out)],
+          lambda _, out: (json.loads(out.read_text())["pipeline"]["device_crop_flip_jitter"]
+                          ["images_per_second"],)),
+    Probe((Row("checkpoint lm-dense save", "ms", ""), Row("checkpoint lm-dense restore", "ms", "")),
+          lambda _, out: ["-c", CHECKPOINT,
+                          json.dumps({**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1})],
+          lambda printed, _: tuple(json.loads(printed.strip().splitlines()[-1])[f"{kind}_ms"]
+                                   for kind in ("save", "restore"))),
+    Probe((Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
+               hardware="A100-SXM4-80GB", head_only=True),),
+          lambda args, out: ["--torch-python", args.torch_python, "--out", str(out), "--claim"],
+          lambda _, out: _qwen35_comparison(out)),
 ]
+BATTERY = [row for probe in PROBES for row in probe.rows]
 
 
 def _tools(tree: Path, tool: str, newer: Path) -> Path:
@@ -151,59 +221,6 @@ def _run(tree: Path, tool: str, argv: list[str], newer: Path,
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
 
-def _qwen35_comparison(out: Path) -> dict:
-    """Translate the paired tool's record into an external-reference row's result."""
-    record = json.loads(out.read_text())
-    comparison = record["comparison"]
-    value = ({"value": comparison["dew_tokens_per_s"], "ratio": comparison["dew_over_torch"],
-              "tolerance": comparison["tolerance"], "passed": comparison["performance_claim_passed"]}
-             if comparison is not None else {"error": record.get("error", "incomplete pair")})
-    return {"reference qwen3.5-0.8b 8x3072 vs torch": value}
-
-
-def _probes(args: argparse.Namespace, out: Path):
-    """Each probe: the rows it measures, its tool, its arguments, and how its output reads into them."""
-    for name, case in STEP_CASES.items():
-        yield ([name], "benchmark_step.py",
-               ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30", "--json-out", str(out)],
-               lambda _, name=name: {name: json.loads(out.read_text())[0]["ms_per_step"]})
-    # A process for each forward, so a module one tree lacks costs that row alone.
-    for name in FORWARD_CASES:
-        yield ([name], "benchmark_forward.py", ["--cases", name, "--json-out", str(out)],
-               lambda _, name=name: {name: json.loads(out.read_text())[name]})
-    yield ([row.name for row in BATTERY if row.name.startswith("serve")], "benchmark_lm_serving.py",
-           ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "5",
-            "--out", str(out)],
-           # The best repeat: a host-bound row's noise only ever slows it (32 slots spread 33% by median).
-           lambda _: {name: value for entry in json.loads(out.read_text())["sweep"]
-                      for name, value in (
-                          (f"serve qwen3-0.6b {entry['slots']} slots",
-                           max(r["output_tokens_per_second"] for r in entry["repeats"])),
-                          (f"serve qwen3-0.6b {entry['slots']} slots, median repeat",
-                           statistics.median(r["output_tokens_per_second"] for r in entry["repeats"])))})
-    yield ([row.name for row in BATTERY if row.name.startswith("attention")], "benchmark_attention.py",
-           ["--implementations", "cudnn", "xla", "--sequence-lengths", "2048", "--head-dims", "128",
-            "--causal", "True", "--json-out", str(out)],
-           lambda _: {f"attention {row['implementation']} S=2048 D=128 causal fwd+bwd":
-                      row["forward_backward_ms"]
-                      for row in json.loads(out.read_text()) if "forward_backward_ms" in row})
-    pipeline = "image pipeline flowers 128px, device crop+flip+jitter"
-    yield ([pipeline], "benchmark_image_pipeline.py",
-           ["--flowers", args.flowers, "--images", "512", "--repeats", "3", "--no-training",
-            "--out", str(out)],
-           lambda _: {pipeline: json.loads(out.read_text())["pipeline"]["device_crop_flip_jitter"]
-                      ["images_per_second"]})
-    case = {**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1}
-    yield (["checkpoint lm-dense save", "checkpoint lm-dense restore"], "",
-           ["-c", CHECKPOINT, json.dumps(case)],
-           lambda printed: {f"checkpoint lm-dense {kind}":
-                            json.loads(printed.strip().splitlines()[-1])[f"{kind}_ms"]
-                            for kind in ("save", "restore")})
-    yield (["reference qwen3.5-0.8b 8x3072 vs torch"], "reference_runs/qwen35_pair.py",
-           ["--torch-python", args.torch_python, "--out", str(out), "--claim"],
-           lambda _: _qwen35_comparison(out))
-
-
 def hardware_status(row: Row, device_kind: str) -> str | None:
     """A hardware-limited row is unmeasured off its named device, never silently passed."""
     if row.hardware is not None and row.hardware not in device_kind:
@@ -214,7 +231,6 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 def measure(tree: Path, args: argparse.Namespace, newer: Path, is_head: bool = True) -> dict:
     """One sample of every row in `tree`: a number, or why the row could not run there."""
     sample = {}
-    required = {row.name: row for row in BATTERY}
 
     @functools.cache
     def hardware() -> str:
@@ -224,26 +240,27 @@ def measure(tree: Path, args: argparse.Namespace, newer: Path, is_head: bool = T
 
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / "out.json"
-        for index, (names, tool, argv, read) in enumerate(_probes(args, out)):
-            external = all(required[name].head_only for name in names)
+        for index, probe in enumerate(PROBES):
+            names = [row.name for row in probe.rows]
+            external = all(row.head_only for row in probe.rows)
             if external and not is_head:
                 continue
-            claiming = args.claim and any(required[name].hardware for name in names)
+            claiming = args.claim and any(row.hardware for row in probe.rows)
             if args.only and not claiming and not any(word in name for name in names for word in args.only):
                 continue
-            unsupported = {name: hardware_status(required[name], hardware()) for name in names
-                           if required[name].hardware is not None}
+            unsupported = {row.name: hardware_status(row, hardware()) for row in probe.rows
+                           if row.hardware is not None}
             if any(unsupported.values()):
                 sample.update({name: reason for name, reason in unsupported.items() if reason is not None})
                 continue
             done = None
             try:
-                done = _run(tree, tool, argv, newer, 3600)
+                done = _run(tree, probe.tool, probe.arguments(args, out), newer, 3600)
                 if done.returncode != 0 and not external:
-                    raise RuntimeError(f"{tool} exited {done.returncode}: {done.stderr[-1500:]}")
-                values = read(done.stdout)
-                sample.update({name: {**values[name], "exit_code": done.returncode} if external
-                                else float(values[name]) for name in names})
+                    raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
+                values = probe.read(done.stdout, out)
+                sample.update({row.name: {**value, "exit_code": done.returncode} if external
+                               else float(value) for row, value in zip(probe.rows, values, strict=True)})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}

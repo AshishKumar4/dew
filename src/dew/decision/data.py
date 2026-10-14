@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Literal
 
 import numpy as np
 
@@ -115,6 +115,12 @@ def _label(value: str | int | float | bool) -> str | int:
         case _:
             return value
 
+
+
+def _slots(stated: Mapping[str, object]) -> dict[str, int]:
+    """The question and option slots a mixture's manifest states its rows need."""
+    return {name: records.integer(value, f"slots.{name}")
+            for name, value in record(stated.get("slots", {}), "slots").items()}
 
 @dataclass(frozen=True)
 class ParseExample:
@@ -320,72 +326,22 @@ class Decisions:
         return train, evaluated, ()
 
     def _mixture(self, root_url: str) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.sources import Files
+        from dew.data.sources import Source
         from dew.data.sources.concatenate import Concatenate
-        from dew.data.storage import Store
 
-        root = Store(root_url)
-        fs, path = root.resolve()
-        mixture = path.rstrip("/") + "/mixture.json"
-        with fs.open(mixture, "rb") as handle:
-            stated = record(json.load(handle), "mixture.json")
-        stated, pinned = self._descriptor(root_url, stated)
+        stated, pinned = self._stated(root_url)
         shares = {
             name: records.number(value, f"weights.{name}")
             for name, value in record(stated.get("weights", {}), "weights").items()
         } | dict(self.weights)
-        slots = {
-            name: records.integer(value, f"slots.{name}")
-            for name, value in record(stated.get("slots", {}), "slots").items()
-        }
-        files = record(stated.get("files", {}), "mixture files")
         training, held, weights = [], [], []
         for name, weight in sorted(shares.items()):
             if weight <= 0:
                 continue
-            corpus = record(files.get(name, {}), f"files.{name}")
             for split, destination in (("train", training), ("held", held)):
-                entry = record(corpus.get(split, {}), f"files.{name}.{split}")
-                shards = entry.get("shards")
-                if isinstance(shards, list):
-                    paths = tuple(
-                        root_url.rstrip("/")
-                        + "/"
-                        + records.text(record(shard, "shard")["path"], "shard.path")
-                        for shard in shards
-                    )
-                else:
-                    url = root_url.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
-                    shard_fs, shard_path = Store(url).resolve()
-                    paths = (url,) if shard_fs.exists(shard_path) else ()
-                if paths:
-                    index = record(entry.get("index", {}), "index").get("path")
-                    source_index = (
-                        None
-                        if index is None
-                        else root_url.rstrip("/") + "/" + records.text(index, "index.path")
-                    )
-                    declared = (
-                        {
-                            root_url.rstrip("/")
-                            + "/"
-                            + records.text(record(shard, "shard")["path"], "shard.path"): record(
-                                shard, "shard"
-                            )
-                            for shard in shards
-                            if isinstance(shards, list)
-                        }
-                        if isinstance(shards, list)
-                        else None
-                    )
-                    if declared is not None and source_index is not None:
-                        declared[source_index] = record(entry["index"], "index")
-                    dataset = _DecisionSource(
-                        Files(paths, format="jsonl", index=source_index, file_info=declared),
-                        slots or None,
-                        descriptor=pinned,
-                    )
-                    destination.append(Pipeline(dataset, name=name).map(ParseExample()))
+                read = self._corpus(root_url, stated, pinned, name, split)
+                if read is not None:
+                    destination.append(read)
             weights.append(weight)
         if not training:
             raise ValueError(f"no corpus of {self.source} has a positive weight")
@@ -396,12 +352,62 @@ class Decisions:
             else Pipeline(
                 _DecisionSource(
                     Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
-                    slots or None,
+                    _slots(stated) or None,
                     descriptor=pinned,
                 )
             ).map(ParseExample())
         )
         return train, evaluated, ()
+
+    def corpus(self, name: str, split: Literal["train", "held"] = "held") -> Pipeline | None:
+        """Corpus `name`'s `split` of this mixture as decision loading reads it, from the
+        shards and index its manifest names (or the corpus's one JSONL file), each row an
+        `Example` under `example`; None when the corpus has no such split. A benchmark reads
+        one corpus's held rows through this, whatever its weight."""
+        if not isinstance(self.source, str):
+            raise ValueError("a corpus is read from a mixture directory's manifest")
+        stated, pinned = self._stated(self.source)
+        return self._corpus(self.source, stated, pinned, name, split)
+
+    def _stated(self, root_url: str) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        """The mixture's manifest, as its descriptor pins it, and that pin."""
+        from dew.data.storage import Store
+
+        fs, path = Store(root_url).resolve()
+        with fs.open(path.rstrip("/") + "/mixture.json", "rb") as handle:
+            stated = record(json.load(handle), "mixture.json")
+        return self._descriptor(root_url, stated)
+
+    def _corpus(self, root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],
+                name: str, split: str) -> Pipeline | None:
+        """Corpus `name`'s `split` from manifest `stated` (`corpus`)."""
+        from dew.data.sources import Files
+        from dew.data.storage import Store
+
+        root = root_url.rstrip("/")
+        corpus = record(record(stated.get("files", {}), "mixture files").get(name, {}), f"files.{name}")
+        entry = record(corpus.get(split, {}), f"files.{name}.{split}")
+        shards = entry.get("shards")
+        if isinstance(shards, list):
+            listed = [record(shard, "shard") for shard in shards]
+            declared: dict[str, Mapping[str, object]] | None = {
+                root + "/" + records.text(shard["path"], "shard.path"): shard for shard in listed
+            }
+            paths = tuple(declared)
+        else:
+            declared = None
+            url = root + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
+            shard_fs, shard_path = Store(url).resolve()
+            paths = (url,) if shard_fs.exists(shard_path) else ()
+        if not paths:
+            return None
+        index = record(entry.get("index", {}), "index").get("path")
+        source_index = None if index is None else root + "/" + records.text(index, "index.path")
+        if declared is not None and source_index is not None:
+            declared[source_index] = record(entry["index"], "index")
+        dataset = _DecisionSource(Files(paths, format="jsonl", index=source_index, file_info=declared),
+                                  _slots(stated) or None, descriptor=pinned)
+        return Pipeline(dataset, name=name).map(ParseExample())
 
     def _descriptor(
         self, root_url: str, stated: Mapping[str, object]
