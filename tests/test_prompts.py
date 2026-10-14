@@ -174,13 +174,15 @@ def test_the_train_stream_encodes_inside_workers():
 def test_prompts_validate_on_a_hub_split_of_their_own(tmp_path, monkeypatch):
     """Prompts from a Hub dataset validate on its own validation split, which the source names,
     where the reward facts wrapped around the source once hid its splits and refused."""
+    import datasets
     from hub_support import native_hub
 
     from dew.data.holdout import Split
     from dew.data.sources import Hub
 
     native_hub(monkeypatch, tmp_path, "acme/prompts",
-               {"train": {"prompt": ["a", "b", "c", "d"]}, "validation": {"prompt": ["x", "y"]}})
+               {"train": datasets.Dataset.from_dict({"prompt": ["a", "b", "c", "d"]}),
+                "validation": datasets.Dataset.from_dict({"prompt": ["x", "y"]})})
     recipe = PromptData(source=Hub("acme/prompts"), tokenizer=TOKENIZER, max_prompt_len=WINDOW,
                         validation=Split("validation"))
     train, held, _ = recipe.pipelines()

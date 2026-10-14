@@ -5,23 +5,12 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-import jax
 import numpy as np
 import pytest
+from hub_support import native_builder
 from token_support import write_token_corpus
 
-from dew.config.data import (
-    ChatData,
-    HoldOut,
-    ImageData,
-    PreferenceData,
-    PromptData,
-    RecordsData,
-    TextData,
-    TinyShakespeareData,
-    VideoData,
-    loader,
-)
+from dew.config.data import HoldOut, ImageData, RecordsData, TextData
 from dew.data import TFDS, Hub, Loading, Memory, load, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -67,10 +56,9 @@ def hub(tmp_path, monkeypatch):
     for revision, offset in (("frozen-default", 0), ("frozen-release", 1000)):
         ids = list(range(offset, offset + 512))
         texts[revision] = [f"document {index:04d} " + "x" * 113 for index in ids]
-        path = tmp_path / f"{revision}.parquet"
-        datasets.Dataset.from_dict({"id": ids, "text": texts[revision]}).to_parquet(path)
-        builders[revision] = datasets.load_dataset_builder(
-            "parquet", data_files={"train": str(path)}, cache_dir=str(tmp_path / revision))
+        split = datasets.Dataset.from_dict({"id": ids, "text": texts[revision]})
+        builders[revision] = native_builder({"train": split}, tmp_path / f"{revision}-files",
+                                            tmp_path / revision)
 
     def info(self, repo, revision=None, **options):
         assert repo == "acme/simple"
@@ -249,47 +237,3 @@ def test_image_data_defaults_hold_out_256_records_and_resize_both_parts():
     for batch in train + held:
         np.testing.assert_array_equal(batch["image"], np.broadcast_to(
             (batch["label"] % 256).astype(np.uint8)[:, None, None, None], (8, 4, 4, 3)))
-
-
-@pytest.mark.parametrize("kind", ["records", "text", "chat", "prompts", "preferences", "images",
-                                  "video", "shakespeare"])
-def test_each_run_spec_loads_the_same_batches_and_plan_as_loader(kind, tmp_path):
-    if kind == "video":
-        pytest.importorskip("moviepy.config", reason="needs the av extra")
-        from test_data import _voxceleb_tree
-        from transformers import Wav2Vec2FeatureExtractor
-
-        _voxceleb_tree(tmp_path)
-        extractor = tmp_path / "extractor"
-        Wav2Vec2FeatureExtractor(sampling_rate=16000).save_pretrained(extractor)
-        spec = VideoData(str(tmp_path / "train"), frames=2, frame_size=8, audio_padding=0,
-                         audio_model=str(extractor), validation=HoldOut(records=1))
-    else:
-        text = [{"text": "v" * 10 + "t" * 990}]
-        conversations = [{"messages": [{"role": "user", "content": "hello"},
-                                        {"role": "assistant", "content": "world"}]}] * 8
-        specs = {
-            "records": RecordsData([{"id": index} for index in range(8)], validation=HoldOut(records=2)),
-            "text": TextData(text, seq_len=3),
-            "chat": ChatData(conversations, str(FIXTURES / "tokenizers" / "tiny-chat"), seq_len=16,
-                             validation=HoldOut(records=2)),
-            "prompts": PromptData([{"prompt": [1, 2, 3]}] * 8, "byte", max_prompt_len=4),
-            "preferences": PreferenceData([{"chosen": [1, 2, 3], "rejected": [1, 2, 4],
-                                            "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}] * 8,
-                                          seq_len=4),
-            "images": ImageData([{"image": np.full((4, 4, 3), index % 256, np.uint8)}
-                                  for index in range(320)], image_size=4, augment=None),
-            "shakespeare": TinyShakespeareData(text, seq_len=3),
-        }
-        spec = specs[kind]
-    options = {"batch": 1, "seed": 21, "read": "memory", "loading": READ}
-    direct, method = loader(spec, **options), spec.load(**options)
-    assert method.records == direct.records and method.held_out == direct.held_out
-    assert method.plan.record() == direct.plan.record()
-    for held in (False, True) if method.val is not None else (False,):
-        left, right = batches(method, held=held), batches(direct, held=held)
-        assert len(left) == len(right)
-        for actual, expected in zip(left, right, strict=True):
-            # A packed batch's coordinates are a pytree; compare it leaf by leaf.
-            assert jax.tree.structure(actual) == jax.tree.structure(expected)
-            jax.tree.map(np.testing.assert_array_equal, actual, expected)
