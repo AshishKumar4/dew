@@ -217,7 +217,7 @@ def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
     (tmp_path / "broken.mp4").write_bytes(b"not a video")
     table = [{"url": clip.as_uri(), "caption": "a fade"}, {"url": (tmp_path / "broken.mp4").as_uri()}]
     pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().filter_map(video.fetch())
-                .filter_map(video.pick_clip(8 / FPS)).filter_map(video.decode(8, size=16)).batch(2))
+                .random_filter_map(video.pick_clip(8 / FPS)).filter_map(video.decode(8, size=16)).batch(2))
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:

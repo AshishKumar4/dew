@@ -687,6 +687,36 @@ def test_finite_diagnostics_draw_after_rejection_and_shuffle_as_training_does(re
         assert row["value"] == row["i"] + row["draw"]
 
 
+def keep_heads(row, rng) -> dict | Rejected:
+    """The row with its draw, or `Rejected("tails")` when the draw lands below a half."""
+    draw = rng.random()
+    return {**row, "draw": np.float64(draw)} if draw >= 0.5 else Rejected("tails")
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_random_step_that_drops_records_draws_alike_in_every_read_and_counts_its_drops(read):
+    """A plain `fn(record, rng)` that may reject goes through random_filter_map: every read keeps
+    the same records with the same draws and counts the rest under the step's reason, where a
+    random step that drops once had a verb only as a Grain transform."""
+    def drawn(mode: str):
+        chain = Memory(rows("a", 24)).named("coins").random_filter_map(keep_heads)
+        return dataclasses.replace(chain, mode=mode, loading=READ)
+
+    kept = [(int(row["i"]), float(row["draw"])) for row in drawn(read).iterate()]
+    assert kept == [(int(row["i"]), float(row["draw"])) for row in drawn("memory").iterate()]
+    assert 0 < len(kept) < 24 and all(draw >= 0.5 for _, draw in kept)
+    assert drawn(read).stats(records=24)["data/rejected/coins/tails"] == 24 - len(kept)
+
+
+def test_filter_map_refuses_a_step_that_draws_and_names_random_filter_map():
+    """A Grain RandomMapTransform draws from a generator, so filter_map, whose steps read the
+    record alone, refuses it rather than call it without one."""
+    from dew.data import video
+
+    with pytest.raises(TypeError):
+        Memory(rows("a", 2)).filter_map(video.pick_clip(1.0))
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_an_augmented_image_preset_can_be_inspected_without_repeating(read):
     from dew.data import presets
