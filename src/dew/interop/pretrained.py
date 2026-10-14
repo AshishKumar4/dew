@@ -63,7 +63,7 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import SourceLeaf, WeightLayout
-from dew.interop.weights import AUTO, declared_dtype
+from dew.interop.weights import AUTO, checkpoint_array, declared_dtype
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1098,12 +1098,19 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
             if part in tensors}
     aliases: tuple[tuple[str, str], ...] = ()
+    parts: tuple[tuple[str, str], ...] = ()
     if param_dtype != "float32":
-        aliases = decoders.validate_source_aliases(
+        aliases, parts = decoders.validate_source_aliases(
             quantization.tensor_names(tensors), partial(quantization.read, tensors, set(quantized_tensors)),
             config, media=media)
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
+    for part, packed in parts:
+        # Checked equal above; the dense copy rounds as the decoded one did, so
+        # the two meet `DecoderFamily.prepare_weights`' comparison as one value.
+        if (part in quantized_tensors) != (packed in quantized_tensors):
+            dense = packed if part in quantized_tensors else part
+            tensors[dense] = checkpoint_array(tensors[dense], param_dtype)
     return tensors, quantized_tensors, scale_dtype, grid
 
 

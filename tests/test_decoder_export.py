@@ -768,6 +768,44 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
 
 
+@pytest.mark.parametrize(
+    "same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"]
+)
+def test_a_quantized_packed_tensor_and_its_part_stored_apart_are_checked_before_rounding(
+        tmp_path, same_values):
+    """Phi-3's gate_up_proj stored in FP8 decodes to 1 + 1/1024, which bfloat16
+    rounds to 1, beside a dense gate_proj that holds the same value or
+    1 + 2/1024, which rounds to 1 too. The two copies of the gate are compared
+    on their original values, before the codec narrows the packed one: an
+    equal copy loads as the packed tensor alone does, a different one is
+    refused although both round alike."""
+    from dew.interop.codecs import E4M3
+
+    fixture = FIXTURES / "phi3-tiny"
+    tensors = tool.source_tensors(fixture)
+    config = json.loads((fixture / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    packed, part = "model.layers.0.mlp.gate_up_proj.weight", "model.layers.0.mlp.gate_proj.weight"
+    shape = tensors[packed].shape
+    decoded = np.float32(1. + 1. / 1024)
+    tensors[packed] = np.ones(shape, dtype=E4M3)
+    tensors[packed + "_scale_inv"] = np.full(((shape[0] + 127) // 128, (shape[1] + 127) // 128), decoded,
+                                             np.float32)
+    save_hf_layout(tensors, config, tmp_path / "alone")
+    copy = decoded if same_values else np.float32(1. + 2. / 1024)
+    save_hf_layout({**tensors, part: np.full((shape[0] // 2, shape[1]), copy, np.float32)}, config,
+                   tmp_path / "apart")
+    if not same_values:
+        with pytest.raises(ValueError, match="differs from the piece"):
+            Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        return
+    apart = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    alone = Pretrained.load(tmp_path / "alone", dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    assert jax.tree.structure(apart.variables) == jax.tree.structure(alone.variables)
+    for ours, theirs in zip(jax.tree.leaves(apart.variables), jax.tree.leaves(alone.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
     from dew.interop.codecs import E4M3
 
