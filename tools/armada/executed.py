@@ -164,7 +164,8 @@ def pytest_sessionfinish(session):
     sys.monitoring.set_events(TOOL, 0)
     out = os.environ.get("DEW_EXECUTED")
     if out:
-        peak = gpu_peak() if len(own) == 1 else None
+        # A file that started a process may have used the GPU there, which no allocator here saw.
+        peak = gpu_peak() if len(own) == 1 and not spawned else None
         recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
                            "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere),
                            "peak": peak} for name, files in own.items()}

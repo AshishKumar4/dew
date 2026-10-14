@@ -237,7 +237,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [(f"3.12:{name}", 0) for name in names]
     runs = [path.read_text().split() for path in tmp_path.glob("ran-*")]
-    assert [share for share, *_ in runs] == ["0.1250"] * len(names), "a process a file, a quarter each"
+    assert [share for share, *_ in runs] == ["0.125"] * len(names), "a process a file, a quarter each"
     spans = [(float(began), float(ended)) for _, began, ended in runs]
     overlapping = max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
     assert 2 <= overlapping <= 4
