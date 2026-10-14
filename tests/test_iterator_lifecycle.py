@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import TimingRegression as Regression, batches
+from affine_run import BATCH, TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
 from dew.data import Loading, Rejected, from_grain, mix
@@ -502,8 +502,9 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
 
 def test_a_refusal_before_the_transfer_finalizes_the_untransferred_source(tmp_path):
-    """A stream fit refuses before its prefetch worker owns it, here for a
-    batch the mesh's eight devices cannot divide, is closed by fit."""
+    """A stream fit refuses before its prefetch worker owns it is closed by fit. Here the stream
+    keeps no position, and the run resumes from a checkpoint that holds none, which any mesh
+    refuses: reading it again from the start would repeat its data."""
     closed = threading.Event()
 
     class Uncheckpointable:
@@ -516,10 +517,16 @@ def test_a_refusal_before_the_transfer_finalizes_the_untransferred_source(tmp_pa
         def close(self):
             closed.set()
 
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      checkpoints=Checkpoints(str(tmp_path)))
-    with pytest.raises(ValueError, match="7"):
-        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, 7), steps=1, checkpoint_every=1)
+    def fit(steps):
+        trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                          checkpoints=Checkpoints(str(tmp_path)))
+        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, BATCH), steps=steps,
+                    checkpoint_every=1)
+
+    fit(1)
+    closed.clear()
+    with pytest.raises(ValueError):
+        fit(2)
     assert closed.is_set()
 
 def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp_path):
