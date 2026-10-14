@@ -50,7 +50,7 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
-from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
+from dew.objectives.lm.objective import TEXT_KEY, batch_text, documents_of, text_preview
 from dew.records import JSON
 from dew.sampling.sample import sample
 from dew.sampling.solvers import Solver
@@ -65,7 +65,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
-    windows also include `text_segment_ids` and `text_positions`.
+    windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
     """
 
     artifact = TextSamples
@@ -186,9 +186,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
-        (``Text(pack="first-fit")``) names each window's documents in
-        `text_segment_ids`, 0 for the padded tail, and their positions in
-        `text_positions`. Each document then attends to itself alone, in both
+        (``TextData(pack="first-fit")``) lays each window's documents out in
+        `text_coordinates`, segment 0 for the padded tail, with their
+        positions. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked
         nor scored: a packed window scores as its documents would one by one.
         Padding under `attention_mask` is not scored either, and a media
@@ -203,8 +203,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                 f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
         fields = prepared.token_fields
         real = jnp.ones(tokens.shape, bool)
-        if "segment_ids" in fields:
-            real &= fields["segment_ids"] != 0
+        documents = documents_of(fields)
+        if documents is not None:
+            real &= documents != 0
         if "attention_mask" in fields:
             real &= fields["attention_mask"].astype(bool)
         for media in ("image_indices", "audio_indices"):

@@ -1008,16 +1008,31 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
         return prediction_path(name, 'mtp', parts[1] if len(parts) >= 3 else None,
                                record_int(config, "num_nextn_predict_layers", 0), '.'.join(parts[2:]),
                                _V4_PREDICTION_LEAVES, block)
+    return dew_path(_v4_spelling(name), config)
+
+
+def _v4_spelling(name: str) -> str:
+    """`name` as transformers' modules spell it: the trunk's tensors under
+    `model.`, and a layer's or a prediction block's tail renamed
+    (`_DEEPSEEK_V4_NAMES`). The path map and the storage preparation both
+    read a tensor under this one name, so the release's spelling, an
+    export's and the reference model's own state dict's are one tensor to
+    each. The renames run over a block's own tail, where the trunk's
+    `norm.weight` cannot meet the compressors' pattern."""
     name = _DEEPSEEK_V4_TRUNK.get(name, name)
     if name.startswith('layers.'):
         name = 'model.' + name
     parts = name.split('.')
-    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()):
-        return dew_path(name, config)
-    tail = '.' + '.'.join(parts[3:])
+    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+        block, tail = '.'.join(parts[:3]), parts[3:]
+    elif len(parts) >= 3 and parts[0] == 'mtp' and parts[1].isdigit():
+        block, tail = '.'.join(parts[:2]), parts[2:]
+    else:
+        return name
+    renamed = '.' + '.'.join(tail)
     for theirs, ours in _DEEPSEEK_V4_NAMES:
-        tail = tail.replace(theirs, ours)
-    return dew_path(f"model.layers.{parts[2]}{tail}", config)
+        renamed = renamed.replace(theirs, ours)
+    return block + renamed
 
 
 def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
@@ -1033,21 +1048,23 @@ def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
     the int32 the router's collection holds (:1062).
     """
     prepared = dict(tensors)
+    spelled = {_v4_spelling(name): name for name in tensors}
     for name, tensor in tensors.items():
-        if name.endswith('.attn.wo_a.weight'):
-            partner = name.removesuffix('wo_a.weight') + 'wq_b.weight'
-            stacked = tensors.get(partner)
-            if stacked is None:
-                raise ValueError(f"{name} needs {partner} to name its head groups")
-            groups = stacked.shape[0] // tensor.shape[1]
+        spelling = _v4_spelling(name)
+        if spelling.endswith('.self_attn.o_a_proj.weight'):
+            partner = spelled.get(spelling.removesuffix('o_a_proj.weight') + 'q_b_proj.weight')
+            if partner is None:
+                raise ValueError(f"{name} needs its block's query projection (wq_b) to name its head groups")
+            groups = tensors[partner].shape[0] // tensor.shape[1]
             prepared[name] = np.ascontiguousarray(
                 tensor.reshape(groups, -1, tensor.shape[1]).transpose(0, 2, 1))
-        elif name.endswith('.gate.tid2eid'):
+        elif spelling.endswith('.gate.tid2eid'):
             if not np.issubdtype(tensor.dtype, np.integer):
                 raise ValueError(f"{name} must contain integer expert indices")
-            router = tensors.get(name.removesuffix('tid2eid') + 'weight')
-            if router is None:
+            router_name = spelled.get(spelling.removesuffix('tid2eid') + 'weight')
+            if router_name is None:
                 raise ValueError(f"{name} has no gate.weight declaring its expert count")
+            router = tensors[router_name]
             if tensor.size:
                 lower, upper = np.min(tensor), np.max(tensor)
                 limits = np.iinfo(np.int32)

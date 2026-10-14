@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from hub_support import native_builder
 
 from dew.data.sources.hub import Hub
 
@@ -41,12 +42,9 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    rows = tmp_path / "rows.parquet"
-    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
-    builders = {
-        cache: datasets.load_dataset_builder("parquet", data_files={"train": str(rows)}, cache_dir=cache)
-        for cache in (str(tmp_path / "first"), str(tmp_path / "second"))
-    }
+    rows = {"train": datasets.Dataset.from_dict({"id": list(range(8))})}
+    builders = {str(cache): native_builder(rows, tmp_path, cache)
+                for cache in (tmp_path / "first", tmp_path / "second")}
     for builder in builders.values():
         builder.download_and_prepare()
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
@@ -83,10 +81,8 @@ def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed
             raise RevisionNotFoundError("404 Client Error: Revision Not Found", response=response)
         return SimpleNamespace(sha="frozen")
 
-    rows = tmp_path / "rows.parquet"
-    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
-    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
-                                            cache_dir=str(tmp_path / "arrow"))
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": list(range(8))})}, tmp_path,
+                             tmp_path / "arrow")
     builder.download_and_prepare()
     monkeypatch.setattr(HfApi, "dataset_info", metadata)
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo_id, **kwargs: ["train.tar"])
@@ -115,10 +111,8 @@ def test_a_prepared_arrow_read_resumes_when_only_the_parquet_conversion_moves(tm
     from dew.data.dataset import DataPartition
     from dew.data.pipeline import Pipeline
 
-    rows = tmp_path / "rows.parquet"
-    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
-    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
-                                            cache_dir=str(tmp_path / "arrow"))
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": list(range(8))})}, tmp_path,
+                             tmp_path / "arrow")
     builder.download_and_prepare()
     converted = ["first"]
 
@@ -165,10 +159,8 @@ def test_an_indexed_hub_read_does_not_list_refs_or_files(tmp_path, monkeypatch):
     from dew.data.dataset import DataPartition
     from dew.data.pipeline import Pipeline
 
-    rows = tmp_path / "rows.parquet"
-    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
-    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
-                                            cache_dir=str(tmp_path / "arrow"))
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": list(range(8))})}, tmp_path,
+                             tmp_path / "arrow")
     builder.download_and_prepare()
 
     def unused(*args, **kwargs):
@@ -287,10 +279,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
         buffer = io.BytesIO()
         PILImage.fromarray(value).save(buffer, format="PNG")
         encoded.append({"bytes": buffer.getvalue(), "path": None})
-    rows = tmp_path / "images.parquet"
-    datasets.Dataset.from_dict({"image": encoded}).cast_column("image", datasets.Image()).to_parquet(rows)
-    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
-                                            cache_dir=str(tmp_path / "arrow"))
+    images = datasets.Dataset.from_dict({"image": encoded}).cast_column("image", datasets.Image())
+    builder = native_builder({"train": images}, tmp_path, tmp_path / "arrow")
     builder.download_and_prepare()
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo_id, **kwargs: ["train.tar"])

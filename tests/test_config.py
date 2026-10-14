@@ -70,18 +70,28 @@ def test_token_budget_flags_refuse_an_ambiguous_or_fractional_batch(fields):
         TrainerConfig(**fields)
 
 
-def test_token_budgets_derive_the_recorded_accumulation_without_changing_the_requested_config():
-    requested = TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304, steps=1)
-    derived = requested.derived()
-    assert requested.accumulation == 1 and derived.accumulation == 4
-    config = RunConfig(trainer=derived)
+def test_token_budgets_determine_the_accumulation_every_reader_sees():
+    """The budgets set the accumulation in the config itself, so RunConfig.train's
+    Trainer commits once a window as a prepared run does; one at odds refuses."""
+    config = RunConfig(trainer=TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304,
+                                             steps=1))
+    assert config.trainer.accumulation == 4
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded.trainer.batch_size is None
     assert loaded.trainer.batch_tokens == 24576 and loaded.trainer.update_tokens == 98304
-    assert loaded.trainer.accumulation == 4
-    conflicting = dataclasses.replace(requested, accumulation=3)
+    assert loaded.trainer == config.trainer
     with pytest.raises(ValueError):
-        conflicting.derived()
+        dataclasses.replace(config.trainer, accumulation=3)
+
+
+def test_coupled_fields_are_set_together():
+    """A row-batched run switches to token budgets by one set of assignments,
+    in any order, though no one of them is valid alone."""
+    rows = RunConfig(trainer=TrainerConfig(steps=1))
+    for order in (["trainer.batch_size=None", "trainer.batch_tokens=24", "trainer.update_tokens=96"],
+                  ["trainer.update_tokens=96", "trainer.batch_tokens=24", "trainer.batch_size=None"]):
+        budgeted = rows.assigned(order).trainer
+        assert (budgeted.batch_size, budgeted.batch_tokens, budgeted.accumulation) == (None, 24, 4)
 
 
 def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
