@@ -586,9 +586,9 @@ class DecisionObjective(Objective[Ratio]):
             scored=batch["scored"],
         )
 
-    @functools.cached_property
+    @property
     def _logits(self):
-        return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
+        return self.program('logits', lambda variables, inputs: self.model.logits(variables, inputs))
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and pack training

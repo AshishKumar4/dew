@@ -77,6 +77,38 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
             np.testing.assert_array_equal(after, before)
 
 
+def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
+    """A server over a bf16 decoder's fp32 masters holds what a load at bf16
+    storage holds, its head bias fp32, and a reload of trained fp32 weights
+    casts them as a server over that load casts them: the two hold the same
+    leaves and draw the same tokens."""
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    masters, native = (Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="bfloat16",
+                                       attention_impl="xla", max_seq_len=64, **storage)
+                       for storage in ({}, {"param_dtype": "bfloat16"}))
+    assert native.variables["params"]["head_bias"].dtype == jnp.float32
+    sampling = Sampling(temperature=0, eos_token_ids=None)
+    wide, narrow = (Server.from_task(source.text_generation(sampling=sampling), slots=2, capacity=32)
+                    for source in (masters, native))
+
+    def same(left, right):
+        for (path, actual), expected in zip(jax.tree_util.tree_leaves_with_path(left), jax.tree.leaves(right),
+                                            strict=True):
+            assert actual.dtype == expected.dtype, path
+            np.testing.assert_array_equal(actual, expected, err_msg=str(path))
+
+    same(wide.variables, narrow.variables)
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, masters.variables)
+    for server in (wide, narrow):
+        server.reload(trained)
+    same(wide.variables, narrow.variables)
+    for actual, expected in zip(wide([[3, 4, 5]], 5, key=3), narrow([[3, 4, 5]], 5, key=3), strict=True):
+        assert_same_generation(actual, expected)
+
+
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
