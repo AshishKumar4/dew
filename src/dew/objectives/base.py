@@ -471,8 +471,6 @@ class Objective(ABC, Generic[Loss, Effects]):
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
     _model_part: ClassVar[str | None] = None
-    artifact: type | None = None
-    """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
     """How the display shows the metrics `loss` reports, keyed by the names it reports them under.
 

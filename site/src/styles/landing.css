@@ -285,18 +285,16 @@ html[data-has-hero][data-past-hero] header.header {
 	box-shadow: none;
 }
 
-/* The page's script above what it printed; a tutorial cell beside its output. */
+/* The page's script above what it printed. */
 
-.run-grid,
-.shown-grid {
+.run-grid {
 	display: grid;
 	grid-template-columns: minmax(0, 1fr);
 	gap: 1rem;
 	align-items: stretch;
 }
 
-.run-grid > *,
-.shown-grid > * {
+.run-grid > * {
 	min-width: 0;
 	margin: 0;
 }
@@ -420,29 +418,6 @@ html[data-has-hero][data-past-hero] header.header {
 	color: inherit;
 }
 
-.objective-tabs {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 0.5rem 1rem;
-	margin-block: 1.25rem;
-}
-
-.objective-tabs label {
-	display: flex;
-	align-items: center;
-	gap: 0.4rem;
-	font-size: 0.85rem;
-	cursor: pointer;
-}
-
-.objective-tabs input {
-	accent-color: var(--sl-color-accent);
-}
-
-.objective-example[hidden] {
-	display: none;
-}
-
 .reward-figure {
 	margin: 0;
 	max-width: 40rem;
@@ -564,16 +539,6 @@ html[data-has-hero][data-past-hero] header.header {
 	margin-top: 0.7rem;
 	font: 0.8rem/1.5 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
-}
-
-.replay-note {
-	margin: 1.5rem 0 0;
-	font-size: 0.85rem;
-	color: var(--dew-muted);
-}
-
-.replay-note a {
-	color: inherit;
 }
 
 @media (min-width: 40rem) {
@@ -931,132 +896,6 @@ html[data-has-hero][data-past-hero] header.header {
 	}
 }
 
-/* Shown: cells from the tutorials and what they printed. */
-
-.shown {
-	display: grid;
-	grid-template-columns: minmax(0, 1fr);
-	gap: clamp(3rem, 8vh, 5rem);
-}
-
-.shown-label {
-	margin: 0 0 1rem;
-	font-family: var(--dew-font-display);
-	font-size: clamp(1.35rem, 2.2vw, 1.75rem);
-	font-weight: 620;
-	letter-spacing: -0.03em;
-}
-
-.shown-label a {
-	color: var(--sl-color-white);
-	text-decoration: none;
-}
-
-.shown-label a::after {
-	content: ' →';
-	color: var(--dew-accent-text);
-	opacity: 0;
-	transition: opacity 150ms ease;
-}
-
-.shown-label a:hover::after {
-	opacity: 1;
-}
-
-/* Figures the examples wrote. The MoE drawing carries its own light background. */
-
-.example-figure {
-	margin: 0;
-}
-
-/* The MoE drawing is a wide figure; below its readable width it scrolls sideways. */
-.figure-scroll {
-	overflow-x: auto;
-	border: 1px solid var(--dew-rule);
-	border-radius: 0.5rem;
-}
-
-.figure-scroll img {
-	display: block;
-	width: 100%;
-	min-width: 48rem;
-	height: auto;
-	background: #fff;
-}
-
-/* The sampling example: one grid per sampler, a row per prompt and a column per seed. */
-
-.sampler-tabs {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 0.5rem;
-	margin-bottom: 1.25rem;
-}
-
-.sampler-tabs label {
-	padding: 0.35rem 0.8rem;
-	border: 1px solid var(--dew-rule);
-	border-radius: 999px;
-	font: 500 0.78rem var(--__sl-font-mono);
-	color: var(--sl-color-gray-2);
-	cursor: pointer;
-}
-
-.sampler-tabs label:has(input:checked) {
-	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
-	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
-	color: var(--sl-color-white);
-}
-
-.sampler-tabs label:has(input:focus-visible) {
-	outline: 2px solid var(--dew-accent-fill);
-	outline-offset: 2px;
-}
-
-.sampler-tabs input {
-	position: absolute;
-	opacity: 0;
-	pointer-events: none;
-}
-
-.sampler-row {
-	max-width: 52rem;
-	margin-bottom: 1rem;
-}
-
-.sampler-prompt {
-	margin: 0 0 0.4rem;
-	font: 0.8rem/1.5 var(--__sl-font-mono);
-	color: var(--sl-color-gray-2);
-}
-
-.sampler-images {
-	display: grid;
-	grid-template-columns: repeat(4, minmax(0, 1fr));
-	gap: 0.4rem;
-}
-
-.sampler-images img {
-	display: block;
-	width: 100%;
-	height: auto;
-	border-radius: 0.3rem;
-}
-
-.sampler-settings {
-	margin: 0;
-	font-size: 0.8rem;
-	color: var(--dew-muted);
-}
-
-.example-figure figcaption {
-	max-width: 48rem;
-	margin-top: 0.8rem;
-	font-size: 0.85rem;
-	line-height: 1.55;
-	color: var(--dew-muted);
-}
-
 /* Tutorials. */
 
 .tutorial-list,
@@ -1164,12 +1003,6 @@ html[data-has-hero][data-past-hero] header.header {
 		height: 2.45rem;
 		padding: 0 0.8rem;
 		font-size: 0.9rem;
-	}
-}
-
-@media (min-width: 62rem) {
-	.shown-grid {
-		grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
 	}
 }
 

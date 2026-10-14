@@ -32,10 +32,6 @@ from dew.training.distributed import DevicePrefetchIterator, shard_batch
 pytestmark = pytest.mark.mesh
 
 
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-
-
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
@@ -57,8 +53,6 @@ class DeterministicObjective(Objective):
     stands in for, so a k-accumulated run and a plain run must trace the same
     parameters, and a partitioned run the same losses as a single-device one.
     """
-
-    artifact = Representations
 
     def __init__(self, decay=_DEFAULT_INIT_DECAY, emb_features=32):
         self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
