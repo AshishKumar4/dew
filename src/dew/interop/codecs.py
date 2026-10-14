@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
@@ -241,10 +241,12 @@ class SourceQuantization:
         return (tuple(name for name in tensors if name not in stored)
                 + tuple(name for name in names if name not in tensors))
 
-    def read(self, tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-        """One original tensor, a quantized weight decoded in float32 on
-        demand, so alias checks never build a float32 copy of the checkpoint."""
-        return self.decode(tensors, name) if self.partners(name)[0] in tensors else tensors[name]
+    def read(self, tensors: Mapping[str, np.ndarray], quantized: Collection[str], name: str) -> np.ndarray:
+        """One original tensor, a weight of `quantized` (`names`) decoded in
+        float32 on demand and any other as stored, so alias checks never build
+        a float32 copy of the checkpoint. Membership is `names`' alone: a mixed
+        format's partners are defined only for the weights it quantizes."""
+        return self.decode(tensors, name) if name in quantized else tensors[name]
 
     def dequantize(self, tensors: Mapping[str, np.ndarray], *,
                    param_dtype: str = "float32") -> dict[str, np.ndarray]:

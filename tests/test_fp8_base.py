@@ -14,6 +14,8 @@ measurement (`measured_fp8_sites`), recorded with the generation it was
 taken on.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -25,6 +27,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact
 
+from dew import cache
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
 from dew.lora import LoRA
@@ -292,6 +295,17 @@ def test_a_device_without_fp8_tensor_cores_measures_no_site():
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
 
+def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
+    """A process beside other work on its GPU (gpu-run -n 0.5 asks XLA to
+    read its picks and write none) would time FP8 against bf16 unfairly, so
+    it is refused before measuring, on a GPU with FP8 tensor cores too."""
+    variables = decoder().init(jax.random.key(0), ids())
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} "
+                                    "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ")
+    with assumed("sm90"), pytest.raises(ValueError, match="shares its GPU"):
+        measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
+
+
 @pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
 @pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
 def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm():
@@ -301,6 +315,8 @@ def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm():
     that width. The packed leaves and the gradient are the step's arguments,
     as a train state's are: XLA folds widened constant codes into a float32
     GEMM."""
+    if not cache.measures_picks():
+        pytest.skip("measuring and cuBLASLt's FP8 GEMM need the GPU to itself: gpu-run without -n")
     variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
                             "narrow": {"kernel": jnp.zeros((1024, 1024), jnp.float32)}}}
     measured = measured_fp8_sites(variables, ("wide", "narrow"), 8192)
