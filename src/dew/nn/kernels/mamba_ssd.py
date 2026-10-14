@@ -30,12 +30,13 @@ out of the cumsum kernel, as mamba_ssm lays them out, so that a program reads it
 and the states the chunks enter are `[B, T // chunk, H, P, N]`.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the configs mamba_ssm's
-own autotuner lists for it (`_space`), mamba_ssm's pick at Nemotron 3's shapes on an H100 its heuristic
-(`HEURISTICS`).
+own autotuner lists for it (its `SPACE`), the tuner's pick at Nemotron 3's shapes on an H100 its heuristic
+(its `PICKS`, `_picks`).
 """
 
 import dataclasses
 import functools
+from collections.abc import Mapping
 from typing import ClassVar
 
 import jax
@@ -63,11 +64,16 @@ class Tiles:
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
     """One of the port's fourteen launches, its `Tiles` measured per GPU model and shape over its
-    kernel's space (`_space`) by the tuner, mamba_ssm's own pick its heuristic (`HEURISTICS`). A
-    subclass names its kernel and what each block spans (`SPANS`)."""
+    `SPACE` by the tuner, `PICKS` its heuristic by operand dtype (`_picks`). A subclass names its
+    kernel, its tiles and what each block spans (`SPANS`)."""
 
     config_cls: ClassVar[type[Tiles]] = Tiles
     NAME: ClassVar[str]
+    SPACE: ClassVar[frozenset[Tiles]]
+    """mamba_ssm's own autotune list for the kernel, `heads` over `_HEADED` for the kernels that sum a
+    group's heads, every config Triton's default four warps and three stages where mamba_ssm's names
+    none."""
+    PICKS: ClassVar[Mapping[str, Tiles]]
     HEADS: ClassVar[str] = "x"
     """The argument whose third axis counts the heads a summing kernel's `heads` splits."""
     SPANS: ClassVar[tuple[tuple[str, int] | str | None, ...]] = (None, None, None)
@@ -94,10 +100,10 @@ class _Launch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Tiles:
         operand = _operand(ba)
         dtype = "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
-        return self._fitted(ba, HEURISTICS[dtype][self.NAME])
+        return self._fitted(ba, self.PICKS[dtype])
 
     def _get_autotuning_configs(self, ba) -> set[Tiles]:
-        return {self._fitted(ba, tiles) for tiles in _space(self.NAME)}
+        return {self._fitted(ba, tiles) for tiles in self.SPACE}
 
 
 def _operand(ba):
@@ -126,66 +132,19 @@ which it derives from the SM count), clipped to the group's (`_Launch._fitted`).
 _SUMMING = [(32, 128), (128, 32), (64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)]
 
 
-def _space(kernel: str) -> frozenset[Tiles]:
-    """`kernel`'s configs to measure: mamba_ssm's own autotune list for it, `heads` over `_HEADED` for
-    the kernels that sum a group's heads, every config Triton's default four warps and three stages
-    where mamba_ssm's names none."""
-    return {
-        "chunk_cumsum": _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3),
-        "chunk_cumsum_bwd": _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3),
-        "chunk_state": _MATMUL,
-        "state_passing": _tiles([(size, 0, 0) for size in (64, 128, 256, 512, 1024, 2048)], 4, 3),
-        "bmm_chunk": _MATMUL,
-        "chunk_scan": _MATMUL | {Tiles(128, 64, 64, 4, 4), Tiles(64, 128, 64, 4, 4)},
-        "chunk_scan_bwd_dstates": _MATMUL,
-        "state_passing_bwd": _tiles([(size, 0, 0) for size in (64, 128, 256, 512, 1024, 2048)], 4, 3),
-        "chunk_scan_chunk_state_bwd_dx": frozenset(dataclasses.replace(tiles, warps=max(tiles.warps, 4))
-                                                   for tiles in _MATMUL),
-        "chunk_state_bwd_db": _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED),
-        "chunk_scan_bwd_dc": _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED),
-        "chunk_scan_bwd_dcb": _tiles([(32, 128, 0), (128, 32, 0), (64, 64, 0), (64, 32, 0), (32, 64, 0),
-                                      (32, 32, 0)], 4, 3, _HEADED),
-        "bmm_chunk_bwd": _MATMUL,
-        "chunk_scan_bwd_ddacs_stable": _tiles([(32, 32, 0), (64, 32, 0), (64, 64, 0), (128, 32, 0),
-                                               (128, 64, 0), (128, 128, 0)], 4, 3),
-    }[kernel]
+_STATES = (64, 128, 256, 512, 1024, 2048)
+"""The state blocks mamba_ssm's state passing tries."""
 
 
-HEURISTICS = {
-    "bfloat16": {
-        "chunk_cumsum": Tiles(16, 0, 0, 4, 3),
-        "chunk_cumsum_bwd": Tiles(16, 0, 0, 4, 3),
-        "chunk_state": Tiles(64, 128, 64, 8, 3),
-        "state_passing": Tiles(512, 0, 0, 4, 3),
-        "bmm_chunk": Tiles(128, 128, 64, 8, 3),
-        "chunk_scan": Tiles(64, 64, 32, 2, 4),
-        "chunk_scan_bwd_dstates": Tiles(64, 128, 32, 4, 4),
-        "state_passing_bwd": Tiles(512, 0, 0, 4, 3),
-        "chunk_scan_chunk_state_bwd_dx": Tiles(32, 64, 32, 4, 5),
-        "chunk_state_bwd_db": Tiles(64, 128, 0, 4, 3, 64),
-        "chunk_scan_bwd_dc": Tiles(64, 128, 0, 4, 3, 64),
-        "chunk_scan_bwd_dcb": Tiles(64, 64, 0, 4, 3, 64),
-        "bmm_chunk_bwd": Tiles(64, 128, 32, 4, 4),
-        "chunk_scan_bwd_ddacs_stable": Tiles(64, 32, 0, 4, 3),
-    },
-}
-HEURISTICS["float32"] = {
-    **HEURISTICS["bfloat16"],
-    "chunk_state": Tiles(64, 64, 32, 2, 4),
-    "bmm_chunk": Tiles(64, 128, 32, 4, 4),
-    "chunk_scan": Tiles(64, 64, 32, 4, 4),
-    "chunk_scan_bwd_dstates": Tiles(64, 64, 32, 2, 4),
-    "chunk_scan_chunk_state_bwd_dx": Tiles(64, 64, 32, 4, 4),
-    "chunk_state_bwd_db": Tiles(64, 64, 0, 4, 3, 64),
-    "chunk_scan_bwd_dc": Tiles(64, 64, 0, 4, 3, 64),
-    "bmm_chunk_bwd": Tiles(128, 64, 32, 4, 4),
-}
-"""Each launch's config without a measurement, by operand dtype: the tuner's pick on an H100 at Nemotron
-3 Ultra's shapes (one row of 4096 tokens, 256 heads of 64 over 8 groups, a state of 128, chunks of 128),
-each summing kernel taking a group's every head. fp32's TF32x3 products want smaller blocks: at bf16's
-picks its launches summed 10.6 ms against 5.9. mamba_ssm's own autotuner picks the same for seven of
-the twelve it tunes; its picks for the chunk state, the state passing, both `C B^T` products and the
-chunk scan ran 4% to 70% slower on the port there (2026-10-13)."""
+def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
+    """A launch's config without a measurement, by operand dtype, `fp32` where it differs from
+    `tiles`: the tuner's pick on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads
+    of 64 over 8 groups, a state of 128, chunks of 128), each summing kernel taking a group's every head.
+    fp32's TF32x3 products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9.
+    mamba_ssm's own autotuner picks the same for seven of the twelve it tunes; its picks for the chunk
+    state, the state passing, both `C B^T` products and the chunk scan ran 4% to 70% slower on the port
+    there (2026-10-13)."""
+    return {"bfloat16": tiles, "float32": tiles if fp32 is None else fp32}
 
 
 def _limit(c, length: int, chunk: int):
@@ -271,6 +230,8 @@ class ChunkCumsum(_Launch):
     """`chunk_cumsum`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum"
+    SPACE = _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3)
+    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
     SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
@@ -314,6 +275,8 @@ class ChunkCumsumBwd(_Launch):
     """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum_bwd"
+    SPACE = _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3)
+    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
     SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dacs: jax.Array, ddt: jax.Array, dt: jax.Array, A: jax.Array, *, chunk: int,
@@ -366,6 +329,8 @@ class ChunkState(_Launch):
     """`chunk_state`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_state"
+    SPACE = _MATMUL
+    PICKS = _picks(Tiles(64, 128, 64, 8, 3), Tiles(64, 64, 32, 2, 4))
     SPANS = (("x", 3), ("b", 3), "chunk")
 
     def _fwd(self, x: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
@@ -424,6 +389,8 @@ class StatePassing(_Launch):
     """`state_passing`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing"
+    SPACE = _tiles([(size, 0, 0) for size in _STATES], 4, 3)
+    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
     SPANS = ("state", None, None)
 
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
@@ -476,6 +443,8 @@ class BmmChunk(_Launch):
     """`bmm_chunk`'s launch (tuning.KernelOp)."""
 
     NAME = "bmm_chunk"
+    SPACE = _MATMUL
+    PICKS = _picks(Tiles(128, 128, 64, 8, 3), Tiles(64, 128, 32, 4, 4))
     SPANS = ("chunk", "chunk", ("a", 3))
 
     def _fwd(self, a: jax.Array, b: jax.Array, seq: jax.Array | None, *, chunk: int, padded: int,
@@ -549,6 +518,8 @@ class ChunkScan(_Launch):
     """`chunk_scan`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan"
+    SPACE = _MATMUL | {Tiles(128, 64, 64, 4, 4), Tiles(64, 128, 64, 4, 4)}
+    PICKS = _picks(Tiles(64, 64, 32, 2, 4), Tiles(64, 64, 32, 4, 4))
     SPANS = ("chunk", ("x", 3), "chunk")
 
     def _fwd(self, cb: jax.Array, x: jax.Array, dt: jax.Array, da: jax.Array, c: jax.Array, states: jax.Array,
@@ -613,6 +584,8 @@ class ChunkScanBwdDstates(_Launch):
     """`chunk_scan_bwd_dstates`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_dstates"
+    SPACE = _MATMUL
+    PICKS = _picks(Tiles(64, 128, 32, 4, 4), Tiles(64, 64, 32, 2, 4))
     SPANS = (("dout", 3), ("c", 3), "chunk")
 
     def _fwd(self, dout: jax.Array, c: jax.Array, da: jax.Array, seq: jax.Array | None, *, chunk: int,
@@ -676,6 +649,8 @@ class StatePassingBwd(_Launch):
     """`state_passing_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing_bwd"
+    SPACE = _tiles([(size, 0, 0) for size in _STATES], 4, 3)
+    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
     SPANS = ("state", None, None)
 
     def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
@@ -754,6 +729,8 @@ class ChunkScanChunkStateBwdDx(_Launch):
     """`chunk_scan_chunk_state_bwd_dx`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_chunk_state_bwd_dx"
+    SPACE = frozenset(dataclasses.replace(tiles, warps=max(tiles.warps, 4)) for tiles in _MATMUL)
+    PICKS = _picks(Tiles(32, 64, 32, 4, 5), Tiles(64, 64, 32, 4, 4))
     SPANS = ("chunk", ("x", 3), "chunk")
 
     def _fwd(self, x: jax.Array, cb: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, d: jax.Array,
@@ -893,6 +870,8 @@ class ChunkStateBwdDb(_Launch):
     """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
+    SPACE = _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED)
+    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", ("b", 3), None)
 
     def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
@@ -907,6 +886,8 @@ class ChunkScanBwdDc(_Launch):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
+    SPACE = _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED)
+    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
@@ -958,6 +939,9 @@ class ChunkScanBwdDcb(_Launch):
     """`chunk_scan_bwd_dcb`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_dcb"
+    SPACE = _tiles([(32, 128, 0), (128, 32, 0), (64, 64, 0), (64, 32, 0), (32, 64, 0), (32, 32, 0)], 4, 3,
+                   _HEADED)
+    PICKS = _picks(Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", "chunk", None)
 
     def _fwd(self, x: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
@@ -1018,6 +1002,8 @@ class BmmChunkBwd(_Launch):
     """`bmm_chunk_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "bmm_chunk_bwd"
+    SPACE = _MATMUL
+    PICKS = _picks(Tiles(64, 128, 32, 4, 4), Tiles(128, 64, 32, 4, 4))
     SPANS = ("chunk", ("a", 3), "chunk")
 
     def _fwd(self, a: jax.Array, dout: jax.Array, residual: jax.Array, *, chunk: int, transposed: bool,
@@ -1086,6 +1072,9 @@ class ChunkScanBwdDdacsStable(_Launch):
     """`chunk_scan_bwd_ddacs_stable`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_ddacs_stable"
+    SPACE = _tiles([(32, 32, 0), (64, 32, 0), (64, 64, 0), (128, 32, 0), (128, 64, 0), (128, 128, 0)],
+                   4, 3)
+    PICKS = _picks(Tiles(64, 32, 0, 4, 3))
     SPANS = ("chunk", "chunk", None)
 
     def _fwd(self, x: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, cb: jax.Array, *, chunk: int,
