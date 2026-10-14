@@ -125,7 +125,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData

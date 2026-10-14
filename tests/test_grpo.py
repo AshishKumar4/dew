@@ -130,7 +130,8 @@ def test_the_loss_reads_the_rolled_out_batch():
 
 def test_evaluation_scores_prompt_perplexity():
     """Validation never samples: each prompt's shifted cross entropy, the
-    real suffix weighted off `prompt_length`, pads counting nothing."""
+    real suffix weighted off `prompt_length`, pads counting nothing, compiled
+    once for the objective's modules."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB), 4, beta=0.0)
     params = objective.init(jax.random.key(0))
     prompts = np.array([[0, 0, 1, 2, 3], [4, 5, 6, 7, 1]], np.int32)
@@ -139,6 +140,9 @@ def test_evaluation_scores_prompt_perplexity():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 
     scores = objective.evaluate(params, batch, step)
+    # A second held pass runs the program the first compiled.
+    with steady_state():
+        objective.evaluate(params, batch, step)
 
     expected = np.asarray(objective.per_token_log_probs(params, prompts))
     weights = np.asarray(scores.weights)
