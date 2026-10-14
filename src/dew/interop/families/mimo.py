@@ -31,11 +31,11 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
-    Packed,
     Renames,
     Ropes,
     base_config,
     decoder_kinds,
+    grouped_qkv,
     plain_partial_rope,
     refuse,
     renamed_name,
@@ -312,22 +312,7 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-def _qkv_runs(config: Mapping[str, object]) -> int:
-    """The fused qkv's runs: one a key head (vLLM's `ckpt_tp`, the config's num_key_value_heads)."""
-    return records.integer(config['num_kv_heads'], 'num_kv_heads')
-
-
-def _qkv_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
-    """One run's query, key and value rows."""
-    runs = _qkv_runs(config)
-    head_dim = records.integer(config['head_dim'], 'head_dim')
-    return (records.integer(config['num_heads'], 'num_heads') // runs * head_dim, head_dim,
-            records.integer(config['value_head_dim'], 'value_head_dim'))
-
-
-_FUSED_QKV = (Packed('.self_attn.qkv_proj.weight', tuple(f'.self_attn.{part}.weight'
-                                                          for part in ('q_proj', 'k_proj', 'v_proj')),
-                     0, widths=_qkv_widths, chunks=_qkv_runs),)
+_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
 
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -336,7 +321,7 @@ def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     on load, and the towers, which the text decoder never runs, have no place."""
     if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
         return None
-    if name.endswith(_FUSED_QKV[0].name):
+    if name.endswith(tuple(packing.name for packing in _FUSED_QKV)):
         return None
     return renamed_path(_NAMES, name, config)
 

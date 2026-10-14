@@ -3,7 +3,6 @@
 from collections.abc import Mapping
 from functools import partial
 
-import jax
 import numpy as np
 
 from dew import records
@@ -14,12 +13,12 @@ from dew.interop.decoder_parts import (
     base_config,
     decoder_tensors,
     fixed_attention_buffer,
+    grouped_qkv,
     hf_ungated,
     renamed_name,
     renamed_path,
     ungated_mlp,
 )
-from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
 
@@ -49,13 +48,12 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
-                       config: Mapping[str, object] | None = None, *,
-                       attention_name: str = 'attention', fused_name: str = 'query_key_value',
-                       interleaved: bool = True) -> Mapping[str, np.ndarray]:
+def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
+                      config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+    """The checkpoint without its fixed attention buffers, each checked: the causal mask, the mask
+    sentinel and the rotary frequencies, which the config computes."""
     if config is None:
-        raise ValueError('GPT-NeoX fused qkv preparation requires translated num_heads and head_dim')
-    heads = records.integer(config['num_heads'], 'num_heads')
+        raise ValueError('GPT-NeoX checks its rotary buffer against translated head geometry')
     dimension = records.integer(config['head_dim'], 'head_dim')
     prepared = {}
     for name, tensor in tensors.items():
@@ -73,19 +71,7 @@ def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                     f"{name} disagrees with the configured rotary frequencies in its stored dtype"
                 )
             continue
-        fused = f'{attention_name}.{fused_name}'
-        if f'.{fused}.' not in name:
-            prepared[name] = tensor
-            continue
-        if interleaved:
-            grouped = tensor.reshape(heads, 3, dimension, *tensor.shape[1:])
-            pieces = [grouped[:, index].reshape(heads * dimension, *tensor.shape[1:])
-                      for index in range(3)]
-        else:
-            kv = records.integer(config['num_kv_heads'], 'num_kv_heads') * dimension
-            pieces = np.split(tensor, (heads * dimension, heads * dimension + kv), axis=0)
-        for index, part in enumerate(('q_proj', 'k_proj', 'v_proj')):
-            prepared[name.replace(fused, f'self_attn.{part}')] = pieces[index]
+        prepared[name] = tensor
     return prepared
 
 
@@ -115,38 +101,6 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def gpt_neox_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                            config: Mapping[str, object], *, attention_name: str = 'attention',
-                            fused_name: str = 'query_key_value', interleaved: bool = True) -> LazyTensors:
-    """The shared writer's tensors with each layer's q, k and v interleaved by
-    head into `fused_name`, the inverse of `gpt_neox_prepare`."""
-    tensors = decoder_tensors(family, model, variables, config)
-    fused: dict[str, tuple[str, ...]] = {}
-    for name in tensors:
-        stem, found, leaf = name.partition('.self_attn.q_proj.')
-        if found:
-            fused[f'{stem}.{attention_name}.{fused_name}.{leaf}'] = tuple(
-                f'{stem}.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj'))
-    parts = {part for names in fused.values() for part in names}
-    specs = {name: spec for name, spec in tensors.specs.items() if name not in parts}
-    for name, (query, *_) in fused.items():
-        spec = tensors.specs[query]
-        specs[name] = jax.ShapeDtypeStruct((sum(tensors.specs[part].shape[0] for part in fused[name]),
-                                           *spec.shape[1:]), spec.dtype)
-
-    def build(name: str) -> np.ndarray:
-        if name not in fused:
-            return tensors[name]
-        values = [tensors[part] for part in fused[name]]
-        if not interleaved:
-            return np.concatenate(values, axis=0)
-        grouped = np.stack([value.reshape(model.num_heads, model.features_per_head, *value.shape[1:])
-                            for value in values], axis=1)
-        return grouped.reshape(3 * values[0].shape[0], *values[0].shape[1:])
-
-    return LazyTensors(specs, build)
-
-
 GPT_NEOX = DecoderFamily(
     ('gpt_neox',),
     _gpt_neox_config,
@@ -161,8 +115,9 @@ GPT_NEOX = DecoderFamily(
     _gpt_neox_export,
     weight_path=_gpt_neox_path,
     export_path=partial(renamed_name, _GPT_NEOX_NAMES),
-    prepare=gpt_neox_prepare,
-    export_weights=gpt_neox_export_weights,
+    prepare=_gpt_neox_buffers,
+    packed=grouped_qkv('.attention.query_key_value'),
+    export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight'),
 )
