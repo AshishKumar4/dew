@@ -11,6 +11,7 @@ job.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -49,13 +50,15 @@ def _split(embeddings, labels):
     return embeddings[:fit], labels[:fit], embeddings[fit:], labels[fit:]
 
 
+@functools.partial(jax.jit, static_argnames=("num_classes", "steps"))
 def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100,
                           learning_rate: float = 1e-2, weight_decay: float = 1e-4):
     """Fit a logistic regression on half the batch and score its accuracy on the rest.
 
     The features are standardized with the first half's statistics, and the
     regression trains for `steps` AdamW steps. A batch of fewer than two
-    samples raises ValueError.
+    samples raises ValueError. One program serves every batch of a shape and
+    class count: the rates are its operands, not constants of its trace.
     """
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
