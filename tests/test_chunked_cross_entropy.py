@@ -31,7 +31,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
-from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, vocabulary_chunks
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns, vocabulary_chunks
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
@@ -716,7 +716,7 @@ def float64_cross_entropy(hidden, head, targets, weights, softcap):
             "probabilities": probabilities, "residual": residual, "slope": slope}
 
 
-def float64_bounds(hidden, head, weights, exact, chunks=None):
+def float64_bounds(hidden, head, weights, exact, tiles=None):
     """The fp32 bound on every loss and gradient entry.
 
     A logit is a dot over F features, so it is off by at most
@@ -726,8 +726,9 @@ def float64_bounds(hidden, head, weights, exact, chunks=None):
     sum by lambda sqrt(V) u relative more, so log Z is off by at most
     E + (lambda sqrt(V) + 4 + 3 C) u + u |log Z|: the row's sum carries
     one rescaling (an exponential, a multiply and an add, 3 u relative) per
-    one of its C chunks, and log Z itself is rounded once, as the maximum
-    plus the sum's log. A loss is off by that plus its target
+    one of the C column tiles the head walks (`tiles`, 1 for the whole row),
+    and log Z itself is rounded once, as the maximum plus the sum's log. A
+    loss is off by that plus its target
     logit's error. A probability exp(z - log Z) carries the same E + log Z
     error plus 2 u relative, and the gradients sum weight * (p - onehot)
     against the head over V columns and against the states over T tokens.
@@ -738,7 +739,7 @@ def float64_bounds(hidden, head, weights, exact, chunks=None):
     tokens = hidden.shape[0]
     logit_error = LAMBDA * np.sqrt(features) * U32 * exact["magnitude"] + 3 * U32 * np.abs(exact["logits"])
     largest = logit_error.max(-1)
-    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4 + 3 * (chunks or 1)) * U32 + U32 * np.abs(exact["log_z"])
+    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4 + 3 * (tiles or 1)) * U32 + U32 * np.abs(exact["log_z"])
     probability_error = (largest + z_error + 2 * U32)[:, None] * exact["probabilities"]
     spread = weights[:, None] * exact["slope"]
     gradient_error = spread * probability_error
@@ -767,6 +768,10 @@ def gemma_vocabulary():
     return hidden, head, targets, weights
 
 
+TILE = (1024, 8192)
+"""The tiled head's tile in the fp32 bound tests: 1024 tokens by 8192 columns."""
+
+
 def fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks):
     """Losses, log partitions and both gradients from the chunked head, or
     with `chunks` None from the full-vocabulary pass it replaced."""
@@ -775,7 +780,7 @@ def fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks):
             losses, log_z = oracle(states, matrix, targets, softcap)
         else:
             losses, _, log_z = chunked_cross_entropy(
-                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, chunks
+                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, chunks, tile=TILE
             )
         return jnp.sum(weights * losses), (losses, log_z)
 
@@ -793,7 +798,9 @@ def test_a_gemma_sized_vocabulary_is_within_fp32_rounding_of_float64(gemma_vocab
     3.4e-06), 5.5e-3 on the states' gradient and 0.23 on the head's."""
     hidden, head, targets, weights = gemma_vocabulary
     exact = float64_cross_entropy(hidden, head, targets, weights, softcap)
-    bounds = float64_bounds(hidden, head, weights, exact, chunks)
+    vocab = head.shape[1]
+    tiles = None if chunks is None else -(-vocab // tile_columns(vocab, chunks, TILE[1]))
+    bounds = float64_bounds(hidden, head, weights, exact, tiles)
 
     actual = fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks)
 

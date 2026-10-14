@@ -82,6 +82,12 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
     return bounds
 
 
+def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:
+    """The vocabulary tile the tiled head walks, forward and backward:
+    `columns` wide, and no wider than one of `vocabulary_chunks`."""
+    return min(columns, vocabulary_chunks(vocab_size, chunks)[0][1])
+
+
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
@@ -265,7 +271,7 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
-    token_tile, width = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
+    token_tile, width = tile[0], tile_columns(table.shape[0], chunks, tile[1])
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     # Once, not per token tile: every tile multiplies the same rounded table,
@@ -341,7 +347,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
     # The logits are recomputed from operands that hold the forward's values,
     # in the forward's column tiles, so they are the logits its normalizer
     # summed: XLA rounds a product of another width otherwise.
-    token_tile, vocab_tile = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
+    token_tile, vocab_tile = tile[0], tile_columns(table.shape[0], chunks, tile[1])
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
