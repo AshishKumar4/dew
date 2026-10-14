@@ -145,6 +145,7 @@ from dew.training.model_flops import (
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.optim import RATE_SCALE, RATE_SHAPE, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -211,15 +212,22 @@ class ProfileWindow:
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
-    Optax exposes a schedule's value through `optax.inject_hyperparams`, which
-    keeps it in the state as a scalar the caller can read. The result is None when
-    the optimizer closes over the rate, or when parameter groups hold several
+    An OptimConfig's solver holds a rate scale and the schedule's value at
+    the last applied update (`dew.training.optim.scaled_solver`), whose
+    product is the rate; an Optax optimizer can inject `learning_rate`
+    itself (`optax.inject_hyperparams`). The result is None when the
+    optimizer closes over the rate, or when parameter groups hold several
     rates.
     """
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
-    rates = [node.hyperparams["learning_rate"]
-             for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
-             if isinstance(node, injected) and "learning_rate" in node.hyperparams]
+    rates = []
+    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
+        if not isinstance(node, injected):
+            continue
+        if RATE_SCALE in node.hyperparams:
+            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
+        elif "learning_rate" in node.hyperparams:
+            rates.append(node.hyperparams["learning_rate"])
     return rates[0] if len(rates) == 1 else None
 
 
@@ -444,7 +452,6 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
-        self._scheduled_rate: optax.Schedule | None = None
         self._optimizer = objective.optimizer(optimizer, accumulation=accumulation) if built else None
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
@@ -711,6 +718,10 @@ class Trainer(Generic[Loss, Effects]):
             abstract, shardings)
         state, position = checkpoints.restore(template, resume,
                                               share=DataPartition.of(self.device_mesh))
+        if self._config is not None:
+            # The rate this run configures, not the one its checkpoint holds.
+            state = dataclasses.replace(state, opt_state=with_rate_scales(state.opt_state,
+                                                                          self._config.rate_scales()))
         self._resume_rung(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -1445,15 +1456,11 @@ class Trainer(Generic[Loss, Effects]):
         return trained
 
     def _schedule(self, updates: int | None) -> None:
-        """The configured optimizer and its logged rate, built for `updates` updates."""
+        """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
         if self._config is None:
             return
         built = self._config.build(updates)
         self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
-        self._scheduled_rate = None
-        if self._config.schedule is not None and not self._config.param_groups:
-            schedule = self._config.schedule.schedule(updates)
-            self._scheduled_rate = jax.jit(lambda updates: schedule(jnp.maximum(updates - 1, 0)))
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -1710,14 +1717,9 @@ class Trainer(Generic[Loss, Effects]):
                if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
-            rate = learning_rate(state.opt_state)
-            if (rate is None and self._config is not None and self._config.schedule is None
-                    and not self._config.param_groups):
-                rate = self._config.learning_rate
-            if rate is None and self._scheduled_rate is not None:
-                rate = self._scheduled_rate(state.updates)
             run.taken = interval.take(current, loss, aux, accepted,
-                                      held(rate, None if state.scale is None else state.scale.scale),
+                                      held(learning_rate(state.opt_state),
+                                           None if state.scale is None else state.scale.scale),
                                       {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
                                       plan.dataset.statistics())
 
@@ -2204,11 +2206,10 @@ class Trainer(Generic[Loss, Effects]):
         StepCompiled records; persistent-cache counts span all jitted programs
         in this process, as compilation_cache_counts describes.
 
-        An injected optimizer rate takes precedence. Otherwise an ungrouped
-        OptimConfig supplies its constant rate or its schedule evaluated at
-        max(updates - 1, 0), the last applied update's rate. The scalar program
-        runs only at the logging cadence, and its value joins the same host
-        read; no optimizer or checkpoint state is added for reporting.
+        The optimizer state supplies the last applied update's rate
+        (`learning_rate`): a rejected attempt leaves it, and an accumulation
+        window moves it only when its update commits. It joins the same host
+        read as the other interval metrics.
         """
         taken, run.taken = run.taken, None
         if taken is None:
