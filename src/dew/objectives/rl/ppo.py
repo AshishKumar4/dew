@@ -3,7 +3,6 @@
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -265,10 +264,6 @@ class PPORollout:
         if self.objective.seq_len != self.episodes.max_prompt_tokens + self.episodes.max_new_tokens - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
 
-    @cached_property
-    def _compiled_values(self):
-        return jax.jit(self.objective.values)
-
     def _order(self, batch: Mapping[str, np.ndarray], count: int) -> np.ndarray:
         """Per episode, the flat packed positions of its action ids in the order they were drawn.
 
@@ -337,8 +332,8 @@ class PPORollout:
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        values = agreed(
-            "PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
+        critic = self.objective.program("values", self.objective.values)
+        values = agreed("PPO critic values", lambda: local_rows(critic(state.variables, device)))
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )
