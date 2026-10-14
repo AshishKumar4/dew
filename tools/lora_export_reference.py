@@ -2,23 +2,23 @@
 """Write the fixtures of PEFT and Diffusers reading the LoRA adapters Dew writes.
 
 Each case adapts a committed tiny source through Dew, moves every factor by
-a seeded draw (a stand-in for training that every machine reproduces bit
-for bit) and writes the adapter with `LoRA.save`: PEFT's directory for a
-decoder, the Diffusers file for a pipeline. Its consumer then reads exactly
-those files and runs the adapted and the merged model on fixed inputs, in
-float32 and in float64. Two halves, in two environments:
+a seeded draw (a stand-in for training) and writes the adapter with
+`LoRA.save`: PEFT's directory for a decoder, the Diffusers file for a
+pipeline. Its consumer then reads exactly those files and runs the adapted
+and the merged model on fixed inputs, in float32 and in float64. Two halves,
+in two environments:
 
-- `export DIR` (the Dew environment) writes every case's adapter into
-  DIR/<case>; tests/test_lora.py reruns `export_case` and requires the same
-  files, byte for byte.
-- `consume DIR` (a PEFT 0.20.0 environment over the Dew one, whose
+- `export` (the Dew environment, on the CPU) writes every case's adapter into
+  tests/fixtures/lora_exports/<case>, which is committed. tests/test_lora.py
+  reruns `export_case` on its own device and requires those files' layout,
+  and reads its outputs from the committed files.
+- `consume` (a PEFT 0.20.0 environment over the Dew one, whose
   transformers 5.16.1, Diffusers 0.34.0 and torch it uses) loads each
-  adapter, requires every tensor in the file to land in the model and no
-  other adapter state, and writes tests/fixtures/lora_exports/<case>.npz:
+  committed adapter, requires every tensor in the file to land in the model
+  and no other adapter state, and writes tests/fixtures/lora_exports/<case>.npz:
   the inputs, the adapted and the merged (PEFT's `merge_and_unload`,
   Diffusers' `fuse_lora`) outputs in float32 and float64
-  (`diffusers_wan_reference.float64`), the output without the adapter, and
-  the SHA-256 of every adapter file (`digest`).
+  (`diffusers_wan_reference.float64`) and the output without the adapter.
 
 The decoders are tests/fixtures/hf/llama-tiny under PEFT's `PeftModel`;
 the pipelines are the tiny SD (its PyTorch UNet), FLUX and SD3 sources
@@ -28,8 +28,8 @@ under their Diffusers pipelines' `load_lora_weights`.
     echo $PWD/.venv/lib/python3.12/site-packages \\
         > ~/.cache/dew/reference-venvs/peft/lib/python3.12/site-packages/dew-env.pth
     uv pip install --python ~/.cache/dew/reference-venvs/peft/bin/python --no-deps peft==0.20.0
-    PYTHONPATH=src python tools/lora_export_reference.py export DIR
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_export_reference.py consume DIR
+    JAX_PLATFORMS=cpu PYTHONPATH=src python tools/lora_export_reference.py export
+    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_export_reference.py consume
 """
 
 from __future__ import annotations
@@ -142,10 +142,6 @@ def digest(path: Path) -> str:
             hashed.update(f"{name} {tensor.dtype} {tensor.shape}".encode())
             hashed.update(np.ascontiguousarray(tensor).tobytes())
     return hashed.hexdigest()
-
-
-def digests(directory: Path) -> dict[str, str]:
-    return {path.name: digest(path) for path in sorted(directory.iterdir()) if path.is_file()}
 
 
 def pipeline_inputs(source: Path, family: str) -> dict[str, np.ndarray]:
@@ -287,7 +283,7 @@ def pipeline_outputs(family: str, adapter: Path, arrays: Mapping[str, np.ndarray
     return {"adapted": adapted, "merged": merged, "base": plain}
 
 
-def consume(directory: Path) -> None:
+def consume() -> None:
     sys.path[:0] = [str(ROOT)]
     import diffusers
     import peft
@@ -299,7 +295,7 @@ def consume(directory: Path) -> None:
 
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for name, case in CASES.items():
-        adapter = directory / name
+        adapter = FIXTURES / name
         if case.source == "llama":
             arrays = {"input_ids": np.load(LLAMA / "input_ids.npy")}
         else:
@@ -310,7 +306,7 @@ def consume(directory: Path) -> None:
                        else pipeline_outputs(case.source, adapter, arrays, wide))
             arrays.update({f"{precision}.{kind}": value for kind, value in outputs.items()
                            if kind != "base" or not wide})
-        meta = {"digests": digests(adapter), "peft": peft.__version__,
+        meta = {"peft": peft.__version__,
                 "transformers": transformers.__version__, "diffusers": diffusers.__version__,
                 "torch": torch.__version__}
         arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
@@ -320,21 +316,21 @@ def consume(directory: Path) -> None:
         print(f"{name}: fp32 off float64 by {gap:.3g}, the adapter moves the output by {moved_by:.3g}")
 
 
-def export(directory: Path) -> None:
+def export() -> None:
     from dew.interop.pretrained import Pretrained
 
     for name, case in CASES.items():
         with source_directory(case.source) as source:
             loaded = Pretrained.load(source, dtype="float32", attention_impl="xla")
-            export_case(case, loaded, directory / name)
-        print(f"{directory / name}: {sorted(digests(directory / name))}")
+            export_case(case, loaded, FIXTURES / name)
+        print(f"{FIXTURES / name}: {sorted(path.name for path in (FIXTURES / name).iterdir())}")
 
 
 def main() -> None:
-    if sys.argv[1:2] == ["export"] and len(sys.argv) == 3:
-        export(Path(sys.argv[2]))
-    elif sys.argv[1:2] == ["consume"] and len(sys.argv) == 3:
-        consume(Path(sys.argv[2]))
+    if sys.argv[1:] == ["export"]:
+        export()
+    elif sys.argv[1:] == ["consume"]:
+        consume()
     else:
         raise SystemExit(__doc__)
 

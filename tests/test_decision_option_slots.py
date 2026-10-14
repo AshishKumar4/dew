@@ -117,8 +117,9 @@ def ragged() -> list[Example]:
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """A batch of 100, 17 x 3 and 24 real options in a 17 x 100 grid, which
-    the encoding compacts into 128 slots: the loss and every parameter's
+    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid
+    as many questions deep as a window holds, which the packing compacts into
+    the slots its bounds allow: the loss and every parameter's
     gradient, backbone's and head's, as over the grid to float32 rounding,
     and the loss reads only the real options."""
     tokenizer = ByteTokenizer()
@@ -140,10 +141,16 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])
-    assert options.shape[1:] == (17, 100)
-    assert sorted(options.reshape(len(examples), -1).sum(axis=1).tolist()) == [24, 51, 100]
-    # The encoding compacts the 100 real options of its widest row into 128 slots.
-    assert laid_out(slotted).option_slots.shape == (3, 128)
+    bounds = objective.bounds
+    assert options.shape[1:] == (bounds.questions, 100)
+    starts = np.asarray(slotted["spans"])[..., 0]
+    owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
+    totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
+              for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
+    assert sorted(totals) == [24, 51, 100]
+    # A window's real options compact into the slots its bounds allow, a multiple of 128.
+    capacity = -(-bounds.options // 128) * 128
+    assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
