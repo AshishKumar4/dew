@@ -390,7 +390,7 @@ class _Rope:
 
 
 def _rope_entry(entry: Mapping[str, object] | None, field: str,
-                yarn_max_pos: int | None = None) -> _Rope:
+                yarn_max_pos: int | None = None, *, ramps: tuple[str, ...] | None = None) -> _Rope:
     """Read one rope_parameters entry, if it names a base or a ramp.
 
     Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
@@ -406,10 +406,14 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
     entry needs for the factor the reference falls back to. Passing it is
     how a family whose attention builds the YaRN frequencies opts in; the
     families that only rotate plainly leave it None and refuse the type.
+    `ramps` restricts the scaled types to those the caller's family computes.
     """
     if entry is None:
         return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if ramps is not None and rope_type not in ('default', 'none', *ramps):
+        refuse(f"{field} (rope_type {rope_type!r})",
+                f"this family applies plain rotary positions or {list(ramps)} ramps")
     theta = entry.get('rope_theta')
     theta = None if theta is None else records.number(theta, 'rope_theta')
     if rope_type == 'llama3':
@@ -452,8 +456,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
 def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
     """Read one plain rope base frequency.
 
-    A llama3 entry refuses where only plain rope has a place: the DeepSeek and
-    Gemma 4 readers.
+    A llama3 entry refuses where only plain rope has a place, as in Gemma 4.
     """
     rope = _rope_entry(entry, field)
     if rope.scaling is not None:
@@ -576,7 +579,8 @@ def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
 
 
 def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
-              spelling: RopeSpelling = PLAIN_SPELLING) -> Ropes:
+              spelling: RopeSpelling = PLAIN_SPELLING, *,
+              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
     The class's records come first (`RopeSpelling`): flat rope_theta with a
@@ -585,19 +589,22 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
     a record that names its type as plain clearing an earlier ramp. Each is
     then parsed once (`_rope_entry`): the full layers' base and ramp are the
     model's, the sliding layers' their kind's where they differ. YaRN reads
-    `yarn_max_pos`, as `_rope_entry` describes.
+    `yarn_max_pos`, as `_rope_entry` describes. `ramps` names the scaling
+    types the family computes; `per_kind=False` refuses nested records.
     """
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
     if spelling.local_field is not None:
         used.add(spelling.local_field)
     (full_field, full_record), sliding = _rope_records(hf_config, spelling)
-    full = _rope_entry(full_record, full_field, yarn_max_pos)
+    if not per_kind and '.' in full_field:
+        refuse(full_field, 'this family reads one rotary record for every layer')
+    full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
     full_ramp = _at_base(full.scaling, theta)
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
-    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos)
+    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
     sliding_ramp = _at_base(local.scaling, sliding_theta)
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
