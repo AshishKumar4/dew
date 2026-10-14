@@ -1,4 +1,4 @@
-"""A batch's real options compacted (`DecisionInputs.option_slots`): Clef's joint head computes those alone.
+"""A batch's real options compacted (`DecisionInputs.option_slots`): the joint head computes those alone.
 
 A batch pads every row to the most questions times the most options, and a
 row's real options are a few of them. The joint head computes each option on
@@ -32,21 +32,21 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.clef import ClefHead
 from dew.decision.data import Decisions as DecisionRecipe
+from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Step
 
 FIXTURES = Path(__file__).parent / "fixtures"
-TINY = FIXTURES / "clef" / "tiny"
+TINY = FIXTURES / "joint_checkpoint" / "tiny"
 BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
 
-def clef_batch():
-    """Clef's tiny head, its output table, the five cases laid out in one
+def stored_batch():
+    """The stored tiny joint head, its output table, the five cases laid out in one
     batch and their states padded to it."""
     tokenizer = HFTokenizer(str(BACKBONE), local_files_only=True)
     rows = []
@@ -58,7 +58,7 @@ def clef_batch():
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in CASES])
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    return ClefHead.load(TINY, attention_impl="xla"), table, inputs, padded
+    return StoredJointHead.load(TINY, attention_impl="xla"), table, inputs, padded
 
 
 def with_slots(inputs: DecisionInputs, slots: int | None) -> DecisionInputs:
@@ -79,15 +79,15 @@ def test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused(
         compacted(options, 4)
 
 
-def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
-    """Clef's trained tiny head over the five cases: every real option's
+def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
+    """The stored tiny joint head over the five cases: every real option's
     logit as over the grid at two numbers of option slots, to float32
     rounding (on armada's CPUs they moved by up to 6.6e-7 in logits of about 0.6
     at two numbers of slots); a slot with no real option scores zero,
     which the model's logits mask (`DecisionModel.logits`). The head's
     parameters do not depend on the number of slots, so a checkpoint trained
     at one serves at another."""
-    loaded, table, inputs, states = clef_batch()
+    loaded, table, inputs, states = stored_batch()
     most = int(np.max(np.sum(np.asarray(inputs.options).reshape(len(states), -1), axis=1)))
     assert most < inputs.options.shape[1] * inputs.options.shape[2]
 
@@ -106,8 +106,8 @@ def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
 
 
 def ragged() -> list[Example]:
-    """Rows of the Qwen3.5-0.8B decision mixture's shapes: one question of a hundred options
-    (LEDGAR), seventeen of three (ContractNLI) and one of twenty-four (CLINC150)."""
+    """Ragged rows: one question of a hundred options, seventeen of three and one of
+    twenty-four."""
     clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
     hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
