@@ -768,6 +768,29 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
 
 
+def test_a_tied_head_stored_with_its_depths_copies_and_no_trunk_embedding_loads_as_tied(tmp_path):
+    """DeepSeek V3's released layout stores each prediction depth's copies of
+    the trunk embedding and head. A tied source that keeps those copies and
+    the head but no trunk embedding still holds the embedding twice over;
+    it loads leaf for leaf as the same source with the trunk embedding."""
+    fixture = FIXTURES / "deepseek-v3-tiny"
+    tensors = tool.source_tensors(fixture)
+    config = json.loads((fixture / "config.json").read_text())
+    config["tie_word_embeddings"] = True
+    embedding = tensors["model.embed_tokens.weight"]
+    depth = f"model.layers.{config['num_hidden_layers']}"
+    tensors.update({"lm_head.weight": embedding.copy(), f"{depth}.embed_tokens.weight": embedding.copy(),
+                    f"{depth}.shared_head.head.weight": embedding.copy()})
+    save_hf_layout(tensors, config, tmp_path / "trunk")
+    save_hf_layout({name: tensor for name, tensor in tensors.items() if name != "model.embed_tokens.weight"},
+                   config, tmp_path / "depths")
+    trunk = Pretrained.load(tmp_path / "trunk", dtype="float32", attention_impl="xla")
+    depths = Pretrained.load(tmp_path / "depths", dtype="float32", attention_impl="xla")
+    assert jax.tree.structure(depths.variables) == jax.tree.structure(trunk.variables)
+    for ours, theirs in zip(jax.tree.leaves(depths.variables), jax.tree.leaves(trunk.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
     from dew.interop.codecs import E4M3
 
