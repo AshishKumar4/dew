@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from dew.nn.inputs import token_id
+
 from .chat import Conversation, render_prompt
 from .text import ByteTokenizer, HFTokenizer
 
@@ -102,17 +104,17 @@ def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: o
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
         ids = tokenizer.encode(prompt, add_special_tokens=False)
-    elif isinstance(prompt, list):
-        ids = [token for token in prompt if isinstance(token, int)]
-        if len(ids) != len(prompt):
-            conversation = Conversation.parse(prompt, tools, origin)
-            if not isinstance(tokenizer, HFTokenizer):
-                raise ValueError(
-                    f"{origin}: chat templates need a Hugging Face tokenizer, not the byte vocabulary"
-                )
-            ids = render_prompt(tokenizer.tokenizer, conversation, origin, thinking)
-        elif tools is not None:
+    elif isinstance(prompt, list) and all(isinstance(token, (int, np.integer)) for token in prompt):
+        if tools is not None:
             raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
+        ids = [token_id(token, where=f"{origin}: a pretokenized prompt") for token in prompt]
+    elif isinstance(prompt, list):
+        conversation = Conversation.parse(prompt, tools, origin)
+        if not isinstance(tokenizer, HFTokenizer):
+            raise ValueError(
+                f"{origin}: chat templates need a Hugging Face tokenizer, not the byte vocabulary"
+            )
+        ids = render_prompt(tokenizer.tokenizer, conversation, origin, thinking)
     else:
         raise ValueError(
             f"{origin}: a prompt is messages, a string or token ids, "
