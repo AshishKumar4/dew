@@ -22,6 +22,7 @@ import numpy as np
 from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
 from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
@@ -236,7 +237,7 @@ class BlockProcess:
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
         generation = _compiled(plan.sharding)(
-            model, variables, plan.place(plan.pad(request.inputs)), request.key,
+            model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
