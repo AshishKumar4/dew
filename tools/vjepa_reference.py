@@ -26,18 +26,17 @@ Run with the Dew test environment's torch, on CPU:
     python tools/vjepa_reference.py OUTPUT.npz
 """
 
-import hashlib
 import importlib.util
 import json
 import sys
 import types
-import urllib.request
 from functools import cache, partial
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
+from reference_source import CACHE as UPSTREAM, verified
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 # In import order: each module's own imports come before it.
@@ -50,7 +49,7 @@ FILES = {
     "src/models/vision_transformer.py": "3d2dd861d535434c4202c1b488436433fc545d558899a48c392c240b4afe8abf",
     "src/models/predictor.py": "2a2d6febea26d5a670445f97bc9bc4c726617ee3d02a38f9aeff3b4b6db5a816",
 }
-CACHE = Path.home() / ".cache" / "dew" / "upstream" / "jepa" / COMMIT
+CACHE = UPSTREAM / "jepa" / COMMIT
 CASES = {
     "published": {"img_size": 8, "patch_size": 2, "in_chans": 3, "embed_dim": 32, "depth": 2, "num_heads": 4,
                   "mlp_ratio": 4, "eps": 1e-6, "predictor_embed_dim": 16, "pred_depth": 2,
@@ -71,14 +70,7 @@ def jepa():
         module.__path__ = []
         sys.modules[package] = module
     for path, digest in FILES.items():
-        local = CACHE / path
-        if not local.is_file():
-            local.parent.mkdir(parents=True, exist_ok=True)
-            url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}"
-            local.write_bytes(urllib.request.urlopen(url).read())
-        found = hashlib.sha256(local.read_bytes()).hexdigest()
-        if found != digest:
-            raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
+        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
         name = path.removesuffix(".py").replace("/", ".")
         spec = importlib.util.spec_from_file_location(name, local)
         module = importlib.util.module_from_spec(spec)
