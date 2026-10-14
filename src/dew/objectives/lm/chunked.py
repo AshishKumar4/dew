@@ -446,12 +446,9 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     raw = biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
     logits = _without(capped_logits(raw, softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict)
-    # A target outside the vocabulary picks no column, as in `_chunk_terms`:
-    # the vocabulary-split head shifts each shard's targets by its first row
+    # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
-    inside = (labels >= 0) & (labels < table.shape[0])
-    picked = jnp.where(inside, jnp.take_along_axis(
-        logits, jnp.clip(labels, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
+    picked = _target_logits(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
     return raw, normalizer, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
@@ -841,6 +838,16 @@ def head_cross_entropy(model, variables, read, targets, chunks: int, *,
                                 predict=predict, temperature=temperature, excluded=excluded)
 
 
+def _target_logits(logits, targets):
+    """Each row of `logits`' entry at its target, as in `_chunk_terms`: 0
+    for a target outside the vocabulary, which picks no column, such as a
+    padding id past it whose weight is 0."""
+    vocab = logits.shape[-1]
+    inside = (targets >= 0) & (targets < vocab)
+    return jnp.where(inside, jnp.take_along_axis(
+        logits, jnp.clip(targets, 0, vocab - 1)[..., None], axis=-1)[..., 0], 0.0)
+
+
 def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: float = 1.0,
                          excluded: int | None = None):
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
@@ -850,8 +857,7 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
     log_z = jax.nn.logsumexp(logits, axis=-1)
-    picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
-    return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
+    return log_z - _target_logits(logits, targets), jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
 @overload
