@@ -86,9 +86,11 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
 
 # --- packing -----------------------------------------------------------------
 
-def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, tokenizer):
-    """Ids, roles, segment ids and positions pack together; the bins hold
-    whole conversations first-fit, padding reads segment 0 and role 0."""
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, tokenizer, read):
+    """Ids, roles, segment ids and positions pack together, by the memory read's planner or
+    Grain's packer as rows stream; the bins hold whole conversations first-fit, padding
+    reads segment 0 and role 0."""
     window = 96
     path = write_parquet(tmp_path, [SHORT, MEDIUM, LONG])
     rendered = [render(tokenizer, conversation) for conversation in (SHORT, MEDIUM, LONG)]
@@ -97,7 +99,7 @@ def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, toke
     (a_ids, a_roles), (b_ids, b_roles), (c_ids, c_roles) = rendered
 
     data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
-        validation=path, long="chunk"), batch=2, read="memory", loading=Loading(workers=0),
+        validation=path, long="chunk"), batch=2, read=read, loading=Loading(workers=0),
             validation_records=4 * (2))
     assert data.val is not None
     batches = list(data.val(DataPartition()))
