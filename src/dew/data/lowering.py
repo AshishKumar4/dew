@@ -538,11 +538,16 @@ class _Build:
     ) -> pygrain.MapDataset:
         """The share of an indexed root that a per-share training read takes,
         repeated unless the pipeline repeats it. Both are views by index, so a
-        cache under them still keys each row by its place in the source."""
+        cache under them still keys each row by its place in the source.
+
+        The share is seeded again: Grain seeds a random step by its depth below
+        the nearest seeded dataset, so the slice and repeat would otherwise key
+        its draws apart from the global order's, a training read's apart from
+        an inspection's."""
         if self.global_order or not self.training:
             return rows
         rows = rows[partition.index :: partition.count]
-        return rows if self.lowering.repeated else rows.repeat(None)
+        return (rows if self.lowering.repeated else rows.repeat(None)).seed(self.seed)
 
     def streamed(
         self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition
