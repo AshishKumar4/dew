@@ -13,7 +13,7 @@ import numpy as np
 from dew.data.chat import Conversation, render_conversation
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.preferences import IDS_KEY, MASK_KEY, _ids, _mask
+from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _ids, _mask
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
     INFO_KEY,
@@ -75,9 +75,6 @@ class RenderPrompt(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch | Rejected:
         element = record(element, "prompt row")
-        unknown = element.keys() - set(PROMPT_FIELDS)
-        if unknown:
-            raise ValueError(f"prompt unknown fields {sorted(unknown)}")
         if "prompt" not in element:
             raise ValueError("RenderPrompt needs a prompt column")
         ids = _prompt_ids(self.vocabulary, element["prompt"], element.get("tools"), "prompt", self.thinking)
@@ -96,6 +93,7 @@ class RenderPrompt(grain.MapTransform):
             if len(value.encode("utf-8")) > self.reward_bytes:
                 raise ValueError(f"prompt {name} exceeds reward_bytes={self.reward_bytes}")
         return {
+            **{key: value for key, value in element.items() if key not in PROMPT_FIELDS},
             PROMPT_KEY: prompt,
             LENGTH_KEY: np.int32(len(ids)),
             **{name: _utf8(value, self.reward_bytes) for name, value in context.items()},
@@ -132,9 +130,6 @@ class PreferencePair(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         element = record(element, "preference row")
-        unknown = element.keys() - {"chosen", "rejected", "chosen_mask", "rejected_mask"}
-        if unknown:
-            raise ValueError(f"preference unknown fields {sorted(unknown)}")
         if "chosen" not in element or "rejected" not in element:
             raise ValueError("a preference pair needs both chosen and rejected ids")
         ids = np.full((2, self.seq_len), self.pad_id, np.int32)
@@ -147,4 +142,5 @@ class PreferencePair(grain.MapTransform):
                 element.get(f"{name}_mask", [1] * len(tokens)), f"{name}_mask", len(tokens), "preference"
             )
             ids[row, : len(tokens)], mask[row, : len(tokens)] = tokens, completion
-        return {IDS_KEY: ids, MASK_KEY: mask}
+        kept = {key: value for key, value in element.items() if key not in PREFERENCE_FIELDS}
+        return {**kept, IDS_KEY: ids, MASK_KEY: mask}

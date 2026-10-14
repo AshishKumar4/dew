@@ -973,7 +973,7 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     """A token store with its document index built packs by the plan of its
     documents' lengths: the indexed order is global, and its windows are the
     ones a memory read packs from the same documents."""
-    from dew.data.sources.files import TokenFiles
+    from dew.data.sources.tokens import TokenFiles
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]

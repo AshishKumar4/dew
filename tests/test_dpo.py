@@ -245,11 +245,16 @@ def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError):
         preference_rows(records({"chosen": [1]}), 0, 4)
     with pytest.raises(ValueError):
-        preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)
-    with pytest.raises(ValueError):
         preference_rows(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError):
         loader(PreferenceData(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
+
+
+def test_unread_preference_fields_pass_through():
+    row = preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)[0]
+    assert row["reward"] == 1.0
+    np.testing.assert_array_equal(row[IDS_KEY], [[1, 2, 3, 4], [1, 2, 5, 0]])
+    np.testing.assert_array_equal(row[MASK_KEY], [[0, 0, 1, 1], [0, 0, 1, 0]])
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):

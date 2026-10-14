@@ -374,6 +374,47 @@ def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     assert list(resumed) == expected
 
 
+@pytest.mark.parametrize("extension", ["gz", "zst"])
+@pytest.mark.parametrize("transport", ["local", "memory"])
+@pytest.mark.parametrize("discovery", ["inferred", "explicit", "directory"])
+def test_compressed_jsonl_reads_and_resumes_in_every_read_mode(tmp_path, extension, transport, discovery):
+    import gzip
+
+    import zstandard
+
+    rows = [{"id": index, "text": "long escaped\nline " * 30} for index in range(30)]
+    payload = b"\n" + b"\n\n".join(json.dumps(row).encode() for row in rows)
+    compressed = gzip.compress(payload) if extension == "gz" else zstandard.ZstdCompressor().compress(payload)
+    root = Store(str(tmp_path) if transport == "local" else f"memory://compressed-{uuid4().hex}")
+    file = root.child(f"rows.jsonl.{extension}")
+    file.write(compressed)
+    url = root.url if discovery == "directory" else file.url
+    files = Files(url, format=None if discovery == "inferred" else "jsonl", shard_bytes=7)
+    manifest = files.manifest()
+    assert len(manifest.shards) == 1
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == rows[0]
+        saved = reader.get_state()
+        assert list(reader) == rows[1:]
+        reader.set_state(saved)
+        assert list(reader) == rows[1:]
+    finally:
+        reader.close()
+    resumed = iter(manifest.reader(manifest.shards[0]))
+    try:
+        resumed.set_state(saved)
+        assert list(resumed) == rows[1:]
+    finally:
+        resumed.close()
+    assert list(files.records("memory")) == rows
+    files.provision()
+    assert files.supports("indexed")
+    indexed = files.records("indexed")
+    assert len(indexed) == len(rows)
+    assert [indexed[index] for index in (29, 0, 15, 29)] == [rows[index] for index in (29, 0, 15, 29)]
+
+
 def test_csv_quoted_newlines_are_never_byte_split():
     root = Store(f"memory://csv-{uuid4().hex}/rows.csv")
     root.write(b'id,text\n0,"two\nlines"\n1,"last"\n')
@@ -542,7 +583,7 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
 
 
 def test_exported_token_lengths_support_indexed_spans_without_record_scan():
-    from dew.data.sources.files import TokenFiles
+    from dew.data.sources.tokens import TokenFiles
 
     root = f"memory://token-export-{uuid4().hex}"
     export(
@@ -568,6 +609,135 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     assert isinstance(resolve(root), TokenFiles)
     with pytest.raises(ValueError, match="one split"):
         source.with_split("val")
+
+
+@pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
+def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path, format_args):
+    from dew.cli.main import main
+    from dew.data.sources import TokenFiles, source
+    from dew.data.text import ByteTokenizer
+
+    documents = ["first café", "next document", "last"]
+    input = tmp_path / "documents.jsonl"
+    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
+    destination = tmp_path / "tokens"
+    assert main(["data", "export", "records", str(destination),
+                 "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--eos",
+                 "--rows-per-shard", "2", *format_args]) == 0
+    stored = source(str(destination))
+    assert isinstance(stored, TokenFiles)
+    vocabulary = ByteTokenizer()
+    expected = np.concatenate([np.append(vocabulary.encode(text), vocabulary.eos_id) for text in documents])
+    assert stored.tokens[:].tolist() == expected.tolist()
+    assert stored.supports("indexed")
+    assert stored.metadata()["eos_id"] == vocabulary.eos_id
+    assert stored.metadata()["train_tokens"] == len(expected)
+    records = stored.records("indexed")
+    actual = np.concatenate([records[index]["text"] for index in range(len(records))])
+    assert actual.tolist() == expected.tolist()
+
+
+def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
+    from dew.cli.main import main
+
+    input = tmp_path / "documents.jsonl"
+    input.write_text('{"text":"a document"}\n')
+    destination = tmp_path / "tokens"
+    with pytest.raises(ValueError):
+        main(["data", "export", "records", str(destination),
+              "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--format", "parquet"])
+    assert not destination.exists()
+
+
+def test_cli_record_exports_still_default_to_parquet(tmp_path):
+    from dew.cli.main import main
+    from dew.data.sources import source
+
+    input = tmp_path / "documents.jsonl"
+    input.write_text('{"text":"a document"}\n')
+    destination = tmp_path / "records"
+    assert main(["data", "export", "records", str(destination),
+                 "--fields", json.dumps({"source": str(input)})]) == 0
+    stored = source(str(destination))
+    assert isinstance(stored, Files)
+    assert stored.kind == "parquet"
+    assert stored.records("indexed")[0] == {"text": "a document"}
+
+
+@pytest.mark.parametrize("read", [None, "memory", "indexed"])
+def test_snapshot_uses_requested_or_preferred_read_and_loading(tmp_path, read):
+    import time
+
+    from torch.utils.data import Dataset
+
+    from dew.data import from_torch
+
+    lock = threading.Lock()
+    active = maximum = 0
+
+    class Counted(Dataset):
+        def __len__(self):
+            return 32
+
+        def __getitem__(self, index):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.01)
+                return {"id": index}
+            finally:
+                with lock:
+                    active -= 1
+
+    chain = from_torch(Counted(), identity="snapshot@1").map(lambda row: {"id": row["id"] * 2}).threads(2)
+    if read is not None:
+        chain = chain.read(read)
+    destination = tmp_path / "snapshot"
+    manifest = chain.snapshot(str(destination), rows_per_shard=7)
+    stored = Files(str(destination)).records("indexed")
+    assert [int(stored[index]["id"]) for index in range(len(stored))] == list(range(0, 64, 2))
+    assert manifest["rows"] == 32
+    assert maximum <= 2
+
+
+def test_snapshot_provisions_the_requested_indexed_read(tmp_path):
+    input = tmp_path / "rows.jsonl"
+    input.write_text('{"id":0}\n{"id":1}\n')
+    files = Files(str(input))
+    assert not files.supports("indexed")
+    destination = tmp_path / "snapshot"
+    files.read("indexed").threads(1).snapshot(str(destination))
+    assert Files(str(input)).supports("indexed")
+    stored = Files(str(destination)).records("indexed")
+    assert [stored[index] for index in range(len(stored))] == [{"id": 0}, {"id": 1}]
+
+
+@pytest.mark.parametrize("read", [None, "indexed"])
+def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeypatch, read):
+    from types import SimpleNamespace
+
+    import datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import Hub
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    prepared = datasets.Dataset.from_dict({"id": [4, 5, 6]})
+    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
+                              info=SimpleNamespace(features=None, splits=None),
+                              as_dataset=lambda **kwargs: prepared)
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
+    chain = Hub("owner/data", revision="pinned").threads(1)
+    if read is not None:
+        chain = chain.read(read)
+    destination = tmp_path / "snapshot"
+    chain.snapshot(str(destination))
+    stored = Files(str(destination)).records("indexed")
+    assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
 
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
@@ -1039,6 +1209,126 @@ def test_foreign_sources_resume_only_their_declared_content_identity(kind, read,
         changed.close()
 
 
+@pytest.mark.parametrize("native_state", [False, True])
+def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path, native_state):
+    from dew.data import from_iter
+
+    path = tmp_path / "native.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+    events = []
+    opened = []
+
+    class Native:
+        def __init__(self):
+            self.file = path.open("rb")
+            self.index = len(opened)
+            opened.append(self)
+            events.append(("open", self.index))
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            line = self.file.readline()
+            if not line:
+                raise StopIteration
+            return json.loads(line)
+
+        def close(self):
+            assert not self.file.closed
+            self.file.close()
+            events.append(("close", self.index))
+
+    # Without a native position, the stream resumes by replay, which it declares.
+    options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
+               if native_state else {"replay": True})
+    source = from_iter(Native, name="native-file@1", **options)
+    manifest = source.manifest()
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == {"id": 0}
+        saved = reader.get_state()
+        assert next(reader) == {"id": 1}
+        reader.set_state(saved)
+        assert events == [("open", 0), ("close", 0), ("open", 1)]
+        assert next(reader) == {"id": 1}
+    finally:
+        reader.close()
+        reader.close()
+    assert events == [("open", 0), ("close", 0), ("open", 1), ("close", 1)]
+    assert all(iterator.file.closed for iterator in opened)
+
+
+def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
+    from dew.data import from_iter
+    from dew.data.compile import compile
+
+    opened = []
+    closed = []
+    owned = []
+    finalizers = []
+    both_started = threading.Event()
+
+    def native(identity, finalized):
+        opened.append(identity)
+        if len(opened) == 2:
+            both_started.set()
+        try:
+            yield from ({"id": index} for index in range(64))
+        finally:
+            closed.append(identity)
+            finalized.set()
+
+    def factory():
+        finalized = threading.Event()
+        iterator = native(len(owned), finalized)
+        owned.append(iterator)
+        finalizers.append(finalized)
+        return iterator
+
+    source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
+    reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                     ).train(DataPartition())
+    try:
+        assert next(reader)["id"].tolist() == [0, 1]
+        assert both_started.wait(timeout=5)
+        assert sorted(opened) == [0, 1] and not closed
+    finally:
+        reader.close()
+        reader.close()
+    # Grain finalizes the unconsumed lookahead on its iterator-making executor.
+    assert all(finalized.wait(timeout=5) for finalized in finalizers)
+    assert sorted(closed) == sorted(opened) == [0, 1]
+
+
+def test_from_iter_forwards_a_native_stop_request():
+    from dew.data import from_iter
+    from dew.data.dataset import Stoppable
+
+    stopped = []
+
+    class Native:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {"id": 0}
+
+        def request_stop(self):
+            stopped.append(True)
+
+    source = from_iter(Native, name="stoppable@1")
+    manifest = source.manifest()
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == {"id": 0}
+        assert isinstance(reader, Stoppable)
+        reader.request_stop()
+        assert stopped == [True]
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
 @pytest.mark.parametrize("resume", ["exact", "non-exact"])
 def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
@@ -1109,6 +1399,26 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     assert restored["scalar"] == values["scalar"]
 
 
+def test_content_fingerprint_preserves_array_identity_and_sequence_order():
+    from dew.data.sources.codec import content_fingerprint, decode, encode
+
+    ordered = {"a": [b"first", b"last"], "z": np.arange(6, dtype=np.int32).reshape(2, 3)}
+    reordered = {"z": ordered["z"], "a": ordered["a"]}
+    digest = content_fingerprint(ordered)
+    assert content_fingerprint(reordered) == digest == hashlib.sha256(encode(ordered)).digest()
+    assert encode(reordered) != encode(ordered)
+    assert list(decode(encode(reordered))) == ["z", "a"]
+    variants = [
+        {**ordered, "z": ordered["z"].astype(np.int64)},
+        {**ordered, "z": ordered["z"].reshape(3, 2)},
+        {**ordered, "z": ordered["z"] + 1},
+        {**ordered, "a": list(reversed(ordered["a"]))},
+        {**ordered, "a": tuple(ordered["a"])},
+    ]
+    assert all(content_fingerprint(row) != digest for row in variants)
+    assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
+
+
 def test_empty_shard_cycles_exhaust_a_named_search_budget():
     root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
     root.write(b" \n\n")
@@ -1134,7 +1444,7 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
 
     from dew.data.sources import source as resolve
     from dew.data.sources.codec import pack_dict_of_byte_arrays
-    from dew.data.sources.files import TokenFiles
+    from dew.data.sources.tokens import TokenFiles
 
     root = Store(str(tmp_path))
     root.child("meta.json").write(
@@ -1318,3 +1628,19 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
     loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
+
+
+def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
+    """A producer's manifest states each file's bytes and checksum; a copy on this host's disk
+    that holds other bytes (a cut of the files under the whole set's manifest) is refused, naming
+    both, and one that holds what it declares is read."""
+    import hashlib
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+    url = str(path)
+    held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
+        with pytest.raises(ValueError):
+            Files(url, file_info={url: stale}).fingerprint()
