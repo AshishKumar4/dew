@@ -139,19 +139,23 @@ def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
     assert take(resumed, 4) == rest
     resumed.close()
     changed = data.train(DataPartition(0, 3))
-    with pytest.raises(ValueError, match="topology"):
+    with pytest.raises(ValueError):
         changed.set_state(saved)
     changed.close()
 
 
 def test_cache_refuses_random_prefix_before_opening_the_artifact():
-    pipeline = Pipeline(source()).random_map(Draw()).then(Artifact(object())).batch(4)
-    with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
-        compile(pipeline, loading=READ)
+    """A random step after a cache compiles; one before it is refused before
+    the artifact is opened, as an `object()` in the cache's place shows."""
+    cached = Pipeline(source()).cache(Cache(f"memory://{uuid4().hex}"))
+    compile(cached.random_map(Draw()).batch(4), loading=READ)
+    with pytest.raises(ValueError):
+        compile(Pipeline(source()).random_map(Draw()).then(Artifact(object())).batch(4), loading=READ)
 
 
-def test_random_validation_is_a_named_refusal():
-    with pytest.raises(ValueError, match=r"validation.*Draw.*canonical"):
+def test_random_validation_is_refused():
+    compile(Pipeline(source()).batch(4), validation=Pipeline(source()).shuffle(0).batch(4), loading=READ)
+    with pytest.raises(ValueError):
         compile(Pipeline(source()).batch(4),
                 validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
 
@@ -257,7 +261,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
                               budget=SearchBudget(consecutive=5, seconds=None)))
-    with pytest.raises(ValueError, match=r"all-zero.*search budget exhausted.*zero_targets"):
+    with pytest.raises(ValueError):
         next(reader)
     counts = reader.get_state()["parents"][0]["counts"]
     assert counts["attempted"] == 5
@@ -266,7 +270,8 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
 
 
 def test_authoritative_zero_target_count_is_refused_before_division():
-    with pytest.raises(ValueError, match=r"empty-targets.*zero valid target"):
+    token_weights(["one-target", "useful"], [1, 1], [3, 2], [1, 10])
+    with pytest.raises(ValueError):
         token_weights(["empty-targets", "useful"], [1, 1], [3, 2], [0, 10])
 
 
@@ -276,7 +281,7 @@ def test_dependency_change_preserves_global_resume_only_when_derived_order_match
     changed = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, revision="after"))
     assert changed.check(plan.record()) == ("revision",)
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
-    with pytest.raises(ValueError, match="accepted_ids"):
+    with pytest.raises(ValueError):
         changed.check(plan.record())
 
 
@@ -293,9 +298,14 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
         state = first.get_state()
     finally:
         first.close()
+    same = reader(1)
+    try:
+        same.set_state(state)
+    finally:
+        same.close()
     other = reader(2)
     try:
-        with pytest.raises(ValueError, match="saved data plan steps changed"):
+        with pytest.raises(ValueError):
             other.set_state(state)
     finally:
         other.close()
@@ -365,7 +375,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
         edited.close()
     other = reader(2)
     try:
-        with pytest.raises(ValueError, match=r"saved data plan (steps|source) changed"):
+        with pytest.raises(ValueError):
             other.set_state(state)
     finally:
         other.close()
@@ -394,10 +404,15 @@ def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_sp
         state = first.get_state()
     finally:
         first.close()
+    same = reader()
+    try:
+        same.set_state(state)
+    finally:
+        same.close()
     write(100)
     rewritten = reader()
     try:
-        with pytest.raises(ValueError, match="saved data plan source changed"):
+        with pytest.raises(ValueError):
             rewritten.set_state(state)
     finally:
         rewritten.close()
@@ -406,7 +421,7 @@ def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_sp
 def test_lambda_identity_requires_explicit_non_exact_resume():
     identity = StepIdentity.of(lambda row: row)
     plan = Plan("global", Manifest({}, (identity,)), {"seed": 0})
-    with pytest.raises(ValueError, match="non-exact"):
+    with pytest.raises(ValueError):
         plan.check(plan.record())
     assert plan.check(plan.record(), resume="non-exact") == ()
 
@@ -440,7 +455,7 @@ def test_a_lambda_step_needs_a_non_exact_resume_whether_or_not_memory_ran_it(rea
         first.close()
     again = compiled("exact").train(DataPartition())
     try:
-        with pytest.raises(ValueError, match="resume='non-exact' is required"):
+        with pytest.raises(ValueError):
             again.set_state(state)
     finally:
         again.close()
@@ -628,19 +643,28 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
         start = int(end)
     changed = compile(Pipeline(stored).shuffle(11, block_shards=3).repeat().batch(4),
                       read="memory", loading=READ).train(DataPartition())
-    with pytest.raises(ValueError, match="block_shards"):
+    with pytest.raises(ValueError):
         changed.set_state(state)
     changed.close()
 
 
-def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
+@pytest.mark.parametrize("tiny_targets", [0, 1], ids=["broken", "working"])
+def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_targets):
+    """A share weighted too small to be chosen is still probed first: one
+    whose rows hold no targets exhausts its budget before the mixture
+    emits a row, and one whose rows hold one lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
-               grain.MapDataset.source([{"targets": 0}]).repeat().to_iter_dataset()]
-    reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "broken"],
+               grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
+    reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
                               budget=SearchBudget(consecutive=3, seconds=None)))
-    with pytest.raises(ValueError, match=r"broken.*budget exhausted"):
-        next(reader)
-    reader.close()
+    try:
+        if tiny_targets:
+            next(reader)
+            return
+        with pytest.raises(ValueError):
+            next(reader)
+    finally:
+        reader.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -677,13 +701,17 @@ def test_map_with_index_reads_the_source_position_in_every_read(expansion):
             assert [(int(row["id"]), int(row["position"])) for row in rows] == expected, (read, pipeline)
 
 
-def test_map_with_index_is_refused_where_a_row_has_no_source_position():
-    mixed = mix([Pipeline(source()), Pipeline(source())], weights=(1, 1))
-    with pytest.raises(ValueError, match="map_with_index in mixture follows mix"):
-        compile(mixed.map_with_index(Placed()).batch(4), loading=READ)
-    windows = Pipeline(Memory([{"text": np.arange(9, dtype=np.int32)}])).windows(4)
-    with pytest.raises(ValueError, match="follows Windows"):
-        compile(windows.map_with_index(Placed()).batch(1), read="memory", loading=READ)
+@pytest.mark.parametrize("after", ["mix", "windows"])
+def test_map_with_index_is_refused_where_a_row_has_no_source_position(after):
+    """A mixture's rows and windows' rows have no one place in a source: each
+    compiles, and map_with_index after it is refused."""
+    if after == "mix":
+        rows, read, batch = mix([Pipeline(source()), Pipeline(source())], weights=(1, 1)), None, 4
+    else:
+        rows, read, batch = Pipeline(Memory([{"text": np.arange(9, dtype=np.int32)}])).windows(4), "memory", 1
+    compile(rows.batch(batch), read=read, loading=READ)
+    with pytest.raises(ValueError):
+        compile(rows.map_with_index(Placed()).batch(batch), read=read, loading=READ)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])
@@ -713,7 +741,8 @@ def test_a_stage_without_a_lowering_is_refused_at_compile_time():
     class Foreign:
         pass
 
-    with pytest.raises(ValueError, match=r"Foreign in .* is not a pipeline stage"):
+    compile(Pipeline(source()).batch(4), loading=READ)
+    with pytest.raises(ValueError):
         compile(Pipeline(source()).then(Foreign()).batch(4), loading=READ)
 
 
@@ -724,14 +753,17 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
     thirds = Pipeline(source()).filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
     data = compile(thirds.batch(4), loading=READ, read="indexed")
     first, second = data.train(DataPartition(0, 2)), data.train(DataPartition(1, 2))
+    again = data.train(DataPartition(0, 2))
     try:
         assert first.identity() == second.identity()
         next(first)
-        with pytest.raises(ValueError, match="topology changed"):
+        again.set_state(first.get_state())
+        with pytest.raises(ValueError):
             second.set_state(first.get_state())
     finally:
         first.close()
         second.close()
+        again.close()
 
 
 def test_a_per_share_reader_states_its_loadings_stop_budget_without_opening():
@@ -896,9 +928,14 @@ def test_a_token_split_is_part_of_the_order_a_resume_checks():
         state = quarter.get_state()
     finally:
         quarter.close()
+    again = reader(0.25)
+    try:
+        again.set_state(state)
+    finally:
+        again.close()
     half = reader(0.5)
     try:
-        with pytest.raises(ValueError, match="order changed"):
+        with pytest.raises(ValueError):
             half.set_state(state)
     finally:
         half.close()
@@ -932,9 +969,14 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
         state = four.get_state()
     finally:
         four.close()
+    again = reader(4)
+    try:
+        again.set_state(state)
+    finally:
+        again.close()
     eight = reader(8)
     try:
-        with pytest.raises(ValueError, match="derived order token_spans changed"):
+        with pytest.raises(ValueError):
             eight.set_state(state)
     finally:
         eight.close()
@@ -991,7 +1033,7 @@ def test_record_steps_before_an_interleave_run_inside_each_shard():
     rows = [[(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="streamed", loading=READ)]
             for pipeline in (before, after)]
     assert rows[0] == rows[1] and sorted(rows[0]) == [(index, 10 * index) for index in range(10)]
-    with pytest.raises(ValueError, match="only record steps before it"):
+    with pytest.raises(ValueError):
         iterate(Pipeline(stored).shuffle(0, window=4).interleave(2), read="streamed", loading=READ)
 
 

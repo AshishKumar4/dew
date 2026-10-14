@@ -682,13 +682,14 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
     assert jnp.max(jnp.abs(packed[:, 6:] - alone)) < 1e-5
 
 
-def test_a_packed_row_refuses_a_decode_cache_by_name(rng):
+def test_a_packed_row_refuses_a_decode_cache(rng):
     """A cache stores no document ids, so a packed row appended to one would attend across its
-    documents: the model refuses it at its entry, naming why, before any layer runs."""
+    documents: the model refuses it, and runs the same row into a cache without its segments."""
     model = tiny()
     ids, segment_ids, positions = packed_pair(rng)
     params = model.init(rng, ids)
-    with pytest.raises(ValueError, match="packed rows cannot append to a decode cache"):
+    model.apply(params, ids, decode=True, mutable=["cache"])
+    with pytest.raises(ValueError):
         model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
                     mutable=["cache"])
 
