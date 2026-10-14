@@ -19,7 +19,9 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Loading
+from dew.config.data import loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
@@ -80,20 +82,6 @@ class DeterministicObjective(Objective):
                                labels=jnp.zeros((data.shape[0],), jnp.int32))
 
 
-class Data:
-    def __init__(self, train, val=None, batch=BATCH, records=None):
-        self._train = train
-        self.val = None if val is None else lambda partition: val()
-        self.batch, self.records = batch, records
-
-    def train(self, partition):
-        return self._train()
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
-
-
 def images():
     rng = np.random.default_rng(0)
     return rng.integers(0, 256, size=(BATCH, RES, RES, 3)).astype(np.uint8)
@@ -125,7 +113,8 @@ def run_losses(steps, **kwargs):
     parameters are split over the mesh's parameter axes."""
     tracker = RecordingTracker()
     trainer = make_trainer(tracker=tracker, **kwargs)
-    state = trainer.fit(Data(batches), steps=steps, log_every=1)
+    state = trainer.fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
     return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
@@ -202,7 +191,8 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
     `dew.pipeline` read) places by them, the state having held them unboxed."""
     layout = Layout(min_shard=1, rules=(("vocab", "fsdp"),))
     Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=2), layout=layout,
-            checkpoints=Checkpoints(str(tmp_path))).fit(Data(batches), steps=1)
+            checkpoints=Checkpoints(str(tmp_path))).fit(
+                Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1)
 
     checkpoints = Checkpoints(str(tmp_path))
     assert checkpoints.boxed() == {("params", "readout", "kernel"): (None, "vocab"),
@@ -269,19 +259,20 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
 
 
 def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
-    """The packed loader is grain's Dataset API, whose iterator reports its
+    """The packed loader is grain's Loader API, whose iterator reports its
     position as a dict where the DataLoader reports JSON bytes. A checkpoint
     holds bytes, so the position has to arrive as bytes and go back as a
     dict."""
-    from dew.data import TokenWindows
+    from dew.config.data import TextData
 
     documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
     (tmp_path / "train.bin").write_bytes(documents.tobytes())
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = TokenWindows(pack=True, path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
-                        packing_bins=2).load(batch=jax.device_count())
+    data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2),
+        batch=jax.device_count(), read="memory", seed=0, loading=Loading(workers=0),
+            validation_records=4 * (jax.device_count()))
 
     mesh = MeshSpec().build()
     with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2) as it:
@@ -323,7 +314,8 @@ def test_fsdp_losses_match_replicated():
 # --------------------------------------------------------------------------
 
 def test_fsdp_shards_parameters_and_optimizer_state():
-    state = make_trainer(fsdp=2).fit(Data(batches), steps=1, log_every=1)
+    state = make_trainer(fsdp=2).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1, log_every=1)
     leaves = jax.tree.leaves(state.variables)
     sharded = [x for x in leaves if 'fsdp' in str(x.sharding.spec)]
     assert sharded, "no parameter was sharded over the fsdp axis"
@@ -355,8 +347,10 @@ def test_fsdp_shards_parameters_and_optimizer_state():
 # --------------------------------------------------------------------------
 
 def test_sharded_checkpoint_roundtrips(tmp_path):
-    trained = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1, log_every=1)
-    restored = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1)
+    trained = make_trainer(tmp_path, fsdp=2).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1, log_every=1)
+    restored = make_trainer(tmp_path, fsdp=2).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1)
 
     assert int(restored.step) == 1
     for before, after in zip(jax.tree.leaves(trained.variables),
@@ -374,13 +368,15 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
     is bytes, not arithmetic, so the values have to come back equal, the EMA
     copy's as much as the weights'.
     """
-    trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
+    trained = make_trainer(tmp_path, fsdp=written).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1, log_every=1)
     before = {field: [np.asarray(leaf).copy() for leaf in jax.tree.leaves(getattr(trained, field))]
               for field in ("variables", "ema")}
     assert any(not np.array_equal(average, live) for average, live
                in zip(before["ema"], before["variables"], strict=True)), "the EMA is its weights"
 
-    reopened = make_trainer(tmp_path, fsdp=restored).fit(Data(batches), steps=1)
+    reopened = make_trainer(tmp_path, fsdp=restored).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1)
     assert int(reopened.step) == 1
     for field, saved in before.items():
         leaves = jax.tree.leaves(getattr(reopened, field))
@@ -395,14 +391,15 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
             assert leaf.addressable_shards[0].data.size == leaf.size // restored
 
 
-def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_path):
-    """A stream without get_state writes no position; a resume from that
-    checkpoint restores the state and reads the stream from its start."""
-    make_trainer(tmp_path).fit(Data(batches), steps=1, log_every=1)
+def test_a_checkpoint_without_a_position_does_not_resume_from_the_top_of_the_stream(tmp_path):
+    """A stream without get_state writes no position, and a resume from that
+    checkpoint, which would read the stream again from its start, is refused."""
+    stream = Loader(lambda partition: batches(), None, batch=BATCH, records=None)
+    make_trainer(tmp_path).fit(stream, steps=1, log_every=1)
     _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is None
-    resumed = make_trainer(tmp_path).fit(Data(batches), steps=2, log_every=1)
-    assert int(resumed.step) == 2
+    with pytest.raises(ValueError, match="holds no data position"):
+        make_trainer(tmp_path).fit(stream, steps=2, log_every=1)
 
 
 # --------------------------------------------------------------------------
@@ -466,10 +463,13 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
     total = accum * updates * 2
     cut = accum * updates + 1
 
-    whole = make_accumulating(tmp_path / "whole", accum).fit(Data(batches), steps=total)
-    interrupted = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=cut)
+    whole = make_accumulating(tmp_path / "whole", accum).fit(
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
+    interrupted = make_accumulating(tmp_path / "split", accum).fit(
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=cut)
     assert int(interrupted.microstep) % accum == 1, "the cut is not mid-window"
-    resumed = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=total)
+    resumed = make_accumulating(tmp_path / "split", accum).fit(
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
 
     assert int(resumed.step) == int(whole.step) == total
     assert moved(snapshot(whole.variables), snapshot(whole.ema))
@@ -506,7 +506,7 @@ def grain_image_loader(num_records=256):
 
 def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     """A resumed run must not replay the batches it already trained on."""
-    data = Data(grain_image_loader, records=BATCH * 64)
+    data = Loader(lambda partition: grain_image_loader(), None, batch=BATCH, records=BATCH * 64)
     make_trainer(tmp_path).fit(data, steps=3, log_every=1)
     _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is not None, "iterator position was never captured"
@@ -568,8 +568,10 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     seen = []
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, fsdp=fsdp_size, tracker=tracker)
-    state = trainer.fit(Data(batches, val=val_stream), steps=2, log_every=1, eval_every=1,
-                        metrics=(PeakToPeak(seen),), preview=True)
+    state = trainer.fit(
+        Loader(lambda partition: batches(), lambda partition: val_stream(), batch=BATCH, records=None),
+        steps=2, log_every=1, eval_every=1,
+        metrics=(PeakToPeak(seen),), preview=True)
 
     assert int(state.step) == 2
     sharded = [x for x in jax.tree.leaves(state.ema) if 'fsdp' in str(x.sharding.spec)]
