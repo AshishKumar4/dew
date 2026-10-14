@@ -67,11 +67,13 @@ ROW_FACTOR = 4.0
 row (`worst_row`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
-and parts further by chance: over the suite's 476 comparisons (2026-10-14),
-Dew's worst row over the reference's sat at a median of 1.00, p90 1.30 and
-p99 2.09. A row that differs rather than rounds moves by orders of
-magnitude: the MiMo tower with its sinks zeroed, which the RMS already
-fails, puts its worst row at 3419 times the reference's."""
+and parts further by chance: over the suite's 3,660 comparisons whose rows
+differ from float64 at all (99 files, 2026-10-14), Dew's worst row over the
+reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
+exported logits). A row that differs rather than rounds moves further: the
+suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
+with its sinks zeroed, put their worst rows at 7.1 and 3,419 times the
+reference's."""
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
