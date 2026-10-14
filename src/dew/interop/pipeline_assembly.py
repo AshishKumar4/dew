@@ -793,6 +793,21 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
                                                    "tie_word_embeddings")}
 
 
+def _bind_language_model[C: ConditionEncoder](
+        directory: Path, config: Mapping[str, object], decoder: CausalTransformer,
+        path: Callable[[str], tuple[str, ...] | None], conditioner: Callable[[Variables], C], *,
+        param_dtype: str, params: Variables | None, lazy: bool) -> tuple[C, tuple[WeightLayout, ...]]:
+    """Bind a language-model text encoder (`bind_component`) into the
+    conditioner its pipeline runs: supplied `params` as they are, or the
+    `text_encoder` component's tensors that `path` maps, with their layouts."""
+    encoder, _, layouts, _ = bind_component(
+        directory / "text_encoder", "text_encoder", config, decoder, lambda name, rank: path(name),
+        lambda bound: conditioner(bound if params is not None else {"text_encoder": bound}),
+        prefix=("encoders", "conditioning", "text_encoder"), params=params, param_dtype=param_dtype,
+        lazy=lazy)
+    return encoder, layouts
+
+
 def _qwen_text_path(record: decoder_parts.DecoderFields):
     """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
     decoder's, its head too, and its vision tower held as stored, which the
@@ -820,7 +835,6 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     """Build Qwen-Image's conditioner: the Qwen3-VL language model, its
     processor's tokenizer and chat template, the parameters and their layouts."""
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
 
     config = _component_config(directory, "text_encoder")
     record = decoders.translate_config(_qwen_vl_text_config(config))
@@ -828,16 +842,11 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tower, layouts = checkpoint_weights.record_layouts(
-            "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
-            _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
-            param_dtype=param_dtype, lazy=lazy)
-        params = {"text_encoder": tower}
-    encoder = QwenImageConditioner(
-        decoder, load_tokenizer(str(directory / "processor")), params, str(directory),
-        tokens=tokens, param_dtype=param_dtype)
+    encoder, layouts = _bind_language_model(
+        directory, config, decoder, _qwen_text_path(record),
+        lambda bound: QwenImageConditioner(decoder, load_tokenizer(str(directory / "processor")), bound,
+                                           str(directory), tokens=tokens, param_dtype=param_dtype),
+        param_dtype=param_dtype, params=params, lazy=lazy)
     return encoder, layouts, {"text_encoder": config}
 
 
@@ -882,7 +891,6 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     Z-Image reads the output of the encoder's second-to-last layer with the
     template's thinking on."""
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
 
     config = _component_config(directory, "text_encoder")
     kind = records.text(config.get("model_type"), "model_type")
@@ -907,17 +915,14 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         # none of these pipelines reads of its released encoder.
         raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
                          "encoder does not have before its final norm")
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tower, layouts = checkpoint_weights.record_layouts(
-            "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
-            _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
-            ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype, lazy=lazy)
-        params = {"text_encoder": tower}
-    encoder = HiddenStatesConditioner(
-        decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory),
-        template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
-        param_dtype=param_dtype)
+    encoder, layouts = _bind_language_model(
+        directory, config, decoder,
+        _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
+        lambda bound: HiddenStatesConditioner(
+            decoder, load_tokenizer(str(directory / "tokenizer")), bound, str(directory),
+            template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,
+            guidance=guidance, param_dtype=param_dtype),
+        param_dtype=param_dtype, params=params, lazy=lazy)
     return encoder, layouts, {"text_encoder": config}
 
 
