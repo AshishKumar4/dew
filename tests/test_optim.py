@@ -182,7 +182,7 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
             return lambda count: self.start * 0.5 ** count
 
     assert scaled(Halving()) == (1.0, Halving())
-    solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=None).build(4)
+    solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=0).build(4)
     params = {"w": jnp.ones(3)}
     state = solver.init(params)
     for step in range(3):
