@@ -16,9 +16,10 @@ REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_enable_tr
 ops order the reductions, and with them jax 0.11.2's XLA measures no kernels:
 each instruction takes the first configuration that compiles, the same in
 every process (xla/service/gpu/autotuning/config_assigner_pass.cc,
-`GetConfigAssignerOptions`). `dew.cache.enable_compilation_cache` keeps
-such a run off stored picks, which XLA would take instead. Deterministic ops
-also take Triton out of the GEMM configurations (`GetEnabledBackends`) while
+`GetConfigAssignerOptions`). Such a run keeps no stored picks
+(`dew.cache.keeps_picks`), which XLA and Dew's kernels would take instead.
+Deterministic ops also take Triton out of the GEMM configurations
+(`GetEnabledBackends`) while
 XLA still fuses dots for Triton, and cuBLAS takes back most of them but not
 the mean-flow hybrid DiT's jvp dot over a concatenation ("No supported
 config found"); with Triton GEMMs off every dot is a cuBLAS call from the
