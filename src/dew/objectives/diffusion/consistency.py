@@ -372,7 +372,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
-        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
+        given, blank = self._conditions(variables, batch, drop_key)
         draws = self._draws(step, count, samples.shape)
         iteration = step.step
         warm = iteration < self.tangent_warmup

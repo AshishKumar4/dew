@@ -198,7 +198,7 @@ class MeanFlowObjective(DiffusionObjective):
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, condition_key, dropout=False)
+        given, blank = self._conditions(variables, batch, condition_key)
         first, second, noise, uniform = self._draws(draw_key, count, samples.shape)
         t, r = intervals(first, second, self.instantaneous)
         z, _, v = self.process.prediction.forward_diffusion(
@@ -279,7 +279,7 @@ class ShortcutObjective(DiffusionObjective):
         count = samples.shape[0]
         rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, condition_key, dropout=False)
+        given, blank = self._conditions(variables, batch, condition_key)
 
         levels = shortcut_levels(rows, self.sections)
         grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
