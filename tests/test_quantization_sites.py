@@ -5,7 +5,7 @@ variables, so the views that rename or restack its scope carry the scale
 with its kernel: the scanned stack, the pipeline's stages, the packed query,
 key and value of the serving step, and every entry method of the model. Each
 view's logits are held to the same float64 rule as the plain loop's, against
-the compressed-tensors author's reference (tests/test_nvfp4_qdq.py), which
+the compressed-tensors author's reference (tests/test_codec_checkpoints.py), which
 the model without its input QDQ fails.
 """
 
