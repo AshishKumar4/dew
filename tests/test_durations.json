@@ -4464,7 +4464,7 @@
 "tests/test_trainer.py::test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest": 0.71,
 "tests/test_trainer.py::test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput": 0.138,
 "tests/test_trainer.py::test_the_validation_split_is_the_one_suite_val": 0.608,
-"tests/test_trainer.py::test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags": 0,
+"tests/test_trainer.py::test_a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache": 0,
 "tests/test_trainer.py::test_typed_root_key_round_trips_and_resumes_bit_exactly": 1.04,
 "tests/test_training_dtypes.py::test_adam_native_parameter_dtypes_survive_updates_and_checkpoints[bfloat16-mean-1]": 0.441,
 "tests/test_training_dtypes.py::test_adam_native_parameter_dtypes_survive_updates_and_checkpoints[bfloat16-mean-2]": 0.52,

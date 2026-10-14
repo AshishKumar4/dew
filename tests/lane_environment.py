@@ -11,14 +11,18 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
-REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0")
+REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true",)
 """The cuda lane's flags for steps repeatable across processes. Deterministic
-ops order the reductions. Autotuning off is a precaution: XLA picks GEMM and
-convolution kernels at compile time by live timing, which can differ between
-compilations (openxla.org/xla/determinism). Two LADD runs on an RTX 4080
-diverged under deterministic ops alone, but 20 fresh DiT processes did not,
-so that cause is unconfirmed. The precaution costs a test lane nothing that
-matters; in training it cost 8% on a 176M DiT step (docs/guides/checkpoints.md)."""
+ops order the reductions, and with them jax 0.11.2's XLA measures no kernels:
+each instruction takes the first configuration that compiles, the same in
+every process (xla/service/gpu/autotuning/config_assigner_pass.cc,
+`GetConfigAssignerOptions`). `dew.cache.enable_compilation_cache` keeps
+such a run off stored picks, which XLA would take instead. Turning
+autotuning off as well (`--xla_gpu_autotune_level=0`) skips that choice for
+cuBLAS and cuDNN calls (`GetShouldAssignConfigToInstructionFn`), which keep
+the configuration they were emitted with: cuDNN refused an fp8 convolution's
+on an H100 (CUDNN_STATUS_NOT_SUPPORTED), and a jvp dot of the mean-flow
+hybrid DiT found no supported configuration."""
 
 
 def configure_lane(environ: MutableMapping[str, str]) -> None:

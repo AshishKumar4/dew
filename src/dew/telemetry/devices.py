@@ -207,11 +207,11 @@ def refuse_cpu_only_jax() -> None:
 def deterministic_ops_requested() -> bool:
     """Whether the run asked XLA for deterministic ops.
 
-    `--xla_gpu_deterministic_ops` orders the reductions of a GPU step.
-    Autotuning, which `--xla_gpu_autotune_level=0` turns off, can pick
-    different kernels in another compilation (docs/guides/checkpoints.md).
-    Kernel selection reads this flag: `dew.nn.attention` keeps
-    cudnn's fused attention away from a run that set it.
+    `--xla_gpu_deterministic_ops` orders the reductions of a GPU step and
+    turns XLA's kernel measurements off, so every compilation picks the same
+    kernels (docs/guides/checkpoints.md). Kernel selection reads this flag:
+    `dew.nn.attention` keeps cudnn's fused attention away from a run that set
+    it, and `dew.cache.enable_compilation_cache` gives it no stored picks.
     """
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')
 

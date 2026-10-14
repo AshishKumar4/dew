@@ -558,6 +558,7 @@ import jax
 import numpy as np
 import optax
 
+from dew.cache import enable_compilation_cache
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
@@ -565,6 +566,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.sampling import Euler
 from dew.training import Trainer
 
+enable_compilation_cache(sys.argv[2])
 model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
                                solver=Euler(), steps=2, ema_decay=None)
@@ -581,30 +583,42 @@ np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
 
-@pytest.mark.gpu(reason="cuDNN convolution autotuning")
-def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(tmp_path):
-    """Autotuning picks a convolution's cuDNN algorithm per process, so only
-    a second process shows whether it agrees. Two fresh processes, without a
-    compilation cache, train a DiT (a convolution embeds its patches) two
-    Adam steps under the cuda lane's flags; every state leaf agrees."""
+@pytest.mark.gpu(reason="cuDNN and cuBLAS kernel choice")
+def test_a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache(tmp_path):
+    """XLA chooses a convolution's cuDNN algorithm and a GEMM's cuBLAS one per
+    process, so only a second process shows whether it agrees. Two fresh
+    processes train a DiT (a convolution embeds its patches) two Adam steps
+    under the cuda lane's flags, with a run between them that measures its
+    kernels, as XLA does by default, into their cache; every state leaf of
+    the second agrees with the first's. JAX's executable cache is off, so
+    each process compiles."""
     from lane_environment import REPEATABLE_GPU_FLAGS
 
     root = Path(__file__).resolve().parents[1]
+    # The lane's own picks settings, which conftest and gpu-run named, stay out of the three runs.
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_autotune_level"))]
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_per_fusion_autotune_cache_dir",
+                                     "--xla_gpu_experimental_autotune_cache_mode"))]
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
-                   "XLA_FLAGS": " ".join([*flags, *REPEATABLE_GPU_FLAGS]),
                    "JAX_ENABLE_COMPILATION_CACHE": "false"}
-    runs = []
-    for index in range(2):
-        out = tmp_path / f"state-{index}.npz"
-        done = subprocess.run([sys.executable, "-c", REPEATED_CONV_STEPS, str(out)], env=environment,
+    lane = {**environment, "XLA_FLAGS": " ".join([*flags, *REPEATABLE_GPU_FLAGS])}
+    measuring = {**environment, "XLA_FLAGS": " ".join(flags)}
+    cache = tmp_path / "cache"
+
+    def trained(name: str, env: dict[str, str]):
+        out = tmp_path / f"{name}.npz"
+        done = subprocess.run([sys.executable, "-c", REPEATED_CONV_STEPS, str(out), str(cache)], env=env,
                               capture_output=True, text=True, timeout=600)
         assert done.returncode == 0, done.stderr
-        runs.append(np.load(out))
-    assert runs[0].files == runs[1].files
-    for name in runs[0].files:
-        np.testing.assert_array_equal(runs[0][name], runs[1][name])
+        return np.load(out)
+
+    first = trained("first", lane)
+    trained("measuring", measuring)
+    assert any((cache / "autotune").rglob("*.pb"))
+    again = trained("again", lane)
+    assert first.files == again.files
+    for name in first.files:
+        np.testing.assert_array_equal(first[name], again[name])
 
 
 RATE_RESUMES = """

@@ -11,7 +11,7 @@ import sys
 
 import jax
 
-from dew.telemetry.devices import xla_flag
+from dew.telemetry.devices import deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:
@@ -55,6 +55,13 @@ def enable_compilation_cache(path: str):
     directory nor the mode is in JAX's cache key, so a run and a process
     that compiled its programs ahead of it share executables. XLA reads its
     flags at the first compile; a directory the run names is kept.
+
+    A run under `--xla_gpu_deterministic_ops` measures nothing: jax 0.11.2's
+    XLA gives each instruction the first configuration that compiles, the
+    same in every process, and stores none. It would still take a stored
+    pick over that one, so a cache another run measured into would change
+    its kernels between a run and its resumption. Such a run names an empty
+    directory and reads no picks.
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
@@ -64,8 +71,9 @@ def enable_compilation_cache(path: str):
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
-        picks = autotune_dir(path)
-        os.makedirs(picks, exist_ok=True)
+        picks = '' if deterministic_ops_requested() else autotune_dir(path)
+        if picks:
+            os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
 
 
