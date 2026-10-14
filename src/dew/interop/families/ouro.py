@@ -20,6 +20,7 @@ from dew import records
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
+    Leaves,
     Renames,
     base_config,
     hf_tensor_name,
@@ -35,7 +36,7 @@ _NAMES: Renames = (('input_layernorm_2', 'post_attention_layernorm'),
                    ('post_attention_layernorm_2', 'post_feedforward_layernorm'))
 """Ouro's norm names onto Gemma 2's, which the shared sandwich map reads."""
 
-_GATE = {'model.early_exit_gate.weight': ('early_exit_gate', 'kernel'),
+_GATE: Leaves = {'model.early_exit_gate.weight': ('early_exit_gate', 'kernel'),
          'model.early_exit_gate.bias': ('early_exit_gate', 'bias')}
 
 _REMOTE = 'ByteDance/Ouro-1.4B'
@@ -61,7 +62,7 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 def _ouro_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return ('params', *_GATE[name]) if name in _GATE else renamed_path(_NAMES, name, config)
+    return renamed_path(_NAMES, name, config, leaves=_GATE)
 
 
 def _ouro_name(dew_name: str, config: Mapping[str, object]) -> str | None:

@@ -274,7 +274,16 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
     (`AttentionMetadata.right_padded`). Its real tokens then follow the held
     ones with no gap, so the row convolves as it stands and its padding is
     zeroed after: the masked conv's values, without its two gathers over
-    every slot and their scattered gradients."""
+    every slot and their scattered gradients.
+
+    Behind a held history `x` passes an optimization barrier: at one row XLA
+    lowers the projection that made `x` to a reduction and fused it into the
+    history's concatenate, which then ran at about 90 GB/s. On an H100 a
+    Qwen3.5-0.8B gated delta net's decode step took 338 against 57 us, 170
+    against 41 with bf16 parameters (CUPTI); at 8 rows the projection is a
+    GEMM and the barrier changes nothing."""
+    if held is not None:
+        x = jax.lax.optimization_barrier(x)
     width = kernel.shape[-1] - 1
     conv = functools.partial(_behind, kernel=kernel, held=held, bias=bias, parts=parts, dtype=dtype)
     if valid is not None and right_padded and segments is None:
