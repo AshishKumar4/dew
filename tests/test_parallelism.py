@@ -32,10 +32,6 @@ from dew.training.distributed import DevicePrefetchIterator, shard_batch
 pytestmark = pytest.mark.mesh
 
 
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-
-
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
