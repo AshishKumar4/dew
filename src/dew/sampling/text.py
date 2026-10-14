@@ -929,8 +929,10 @@ def generate(model: nn.Module, params: Variables,
 
     Parameters keep their placement, and decode at the model's compute
     dtype: a call casts a parameter stored wider to it once, before its
-    loop (`dew.interop.weights.decoding_storage`). On a mesh, the rows are
-    split over its batch axes and the result keeps that sharding; ``Generation.host()``
+    loop (`dew.interop.weights.decoding_storage`), and holds that copy
+    beside the caller's weights while it runs (fp32 weights under bf16
+    compute: half their bytes again). On a mesh, the rows are split over
+    its batch axes and the result keeps that sharding; ``Generation.host()``
     reads a process's own rows back. All cooperating processes must use the
     same input shapes, effective decoding components, padding id and
     continuation count. The decode loops have fixed bounds, and the
