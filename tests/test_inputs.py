@@ -42,7 +42,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    from dew.nn.inputs import BATCH_AXES, RowPlan
+    from dew.nn.inputs import RowPlan, request_axes
     from dew.training import MeshSpec
 
     mesh = MeshSpec().build()
@@ -54,7 +54,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     expected = jax.vmap(lambda row: jax.random.fold_in(jax.random.key(11), row))(jnp.arange(8))
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected))
     assert jax.random.key_impl(keys) == jax.random.key_impl(key)
-    assert keys.sharding == NamedSharding(mesh, P(BATCH_AXES))
+    assert keys.sharding == NamedSharding(mesh, P(request_axes(mesh)))
 
 
 def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
@@ -63,6 +63,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.nn.inputs import ModelInputs
+    from dew.nn.sharding import batch_axes
     from dew.training.distributed import MeshSpec, shard_batch
 
     mesh = MeshSpec().build()
@@ -84,7 +85,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["text"].tokens.dtype == jnp.int32
     assert placed["text"].conditioning["pixel_values"].dtype == jnp.float32
     assert "attention_mask" not in placed["text"].token_fields
-    row_axes = ("data", "expert", "fsdp")
+    row_axes = batch_axes(mesh)
     assert placed["text"].tokens.sharding == NamedSharding(mesh, P(row_axes, "sequence"))
     assert placed["text"].conditioning["pixel_values"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["labels"].sharding == NamedSharding(mesh, P(row_axes))

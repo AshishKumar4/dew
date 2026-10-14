@@ -189,8 +189,8 @@ Cost, at list prices on 2026-10-08:
 - A container costs $0.000020 per vCPU-second of active CPU, $0.0000025 per GiB-second of memory and $0.00000007 per
   GB-second of disk ([Cloudflare](https://developers.cloudflare.com/containers/pricing/)). That is $0.401 an hour for
   a standard-4 with its CPU busy.
-- An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) through $2.79
-  ([Lambda](https://lambda.ai/pricing)) to $5.07 for GCP's a2-ultragpu-1g in us-central1
+- An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) to $5.07 for GCP's
+  a2-ultragpu-1g in us-central1
   ([Google Cloud](https://cloud.google.com/products/compute/pricing/accelerator-optimized)). The run here was on an
   A100 40GB, so the 80GB's price is an upper bound on it.
 

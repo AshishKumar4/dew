@@ -1076,7 +1076,8 @@ class SparseMLP(nn.Module):
         count = (projection_flops(lengths, self.out_features, self.num_experts)
                  + self.top_k * expert.model_flops(lengths))
         if not self.scale_inputs:
-            count += projection_flops(lengths, self.top_k, self.out_features)
+            # The experts' outputs combine at their own width, the latent one before its up projection.
+            count += projection_flops(lengths, self.top_k, width)
         if self.latent_features is not None:
             count += 2 * projection_flops(lengths, self.out_features, self.latent_features)
         if self.shared is not None:

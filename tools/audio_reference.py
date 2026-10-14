@@ -25,28 +25,32 @@ from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel, Gemma4M
 LEARNING_RATE = 0.002
 
 
-def reference(kind):
-    torch.manual_seed(314)
+def audio_config(kind):
+    """The tiny audio tower, alone here and in tools/audio_wrapper_reference.py's wrapper."""
     if kind == "gemma3n":
-        config = Gemma3nAudioConfig(
+        return Gemma3nAudioConfig(
             input_feat_size=16, hidden_size=16, conf_num_hidden_layers=2,
             conf_num_attention_heads=2, conf_attention_chunk_size=4,
             conf_attention_context_left=5, conf_attention_context_right=2,
             sscp_conv_channel_size=(8, 4), conf_reduction_factor=2,
             vocab_offset=56, vocab_size=8, rms_norm_eps=1e-5)
-        model = Gemma3nAudioEncoder(config).eval()
-        projector = Gemma3nMultimodalEmbedder(config, Gemma3nTextConfig(hidden_size=32)).eval()
-        extractor = Gemma3nAudioFeatureExtractor(feature_size=16)
-    else:
-        config = Gemma4AudioConfig(
-            hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
-            subsampling_conv_channels=(16, 4), output_proj_dims=24,
-            attention_chunk_size=4, attention_context_left=5, attention_context_right=2,
-            use_clipped_linears=True, rms_norm_eps=1e-5)
-        config._attn_implementation = "sdpa"
-        model = Gemma4AudioModel(config).eval()
-        projector = Gemma4MultimodalEmbedder(config, Gemma4TextConfig(hidden_size=32)).eval()
-        extractor = Gemma4AudioFeatureExtractor(feature_size=16)
+    return Gemma4AudioConfig(
+        hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
+        subsampling_conv_channels=(16, 4), output_proj_dims=24,
+        attention_chunk_size=4, attention_context_left=5, attention_context_right=2,
+        use_clipped_linears=True, rms_norm_eps=1e-5)
+
+
+def waveforms():
+    """Two 16 kHz waveforms of unequal length, so padding and masks act."""
+    time = np.arange(4096, dtype=np.float32) / 16000
+    return [0.3 * np.sin(2 * np.pi * 437 * time) + 0.15 * np.cos(2 * np.pi * 113 * time),
+            0.4 * np.sin(2 * np.pi * 283 * time[:1693])]
+
+
+def perturb(model):
+    """One-dimensional weights off their initialization, from torch's global
+    generator, and finite bounds on the clipped linears."""
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if parameter.ndim == 1 and name.endswith("weight"):
@@ -60,6 +64,22 @@ def reference(kind):
                 buffer.fill_(-0.08)
             elif name.endswith("output_max"):
                 buffer.fill_(0.08)
+
+
+def reference(kind):
+    torch.manual_seed(314)
+    config = audio_config(kind)
+    if kind == "gemma3n":
+        model = Gemma3nAudioEncoder(config).eval()
+        projector = Gemma3nMultimodalEmbedder(config, Gemma3nTextConfig(hidden_size=32)).eval()
+        extractor = Gemma3nAudioFeatureExtractor(feature_size=16)
+    else:
+        config._attn_implementation = "sdpa"
+        model = Gemma4AudioModel(config).eval()
+        projector = Gemma4MultimodalEmbedder(config, Gemma4TextConfig(hidden_size=32)).eval()
+        extractor = Gemma4AudioFeatureExtractor(feature_size=16)
+    perturb(model)
+    with torch.no_grad():
         for name, parameter in projector.named_parameters():
             if parameter.ndim > 1:
                 parameter.normal_(std=0.1)
@@ -76,16 +96,14 @@ def write_reference(root):
     if transformers.__version__ != "5.16.1":
         raise RuntimeError("Reference fixtures require Transformers 5.16.1")
     torch.set_num_threads(2)
-    time = np.arange(4096, dtype=np.float32) / 16000
-    waveforms = [0.3 * np.sin(2 * np.pi * 437 * time) + 0.15 * np.cos(2 * np.pi * 113 * time),
-                 0.4 * np.sin(2 * np.pi * 283 * time[:1693])]
+    sounds = waveforms()
     for kind in ("gemma3n", "gemma4"):
         directory = root / kind
         directory.mkdir(parents=True, exist_ok=True)
         config, model, projector, extractor = reference(kind)
-        for index, waveform in enumerate(waveforms):
+        for index, waveform in enumerate(sounds):
             np.save(directory / f"waveform_{index}.npy", waveform)
-        processed = extractor(waveforms, padding="longest", return_tensors="np")
+        processed = extractor(sounds, padding="longest", return_tensors="np")
         features = torch.tensor(processed["input_features"], requires_grad=True)
         mask = torch.tensor(processed["input_features_mask"])
         output = model(features, ~mask if kind == "gemma3n" else mask)
