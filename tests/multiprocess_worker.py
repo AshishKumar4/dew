@@ -70,8 +70,6 @@ def make_objective():
     from dew.objectives.base import Aux, EMASpec, Objective
 
     class Reconstruction(Objective):
-        artifact = Representations
-
         def __init__(self):
             self.model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                                    mlp_ratio=1)
@@ -1060,8 +1058,6 @@ def _evaluation_parts(case: _EvaluationCase):
     from dew.objectives.base import Aux, Objective
 
     class Numerical(Objective):
-        artifact = Representations
-
         def init(self, key, variables=None):
             return {"params": {"offset": jnp.zeros(())}}
 
