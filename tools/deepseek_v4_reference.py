@@ -428,7 +428,8 @@ class DeepseekV4MTP(torch.nn.Module):
 
 def load_mtp_reference(directory: Path, config: DeepseekV4Config, dtype=None) -> DeepseekV4MTP:
     """The fixture's released mtp.0.* tensors as a runnable depth, in `dtype`
-    (float32 where None).
+    (float32 where None), its experts eager as `reference_model` runs the
+    trunk's (torch's grouped matmul takes no float64).
 
     The release ships the depth under its own flat names and transformers
     builds none, so the block is loaded through the standard
@@ -491,7 +492,7 @@ def load_mtp_reference(directory: Path, config: DeepseekV4Config, dtype=None) ->
         safetensors.torch.save_file(renamed, str(Path(temporary, "model.safetensors")))
         loaded = DeepseekV4ForCausalLM.from_pretrained(
             temporary, dtype=torch.float32 if dtype is None else dtype, local_files_only=True,
-            output_loading_info=True)
+            output_loading_info=True, experts_implementation="eager")
     if not isinstance(loaded, tuple):
         raise SystemExit("output_loading_info returns the model and its report")
     model, report = loaded
