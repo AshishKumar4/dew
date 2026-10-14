@@ -18,16 +18,23 @@ after(() => worker?.dispose());
 async function run(name) { return (await worker.dispatchFetch(`https://test/${name}`)).json(); }
 test('a connected session counts once, with no spare or spare budget', async () => {
 	const result = await run('on-time');
-	assert.equal(result.counted, true);
+	assert.equal(result.counted, Date.parse('2026-09-24T10:00:04Z') + Number(config.vars.WALL_SECONDS) * 1000);
 	assert.equal(result.during.active, 1);
 	assert.equal(result.during.budgetUsedSeconds, Number(config.vars.WALL_SECONDS));
 	assert.deepEqual(Object.keys(result.opened).sort(), ['id', 'ok']);
 });
 test('a late or ended session cannot restart its clock', async () => {
-	assert.equal((await run('late')).counted, false);
+	assert.equal((await run('late')).counted, null);
 	const ended = await run('ended');
-	assert.equal(ended.restarted, false);
+	assert.equal(ended.restarted, null);
 	assert.equal(ended.status.active, 0);
+});
+test('a reconnect keeps the first end of its session, and none is let in after it', async () => {
+	const { counted, again, past, open, status } = await run('reconnect');
+	assert.equal(again, counted, 'a reconnect ten seconds before the end ends when the first connection does');
+	assert.equal(past, null);
+	assert.equal(open, false);
+	assert.equal(status.budgetUsedSeconds, Number(config.vars.WALL_SECONDS), 'charged for the wall clock, no more');
 });
 test('an overdue session releases its host through the shared pool', async () => {
 	const result = await run('overdue');

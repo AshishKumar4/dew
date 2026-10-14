@@ -28,6 +28,7 @@ from dew.decision.layout import (
     Specials,
     StateFirstLayout,
     compacted,
+    question_fields,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
@@ -130,19 +131,7 @@ class Encoding:
         length = self.layout.max_len
         if not self.layout.fits(encoded):
             raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
-        count = len(encoded.questions)
-        row: Batch = {
-            "tokens": np.asarray(encoded.tokens, np.int32),
-            "kinds": np.zeros(count, np.int32),
-            "questions": np.ones(count, bool),
-            "spans": np.zeros((count, 2), np.int32),
-            "option_spans": np.zeros((count, self.width, 2), np.int32),
-            "options": np.zeros((count, self.width), bool),
-            "labels": np.zeros(count, np.int32),
-            "scored": np.zeros(count, bool),
-            "targets": np.zeros((count, self.width), np.float32),
-        }
-        for slot, laid in enumerate(encoded.questions):
+        for laid in encoded.questions:
             count = len(asked[laid.name].options)
             if len(laid.options) != count:
                 raise ValueError(
@@ -151,9 +140,16 @@ class Encoding:
                 )
             if count > self.width:
                 raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
-            row["kinds"][slot], row["spans"][slot] = laid.kind, laid.span
-            row["option_spans"][slot, :count] = laid.options
-            row["options"][slot, :count] = True
+        questions = len(encoded.questions)
+        row: Batch = {
+            "tokens": np.asarray(encoded.tokens, np.int32),
+            **question_fields(encoded, questions, self.width),
+            "labels": np.zeros(questions, np.int32),
+            "scored": np.zeros(questions, bool),
+            "targets": np.zeros((questions, self.width), np.float32),
+        }
+        for slot, laid in enumerate(encoded.questions):
+            count = len(laid.options)
             if laid.name in golds:
                 shown = golds[laid.name][list(laid.order)]
                 row["targets"][slot, :count] = shown
