@@ -7,9 +7,11 @@ backward reads and writes the `[B, T, C]` activation once for each of the norm's
 transposes, several of them in fp32. Here the forward reads the projection once and writes each output
 piece once (the queries, keys and values as the scans take them, so no copy splits them), and the
 backward reads the projection and the cotangents once and writes the projection's gradient once,
-everything between in fp32 registers. Neither saves anything but the projection. Each piece is its
-own call, so a program knows statically whether it normalises and which cotangent it reads; the
-backward's calls write their columns of one gradient, each taking the last one's as its output.
+everything between in fp32 registers. Neither saves anything but the projection. The forward writes
+every piece in one call, each program branching statically on the piece its blocks belong to, so that
+a decoding step, whose conv is a few launch-bound programs, launches it once; the backward's pieces
+are each their own call, which knows statically whether it normalises and which cotangent it reads,
+and writes its columns of one gradient, each taking the last one's as its output.
 
 The forward needs nothing past a token's window, so each of its programs takes a tile of `ROWS`
 tokens and loads their windows at the conv's K shifts at once (the overlap stays in L1 and L2), as
@@ -180,26 +182,39 @@ def _unpack(refs, has_bias: bool, has_valid: bool):
     return x_ref, w_ref, b_ref, valid_ref, refs
 
 
-def _forward_kernel(*refs, first: int, normalised: bool, block: int, rows: int, count: int, length: int,
+def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows: int, count: int, length: int,
                     has_bias: bool, has_valid: bool, activation: bool, eps: float, interpret: bool):
-    """A tile of `rows` tokens, each computed from its K-window loaded at the conv's shifts, all at once:
-    the forward needs nothing from the tokens past the tile, so it walks nothing."""
-    from jax.experimental.pallas import triton as plgpu
-
-    x_ref, w_ref, b_ref, valid_ref, (out_ref,) = _unpack(refs, has_bias, has_valid)
-    columns = first + pl.program_id(0) * block + jnp.arange(block, dtype=jnp.int32)
+    """A tile of `rows` tokens of one block of one piece, each token computed from its K-window loaded
+    at the conv's shifts, all at once: the forward needs nothing from the tokens past the tile, so it
+    walks nothing. `pieces` holds each piece's first program, first channel, block and whether it
+    normalises; the programs of grid axis 0 run through the pieces' blocks in order, so one call
+    writes every piece."""
+    x_ref, w_ref, b_ref, valid_ref, out_refs = _unpack(refs, has_bias, has_valid)
+    program = pl.program_id(0)
     tokens = pl.program_id(1) * rows + jnp.arange(rows, dtype=jnp.int32)
-    local = columns - first
-    taps, bias = _taps(w_ref, b_ref, columns, count)
-    window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
-    y = _preactivation(window, taps, bias)
-    if activation:
-        y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
-    if normalised:
-        y = y * _inverse_norm(y, eps, interpret=interpret)
-    y = jnp.where(_kept(valid_ref, tokens, length)[:, None], y, 0.0)
-    plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
-                mask=(tokens < length)[:, None])
+    ends = [lo for lo, *_ in pieces[1:]] + [None]
+
+    for (lo, first, block, normalised), end, out_ref in zip(pieces, ends, out_refs, strict=True):
+        def piece(lo=lo, first=first, block=block, normalised=normalised, out_ref=out_ref):
+            from jax.experimental.pallas import triton as plgpu
+
+            local = (program - lo) * block + jnp.arange(block, dtype=jnp.int32)
+            columns = first + local
+            taps, bias = _taps(w_ref, b_ref, columns, count)
+            window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
+            y = _preactivation(window, taps, bias)
+            if activation:
+                y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
+            if normalised:
+                y = y * _inverse_norm(y, eps, interpret=interpret)
+            y = jnp.where(_kept(valid_ref, tokens, length)[:, None], y, 0.0)
+            plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
+                        mask=(tokens < length)[:, None])
+
+        if len(pieces) == 1:
+            piece()
+        else:
+            pl.when((program >= lo) & (program < end) if end is not None else program >= lo)(piece)
 
 
 def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
@@ -301,24 +316,26 @@ def _params(warps: int | None, stages: int | None):
 
 def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
              rows: int | None = None, warps: int | None = None, stages: int | None = None):
+    """Every piece in one call (`_forward_kernel`): at one decoding row the conv's cost is its launches."""
     batch, length, _ = x.shape
     rows = ROWS if rows is None else rows
-    out = []
+    pieces, programs = [], 0
     for first, width, head in _pieces(parts):
         block = block_width(width, head)
-        grid = (width // block, pl.cdiv(length, rows), batch)
-        specs, operands = _inputs(x, taps, bias, valid)
-        kernel = functools.partial(
-            _forward_kernel, first=first, normalised=head is not None, block=block, rows=rows,
-            count=taps.shape[1], length=length, has_bias=bias is not None, has_valid=valid is not None,
-            activation=activation, eps=eps, interpret=interpret)
-        out.append(pl.pallas_call(
-            kernel, grid=grid, in_specs=specs,
-            out_specs=pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)),
-            out_shape=jax.ShapeDtypeStruct((batch, length, width), dtype),
-            compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_forward",
-        )(*operands))
-    return tuple(out)
+        pieces.append((programs, first, block, head is not None))
+        programs += width // block
+    specs, operands = _inputs(x, taps, bias, valid)
+    kernel = functools.partial(
+        _forward_kernel, pieces=tuple(pieces), rows=rows, count=taps.shape[1], length=length,
+        has_bias=bias is not None, has_valid=valid is not None, activation=activation, eps=eps,
+        interpret=interpret)
+    widths = [width for width, _ in parts]
+    return tuple(pl.pallas_call(
+        kernel, grid=(programs, pl.cdiv(length, rows), batch), in_specs=specs,
+        out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
+        out_shape=[jax.ShapeDtypeStruct((batch, length, width), dtype) for width in widths],
+        compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_forward",
+    )(*operands))
 
 
 def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: float, interpret: bool,
