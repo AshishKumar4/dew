@@ -1803,10 +1803,9 @@ Over an fsdp mesh GSPMD placed the gated delta net's projections head-split
 with the rows gathered: each device ran both rows' delta rule, and the step
 moved 8.4 GiB of all-to-alls and 2.8 GiB of activation gathers. Each
 projection now keeps the residual's placement
-(`GatedDeltaNet._project`). Qwen3.5-9B with its middle eight layers (12 to
-20) run twice, rank-256 factors over a frozen bf16 base, one 3072-token row
-a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
-102918039, the median of steps 100 to 220:
+(`GatedDeltaNet._project`). Qwen3.5-9B, LoRA rank 256 over a frozen bf16
+base, FSDP 2, one 3072-token row a GPU, minimal remat, two H100 80GB HBM3
+SXMs over NVLink, land/gdn-unit 102918039, the median of steps 100 to 220:
 
 | run | step ms | peak GiB |
 |---|---|---|
@@ -1816,15 +1815,6 @@ a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
 
 The profile's delta-net time fell from 175 to 95 ms over both devices, and
 every all-to-all and activation gather left the step.
-
-```
-cd <dew checkout> && PYTHONPATH=src python recipes/decision/clef.py --mixture.root <mix> --trainer.name run \
-  --pretrained Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --max-len 3072 \
-  --max-state-tokens 1024 --trainer.batch-size 2 --trainer.steps 220 --trainer.eval-every 220 \
-  --trainer.checkpoint-every None --trainer.log-every 1 --no-calibrate --optim.schedule.warmup-steps 10 \
-  --lora.rank 256 --param-dtype bfloat16 --loop-steps 2 --loop-layers 12 20 --remat minimal \
-  --trainer.mesh.fsdp 2
-```
 
 ## UNet batch scaling
 
