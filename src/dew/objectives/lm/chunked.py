@@ -82,6 +82,12 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
     return bounds
 
 
+def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:
+    """The vocabulary tile the tiled head walks, forward and backward:
+    `columns` wide, and no wider than one of `vocabulary_chunks`."""
+    return min(columns, vocabulary_chunks(vocab_size, chunks)[0][1])
+
+
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
@@ -216,10 +222,9 @@ def _row_terms(logits, predict: bool) -> tuple[
 
 
 class _ChunkTerms(NamedTuple):
-    """One tile's logsumexp and target logit, its best logit and column when
-    a prediction is asked for, and its maximum and the sum of exponentials
-    scaled to it."""
-    lse: jax.Array
+    """One tile's target logit, its best logit and column when a prediction
+    is asked for, and its maximum and the sum of exponentials scaled to it,
+    from which its rows' log partitions follow (`_forward`)."""
     picked: jax.Array
     best: jax.Array | None
     column: jax.Array | None
@@ -227,20 +232,17 @@ class _ChunkTerms(NamedTuple):
     mass: jax.Array
 
 
-def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
+def _chunk_terms(hidden, head_chunk, targets, start: int,
                  softcap: float | None, precision: jax.lax.PrecisionLike,
                  predict: bool, temperature: float, excluded, bias=None) -> _ChunkTerms:
-    """One tile's `_ChunkTerms`."""
+    """One tile's `_ChunkTerms`, its columns from `start` on."""
     logits = _without(capped_logits(biased_logits(_tile_logits(hidden, head_chunk, precision), bias),
                               softcap, temperature), start, excluded)
-
-    inside = (targets >= start) & (targets < stop)
-    column = jnp.clip(targets - start, 0, stop - start - 1)
-    picked = jnp.where(inside, jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0], 0.0)
-    lse, top, normalizer = _row_terms(logits, predict)
+    picked = _target_logits(logits, targets - start)
+    _, top, normalizer = _row_terms(logits, predict)
     if top is None:
-        return _ChunkTerms(lse, picked, None, None, *normalizer)
-    return _ChunkTerms(lse, picked, top[0], top[1] + start, *normalizer)
+        return _ChunkTerms(picked, None, None, *normalizer)
+    return _ChunkTerms(picked, top[0], top[1] + start, *normalizer)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
@@ -260,11 +262,13 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
              softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float, bias=None):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
     token tile at a time, and apart from them each row's maximum and the sum
-    of its exponentials scaled to it."""
+    of its exponentials scaled to it. The vocabulary tiles carry only that
+    maximum and sum; a row's log partition is formed from them once, after
+    its last tile."""
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
-    token_tile, width = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
+    token_tile, width = tile[0], tile_columns(table.shape[0], chunks, tile[1])
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     # Once, not per token tile: every tile multiplies the same rounded table,
@@ -278,22 +282,23 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
         def columns(first, carry, count):
             terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
-                picked_targets, first, first + count, softcap, precision, predict, temperature, excluded,
+                picked_targets, first, softcap, precision, predict, temperature, excluded,
                 None if bias is None else jax.lax.dynamic_slice_in_dim(bias, first, count))
-            peak = jnp.maximum(carry[2], terms.peak)
-            merged = (jnp.logaddexp(carry[0], terms.lse), carry[1] + terms.picked, peak,
-                      _rescaled(carry[2], carry[3], peak) + _rescaled(terms.peak, terms.mass, peak))
+            peak = jnp.maximum(carry[1], terms.peak)
+            merged = (carry[0] + terms.picked, peak,
+                      _rescaled(carry[1], carry[2], peak) + _rescaled(terms.peak, terms.mass, peak))
             if terms.best is None or terms.column is None:
                 return merged
-            better = terms.best > carry[4]
-            return (*merged, jnp.where(better, terms.best, carry[4]),
-                    jnp.where(better, terms.column, carry[5]))
+            better = terms.best > carry[3]
+            return (*merged, jnp.where(better, terms.best, carry[3]),
+                    jnp.where(better, terms.column, carry[4]))
 
-        initial = (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work)) * 2
+        initial = (jnp.zeros((size,), work), jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work))
         if predict:
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
-        total, target_logit, *rest = _over_tiles(initial, table.shape[0], width, columns)
-        values = (total - target_logit, total, *rest[:2], *rest[3:])
+        target_logit, peak, mass, *rest = _over_tiles(initial, table.shape[0], width, columns)
+        total = peak + jnp.log(mass)
+        values = (total - target_logit, total, peak, mass, *rest[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
@@ -339,7 +344,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
     # The logits are recomputed from operands that hold the forward's values,
     # in the forward's column tiles, so they are the logits its normalizer
     # summed: XLA rounds a product of another width otherwise.
-    token_tile, vocab_tile = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
+    token_tile, vocab_tile = tile[0], tile_columns(table.shape[0], chunks, tile[1])
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
@@ -446,12 +451,9 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     raw = biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
     logits = _without(capped_logits(raw, softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict)
-    # A target outside the vocabulary picks no column, as in `_chunk_terms`:
-    # the vocabulary-split head shifts each shard's targets by its first row
+    # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
-    inside = (labels >= 0) & (labels < table.shape[0])
-    picked = jnp.where(inside, jnp.take_along_axis(
-        logits, jnp.clip(labels, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
+    picked = _target_logits(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
     return raw, normalizer, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
@@ -665,10 +667,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk
         logits, pullback = jax.vjp(lambda raw: capped_logits(raw, cap, temperature),
                                    biased_logits(_tile_logits(states, matrix, precision), bias))
         log_z, top, (peaks, masses) = _row_terms(_without(logits, 0, excluded), predict)
-        inside = (targets >= 0) & (targets < table.shape[0])
-        picked = jnp.where(inside, jnp.take_along_axis(
-            logits, jnp.clip(targets, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
-        values = [log_z - picked, log_z]
+        values = [log_z - _target_logits(logits, targets), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
@@ -841,6 +840,16 @@ def head_cross_entropy(model, variables, read, targets, chunks: int, *,
                                 predict=predict, temperature=temperature, excluded=excluded)
 
 
+def _target_logits(logits, targets):
+    """Each row of `logits`' entry at its target, 0 for a target outside its
+    columns, which picks none: a padding id past the vocabulary, whose weight
+    is 0, or another tile's or shard's column."""
+    vocab = logits.shape[-1]
+    inside = (targets >= 0) & (targets < vocab)
+    return jnp.where(inside, jnp.take_along_axis(
+        logits, jnp.clip(targets, 0, vocab - 1)[..., None], axis=-1)[..., 0], 0.0)
+
+
 def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: float = 1.0,
                          excluded: int | None = None):
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
@@ -850,8 +859,7 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
     log_z = jax.nn.logsumexp(logits, axis=-1)
-    picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
-    return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
+    return log_z - _target_logits(logits, targets), jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
 @overload

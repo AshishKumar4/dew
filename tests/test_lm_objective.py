@@ -738,6 +738,63 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
 
 
+def vocabulary_products(jaxpr, vocab: int) -> int:
+    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
+    count = 0
+    for eqn in jaxpr.eqns:
+        shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
+        count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
+        for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                     or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
+            inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
+            if hasattr(inner, "eqns"):
+                count += vocabulary_products(inner, vocab)
+    return count
+
+
+def head_scored(vocab: int, **options):
+    """A two-layer decoder whose untied head spans `vocab` columns, and two
+    9-token rows of its ids, for the tests that count the head's products."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
+                              max_seq_len=8, tie_embeddings=False, qk_norm=False, attention_impl="reference",
+                              **options)
+    return model, jax.random.randint(jax.random.key(1), (2, 9), 0, vocab)
+
+
+def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
+    """A teacher's or a student's prediction (`LMObjective.predict`) holds the
+    whole logits, and scores its losses from them: its forward contracts the
+    vocabulary once and its gradient three times, and its losses and logits
+    are the tiled head's and the model's own. A padding id past the
+    vocabulary as the last target picks no column, as the tiled head's, so
+    every loss stays finite."""
+    from dew.objectives.lm.chunked import model_logits
+    vocab = 61
+    model, tokens = head_scored(vocab)
+    tokens = tokens.at[:, -1].set(vocab)
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=vocab, head_tile=(4, 16))
+    params = objective.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=False)
+
+    def predicted(params):
+        return objective.predict(params, {TEXT_KEY: tokens}, step, train=False)[2]
+
+    def pulled(params):
+        prediction = predicted(params)
+        return jnp.sum(prediction.logits * 0.5) + jnp.sum(prediction.losses * prediction.weights)
+
+    assert vocabulary_products(jax.make_jaxpr(predicted)(params).jaxpr, vocab) == 1
+    assert vocabulary_products(jax.make_jaxpr(jax.grad(pulled))(params).jaxpr, vocab) == 3
+    with jax.default_matmul_precision("highest"):
+        prediction = predicted(params)
+        scores = objective.token_scores(params, tokens)
+        whole = model_logits(model, params, scores.hidden)
+    assert np.all(np.isfinite(prediction.losses))
+    np.testing.assert_allclose(prediction.losses, scores.losses, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(prediction.logits, whole, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("tile_tokens", [4, 16])
 def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
         tile_tokens):
@@ -749,12 +806,9 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
     padding included. A tile that holds all 16 tokens would make one chunk
     holding every logit, so the step keeps the tiled head, contracting the
     vocabulary as it does without a z-loss, which never fuses."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     vocab = 61
-    model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
-                              max_seq_len=8, tie_embeddings=False, remat="full", qk_norm=False,
-                              attention_impl="reference")
-    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, vocab).at[1, 6:].set(0)
+    model, tokens = head_scored(vocab, remat="full")
+    tokens = tokens.at[1, 6:].set(0)
     fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
     params = fused.init(jax.random.key(0))
 
@@ -766,21 +820,9 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
             return objective.reduce_loss(stats)[0]
         return scalar
 
-    def products(jaxpr) -> int:
-        """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
-        count = 0
-        for eqn in jaxpr.eqns:
-            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
-            count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
-            for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                         or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
-                inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
-                if hasattr(inner, "eqns"):
-                    count += products(inner)
-        return count
-
     def step_products(objective) -> int:
-        return products(jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params).jaxpr)
+        program = jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params)
+        return vocabulary_products(program.jaxpr, vocab)
 
     if tile_tokens == 4:
         assert step_products(fused) == 3
