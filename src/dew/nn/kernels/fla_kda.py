@@ -48,7 +48,6 @@ from dew.nn.kernels.fla_gdn import (
     _halves,
     _headed,
     _Launch,
-    _launch,
     _read,
     _row,
     _rows,
@@ -191,14 +190,12 @@ _INTRA_DIAGONAL = IntraDiagonal()
 
 
 def intra_diagonal(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                   bh: int | None = None, warps: int | None = None, stages: int | None = None,
                    interpret: bool = False):
     """`(Aqk, Akk)` `[B, T, HV, 16]`, each token's row of its sub-chunk's diagonal block, `Aqk` in `k`'s
     dtype and `Akk` fp32: fla's `chunk_kda_fwd_intra_token_parallel` (chunk_intra_token_parallel.py:121-
     180), a program per place of each chunk (`spans`, the rows' own where None) and `BH` value heads."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_INTRA_DIAGONAL, {"bh": bh, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _INTRA_DIAGONAL(q, k, g, g_lo, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_ref, akkd_ref, aqk_ref,
@@ -332,7 +329,6 @@ _INTRA_SOLVE = IntraSolve()
 
 
 def intra_solve(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                bk: int | None = None, warps: int | None = None, stages: int | None = None,
                 interpret: bool = False):
     """`(Aqk, Akk)` `[B, T, HV, BT]` in `k`'s dtype: each chunk's `scale (q exp2(g)) (k exp2(-g))^T`,
     causal, and the inverse `(I + tril(beta (k exp2(g)) (k exp2(-g))^T, -1))^-1`: fla's
@@ -343,8 +339,8 @@ def intra_solve(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Se
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     aqkd, akkd = intra_diagonal(q, k, g, g_lo, beta, scale=scale, chunk=chunk, spans=spans,
                                 interpret=interpret)
-    return _launch(_INTRA_SOLVE, {"bk": bk, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, aqkd, akkd, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _INTRA_SOLVE(q, k, g, g_lo, beta, aqkd, akkd, *spans, chunk=chunk, scale=scale,
+                        interpret=interpret)
 
 
 def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, lo_ref, *refs, chunk: int, aligned: bool,
@@ -428,15 +424,13 @@ _RECOMPUTE_W_U = RecomputeWU()
 
 
 def recompute_w_u(k, v, beta, a, g, g_lo, q=None, *, chunk: int = 64, spans: Sequences | None = None,
-                  bk: int | None = None, bv: int | None = None, warps: int | None = None,
-                  stages: int | None = None, interpret: bool = False):
+                  interpret: bool = False):
     """`(w, u, kg, qg)`: fla's `recompute_w_u_fwd` for KDA (wy_fast.py:264-311). `w`, `kg` and `qg`
     `[B, T, HV, K]` in `k`'s dtype, `u` in `v`'s; `qg` only for given queries `q` `[B, T, H, K]`, else
     None. `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta` `[B, T, HV]`, `a` the inverse per chunk `[B,
     T, HV, BT]`, `g` and `g_lo` the base-2 cumulated decay's halves `[B, T, HV, K]` fp32."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_RECOMPUTE_W_U, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   k, v, beta, a, g, g_lo, q, *spans, chunk=chunk, interpret=interpret)
+    return _RECOMPUTE_W_U(k, v, beta, a, g, g_lo, q, *spans, chunk=chunk, interpret=interpret)
 
 
 def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool, scale: float,
@@ -503,14 +497,12 @@ _CHUNK_FWD_O = ChunkFwdO()
 
 
 def chunk_fwd_o(q, v, g, a, h, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                bk: int | None = None, bv: int | None = None, warps: int | None = None,
-                stages: int | None = None, interpret: bool = False):
+                interpret: bool = False):
     """The output `[B, T, HV, V]` in `v`'s dtype: fla's `chunk_gla_fwd_o_gk` (gla/chunk.py:962-997). `q`
     `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `g` the base-2 cumulated decay `[B, T, HV,
     K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memory each chunk enters (`fla_gdn.chunk_fwd_h`'s)."""
     spans = sequences(*q.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_FWD_O, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _CHUNK_FWD_O(q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, aligned: bool, scale: float,
@@ -572,14 +564,13 @@ class BwdDav(_KdaLaunch):
 _BWD_DAV = BwdDav()
 
 
-def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None = None, bv: int | None = None,
-            warps: int | None = None, stages: int | None = None, interpret: bool = False):
+def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+            interpret: bool = False):
     """`(dAqk, dv)`: fla's `chunk_kda_bwd_dAv` (chunk_bwd.py:314-365), `dAqk` `[B, T, HV, BT]` fp32 and
     `dv` `[B, T, HV, V]` in `do`'s dtype. `v` the corrected values, `do` the output's gradient, `a`
     `Aqk`."""
     spans = sequences(*v.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_DAV, {"bv": bv, "warps": warps, "stages": stages},
-                   v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _BWD_DAV(v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, lo_ref, beta_ref, a_ref, h_ref, do_ref,
@@ -715,15 +706,13 @@ _BWD_WY_DQKG = BwdWyDqkg()
 
 
 def bwd_wy_dqkg(q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *, scale: float, chunk: int = 64,
-                spans: Sequences | None = None, bk: int | None = None, bv: int | None = None,
-                warps: int | None = None, stages: int | None = None, interpret: bool = False):
+                spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, dv, db, dg, dAkk)`: fla's `chunk_kda_bwd_wy_dqkg_fused` (chunk_bwd.py:367-431), `dq`,
     `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T, HV]` and `dAkk` `[B, T, HV, BT]` fp32, `dv` in `v`'s dtype.
     `h` and `dh` the memory each chunk enters and its gradient (`fla_gdn.chunk_fwd_h`'s and
     `chunk_bwd_dhu`'s), `dv` the corrected values' full gradient, `a` `Akk`'s inverse."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_WY_DQKG, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
+    return _BWD_WY_DQKG(q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
                    interpret=interpret)
 
 
@@ -877,16 +866,14 @@ _BWD_INTRA = BwdIntra()
 
 
 def bwd_intra(q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *, chunk: int = 64,
-              spans: Sequences | None = None,
-              bk: int | None = None, warps: int | None = None, stages: int | None = None,
-              interpret: bool = False):
+              spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, db, dg)` fp32, `bwd_wy_dqkg`'s plus the intra-chunk terms of `dAqk` and `dAkk`: fla's
     `chunk_kda_bwd_intra` (chunk_intra.py:897-960), its grid over key blocks, sub-chunks and heads,
     beta's gradient summed over the key blocks after. `dq`, `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T,
     HV]`."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_INTRA, {"bk": bk, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *spans, chunk=chunk, interpret=interpret)
+    return _BWD_INTRA(q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *spans, chunk=chunk,
+                      interpret=interpret)
 
 
 def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):

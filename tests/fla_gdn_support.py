@@ -9,7 +9,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import fla_gdn, generation
+from dew.nn.kernels import fla_gdn, generation, tuning
 from dew.nn.precision import compensated_difference
 
 COMPILED_SHAPES = {
@@ -32,7 +32,13 @@ class KernelCase(NamedTuple):
     call: Callable[[], tuple[Callable, tuple[jax.ShapeDtypeStruct, ...]]]
 
 
-def _case_call(kernel, config, shape, dtype, *, reverse=False):
+def _pinned(kernel, tiles, *args, **kwargs):
+    """`fla_gdn`'s `kernel` on `args`, its launch pinned to `tiles` (`tuning.pinned`)."""
+    with tuning.pinned({type(getattr(fla_gdn, "_" + kernel.upper())): tiles}):
+        return getattr(fla_gdn, kernel)(*args, **kwargs)
+
+
+def _case_call(kernel, tiles, shape, dtype, *, reverse=False):
     batch, length, key_heads, value_heads = (shape[name] for name in
                                             ("batch", "length", "key_heads", "value_heads"))
     width, columns, chunk = (shape[name] for name in ("width", "columns", "chunk"))
@@ -56,17 +62,17 @@ def _case_call(kernel, config, shape, dtype, *, reverse=False):
         "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, gated, entered, valued, valued, entered),
         "prepare_wy_repr_bwd": (keyed, valued, beta, gated, gated, inverse, weighted, valued, keyed),
     }
-    kwargs = {**config, "chunk": chunk, "interpret": False}
+    kwargs = {"chunk": chunk, "interpret": False}
     if kernel == "chunk_local_cumsum":
         kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
-    return functools.partial(getattr(fla_gdn, kernel), **kwargs), operands[kernel]
+    return functools.partial(_pinned, kernel, tiles, **kwargs), operands[kernel]
 
 
 def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel at the tiles `target` runs it with unmeasured (`fla_gdn.HEURISTICS`) for both dtypes
-    at each shape, and the reverse cumsum, for the compile test."""
+    """Each kernel pinned to the tiles `target` runs it with unmeasured (`fla_gdn.HEURISTICS`) for both
+    dtypes at each shape, and the reverse cumsum, for the compile test."""
     with generation.assumed(target):
         wide = fla_gdn._wide()
     for dtype in ("bfloat16", "float32"):
@@ -78,7 +84,7 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
                 for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
-                    yield KernelCase(name, functools.partial(_case_call, kernel, config, shape, dtype,
+                    yield KernelCase(name, functools.partial(_case_call, kernel, tiles, shape, dtype,
                                                              reverse=reverse))
 
 
