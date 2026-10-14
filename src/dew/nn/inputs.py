@@ -16,7 +16,7 @@ from flax import struct
 from jax.core import Tracer
 
 from dew.coordination import agreed
-from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -43,8 +43,6 @@ type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
-BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
-"""The mesh axes a request's rows split over: every axis but sequence and stage."""
 
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
@@ -181,9 +179,11 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
+        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
         return replace(self,
             tokens=self.tokens[:, selection],
-            token_fields={name: value[:, selection] for name, value in self.token_fields.items()})
+            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
+                          for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
@@ -690,12 +690,21 @@ def mesh_of(tree) -> jax.sharding.Mesh | None:
     return None
 
 
+def request_axes(mesh: jax.sharding.Mesh) -> tuple[str, ...]:
+    """The mesh axes a request's rows split over: every axis but sequence and
+    stage, so each process places rows of its own requests on its own
+    devices. A training batch's rows split over the data axes alone
+    (`dew.nn.sharding.batch_axes`): every process of a share reads the same
+    rows there, where each process here brings its own."""
+    return tuple(axis for axis in mesh.axis_names if axis not in (SEQUENCE_AXIS, STAGE_AXIS))
+
+
 @dataclass(frozen=True)
 class RowPlan:
     """Where one request's rows sit while a task runs.
 
     Without a mesh every array stays on the default device. On a mesh, rows
-    split over its batch axes. Each process contributes ``count`` rows, its
+    split over its request axes (`request_axes`). Each process contributes ``count`` rows, its
     ``rows`` real ones followed by repeats that pad them to a multiple of its
     devices on those axes, so every device holds the same shape and every
     collective lines up. Results keep that sharding, and ``host`` reads a
@@ -713,7 +722,7 @@ class RowPlan:
         if mesh is None:
             return cls(None, rows, rows, 0, 1)
         processes, process = jax.process_count(), jax.process_index()
-        batch_devices = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+        batch_devices = math.prod(mesh.shape[axis] for axis in request_axes(mesh))
         if batch_devices % processes:
             raise ValueError("the batch axes of the mesh do not split evenly over the processes")
         local_devices = batch_devices // processes
@@ -723,7 +732,7 @@ class RowPlan:
     def sharding(self) -> jax.sharding.NamedSharding | None:
         if self.mesh is None:
             return None
-        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(BATCH_AXES))
+        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(request_axes(self.mesh)))
 
     @property
     def global_rows(self) -> int:

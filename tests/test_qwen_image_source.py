@@ -266,11 +266,13 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     The objective runs the whole source: the VAE encodes the RGBA pixels,
     the Qwen3-VL language model encodes the prompts, and the transformer
     takes the gradient. The encoder and the autoencoder are state, so every
-    leaf survives the step and their tensors - the vision tower the prompt
-    never reads included - go back out byte for byte; the export reloads to
-    the trained forward.
+    leaf survives the step. The encoder's state is the leaves its language
+    model's layouts bind; the vision tower, which the prompt never reads, is
+    carried as stored beside it, and both go back out byte for byte. The
+    export reloads to the trained forward.
     """
     import optax
+    from flax.traverse_util import flatten_dict
 
     from dew.checkpoints import Checkpoints
     from dew.inputs.diffusion import QwenImageConditioner
@@ -311,6 +313,11 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         for got, want in zip(jax.tree.leaves(state.variables[held]),
                              jax.tree.leaves(initial.variables[held]), strict=True):
             np.testing.assert_array_equal(got, want)
+    assert set(flatten_dict(state.variables["encoders"]["conditioning"])) == {
+        layout.paths[0][2:] for layout in loaded.weight_layouts if layout.name.startswith("text_encoder/")}
+    visual = {f"text_encoder/{name}" for name in component_tensors(source / "pipeline", "text_encoder")
+              if name.startswith("model.visual.")}
+    assert visual and set(loaded.retained_tensors) == visual
 
     checkpoints.save(1, state, None, {})
     checkpoints.wait()
