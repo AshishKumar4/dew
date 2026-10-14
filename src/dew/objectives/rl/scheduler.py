@@ -316,7 +316,6 @@ class RolloutScheduler:
         self._key: jax.Array = jax.random.key(0)
         self._submissions = 0
         self._partition = DataPartition()
-        self._rescore = jax.jit(objective.packed_log_probs)
 
     def tasks(self, dataset: Loader) -> Loader:
         """Return `dataset` with a training stream that registers each task batch ahead of the step.
@@ -538,7 +537,8 @@ class RolloutScheduler:
         # Over a mesh the rows are placed as the step places the batch, every
         # process's rows together, so the rescoring runs once over the pool's
         # batch and each process reads its own rows back.
-        scored = self._rescore(state.variables, packed if mesh is None else shard_batch(mesh, packed))
+        rescore = self.objective.program("packed log probs", self.objective.packed_log_probs)
+        scored = rescore(state.variables, packed if mesh is None else shard_batch(mesh, packed))
         packed[OLD_LOG_PROBS_KEY] = local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
         if sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
