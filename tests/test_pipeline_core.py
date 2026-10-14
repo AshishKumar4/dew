@@ -974,6 +974,7 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     documents' lengths: the indexed order is global, and its windows are the
     ones a memory read packs from the same documents."""
     from dew.data.sources.tokens import TokenFiles
+    from dew.data.text import chunk
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
@@ -984,11 +985,13 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     store = TokenFiles(str(tmp_path)).provision()
 
     def windows(pipeline, read):
-        rows = iterate(pipeline.pack(8, bins=2), read=read, loading=READ)
+        rows = iterate(pipeline.flat_map(chunk(8)).pack(8, bins=2), read=read, loading=READ)
         return [{name: np.asarray(value).tolist() for name, value in row.items() if name[:5] != "_dew_"}
                 for row in rows]
 
-    lowering = compile(Pipeline(store).pack(8, bins=2).batch(2), read="indexed", loading=READ).plan.lowering
+    # The 10-token document is cut where the chunk step says, which the plan of lengths cuts alike.
+    lowering = compile(Pipeline(store).flat_map(chunk(8)).pack(8, bins=2).batch(2), read="indexed",
+                       loading=READ).plan.lowering
     assert lowering == "global"
     memory = Pipeline(Memory([{"text": document} for document in documents]))
     assert windows(Pipeline(store), "indexed") == windows(memory, "memory")
