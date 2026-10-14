@@ -108,11 +108,14 @@ class DPOObjective(LMObjective):
         }, qk_stats=policy.qk)
 
     def evaluate(self, params, batch, step):
-        """Return per-token scores of the chosen responses under the policy, for their perplexity.
+        """Return per-token scores of the chosen responses under the policy, for their perplexity,
+        compiled for the current modules over the pairs alone (`_evaluation_scores`)."""
+        pairs = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY]}
+        return self._compiled_scores(self.evaluation_variables(params, step), pairs, step.key)
 
-        The per-token cross entropies take the shifted completion mask as
-        weights.
-        """
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        """The chosen responses' per-token cross entropies, with the shifted
+        completion mask as weights."""
         chosen_ids, _, chosen_mask, _ = self._halves(batch)
         scores = self.token_scores(params, chosen_ids, predict=True)
         losses = scores.losses
