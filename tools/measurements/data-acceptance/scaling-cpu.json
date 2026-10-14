@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "config": {
+    "output": "/armada/task/artifacts/scaling-cpu.json",
+    "work": "matrix-work",
+    "shards": 16,
+    "records": 4096,
+    "cycles": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "steps": 64,
+    "warmup": 4,
+    "batch": 32,
+    "image_size": 128
+  },
+  "rows": [
+    {
+      "cycle": 1,
+      "first_batch_seconds": 1.232124380000002,
+      "batches": 64,
+      "batches_per_second": 28.39019945437921,
+      "records_per_second": 908.4863825401347,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 31.50058699999647,
+      "latency_p95_ms": 61.538991999995574
+    },
+    {
+      "cycle": 2,
+      "first_batch_seconds": 1.1248959589999998,
+      "batches": 64,
+      "batches_per_second": 41.33950862138004,
+      "records_per_second": 1322.8642758841613,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 19.747817000009604,
+      "latency_p95_ms": 55.95171800000287
+    },
+    {
+      "cycle": 4,
+      "first_batch_seconds": 0.8206816399999894,
+      "batches": 64,
+      "batches_per_second": 50.27274239204052,
+      "records_per_second": 1608.7277565452966,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 14.89410199999952,
+      "latency_p95_ms": 49.97696300000598
+    },
+    {
+      "cycle": 8,
+      "first_batch_seconds": 0.884263684000004,
+      "batches": 64,
+      "batches_per_second": 36.82280585222601,
+      "records_per_second": 1178.3297872712324,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 22.52097900000649,
+      "latency_p95_ms": 48.358680999996295
+    }
+  ],
+  "speedup": {
+    "1": 1.0,
+    "2": 1.4561189923237186,
+    "4": 1.77077806278976,
+    "8": 1.2970252608262696
+  }
+}
