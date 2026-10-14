@@ -125,8 +125,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     the Worker returns. A read is the file's whose test calls it, by any
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
-    first, beside others. The `platform` module is no read. A file that started a process
-    has no key, so it is in, and no task reuses its row."""
+    first, beside others. The `sys` and `platform` modules are no read. A
+    file that started a process has no key, so it is in, and no task reuses
+    its row."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -148,7 +149,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_imported_too.py": "from devices import Device, placed\nON = placed(Device())\n"
                                 "def test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
-        "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
+        "test_machine.py": "import platform, sys\n"
+                           "def test_machine(): assert platform.platform() and sys.platform\n",
         "plain.py": "def helper(): return 1\n",
         "test_plain.py": "def test_plain():\n    from plain import helper\n    assert helper() == 1\n",
         "test_lost.py": "def test_lost(): pass\n",
