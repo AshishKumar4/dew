@@ -136,7 +136,6 @@ from dew.training.memory import (
     step_compiler_options,
 )
 from dew.training.model_flops import (
-    FORWARD_FLOPS,
     TOKENS,
     TRAINING_FLOPS,
     _TokenCount,
@@ -467,7 +466,6 @@ class Trainer(Generic[Loss, Effects]):
         # program is the step as handed to XLA, before GSPMD partitions it,
         # and the executable the step as compiled, whose memory analysis a
         # benchmark reads.
-        self.flops_per_step = None
         self.step_flops: StepFlops | None = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
@@ -1107,7 +1105,6 @@ class Trainer(Generic[Loss, Effects]):
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
             self.step_flops = flops and StepFlops(split * flops.model, split * flops.hardware)
-            self.flops_per_step = self.step_flops and self.step_flops.hardware
             self.memory = memory_record(self.executable, self._local_devices(), candidate.held, fits=True)
             self.links = links
         return self._runner(planned, mesh)
@@ -1706,7 +1703,7 @@ class Trainer(Generic[Loss, Effects]):
         current, checkpoints = run.current, self.checkpoints
         ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
         aux = {name: value for name, value in aux.items()
-               if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
+               if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
