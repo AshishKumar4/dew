@@ -144,7 +144,7 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     places them, the product and the input gradient are the same exact
     products: a row's cast reads the row alone, wherever it lies."""
     x, leaves, cotangent = product_case()
-    mesh = jax.make_mesh((2,), ("fsdp",), devices=jax.devices()[:2])
+    mesh = jax.make_mesh((2,), ("fsdp",), (jax.sharding.AxisType.Auto,), devices=jax.devices()[:2])
     split = NamedSharding(mesh, PartitionSpec("fsdp", None))
     x, cotangent, *leaves = jax.device_put((x, cotangent, *leaves), split)
     output, pullback = jax.jit(lambda *args: jax.vjp(frozen_fp8_product, *args))(x, *leaves)
