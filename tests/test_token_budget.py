@@ -1,93 +1,90 @@
-"""Token budgets keep a small shape set, exact positions and every real row."""
+"""A token budget is whole rows of the one length a pipeline's rows hold, on every share."""
 
-import dataclasses
 import itertools
 
-import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data.batching import TOKEN_COUNTS
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
-from dew.data.pipeline import Pipeline, TokenField
+from dew.data.pipeline import Pipeline
 from dew.data.sources.memory import Memory
+from dew.data.steps.text import FixedTokens
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
 
-@dataclasses.dataclass(frozen=True)
-class Geometry(grain.MapTransform):
-    max_length: int = 16
-    token_fields: tuple[TokenField, ...] = (TokenField("tokens"), TokenField("valid", pad=False))
-    length_field: str = "length"
-
-    def map(self, row):
-        length = int(row["length"])
-        return {**row, "tokens": np.full(self.max_length, row["id"], np.int32),
-                "valid": np.arange(self.max_length) < length}
+def windows(tokens: int) -> Pipeline:
+    """Token windows of 8 targets (9 ids) each, under a budget of `tokens`."""
+    documents = Memory(tuple({"text": np.arange(index, index + 9, dtype=np.int32)} for index in range(48)))
+    return Pipeline(documents).map(FixedTokens(8, extra=1)).shuffle(7).repeat().batch(tokens=tokens)
 
 
-def records():
-    return Memory(tuple({"id": np.int32(index), "length": np.int32((3, 7, 14)[index % 3])}
-                        for index in range(48)))
-
-
-def batches():
-    return Pipeline(records()).map(Geometry()).shuffle(7).repeat().batch(
-        tokens=64, lengths=(4, 8, 16))
-
-
-def copy_batch(row):
-    return {name: np.asarray(value).tolist() for name, value in row.items()}
-
-
-def test_fixed_token_budget_and_bounded_shape_count():
-    data = compile(batches(), read="memory", seed=7, loading=READ)
-    assert data.batch_tokens == 64
-    assert data.records is None
-    reader = data.train(DataPartition())
+def test_a_token_budget_reads_its_rows_on_every_share_as_one_global_batch():
+    """32 tokens of 8-target windows are 4 rows; two shares read two each, and together the rows of
+    the one-share batch, at every step and from a saved position."""
+    data = compile(windows(32), read="memory", seed=7, loading=READ)
+    assert data.batch_tokens == 32
+    whole = data.train(DataPartition())
+    halves = [data.train(DataPartition(index, 2)) for index in range(2)]
     try:
-        observed = list(itertools.islice(reader, 18))
-        shapes = {row["tokens"].shape for row in observed}
-        assert shapes <= {(16, 4), (8, 8), (4, 16)}
-        assert len(shapes) > 1
-        for row in observed:
-            assert row["tokens"].size == 64
-            np.testing.assert_array_equal(row[TOKEN_COUNTS], row["valid"].sum(axis=1))
-            assert VALID_ROWS not in row
+        for _ in range(3):
+            batch = next(whole)["text"]
+            parts = [next(half)["text"] for half in halves]
+            assert batch.shape == (4, 9) and all(part.shape == (2, 9) for part in parts)
+            assert sorted(map(tuple, batch.tolist())) == sorted(map(tuple, np.concatenate(parts).tolist()))
+        state = whole.get_state()
+        expected = [next(whole)["text"].tolist() for _ in range(2)]
     finally:
-        reader.close()
-
-
-def test_token_budget_restores_mid_window_without_buffer_in_checkpoint():
-    data = compile(batches(), read="memory", seed=7, loading=READ)
-    reader = data.train(DataPartition())
-    list(itertools.islice(reader, 3))
-    state = reader.get_state()
-    assert len(state) < 100_000
-    expected = [copy_batch(row) for row in itertools.islice(reader, 7)]
-    reader.close()
+        for reader in (whole, *halves):
+            reader.close()
     resumed = data.train(DataPartition())
-    resumed.set_state(state)
-    assert [copy_batch(row) for row in itertools.islice(resumed, 7)] == expected
-    resumed.close()
-
-
-def test_token_budget_validation_keeps_partial_rows_with_a_mask():
-    validation = Pipeline(Memory(({"id": np.int32(0), "length": np.int32(14)},))).map(
-        Geometry()).batch(tokens=64, lengths=(4, 8, 16), drop_remainder=False)
-    data = compile(batches(), validation=validation, read="memory", loading=READ)
-    reader = data.val(DataPartition())
     try:
-        batch = next(reader)
-        assert batch["tokens"].shape == (4, 16)
-        np.testing.assert_array_equal(batch[VALID_ROWS], [True, False, False, False])
-        assert next(reader, None) is None
+        resumed.set_state(state)
+        assert [batch["text"].tolist() for batch in itertools.islice(resumed, 2)] == expected
     finally:
-        reader.close()
+        resumed.close()
+
+
+def test_a_token_budget_of_part_rows_or_rebatched_rows_is_refused():
+    with pytest.raises(ValueError, match="not whole rows of 8 tokens"):
+        compile(windows(36), read="memory", loading=READ)
+    with pytest.raises(ValueError, match=r"rebatch.*fixed token budget"):
+        compile(windows(32).rebatch(8), read="memory", loading=READ)
+
+
+@pytest.mark.parametrize("drop_remainder", [False, True])
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_finite_token_budget_marks_its_remainder_or_drops_it(drop_remainder, shares):
+    """A finite pass scores each kept record once, with a fixed shape even in its last batch."""
+    records = Memory(tuple({"id": np.int32(index), "text": np.arange(index * 8, (index + 1) * 8,
+                       dtype=np.int32)} for index in range(6)))
+    pipeline = (Pipeline(records).map(FixedTokens(8)).repeat(1)
+                .batch(tokens=32, drop_remainder=drop_remainder))
+    data = compile(pipeline, read="memory", loading=READ)
+    size = 4 // shares
+    delivered = []
+    for share in range(shares):
+        stream = data.train(DataPartition(share, shares))
+        try:
+            batches = list(stream)
+        finally:
+            stream.close()
+        expected_ids = [list(range(share, 4, shares))]
+        expected_masks = [[True] * size]
+        if not drop_remainder:
+            expected_ids.append(list(range(4 + share, 6, shares)) * 2)
+            expected_masks.append([True] * (size // 2) + [False] * (size // 2))
+        assert [batch["id"].tolist() for batch in batches] == expected_ids
+        masks = [np.asarray(batch.get(VALID_ROWS, np.ones(size, bool))) for batch in batches]
+        assert [mask.tolist() for mask in masks] == expected_masks
+        for batch, mask in zip(batches, masks, strict=True):
+            assert batch["id"].shape == (size,) and batch["text"].shape == (size, 8)
+            np.testing.assert_array_equal(batch["text"], batch["id"][:, None] * 8 + np.arange(8))
+            delivered.extend(batch["id"][mask].tolist())
+    assert sorted(delivered) == list(range(4 if drop_remainder else 6))
 
 
 @pytest.mark.parametrize("drop_remainder", [False, True])
@@ -129,26 +126,3 @@ def test_variable_axis_is_an_input_contract_not_a_trainer_exception():
         declared.check({"tokens": np.zeros((4, 17), np.int32)})
     with pytest.raises(ValueError, match="shape"):
         InputSpec(Field("tokens", (16,))).check({"tokens": np.zeros((4, 8), np.int32)})
-
-
-def test_token_budget_refuses_unsynchronized_share_shapes():
-    data = compile(batches(), read="memory", loading=READ)
-    reader = data.train(DataPartition(0, 2))
-    with pytest.raises(ValueError, match="synchronized shape"):
-        next(reader)
-    reader.close()
-
-
-@pytest.mark.parametrize("workers", [0, 2])
-def test_token_budget_keeps_post_batch_limit_and_workers(workers):
-    data = compile(batches().workers(workers).limit(3), read="memory", loading=READ)
-    reader = data.train(DataPartition())
-    try:
-        assert len(list(reader)) == 3
-    finally:
-        reader.close()
-
-
-def test_token_budget_refuses_row_rebatching():
-    with pytest.raises(ValueError, match=r"rebatch.*fixed token budget"):
-        compile(batches().rebatch(8), read="memory", loading=READ)

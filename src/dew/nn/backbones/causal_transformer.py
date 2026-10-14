@@ -35,6 +35,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, mixers
 
@@ -100,7 +101,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, _merged, run_pipeline, run_stack
+from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -2030,7 +2031,7 @@ class CausalTransformer(nn.Module):
             if stacked and first in tree:
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
             if 'layers_0' in tree:
-                held = _merged(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
+                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             if held:
                 variables[collection] = held
         return variables
