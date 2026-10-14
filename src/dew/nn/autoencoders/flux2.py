@@ -37,8 +37,13 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
 
+    record_name = 'flux2'
+    record_module = AutoencoderKL
+
     def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
         super().__init__(model, params)
+        self.statistics = {'mean': np.asarray(mean, np.float32), 'variance': np.asarray(variance, np.float32),
+                           'epsilon': epsilon}
         # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last.
         self.encode_single_frame = jax.jit(lambda params, image, key=None: pixel_unshuffle(jnp.asarray(
             model.apply({"params": params}, image, key, method=model.encode))))
@@ -54,6 +59,9 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
                 f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
                 f"channel ({4 * model.latent_channels},)"
             )
+
+    def record_arguments(self) -> dict:
+        return self.statistics
 
     @property
     def downscale_factor(self) -> int:

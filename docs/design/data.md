@@ -48,6 +48,8 @@ Three types, six function shapes.
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
 | `DatasetFn` | `(Dataset, *settings) -> Dataset` | `pipe(fn, *settings)` | any |
 
+A random step's draw is keyed by the record's place in the run's order, its epoch included: the same in every read mode and reader for one order, and on resume. A different shuffle draws differently, and a read cut per share (one that drops records, or a streamed one) keys a draw by the record's place in its share.
+
 ```mermaid
 flowchart TD
   F{"Does the step look at<br/>more than one record?"}

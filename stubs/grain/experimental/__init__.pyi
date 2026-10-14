@@ -28,6 +28,18 @@ class FirstFitPackIterDataset(IterDataset[T], Generic[T]):
     ) -> None: ...
 
 
+class DatasetOptions:
+    """Options a dataset's transformations read, merged down the tree it wraps."""
+
+    def __init__(self, *, min_shm_size: int = ...) -> None: ...
+
+
+class WithOptionsIterDataset(IterDataset[T], Generic[T]):
+    """`parent` with `options` for the transformations below it, a worker's included."""
+
+    def __init__(self, parent: IterDataset[T], options: DatasetOptions) -> None: ...
+
+
 class ThreadPrefetchIterDataset(IterDataset[T], Generic[T]):
     """`parent` read by one background thread, at most `prefetch_buffer_size`
     elements ahead of the consumer."""

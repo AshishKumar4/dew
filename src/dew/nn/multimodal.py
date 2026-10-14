@@ -105,14 +105,12 @@ class VisionConditioner(nn.Module):
         self({"pixel_values": jnp.zeros((1, 1, channels, side, side), self.dtype or jnp.float32)})
 
 
-    def fuse(self, tokens: jax.Array, embeddings: jax.Array,
-             image_indices: jax.Array, conditioning: Mapping[str, jax.Array],
-             train: bool = False) -> Fusion:
-        """Replace marked text slots with the corresponding soft feature."""
-        if image_indices.shape != tokens.shape:
+    def fuse(self, embeddings: jax.Array, image_indices: jax.Array, conditioning: Mapping[str, jax.Array],
+             train: bool = False) -> jax.Array:
+        """`embeddings` `[B, S, D]` with the slots `image_indices` marks replaced by their soft features."""
+        if image_indices.shape != embeddings.shape[:-1]:
             raise ValueError("image_indices must align with the token rows")
-        return Fusion(tokens, _place(embeddings, self(conditioning, train=train), image_indices),
-                      image_indices >= 0)
+        return _place(embeddings, self(conditioning, train=train), image_indices)
 
 
 class AudioConditioner(nn.Module):
@@ -316,8 +314,7 @@ class MultimodalTransformer(nn.Module):
                     raise TypeError("Gemma 3n media embedders carry the hard vocabulary")
                 embeddings = embedder.merge_hard_embeddings(embeddings, tokens)
         if conditioning is not None and image_indices is not None:
-            embeddings = self.conditioner.fuse(decoder_tokens, embeddings, image_indices,
-                                               conditioning, train=train).embeddings
+            embeddings = self.conditioner.fuse(embeddings, image_indices, conditioning, train=train)
         if conditioning is not None and audio_indices is not None:
             if self.audio is None:
                 raise ValueError("audio_indices require an audio tower")
