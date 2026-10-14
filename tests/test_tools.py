@@ -540,6 +540,70 @@ def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
     assert lint.main(["--root", str(tmp_path), "--package", "sparx"]) == 1
 
 
+def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
+    """Write `files` into a sparx checkout and return each finding as (path, line, code)."""
+    lint = load("lint_slop")
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text)
+    modules = list(lint.collect(["src/sparx", "tests", "tools"], tmp_path, "sparx"))
+    return sorted((finding.path, finding.line, finding.code)
+                  for module in modules for finding in lint.check(module))
+
+
+def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
+    """SLOP011: `match=` on a raise, a read of a function's source and a test
+    that names a source file each prove text, not behaviour. A raise without
+    `match`, and a library that names its own file, are not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": 'HOME = "src/sparx/graph.py"\n',
+        "tests/test_graph.py": (
+            "import inspect\n"
+            "import pytest\n"
+            "from sparx import graph\n"
+            "def test_wording():\n"
+            "    with pytest.raises(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"
+            "def test_source():\n"
+            "    assert 'return' in inspect.getsource(graph)\n"
+            "def test_file():\n"
+            "    assert open('src/sparx/graph.py').read()\n"
+            "def test_refusal():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        graph.edges({})\n"),
+    })
+    assert found == [("tests/test_graph.py", 5, "SLOP011"), ("tests/test_graph.py", 8, "SLOP011"),
+                     ("tests/test_graph.py", 10, "SLOP011")]
+
+
+def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
+    """SLOP012: a script that assigns over the package's own functions, and a
+    library that assigns over anything it imported, change them for every
+    caller. A script's rebinding of another library, an interpreter hook, and
+    an attribute of an object a file made are not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": (
+            "import sys\n"
+            "import json\n"
+            "class Edges:\n"
+            "    pass\n"
+            "def install():\n"
+            "    json.dumps = repr\n"
+            "    sys.excepthook = print\n"
+            "    edges = Edges()\n"
+            "    edges.count = 0\n"),
+        "tools/bench.py": (
+            "import json\n"
+            "from sparx import graph\n"
+            "import sparx.graph\n"
+            "graph.install = print\n"
+            "setattr(sparx.graph, 'install', print)\n"
+            "json.dumps = repr\n"),
+    })
+    assert found == [("src/sparx/graph.py", 6, "SLOP012"), ("tools/bench.py", 4, "SLOP012"),
+                     ("tools/bench.py", 5, "SLOP012")]
+
+
 # ---------------------------------------------------------------------------
 # tools/hf_coverage.py
 # ---------------------------------------------------------------------------

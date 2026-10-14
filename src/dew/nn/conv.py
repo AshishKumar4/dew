@@ -30,7 +30,7 @@ does a convolution a Qwix rule quantizes (`dew.training.quantization`).
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -199,7 +199,13 @@ def _conv_general_dilated(
         feature_group_count: int = 1, batch_group_count: int = 1,
         precision: jax.lax.PrecisionLike = None,
         preferred_element_type: DTypeLike | None = None,
-        out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+        out_sharding: jax.sharding.NamedSharding | None = None, *,
+        dilated: Callable[[jax.Array, jax.Array, int], jax.Array] | None = None) -> jax.Array:
+    """`lax.conv_general_dilated` with Dew's depthwise forms. A dilated 3x3
+    depthwise one runs on CUDA as `dilated(x, kernel, dilation)`, by default
+    the form measured faster for its dtype; `tools/benchmark_depthwise.py`
+    passes lax's own to time against it."""
+
     def convolve(x: jax.Array, w: jax.Array) -> jax.Array:
         return jax.lax.conv_general_dilated(
             x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
@@ -218,9 +224,9 @@ def _conv_general_dilated(
             and lhs.dtype == rhs.dtype and lhs.dtype in (jnp.float32, jnp.bfloat16)
             and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
-        # A dilated one on CUDA takes the form measured faster for its dtype
-        # (`_materialized_depthwise_3x3`).
-        dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
+        # bf16 is faster polyphase, fp32 materialized (`_materialized_depthwise_3x3`).
+        if dilated is None:
+            dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
         return jax.lax.platform_dependent(
             lhs, rhs,
             cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),

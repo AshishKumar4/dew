@@ -3,13 +3,15 @@
 
 RTX 4080: ~/.cache/dew/dew-gpu-run env PYTHONPATH=src python tools/benchmark_depthwise.py kernels
 Run `step --implementation lax` and `step --implementation production` in
-separate processes. The diagnostic lax choice substitutes the dilated
-convolution for production's dilated forms (polyphase in bf16, the
-materialized shifted products in fp32) only inside this benchmark;
+separate processes. The diagnostic lax choice runs lax's dilated
+convolution where production runs its dilated forms (polyphase in bf16, the
+materialized shifted products in fp32): each Dew convolution traced within
+`dilated_form` takes the form as its argument (`dew.nn.conv`), and
 production dispatch has no performance flag.
 """
 
 import argparse
+import contextlib
 import json
 import statistics
 from functools import partial
@@ -18,6 +20,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 import dew.nn.conv as conv
 from dew.nn.kernels.tuning import samples
@@ -32,6 +35,26 @@ def reference(x, kernel, dilation, *, layout='NHWC', precision=jax.lax.Precision
         feature_group_count=kernel.shape[-1] if layout == 'NHWC' else kernel.shape[0],
         precision=precision)
     return out if layout == 'NHWC' else out.transpose(0, 2, 3, 1)
+
+
+@contextlib.contextmanager
+def dilated_form(form):
+    """Each Dew convolution applied within runs a dilated 3x3 depthwise one on
+    CUDA as `form(x, kernel, dilation)`, in place of production's form."""
+    convolve = partial(conv._conv_general_dilated, dilated=form)
+
+    def substituted(call, args, kwargs, context):
+        module = context.module
+        if (context.method_name != '__call__' or not isinstance(module, conv.Conv)
+                or module.conv_general_dilated is not conv._conv_general_dilated
+                or module.is_initializing()):
+            return call(*args, **kwargs)
+        # The same layer, over the same parameters, with the form as its convolution's argument.
+        return module.clone(parent=None, name=None, conv_general_dilated=convolve).apply(
+            {'params': module.variables['params']}, *args, **kwargs)
+
+    with nn.intercept_methods(substituted):
+        yield
 
 
 def vjp(operation, x, kernel, cotangent):
@@ -95,8 +118,6 @@ def step(args):
     import benchmark_step
     from benchmark_cases import Case
 
-    if args.implementation == 'lax':
-        conv._polyphase_depthwise_3x3 = conv._materialized_depthwise_3x3 = partial(reference, precision=None)
     config = {'emb_features': 768, 'mlp_ratio': 4, 'norm_epsilon': 1e-5,
               'num_heads': 12, 'num_layers': 16, 'patch_size': 2, 'scan_order': 'zigzag',
               'ssm_attention_ratio': '3:1', 'ssm_state_dim': 64, 'text_pooling': 'all',
@@ -105,9 +126,12 @@ def step(args):
         config['remat'] = True
     cases = [Case('hybrid_dit', config, batch_size=batch, image_size=32, channels=4)
              for batch in ((16, 32) if args.batch_size is None else (args.batch_size,))]
-    rows = benchmark_step.main(benchmark_step.BenchmarkConfig(
-        cases=cases, steps=args.repeats, warmup=5, profile_dir=str(args.output.parent / args.implementation),
-        profile_steps=5, json_out=str(args.output), dtype=args.dtype))
+    lax = args.implementation == 'lax'
+    with dilated_form(partial(reference, precision=None)) if lax else contextlib.nullcontext():
+        rows = benchmark_step.main(benchmark_step.BenchmarkConfig(
+            cases=cases, steps=args.repeats, warmup=5,
+            profile_dir=str(args.output.parent / args.implementation), profile_steps=5,
+            json_out=str(args.output), dtype=args.dtype))
     for row, case in zip(rows, cases, strict=True):
         profile = args.output.parent / args.implementation / case.label.replace(' ', '_') / 'process0'
         row.update(convolution_profile(profile))
@@ -136,17 +160,12 @@ def checkpoint(args):
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
                                            revision='0043f4455889f1625fc6a7472241ebfaed751358')
-    original = conv._polyphase_depthwise_3x3, conv._materialized_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
 
     def sample(dilated=None):
-        try:
-            if dilated is not None:
-                conv._polyphase_depthwise_3x3 = conv._materialized_depthwise_3x3 = dilated
-            jax.clear_caches()
+        jax.clear_caches()
+        with contextlib.nullcontext() if dilated is None else dilated_form(dilated):
             return jax.block_until_ready(pipeline(prompt, key=17, steps=20))
-        finally:
-            conv._polyphase_depthwise_3x3, conv._materialized_depthwise_3x3 = original
 
     with jax.default_matmul_precision('highest'):
         before = sample(partial(reference, precision=None))

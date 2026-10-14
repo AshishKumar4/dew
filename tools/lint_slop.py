@@ -20,6 +20,8 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
+- SLOP011 is about the suite. A test proves behaviour, not wording or source.
+- SLOP012 runs everywhere but the suite, which SLOP008 covers.
 - SLOP013 is about what importing `src/<package>` does to the process.
 
 Every rule fails the gate, and none has a per-finding suppression.
@@ -97,6 +99,8 @@ SEAMS = ("subprocess", "socket", "urllib", "request", "http", "download", "hub",
          "fetch", "client", "urlopen", "snapshot")
 NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "tuple", "str",
              "int", "float", "bool", "bytes"}
+# The hooks Python documents as set by assignment.
+INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "threading.excepthook"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
                  "register_event_listener", "filterwarnings", "simplefilter")
@@ -784,6 +788,61 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
+def _imported(tree: ast.Module) -> dict[str, str]:
+    """The local names this file binds by import, each with the module it came from."""
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            bound |= {(alias.asname or alias.name).split(".")[0]: alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            bound |= {alias.asname or alias.name: node.module or "" for alias in node.names}
+    return bound
+
+
+def _root(node: ast.expr) -> str:
+    """The name an attribute chain starts from, or ""."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def wording(module: Module) -> Iterator[Finding]:
+    """SLOP011: a test that checks wording or source text instead of behaviour."""
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Call):
+            name = _named(node.func)
+            if name.endswith("raises") and any(keyword.arg == "match" for keyword in node.keywords):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                              "matches an error's wording; assert the refusal, not its text")
+            elif name.rsplit(".", 1)[-1] in {"getsource", "getsourcelines", "getsourcefile"}:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                              "reads source text; test what the code does")
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and node.value.startswith(f"src/{module.package}/") and node.value.endswith(".py")):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                          f"names {node.value}; test what the code does, not its source")
+
+
+def patches(module: Module) -> Iterator[Finding]:
+    """SLOP012: a module replaced by assignment, outside the suite."""
+    imported = _imported(module.tree)
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Assign):
+            replaced = [target for target in node.targets if isinstance(target, ast.Attribute)]
+        elif isinstance(node, ast.Call) and _named(node.func) == "setattr" and node.args:
+            replaced = [node.args[0]]
+        else:
+            continue
+        for target in replaced:
+            origin = imported.get(_root(target), "")
+            # The library rebinds nothing it imported but the interpreter's own hooks; a
+            # script, nothing of our package.
+            if origin and _named(target) not in INTERPRETER_HOOKS and (
+                    module.is_source or origin.split(".")[0] == module.package):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP012",
+                              f"rebinds {_named(target)} for every caller; pass the behaviour in")
+
+
 def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
     """The statements an import executes: every block but function bodies and the
     script guard's body (its `else` still runs), class bodies included."""
@@ -830,8 +889,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    if module.relative.startswith("tests/"):
-        rules = (*rules, mocks)
+    rules = (*rules, mocks, wording) if module.relative.startswith("tests/") else (*rules, patches)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
