@@ -38,7 +38,9 @@ def peak_signal_noise_ratio(
     `per_example` is set. Identical inputs give +inf.
     """
     pred, targ = frame_batch(predictions), frame_batch(targets)
-    mse = jnp.mean((pred - targ) ** 2, axis=(1, 2, 3))
+    # Widened before the difference: uint8 pixels would wrap it and square it modulo 256.
+    wide = jnp.promote_types(jnp.result_type(pred, targ), jnp.float32)
+    mse = jnp.mean((pred.astype(wide) - targ.astype(wide)) ** 2, axis=(1, 2, 3))
     scores = 10.0 * jnp.log10(data_range**2 / mse)
     return scores if per_example else jnp.mean(scores)
 
