@@ -556,11 +556,16 @@ def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[Device
 def _coordinated(pipeline: Pipeline) -> tuple[Coordinated, ...]:
     """The step that lays each packed window's documents out as the model
     reads them (`Coordinated`), one per packed ids field, before the stages
-    that pack are planned away: a window holds no more documents than tokens."""
+    that pack are planned away: a window holds no more documents than tokens.
+    A source that reads its windows by plan (`PackedSource`) packs as its pack
+    stage would."""
+    from dew.data.packing import PackedSource
+
+    packs = [stage for stage in _steps(pipeline) if isinstance(stage, Pack)]
+    packs += [source.plan.pack for _, source in _leaves(pipeline) if isinstance(source, PackedSource)]
     caps: dict[tuple[str, ...], int] = {}
-    for stage in _steps(pipeline):
-        if isinstance(stage, Pack):
-            caps[stage.fields] = max(caps.get(stage.fields, 0), stage.seq_len)
+    for stage in packs:
+        caps[stage.fields] = max(caps.get(stage.fields, 0), stage.seq_len)
     return tuple(Coordinated(fields, cap) for fields, cap in caps.items())
 
 
