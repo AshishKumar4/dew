@@ -16,6 +16,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from transformers import AutoTokenizer
@@ -131,14 +132,15 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
 
     assert len(resumed) == len(remaining) == 2
     for uninterrupted, restarted in zip(remaining, resumed, strict=True):
-        for key in uninterrupted:
-            np.testing.assert_array_equal(uninterrupted[key], restarted[key])
+        assert jax.tree.structure(uninterrupted) == jax.tree.structure(restarted)
+        for left, right in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(restarted), strict=True):
+            np.testing.assert_array_equal(left, right)
     for batch, (ids, assistant_mask) in zip([first, *resumed], expected, strict=True):
         np.testing.assert_array_equal(batch["text"][0, :len(ids)], ids)
         np.testing.assert_array_equal(batch["text_roles"][0, :len(ids)] == Role.ASSISTANT,
                                       assistant_mask)
-        np.testing.assert_array_equal(batch["text_positions"][0, :len(ids)], np.arange(len(ids)))
-        np.testing.assert_array_equal(batch["text_segment_ids"][0, :len(ids)], 1)
+        np.testing.assert_array_equal(batch["text_coordinates"].positions[0, :len(ids)], np.arange(len(ids)))
+        np.testing.assert_array_equal(batch["text_coordinates"].segments[0, :len(ids)], 1)
         np.testing.assert_array_equal(batch["text_roles"][0, len(ids):], 0)
 
 
@@ -239,7 +241,7 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
     # Two conversations, one window: the second starts where the first ends.
     np.testing.assert_array_equal(batch["text"][0][len(ids):2 * len(ids)], ids)
-    np.testing.assert_array_equal(batch["text_segment_ids"][0][len(ids):2 * len(ids)], 2)
+    np.testing.assert_array_equal(batch["text_coordinates"].segments[0][len(ids):2 * len(ids)], 2)
 
 
 def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch, tools_tokenizer):

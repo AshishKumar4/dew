@@ -37,7 +37,7 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
@@ -355,9 +355,11 @@ def global_batch(case: Case) -> Batch:
             per_document = -(-width // case.packed_documents)
             document = np.repeat(np.arange(case.packed_documents), per_document)[:width]
             rows = (case.batch_size, 1)
-            batch["text_segment_ids"] = np.tile(document + 1, rows).astype(np.int32)
-            batch["text_positions"] = np.tile(
-                np.arange(width) - document * per_document, rows).astype(np.int32)
+            # As the packer lays a batch out (`dew.data.steps.generic.Coordinated`).
+            positions = np.arange(width) - document * per_document
+            batch["text_coordinates"] = coordinates(
+                segments=np.tile(document + 1, rows), positions=np.tile(positions, rows),
+                max_segments=case.packed_documents + 1, right_padded=True, xp=np)
     else:
         sample_key = "video" if case.frames else "image"
         batch[sample_key] = rng.integers(

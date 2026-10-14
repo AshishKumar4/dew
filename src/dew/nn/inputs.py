@@ -181,9 +181,11 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
+        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
         return replace(self,
             tokens=self.tokens[:, selection],
-            token_fields={name: value[:, selection] for name, value in self.token_fields.items()})
+            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
+                          for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.

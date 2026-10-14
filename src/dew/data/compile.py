@@ -35,6 +35,7 @@ from dew.data.analysis import (
     _name,
     _preferred_read,
     _promoted,
+    _Ran,
     _steps,
     _until,
     _written,
@@ -95,6 +96,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -495,7 +497,8 @@ def _compiled(
     )
     build = build.tuned(train)
     train_host, device = _batch_steps(train)
-    train_host = train_host + host
+    packed = _coordinated(original)
+    train_host = packed + train_host + host
     statistics = _Statistics(counts)
     training = functools.partial(
         _training_reader,
@@ -515,7 +518,7 @@ def _compiled(
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
             ).tuned(validation),
-            host=_held_steps(validation) + host,
+            host=packed + _held_steps(validation) + host,
         )
     )
     records = _epoch_records(train, build)
@@ -545,6 +548,27 @@ def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[Device
     steps = [stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)]
     return (tuple(step for step in steps if not isinstance(step, DeviceStep)),
             tuple(step for step in steps if isinstance(step, DeviceStep)))
+
+
+def _coordinated(pipeline: Pipeline) -> tuple[Coordinated, ...]:
+    """The step that lays each packed window's documents out as the model
+    reads them (`Coordinated`), one per packed ids field, before the stages
+    that pack are planned away: a window holds no more documents than tokens.
+    A pack counts wherever it runs: as a stage, in the stages a memory read
+    already ran, or as the plan a source reads its windows by (`PackedSource`)."""
+    from dew.data.packing import PackedSource
+
+    packs = [stage for stage in _steps(pipeline) if isinstance(stage, Pack)]
+    for _, source in _leaves(pipeline):
+        packs += [stage for stage in _written(source, ()) if isinstance(stage, Pack)]
+        while isinstance(source, (_Facts, _Ran)):
+            source = source.source if isinstance(source, _Facts) else source.original
+        if isinstance(source, PackedSource):
+            packs.append(source.plan.pack)
+    caps: dict[tuple[str, ...], int] = {}
+    for stage in packs:
+        caps[stage.fields] = max(caps.get(stage.fields, 0), stage.seq_len)
+    return tuple(Coordinated(fields, cap) for fields, cap in caps.items())
 
 
 def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
@@ -830,6 +854,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
             for stage in pipeline.stages))
     (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
                             counts=(counts,) if records is None else None)
+    packed = _coordinated(pipeline)
     if read == "memory" and records is None:
         pipeline = _materialize(pipeline, counts)
     lowering = _analyzed(pipeline, read)
@@ -840,7 +865,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
-    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
+    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
@@ -931,6 +956,7 @@ def validation(
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    packed = _coordinated(pipeline)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     if read == "memory":
@@ -938,7 +964,7 @@ def validation(
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
-                             host=_held_steps(pipeline) + host)
+                             host=packed + _held_steps(pipeline) + host)
 
 
 def publish(
