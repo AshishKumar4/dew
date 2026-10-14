@@ -111,6 +111,6 @@ GPT OSS's per-expert biases go through `moe.gather_expert_bias`, which accumulat
 
 ## Cost and validation
 
-More experts need more parameter storage, even with a fixed `top_k`. Routing, communication, shared experts and load imbalance all add to runtime. Estimate the optimizer and EMA storage along with the parameters, and time a representative forward and backward step on the topology you plan to use.
+More experts need more parameter storage, even with a fixed `top_k`. Routing, communication, shared experts and load imbalance all add to runtime. Every expert's weights stay in accelerator memory: streaming experts from host memory or SSD, as a trillion-parameter model would need, is deferred, not dropped. Estimate the optimizer and EMA storage along with the parameters, and time a representative forward and backward step on the topology you plan to use.
 
 Against a reference model, compare the router's selections and weights, the sparse layer output, the loss and the parameter updates. For distributed training, check that the balancing statistics cover the global batch and that replicated state stays identical across shards. [Supported models](../models.md) lists which sparse checkpoints load and which have no export writer.

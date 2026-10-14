@@ -34,13 +34,11 @@ truth, everything in float64.
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import sys
 import tarfile
 import tempfile
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
@@ -54,7 +52,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "flaxdiff_pipeline" / "reference.npz"
 COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
 ARCHIVE_SHA256 = "93535e536346b5112751cd581fc6d94ba041fcf46365a81abbeaf572ff3682fd"
-SOURCE = Path.home() / ".cache" / "dew" / "upstream" / "AshishKumar4" / "FlaxDiff" / COMMIT
 MODEL = {"output_channels": 4, "patch_size": 2, "emb_features": 32, "num_layers": 4,
          "num_heads": 4, "mlp_ratio": 4, "dropout_rate": 0.1, "norm_groups": 0,
          "use_hilbert": False, "use_flash_attention": False,
@@ -66,23 +63,19 @@ IMAGE, STEPS, KEY, SEED = 32, 200, 3, 0
 
 def fetch() -> Path:
     """The pinned source, fetched once and checked against its SHA-256."""
-    if (SOURCE / "flaxdiff" / "__init__.py").is_file():
-        return SOURCE
-    SOURCE.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/AshishKumar4/FlaxDiff/archive/{COMMIT}.tar.gz"
-    with urllib.request.urlopen(url, timeout=300) as response:
-        archive = response.read()
-    if hashlib.sha256(archive).hexdigest() != ARCHIVE_SHA256:
-        raise SystemExit(f"{url} is not the pinned archive")
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as file:
-        file.write(archive)
-        file.flush()
-        with tarfile.open(file.name) as source:
-            members = [member for member in source.getmembers() if "/" in member.name]
-            for member in members:
-                member.name = member.name.split("/", 1)[1]
-            source.extractall(SOURCE, members=members, filter="data")
-    return SOURCE
+    from tools.reference_source import CACHE, verified
+
+    unpacked = CACHE / "AshishKumar4" / "FlaxDiff" / COMMIT
+    if (unpacked / "flaxdiff" / "__init__.py").is_file():
+        return unpacked
+    archive = verified(f"https://github.com/AshishKumar4/FlaxDiff/archive/{COMMIT}.tar.gz",
+                       unpacked.parent / f"{COMMIT}.tar.gz", ARCHIVE_SHA256)
+    with tarfile.open(archive) as source:
+        members = [member for member in source.getmembers() if "/" in member.name]
+        for member in members:
+            member.name = member.name.split("/", 1)[1]
+        source.extractall(unpacked, members=members, filter="data")
+    return unpacked
 
 
 def towers(root: Path) -> tuple[Path, Path]:
@@ -226,6 +219,7 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
 
 
 def main() -> None:
+    sys.path[:0] = [str(ROOT)]
     sys.path.insert(0, str(fetch()))
     # FlaxDiff's `StableDiffusionVAE` imports Diffusers' Flax SD pipeline and
     # never uses it; that module imports FlaxCLIPTextModel, which

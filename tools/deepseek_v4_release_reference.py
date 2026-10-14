@@ -27,22 +27,20 @@ under `v4/` and `v4_1/`. Run from the checkout with torch 2.14 on the CPU:
     python tools/deepseek_v4_release_reference.py
 """
 
-import hashlib
 import importlib.util
 import json
 import sys
 import tempfile
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
+from reference_source import CACHE, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_v4_release.npz"
-CACHE = Path.home() / ".cache" / "dew" / "upstream"
 RELEASES = {
     "v4": ("deepseek-ai/DeepSeek-V4-Flash", "60d8d70770c6776ff598c94bb586a859a38244f1", 128),
     "v4_1": ("deepseek-ai/DeepSeek-V4.1-Flash", "dba1be0a40aa45a94ad051997016db3960a90277", 32),
@@ -62,15 +60,8 @@ KERNELS = ("act_quant", "fp4_act_quant", "fp4_gemm", "fp8_gemm", "hc_split_sinkh
 def fetched(release: str, path: str) -> Path:
     """One release file at its pinned commit, checked against its SHA-256."""
     repo, commit, _ = RELEASES[release]
-    local = CACHE / repo / commit / path
-    if not local.is_file():
-        local.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://huggingface.co/{repo}/resolve/{commit}/{path}"
-        local.write_bytes(urllib.request.urlopen(url).read())
-    digest = hashlib.sha256(local.read_bytes()).hexdigest()
-    if digest != SHA256[release, path]:
-        raise RuntimeError(f"{local} has SHA-256 {digest}, not the pinned {SHA256[release, path]!r}")
-    return local
+    return verified(f"https://huggingface.co/{repo}/resolve/{commit}/{path}", CACHE / repo / commit / path,
+                    SHA256[release, path])
 
 
 def load(name: str, path: Path):
