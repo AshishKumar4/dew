@@ -13,14 +13,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import Digits, decoder, flat_tree, serving_task as task
+from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.pipeline import place
 from dew.inference.serving import Server
-from dew.interop.weights import decoding_storage
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.kv_cache import KVCache
@@ -79,25 +78,34 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
 
 
 def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
-    """A server over a bf16 decoder's fp32 weights holds them at decoding
-    storage, and a reload of the trained fp32 tree casts it there: the
-    server then draws what one built over the trained weights draws."""
-    model = decoder().clone(max_seq_len=128, dtype=jnp.bfloat16, head_bias=True)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    bound = TextGeneration(model, params, RunProcessor(Digits()),
-                           sampling=Sampling(temperature=0, eos_token_ids=12))
-    server = Server.from_task(bound, slots=2, capacity=128)
+    """A server over a bf16 decoder's fp32 masters holds what a load at bf16
+    storage holds, its head bias fp32, and a reload of trained fp32 weights
+    casts them as a server over that load casts them: the two hold the same
+    leaves and draw the same tokens."""
+    from pathlib import Path
 
-    def held(variables):
-        return {name: leaf.dtype for name, leaf in flat_tree(variables).items()}
+    from dew.interop import Pretrained
 
-    stored = held(decoding_storage(model, params))
-    assert held(server.variables) == stored and jnp.dtype(jnp.bfloat16) in stored.values()
-    trained = jax.tree.map(lambda leaf: leaf * 1.5, params)
-    server.reload(trained)
-    assert held(server.variables) == stored
-    fresh = Server.from_task(bound.bind(trained), slots=2, capacity=128)
-    for actual, expected in zip(server(["12", "34"], 5, key=3), fresh(["12", "34"], 5, key=3), strict=True):
+    masters, native = (Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="bfloat16",
+                                       attention_impl="xla", max_seq_len=48, **storage)
+                       for storage in ({}, {"param_dtype": "bfloat16"}))
+    assert native.variables["params"]["head_bias"].dtype == jnp.float32
+    sampling = Sampling(temperature=0, eos_token_ids=None)
+    wide, narrow = (Server.from_task(source.text_generation(sampling=sampling), slots=2, capacity=32)
+                    for source in (masters, native))
+
+    def same(left, right):
+        for (path, actual), expected in zip(jax.tree_util.tree_leaves_with_path(left), jax.tree.leaves(right),
+                                            strict=True):
+            assert actual.dtype == expected.dtype, path
+            np.testing.assert_array_equal(actual, expected, err_msg=str(path))
+
+    same(wide.variables, narrow.variables)
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, masters.variables)
+    for server in (wide, narrow):
+        server.reload(trained)
+    same(wide.variables, narrow.variables)
+    for actual, expected in zip(wide([[3, 4, 5]], 5, key=3), narrow([[3, 4, 5]], 5, key=3), strict=True):
         assert_same_generation(actual, expected)
 
 
