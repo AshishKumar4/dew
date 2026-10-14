@@ -214,12 +214,17 @@ def _parses(function: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) ->
     return tested and refuses
 
 
+def _arguments(function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> list[ast.arg]:
+    """Every parameter in a signature."""
+    arguments = function.args
+    return [argument for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                                      arguments.vararg, arguments.kwarg) if argument is not None]
+
+
 def _annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
     """Every annotation in a signature, paired with the name it belongs to."""
-    arguments = function.args
-    for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                     arguments.vararg, arguments.kwarg):
-        if argument is not None and argument.annotation is not None:
+    for argument in _arguments(function):
+        if argument.annotation is not None:
             yield argument.arg, argument.annotation
     if function.returns is not None:
         yield "return", function.returns
@@ -312,13 +317,15 @@ def suppressions(module: Module) -> Iterator[Finding]:
                           f"{hit.strip()} asserts what the code did not prove")
 
 
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
 def _own(scope: ast.AST) -> Iterator[ast.AST]:
-    """Every node in one scope, without descending into a nested scope."""
+    """Every node in one scope, a nested scope's own node but not its contents."""
     for node in ast.iter_child_nodes(scope):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
-            continue
         yield node
-        yield from _own(node)
+        if not isinstance(node, SCOPES):
+            yield from _own(node)
 
 
 def probes(module: Module) -> Iterator[Finding]:
@@ -586,10 +593,10 @@ def _bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[
     return {alias.asname or alias.name: f"{base}.{alias.name}" for alias in node.names if alias.name != "*"}
 
 
-def _imports(tree: ast.Module, name: str, package: bool) -> dict[str, str]:
+def _imports(tree: ast.Module, parent: Sequence[str]) -> dict[str, str]:
     """What each name a module imports stands for, as a dotted path: every
-    import in it, those inside functions and type-checking blocks included."""
-    parent = name.split(".") if package else name.split(".")[:-1]
+    import in it, those inside functions and type-checking blocks included.
+    `parent` is the package its relative imports start from (`_parent`)."""
     bound: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import | ast.ImportFrom):
@@ -647,7 +654,7 @@ class ModelIndex:
         bodies: dict[str, list[ast.stmt]] = {}
         for module in modules:
             name = _module_name(module)
-            index.imports[name] = _imports(module.tree, name, module.path.name == "__init__.py")
+            index.imports[name] = _imports(module.tree, _parent(module))
             index.aliases[name] = {}
             for node in module.tree.body:
                 if isinstance(node, ast.ClassDef):
@@ -799,43 +806,48 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
-SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp,
-          ast.DictComp, ast.GeneratorExp)
+def _outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef) -> list[ast.AST]:
+    """The parts of a nested scope's statement its enclosing scope evaluates:
+    decorators, defaults, annotations, a class's bases and keywords."""
+    if isinstance(scope, ast.ClassDef):
+        return [*scope.decorator_list, *scope.bases, *scope.keywords]
+    defaults = [*scope.args.defaults, *(default for default in scope.args.kw_defaults if default is not None)]
+    if isinstance(scope, ast.Lambda):
+        return defaults
+    return [*scope.decorator_list, *defaults, *(annotation for _, annotation in _annotations(scope))]
 
 
-def _in_scope(scope: ast.AST) -> Iterator[ast.AST]:
-    """Every node of one lexical scope, a nested scope itself but not its contents."""
-    for node in ast.iter_child_nodes(scope):
-        yield node
-        if not isinstance(node, SCOPES):
-            yield from _in_scope(node)
-
-
-def _scoped(scope: ast.AST, visible: Mapping[str, str], parent: Sequence[str]
+def _scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
+            bound: frozenset[str] = frozenset(), class_body: bool = False
             ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
-    """Every node under `scope`, with what each name imported there stands for
-    (`visible` around it): a scope's own imports over its surroundings', and
-    a name it binds otherwise (a parameter, an assignment, a definition)
-    standing for no import. A class body's names reach no scope inside it."""
-    nodes = list(_in_scope(scope))
-    arguments = scope.args if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) else None
-    local = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
-    local |= {node.name for node in nodes
-              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
-    if arguments is not None:
-        parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
-                      arguments.kwarg)
-        local |= {parameter.arg for parameter in parameters if parameter is not None}
+    """Every node of a scope's `body` and of the scopes in it, with what each
+    name imported there stands for (`visible` around it): a name the scope
+    only imports, its import; one it binds otherwise (`bound` parameters,
+    an assignment, a definition), none. A comprehension's targets stay its
+    own, and a class body's names reach no scope inside it."""
+    nodes = [node for statement in body
+             for node in (statement, *(() if isinstance(statement, SCOPES) else _own(statement)))]
+    targets = {id(name) for node in nodes if isinstance(node, ast.comprehension)
+               for name in ast.walk(node.target)}
+    stored = {node.id for node in nodes
+              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
+    defined = {node.name for node in nodes
+               if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+    local = {*bound, *stored, *defined}
     imported: dict[str, str] = {}
     for node in nodes:
         if isinstance(node, ast.Import | ast.ImportFrom):
             imported |= _bound_by(node, parent)
-    table = {name: target for name, target in visible.items() if name not in local} | imported
-    inner = visible if isinstance(scope, ast.ClassDef) else table
+    table = {name: target for name, target in {**visible, **imported}.items() if name not in local}
     for node in nodes:
         yield node, table
         if isinstance(node, SCOPES):
-            yield from _scoped(node, inner, parent)
+            yield from ((part, table) for outer in _outside(node) for part in ast.walk(outer))
+            inner = node.body if isinstance(node.body, list) else [node.body]
+            parameters = frozenset() if isinstance(node, ast.ClassDef) else frozenset(
+                argument.arg for argument in _arguments(node))
+            yield from _scoped(inner, visible if class_body else table, parent, parameters,
+                               isinstance(node, ast.ClassDef))
 
 
 def _resolved(node: ast.expr, table: Mapping[str, str]) -> str:
@@ -852,7 +864,7 @@ def _resolved(node: ast.expr, table: Mapping[str, str]) -> str:
 
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour."""
-    for node, table in _scoped(module.tree, {}, _parent(module)):
+    for node, table in _scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Call):
             called = _resolved(node.func, table)
             if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
@@ -869,7 +881,7 @@ def wording(module: Module) -> Iterator[Finding]:
 
 def patches(module: Module) -> Iterator[Finding]:
     """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
-    for node, table in _scoped(module.tree, {}, _parent(module)):
+    for node, table in _scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
             owner, attribute = node.value, node.attr
         elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
