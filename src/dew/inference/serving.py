@@ -524,14 +524,14 @@ class Server:
         """
         mesh = mesh_of(task.variables)
         if mesh is not None:
-            if mesh.shape[STAGE_AXIS] > 1:
+            if mesh.shape.get(STAGE_AXIS, 1) > 1:
                 raise ValueError(
                     "a server decodes through the whole layer stack every step; the stage axis "
                     "runs the stack as the training pipeline, which the decoder refuses to decode "
                     "through (one token a step leaves no microbatches to pipeline). Serve on a "
                     "mesh with stage=1"
                 )
-            if mesh.shape[SEQUENCE_AXIS] > 1:
+            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
                 raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
                                  "and a decoder refuses to decode under a sequence axis, which splits a "
                                  "sequence's positions. Serve on a mesh with sequence=1")

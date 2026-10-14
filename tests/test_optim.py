@@ -33,12 +33,12 @@ from dew.training.optim import (
     Power,
     PowerTail,
     ScheduleBase,
+    learning_rate,
     muon_weight_dimension_numbers,
     scale_by_qk_clip,
     scaled,
     weight_decay_mask,
 )
-from dew.training.trainer import learning_rate
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3

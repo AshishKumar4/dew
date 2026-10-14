@@ -52,6 +52,7 @@ from dew.registry import dtype_name, from_record, resolve_dtype
 from dew.sampling.guidance import CFG
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
 
     from dew.training.distributed import Layout, MeshSpec
 
@@ -395,7 +396,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
 def load_diffusion_conditioner[C: ConditionEncoder](
         checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
         revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
-        params: Variables | None = None, mesh: MeshSpec | None = None, layout: Layout | None = None,
+        params: Variables | None = None, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
         size: tuple[int, int] | None = None) -> C:
     """Load the text conditioning a pipeline's denoiser reads, which must be a
     `kind`, or bind supplied parameters using metadata only. `tokens` replaces
