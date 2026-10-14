@@ -5,6 +5,7 @@ AdamW keeps the embeddings, the head and the norms, Muon takes the matrices.
 Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
+import dataclasses
 import json
 import typing
 from pathlib import Path
@@ -31,6 +32,7 @@ from dew.training.optim import (
     ParamGroup,
     Power,
     PowerTail,
+    ScheduleBase,
     muon_weight_dimension_numbers,
     scale_by_qk_clip,
     scaled,
@@ -166,6 +168,26 @@ def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
         np.asarray(at(updates, out)).reshape(out_flat['kernel'].shape),
         np.asarray(expected_out['kernel']), atol=1e-8)
 
+
+
+def test_a_schedule_that_marks_no_rate_is_its_own_shape():
+    """A ScheduleBase subclass implementing `values` alone, with fields of its own and
+    none marked a rate, builds under OptimConfig and steps at the values it gives."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Halving(ScheduleBase):
+        start: float = 0.4
+
+        def values(self, steps):
+            return lambda count: self.start * 0.5 ** count
+
+    assert scaled(Halving()) == (1.0, Halving())
+    solver = OptimConfig(optimizer="sgd", learning_rate=Halving(), clip_grads=None).build(4)
+    params = {"w": jnp.ones(3)}
+    state = solver.init(params)
+    for step in range(3):
+        updates, state = solver.update({"w": jnp.ones(3)}, state, params)
+        np.testing.assert_allclose(np.asarray(updates["w"]), -0.4 * 0.5 ** step, rtol=1e-6)
 
 def test_weight_decay_reaches_the_norm_scales():
     """Decay on the norm scale is the piece of the recipe that lives in the

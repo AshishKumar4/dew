@@ -571,7 +571,9 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
     rates' ratios stay in the shape, so runs at different scales share it.
     A schedule of zeros has the scale 0 and a shape whose first rate field
     is 1, so it applies exactly zero. A None field keeps its derived
-    default (OneCycle's init and end)."""
+    default (OneCycle's init and end). A schedule that marks no field a
+    rate, a subclass implementing `values` alone, is its own shape at the
+    scale 1: its values are the rates."""
     if not isinstance(rate, ScheduleBase):
         return rate, None
 
@@ -583,7 +585,10 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
             elif dataclasses.is_dataclass(value):
                 yield from rates(value)
 
-    scale = next((value for value in rates(rate) if value != 0), 0.0)
+    found = list(rates(rate))
+    if not found:
+        return 1.0, rate
+    scale = next((value for value in found if value != 0), 0.0)
 
     def normalized(record):
         fields = {}
@@ -596,8 +601,8 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         return dataclasses.replace(record, **fields)
 
     shape = normalized(rate)
-    if scale == 0:
-        first = next(field.name for field in dataclasses.fields(rate) if field.metadata.get('rate'))
+    first = next((field.name for field in dataclasses.fields(rate) if field.metadata.get('rate')), None)
+    if scale == 0 and first is not None:
         shape = dataclasses.replace(shape, **{first: 1.0})
     return scale, shape
 
