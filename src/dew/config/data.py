@@ -12,7 +12,16 @@ import numpy as np
 from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
-from dew.data.holdout import HoldOut, SourceValue, Split, Validation, _branches, _source, source_argument
+from dew.data.holdout import (
+    HoldOut,
+    SourceValue,
+    Split,
+    Validation,
+    _branches,
+    _named_split,
+    _source,
+    source_argument,
+)
 from dew.data.load import RECORD_HOLDOUT, TEXT_HOLDOUT
 from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, ObjectiveData, Phases, Pipeline, mix
 
@@ -114,31 +123,22 @@ class TextData(_Loadable):
         if isinstance(self.source, Mapping) and all(
             isinstance(weight, (int, float)) for weight in self.source.values()
         ):
-            branches = [dataclasses.replace(self, source=path).pipelines() for path in sorted(self.source)]
-            if not branches:
+            # Each corpus with its weight, so a corpus without a held split leaves the held mixture
+            # with its weight.
+            weights = {path: float(weight) for path, weight in self.source.items()
+                       if isinstance(weight, (int, float))}
+            pairs = [(dataclasses.replace(self, source=path).pipelines(), weight)
+                     for path, weight in sorted(weights.items())]
+            if not pairs:
                 raise ValueError("TextData mixture has no corpora")
-            weighted = {
-                path: float(weight)
-                for path, weight in self.source.items()
-                if isinstance(weight, (int, float))
-            }
-            weights = [weighted[path] for path in sorted(weighted)]
-            trains = [branch[0] for branch in branches]
-            held = [branch[1] for branch in branches]
-            train = (
-                trains[0]
-                if len(trains) == 1
-                else mix(trains, weights, by="tokens")
-            )
-            scored = [branch for branch in held if branch is not None]
-            validation = (
-                None
-                if not scored
-                else scored[0]
-                if len(scored) == 1
-                else mix(scored, weights)
-            )
-            return train, validation, ()
+            trains = [(branches[0], weight) for branches, weight in pairs]
+            scored = [(branches[1], weight) for branches, weight in pairs if branches[1] is not None]
+
+            def mixed(weighted, **options):
+                pipelines, shares = zip(*weighted, strict=True)
+                return pipelines[0] if len(pipelines) == 1 else mix(pipelines, shares, **options)
+
+            return mixed(trains, by="tokens"), mixed(scored) if scored else None, ()
         stored = _source(self.source, split=self.split)
         if isinstance(stored, TokenFiles):
             return self._token_pipelines(stored)
@@ -180,13 +180,13 @@ class TextData(_Loadable):
 
         held = self.validation
         if isinstance(held, Split):
-            held = dataclasses.replace(stored, split=held.name)
+            held = _named_split(stored, held.name)
         elif isinstance(held, HoldOut):
             raise ValueError(
                 "token-store validation uses its named split; slice a windows Pipeline for HoldOut"
             )
         if held is None and stored.metadata().get("val_tokens", 0):
-            held = dataclasses.replace(stored, split="val")
+            held = _named_split(stored, "val")
         sources = (stored, None if held is None or isinstance(held, Pipeline) else _source(held))
 
         def windows(source, stride):
@@ -273,6 +273,10 @@ class PromptData(_Loadable):
 class _PromptFacts:
     source: Source
     width: int | None
+
+    def with_split(self, name: str) -> _PromptFacts:
+        """These facts over the source's own split `name`, which a source without splits refuses."""
+        return dataclasses.replace(self, source=_named_split(self.source, name))
 
     def consumed(self, read: Read) -> _PromptFacts:
         consumed = dataclasses.replace(self, source=_consumed(self.source, read))
@@ -577,12 +581,14 @@ def _batched(
     train: bool,
     tokens: int | None = None,
 ) -> Pipeline:
-    from dew.data.pipeline import BatchStage, MapBatch
+    from dew.data.pipeline import BatchStage, MapBatch, TokenBudget
 
-    stated = [stage.size for stage in pipeline.stages if isinstance(stage, BatchStage)]
+    stated = [(stage.size, None) if isinstance(stage, BatchStage) else (None, stage.tokens)
+              for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget))]
     if stated:
-        if stated != [batch]:
-            raise ValueError(f"pipeline batches {stated}, but load requested batch={batch}")
+        if stated != [(batch, tokens)]:
+            raise ValueError(f"pipeline batches {stated} (rows, tokens), but load requested batch={batch}, "
+                             f"tokens={tokens}")
         return pipeline
 
     at = _until(pipeline.stages, MapBatch)
