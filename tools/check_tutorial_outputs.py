@@ -17,8 +17,9 @@ It exits 1 when it flags anything. With --report it exits 0 and, under GitHub
 Actions, turns each flag into a warning and writes a table to the job summary:
 the Tutorials workflow reports stale outputs this way, since the notebooks
 import about 190 of Dew's files and nearly every change to the library makes
-their outputs stale. The outputs are refreshed by a daily full run; the smoke
-run is what fails when a notebook breaks.
+their outputs stale. The outputs are refreshed by a full run
+(`run_tutorials.py --full --save`) when a tutorial is revised; the smoke run is
+what fails when a notebook breaks.
 
     python tools/run_tutorials.py --imports /tmp/imports.json
     python tools/check_tutorial_outputs.py /tmp/imports.json [--report] [PREFIX ...]

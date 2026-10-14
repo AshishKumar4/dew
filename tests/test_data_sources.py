@@ -118,6 +118,56 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     return converted
 
 
+def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
+    """A dataset repo's `.arrow` files are what `save_to_disk` and `push_to_hub` write, Arrow's
+    stream format, which no file reader opens; a split that holds only those streams its Parquet
+    conversion, and a pinned revision without one is prepared rather than streamed."""
+    from types import SimpleNamespace
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Hub
+
+    rows = pa.table({"id": list(range(12))})
+    stream = pa.BufferOutputStream()
+    with pa.ipc.new_stream(stream, rows.schema) as writer:
+        writer.write_table(rows)
+    converted = pa.BufferOutputStream()
+    pq.write_table(rows, converted)
+    payloads = {
+        "datasets/owner/data@original/train/data-00000-of-00001.arrow": stream.getvalue().to_pybytes(),
+        "datasets/owner/data@converted/default/train/0000.parquet": converted.getvalue().to_pybytes(),
+    }
+
+    def header(self, path, **kwargs):
+        return {"name": path, "type": "file", "size": len(payloads[path]),
+                "sha256": hashlib.sha256(payloads[path]).hexdigest()}
+
+    def listing(self, repo, *, repo_type, revision):
+        return (["default/train/0000.parquet"] if revision == "converted"
+                else ["train/data-00000-of-00001.arrow", "train/state.json"])
+
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    monkeypatch.setattr(HfFileSystem, "info", header)
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
+    reader = compile(Pipeline(Hub("owner/data")).batch(4), read="streamed",
+                     loading=Loading(workers=0)).train(DataPartition())
+    try:
+        assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
+    finally:
+        reader.close()
+    assert Hub("owner/data", revision="original").streamed is None
+
+
 def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(moving_hub_conversion):
     """One source pins its conversion once; a new source refuses the old plan
     after that conversion moves under the same default commit."""
@@ -230,7 +280,7 @@ def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
         moved.close()
 
 
-@pytest.mark.parametrize("format", ["jsonl", "arrow", "parquet"])
+@pytest.mark.parametrize("format", ["jsonl", "parquet"])
 def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     from types import SimpleNamespace
 
@@ -609,6 +659,81 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     assert isinstance(resolve(root), TokenFiles)
     with pytest.raises(ValueError, match="one split"):
         source.with_split("val")
+
+
+@pytest.fixture(params=["raw", "packed", "export"])
+def token_span_store(tmp_path, request):
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    documents = [[], [], [1, 2, 0], [], [3, 0], [4, 5, 6, 0]]
+    metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                "vocab_size": 256, "eos_id": 0}
+    if request.param == "export":
+        export([{"text": np.asarray(document, np.int32)} for document in documents], str(tmp_path),
+               format="array_record", rows_per_shard=2, length_field="text", metadata=metadata)
+    else:
+        (tmp_path / "meta.json").write_text(json.dumps(metadata))
+        for shard, start in enumerate(range(0, len(documents), 2)):
+            writer = ArrayRecordWriter(str(tmp_path / f"train-{shard}.array_record"), "group_size:1")
+            for document in documents[start:start + 2]:
+                raw = np.asarray(document, np.int32).tobytes()
+                writer.write(pack_dict_of_byte_arrays({"ids": raw}) if request.param == "packed" else raw)
+            writer.close()
+    return tmp_path, "ids" if request.param == "packed" else None
+
+
+def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_span_store):
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.tokens import TokenFiles
+
+    root, field = token_span_store
+    stored = TokenFiles(str(root), field=field).provision()
+    tokens = stored.tokens
+    expected = np.asarray([1, 2, 0, 3, 0, 4, 5, 6, 0], np.int32)
+    assert len(tokens) == len(expected)
+    for span in (slice(None), slice(1, 8), slice(-5, -1), slice(3, 5), slice(5, 5), slice(8, 2)):
+        np.testing.assert_array_equal(tokens[span], expected[span])
+    with pytest.raises(ValueError):
+        tokens[::2]
+    assert stored.documented
+    assert stored.document_ends().tolist() == [3, 5, 9]
+    for read in ("memory", "indexed", "streamed"):
+        rows = iterate(Pipeline(stored), read=read, loading=Loading(workers=0, threads=1, read_buffer=0))
+        assert [row["text"].tolist() for row in rows] == [[1, 2, 0], [3, 0], [4, 5, 6, 0]]
+    for shard, index in zip(tokens.shards, tokens.indexes, strict=True):
+        assert shard.columns is index.values
+        assert isinstance(shard.columns, np.memmap)
+    reopened = pickle.loads(pickle.dumps(tokens))
+    np.testing.assert_array_equal(reopened[1:8], expected[1:8])
+    assert all(isinstance(shard.columns, np.memmap) for shard in reopened.shards)
+
+
+def test_each_token_document_is_checked_against_its_producer_length(token_span_store):
+    from dew.data.sources.tokens import TokenFiles
+
+    root, field = token_span_store
+    TokenFiles(str(root), field=field).provision()
+    manifest_path = root / "_dew_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes()) if manifest_path.exists() else None
+    path = (root / manifest["files"][1]["lengths"]["path"] if manifest is not None
+            else root / "train.lengths.npy")
+    columns = np.load(path, allow_pickle=False)
+    row = 0 if manifest is not None else 2
+    columns[row, 0] += 1
+    columns[row:, 1] += 1
+    encoded = io.BytesIO()
+    np.save(encoded, columns, allow_pickle=False)
+    path.write_bytes(encoded.getvalue())
+    if manifest is not None:
+        manifest["files"][1]["lengths"].update(
+            bytes=len(encoded.getvalue()), sha256=hashlib.sha256(encoded.getvalue()).hexdigest())
+        manifest_path.write_text(json.dumps(manifest))
+    stored = TokenFiles(str(root), field=field)
+    with pytest.raises(ValueError):
+        stored.tokens[:3]
 
 
 @pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
@@ -1065,6 +1190,30 @@ def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, fo
     assert first_rows == second_rows == [f"row {index}" + ("\n" if format == "text" else "")
                                         for index in range(4)]
     assert first_identity == second_identity
+
+
+def test_a_pool_is_shown_which_part_of_its_plan_differs():
+    """Processes whose plans differ are refused with each one's plan, part by
+    part, a digest each: a step's identity or a source's content shows as the
+    one entry that differs, not as one digest of everything."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    def parts(rows, version):
+        doubled = Pipeline(Memory(rows)).map(lambda row: {"x": row["x"] * 2}, identity=f"doubled@{version}")
+        return compile(doubled.repeat().batch(2), read="memory", loading=Loading(workers=0)).plan.parts()
+
+    rows = tuple({"x": np.int32(index)} for index in range(4))
+    base, stepped = parts(rows, 1), parts(rows, 2)
+    changed = parts((*rows[:3], {"x": np.int32(9)}), 1)
+
+    def differing(other) -> set[str]:
+        return {name for name in base if base[name] != other[name]}
+
+    assert differing(stepped) == {"manifest steps"}
+    assert [old == new for old, new in zip(base["manifest steps"], stepped["manifest steps"], strict=True)
+            ].count(False) == 1
+    assert "manifest source" in differing(changed) and "manifest steps" not in differing(changed)
 
 
 def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):

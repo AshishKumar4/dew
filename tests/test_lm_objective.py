@@ -734,19 +734,24 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
 
 
-def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head():
+@pytest.mark.parametrize("tile_tokens", [4, 16])
+def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
+        tile_tokens):
     """A training step whose head is tiled takes the head's gradient in the
-    forward (`fused_head_loss`): beside blocks recomputed in the backward, the
-    step contracts the whole vocabulary three times, the logits, the states'
-    gradient and the head's, none again, and its loss and gradients are the
-    per-token tiled head's, z-loss and padding included."""
+    forward (`fused_head_loss`), a tile's tokens a chunk: beside blocks
+    recomputed in the backward, the step contracts the whole vocabulary
+    three times, the logits, the states' gradient and the head's, none again,
+    and its loss and gradients are the per-token tiled head's, z-loss and
+    padding included. A tile that holds all 16 tokens would make one chunk
+    holding every logit, so the step keeps the tiled head, contracting the
+    vocabulary as it does without a z-loss, which never fuses."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     vocab = 61
     model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
                               max_seq_len=8, tie_embeddings=False, remat="full", qk_norm=False,
                               attention_impl="reference")
     tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, vocab).at[1, 6:].set(0)
-    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(4, 16))
+    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
     params = fused.init(jax.random.key(0))
 
     def loss(objective, *, training):
@@ -770,7 +775,14 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
                     count += products(inner)
         return count
 
-    assert products(jax.make_jaxpr(jax.grad(loss(fused, training=True)))(params).jaxpr) == 3
+    def step_products(objective) -> int:
+        return products(jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params).jaxpr)
+
+    if tile_tokens == 4:
+        assert step_products(fused) == 3
+    else:
+        tiled = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(tile_tokens, 16))
+        assert step_products(fused) == step_products(tiled) != 3
     with jax.default_matmul_precision("highest"):
         mine = jax.value_and_grad(loss(fused, training=True))(params)
         theirs = jax.value_and_grad(loss(fused, training=False))(params)

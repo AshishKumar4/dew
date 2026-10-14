@@ -8,7 +8,7 @@ the accepted rows, each with the source position it came from, as a
 other. Record steps, token splits, Grain's packers and cache reads run by
 the Grain lowering's own definitions (`dew.data.lowering`); first-fit
 packing and windows run by their indexed plans (`PackedWindows`,
-`WindowRecords`), so the plan can fingerprint them. It counts what it
+`IndexedWindows`), so the plan can fingerprint them. It counts what it
 attempted, accepted and rejected, and records the derived order facts a
 resume checks.
 """
@@ -186,12 +186,14 @@ def _memory_stages(
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):
-            from dew.data.steps.windows import WindowRecords
+            from dew.data.steps.windows import IndexedWindows
 
             derived[f"accepted_before_windows_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            windows = WindowRecords(tuple(record(value, "window document") for _, value in rows), stage)
+            windows = IndexedWindows.from_records(
+                tuple(record(value, "window document") for _, value in rows), stage
+            )
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
@@ -222,7 +224,8 @@ def _memory_stages(
             expanded_counts: dict[tuple[int, ...], int] = {}
             counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
             for identifier, value in rows:
-                for child, output in enumerate(_outputs(stage, identifier[0], value)):
+                outputs = _outputs(stage, identifier[0], value, counts=counter)
+                for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1
                     else:

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import TimingRegression as Regression, batches
+from affine_run import BATCH, TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
 from dew.data import Loading, Rejected, from_grain, mix
@@ -308,6 +308,47 @@ def test_full_queue_close_preserves_consumed_position_and_releases_source():
     assert ref() is None
 
 
+def test_a_stop_request_racing_the_workers_close_reaches_the_source_it_read():
+    """close asks a stoppable source to stop while the worker, the source just drained, closes it
+    and lets it go: the request reaches the source close read, and close returns without error.
+    The source holds the race open: when close checks it for request_stop, the source lets its
+    worker drain and finish, and waits a moment for it."""
+    events, drain = [], threading.Event()
+    stream = None
+
+    class Draining:
+        @property
+        def __class__(self):
+            # The main thread's checks after the stop was asked for: let the worker finish meanwhile.
+            if threading.current_thread() is threading.main_thread() and stream._stop.is_set():
+                drain.set()
+                for _ in range(100):
+                    if stream._iterator is None:
+                        break
+                    threading.Event().wait(0.01)
+            return Draining
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            drain.wait(10)
+            raise StopIteration
+
+        def request_stop(self):
+            events.append("stop")
+
+        def close(self):
+            events.append("close")
+
+    stream = DevicePrefetchIterator(Draining(), MeshSpec().build(), depth=1)
+    consumer = threading.Thread(target=lambda: next(stream, None))
+    consumer.start()
+    stream.close()
+    consumer.join(10)
+    assert sorted(events) == ["close", "stop"]
+
+
 @pytest.mark.parametrize("failure", [None, ValueError("source failed")])
 def test_terminal_outcome_finalizes_with_a_full_data_queue(failure):
     source = Source(end=3, failure=failure)
@@ -504,8 +545,9 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
 
 def test_a_refusal_before_the_transfer_finalizes_the_untransferred_source(tmp_path):
-    """A stream fit refuses before its prefetch worker owns it, here for a
-    batch the mesh's eight devices cannot divide, is closed by fit."""
+    """A stream fit refuses before its prefetch worker owns it is closed by fit. Here the stream
+    keeps no position, and the run resumes from a checkpoint that holds none, which any mesh
+    refuses: reading it again from the start would repeat its data."""
     closed = threading.Event()
 
     class Uncheckpointable:
@@ -518,10 +560,16 @@ def test_a_refusal_before_the_transfer_finalizes_the_untransferred_source(tmp_pa
         def close(self):
             closed.set()
 
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      checkpoints=Checkpoints(str(tmp_path)))
-    with pytest.raises(ValueError, match="7"):
-        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, 7), steps=1, checkpoint_every=1)
+    def fit(steps):
+        trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                          checkpoints=Checkpoints(str(tmp_path)))
+        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, BATCH), steps=steps,
+                    checkpoint_every=1)
+
+    fit(1)
+    closed.clear()
+    with pytest.raises(ValueError):
+        fit(2)
     assert closed.is_set()
 
 def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp_path):
