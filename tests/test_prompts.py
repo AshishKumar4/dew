@@ -184,6 +184,6 @@ def test_prompts_validate_on_a_hub_split_of_their_own(tmp_path, monkeypatch):
     recipe = PromptData(source=Hub("acme/prompts"), tokenizer=TOKENIZER, max_prompt_len=WINDOW,
                         validation=Split("validation"))
     train, held, _ = recipe.pipelines()
-    rows = {name: list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    rows = {name: list(iterate(pipeline, read="memory", provision=True, loading=Loading(workers=0)))
             for name, pipeline in (("train", train), ("held", held))}
     assert len(rows["train"]) == 4 and len(rows["held"]) == 2
