@@ -33,6 +33,7 @@ rotated int8, and by -0.03 for unrotated float8 and +1.03 for rotated float8
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Mapping
 from typing import Literal, Protocol, runtime_checkable
@@ -66,6 +67,20 @@ def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:
         return None
     name = last.key
     return name if isinstance(name, str) else None
+
+
+def overflowed(cache: Mapping[str, object], capacity: int) -> jax.Array:
+    """`[rows]`: whether a row's decode calls appended more real tokens than its cache's `capacity`.
+
+    Every cursor counts each real token a call appends, writes past `capacity` drop, and the cursor
+    never falls back, so a cursor past capacity is the row's lasting record that later calls read an
+    incomplete prefix. `generate` and the server refuse such a prompt on the host first; a caller
+    appending with `apply(decode=True)` itself checks this after its calls."""
+    beyond = [jnp.any(leaf.reshape(-1, leaf.shape[-1]) > capacity, axis=0)
+              for path, leaf in jax.tree_util.tree_leaves_with_path(cache) if leaf_name(path) == CURSOR]
+    if not beyond:
+        raise ValueError("this cache keeps no cursor, so it has no capacity to overflow")
+    return functools.reduce(jnp.logical_or, beyond)
 
 
 def is_paged(cache: Mapping[str, object]) -> bool:
