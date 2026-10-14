@@ -335,8 +335,11 @@ def repae_step_f64(tmp_path_factory) -> SimpleNamespace:
     """The same step in float64 end to end, under `jax.enable_x64`: every
     weight, the batch and the running statistics the reference's float64
     run read, and the step's own draws, which are float32 at any precision
-    as the reference replays them."""
-    with jax.enable_x64(new_val=True):
+    as the reference replays them. It runs on the CPU, as the lane's float64
+    references do: the reference replays draws made there, and a GPU's
+    float32 normal draws differ from a CPU's in their last bits (one in 21
+    on an H100, by up to 2.4e-7), which the float64 rule would see."""
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         return _repae_step(tmp_path_factory.mktemp("repae_f64"), jnp.float64)
 
 
