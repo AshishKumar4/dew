@@ -137,24 +137,14 @@ def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    expert_index = None
-    head_name, embedding_name = family.tied_head_names
-    if text_name == head_name and config["tie_embeddings"]:
-        # The tied head has no leaf of its own, so its source name binds to
-        # the embedding it copies, under whatever name that family stores.
-        embedding = family.weight_path(embedding_name, config)
-        if embedding is None:
-            raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
-        paths = (nested(embedding),)
-    else:
-        path = family.weight_path(text_name, config)
-        if path is None:
-            return None
-        path, expert_index = _stacked_expert(path)
-        paths = (nested(path),)
-        if path[-1] == "kernel" and tensor.ndim == 2:
-            lead = _leading_axes(variables, paths[0], expert_index)
-            transpose = (*range(lead), lead + 1, lead)
+    path = family.source_path(text_name, config)
+    if path is None:
+        return None
+    path, expert_index = _stacked_expert(path)
+    paths = (nested(path),)
+    if path[-1] == "kernel" and tensor.ndim == 2:
+        lead = _leading_axes(variables, paths[0], expert_index)
+        transpose = (*range(lead), lead + 1, lead)
     # A floating weight is written in its leaf's dtype; an index table
     # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
