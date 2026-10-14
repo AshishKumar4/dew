@@ -30,6 +30,20 @@ from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 
 
+def u_walk(x, down, middle, merges, up, run):
+    """The U-shaped walk of a token stack: each of the `down` blocks' outputs saved, the `middle`
+    block, then each of the `up` blocks after its `merges` projection of the stream concatenated with
+    the skip saved last. `run(block, x)` applies a block with the stack's own conditioning."""
+    skips = []
+    for block in down:
+        x = run(block, x)
+        skips.append(x)
+    x = run(middle, x)
+    for merge, block in zip(merges, up, strict=True):
+        x = run(block, merge(jnp.concatenate([x, skips.pop()], axis=-1)))
+    return x
+
+
 class UViT(_TransformerOptions):
     """Denoises patches as U-ViT does, following baofff/U-ViT's libs/uvit_t2i.py.
 
@@ -182,14 +196,8 @@ class UViT(_TransformerOptions):
         x = jnp.concatenate(tokens, axis=1) + jnp.concatenate(positions, axis=1).astype(patches.dtype)
         extras = x.shape[1] - num_patches
 
-        skips = []
-        for block in self.in_blocks:
-            x = block(x, conditioning=None, freqs_cis=None, train=train)
-            skips.append(x)
-        x = self.mid_block(x, conditioning=None, freqs_cis=None, train=train)
-        for skip_linear, block in zip(self.skip_linear, self.out_blocks, strict=True):
-            x = skip_linear(jnp.concatenate([x, skips.pop()], axis=-1))
-            x = block(x, conditioning=None, freqs_cis=None, train=train)
+        x = u_walk(x, self.in_blocks, self.mid_block, self.skip_linear, self.out_blocks,
+                   lambda block, x: block(x, conditioning=None, freqs_cis=None, train=train))
 
         out = self.decoder_pred(self.norm(x))[:, extras:]
         if inverse is not None:
@@ -302,17 +310,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
         freqs_cis = rotary_freqs(jnp.arange(x_seq.shape[1]), self.emb_features // self.num_heads,
                                  ROPE_THETA, dtype=at_least_fp32(x_seq.dtype))
 
-        skips = []
-        for i in range(self.num_layers // 2):
-            x_seq = self.down_blocks[i](x_seq, cond_emb, freqs_cis, train)
-            skips.append(x_seq)
-
-        x_seq = self.mid_block(x_seq, cond_emb, freqs_cis, train)
-
-        for i in range(self.num_layers // 2):
-            skip_conn = skips.pop()
-            x_seq = jnp.concatenate([x_seq, skip_conn], axis=-1)
-            x_seq = self.up_dense[i](x_seq)
-            x_seq = self.up_blocks[i](x_seq, cond_emb, freqs_cis, train)
+        x_seq = u_walk(x_seq, self.down_blocks, self.mid_block, self.up_dense, self.up_blocks,
+                       lambda block, x: block(x, cond_emb, freqs_cis, train))
 
         return self.output(x_seq, hilbert_inv_idx, H, W)

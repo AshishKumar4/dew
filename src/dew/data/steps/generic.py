@@ -28,6 +28,32 @@ class Fields(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class Coordinated(grain.MapTransform):
+    """A packed training or validation batch with each window's documents as
+    the model reads them: the `<ids>_segment_ids` and `<ids>_positions` a
+    packer writes for its `fields` become `<ids>_coordinates`, the model's
+    `dew.nn.inputs.Coordinates` built on the host, holding at most
+    `max_segments` documents a row (static, so a compiled step is specialized
+    to it). `ids` is the packed ids field, the first of `fields`."""
+
+    fields: tuple[str, ...]
+    max_segments: int
+
+    def map(self, element: Batch) -> Batch:
+        from dew.nn.inputs import coordinates
+
+        ids = self.fields[0]
+        if f"{ids}_segment_ids" not in element:
+            # A batch read without the training packing (a validation set of whole rows).
+            return element
+        packing = {f"{field}_{part}" for field in self.fields for part in ("segment_ids", "positions")}
+        laid = coordinates(segments=element[f"{ids}_segment_ids"], positions=element[f"{ids}_positions"],
+                           max_segments=self.max_segments, right_padded=True, xp=np)
+        return {**{name: value for name, value in element.items() if name not in packing},
+                f"{ids}_coordinates": laid}
+
+
+@dataclasses.dataclass(frozen=True)
 class Formatting(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         fields = record(element, "dataset row")
