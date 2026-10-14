@@ -613,7 +613,7 @@ GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
 fragmentation, which can leave a share its own size short of a block it needs."""
 GPU_UNRECORDED = 4
-"""A file no record has a peak for runs on this part of the lane's share."""
+"""A file no run has measured the peak of first runs on this part of the lane's share."""
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
@@ -622,24 +622,37 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     (`tested`), and write their verdict rows to `out`.
 
     A file's process may hold the peak memory its last run on this GPU's class held
-    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`, and one without a peak
-    a `GPU_UNRECORDED`th of the share. Files start heaviest first while their shares fit the share
-    this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most
-    `processes` at once. A file that runs out of its share is red: it took more than its last run,
-    or more than a file no run has measured is given, and its next run has the share it reached."""
+    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`. A file that started
+    another process, or whose last run left no report, holds the whole share, alone: its children's
+    memory is measured nowhere, and they size what they run by the device they see. A file no run
+    has measured is given a guess, a `GPU_UNRECORDED`th of the share; if it runs red on the guess,
+    it runs again at once with the whole share, alone, and that run's row and peak are its own. Files
+    start heaviest first while their shares fit the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
+    runs out of a measured share is red: it took more than its last run."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def needs(name: str) -> float:
+    def needs(name: str) -> tuple[float, bool]:
+        """A file's share, and whether it is a guess."""
         record = cache_request(cache_url(python, row(python, name, ""), held), token)
-        peak = json.loads(record).get("peak") if record else None
+        if record is None:
+            return budget / GPU_UNRECORDED, True
+        recorded = json.loads(record)
+        if recorded["depends"] is None:
+            return budget, False
+        if recorded["peak"] is None:
+            return budget / GPU_UNRECORDED, True
         factor, slack = GPU_HEADROOM
-        return budget / GPU_UNRECORDED if peak is None else min(peak * factor + slack, budget)
+        return min(recorded["peak"] * factor + slack, budget), False
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        shares = dict(zip(tests, pool.map(needs, tests), strict=True))
+        sized = dict(zip(tests, pool.map(needs, tests), strict=True))
+    shares = {name: share for name, (share, _) in sized.items()}
+    guessed = {name for name, (_, guess) in sized.items() if guess}
+    retried: set[str] = set()
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
     waiting = sorted(tests, key=lambda name: -shares[name])
@@ -652,13 +665,20 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
-                                    environ)] = fits
+                # A retry runs: the red run's record may not have reached the Worker over a green one.
+                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline,
+                                    cache and fits not in retried, 60.0, common, environ)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
                 future.result()
-                del running[future]
+                name = running.pop(future)
+                red = any(verdict["exitCode"] for verdict in json.loads(verdicts[name].read_text())["rows"])
+                if name in guessed and red:
+                    guessed.remove(name)
+                    retried.add(name)
+                    shares[name] = budget
+                    waiting.insert(0, name)
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0
