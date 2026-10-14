@@ -6,7 +6,12 @@ a message without one uses the page's only cell.
 
 A cell sent with "kernel": "train" runs Dew itself in a fresh training context
 (gateway_manager.py, live_training.py), closed when the cell ends. A host runs
-one at a time; the others wait in order and hear their place in line.
+one at a time; the others wait in order and hear their place in line. A page
+runs or queues at most MAX_CELLS cells of either kind at once.
+
+A session's lifetime is the Worker's: it names the session's absolute end
+(DEADLINE_HEADER, from the Coordinator's first start), and every connection of
+the session closes then, however late it reconnected.
 """
 
 import asyncio
@@ -34,6 +39,8 @@ MAX_OUTPUT = 2_000_000
 # start-gateway.sh starts at most MAX_CONTEXTS + 1 kernels.
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
+DEADLINE_HEADER = "X-Dew-Deadline"
+"""The session's end, in milliseconds since the epoch, which the Worker sets on every connection."""
 # Memory the model process and the bridge keep free. Below it a new context is refused and the
 # largest guest is killed at once: waiting for the kernel's OOM killer lets the host thrash first.
 RESERVE = 1536 << 20
@@ -169,8 +176,9 @@ class Page:
 
 
 class Gateway:
-    def __init__(self, token, secret, commit):
-        self.token, self.secret, self.commit = token, secret, commit
+    def __init__(self, token, secret, commit, kernels="127.0.0.1:8890"):
+        # `kernels` is the Kernel Gateway's address (start-gateway.sh).
+        self.token, self.secret, self.commit, self.kernels = token, secret, commit, kernels
         # session -> cell -> context; None holds the context made ready before the page names a cell.
         self.contexts: dict[str, dict[str | None, Context]] = {}
         self.connected = set()
@@ -181,12 +189,11 @@ class Gateway:
         self.waiting = []
         self.started = time.monotonic()
         self.idle = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
-        self.wall = int(os.environ.get("DEW_LIVE_WALL_SECONDS", "1200"))
 
     async def api(self, path, data=None, method=None):
         def call():
             body = None if data is None else json.dumps(data).encode()
-            request = urllib.request.Request("http://127.0.0.1:8890" + path, data=body, method=method,
+            request = urllib.request.Request(f"http://{self.kernels}{path}", data=body, method=method,
                                              headers={"Authorization": "token " + self.token,
                                                       "Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -204,10 +211,18 @@ class Gateway:
             if available() < RESERVE + (512 << 20):
                 raise ValueError("the shared host is short of memory right now; try again in a minute")
             started = time.monotonic()
-            kernel = {**await self.api("/api/kernels", {"name": kernel}), "preload": PRELOAD[kernel]}
+            # The create runs to its end whatever cancels this start, so its kernel is deleted below.
+            creating = asyncio.ensure_future(self.api("/api/kernels", {"name": kernel}))
+            try:
+                created = await asyncio.shield(creating)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await self.api(f"/api/kernels/{(await creating)['id']}", method="DELETE")
+                raise
+            kernel = {**created, "preload": PRELOAD[kernel]}
             channels = None
             try:
-                url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels"
+                url = f"ws://{self.kernels}/api/kernels/{kernel['id']}/channels"
                 try:
                     channels = await connect(url, max_size=MAX_OUTPUT, open_timeout=60,
                                              additional_headers={"Authorization": "token " + self.token})
@@ -220,18 +235,23 @@ class Gateway:
                     raise RuntimeError("the isolated Python context could not load its client")
                 context.setup = time.monotonic() - started
                 return context
-            except Exception:
-                if channels:
-                    await channels.close()
-                await self.api(f"/api/kernels/{kernel['id']}", method="DELETE")
+            except BaseException:
+                # Cancellation too (a disconnect, a Restart): nothing else knows this kernel yet.
+                await asyncio.shield(self.discard(channels, kernel["id"]))
                 raise
+
+    async def discard(self, channels, identifier):
+        """Close a kernel no context holds: its channels, if open, and the kernel."""
+        if channels:
+            await channels.close()
+        await self.api(f"/api/kernels/{identifier}", method="DELETE")
 
     async def create(self, session):
         if session not in self.contexts:
             self.contexts[session] = {}
             try:
                 self.contexts[session][None] = await self.start(session)
-            except Exception:
+            except BaseException:
                 del self.contexts[session]
                 raise
         return self.contexts[session]
@@ -326,6 +346,11 @@ class Gateway:
 
     async def websocket(self, socket):
         session = socket.request.path.split("/")[2]
+        # The session's end, on this host's monotonic clock.
+        deadline = time.monotonic() + int(socket.request.headers[DEADLINE_HEADER]) / 1000 - time.time()
+        if deadline <= time.monotonic():
+            await socket.close(1008, "this session is over")
+            return
         try:
             cells = await self.create(session)
         except Exception as error:
@@ -341,7 +366,6 @@ class Gateway:
                                       "dew": self.commit}))
         page = Page(socket, session, cells)
         try:
-            deadline = time.monotonic() + self.wall
             while time.monotonic() < deadline:
                 try:
                     raw = await asyncio.wait_for(socket.recv(), timeout=min(15, deadline - time.monotonic()))
@@ -365,6 +389,13 @@ class Gateway:
                             (message["op"] == "execute" and
                              (not isinstance(message.get("code"), str) or len(message["code"]) > MAX_CODE))):
                         raise ValueError("invalid or oversized cell")
+                    for ended in [name for name, task in page.running.items() if task.done()]:
+                        del page.running[ended], page.requests[ended]
+                    if message["op"] == "execute" and len(page.running) >= MAX_CELLS:
+                        await page.fail(message["id"], ValueError(
+                            f"this page runs or queues {MAX_CELLS} cells already; stop one, or wait for one "
+                            "to finish"))
+                        continue
                     step = self.run if message["op"] == "execute" else self.restart
                     before = page.running.get(cell), page.requests.get(cell)
                     page.running[cell] = asyncio.create_task(step(page, message, cell, before))
