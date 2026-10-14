@@ -78,7 +78,7 @@ def png(color: tuple[int, int, int]) -> bytes:
 
 
 def test_images_decode_from_every_form_a_request_carries():
-    """Clef's `images` extension: PIL images, encoded bytes, and base64,
+    """The `images` extension: PIL images, encoded bytes, and base64,
     bare or as a data URL, all read as the same pixels."""
     from PIL import Image
 
