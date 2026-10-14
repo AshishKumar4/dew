@@ -16,12 +16,16 @@ from dew.records import record
 
 @dataclasses.dataclass(frozen=True)
 class Fields(grain.MapTransform):
-    names: tuple[str, ...]
+    names: tuple[str, ...] | None = None
     rename: tuple[tuple[str, str], ...] = ()
+    remove: tuple[str, ...] = ()
 
     def map(self, element: Batch) -> Batch:
         renamed = dict(self.rename)
-        return {renamed.get(name, name): element[name] for name in self.names}
+        names = tuple(element) if self.names is None else self.names
+        kept = {name: element[name] for name in names if name not in self.remove}
+        return {**{name: value for name, value in kept.items() if name not in renamed},
+                **{new: kept[old] for old, new in self.rename}}
 
 
 @dataclasses.dataclass(frozen=True)
