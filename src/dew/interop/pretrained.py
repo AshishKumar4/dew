@@ -76,6 +76,7 @@ from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
 
     from dew.lora import Adapter, LoRA
     from dew.training.distributed import Layout, MeshSpec
@@ -410,7 +411,7 @@ class Pretrained:
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
-             mesh: MeshSpec | None = None, layout: Layout | None = None,
+             mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
@@ -481,7 +482,7 @@ class Pretrained:
               attention_impl: str = "auto", max_seq_len: int | None = None,
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
               dduf_file: str | None = None,
-              mesh: MeshSpec | None = None, layout: Layout | None = None, fallback: str | None = None,
+              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None,
               weights: bool = True) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
@@ -841,7 +842,7 @@ class PretrainedFallback(Pretrained):
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
-                          mesh: MeshSpec | None = None, layout: Layout | None = None,
+                          mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 

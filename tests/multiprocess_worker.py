@@ -1001,7 +1001,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp, stage=stage, microbatches=microbatches),
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage), microbatches=microbatches,
                    layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
 
 

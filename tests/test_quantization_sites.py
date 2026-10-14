@@ -77,7 +77,7 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
     """Two stages of one layer each, two microbatches of one row: the stage
     axis stacks the scales as it stacks the kernels."""
     _, loaded, reference = case
-    mesh = MeshSpec(stage=2, microbatches=2).build(jax.devices()[:2])
+    mesh = MeshSpec(stage=2).build(jax.devices()[:2])
     placed = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
     with jax.set_mesh(mesh), pipeline_microbatches(2):
         logits = jax.jit(loaded.model.apply)(placed, jnp.asarray(reference["ids"], jnp.int32))

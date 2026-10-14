@@ -38,7 +38,7 @@ from grain._src.python.dataset.transformations.batch import make_batch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-from dew.nn.sharding import BATCH_AXES, LayoutRefused
+from dew.nn.sharding import LayoutRefused, batch_axes
 
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
@@ -101,9 +101,10 @@ class DataPartition:
     def of(cls, mesh: Mesh) -> DataPartition:
         """Return the share of every global batch this process reads on `mesh`.
 
-        A batch's rows split over the batch axes and no others (`BATCH_SPEC`).
-        The sequence axis splits positions, the tensor axis splits widths, and
-        the stage axis holds a pipeline's stages, so processes whose devices
+        A batch's rows split over the row axes and no others: those the rules
+        in context give `activation_batch` (`batch_axes`). The sequence axis
+        splits positions, the tensor axis splits widths, and the stage axis
+        holds a pipeline's stages, so processes whose devices
         hold the same row shards need the same rows. The processes therefore
         fall into groups by the rows they hold. Each group reads one share,
         numbered by the first row shard it holds, and every process in the
@@ -114,7 +115,7 @@ class DataPartition:
         being the same rows. No share can then be read whole by each group, so
         such a mesh is refused.
         """
-        return _partition(mesh)
+        return _partition(mesh, batch_axes(mesh))
 
     def rows(self, batch: int) -> int:
         """Return how many rows of a `batch`-row global batch one share holds.
@@ -135,10 +136,10 @@ class DataPartition:
 
 
 @functools.cache
-def _partition(mesh: Mesh) -> DataPartition:
-    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+def _partition(mesh: Mesh, rows: tuple[str, ...]) -> DataPartition:
+    shards = math.prod(mesh.shape[axis] for axis in rows)
     held: dict[int, set[int]] = {}
-    placement = NamedSharding(mesh, P(BATCH_AXES)).devices_indices_map((shards,))
+    placement = NamedSharding(mesh, P(rows or None)).devices_indices_map((shards,))
     for device, index in placement.items():
         held.setdefault(device.process_index, set()).add(index[0].start or 0)
     groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
