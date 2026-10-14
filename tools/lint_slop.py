@@ -791,11 +791,12 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
-def _resolved(node: ast.expr, bound: Mapping[str, str]) -> str:
+def _resolved(node: ast.expr, bound: Mapping[str, str], local: frozenset[str]) -> str:
     """The dotted path `node` spells, its first name read as the import `bound`
-    gives it (`_imports`), or "" where no import binds that name."""
+    gives it (`_imports`), or "" where no import binds that name or an
+    enclosing function binds it itself (`local`, `_scoped`)."""
     head, _, rest = _named(node).partition(".")
-    target = bound.get(head, "")
+    target = "" if head in local else bound.get(head, "")
     return f"{target}.{rest}" if target and rest else target
 
 
@@ -819,8 +820,8 @@ def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour."""
     bound = _imports(module.tree, _module_name(module), module.path.name == "__init__.py")
     for node, local in _scoped(module.tree):
-        if isinstance(node, ast.Call) and _root(node.func) not in local:
-            called = _resolved(node.func, bound)
+        if isinstance(node, ast.Call):
+            called = _resolved(node.func, bound, local)
             if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "matches an error's wording; assert the refusal, not its text")
@@ -846,7 +847,7 @@ def patches(module: Module) -> Iterator[Finding]:
             attribute = named.value if spelled else "*"
         else:
             continue
-        origin = "" if _root(owner) in local else _resolved(owner, bound)
+        origin = _resolved(owner, bound, local)
         target = f"{origin}.{attribute}"
         # The library rebinds nothing it imported but the interpreter's own hooks; a
         # script, nothing of our package.
