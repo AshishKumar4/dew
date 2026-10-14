@@ -118,7 +118,6 @@ class JepaObjective(Objective[Ratio]):
     `frozen`, and the target encoder is the trainer's average of the trained
     leaves over that same frozen base.
     """
-    artifact = Representations
     # A collapsing encoder's spread falls to zero; a redundant one's
     # off-diagonal covariance rises.
     shown: Mapping[str, Shown] = {
