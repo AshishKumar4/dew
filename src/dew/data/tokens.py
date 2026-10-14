@@ -60,12 +60,14 @@ def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
 
 
-def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np.ndarray]:
+def first_fit(sizes: np.ndarray, window: int, bins: int,
+              segments: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """The plan grain's first-fit packer would follow over chunks of `sizes`.
 
     Grain's packer holds `bins` open windows, adds each record to the first
-    with room, and emits all of them when a record fits in none
-    (`grain/_src/python/dataset/transformations/packing.py:341-355`). Run
+    with room and fewer than `segments` records, and emits all of them when
+    a record fits in none (`grain/_src/python/dataset/transformations/packing.py:341-355`,
+    `packing_packed_batch.py` `FirstFitPackedBatch`). Run
     over the lengths alone it is a plan rather than a pass: which window
     every chunk belongs to, without reading a token. That plan is what lets
     the packing run ahead of the shard, so a window holds the same chunks at
@@ -81,22 +83,24 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
     if bins < 1:
         raise ValueError(f"a packer fills at least one window at a time, got {bins}")
     room = [window] * bins
+    held = [0] * bins
     plan = np.empty(len(sizes), np.int64)
     closed = 0
     for index, size in enumerate(sizes.tolist()):
         chosen = -1
         for candidate, free in enumerate(room):
-            if free >= size:
+            if free >= size and (segments is None or held[candidate] < segments):
                 chosen = candidate
                 break
         if chosen < 0:
-            # Every open window is short of room, so the packer emits all of
-            # them and starts this chunk in the first of a fresh set.
+            # Every open window is short of room or full, so the packer emits
+            # all of them and starts this chunk in the first of a fresh set.
             closed += bins
-            room = [window] * bins
+            room, held = [window] * bins, [0] * bins
             chosen = 0
         plan[index] = closed + chosen
         room[chosen] -= size
+        held[chosen] += 1
     windows = closed + bins - room.count(window)
     starts = np.concatenate([np.zeros(1, np.int64),
                              np.cumsum(np.bincount(plan, minlength=windows))])
@@ -184,11 +188,11 @@ class PackedWindows(_WrappingDataset):
     """
 
     def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
-                 bins: int, described: str):
+                 bins: int, described: str, *, segments: int | None = None):
         super().__init__(DocumentChunks(documents, lengths, window))
         self._window, self._bins = window, bins
         self._described = described
-        self.order, self.starts = first_fit(chunk_lengths(lengths, window), window, bins)
+        self.order, self.starts = first_fit(chunk_lengths(lengths, window), window, bins, segments)
 
     def __repr__(self) -> str:
         # A saved position names the order it counts into (`dew.position`),

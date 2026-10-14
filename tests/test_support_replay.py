@@ -23,7 +23,16 @@ from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits
 from dew.objectives.rl.grpo import GRPOObjective
-from dew.objectives.rl.sessions import SUPPORT_COLUMNS_KEY, SUPPORT_KEY, Call, Session, Status, pack
+from dew.objectives.rl.sessions import (
+    SUPPORT_COLUMNS_KEY,
+    SUPPORT_KEY,
+    Call,
+    Session,
+    Status,
+    chain_lengths,
+    pack,
+    rows_needed,
+)
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -101,12 +110,15 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
     obj, params, _, sampling, rollouts = sampled(adapted=True)
     grpo = GRPOObjective(obj.model, obj.seq_len, sampling_temperature=sampling.temperature,
                          variables=params)
-    batch = pack(rollouts, PROMPT + NEW, rows=jax.device_count(), support_capacity=12 * NEW)
+    # As many rows as the chains need, in whole rows for every device.
+    needed = rows_needed(chain_lengths(rollouts, PROMPT + NEW, truncation="mask"), PROMPT + NEW)
+    rows = -(-needed // jax.device_count()) * jax.device_count()
+    batch = pack(rollouts, PROMPT + NEW, rows=rows, support_capacity=12 * NEW)
     drawn_ids = batch["response_mask"] != 0
     scored = np.asarray(grpo.packed_log_probs(params, batch))[drawn_ids]
     np.testing.assert_allclose(scored, batch["behavior_log_probs"][drawn_ids], atol=2e-5)
 
-    data = dataset(lambda: iter([batch]), batch=jax.device_count())
+    data = dataset(lambda: iter([batch]), batch=rows)
     trainer = Trainer(grpo, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
                       layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()
