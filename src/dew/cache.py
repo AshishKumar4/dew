@@ -52,10 +52,9 @@ def enable_compilation_cache(path: str):
     the same fusions takes them without measuring. A process beside other work
     on its GPU would measure unfairly, so it reads them and adds none
     (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
-    directory nor the mode is in JAX's cache key, so a run and the process
-    that compiled ahead of it (`TrainerConfig.compile_only`) share
-    executables. XLA reads its flags at the first compile; a directory the
-    run names is kept.
+    directory nor the mode is in JAX's cache key, so a run and a process
+    that compiled its programs ahead of it share executables. XLA reads its
+    flags at the first compile; a directory the run names is kept.
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)

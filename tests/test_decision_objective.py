@@ -1,8 +1,8 @@
 """`DecisionObjective`: proper scoring rules, metrics, row encoding, and training through LoRA."""
 
-import itertools
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -121,112 +121,81 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
     variables = objective.init(jax.random.key(0))
     loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
-    logits = np.asarray(objective.model.logits(variables, laid_out(batch)))[:, 0, :3]
+    logits = np.asarray(objective.model.logits(variables, laid_out(batch, objective.bounds.segments)))
+    logits = logits[np.asarray(batch["questions"])][:, :3]
     expected = -np.mean(np.sum(np.array([0.6, 0.3, 0.1]) * jax.nn.log_softmax(logits), axis=-1))
     assert float(loss) == pytest.approx(float(expected), rel=1e-5)
 
 
-def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
-    """Rows of forty lengths, two to a batch: each batch is cut at the next
-    multiple of eight past its longest row, a window of batches holds the
-    uncut stream's rows, and cutting a batch leaves its loss as it was."""
-    from dew.objectives.base import Step
-
-    rows = [Example("x" * size, {"team": INTENT}, {"team": "sales"}) for size in range(1, 41)]
-
-    def read(**fields):
-        objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                      shuffle_options=False, **fields)
-        data = loader(DecisionRecipe(source=rows), batch=2, read="memory", objective=objective.data())
-        stream = data.train(DataPartition())
-        try:
-            return objective, [{name: np.array(value, copy=True) for name, value in batch.items()}
-                               for batch in itertools.islice(stream, 64)]
-        finally:
-            stream.close()
-
-    def held(batches):
-        return sorted(tuple(row[valid]) for batch in batches for row, valid
-                      in zip(np.asarray(batch["tokens"]), np.asarray(batch["valid"]), strict=True))
-
-    plain, whole = read()
-    bucketed, cut = read(bucket=8)
-    assert bucketed.inputs.sample.key == "tokens"
-    assert bucketed.inputs.sample.shape == (LAYOUT.max_len,)
-    assert bucketed.inputs.sample.variable_axes == (0,)
-    for batch in cut:
-        size, longest = batch["tokens"].shape[1], int(np.sum(batch["valid"], axis=1).max())
-        assert size % 8 == 0 and longest <= size < longest + 8
-    assert held(cut) == held(whole)
-    batch = whole[0]
-    size = -(-int(np.sum(batch["valid"], axis=1).max()) // 8) * 8
-    trimmed = {name: value[:, :size] if name in ("tokens", "valid", "positions", "slots") else value
-               for name, value in batch.items()}
-    variables = plain.init(jax.random.key(0))
-    step = Step(jnp.asarray(0), jax.random.key(0), None)
-    np.testing.assert_allclose(plain.scalar_loss(variables, trimmed, step)[0],
-                               plain.scalar_loss(variables, batch, step)[0], rtol=1e-6)
 
 
-HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index), {"team": INTENT},
-                {"team": ("billing", "technical", "sales")[index // 3 % 3]}) for index in range(18)]
-"""Under `LAYOUT`, six rows of 52 or 53 tokens and twelve of 66 to 83, no two alike."""
+HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index),
+                {"team": INTENT, "urgent": Noul("Is it urgent?")},
+                {"team": ("billing", "technical", "sales")[index // 3 % 3]}
+                | ({"urgent": "true" if index // 4 % 2 else "false"} if index % 4 == 0 else {}))
+        for index in range(18)]
+"""Distinct states and question rows, some requests answering both questions and others just one."""
 
 
-@pytest.mark.parametrize(("bucket", "batching", "cut"), [
-    (8, {"batch": 4}, lambda longest: min(LAYOUT.max_len, -(-longest // 8) * 8)),
-    (None, {"batch": None, "tokens": 192, "lengths": (64, 96)}, lambda longest: 64 if longest <= 64 else 96),
-], ids=["rows", "tokens"])
-def test_a_held_pass_is_cut_as_training_is_and_scores_every_row_once(bucket, batching, cut):
-    """Eighteen held rows in batches of four cut at the next multiple of
-    eight past their longest row, or in a token budget's two lengths: each
-    batch is cut as a training batch is rather than padded to max_len, and
-    holds rows of like length. Every row is read once, the last batch's
-    repeats count nothing, and each row's probabilities and the pass's log
-    loss are those of every row in one uncut batch."""
+def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
+    """Held question rows share windows, four windows a batch: their exact identities
+    appear once, repeats count nothing, each question decides as it does alone,
+    and the pass's log loss is the mean of its questions'."""
+    from test_decision_packing import alone, owners, rows_of
+
     from dew.objectives.base import Step
     from dew.training.distributed import MeshSpec
     from dew.training.evaluation import Evaluation
 
-    def built(**fields):
-        return DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                 shuffle_options=False, **fields)
-
-    plain, cutting = built(), built(bucket=bucket)
-    variables = plain.init(jax.random.key(0))
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout,
+                                  shuffle_options=False)
+    variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-
-    def scored(objective, batch) -> list:
-        """Each real row's tokens and probabilities."""
-        found = np.asarray(objective.evaluate(variables, batch, step).probabilities)[:, 0]
-        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(found), bool)))
-        return [(tuple(np.asarray(tokens)[np.asarray(valid)].tolist()), row) for tokens, valid, row, kept
-                in zip(batch["tokens"], batch["valid"], found, real, strict=True) if kept]
-
-    recipe = DecisionRecipe(source=HELD, validation=HELD)
-    oracle = loader(recipe, batch=len(HELD), read="memory", objective=plain.data())
-    data = loader(recipe, read="memory", objective=cutting.data(), **batching)
-    (whole,) = list(oracle.val(DataPartition()))
-    expected = dict(scored(plain, whole))
-    batches = list(data.val(DataPartition()))
-    spans, seen = [], []
-    for batch in batches:
-        lengths = np.sum(batch["valid"], axis=1)
-        assert batch["tokens"].shape[1] == cut(int(lengths.max()))
-        spans.append((int(lengths.min()), int(lengths.max())))
-        seen.extend(scored(cutting, batch))
-    assert min(batch["tokens"].shape[1] for batch in batches) < LAYOUT.max_len
-    spans.sort()
-    assert all(below[1] <= above[0] for below, above in itertools.pairwise(spans)), spans
-    assert sorted(key for key, _ in seen) == sorted(expected)
-    # Within float32 rounding: a cut row's attention sums over fewer padded keys.
-    for key, found in seen:
-        np.testing.assert_allclose(found, expected[key], rtol=1e-5)
+    data = loader(DecisionRecipe(source=HELD, validation=HELD), batch=4, read="memory",
+                objective=objective.data())
+    expected = {}
+    for index, example in enumerate(HELD):
+        asked = {name: example.questions[name] for name in example.labels()}
+        for encoded in objective.layout.rows(TOKENIZER, SPECIALS, example.state, asked):
+            (laid,) = encoded.questions
+            expected[encoded.tokens] = (index, laid)
+    seen, windows_seen = {}, set()
+    shared, repeats = False, 0
+    for batch in data.val(DataPartition()):
+        batch = {name: np.asarray(value) for name, value in batch.items()}
+        found = np.asarray(objective.evaluate(variables, batch, step).probabilities)
+        # A batch that repeats windows to fill itself marks its real ones.
+        real = batch.get(VALID_ROWS, np.ones(len(batch["tokens"]), bool))
+        shared |= bool((batch["segments"][real].max(axis=1) > 1).any())
+        repeats += int((~real).sum())
+        windows_seen.update(tuple(tokens) for tokens in batch["tokens"][real])
+        assert all(tuple(tokens) in windows_seen for tokens in batch["tokens"][~real])
+        for window, row in rows_of(batch):
+            if not real[window]:
+                continue
+            one = alone(batch, window, row)
+            (slot,) = np.flatnonzero(owners(batch)[window] == row)
+            key = tuple(one["tokens"][0].tolist())
+            index, laid = expected[key]
+            identity = index, laid.name
+            assert identity not in seen
+            width = len(laid.options)
+            seen[identity] = found[window, slot, :width], int(batch["labels"][window, slot])
+            np.testing.assert_array_equal(one["spans"][0, 0], laid.span)
+            gold = HELD[index].distribution(laid.name)[list(laid.order)]
+            np.testing.assert_array_equal(one["targets"][0, 0, :width], gold)
+            # Within float32 rounding: alone, a row's attention sums over none of its window's keys.
+            own = objective.evaluate(variables, one, step).probabilities[0, 0, :width]
+            np.testing.assert_allclose(seen[identity][0], own, rtol=1e-5)
+    assert shared and repeats > 0
+    assert set(seen) == {(index, laid.name) for index, laid in expected.values()}
     mesh = MeshSpec().build(jax.local_devices()[:1])
-    passes = [Evaluation.run(objective, variables, reader, key=0, metrics=[LogLoss()], mesh=mesh)
-              for objective, reader in ((cutting, data.val), (plain, oracle.val))]
-    assert [result.records for result in passes] == [len(HELD), len(HELD)]
-    assert passes[0].scores["val/log_loss"] == pytest.approx(passes[1].scores["val/log_loss"], rel=1e-5)
+    result = Evaluation.run(objective, variables, data.val, key=0, metrics=[LogLoss()], loss=True, mesh=mesh)
+    expected = -np.mean([np.log(probabilities[label]) for probabilities, label in seen.values()])
+    assert result.scores["val/log_loss"] == pytest.approx(expected, rel=1e-5)
+    assert result.scores["val/loss"] == pytest.approx(expected, rel=1e-5)
 
 
 def tiny_backbone() -> CausalTransformer:
@@ -387,6 +356,41 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     asked = {"team": INTENT}
     np.testing.assert_array_equal(reloaded("charged twice!", asked)["team"].probabilities,
                                   live("charged twice!", asked)["team"].probabilities)
+
+
+def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
+    """A joint layout may train and batch many one-question rows, but neither the live
+    nor the saved task may read several question types as one question's embedding."""
+    from dew.decision import DecisionHead, JointLayout, Score
+
+    layout = JointLayout(max_len=1024)
+    pick = Choice("x", ["0", "1"])
+    examples = [Example(state, {"q0": pick}, {"q0": label})
+                for state, label in (("first", "0"), ("second", "1"))]
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, head=DecisionHead(32, layers=1),
+                                  shuffle_options=False)
+    data = loader(DecisionRecipe(source=examples, validation=examples), batch=8, read="memory",
+                  objective=objective.data())
+    (batch,) = list(data.val(DataPartition()))
+    assert int(np.asarray(batch["segments"]).max()) == 2
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    requests = [(example.state, example.questions) for example in examples]
+    first, second = live.batch(requests), reloaded.batch(requests)
+    for request, (answer, usage), (again, restored_usage) in zip(requests, first, second, strict=True):
+        np.testing.assert_array_equal(answer["q0"].probabilities, again["q0"].probabilities)
+        np.testing.assert_array_equal(again["q0"].probabilities,
+                                      reloaded(*request)["q0"].probabilities)
+        assert usage == restored_usage
+    score = Score("rate", ["low", "high"])
+    for task in (live, reloaded):
+        for questions in ({"pick": pick, "score": score}, {"score": score, "flag": Noul("x")}):
+            with pytest.raises(ValueError):
+                task("first", questions)
 
 
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):

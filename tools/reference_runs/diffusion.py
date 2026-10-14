@@ -337,7 +337,8 @@ def main() -> None:
         "first_step_seconds": first_step_seconds,
         "flops_per_image": flops_image,
         "work": dataclasses.asdict(work),
-        "hlo_flops_per_step": None if trainer is None else trainer.flops_per_step,
+        "hlo_flops_per_step": (None if trainer is None or trainer.step_flops is None
+                               else trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
             / window_seconds / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats]},

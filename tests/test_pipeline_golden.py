@@ -34,20 +34,14 @@ from dew.data.dataset import DataPartition, DataPhase, Loading
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.sources.files import Files
 from dew.data.sources.tfds import TFDS
-from dew.data.text import ByteTokenizer
-from dew.decision.data import Decisions, Example
-from dew.decision.layout import Specials, StateFirstLayout
-from dew.decision.objective import DecisionObjective
-from dew.decision.questions import Choice
-from dew.nn.backbones.causal_transformer import CausalTransformer
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
-         "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records", "decision_table",
-         "decision_mix")
-"""Every migrated loader but the video recipe's, whose record the media stages changed on purpose (a
-waveform and its validity in place of per-frame rows and features); tests/test_data.py holds that
-recipe to itself across workers and a resume."""
+         "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
+"""The recipes the old loaders read alike. Decision rows are not among them: they pack into windows,
+which no old loader did (tests/test_decision_packing.py); nor is the video recipe, whose record the
+media stages changed on purpose (a waveform and its validity in place of per-frame rows and features):
+tests/test_data.py holds that recipe to itself across workers and a resume."""
 
 
 def _digest(batch):
@@ -109,12 +103,6 @@ def recipes(tmp_path_factory):
     image_root, image_file = _image_sources(root, pixels)
     table = root / "records.parquet"
     pq.write_table(pa.table({"id": list(range(40)), "x": [[index, index + 1] for index in range(40)]}), table)
-    objective = DecisionObjective(
-        CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16),
-        tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
-        layout=StateFirstLayout(max_len=128), shuffle_options=True)
-    examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
-                for index in range(40)]
     augment = Augment(backend="host", jitter=True)
     return {
         "text_windows": (TextData(tokens, seq_len=16), {"validation_records": 16}),
@@ -137,9 +125,6 @@ def recipes(tmp_path_factory):
                                 validation=HoldOut(records=4)), {}),
         "hub_records": (RecordsData(Files(str(table))), {}),
         "tfds_records": (RecordsData(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
-        "decision_table": (Decisions(examples, validation=examples[:5]), {"objective": objective.data()}),
-        "decision_mix": (Decisions({"a": examples, "b": examples[:8]}, weights={"a": 3, "b": 1},
-                                    validation=examples[:5]), {"objective": objective.data()}),
     }
 
 

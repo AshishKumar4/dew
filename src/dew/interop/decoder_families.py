@@ -20,13 +20,15 @@ from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
+from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
 from dew.interop.families.mamba import MAMBA
 from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA
-from dew.interop.families.mimo import MIMO_V2_FLASH
+from dew.interop.families.mimo import MIMO_V2, MIMO_V2_FLASH
 from dew.interop.families.modernbert import MODERNBERT
+from dew.interop.families.muse import MUSE_GLIMMER_TEXT
 from dew.interop.families.nemotron_h import NEMOTRON_H
 from dew.interop.families.olmo import OLMO3
 from dew.interop.families.opt import OPT
@@ -55,6 +57,7 @@ ENTRIES = (
     PHI3,
     MINIMAX_M2,
     MIMO_V2_FLASH,
+    MIMO_V2,
     MODERNBERT,
     NEMOTRON_H,
     STARCODER2,
@@ -79,6 +82,7 @@ ENTRIES = (
     KIMI_LINEAR,
     KIMI_K3,
     DEEPSEEK_V3,
+    MUSE_GLIMMER_TEXT,
     QWEN3_NEXT,
     QWEN3_5_MOE_TEXT,
     QWEN3_5_TEXT,
@@ -108,6 +112,7 @@ ENTRIES = (
         preserve_source_layout=True,
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),
+    K2_HORIZON,
     DecoderFamily(
         ("ministral",),
         ministral_config,

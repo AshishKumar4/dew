@@ -26,7 +26,7 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
-from dew.objectives.lm.chunked import head_cross_entropy
+from dew.objectives.lm.chunked import final_read, head_cross_entropy
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
@@ -357,13 +357,19 @@ class GRPOObjective(LMObjective):
 
     def validation_loss(self, variables, batch, step):
         """Score the source prompts' NLL, not the surrogate's rollout-only fields."""
-        scores = self.evaluate(variables, batch, step)
+        scores = self._evaluation_scores(variables, batch, step.key)
         assert scores.weights is not None
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total)
 
     def evaluate(self, params, batch, step):
-        """Return the per-token scores of the prompts under the policy, for their perplexity.
+        """Return the per-token scores of the prompts under the policy, for their perplexity,
+        compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
+        prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
+        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.key)
+
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        """The prompts' per-token scores.
 
         Prompts are left-padded, so a row's real tokens are its last
         `prompt_length` columns. Each row's score is its shifted cross entropy
@@ -378,9 +384,8 @@ class GRPOObjective(LMObjective):
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")
         padding = prompts.shape[1] - lengths
         aligned = _shift_rows(prompts, padding)
-        hidden = self.model.apply(params, aligned[:, :-1], train=False,
-                                  method="hidden_states")
-        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, aligned[:, 1:],
+        read = final_read(self.model, params, aligned[:, :-1], train=False)
+        losses, predicted, _ = head_cross_entropy(self.model, params, read, aligned[:, 1:],
                                                   self.head_chunks, predict=True)
         assert predicted is not None
         correct, _ = _unpadded(predicted == aligned[:, 1:], padding)

@@ -278,6 +278,17 @@ class Coordinates:
         return jnp.maximum(jnp.cumsum(self.valid, axis=1, dtype=jnp.int32) - 1, 0)
 
 
+def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
+    """The cumulative offsets of the varlen sequences over the `[B * S]`
+    tokens of `begins` `[B, S]`, which marks each sequence's first token: a
+    kernel's `cu_seqlens` `[sequences + 1]`, the sequences past the marked
+    ones empty at the end. Every row's first token begins one."""
+    rows, length = begins.shape
+    first = begins.at[:, 0].set(True).reshape(-1)
+    starts = jnp.nonzero(first, size=sequences, fill_value=rows * length)[0]
+    return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
+
+
 def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
                 max_segments: int | None = None, right_padded: bool = False, xp=jnp) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
