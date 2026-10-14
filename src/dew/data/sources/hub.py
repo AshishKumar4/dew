@@ -150,6 +150,9 @@ class Hub(Dataset):
             return self.streamed is not None
         return Path(self.builder.cache_dir, "dataset_info.json").is_file()
 
+    def can_provision(self, read: Read) -> bool:
+        return read != "streamed"
+
     def provision(self) -> Hub:
         preparing(self, self.builder.info.download_size, self.builder.cache_dir)
         self.builder.download_and_prepare()
