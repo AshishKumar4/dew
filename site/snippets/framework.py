@@ -12,7 +12,6 @@ small offline fixtures.
 import argparse
 import json
 import os
-import sys
 from dataclasses import replace
 from pathlib import Path
 
