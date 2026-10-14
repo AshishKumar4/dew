@@ -1216,8 +1216,8 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
-                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
-                                 else self.dspark.target_layers.index(index)),
+                prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
+                                   else None),
                 attention_norm=index > 0 or self.first_attention_norm)
             for index, layer_type in enumerate(types))
 
@@ -1253,7 +1253,7 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
-            prediction_slot=spec.prediction_slot,
+            prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
             emb_features=self.emb_features,
