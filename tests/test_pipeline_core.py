@@ -466,6 +466,48 @@ def test_causal_windows_keep_each_boundary_target_and_restore_carry():
     resumed.close()
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_causal_windows_reject_per_document_field_drift_in_every_read(read):
+    stored = Memory([
+        {"text": np.asarray([1, 2], np.int32), "roles": np.asarray([10], np.int8)},
+        {"text": np.asarray([3], np.int32), "roles": np.asarray([20, 30], np.int8)},
+    ])
+    windows = Pipeline(stored).windows(2, fields=("text", "roles"))
+    with pytest.raises(ValueError):
+        list(iterate(windows, read=read, loading=READ))
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_chunk_statistics_count_fanout_per_input_document_and_resume(read):
+    from dew.data.steps.text import Chunks
+
+    stored = Memory([
+        {"text": np.arange(1, 8, dtype=np.int32)},
+        {"text": np.arange(11, 15, dtype=np.int32)},
+    ])
+    pipeline = Pipeline(stored, name="chunks").flat_map(Chunks(3, overlap=1)).batch(1)
+    data = compile(pipeline, read=read, loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        first = take(reader, 1)
+        saved = reader.get_state()
+        rest = take(reader, 4)
+        metrics = dict(data.statistics())
+        assert [row["text"][0] for row in first + rest] == [
+            [1, 2, 3], [3, 4, 5], [5, 6, 7], [11, 12, 13], [13, 14],
+        ]
+        assert metrics["data/chunks_per_record/chunks"] == 2.5
+    finally:
+        reader.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert take(resumed, 4) == rest
+        assert data.statistics()["data/chunks_per_record/chunks"] == 2.5
+    finally:
+        resumed.close()
+
+
 def test_validation_takes_accepted_rows_before_the_share_cut():
     prefix = Pipeline(source(11)).filter_map(Odd()).take(3).batch(4)
     data = compile(Pipeline(source()).batch(4), validation=prefix, loading=READ)
