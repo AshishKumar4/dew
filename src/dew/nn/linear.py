@@ -87,17 +87,17 @@ Pieces = Sequence[tuple[int, int | None]]
 
 
 @overload
-def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: None = None,
-                  dtype=None) -> jax.Array: ...
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
+                  parts: None = None, dtype=None) -> jax.Array: ...
 
 
 @overload
-def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces,
-                  dtype=None) -> tuple[jax.Array, ...]: ...
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
+                  parts: Pieces, dtype=None) -> tuple[jax.Array, ...]: ...
 
 
-def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces | None = None,
-                  dtype=None) -> jax.Array | tuple[jax.Array, ...]:
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
+                  parts: Pieces | None = None, dtype=None) -> jax.Array | tuple[jax.Array, ...]:
     """Depthwise causal conv over `[B, S, D]` with the `[D, K]` taps.
 
     The reference pads `K - 1` zeros to the left
@@ -115,7 +115,10 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     The sum, bias and silu run in at least fp32 and round once, to `dtype`
     (x's where None), so a mixer hands over its projection as it comes and
     asks for the width its scan runs in. `valid` `[B, S]` zeroes the outputs
-    of padding slots. `parts` `((width, head), ...)` returns the channels as
+    of padding slots. `segments` `[B, S]` numbers packed documents, and a tap
+    reads a token only in its output token's: each document convolves as if
+    zeros preceded it, as mamba_ssm's `causal_conv1d_fn(seq_idx=...)` does.
+    `parts` `((width, head), ...)` returns the channels as
     those consecutive pieces, a piece with a `head` l2-normalised over each
     `head` channels (`l2norm`), the queries and keys of a delta rule: each
     piece is the array its scan reads, not a slice of one to copy out.
@@ -133,16 +136,18 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     rows = _row_split(x)
     if rows is not None:
-        out = _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
+        out = _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows)
     else:
         pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
         if conv_refusal(x, kernel, pieces, dtype) is None:
             out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
+                                  None if segments is None else jnp.asarray(segments, jnp.int32),
                                   pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
                                   interpret=not generation.triton_runs())
             out = out[0] if parts is None else out
         else:
-            out = xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+            out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
+                             dtype=dtype)
     # The conv's output, which a remat policy may keep (`dew.nn.backbones.decoder_block.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
 
@@ -163,22 +168,25 @@ def _row_split(x) -> MeshAxes | None:
     return rows if automatic <= set(mesh_axes(rows)) else None
 
 
-def _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows: MeshAxes):
+def _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows: MeshAxes):
     """`causal_conv1d` with each shard of `rows` convolving its own rows (`manual_map`); the taps and
     bias are whole on every shard, and their gradients sum over the shards' rows."""
     P = jax.sharding.PartitionSpec
     row = P(rows, None, None)
     pieces = 1 if parts is None else len(tuple(parts))
 
-    def local(x, kernel, bias, valid):
-        return causal_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+    def local(x, kernel, bias, valid, segments):
+        return causal_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
+                             dtype=dtype)
 
-    in_specs = (row, P(), None if bias is None else P(), None if valid is None else P(rows, None))
-    return manual_map(local, in_specs, row if parts is None else (row,) * pieces)(x, kernel, bias, valid)
+    tokens = [None if given is None else P(rows, None) for given in (valid, segments)]
+    in_specs = (row, P(), None if bias is None else P(), *tokens)
+    return manual_map(local, in_specs, row if parts is None else (row,) * pieces)(x, kernel, bias, valid,
+                                                                                 segments)
 
 
-def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces | None = None,
-               dtype=None) -> jax.Array | tuple[jax.Array, ...]:
+def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
+               parts: Pieces | None = None, dtype=None) -> jax.Array | tuple[jax.Array, ...]:
     """`causal_conv1d`'s arithmetic in XLA: a CPU's and a TPU's, and the
     oracle of the GPU's kernels."""
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
@@ -187,9 +195,18 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, par
     wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
     padded = jnp.pad(x, ((0, 0), (K - 1, 0), (0, 0))).astype(wide)
     taps = kernel.astype(wide)
-    windows = padded[:, :length] * taps[:, 0]
+
+    def read(tap):
+        """The tokens `K - 1 - tap` before each, those of its own document."""
+        window = padded[:, tap:tap + length]
+        if segments is None:
+            return window
+        before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
+        return jnp.where((before == segments)[..., None], window, 0)
+
+    windows = read(0) * taps[:, 0]
     for tap in range(1, K):
-        windows = windows + padded[:, tap:tap + length] * taps[:, tap]
+        windows = windows + read(tap) * taps[:, tap]
     if bias is not None:
         windows = windows + bias.astype(wide)
     if activation:
@@ -227,26 +244,6 @@ def conv_refusal(x, kernel, parts, dtype) -> str | None:
          "a JVP trace needs forward-mode derivatives; the kernels implement a VJP"),
         (seen_whole(x), "a mesh axis splits the conv's operands, and the kernels see whole arrays"),
     ) or short_conv.refusal(x, kernel, parts, dtype)
-
-
-def document_conv1d(history, x, history_segments, segments, taps, bias=None):
-    """The causal depthwise conv of `causal_conv1d` over `x` `[B, S, D]`
-    behind `history` `[B, K-1, D]`, where a tap reads a token only if it
-    shares the output token's segment: each packed document convolves as if
-    zeros preceded it, as mamba_ssm's `causal_conv1d_fn(seq_idx=...)` does.
-    `taps` `[D, K]`, `history_segments` `[B, K-1]`, `segments` `[B, S]`;
-    silu after the bias, in at least fp32."""
-    width = taps.shape[1] - 1
-    length = x.shape[1]
-    stream = jnp.concatenate([history, x], axis=1)
-    stream = stream.astype(at_least_fp32(stream.dtype))
-    stream_segments = jnp.concatenate([history_segments, segments], axis=1)
-    out = (jnp.zeros(x.shape, stream.dtype) if bias is None
-           else jnp.broadcast_to(bias.astype(stream.dtype), x.shape))
-    for tap in range(width + 1):
-        same = stream_segments[:, tap:tap + length] == segments
-        out = out + taps[:, tap] * jnp.where(same[..., None], stream[:, tap:tap + length], 0)
-    return nn.silu(out)
 
 
 def _stream_order(valid):
@@ -295,32 +292,33 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
         rows = (ends[:, None] + jnp.arange(width)[None, :])[:, :, None]
         return conv(x, valid=valid), jnp.take_along_axis(stream, rows, axis=1)
     if valid is None and segments is not None:
-        # Every slot real: each packed document convolves alone where it stands (`document_conv1d`), the
-        # held history counting as the first's, without the masked conv's gathers over every slot; the
-        # history left keeps only the last document's tokens, as `_masked_conv1d`'s does.
+        # Every slot real: each packed document convolves alone where it stands, the held history counting
+        # as the first's, without the masked conv's gathers over every slot; the history left keeps only
+        # the last document's tokens, as `_masked_conv1d`'s does.
         state = rows_like(jnp.zeros((x.shape[0], width, x.shape[2]), x.dtype), x) if held is None else held
-        before = jnp.broadcast_to(segments[:, :1], (x.shape[0], width))
-        out = document_conv1d(state, x, before, segments, kernel, bias)
-        kept = jnp.concatenate([before, segments], axis=1)[:, -width:]
+        kept = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')[:, -width:]
         history = jnp.where((kept == segments[:, -1:])[:, :, None],
                             jnp.concatenate([state, x], axis=1)[:, -width:], 0)
-        return conv_pieces(out, parts, x.dtype if dtype is None else dtype), history
+        return conv(x, segments=segments), history
     if valid is not None:
         return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype)
     history = x if held is None else jnp.concatenate([held, x], axis=1)
     return conv(x), history[:, -width:]
 
 
-def _behind(x, *, kernel, held, bias, valid=None, parts=None, dtype=None):
+def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dtype=None):
     """`causal_conv1d` of `x` after the `held` history `[B, K - 1, D]`, or
-    after the conv's own zeros where None."""
+    after the conv's own zeros where None; the history is the first of
+    packed `segments`' documents."""
     if held is None:
-        return causal_conv1d(x, kernel, bias=bias, valid=valid, parts=parts, dtype=dtype)
+        return causal_conv1d(x, kernel, bias=bias, valid=valid, segments=segments, parts=parts, dtype=dtype)
     width = held.shape[1]
     if valid is not None:
         valid = jnp.pad(valid, ((0, 0), (width, 0)), constant_values=True)
-    out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, bias=bias, valid=valid, parts=parts,
-                        dtype=dtype)
+    if segments is not None:
+        segments = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')
+    out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, bias=bias, valid=valid, segments=segments,
+                        parts=parts, dtype=dtype)
     return jax.tree.map(lambda piece: piece[:, width:], out)
 
 
@@ -370,7 +368,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     history. `cumsum(valid) - 1` indexes each real token in the row's stream,
     so one convolution over the gathered stream replaces S sequential windows.
     `segments` `[B, S]` makes each packed document convolve alone
-    (`document_conv1d`); the held `state` belongs to the first real token's
+    (`causal_conv1d`); the held `state` belongs to the first real token's
     document. Masking an ordinary convolution's input instead reads the zeros in
     a gap (5.0 off in fp32 on nine slots with holes at 2, 5 and 6,
     test_the_masked_conv_reads_across_a_gap). `parts` and `dtype` are
@@ -391,20 +389,20 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     # The K-1 stream rows from the row's token count on are the history it leaves.
     rows = (rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :]
     history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
-    if segments is None:
-        # The history in front carries the K-1 taps the first real token
-        # reads, so row width + j of the convolution is the output of real
-        # token j.
-        convolved = causal_conv1d(stream, kernel, bias=bias, dtype=at_least_fp32(x.dtype))[:, width:]
-    else:
+    owners = None
+    if segments is not None:
+        # The stream's documents, the history in front counting as the first real token's.
         ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
-        held = jnp.broadcast_to(ordered[:, :1], (batch, width))
-        convolved = document_conv1d(state, compact, held, ordered, kernel, bias)
+        owners = jnp.pad(ordered, ((0, 0), (width, 0)), mode='edge')
         # The next call continues the last real token's document, so the history keeps only its
         # tokens; an earlier document's, where the last is shorter than K-1, read as its start's zeros.
-        kept = jnp.take_along_axis(jnp.concatenate([held, ordered], axis=1), rows, axis=1)
+        kept = jnp.take_along_axis(owners, rows, axis=1)
         last = jnp.take_along_axis(ordered, jnp.maximum(rank[:, -1:], 0), axis=1)
         history = jnp.where(((kept == last) | (rank[:, -1:] < 0))[:, :, None], history, 0)
+    # The history in front carries the K-1 taps the first real token reads, so row width + j of the
+    # convolution is the output of real token j.
+    convolved = causal_conv1d(stream, kernel, bias=bias, segments=owners,
+                              dtype=at_least_fp32(x.dtype))[:, width:]
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
     output = jnp.where(valid[:, :, None], output, 0)
     return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
