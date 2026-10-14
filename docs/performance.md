@@ -1133,6 +1133,30 @@ tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096
 --value-dim 128 --batch-size 2 --heads 128 --kv-groups 16 --causal True --sliding-window 128
 --sinks`.
 
+### Packed rows on FlashAttention's varlen kernel, 2026-10-13
+
+A packed call ran XLA's attention under the document mask. Flash's varlen kernel takes the rows as
+sequences instead, each document and each row's padding after them one sequence over the flattened
+tokens, so `cu_seqlens` holds `B * (max_segments + 1)` sequences whatever the rows hold: the cap is
+a static size, and the sequences past a row's documents are empty but still launch. At Qwen3.5-0.8B's
+attention (8 x 3072 tokens, 8 query heads over 2 of 256, causal, 64 padding tokens a row), forward
+and backward in ms, median of 20, jax 0.11.2:
+
+| documents a row | xla, document mask | flash, cap = documents | flash, cap 64 | flash, cap 3072 |
+|---|---:|---:|---:|---:|
+| H100 SXM, 1 | 12.58 | 2.63 | 4.19 | 81.61 |
+| H100 SXM, 4 | 12.68 | 1.71 | 3.22 | 81.03 |
+| H100 SXM, 16 | 12.27 | 1.45 | 2.66 | 79.94 |
+| A100 40GB, 1 | 22.75 | 8.23 | 13.69 | 162.51 |
+| A100 40GB, 4 | 22.73 | 5.77 | 9.19 | 159.02 |
+| A100 40GB, 16 | 24.65 | 3.94 | 6.69 | 157.13 |
+
+An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
+loses to the mask, and 64 wins at every document count. The target rows of sm80 and sm90 name
+flash for `attention_packed`, and `flash_refusal` takes a packed call there when its
+`Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`); a cap the data does not declare
+is the row length, which stays on the mask.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
