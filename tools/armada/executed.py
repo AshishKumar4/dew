@@ -60,9 +60,11 @@ decided: dict[types.CodeType, bool] = {}
 
 def started(code, offset):
     if code is CHILD_START:
+        # Never disabled: a thread's start that disabled it as the next test file began would leave
+        # that file's starts unseen. Process starts are few.
         if running:
             spawned.add(running[-1])
-        return sys.monitoring.DISABLE
+        return None
     name = code.co_filename
     if not checkout(name):
         return sys.monitoring.DISABLE
