@@ -171,14 +171,19 @@ def cpu_class() -> str:
 
 def device_class() -> str:
     """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as
-    tests/lane_environment.py reads it) the host's GPU model as its driver names it, before the CPU's
-    class, whose float32 the lane's CPU devices compute (`cpu_class`); else the CPU's class alone."""
+    tests/lane_environment.py reads it) the model of the GPU it was given (`CUDA_VISIBLE_DEVICES`) as
+    the driver names it, before the CPU's class, whose float32 the lane's CPU devices compute
+    (`cpu_class`); else the CPU's class alone."""
     if "cuda" not in os.environ.get("JAX_PLATFORMS", "").split(","):
         return cpu_class()
-    models = sorted({line.partition(":")[2].strip()
-                     for path in Path("/proc/driver/nvidia/gpus").glob("*/information")
-                     for line in path.read_text().splitlines() if line.startswith("Model:")})
-    return "-".join(["+".join(models).replace(" ", "-") or "unknown-gpu", cpu_class()])
+    return "-".join([re.sub(r"[^A-Za-z0-9.]+", "-", gpu_query("name")), cpu_class()])
+
+
+def gpu_query(field: str) -> str:
+    """`nvidia-smi`'s `field` of the GPU this process was given (`CUDA_VISIBLE_DEVICES`)."""
+    return subprocess.run(["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits", "-i",
+                           os.environ["CUDA_VISIBLE_DEVICES"]], capture_output=True, text=True,
+                          check=True).stdout.strip()
 
 
 def worker() -> str:
@@ -592,9 +597,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
     runs out of its share is red: it took more than it took before."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
-    total = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits",
-                                "-i", os.environ["CUDA_VISIBLE_DEVICES"]], capture_output=True, text=True,
-                               check=True).stdout) * 2 ** 20
+    total = int(gpu_query("memory.total")) * 2 ** 20
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
@@ -608,7 +611,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
     waiting = sorted(tests, key=lambda name: -shares[name])
-    verdicts = {name: out.with_name(f"{out.name}.{Path(name).stem}") for name in tests}
+    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
     running: dict[concurrent.futures.Future, str] = {}
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         while waiting or running:
@@ -616,7 +619,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             fits = next((name for name in waiting if shares[name] <= free), None)
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
-                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": f"{shares[fits] / total:.4f}"}
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
                 running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
                                     environ)] = fits
                 continue
