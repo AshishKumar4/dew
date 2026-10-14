@@ -29,18 +29,20 @@ times, from which `durations` rewrites tests/test_durations.json: given green
 runs' verdicts (`armada verdict <sha> --json`), the newest first, it records
 each test of the newest at its least time as the floor's Python ran it.
 
-The test cache skips a file whose inputs are unchanged since it ran green. A
+The test cache reuses a file's row when its inputs are unchanged since it ran green. A
 green row records the checkout's Python files its tests executed
 (tools/armada/executed.py) and its key, a hash of those files, the file
 itself and what every file shares (`shared`: the environment's locks, the
 CI tools, every non-Python file under tests/ and src/, and the names of every
-Python file there, so a file a scanner would find changes every key). The
-plan recomputes each file's key from its record at the commit it plans, and
-leaves out a file whose every row's key matches, which ran green on exactly
-these inputs. A file that started another process is never skipped, since no
+Python file there, so a file a scanner would find changes every key). A task
+recomputes each of its files' keys from the record made on its own CPU class
+(float32 results differ by microarchitecture) and reports the recorded green row
+instead of running a file whose key matches, which ran green on exactly these
+inputs there. A file that started another process is never reused, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
-under `CACHE_PREFIX`; with DEW_TEST_CACHE=off, or without its URL and token, the
-plan runs every file.
+under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
+entries carry to their tasks (`--cache`), or without the Worker's URL and
+token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU, from which `gpu-tier` names the files that take
@@ -150,15 +152,29 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
     return digest.hexdigest()
 
 
+def cpu_class() -> str:
+    """This host's CPU microarchitecture (vendor, family, model). XLA:CPU emits the same code on every
+    host, but hardware estimate instructions (vrsqrtps) differ between microarchitectures, so float32
+    results, and thus numerical verdicts, belong to the class that produced them."""
+    fields = {}
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("vendor_id", "cpu family", "model") and key.strip() not in fields:
+            fields[key.strip()] = value.strip()
+    return "-".join(fields.get(key, "unknown") for key in ("vendor_id", "cpu family", "model"))
+
+
 def worker() -> str:
     """The URL of the Worker that holds the records."""
     return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
 
 
-def cache_url(python: str, row_name: str) -> str:
-    """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
+def cache_url(python: str, row_name: str, cpu: str) -> str:
+    """Where the record of `row_name` on CPU class `cpu` lives: the Worker's key alphabet has no colon
+    or hash."""
     _, name, split = parsed_row(row_name)
-    return f"{worker()}/{CACHE_PREFIX}/{python}/{name}/{'-of-'.join(split.split('/')) if split else 'whole'}"
+    return (f"{worker()}/{CACHE_PREFIX}/{python}/{cpu}/{name}/"
+            + ("-of-".join(split.split("/")) if split else "whole"))
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -179,43 +195,17 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
         return None
 
 
-def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str, list[float]],
-                 target: float) -> set[str]:
-    """The files of `timed` whose every row, as the plan would split them, ran green on these inputs."""
-    common = shared(python)
-
-    def rows_of(name: str) -> list[str]:
-        seconds = timed[name]
-        if seconds is None or seconds <= target:
-            return [row(python, name, "")]
-        count = len(split(recorded.get(name, []), seconds, target))
-        return [row(python, name, f"{group}/{count}") for group in range(1, count + 1)]
-
-    with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        hits = pool.map(lambda name: cached(python, rows_of(name), common), timed)
-        return {name for name, hit in zip(timed, hits, strict=True) if hit}
-
-
-def reading_token() -> str | None:
-    """The token the records are read with, or None where the cache is off or out of reach."""
-    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
-    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+def reused(python: str, name: str, split: str, common: str) -> dict | None:
+    """The green row of test file `name` (in `split`'s group) recorded on this host's CPU class, if it
+    ran green there on exactly these inputs; else None."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    return token
-
-
-def cached(python: str, rows: list[str], common: str) -> bool:
-    """Whether every one of a file's `rows` ran green on exactly these inputs."""
-    token = reading_token()
-    if token is None:
-        return False
-    for row_name in rows:
-        record = cache_request(cache_url(python, row_name), token)
-        if record is None:
-            return False
-        if not fresh(json.loads(record), parsed_row(row_name)[1], common):
-            return False
-    return True
+    record = cache_request(cache_url(python, row(python, name, split), cpu_class()), token)
+    if record is None:
+        return None
+    recorded = json.loads(record)
+    return recorded["row"] if fresh(recorded, name, common) else None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -315,16 +305,15 @@ def torchax_files(names: Iterable[str]) -> set[str]:
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another."""
+    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
+    the test cache's policy, DEW_TEST_CACHE here, to its task."""
+    cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings, python)
-        unchanged = cached_files(python, timed, recorded, target)
-        print(f"{python}: {len(unchanged)} of {len(files)} files ran green on these inputs", file=sys.stderr)
-        timed = {name: seconds for name, seconds in timed.items() if name not in unchanged}
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
@@ -346,13 +335,14 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight})
+                            "weight": weight, "cache": cache})
     rest = [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[1]}-{COLLECT}-{index + 1}", "python": PYTHONS[1],
                         "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target})
+                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target,
+                        "cache": cache})
     return entries
 
 
@@ -406,7 +396,8 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
-def task(python: str, tests: list[str], split: str, out: Path, deadline: float, grace: float = 60.0) -> int:
+def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
+         grace: float = 60.0) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
     killing them `grace` seconds after that.
 
@@ -417,6 +408,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     began = time.monotonic()
     # Before any test writes under tests/, the inputs as the plan saw them.
     common = shared(python)
+    rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
+    tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
+    if rows:
+        print(f"{len(rows)} files ran green on these inputs on {cpu_class()}; their rows are reused")
+    if not tests:
+        out.write_text(json.dumps({"rows": rows}))
+        return 0
     executed_report = out.with_name(f"{out.name}.executed.json")
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
@@ -460,7 +458,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
-    rows = []
+    ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
     wall = time.monotonic() - began
@@ -481,29 +479,31 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         seconds = own_seconds[name] * pace if pace else wall / len(tests)
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
-        rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
+        ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}})
-    out.write_text(json.dumps({"rows": rows}))
-    record(python, rows, executed_report, common)
+    out.write_text(json.dumps({"rows": rows + ran}))
+    record(python, ran, executed_report, common)
     return 0
 
 
 def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
-    """Keep each green row's key, the files its tests executed and where they read the backend:
-    `cached` reads the key back, `gpu_tier` the reads."""
+    """Keep each green row with its key, the files its tests executed and where they read the
+    backend: `reused` reads the row back, `gpu_tier` the reads."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
     executed = json.loads(executed_report.read_text())
+    cpu = cpu_class()
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         if row_["exitCode"] == 0 and name in executed:
             depends = executed[name]["depends"]
             key = None if depends is None else cache_key(common, name, depends)
-            body = json.dumps({"key": key, "depends": depends, "reads": executed[name]["reads"]}).encode()
-            cache_request(cache_url(python, row_["name"]), token, body)
+            body = json.dumps({"key": key, "depends": depends, "row": row_,
+                               "reads": executed[name]["reads"]}).encode()
+            cache_request(cache_url(python, row_["name"], cpu), token, body)
 
 
 def listed(prefix: str, token: str) -> list[str]:
@@ -524,18 +524,18 @@ def listed(prefix: str, token: str) -> list[str]:
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
-    a split file's under each count of groups it was planned as. A file is out only where every
-    record is of these inputs (`fresh`) and says neither, so a file whose inputs changed since it
-    ran is in as "changed", and one without a record, or with one the Worker did not return, as
-    "unrecorded": a new file, or one no green run of these tools has recorded."""
-    token = reading_token()
-    if token is None:
+    on every CPU class, a split file's under each count of groups it was planned as. A file is out
+    only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
+    changed since it ran is in as "changed", and one without a record, or with one the Worker did not
+    return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
     common = shared(python)
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
-        name = key.rsplit("/", 1)[0]
+        name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <cpu class>/<test file>/<group>
         record = cache_request(f"{worker()}/{prefix}{key}", token)
         if record is None:
             return name, ["unrecorded"]
@@ -551,12 +551,12 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
-def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float]:
+def durations(verdicts: list[dict]) -> dict[str, float]:
     """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
     as their floor's Python ran it: what it takes where nothing slows it. A container can run three
     times as slowly as the rest of its run, and a run's compilations can miss the shared cache, and
-    neither moves a test's time. A test of a file the newest run ran, which that run did not have, is
-    gone; a file the newest run skipped as unchanged (the test cache) keeps its times from `before`."""
+    neither moves a test's time. A test the newest run did not have is gone; a reused row (the test
+    cache) carries the times of the run that recorded it."""
     times: dict[str, list[float]] = {}
     for verdict in verdicts:
         rows = verdict["rows"]
@@ -571,10 +571,7 @@ def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float
                 times.setdefault(node, []).append(seconds)
     newest_rows = [row for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")]
     newest = {node for row in newest_rows for node in row["tests"]}
-    ran = {parsed_row(row["name"])[1] for row in newest_rows}
-    kept = {node: seconds for node, seconds in before.items() if node.split("::")[0] not in ran}
-    return dict(sorted({**kept, **{node: round(min(seconds), 3) for node, seconds in times.items()
-                                   if node in newest}}.items()))
+    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
 
 
 def main() -> int:
@@ -588,6 +585,9 @@ def main() -> int:
     running.add_argument("--tests", required=True)
     running.add_argument("--split", default="")
     running.add_argument("--out", type=Path, required=True)
+    running.add_argument(
+        "--cache", choices=("on", "off"), required=True,
+        help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     choosing = operations.add_parser("gpu-tier")
@@ -597,8 +597,7 @@ def main() -> int:
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "durations":
-        before = json.loads(DURATIONS.read_text()) if DURATIONS.is_file() else {}
-        recorded = durations([json.loads(path.read_text()) for path in args.verdicts], before)
+        recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0
@@ -620,7 +619,7 @@ def main() -> int:
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline)
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache == "on")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -18,6 +19,9 @@ def ci(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.chdir(tmp_path)
+    # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
+    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_TEST_CACHE"):
+        monkeypatch.delenv(name, raising=False)
     (tmp_path / "tests").mkdir()
     return module
 
@@ -122,7 +126,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
     first, beside others. The `platform` module is no read. A file that started a process
-    has no key, so it is in, and the plan never skips it."""
+    has no key, so it is in, and no task reuses its row."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -168,7 +172,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
             f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
-    stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2")[len(url):]] = None
+    stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())[len(url):]] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/devices.py:placed"],
         "tests/test_imported_too.py": ["tests/devices.py:placed"],
@@ -183,7 +187,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_spawns.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
-    assert [ci.cached("3.12", [ci.row("3.12", f"tests/{name}", "")], common)
+    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_spawns.py")] == [True, False]
 
 
@@ -218,30 +222,27 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
 def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
     """`durations` records each test of the newest verdict at its least time
     over green verdicts' floor rows, so a slow container or run moves nothing
-    and a test since removed is dropped, keeps the times of a file the newest
-    run skipped as unchanged, and refuses a red run or rows that carry no times."""
+    and a test since removed is dropped, and refuses a red run or rows that
+    carry no times."""
     def verdict(x, y):
         return {"rows": [
             {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
             {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": y}},
             {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 90.0}}]}
 
-    assert ci.durations([verdict(1.2346, 2.0)], {}) == {
+    assert ci.durations([verdict(1.2346, 2.0)]) == {
         "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
-    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)], {}) == {
+    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
         "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
     removed = {"rows": [{"name": "3.12:tests/test_a.py", "exitCode": 0,
                          "tests": {"tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_gone": 3.0}}]}
-    assert ci.durations([verdict(1.0, 2.0), removed], {}) == {
+    assert ci.durations([verdict(1.0, 2.0), removed]) == {
         "tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_y": 2.0}
-    cold = ci.durations([{"rows": [*verdict(1.0, 2.0)["rows"], {
-        "name": "3.12:tests/test_b.py", "exitCode": 0, "tests": {"tests/test_b.py::test_z": 4.0}}]}], {})
-    assert ci.durations([verdict(1.0, 2.0)], cold) == cold
     red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
     with pytest.raises(SystemExit):
-        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}], {})
+        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
     with pytest.raises(SystemExit):
-        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}], {})
+        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
@@ -263,6 +264,56 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
     assert long / short == pytest.approx(3.0, rel=0.25)
+
+
+def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
+    """A file that ran green is reused by a later task on the same CPU class while its inputs are
+    unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
+    (the daily full run) runs it again. Each task runs as armada starts it: .armada.json's command
+    filled from its plan entry."""
+    (tmp_path / "tests/test_counted.py").write_text(
+        "from pathlib import Path\n"
+        "def test_ok():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    worker: dict[str, bytes] = {}
+
+    def cache_request(url, token, data=None):
+        if data is not None:
+            worker[url] = data
+        return worker.get(url) if data is None else None
+
+    monkeypatch.setattr(ci, "cache_request", cache_request)
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    out = tmp_path / "verdict.json"
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+
+    def run(cpu, policy="on"):
+        monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
+        monkeypatch.setenv("DEW_TEST_CACHE", policy)
+        [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+        values = {**entry, "out": out}
+        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+        # A task's environment is .armada.json's, which the plan's DEW_TEST_CACHE is not part of.
+        monkeypatch.delenv("DEW_TEST_CACHE")
+        assert ci.main() == 0
+        [only] = json.loads(out.read_text())["rows"]
+        assert only["exitCode"] == 0
+        return len((tmp_path / "runs").read_text())
+
+    assert run("GenuineIntel-6-143") == 1
+    assert run("GenuineIntel-6-143") == 1
+    assert run("AuthenticAMD-25-1") == 2
+    assert run("AuthenticAMD-25-1") == 2
+    assert run("AuthenticAMD-25-1", policy="off") == 3
+    (tmp_path / "tests/test_counted.py").write_text(
+        (tmp_path / "tests/test_counted.py").read_text() + "def test_more(): pass\n")
+    assert run("GenuineIntel-6-143") == 4
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
