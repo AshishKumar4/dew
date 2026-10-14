@@ -1445,6 +1445,35 @@ class Packed:
                             chunks=None if runs == 1 else runs)
 
 
+_QKV = ('q_proj', 'k_proj', 'v_proj')
+
+
+def _key_runs(config: Mapping[str, object]) -> int:
+    """A grouped qkv's runs: one a key head."""
+    return records.integer(config['num_kv_heads'], 'num_kv_heads')
+
+
+def _key_run_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
+    """One run's query, key and value rows: its key head's group of query heads, then the key and
+    value head."""
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    return (records.integer(config['num_heads'], 'num_heads') // _key_runs(config) * head_dim, head_dim,
+            records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
+
+
+def grouped_qkv(name: str) -> tuple[Packed, Packed]:
+    """The weight and bias of a fused q, k and v projection under `name`
+    (`.attention.query_key_value`), stored in one run a key head, each run
+    its group's query rows, then its key's and its value's. GPT-NeoX's and
+    BLOOM's per-head interleave is the run of a model whose every head keys
+    itself, Falcon-7B's and GPTBigCode's multi-query [q | k | v] the one run
+    of one key head, and MiMo-V2.6's fused qkv the run vLLM pre-shards it in
+    (`_shard_fp8_qkv_proj`)."""
+    weight, bias = (Packed(f'{name}.{leaf}', tuple(f'.self_attn.{part}.{leaf}' for part in _QKV), 0,
+                           widths=_key_run_widths, chunks=_key_runs) for leaf in ('weight', 'bias'))
+    return weight, bias
+
+
 # Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch
 # Linears, `gate_up_proj` `[E, 2 * expert, hidden]` with the gate in the first
 # rows and `down_proj` `[E, hidden, expert]`, where dew stacks `[E, in, out]`.
