@@ -21,7 +21,6 @@ explicit block/warp/stage overrides for the lab.
 
 import dataclasses
 import functools
-from collections.abc import Mapping
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -185,16 +184,6 @@ def _wide() -> bool:
     if not target.generation.startswith("sm"):
         return True
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
-
-
-def _launch(op: _Launch, overrides: Mapping[str, int | None], *args, **kwargs):
-    """`op` on `args`, its tiles the tuner's pick or heuristic, with any `overrides` (the lab's, a
-    test's) replacing their fields, fitted to the call as every config is (`_Launch._tiles`)."""
-    given = {field: value for field, value in overrides.items() if value is not None}
-    if given:
-        ba = op.bind(*args, **kwargs)
-        op = op.replace(config=op._tiles(ba, dataclasses.replace(op._get_heuristics_config(ba), **given)))
-    return op(*args, **kwargs)
 
 
 class Sequences(NamedTuple):
@@ -394,8 +383,7 @@ _CHUNK_LOCAL_CUMSUM = ChunkLocalCumsum()
 
 
 def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
-                       spans: Sequences | None = None, warps: int | None = None, stages: int | None = None,
-                       interpret: bool = False):
+                       spans: Sequences | None = None, interpret: bool = False):
     """`g` `[B, T, H]`, or `[B, T, H, K]` per key dimension, cumulated within each chunk of `chunk`
     tokens of each sequence (`spans`, the rows where None), fp32: fla's `chunk_local_cumsum`
     (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
@@ -404,8 +392,7 @@ def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, revers
     rounded once. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
     batch, length = g.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_LOCAL_CUMSUM, {"warps": warps, "stages": stages},
-                   g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)
+    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)
 
 
 def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
@@ -552,8 +539,7 @@ class KktSolve(_Launch):
 _KKT_SOLVE = KktSolve()
 
 
-def kkt_solve(k, g, g_lo, beta, *, chunk: int = 64, sub: int = 16, bk: int | None = None,
-              spans: Sequences | None = None, warps: int | None = None, stages: int | None = None,
+def kkt_solve(k, g, g_lo, beta, *, chunk: int = 64, sub: int = 16, spans: Sequences | None = None,
               interpret: bool = False):
     """`(I + A)^-1` per chunk, `[B, T, HV, BT]` in `k`'s dtype and zero above the diagonal: fla's
     fused kkt and solve for 64-token chunks (chunk_fwd.py:367-396). `k` `[B, T, H, K]`, `g` and `g_lo`
@@ -561,8 +547,7 @@ def kkt_solve(k, g, g_lo, beta, *, chunk: int = 64, sub: int = 16, bk: int | Non
     `BK` over 32 and 64 and warps over 1, 2 and 4."""
     batch, length = k.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_KKT_SOLVE, {"bk": bk, "warps": warps, "stages": stages},
-                   k, g, g_lo, beta, *spans, chunk=chunk, sub=sub, interpret=interpret)
+    return _KKT_SOLVE(k, g, g_lo, beta, *spans, chunk=chunk, sub=sub, interpret=interpret)
 
 
 def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *, chunk: int,
@@ -632,8 +617,7 @@ class RecomputeWU(_Launch):
 _RECOMPUTE_W_U = RecomputeWU()
 
 
-def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, bk: int | None = None, bv: int | None = None,
-                  spans: Sequences | None = None, warps: int | None = None, stages: int | None = None,
+def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, spans: Sequences | None = None,
                   interpret: bool = False):
     """`(w, u)`, in `k`'s and `v`'s dtypes: fla's `recompute_w_u_fwd` (wy_fast.py:247-296).
 
@@ -643,8 +627,7 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, bk: int | None = None, b
     2, 4, 8 and stages over 2, 3, 4."""
     batch, length = k.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_RECOMPUTE_W_U, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   k, v, beta, a, g, *spans, chunk=chunk, interpret=interpret)
+    return _RECOMPUTE_W_U(k, v, beta, a, g, *spans, chunk=chunk, interpret=interpret)
 
 
 def _span(span_ref, length: int, chunk: int, aligned: bool):
@@ -764,8 +747,7 @@ class ChunkFwdH(_Launch):
 _CHUNK_FWD_H = ChunkFwdH()
 
 
-def chunk_fwd_h(k, w, u, g, g_lo, h0, *, chunk: int = 64, bv: int | None = None,
-                spans: Sequences | None = None, warps: int | None = None, stages: int | None = None,
+def chunk_fwd_h(k, w, u, g, g_lo, h0, *, chunk: int = 64, spans: Sequences | None = None,
                 interpret: bool = False):
     """`(h, corrected, final)`: the memory each chunk enters `[B, T // chunk, HV, K, V]` (`[1, NT, ...]`
     over `spans`' chunks) in `k`'s dtype, the corrected values `[B, T, HV, V]` in `u`'s and each row's
@@ -777,8 +759,7 @@ def chunk_fwd_h(k, w, u, g, g_lo, h0, *, chunk: int = 64, bv: int | None = None,
     4 warps, 3 stages (c53)."""
     batch, length = k.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_FWD_H, {"bv": bv, "warps": warps, "stages": stages},
-                   k, w, u, g, g_lo, h0, *spans, chunk=chunk, interpret=interpret)
+    return _CHUNK_FWD_H(k, w, u, g, g_lo, h0, *spans, chunk=chunk, interpret=interpret)
 
 
 def _per_row(h, batch: int, length: int, chunk: int, spans: Sequences):
@@ -909,9 +890,8 @@ class ChunkBwdDhu(_Launch):
 _CHUNK_BWD_DHU = ChunkBwdDhu()
 
 
-def chunk_bwd_dhu(q, k, w, g, g_lo, dht, do, dv, *, scale: float, chunk: int = 64, bv: int | None = None,
-                  spans: Sequences | None = None, warps: int | None = None, stages: int | None = None,
-                  interpret: bool = False):
+def chunk_bwd_dhu(q, k, w, g, g_lo, dht, do, dv, *, scale: float, chunk: int = 64,
+                  spans: Sequences | None = None, interpret: bool = False):
     """`(dh, dh0, dv2)`: the gradient of the memory each chunk leaves into `[B, T // chunk, HV, K, V]`
     (`[1, NT, ...]` over `spans`' chunks) in `q`'s dtype, of each row's initial memory `[B, HV, K, V]`
     fp32, and the corrected values' full gradient `[B, T, HV, V]` in `dv`'s: fla's
@@ -922,8 +902,8 @@ def chunk_bwd_dhu(q, k, w, g, g_lo, dht, do, dv, *, scale: float, chunk: int = 6
     A100 choice: BV 32, 4 warps, 3 stages (c53)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_BWD_DHU, {"bv": bv, "warps": warps, "stages": stages},
-                   q, k, w, g, g_lo, dht, do, dv, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return _CHUNK_BWD_DHU(q, k, w, g, g_lo, dht, do, dv, *spans, scale=scale, chunk=chunk,
+                          interpret=interpret)
 
 
 def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, do_ref, dv_ref, *, chunk: int, aligned: bool,
@@ -992,16 +972,14 @@ class ChunkBwdDvLocal(_Launch):
 _CHUNK_BWD_DV_LOCAL = ChunkBwdDvLocal()
 
 
-def chunk_bwd_dv_local(q, k, g, g_lo, do, *, scale: float, chunk: int = 64, bk: int | None = None,
-                       bv: int | None = None, spans: Sequences | None = None, warps: int | None = None,
-                       stages: int | None = None, interpret: bool = False):
+def chunk_bwd_dv_local(q, k, g, g_lo, do, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+                       interpret: bool = False):
     """The corrected values' gradient from each chunk's own output, `[B, T, HV, V]` in `do`'s dtype:
     fla's `chunk_bwd_dv_local` (chunk_o.py:640-676). fla tiles `BK` and `BV` at 64 on an A100
     (its CONST_TILING for ampere and ada shared memory) and chose 2 warps, 3 stages there (c53)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_BWD_DV_LOCAL, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, do, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return _CHUNK_BWD_DV_LOCAL(q, k, g, g_lo, do, *spans, scale=scale, chunk=chunk, interpret=interpret)
 
 
 def _split_dot(a, b, *, exact: bool):
@@ -1133,8 +1111,7 @@ _CHUNK_BWD_DQKWG = ChunkBwdDqkwg()
 
 
 def chunk_bwd_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: int = 64,
-                    bk: int | None = None, bv: int | None = None, spans: Sequences | None = None,
-                    warps: int | None = None, stages: int | None = None, interpret: bool = False):
+                    spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, dw, dg)`: fla's `chunk_bwd_dqkwg` (chunk_o.py:696-743). `q`, `k` `[B, T, H, K]`, `v`
     the corrected values and `do` `[B, T, HV, V]`, `w` `[B, T, HV, K]` (its shape and dtype for `dw`),
     `g` and `g_lo` the base-2 cumulated decay's halves, `h` and `dh` per chunk `[B, T // chunk, HV, K,
@@ -1144,8 +1121,8 @@ def chunk_bwd_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: 
     4 warps, 2 stages (c53)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_BWD_DQKWG, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, k, v, w, g, g_lo, h, dv, do, dh, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return _CHUNK_BWD_DQKWG(q, k, v, w, g, g_lo, h, dv, do, dh, *spans, scale=scale, chunk=chunk,
+                            interpret=interpret)
 
 
 def _chunk_states(h):
@@ -1298,9 +1275,8 @@ class PrepareWyReprBwd(_Launch):
 _PREPARE_WY_REPR_BWD = PrepareWyReprBwd()
 
 
-def prepare_wy_repr_bwd(k, v, beta, g, g_lo, a, dw, du, dk=None, *, chunk: int = 64, bk: int | None = None,
-                        bv: int | None = None, spans: Sequences | None = None, warps: int | None = None,
-                        stages: int | None = None, interpret: bool = False):
+def prepare_wy_repr_bwd(k, v, beta, g, g_lo, a, dw, du, dk=None, *, chunk: int = 64,
+                        spans: Sequences | None = None, interpret: bool = False):
     """`(dk, dv, db, dg)` through the WY representation: fla's `prepare_wy_repr_bwd` (wy_fast.py:
     296-343). `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta`, `g` and `g_lo` (the cumulated decay's
     halves) `[B, T, HV]`, `a` the inverse
@@ -1310,8 +1286,7 @@ def prepare_wy_repr_bwd(k, v, beta, g, g_lo, a, dw, du, dk=None, *, chunk: int =
     `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53)."""
     batch, length = k.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_PREPARE_WY_REPR_BWD, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   k, v, beta, g, g_lo, a, dw, du, dk, *spans, chunk=chunk, interpret=interpret)
+    return _PREPARE_WY_REPR_BWD(k, v, beta, g, g_lo, a, dw, du, dk, *spans, chunk=chunk, interpret=interpret)
 
 
 def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, lo_ref, o_ref, *, chunk: int, aligned: bool,
@@ -1387,9 +1362,8 @@ class ChunkFwdO(_Launch):
 _CHUNK_FWD_O = ChunkFwdO()
 
 
-def chunk_fwd_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64, bk: int | None = None,
-                bv: int | None = None, spans: Sequences | None = None, warps: int | None = None,
-                stages: int | None = None, interpret: bool = False):
+def chunk_fwd_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+                interpret: bool = False):
     """Each chunk's output, `[B, T, HV, V]` in `v`'s dtype: fla's `chunk_fwd_o` (chunk_o.py:529-575).
 
     `q`, `k` `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `h` the memory each chunk
@@ -1399,8 +1373,7 @@ def chunk_fwd_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64, bk: int |
     one of fla's configs (`BK, BV` 128/128 at 8 warps, 64/64 at 4, 32/32 at 2, all 3 stages)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_FWD_O, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, k, v, h, g, g_lo, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return _CHUNK_FWD_O(q, k, v, h, g, g_lo, *spans, scale=scale, chunk=chunk, interpret=interpret)
 
 
 def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
