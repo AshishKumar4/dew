@@ -82,7 +82,7 @@ class _Memory:
         return self.held
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.original.metadata(), **self.facts, "accepted": len(self.held)}
+        return {**self.original.metadata(), **self.facts, "rows": len(self.held), "accepted": len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured
@@ -242,7 +242,7 @@ def _memory_stages(
                 counted = expanded_counts
         consumed += 1
     if counted is not None:
-        targets = {"windows": len(rows), "valid_targets": sum(counted.values())}
+        targets = {"valid_targets": sum(counted.values())}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
@@ -264,7 +264,7 @@ def _targeted(
             total += count
         else:
             counter.rejected["zero_targets"] += 1
-    return kept, {"windows": len(kept), "valid_targets": total}
+    return kept, {"valid_targets": total}
 
 
 def _memory_mixture(

@@ -30,7 +30,7 @@ from token_support import write_token_corpus
 
 from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
-from dew.data.compile import compile, validation
+from dew.data.compile import compile, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
@@ -1032,3 +1032,24 @@ def test_phases_that_end_in_other_device_steps_are_refused():
     with pytest.raises(ValueError):
         compile(Pipeline(Phases((phase("plain"), phase("stepped").map(_DevicePlusOne())), (1, None))),
                 read="memory", loading=READ)
+
+
+def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_each_states(tmp_path):
+    """Published generations mix by tokens from the rows and valid targets each states, where
+    the weighting once looked for a windows count no generation states."""
+    from dew.data.cache import Cache
+    from dew.data.steps.text import CountTargets, Tokenize
+
+    def published(name: str, documents: int) -> Pipeline:
+        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
+        generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
+                             Cache(str(tmp_path / name)), read="indexed", loading=READ)
+        return Pipeline(generation.source(), name=name)
+
+    data = compile(mix([published("short", 4), published("long", 8)], by="tokens").repeat().batch(2),
+                   read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert len(list(itertools.islice(stream, 4))) == 4
+    finally:
+        stream.close()

@@ -795,7 +795,8 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
     """A mixture's weights, as shares of its corpora's stated valid target
-    tokens when it mixes by tokens."""
+    tokens when it mixes by tokens, from the rows and valid targets each
+    corpus states as it is read."""
     if mixture.tokens is None:
         return mixture.weights
     leaves = [child.source for child in mixture.pipelines if not isinstance(child.source, (Mixture, Phases))]
@@ -803,7 +804,7 @@ def _weights(mixture: Mixture) -> Sequence[float]:
     return token_weights(
         [_name(child) for child in mixture.pipelines],
         mixture.weights,
-        [integer(stated["windows"], "windows") for stated in facts],
+        [integer(stated["rows"], "rows") for stated in facts],
         [integer(stated["valid_targets"], "valid_targets") for stated in facts],
     )
 
