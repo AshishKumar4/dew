@@ -10,7 +10,7 @@ uvicorn:
     python examples/serve_decisions.py --run runs/tickets
 
 `--model` loads a released Laya checkpoint (with `--subfolder multilingual`
-for the multilingual one) or a Clef release, and `--run` a
+for the multilingual one) or a joint-head release, and `--run` a
 `DecisionObjective` run with the calibration saved into it. `--dtype`
 chooses the compute dtype (bfloat16 on a GPU), and `--max-len`,
 `--head-max-len` and `--option-tokens` widen the layout's budgets.
@@ -26,7 +26,7 @@ A request Jev would refuse gets a 422 with the reason, as Jev's does. With
 Bearer <key>`, and gets a 401 without it. `--details` adds Laya's extra
 answer fields (a noul's confidence, abstention, how much of the state was
 read); `--strict` answers exactly as Jev's endpoint does, dropping the
-request fields Jev does not know, such as Clef's `images`. `--whole`
+request fields Jev does not know, such as `images`. `--whole`
 refuses, with a 422 naming the maximum context length, a request the
 layout could answer only by cutting its state, instructions or options, as
 Decision Index requires of an engine:
