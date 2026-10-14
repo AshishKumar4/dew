@@ -1,9 +1,12 @@
 """What several interop tests read off a reference: a checkpoint's stored
-bytes and the audio features a checkpoint's own extractor makes."""
+bytes, a source autoencoder's vector-Jacobian products and the audio features
+a checkpoint's own extractor makes."""
 
 import tarfile
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -63,6 +66,31 @@ def scaled_gap(actual, expected) -> float:
     expected = np.asarray(expected, np.float64)
     difference = np.abs(np.asarray(actual, np.float64) - expected).max()
     return float(difference / max(1.0, float(np.abs(expected).max())))
+
+
+def assert_autoencoder_vjp(walk: str, call, params, operand, probes, layouts, reference, operand_gradient,
+                           bound: float):
+    """A source autoencoder's recorded vector-Jacobian product of one `walk`: `call(params, operand)`'s
+    outputs dotted with `probes`, differentiated for the operand and the parameters. The operand's
+    gradient is held to the source's `operand_gradient`, and each of `layouts`' parameters' gradient,
+    written into its source tensor's layout as an export writes it, to the source's
+    `{walk}.grad.<tensor>`, each within `bound` (`scaled_gap`). Returns the outputs."""
+    def objective(params, operand):
+        outputs = call(params, operand)
+        return sum(jnp.sum(output * probe) for output, probe in
+                   zip(jax.tree.leaves(outputs), probes, strict=True)), outputs
+
+    (_, outputs), (grad_params, grad_operand) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
+        params, operand)
+    operand_gap = scaled_gap(grad_operand, operand_gradient)
+    gaps = {layout.name: scaled_gap(layout.export({"autoencoder": grad_params}),
+                                    reference[f"{walk}.grad.{layout.name.removeprefix('vae/')}"])
+            for layout in layouts}
+    worst = max(gaps, key=lambda name: gaps[name])
+    print(f"{walk}: input gradient gap {operand_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
+    assert operand_gap < bound
+    assert gaps[worst] < bound, worst
+    return outputs
 
 
 

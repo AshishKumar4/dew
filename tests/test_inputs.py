@@ -6,6 +6,7 @@ copying resident inputs through the host.
 """
 
 import numpy as np
+import pytest
 from steady_state import guarded
 
 
@@ -90,3 +91,35 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["text"].conditioning["pixel_values"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["labels"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["weight"].sharding == NamedSharding(mesh, P())
+
+
+@pytest.mark.parametrize("parser", ["preference", "prompt", "request", "rollout", "completion"])
+def test_every_token_id_parser_reads_ids_by_one_law(parser):
+    """A dataset's and a request's token ids are read alike (`token_id`): a Python or NumPy integer
+    from 0 through int32's largest passes as an int, and a bool, a negative id or one past int32 is
+    refused, where the parsers once disagreed on all three."""
+    from dew.data.prompts import _prompt_ids
+    from dew.data.steps.chat import PreferencePair
+    from dew.data.text import ByteTokenizer
+    from dew.inference.clients import _token_rows
+    from dew.inference.rollouts import _prompt
+    from dew.inference.tasks import prepared_inputs
+
+    def read(ids: list) -> list[int]:
+        if parser == "preference":
+            pair = PreferencePair(seq_len=4).map({"chosen": ids, "rejected": ids})
+            return pair["input_ids"][0, : len(ids)].tolist()
+        if parser == "prompt":
+            return list(_prompt_ids(ByteTokenizer(), ids, None, "prompt", None))
+        if parser == "request":
+            return np.asarray(prepared_inputs(None, [ids], images=None).tokens)[0].tolist()
+        if parser == "rollout":
+            return list(_prompt(ids))
+        rows = _token_rows([ids])
+        assert rows is not None
+        return rows[0]
+
+    assert read([np.int64(7), 3]) == [7, 3]
+    for refused in (True, -1, 2**31):
+        with pytest.raises(ValueError):
+            read([5, refused])

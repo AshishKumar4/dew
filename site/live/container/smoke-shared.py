@@ -3,10 +3,11 @@
 import asyncio
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 
-from shared_bridge import available, load, resident
+from shared_bridge import DEADLINE_HEADER, available, load, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -117,22 +118,22 @@ async def closed():
 
 async def pressure(headers):
     """More memory than the host holds, asked for at once: 24 page cells filling their address
-    space and a training run filling its writable memory. The bridge refuses contexts or stops
-    guests, never the model process, every cell that does not finish says why, and the model
-    still answers afterwards."""
+    space, six a page as a page may run, and a training run on a fifth page filling its writable
+    memory. The bridge refuses contexts or stops guests, never the model process, every cell that
+    does not finish says why, and the model still answers afterwards."""
     model, before = model_process(), available() >> 20
-    step("pressure: opening four pages")
-    pages = [await page(headers) for _ in range(4)]
+    step("pressure: opening five pages")
+    pages = [await page(headers) for _ in range(5)]
     step("pressure: filling memory from 24 page cells and a training cell")
-    for number, socket in enumerate(pages):
+    for number, socket in enumerate(pages[:4]):
         for cell in range(6):
             await socket.send(json.dumps({"op": "execute", "id": f"{number}.{cell}", "code": FILL,
                                           "cell": f"fill{cell}"}))
-    await pages[0].send(json.dumps({"op": "execute", "id": "train", "code": FILL, "cell": "train",
+    await pages[4].send(json.dumps({"op": "execute", "id": "train", "code": FILL, "cell": "train",
                                     "kernel": "train"}))
     seen = {}
     for number, socket in enumerate(pages):
-        seen.update(await outcomes(socket, 7 if number == 0 else 6))
+        seen.update(await outcomes(socket, 1 if number == 4 else 6))
     # A cell that did not finish was stopped or refused, in words; the pressure must have done one.
     reasons = ("Stopped: This cell's Python context stopped",
                "ValueError: the shared container has no free",
@@ -164,7 +165,8 @@ async def main():
     if not secret:
         raise ValueError("the smoke check requires the private relay credential on stdin")
     session = str(uuid.uuid4())
-    headers = {"Authorization": "Bearer " + secret}
+    # As the Worker sends them: the relay's credential and the session's end, past this smoke's own.
+    headers = {"Authorization": "Bearer " + secret, DEADLINE_HEADER: str(int((time.time() + 3600) * 1000))}
     async with connect(f"ws://127.0.0.1:8888/contexts/{session}/ws", additional_headers=headers) as socket:
         assert json.loads(await socket.recv())["type"] == "ready"
         # The page's cells, as Dew code the context's model_client stands in for.
