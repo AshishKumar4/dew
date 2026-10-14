@@ -233,8 +233,8 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
-    """Whether test file `name`'s record was made on exactly these inputs. A file that started
-    another process has no key: no event saw that process's code."""
+    """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
+    or one of a file that started another process, whose code no event saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
 
 
@@ -520,8 +520,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
 
 
 def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
-    """Keep each green row with its key, the files its tests executed and where they read the
-    backend: `reused` reads the row back, `gpu_tier` the reads."""
+    """Keep each row a task ran with the files its tests executed, where they read the backend and
+    its peak memory on a GPU: `gpu_tier` reads the reads, `gpu_lane` the peak. A green row keeps
+    its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
+    an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
@@ -529,12 +531,13 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
     held = device_class()
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        if row_["exitCode"] == 0 and name in executed:
-            depends = executed[name]["depends"]
-            key = None if depends is None else cache_key(common, name, depends)
-            body = json.dumps({"key": key, "depends": depends, "row": row_, "reads": executed[name]["reads"],
-                               "peak": executed[name]["peak"]}).encode()
-            cache_request(cache_url(python, row_["name"], held), token, body)
+        if name not in executed:
+            continue
+        depends = executed[name]["depends"]
+        green = row_["exitCode"] == 0 and depends is not None
+        body = json.dumps({"key": cache_key(common, name, depends) if green else None, "depends": depends,
+                           "row": row_, "reads": executed[name]["reads"], "peak": executed[name]["peak"]})
+        cache_request(cache_url(python, row_["name"], held), token, body.encode())
 
 
 def listed(prefix: str, token: str) -> list[str]:
@@ -594,11 +597,12 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     """Run `tests` on this process's share of the one GPU it sees, each file as a task of its own
     (`tested`), and write their verdict rows to `out`.
 
-    A file's process may hold the peak memory its record on this GPU's class holds
-    (tools/armada/executed.py's `gpu_peak`) and `GPU_HEADROOM`, and one without a peak a
-    `GPU_UNRECORDED`th of the share. Files start heaviest first while their shares fit the share
+    A file's process may hold the peak memory its last run on this GPU's class held
+    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`, and one without a peak
+    a `GPU_UNRECORDED`th of the share. Files start heaviest first while their shares fit the share
     this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most
-    `processes` at once. A file that runs out of its share is red: it took more than it took before."""
+    `processes` at once. A file that runs out of its share is red: it took more than its last run,
+    or more than a file no run has measured is given, and its next run has the share it reached."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
