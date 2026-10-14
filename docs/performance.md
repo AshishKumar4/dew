@@ -1090,6 +1090,25 @@ names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHO
 tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
 --head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
 
+### Heads of 64 on the A100, 2026-10-14
+
+FlashAttention-2 (`dew_flash_attn` 0.3.0) now beats tokamax's Pallas-Triton kernel at every 64-wide
+shape on an A100-SXM4-40GB, forward and backward, so sm80's row names flash for those heads too
+(`attention_narrow`). Milliseconds, bf16, jax 0.11.2, tokamax 0.0.15, the median of seven
+20-call windows:
+
+| shape | Triton | FlashAttention-2 | cuDNN |
+|---|---|---|---|
+| 8 x 2048 causal, 32 query heads over 4 | 5.34 | 3.63 | 5.14 |
+| 8 x 2048 causal, 32 heads | 5.17 | 3.53 | 5.02 |
+| 8 x 2048 bidirectional, 32 query heads over 4 | 9.12 | 5.89 | 7.99 |
+| 32 x 256 bidirectional, 12 heads (SimpleDiT-B) | 0.439 | 0.380 | 0.540 |
+| 8 x 1024 bidirectional, 12 heads | 1.356 | 0.702 | 0.979 |
+| 4 x 4096 causal, 16 heads | 4.89 | 3.48 | 4.45 |
+
+'auto' took Triton for the first shape in a 1.1B Llama-style step (22 layers of the first row's
+attention, 8 x 2048 tokens, AdamW), where attention was 120 of its 652.6 ms.
+
 ### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
 
 At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
