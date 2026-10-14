@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import re
 import sys
 import time
@@ -127,9 +128,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process has no key, so it is in, and no task reuses
-    its row. Under pytest-xdist, the workers' reports join. The command line
-    spreads the tier over its shards, each file once, torchax files in
-    sessions of their own."""
+    its row. The command line spreads the tier over its shards, each file
+    once."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -167,12 +167,10 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file, on two
-    # pytest-xdist workers, as the GPU tier runs: each worker's report joins the task's.
+    # The session fixture's files in a task of their own, where it reads for every file.
     fixtures = ["tests/test_one.py", "tests/test_two.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests, options in (([name for name in ran if name not in fixtures], ""), (fixtures, "-n 2")):
-        monkeypatch.setenv("PYTEST_ADDOPTS", options)
+    for tests in ([name for name in ran if name not in fixtures], fixtures):
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
@@ -195,15 +193,56 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_spawns.py")] == [True, False]
-    (tmp_path / "tests/test_marked.py").write_text("import pytest\npytestmark = pytest.mark.torchax\n"
-                                                  "@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n")
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
-    sessions = [line.split() for line in capsys.readouterr().out.splitlines()]
-    assert {shard for shard, *_ in sessions} == {"0", "1"}
-    assert sorted(name for _, *names in sessions for name in names) == sorted(ci.gpu_tier("3.12"))
-    assert ["tests/test_marked.py"] in [names for _, *names in sessions]
+    shards = [line.split() for line in capsys.readouterr().out.splitlines()]
+    assert len(shards) == 2 and all(shards)
+    assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
+
+
+def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The GPU lane gives each file a process of its own and a part of the
+    lane's memory share, a quarter where no record names the file's peak,
+    so four run at once, each with its part. Its rows join one verdict, each
+    recorded as a task's are, and a second lane reuses the green ones."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    # nvidia-smi as the driver answers it for an 80 GiB GPU.
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    source = ("import os, time\n"
+              "def test_runs():\n"
+              "    began = time.monotonic()\n"
+              "    time.sleep(1)\n"
+              "    with open(f'ran-{os.getpid()}', 'w') as ran:\n"
+              "        share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+              "        ran.write(f'{share} {began} {time.monotonic()}')\n")
+    names = [f"tests/test_file_{index}.py" for index in range(5)]
+    for name in names:
+        (tmp_path / name).write_text(source)
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    rows = json.loads(out.read_text())["rows"]
+    assert [(row["name"], row["exitCode"]) for row in rows] == [(f"3.12:{name}", 0) for name in names]
+    runs = [path.read_text().split() for path in tmp_path.glob("ran-*")]
+    assert [share for share, *_ in runs] == ["0.1250"] * len(names), "a process a file, a quarter each"
+    spans = [(float(began), float(ended)) for _, began, ended in runs]
+    overlapping = max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+    assert 2 <= overlapping <= 4
+    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    assert len(list(tmp_path.glob("ran-*"))) == len(names), "the second lane reused every green row"
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):

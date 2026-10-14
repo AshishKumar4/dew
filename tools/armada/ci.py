@@ -5,6 +5,7 @@
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT...
     python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
+    python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -70,7 +71,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Mapping
 from pathlib import Path
 
 PYTHONS = ("3.12", "3.14")
@@ -323,11 +324,6 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-def torchax_files(names: Iterable[str]) -> set[str]:
-    """The files of `names` marked `torchax` (`APART`)."""
-    return {name for name in names if APART.search(Path(name).read_text())}
-
-
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
@@ -349,7 +345,7 @@ def plan(target: float, timings: dict) -> list[dict]:
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
-        apart = torchax_files(light)
+        apart = {name for name in light if APART.search(Path(name).read_text())}
         for family in (sorted(set(light) - apart), sorted(apart)):
             count = max(math.ceil(sum(light[name] for name in family) / target), 1)
             tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
@@ -427,9 +423,14 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     the plan weighs a file by what it costs a container (its import, its collection, the
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
     at 300 seconds ran a median of 392."""
-    began = time.monotonic()
     # Before any test writes under tests/, the inputs as the plan saw them.
-    common = shared(python)
+    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {})
+
+
+def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool, grace: float,
+           common: str, environ: Mapping[str, str]) -> int:
+    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's."""
+    began = time.monotonic()
     rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
@@ -454,7 +455,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True,
-                            env={**os.environ, "PYTHONPATH": path, "DEW_EXECUTED": str(executed_report)})
+                            env={**os.environ, **environ, "PYTHONPATH": path,
+                                 "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -523,8 +525,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         if row_["exitCode"] == 0 and name in executed:
             depends = executed[name]["depends"]
             key = None if depends is None else cache_key(common, name, depends)
-            body = json.dumps({"key": key, "depends": depends, "row": row_,
-                               "reads": executed[name]["reads"]}).encode()
+            body = json.dumps({"key": key, "depends": depends, "row": row_, "reads": executed[name]["reads"],
+                               "peak": executed[name]["peak"]}).encode()
             cache_request(cache_url(python, row_["name"], held), token, body)
 
 
@@ -573,6 +575,60 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
+GPU_HEADROOM = 1.25
+"""A file's share of the GPU over its recorded peak: the allocator's fragmentation and rounding."""
+GPU_UNRECORDED = 4
+"""A file no record has a peak for runs on this part of the lane's share."""
+
+
+def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
+             deadline: float) -> int:
+    """Run `tests` on this process's GPU share, each file as a task of its own (`tested`), and write
+    their verdict rows to `out`.
+
+    A file's process may hold `GPU_HEADROOM` times the peak memory its record on this GPU's class
+    holds (tools/armada/executed.py's `gpu_peak`), and one without a peak a `GPU_UNRECORDED`th of
+    the share. Files start heaviest first while their shares fit the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
+    runs out of its share is red: it took more than it took before."""
+    token = os.environ["DEW_XLA_CACHE_TOKEN"]
+    total = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits",
+                                "-i", os.environ["CUDA_VISIBLE_DEVICES"]], capture_output=True, text=True,
+                               check=True).stdout) * 2 ** 20
+    budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
+    held = device_class()
+
+    def needs(name: str) -> float:
+        record = cache_request(cache_url(python, row(python, name, ""), held), token)
+        peak = json.loads(record).get("peak") if record else None
+        return budget / GPU_UNRECORDED if peak is None else min(peak * GPU_HEADROOM, budget)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        shares = dict(zip(tests, pool.map(needs, tests), strict=True))
+    # Before any test writes under tests/, the inputs every file's key hashes.
+    common = shared(python)
+    waiting = sorted(tests, key=lambda name: -shares[name])
+    verdicts = {name: out.with_name(f"{out.name}.{Path(name).stem}") for name in tests}
+    running: dict[concurrent.futures.Future, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        while waiting or running:
+            free = budget - sum(shares[name] for name in running.values())
+            fits = next((name for name in waiting if shares[name] <= free), None)
+            if fits is not None and len(running) < processes:
+                waiting.remove(fits)
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": f"{shares[fits] / total:.4f}"}
+                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
+                                    environ)] = fits
+                continue
+            done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                future.result()
+                del running[future]
+    rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
+    out.write_text(json.dumps({"rows": rows}))
+    return 0
+
+
 def durations(verdicts: list[dict]) -> dict[str, float]:
     """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
     as their floor's Python ran it: what it takes where nothing slows it. A container can run three
@@ -615,6 +671,12 @@ def main() -> int:
     choosing = operations.add_parser("gpu-tier")
     choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    lane = operations.add_parser("gpu-lane")
+    lane.add_argument("--tests", required=True)
+    lane.add_argument("--out", type=Path, required=True)
+    lane.add_argument("--cache", choices=("on", "off"), required=True)
+    lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
+    lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
@@ -630,15 +692,14 @@ def main() -> int:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
             return 0
-        # A pytest session a line, after its shard: files marked `torchax` run apart from the rest, as
-        # in the plan, each set spread over the shards by its tests' recorded times.
-        apart, recorded = torchax_files(tier), recorded_tests()
-        for session in (set(tier) - apart, apart):
-            weights = {name: sum(recorded.get(name, [1.0])) for name in session}
-            for shard, (_, names) in enumerate(packed(weights, args.shards)):
-                if names:
-                    print(shard, *names)
+        # Each shard's files on a line, spread by their tests' recorded times.
+        recorded = recorded_tests()
+        for _, names in packed({name: sum(recorded.get(name, [1.0])) for name in tier}, args.shards):
+            print(*names)
         return 0
+    if args.operation == "gpu-lane":
+        return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache == "on",
+                        processes=args.processes, deadline=args.deadline)
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))
