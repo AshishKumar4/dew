@@ -1559,14 +1559,24 @@ class DecoderFamily:
     def prepare_weights(self, tensors: Mapping[str, np.ndarray],
                         config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The checkpoint's tensors as the path map reads them: `prepare`'s, with
-        every `packed` tensor split into its parts."""
+        every `packed` tensor split into its parts.
+
+        A fused tensor and a part stored under its own name, such as Qwen's
+        `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
+        part; they are compared before any cast, so unequal copies are
+        refused whichever the checkpoint lists first."""
         prepared = self.prepare(tensors, config)
         if not self.packed:
             return prepared
         split: dict[str, np.ndarray] = {}
         for name, tensor in prepared.items():
             packing = self.packing(name)
-            split.update({name: tensor} if packing is None else packing.split(name, tensor, config))
+            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+            for part, value in parts.items():
+                held = split.setdefault(part, value)
+                if held is not value and not np.array_equal(np.asarray(held), np.asarray(value)):
+                    raise ValueError(f"{name} holds {part}, which another of the checkpoint's tensors "
+                                     "holds with other values")
         return split
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
