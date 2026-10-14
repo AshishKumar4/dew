@@ -1311,12 +1311,12 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
                  names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
-    """Bind each leaf, by its path from its collection, to the source tensor `names` gives it.
+    """Bind each leaf, by its path collection first, to the source tensor `names` gives it.
 
     A leaf is stored as the load oriented it, a 2-D kernel transposed. None
-    writes nothing, as for the tied head. A tuple names one tensor per expert
-    of a stacked leaf, in expert order, each that expert's slice, as a source
-    holding one tensor per expert is stacked on load.
+    writes nothing, as for the tied head. A tuple names one source tensor per
+    expert of a stacked leaf, in expert order: the slices the load stacked
+    (`hf_decoders._stack_experts`).
     """
     layouts: dict[str, WeightLayout] = {}
     for path, value in leaves.items():
