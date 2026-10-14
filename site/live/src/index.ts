@@ -1,7 +1,7 @@
 // live.dewml.dev. The page asks for a session with a Turnstile token, gets a
 // short-lived token back, and opens the session's WebSocket with it.
 //
-//   POST /v1/sessions            {"turnstile": "<token>"} -> {id, token, socket, warm, limits}
+//   POST /v1/sessions            {"turnstile": "<token>"} -> {id, token, socket, limits}
 //   GET  /v1/sessions/<id>/ws?token=...   WebSocket to the session's kernel
 //   GET  /v1/status              {active, maxSessions, budgetUsedSeconds, budgetSeconds}
 
@@ -79,7 +79,7 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	const token = await sign(env.SESSION_SECRET, opened.id, expires);
 	const socket = `wss://${new URL(request.url).host}/v1/sessions/${opened.id}/ws?token=${encodeURIComponent(token)}`;
 	return reply(
-		{ id: opened.id, token, socket,  limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
+		{ id: opened.id, token, socket, limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
 		201,
 		cors,
 	);

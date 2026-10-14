@@ -365,6 +365,8 @@ class Gateway:
                                       "setup": next(iter(cells.values())).setup if cells else 0,
                                       "dew": self.commit}))
         page = Page(socket, session, cells)
+        # Why the session ends, which the page shows: the socket's close reason.
+        ending = "it reached its time limit"
         try:
             while time.monotonic() < deadline:
                 try:
@@ -372,6 +374,7 @@ class Gateway:
                 except TimeoutError:
                     used = max((context.last_used for context in cells.values()), default=0)
                     if not page.busy() and time.monotonic() - used > self.idle:
+                        ending = f"it had no request for {self.idle // 60} minutes"
                         break
                     continue
                 message = json.loads(raw)
@@ -410,6 +413,7 @@ class Gateway:
                     await task
             self.connected.discard(session)
             await self.close(session)
+        await socket.close(1000, ending)
 
     async def interrupt(self, page, cell):
         """Interrupt what runs in `cell`, and end a training cell's wait for its turn."""

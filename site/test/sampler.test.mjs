@@ -87,7 +87,7 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 	let requests = 0;
 	await page.route(`${live.endpoint}/v1/sessions`, (route) => {
 		requests++;
-		return route.fulfill({ json: { socket: SOCKET, warm: true } });
+		return route.fulfill({ json: { socket: SOCKET } });
 	});
 	const sent = [];
 	const text = Promise.withResolvers();
@@ -304,6 +304,32 @@ test('the MoE controls render the recorded frame and router counts, not syntheti
 	await page.close();
 });
 
+
+test('a session the bridge ends says why, through the socket that closes', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			socket.send(JSON.stringify({ id: message.id, type: 'display', png: PNG }));
+			socket.send(JSON.stringify({ id: message.id, type: 'done', status: 'ok', count: 1 }));
+			// As shared_bridge.py ends a session at its time limit.
+			setTimeout(() => socket.close({ code: 1000, reason: 'it reached its time limit' }), 100);
+		});
+	});
+	await page.goto(`${site.url}sample/`);
+	await page.locator('[data-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-status]').textContent.startsWith('The live kernel stopped'));
+	assert.equal(await page.locator('[data-status]').textContent(),
+		'The live kernel stopped: it reached its time limit. Press Run to start a new one.');
+	await page.close();
+});
 
 test('a stale model revision asks for a reload instead of showing a traceback', async () => {
 	const page = await browser.newPage();
