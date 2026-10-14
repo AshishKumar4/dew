@@ -7,7 +7,6 @@ through a single joint attention over the concatenated sequence.
 
 from collections.abc import Sequence
 
-import einops
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -26,6 +25,7 @@ from ..dit import (
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
+from ..scan_orders import patchify, unpatchify
 from .joint import DoubleStreamBlock
 
 PATCH_SIDE = 2
@@ -119,13 +119,7 @@ class PatchMerging(nn.Module):
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B, _, C = x.shape
-
-        x = x.reshape(B, H_patches, W_patches, C)
-        merged = einops.rearrange(
-            x,
-            'b (h p1) (w p2) c -> b h w (p1 p2 c)',
-            p1=PATCH_SIDE, p2=PATCH_SIDE
-        )
+        merged = patchify(x.reshape(B, H_patches, W_patches, C), PATCH_SIDE)
         merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
             features=self.out_features,
@@ -133,12 +127,7 @@ class PatchMerging(nn.Module):
             precision=self.precision,
             name="projection"
         )(merged)
-
-        new_H = H_patches // PATCH_SIDE
-        new_W = W_patches // PATCH_SIDE
-        merged = merged.reshape(B, new_H * new_W, self.out_features)
-
-        return merged, new_H, new_W
+        return merged, H_patches // PATCH_SIDE, W_patches // PATCH_SIDE
 
 class PatchExpanding(nn.Module):
     """Expands each token into a 2x2 group of `out_features` tokens, doubling
@@ -160,28 +149,16 @@ class PatchExpanding(nn.Module):
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B = x.shape[0]
-
-        expanded_features = self.expanded_features
         x = nn.Dense(
-            features=expanded_features,
+            features=self.expanded_features,
             dtype=self.dtype,
             precision=self.precision,
             name="projection"
         )(x)
         x = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
-
-        x = x.reshape(B, H_patches, W_patches, expanded_features)
-        expanded = einops.rearrange(
-            x,
-            'b h w (p1 p2 c) -> b (h p1) (w p2) c',
-            p1=PATCH_SIDE, p2=PATCH_SIDE, c=self.out_features
-        )
-
-        new_H = H_patches * PATCH_SIDE
-        new_W = W_patches * PATCH_SIDE
-        expanded = expanded.reshape(B, new_H * new_W, self.out_features)
-
-        return expanded, new_H, new_W
+        new_H, new_W = H_patches * PATCH_SIDE, W_patches * PATCH_SIDE
+        expanded = unpatchify(x, PATCH_SIDE, new_H, new_W, self.out_features)
+        return expanded.reshape(B, new_H * new_W, self.out_features), new_H, new_W
 
 
 class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
