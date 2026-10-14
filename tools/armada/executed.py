@@ -10,7 +10,8 @@ cache never skips it.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
-runs it (`ci.py gpu-tier`). A read is the test file's being collected or run. As with the files they
+runs it (`ci.py gpu-tier`), each file in a process of its own, which records its peak memory on the
+GPU (`gpu_peak`). A read is the test file's being collected or run. As with the files they
 execute, what session-scoped fixtures read is every file's, and what runs under a module's body,
 which runs once, as it is imported, is its own test file's too, and every file's before collection."""
 
@@ -160,25 +161,20 @@ def pytest_fixture_setup(fixturedef, request):
 
 
 def pytest_sessionfinish(session):
-    """Write the report. Under pytest-xdist each worker writes its own beside it, and the controller,
-    which runs no test and finishes last, joins theirs: a file whose tests ran on several workers
-    executed and read what each did, and started a process if any did."""
     sys.monitoring.set_events(TOOL, 0)
     out = os.environ.get("DEW_EXECUTED")
-    if not out:
-        return
-    recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
-                       "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere)}
-                for name, files in own.items()}
-    if "PYTEST_XDIST_WORKER" in os.environ:
-        Path(f"{out}.{os.environ['PYTEST_XDIST_WORKER']}").write_text(json.dumps(recorded))
-        return
-    for part in sorted(Path(out).parent.glob(f"{Path(out).name}.gw*")):
-        for name, theirs in json.loads(part.read_text()).items():
-            mine = recorded.setdefault(name, theirs)
-            if mine is not theirs:
-                both = (mine["depends"], theirs["depends"])
-                mine["depends"] = None if None in both else sorted({*both[0], *both[1]})
-                mine["reads"] = sorted({*mine["reads"], *theirs["reads"]})
-        part.unlink()
-    Path(out).write_text(json.dumps(recorded))
+    if out:
+        peak = gpu_peak() if len(own) == 1 else None
+        recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
+                           "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere),
+                           "peak": peak} for name, files in own.items()}
+        Path(out).write_text(json.dumps(recorded))
+
+
+def gpu_peak() -> int | None:
+    """The most memory this process held at once on a GPU of its own, in bytes, or None on another
+    backend: a process that ran one test file holds that file's peak (`ci.py gpu-lane`)."""
+    jax = sys.modules.get("jax")
+    if jax is None or jax.default_backend() != "gpu":
+        return None
+    return max(device.memory_stats()["peak_bytes_in_use"] for device in jax.local_devices())

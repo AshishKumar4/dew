@@ -20,11 +20,6 @@ diverged under deterministic ops alone, but 20 fresh DiT processes did not,
 so that cause is unconfirmed. The precaution costs a test lane nothing that
 matters; in training it cost 8% on a 176M DiT step (docs/guides/checkpoints.md)."""
 
-GPU_MEMORY = 0.75
-"""The share of each GPU's memory a cuda lane's tests hold together, jax's own
-default. xdist workers share the GPUs, so one compiles while another
-computes, and each holds an equal part of the share the run was given."""
-
 
 def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
@@ -56,11 +51,6 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     else:
         if accelerator == "cuda":
             flags.extend(REPEATABLE_GPU_FLAGS)
-            # Allocated as used: the xdist controller opens the GPUs too, and runs no test.
-            environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-            share = float(environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", GPU_MEMORY))
-            workers = int(environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
-            environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = f"{share / workers:.4f}"
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         cpu_devices = local[accelerator](environ)
