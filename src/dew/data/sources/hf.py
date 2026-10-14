@@ -114,10 +114,22 @@ class HF(Dataset):
         return _Streamed(self._undecoded(), shard)
 
     def metadata(self) -> Mapping[str, object]:
-        return {} if self.streamed else {"rows": len(self.dataset)}
+        """Its class names (`class_names`), as Hub states a prepared dataset's, and
+        its rows where the dataset is indexed."""
+        rows = {} if self.streamed else {"rows": len(self.dataset)}
+        return {"class_names": class_names(self.dataset.features), **rows}
 
     def lengths(self) -> np.ndarray | None:
         return None
+
+
+def class_names(features: Mapping[str, Any] | None) -> dict[str, tuple[str, ...]]:
+    """The names of each `ClassLabel` feature's classes, by feature, which a
+    configured caption reads in place of the label's number."""
+    from datasets import ClassLabel
+
+    return {name: tuple(feature.names) for name, feature in (features or {}).items()
+            if isinstance(feature, ClassLabel)}
 
 
 class _Streamed(grain.IterDataset):
