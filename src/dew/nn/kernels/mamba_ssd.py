@@ -233,21 +233,17 @@ def _documents(batch: int, padded: int):
     return pl.BlockSpec((None, padded), lambda i, bc, h: (bc % batch, 0))
 
 
-ROWS_SUMMED = 16
-"""The rows of a chunk `_chunk_cumsum_kernel` sums at once where a document starts inside it."""
-
-
 def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int):
     """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
     cumulated over the chunk, both fp32 in mamba_ssm's heads-first layout.
 
-    Where a document starts inside the chunk, each step's sum starts at its own document's first
-    step in the chunk, where mamba_ssm's runs on from the chunk's first: every decay a kernel reads
-    is a difference of two of these sums within one document, which the earlier document's steps
-    would otherwise enter and leave in rounding, so that a token's output moved with the values of
-    another document's (tests/test_mixers.py, `test_no_token_reaches_another_document`). The sum
-    is then each step's masked terms reduced, `ROWS_SUMMED` rows at a time."""
+    With documents, each document in the chunk cumulates its own steps alone, the others' zeroed,
+    where mamba_ssm's sum runs on from the chunk's first step: every decay a kernel reads is a
+    difference of two of these sums within one document, which an earlier document's steps would
+    otherwise enter and leave in rounding, so that a token's output moved with another document's
+    values (tests/test_mixers.py, `test_no_token_reaches_another_document`). A chunk inside one
+    document takes one sum, as without them."""
     *seq, step_ref, da_ref = refs
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
@@ -259,26 +255,15 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     if not seq:
         da_ref[:, steps] = jnp.cumsum(decay, axis=1)
         return
-    documents = seq[0][steps]
-    # The documents count up along a row, so one starts in the chunk exactly where its ends differ.
-    restarts = seq[0][start] != seq[0][start + chunk - 1]
+    documents = seq[0][steps][None, :]
 
-    @pl.when(jnp.logical_not(restarts))
-    def _():
-        da_ref[:, steps] = jnp.cumsum(decay, axis=1)
+    def document(d, summed):
+        mine = documents == d
+        return summed + jnp.where(mine, jnp.cumsum(jnp.where(mine, decay, 0.0), axis=1), 0.0)
 
-    @pl.when(restarts)
-    def _():
-        def rows(i, carry):
-            first = i * ROWS_SUMMED
-            mine = seq[0][pl.ds(start + first, ROWS_SUMMED)]
-            summed = ((jnp.arange(chunk)[None, :] <= first + jnp.arange(ROWS_SUMMED)[:, None])
-                      & (documents[None, :] == mine[:, None]))
-            da_ref[:, pl.ds(start + first, ROWS_SUMMED)] = jnp.sum(
-                jnp.where(summed[None], decay[:, None, :], 0.0), axis=2)
-            return carry
-
-        jax.lax.fori_loop(0, chunk // ROWS_SUMMED, rows, 0)
+    # The documents count up along a row, from the chunk's first step's to its last's.
+    da_ref[:, steps] = jax.lax.fori_loop(seq[0][start], seq[0][start + chunk - 1] + 1, document,
+                                         jnp.zeros(decay.shape, jnp.float32))
 
 
 @dataclasses.dataclass(frozen=True)
