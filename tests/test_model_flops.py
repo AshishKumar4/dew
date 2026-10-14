@@ -545,12 +545,16 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
 
 
-@pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])
+@pytest.mark.parametrize("kind", ["sparse", "latent", "gpt_oss", "gemma4"])
 def test_active_expert_products_match_the_executed_forward(kind):
+    """A latent MoE combines its experts' outputs at the latent width, before
+    projecting them up to the residual's."""
     lengths = np.array([4, 4])
     x = jnp.ones((2, 4, 8))
     if kind == "sparse":
         model = SparseMLP(4, 2, 16, 8, implementation="xla")
+    elif kind == "latent":
+        model = SparseMLP(4, 2, 16, 8, implementation="xla", latent_features=4)
     elif kind == "gpt_oss":
         model = GptOssMLP(8, 16, 4, 2, implementation="xla")
     else:
