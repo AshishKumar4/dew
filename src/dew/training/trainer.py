@@ -1545,7 +1545,8 @@ class Trainer(Generic[Loss, Effects]):
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
-                    run.reads[batch_signature(device)] = step_reads(self.executable)
+                    signature = batch_signature(device)
+                    run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick

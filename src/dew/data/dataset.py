@@ -1103,7 +1103,9 @@ class GlobalStream:
                 f"past {len(saved.completed)} phase(s), and this run reads one order "
                 f"({self._order}); resume it with the phases that wrote it"
             )
-        if saved.order != self._order:
+        from dew.data.plan import same_order
+
+        if not same_order(saved.order, self._order):
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
@@ -1237,15 +1239,18 @@ class PhasedStream:
                         )
                     )
                 )
+        from dew.data.plan import same_order
+
         for index, (order, end) in enumerate(saved.completed):
-            if index >= len(self._ends) or (self._streams[index].order, self._ends[index]) != (order, end):
+            if (index >= len(self._ends) or not same_order(order, self._streams[index].order)
+                    or self._ends[index] != end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._streams) or self._streams[phase].order != saved.order:
+        if phase >= len(self._streams) or not same_order(saved.order, self._streams[phase].order):
             raise ValueError(
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "

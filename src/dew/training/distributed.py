@@ -816,13 +816,17 @@ def batch_layout(batch: Batch) -> str:
                      for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
-def step_reads(executable: jax.stages.Compiled) -> tuple[bool, ...]:
-    """Which leaves of its batch, the second argument, a compiled step reads, in
-    leaf order: those the executable kept, where JAX pruned the rest
-    (`jax.stages.Compiled.input_shardings` names no sharding for those)."""
+def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:
+    """Which leaves of its batch, the second argument, a compiled step reads,
+    in the leaf order of the batch's own `signature` (`batch_signature`):
+    those the executable kept, where JAX pruned the rest
+    (`jax.stages.Compiled.input_shardings` names no sharding for those). A
+    field the batch holds as None, as an optional part of `Coordinates`, is
+    None in the shardings too and no leaf of the batch, so the batch's tree,
+    not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
-    shardings = jax.tree.leaves(arguments[1], is_leaf=lambda leaf: leaf is None)
-    return tuple(sharding is not None for sharding in shardings)
+    tree, _ = signature
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[1]))
 
 
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
