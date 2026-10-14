@@ -61,6 +61,9 @@ class _Memory:
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
     target_counts: tuple[int, ...] | None = None
+    documents: int | None = None
+    """The most documents a window holds where `ran` packs them, which its
+    batches declare (`Coordinates.max_segments`)."""
 
     def describe(self) -> str:
         return self.original.describe()
@@ -172,6 +175,7 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
+    documents = source.documents if isinstance(source, _Memory) else None
     counted: dict[tuple[int, ...], int] | None = (
         dict(zip(source.identifiers, source.target_counts, strict=True))
         if isinstance(source, _Memory) and source.target_counts is not None
@@ -221,6 +225,9 @@ def _memory_stages(
                 derived["packing"] = fingerprint(sizes)
             rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter,
                                       stage.fields[0])
+            ids = f"{stage.fields[0]}_segment_ids"
+            documents = max((int(np.max(record(value, "packed window")[ids], initial=0))
+                             for _, value in rows), default=0)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
@@ -246,7 +253,8 @@ def _memory_stages(
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted,
+                         documents)
 
 
 def _targeted(
@@ -308,6 +316,7 @@ def _memory_order(
     derived: dict[str, str],
     packed: Mapping[str, int] | None,
     counted: Mapping[tuple[int, ...], int] | None,
+    documents: int | None,
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -345,6 +354,7 @@ def _memory_order(
             inputs,
             pipeline.stages[:consumed],
             None if counted is None else tuple(counted[identifier] for identifier, _ in rows),
+            documents,
         ),
         stages=remaining,
     )
