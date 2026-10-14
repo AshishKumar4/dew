@@ -29,11 +29,15 @@ from dew.nn.flops import counted_flops
 from dew.nn.text_encoders import (
     DEFAULT_MODEL,
     DEFAULT_T5_MODEL,
-    CLIPTextModel,
     CLIPTextTransformer,
     CLIPTowerOutput,
-    T5EncoderModel,
     T5EncoderTransformer,
+    _t5_path,
+    _text_path,
+    bind_text_tower,
+    t5_embedding,
+    translate_config,
+    translate_t5_config,
 )
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
@@ -145,6 +149,11 @@ def rebuild(name: str, fields: Mapping[str, object], *,
 class _TextTower(ConditionEncoder[str, TextContext]):
     """A pretrained text tower with the checkpoint's own tokenizer.
 
+    `from_pretrained` builds the tower at `dtype` and stores its weights at
+    `param_dtype`, FP32 masters by default whatever the checkpoint stores.
+    Supplied `params` are bound unchanged, and only the configuration and
+    the tokenizer are read.
+
     `tokenize` pads every prompt to `context` tokens and returns the ids with
     the attention mask. `encode` returns the tower's last hidden state with
     that mask as a `TextContext`, so a model can pool over the real tokens
@@ -233,9 +242,9 @@ class CLIPText(_TextTower):
         from dew.data.text import load_tokenizer
 
         dtype = resolve_dtype(dtype)
-        model = CLIPTextModel.from_pretrained(
-            checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
-        return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
+        transformer, variables = bind_text_tower("CLIP text", translate_config, _text_path, checkpoint,
+                                                 revision, params, dtype, param_dtype)
+        return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
                    tokenizer=load_tokenizer(checkpoint, revision=revision),
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
@@ -267,9 +276,9 @@ class T5Text(_TextTower):
         from dew.data.text import load_tokenizer
 
         dtype = resolve_dtype(dtype)
-        model = T5EncoderModel.from_pretrained(
-            checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
-        return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
+        transformer, variables = bind_text_tower("T5", translate_t5_config, _t5_path, checkpoint, revision,
+                                                 params, dtype, param_dtype, validate=t5_embedding)
+        return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
                    tokenizer=load_tokenizer(checkpoint, revision=revision),
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 

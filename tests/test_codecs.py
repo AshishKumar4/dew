@@ -72,11 +72,11 @@ def test_an_untrained_re_export_writes_the_same_values(dtype):
     point's doing, which is the same value."""
     _, codes, exponents = fixture_weight(dtype)
     source = {"m.weight_packed": codes, "m.weight_scale": exponents}
-    decoded = codecs.PACKED_MXFP4.read(source, "m.weight")
+    decoded = codecs.PACKED_MXFP4.decode(source, "m.weight")
 
     again = codecs.PACKED_MXFP4.requantize({"m.weight": decoded.astype(STORED[dtype])}, ("m.weight",))
 
-    np.testing.assert_array_equal(codecs.PACKED_MXFP4.read(again, "m.weight"), decoded)
+    np.testing.assert_array_equal(codecs.PACKED_MXFP4.decode(again, "m.weight"), decoded)
     np.testing.assert_array_equal(again["m.weight_scale"], exponents)
     before, after = (np.stack([packed & 15, packed >> 4]) for packed in (codes, again["m.weight_packed"]))
     moved = before != after
@@ -145,7 +145,7 @@ def test_a_v4_fp8_linear_decodes_as_the_releases_convert_reads_it(
     tensors = {"layers.0.attn.wo_a.weight": weight, "layers.0.attn.wo_a.scale": scale}
 
     with np.errstate(over="ignore"):
-        decoded = codecs.deepseek_v4(block, fp4_experts=True).read(tensors, "layers.0.attn.wo_a.weight")
+        decoded = codecs.deepseek_v4(block, fp4_experts=True).decode(tensors, "layers.0.attn.wo_a.weight")
 
     np.testing.assert_array_equal(bfloat16_bits(decoded), v4_release[f"{release}/wo_a/{layer}"])
 
@@ -162,7 +162,7 @@ def test_a_v4_fp4_expert_decodes_as_the_releases_convert_reads_it(v4_release, re
     tensors = {"layers.0.ffn.experts.0.w1.weight": packed,
                "layers.0.ffn.experts.0.w1.scale": scale.view(ml_dtypes.float8_e8m0fnu)}
 
-    decoded = codecs.deepseek_v4(block, fp4_experts=True).read(tensors, "layers.0.ffn.experts.0.w1.weight")
+    decoded = codecs.deepseek_v4(block, fp4_experts=True).decode(tensors, "layers.0.ffn.experts.0.w1.weight")
 
     expected = v4_release[f"{release}/expert/dense"]
     np.testing.assert_array_equal(decoded, expected)
@@ -180,7 +180,7 @@ def test_a_v4_1_engram_row_decodes_as_the_releases_lookup_reads_it(v4_release):
     tensors = {"layers.14.engram.embed.weight": weight, "layers.14.engram.embed.scale": scale}
 
     with np.errstate(over="ignore"):
-        table = codecs.deepseek_v4(32, fp4_experts=True).read(tensors, "layers.14.engram.embed.weight")
+        table = codecs.deepseek_v4(32, fp4_experts=True).decode(tensors, "layers.14.engram.embed.weight")
 
     np.testing.assert_array_equal(bfloat16_bits(table[v4_release["v4_1/engram/indices"]]),
                                   v4_release["v4_1/engram/values"])
@@ -218,7 +218,7 @@ def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_
              "layers.1.engram.embed.weight": rng.standard_normal((9, 256)).astype(np.float32),
              "layers.0.ffn.gate.weight": rng.standard_normal((4, 100)).astype(np.float32)}
     names = ("layers.0.attn.wkv.weight", "layers.0.ffn.experts.1.w3.weight", "layers.1.engram.embed.weight")
-    read = codecs.deepseek_v4(32, fp4_experts=True).read
+    read = codecs.deepseek_v4(32, fp4_experts=True).decode
 
     stored = codecs.deepseek_v4(32, fp4_experts=True).requantize(dense, names)
 
@@ -248,7 +248,7 @@ EXPERT = "layers.0.ffn.experts.0.w1.weight"
 
 
 def v4_read(tensors: dict[str, np.ndarray], name: str, fp4_experts: bool = True) -> np.ndarray:
-    return codecs.deepseek_v4(32, fp4_experts=fp4_experts).read(tensors, name)
+    return codecs.deepseek_v4(32, fp4_experts=fp4_experts).decode(tensors, name)
 
 
 @pytest.mark.parametrize(
@@ -379,7 +379,7 @@ def v4_release_storage(
         dense, names
     )
     # The decoder is held to the releases' own reading in the tests above.
-    read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).read
+    read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).decode
     decoded = {**dense, **{name: read(stored, name) for name in names}}
     config = {**json.loads((V4_TINY / "config.json").read_text()), "moe_intermediate_size": 32}
     released = json.loads((V4_TINY.parent / "deepseek-v4-flash" / "config.json").read_text())
@@ -414,7 +414,7 @@ def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, 
     )
     written = read_weights(tmp_path / "export")
     assert set(written) == set(stored)
-    read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4").read
+    read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4").decode
     for name, value in stored.items():
         assert written[name].dtype == value.dtype, name
         if name in names:
@@ -480,7 +480,7 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
     ceil rule moves to half the scale with the same values."""
     partner = name.removesuffix("weight") + "scale"
     weight, scale = released_tensor(repo, name, rows), released_tensor(repo, partner, rows)
-    read = codecs.deepseek_v4(block, fp4_experts=fp4_experts).read
+    read = codecs.deepseek_v4(block, fp4_experts=fp4_experts).decode
     layout = codecs.deepseek_v4_layout(name, fp4_experts)
 
     decoded = read({name: weight, partner: scale}, name)

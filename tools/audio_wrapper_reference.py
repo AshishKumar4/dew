@@ -24,13 +24,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
+from audio_reference import audio_config, perturb, waveforms
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import (Gemma3nAudioConfig, Gemma3nAudioFeatureExtractor, Gemma3nConfig,
-                          Gemma3nProcessor, Gemma3nTextConfig, Gemma3nVisionConfig, Gemma4AudioConfig,
-                          Gemma4AudioFeatureExtractor, Gemma4Config, Gemma4ImageProcessor, Gemma4Processor,
-                          Gemma4TextConfig, Gemma4VideoProcessor, Gemma4VisionConfig, PreTrainedTokenizerFast,
-                          SiglipImageProcessor)
+from transformers import (Gemma3nAudioFeatureExtractor, Gemma3nConfig, Gemma3nProcessor,
+                          Gemma3nTextConfig, Gemma3nVisionConfig, Gemma4AudioFeatureExtractor, Gemma4Config,
+                          Gemma4ImageProcessor, Gemma4Processor, Gemma4TextConfig, Gemma4VideoProcessor,
+                          Gemma4VisionConfig, PreTrainedTokenizerFast, SiglipImageProcessor)
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
 
@@ -67,11 +67,7 @@ def gemma3n():
         tie_word_embeddings=True)
     vision = Gemma3nVisionConfig(hidden_size=2048, vocab_size=8, vocab_offset=48,
                                  model_args={"channel_multiplier": 1 / 64, "stem_size": 8, "msfa_output_resolution": 2})
-    audio = Gemma3nAudioConfig(
-        input_feat_size=16, hidden_size=16, conf_num_hidden_layers=2, conf_num_attention_heads=2,
-        conf_attention_chunk_size=4, conf_attention_context_left=5, conf_attention_context_right=2,
-        sscp_conv_channel_size=(8, 4), conf_reduction_factor=2, vocab_offset=56, vocab_size=8, rms_norm_eps=1e-5)
-    config = Gemma3nConfig(text_config=text, vision_config=vision, audio_config=audio,
+    config = Gemma3nConfig(text_config=text, vision_config=vision, audio_config=audio_config("gemma3n"),
                            image_token_id=49, audio_token_id=57, boi_token_id=3, eoi_token_id=48,
                            boa_token_id=4, eoa_token_id=56, vision_soft_tokens_per_image=4,
                            audio_soft_tokens_per_image=3, pad_token_id=0, bos_token_id=2, eos_token_id=1)
@@ -101,11 +97,7 @@ def gemma4():
                                 num_attention_heads=4, num_key_value_heads=2, head_dim=8,
                                 pooling_kernel_size=2, patch_size=8, position_embedding_size=64,
                                 standardize=True)
-    audio = Gemma4AudioConfig(
-        hidden_size=16, num_hidden_layers=2, num_attention_heads=2, subsampling_conv_channels=(16, 4),
-        output_proj_dims=24, attention_chunk_size=4, attention_context_left=5, attention_context_right=2,
-        use_clipped_linears=True, rms_norm_eps=1e-5)
-    config = Gemma4Config(text_config=text, vision_config=vision, audio_config=audio,
+    config = Gemma4Config(text_config=text, vision_config=vision, audio_config=audio_config("gemma4"),
                           image_token_id=49, video_token_id=50, audio_token_id=57, boi_token_id=3,
                           eoi_token_id=48, boa_token_id=4, eoa_token_index=56,
                           pad_token_id=0, bos_token_id=2, eos_token_id=1)
@@ -120,37 +112,19 @@ def gemma4():
     return config, model, processor
 
 
-def randomize(model):
-    torch.manual_seed(SEED)
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if parameter.ndim == 1 and name.endswith("weight"):
-                parameter.uniform_(0.7, 1.3)
-        for name, buffer in model.named_buffers():
-            if name.endswith("input_min"):
-                buffer.fill_(-1.2)
-            elif name.endswith("input_max"):
-                buffer.fill_(1.2)
-            elif name.endswith("output_min"):
-                buffer.fill_(-0.08)
-            elif name.endswith("output_max"):
-                buffer.fill_(0.08)
-
-
 def write(root: Path):
     if transformers.__version__ != "5.16.1":
         raise RuntimeError("Reference fixtures require Transformers 5.16.1")
     torch.set_num_threads(2)
-    time = np.arange(4096, dtype=np.float32) / 16000
-    waveforms = [0.3 * np.sin(2 * np.pi * 437 * time) + 0.15 * np.cos(2 * np.pi * 113 * time),
-                 0.4 * np.sin(2 * np.pi * 283 * time[:1693])]
+    sounds = waveforms()
     for kind, build in (("gemma-3n-audio-tiny", gemma3n), ("gemma-4-audio-tiny", gemma4)):
         directory = root / kind
         directory.mkdir(parents=True, exist_ok=True)
         config, model, processor = build()
-        randomize(model)
+        torch.manual_seed(SEED)
+        perturb(model)
         prompts = ["listen <audio> ok", "say <audio> again ok"]
-        inputs = processor(text=prompts, audio=waveforms, padding=True, return_tensors="np")
+        inputs = processor(text=prompts, audio=sounds, padding=True, return_tensors="np")
         tensors = {key: torch.from_numpy(np.asarray(value)) for key, value in inputs.items()}
         forward = {key: value for key, value in tensors.items()
                    if key in ("input_ids", "attention_mask", "input_features", "input_features_mask",
@@ -164,7 +138,7 @@ def write(root: Path):
         (directory / "generation_config.json").write_text(json.dumps(
             {"do_sample": False, "eos_token_id": 1, "pad_token_id": 0, "bos_token_id": 2}, indent=2) + "\n")
         processor.save_pretrained(str(directory))
-        for index, waveform in enumerate(waveforms):
+        for index, waveform in enumerate(sounds):
             np.save(directory / f"waveform_{index}.npy", waveform)
         np.savez(directory / "reference.npz", logits=logits.numpy(), generated=generated.numpy(),
                  **{key: np.asarray(value) for key, value in inputs.items()})

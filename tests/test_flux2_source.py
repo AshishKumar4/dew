@@ -207,12 +207,16 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
     """FLUX.2 [dev]'s conditioning over a tiny Mistral-3 encoder with Mistral
     Small 3.1's chat template: the system and user turns, 512 tokens padded
     on the right, the hidden states after layers 10, 20 and 30 stacked, and
-    the guidance [dev] embeds. The vision tower is carried, not run, and
-    exports as it came."""
+    the guidance [dev] embeds. The vision tower and projector are carried as
+    stored, not held as variables: the variables are the leaves the language
+    model's layouts bind, and those layouts with the carried tensors export
+    every stored tensor as it came."""
+    from flax.traverse_util import flatten_dict
+
     from dew.interop.pipeline_assembly import _hidden_states_conditioning
 
     directory = source / "mistral3"
-    encoder, layouts, _ = _hidden_states_conditioning(
+    encoder, layouts, retained, _ = _hidden_states_conditioning(
         directory, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0,
         param_dtype="float32", attention_impl="xla")
     assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
@@ -220,8 +224,12 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
     assert relative_gap(condition.context, arrays["mistral3.context"]) < FORWARD
     np.testing.assert_array_equal(np.asarray(condition.guidance), [4.0, 4.0])
     tensors = component_tensors(directory, "text_encoder")
-    assert {layout.name for layout in layouts} == {f"text_encoder/{name}" for name in tensors}
-    assert any("vision_tower." in name for name in tensors)
-    for layout in layouts:
-        written = layout.export({"encoders": {"conditioning": encoder.params}})
-        assert written.tobytes() == tensors[layout.name.removeprefix("text_encoder/")].tobytes(), layout.name
+    assert set(flatten_dict(encoder.params)) == {layout.paths[0][2:] for layout in layouts}
+    assert {f"text_encoder/{name}" for name in tensors} == {layout.name for layout in layouts} | set(retained)
+    assert any("vision_tower." in name for name in retained)
+    assert any("multi_modal_projector." in name for name in retained)
+    variables = {"encoders": {"conditioning": encoder.params}}
+    written = {layout.name: layout.export(variables) for layout in layouts}
+    for name, tensor in {**written, **retained}.items():
+        stored = tensors[name.removeprefix("text_encoder/")]
+        assert (tensor.dtype, tensor.tobytes()) == (stored.dtype, stored.tobytes()), name
