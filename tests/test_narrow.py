@@ -52,13 +52,15 @@ def test_a_scan_copies_its_stacked_layers_not_its_constants():
 
 
 def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8):
+             mixture=False, rows=8, ragged=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     copies on the generations named, on `mesh` with every parameter split
     where it divides, `accumulation` steps an update of `split`
     microbatches each, over `rows` rows. A `mixture` routes its MLPs over
-    four experts under a balance loss."""
+    four experts under a balance loss. A `ragged` run's even steps end
+    their first half of rows in padding, so no two neighbouring
+    microbatches count as many tokens."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -79,8 +81,10 @@ def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0, 
     state = trainer.initial_state()
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
     step = trainer.compile(state, batch)
+    shorter = {TEXT_KEY: batch[TEXT_KEY].at[:rows // 2, -3:].set(0)}
+    trained = [shorter if ragged and index % 2 == 0 else batch for index in range(steps)]
     losses = []
-    for current in [batch] * steps + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
+    for current in trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
         state, loss, *_ = step(state, current)
         losses.append(np.asarray(loss))
     return state, losses
@@ -123,14 +127,15 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
         monkeypatch, accumulation, split, mixture):
     """A step that pools several microbatches, by accumulation or a batch
     read in parts, reads the copies through its window and rewrites them as
-    it commits. Each microbatch's gradient is widened as it is pooled, and a
-    loss whose balance terms pool apart (a mixture's) replays the window's
-    microbatches through the copies too: under SGD every parameter after
-    two windows is bitwise the plain run's, and the copies are the cast of
-    what the last commit wrote."""
+    it commits. Each microbatch's gradient is widened as it is pooled, so
+    weighing microbatches of unequal token counts into one mean rounds in
+    fp32 as without copies, and a loss whose balance terms pool apart (a
+    mixture's) replays the window's microbatches through the copies too:
+    under SGD every parameter after two windows is bitwise the plain run's,
+    and the copies are the cast of what the last commit wrote."""
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
-           "rows": split * max(8, jax.device_count())}
+           "rows": split * max(8, jax.device_count()), "ragged": True}
     narrow, losses = _trained(monkeypatch, {device_generation()}, optax.sgd(0.5), **run)
     plain, plain_losses = _trained(monkeypatch, set(), optax.sgd(0.5), **run)
     assert plain.compute is None and int(narrow.updates) == int(plain.updates) == 2
