@@ -101,12 +101,15 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
     obj, params, _, sampling, rollouts = sampled(adapted=True)
     grpo = GRPOObjective(obj.model, obj.seq_len, sampling_temperature=sampling.temperature,
                          variables=params)
-    batch = pack(rollouts, PROMPT + NEW, rows=jax.device_count(), support_capacity=12 * NEW)
+    # As many rows as the chains need, in whole rows for every device.
+    needed = len(pack(rollouts, PROMPT + NEW, support_capacity=12 * NEW)["response_mask"])
+    rows = -(-needed // jax.device_count()) * jax.device_count()
+    batch = pack(rollouts, PROMPT + NEW, rows=rows, support_capacity=12 * NEW)
     drawn_ids = batch["response_mask"] != 0
     scored = np.asarray(grpo.packed_log_probs(params, batch))[drawn_ids]
     np.testing.assert_allclose(scored, batch["behavior_log_probs"][drawn_ids], atol=2e-5)
 
-    data = dataset(lambda: iter([batch]), batch=jax.device_count())
+    data = dataset(lambda: iter([batch]), batch=rows)
     trainer = Trainer(grpo, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
                       layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()
