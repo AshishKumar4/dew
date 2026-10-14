@@ -77,6 +77,8 @@ def arguments() -> argparse.Namespace:
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
+    parser.add_argument("--param-dtype", choices=("float32", "bfloat16"), default="float32",
+                        help="the parameters in memory; bfloat16 bounds what casting them each use costs")
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None,
@@ -130,7 +132,7 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
-    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype=args.param_dtype,
                                  attention_impl=args.attention)
     model = pretrained.model
     if args.remat is not None:
