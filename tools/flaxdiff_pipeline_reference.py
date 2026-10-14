@@ -146,25 +146,30 @@ class TorchCLIP:
 
 def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
     """Dew's own call on the run: its initial state, each ancestral step's
-    unit noise in order, and its images."""
-    import dew.sampling.solvers as solvers
+    unit noise in order, and its images. The call runs the task's own solver
+    through one that records, step by step, the unit normal an ancestral
+    step draws from the key the walk hands it (`EulerAncestral.step`)."""
+    from flax import struct
+
     from dew.sampling import TextToImage
+    from dew.sampling.solvers import Solver
 
     task = TextToImage.from_flaxdiff(step, config, jax_version=jax.__version__)
     noise: list[np.ndarray] = []
 
-    def normal(key, shape, dtype=jnp.float32):
-        value = jax.random.normal(key, shape, dtype)
-        jax.debug.callback(lambda drawn: noise.append(np.asarray(drawn)), value, ordered=True)
-        return value
+    @struct.dataclass
+    class Recording:
+        solver: Solver
 
-    recorded = types.SimpleNamespace(**{**vars(jax), "random": types.SimpleNamespace(
-        **{**vars(jax.random), "normal": normal})})
-    original, solvers.jax = solvers.jax, recorded
-    try:
-        images = np.asarray(task(list(PROMPTS), key=KEY).images)
-    finally:
-        solvers.jax = original
+        def init(self, x, times, process, *, key):
+            return self.solver.init(x, times, process, key=key)
+
+        def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+            drawn = jax.random.normal(key, x.shape)
+            jax.debug.callback(lambda value: noise.append(np.asarray(value)), drawn, ordered=True)
+            return self.solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)
+
+    images = np.asarray(task(list(PROMPTS), key=KEY, solver=Recording(task.solver)).images)
     start = np.asarray(task.prepare(list(PROMPTS), key=KEY).noise)
     return start, noise, images
 
