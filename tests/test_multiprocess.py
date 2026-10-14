@@ -1062,15 +1062,21 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
 
 
 @pytest.mark.distributed
-def test_a_pool_holds_process_zeros_frozen_fp8_sites(tmp_path):
+def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
     """The frozen FP8 sites decide which kernels a rank's train state holds
-    packed, so every rank must hold one record. Process 0 measures both
-    shapes and the others take its record without timing anything, even
-    where their own timers would have chosen otherwise."""
+    packed, so process 0 decides them for the pool: on CPUs it refuses for
+    want of FP8 tensor cores and its peer hears of it at the agreement,
+    deciding nothing itself. A tree that lacks a site on process 1 alone is
+    refused there and heard of on process 0, and both pass the next
+    agreement."""
     reports = run_pool("fp8_sites", tmp_path / "pool", 2, timeout=180)
-    assert [report["sites"] for report in reports] == [["wide", "narrow"]] * 2
-    assert [report["generation"] for report in reports] == ["sm90"] * 2
-    assert [report["timed"] for report in reports] == [4, 0]
+    unsupported = [report["unsupported"] for report in reports]
+    assert unsupported[0].startswith("ValueError") and "no FP8 tensor cores" in unsupported[0]
+    assert unsupported[1].startswith("PeerFailure")
+    missing = [report["missing"] for report in reports]
+    assert missing[0].startswith("PeerFailure")
+    assert missing[1].startswith("ValueError") and "frozen FP8 site narrow" in missing[1]
+    assert [report["after"] for report in reports] == [True, True]
 
 
 @pytest.mark.distributed

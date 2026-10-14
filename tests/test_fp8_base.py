@@ -14,6 +14,8 @@ measurement (`measured_fp8_sites`), recorded with the generation it was
 taken on.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -289,6 +291,17 @@ FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
 def test_a_device_without_fp8_tensor_cores_measures_no_site():
     variables = decoder().init(jax.random.key(0), ids())
     with pytest.raises(ValueError, match="no FP8 tensor cores"):
+        measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
+
+
+def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
+    """A process beside other work on its GPU (gpu-run -n 0.5 asks XLA to
+    read its picks and write none) would time FP8 against bf16 unfairly, so
+    it is refused before measuring, on a GPU with FP8 tensor cores too."""
+    variables = decoder().init(jax.random.key(0), ids())
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} "
+                                    "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ")
+    with assumed("sm90"), pytest.raises(ValueError, match="shares its GPU"):
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
 
