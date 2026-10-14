@@ -582,8 +582,9 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
-GPU_HEADROOM = 1.25
-"""A file's share of the GPU over its recorded peak: the allocator's fragmentation and rounding."""
+GPU_HEADROOM = (1.25, 2 ** 30)
+"""A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
+fragmentation, which can leave a share its own size short of a block it needs."""
 GPU_UNRECORDED = 4
 """A file no record has a peak for runs on this part of the lane's share."""
 
@@ -593,11 +594,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     """Run `tests` on this process's share of the one GPU it sees, each file as a task of its own
     (`tested`), and write their verdict rows to `out`.
 
-    A file's process may hold `GPU_HEADROOM` times the peak memory its record on this GPU's class
-    holds (tools/armada/executed.py's `gpu_peak`), and one without a peak a `GPU_UNRECORDED`th of
-    the share. Files start heaviest first while their shares fit the share this process was given
-    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
-    runs out of its share is red: it took more than it took before."""
+    A file's process may hold the peak memory its record on this GPU's class holds
+    (tools/armada/executed.py's `gpu_peak`) and `GPU_HEADROOM`, and one without a peak a
+    `GPU_UNRECORDED`th of the share. Files start heaviest first while their shares fit the share
+    this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most
+    `processes` at once. A file that runs out of its share is red: it took more than it took before."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
@@ -606,7 +607,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     def needs(name: str) -> float:
         record = cache_request(cache_url(python, row(python, name, ""), held), token)
         peak = json.loads(record).get("peak") if record else None
-        return budget / GPU_UNRECORDED if peak is None else min(peak * GPU_HEADROOM, budget)
+        factor, slack = GPU_HEADROOM
+        return budget / GPU_UNRECORDED if peak is None else min(peak * factor + slack, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         shares = dict(zip(tests, pool.map(needs, tests), strict=True))
