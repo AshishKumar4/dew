@@ -97,14 +97,14 @@ def test_the_loss_is_the_papers_equation(runs):
     x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
     time = schedule.model_time(t)
     teacher = task.teacher
-    given, blank = teacher._conditions(params[TEACHER], batch, drop_key, dropout=False)
+    given, blank = teacher._conditions(params[TEACHER], batch, drop_key)
     variables = teacher.model_variables(params[TEACHER])
     null = jax.tree.map(lambda value, empty: jnp.broadcast_to(empty, value.shape), given,
                         aligned_conditions(given, blank))
     conditional = teacher.model.apply(variables, x, time, **given)
     unconditional = teacher.model.apply(variables, x, time, **null)
     target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
-    student_given, _ = task._conditions(params, batch, drop_key, dropout=False)
+    student_given, _ = task._conditions(params, batch, drop_key)
     output = task.model.apply(task.model_variables(params), x, time, **with_guidance(student_given, scale))
     # Weighted per row as the process weighs its times: one for flow matching, EDM's lambda(sigma).
     expected = jnp.mean(0.5 * jnp.square(output - target) * task.process.weight(t).reshape(-1, 1, 1, 1))

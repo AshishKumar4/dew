@@ -95,6 +95,32 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     assert not np.allclose(losses[:, 2:], plain[:, 2:])
 
 
+def test_padding_that_holds_the_mask_token_scores_nothing():
+    """A padded row whose padding slots hold the mask token, as a tokenizer padding with it writes
+    them: the loss, its gradient and the evaluation's per-token scores are finite and the same as
+    with any other token there, since padding is neither masked nor scored."""
+    model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
+                         num_heads=2, mlp_features=16, max_seq_len=4, causal=False, qk_norm=False,
+                         attention_impl='reference', dtype=jnp.float32)
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=31)(), seq_len=4, head_chunks=4,
+                                         ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    mask = jnp.asarray([[1, 1, 0, 0]], bool)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+
+    def scored(padding):
+        tokens = jnp.asarray([[2, 5, padding, padding]], jnp.int32)
+        batch = {"text": ModelInputs(tokens, {"attention_mask": mask})}
+        loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
+        return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
+
+    mask_padded, other_padded = scored(31), scored(7)
+    assert np.isfinite(float(mask_padded[0]))
+    assert all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(mask_padded[1]))
+    np.testing.assert_array_equal(np.asarray(mask_padded[2].losses), np.asarray(other_padded[2].losses))
+    assert float(mask_padded[0]) == float(other_padded[0])
+
+
 def loaded(name: str):
     """A committed tiny masked-diffusion checkpoint as its model and variables."""
     from safetensors.numpy import load_file

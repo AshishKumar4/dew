@@ -41,6 +41,38 @@ def test_the_public_loader_reads_the_fixture(tensors):
     assert largest(logits, reference) < 1e-5
 
 
+def test_a_bf16_mamba2_sums_its_residual_stream_in_fp32(tmp_path, tensors):
+    """`residual_in_fp32` (transformers' Mamba2Block and mamba_ssm's Block): in bf16 each layer reads
+    the stream in bf16 and adds its output to it in fp32. With the fixture's weights rounded to bf16
+    values (so the float64 port runs the same ones) and its embeddings scaled 256 times, so that the
+    stream dwarfs the mixers' outputs as Mamba-2 130M's massive activations do, each layer's stream
+    is held to the float64 port's by the float64 rule against transformers' own bf16 forward. A
+    stream rounded to bf16 sat 27 and 34 times farther."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    narrow = {name: np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32)
+              for name, value in tensors.items()}
+    narrow["backbone.embeddings.weight"] = narrow["backbone.embeddings.weight"] * 256
+    save_file(narrow, tmp_path / "model.safetensors")
+    (tmp_path / "config.json").write_text((FIXTURE / "config.json").read_text())
+    ids = np.load(FIXTURE / "input_ids.npy")
+
+    def port(dtype):
+        model = transformers.Mamba2ForCausalLM.from_pretrained(tmp_path, dtype=dtype).eval()
+        with torch.no_grad():
+            out = model(torch.from_numpy(ids.astype(np.int64)), output_hidden_states=True)
+        # Each layer's output, then the final norm's.
+        return [state.double().numpy() for state in out.hidden_states[:-1]]
+
+    truth, theirs = port(torch.float64), port(torch.bfloat16)
+    loaded = Pretrained.load(tmp_path, dtype="bfloat16", param_dtype="bfloat16")
+    _, state = loaded.model.apply(loaded.variables, jnp.asarray(ids), capture_intermediates=True,
+                                  mutable=["intermediates"])
+    for layer, (wide, narrow) in enumerate(zip(truth, theirs, strict=True)):
+        mine = np.asarray(state["intermediates"][f"layers_{layer}"]["__call__"][0], np.float64)
+        assert_as_exact_as_the_reference(mine, narrow, wide, f"layer {layer}'s residual stream")
+
+
 def mamba_ssm_config() -> dict:
     """The mamba2-tiny fixture as mamba_ssm's own config.json spells it
     (mamba_ssm/models/config_mamba.py), its vocabulary unpadded."""
