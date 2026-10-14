@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -73,6 +74,20 @@ class MinChars:
 
     def __call__(self, element: Batch) -> bool:
         return len(str(element[self.field])) >= self.count
+
+
+@dataclasses.dataclass(frozen=True)
+class Normalized(grain.MapTransform):
+    """The text in `field` in Unicode normal form `form` (`unicodedata.normalize`); other fields
+    pass through."""
+
+    form: Literal["NFC", "NFKC", "NFD", "NFKD"] = "NFKC"
+    field: str = "text"
+
+    def map(self, element: Batch) -> Batch:
+        text = element[self.field]
+        text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+        return {**element, self.field: unicodedata.normalize(self.form, text)}
 
 
 @dataclasses.dataclass(frozen=True)

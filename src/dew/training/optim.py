@@ -571,7 +571,9 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
     rates' ratios stay in the shape, so runs at different scales share it.
     A schedule of zeros has the scale 0 and a shape whose first rate field
     is 1, so it applies exactly zero. A None field keeps its derived
-    default (OneCycle's init and end)."""
+    default (OneCycle's init and end). A schedule that marks no field a
+    rate, a subclass implementing `values` alone, is its own shape at the
+    scale 1: its values are the rates."""
     if not isinstance(rate, ScheduleBase):
         return rate, None
 
@@ -583,7 +585,10 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
             elif dataclasses.is_dataclass(value):
                 yield from rates(value)
 
-    scale = next((value for value in rates(rate) if value != 0), 0.0)
+    found = list(rates(rate))
+    if not found:
+        return 1.0, rate
+    scale = next((value for value in found if value != 0), 0.0)
 
     def normalized(record):
         fields = {}
@@ -596,10 +601,32 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         return dataclasses.replace(record, **fields)
 
     shape = normalized(rate)
-    if scale == 0:
-        first = next(field.name for field in dataclasses.fields(rate) if field.metadata.get('rate'))
+    first = next((field.name for field in dataclasses.fields(rate) if field.metadata.get('rate')), None)
+    if scale == 0 and first is not None:
         shape = dataclasses.replace(shape, **{first: 1.0})
     return scale, shape
+
+
+def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
+    """Return the learning rate stored in `opt_state`, if the optimizer stores one.
+
+    An OptimConfig's solver holds a rate scale and the schedule's value at
+    the last applied update (`dew.training.optim.scaled_solver`), whose
+    product is the rate; an Optax optimizer can inject `learning_rate`
+    itself (`optax.inject_hyperparams`). The result is None when the
+    optimizer closes over the rate, or when parameter groups hold several
+    rates.
+    """
+    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+    rates = []
+    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
+        if not isinstance(node, injected):
+            continue
+        if RATE_SCALE in node.hyperparams:
+            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
+        elif "learning_rate" in node.hyperparams:
+            rates.append(node.hyperparams["learning_rate"])
+    return rates[0] if len(rates) == 1 else None
 
 
 def with_rate_scales(opt_state: optax.OptState, scales: Mapping[str | None, float]) -> optax.OptState:
