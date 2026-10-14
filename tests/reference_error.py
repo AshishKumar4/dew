@@ -52,6 +52,17 @@ import numpy as np
 
 FACTOR = 2.0
 
+ROW_FACTOR = 4.0
+"""How far Dew's worst row may sit from float64 against the reference's worst
+row (`worst_row`). An RMS over every entry averages a few wrong rows into a
+large tensor, so each comparison also holds Dew's worst row to the
+reference's. The worst of many rows is an extreme value, not an average,
+and parts further by chance: over the suite's 476 comparisons (2026-10-14),
+Dew's worst row over the reference's sat at a median of 1.00, p90 1.30 and
+p99 2.09. A row that differs rather than rounds moves by orders of
+magnitude: the MiMo tower with its sinks zeroed, which the RMS already
+fails, puts its worst row at 3419 times the reference's."""
+
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
 
@@ -124,13 +135,35 @@ def distance(value, truth) -> float:
     return float(np.sqrt(np.mean(np.square(difference))))
 
 
+def worst_row(value, truth, scale: float) -> float:
+    """The largest row's RMS distance from float64, each row (every axis but
+    the last) over the larger of its own RMS and `scale`: a row's rounding
+    follows the size of what it sums, which a row that cancels or is masked to
+    zeros (a single-key query's gradient) does not show, and the leaf's own size
+    stands for it. A value of rank one or less is one row, which `distance`
+    already judges, and has none of its own (0), as has a zero leaf."""
+    value, truth = np.asarray(value, np.float64), np.asarray(truth, np.float64)
+    if truth.ndim < 2 or not scale > 0:
+        return 0.0
+    rows = (-1, truth.shape[-1])
+    sizes = np.sqrt(np.mean(np.square(truth.reshape(rows)), axis=1))
+    errors = np.sqrt(np.mean(np.square((value - truth).reshape(rows)), axis=1))
+    return float(np.max(errors / np.maximum(sizes, scale)))
+
+
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
-    """Dew within FACTOR times the reference's RMS distance from float64."""
+    """Dew within FACTOR times the reference's RMS distance from float64, and
+    its worst row within ROW_FACTOR times the reference's (`worst_row`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
+    scale = distance(truth, 0)
+    row, their_row = worst_row(dew, truth, scale), worst_row(reference, truth, scale)
+    assert within(row, ROW_FACTOR * their_row), (
+        f"{label}: dew's worst row is {row:.3e} from float64 (rms over the row's size), the "
+        f"reference's {their_row:.3e} (ratio {row / their_row:.2f}, allowed {ROW_FACTOR})")
 
 
 
@@ -155,7 +188,8 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
     bias's gradient does under the softmax's shift invariance, is held to
     its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own."""
+    signs are independent keeps about its own. Each leaf's worst row is held
+    to the reference's too (`ROW_FACTOR`)."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -168,6 +202,12 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
+        # The worst row, its order floor the leaf's in the rows' own units.
+        row = worst_row(mine, true, scale)
+        row_bar = ROW_FACTOR * max(worst_row(theirs, true, scale), spread * unit)
+        if not within(row, row_bar):
+            over.append(f"{jax.tree_util.keystr(path)}: the worst row {row:.3e} from float64 "
+                        f"(rms over its size), allowed {row_bar:.3e}")
     assert not over, "\n".join(over)
 
 
