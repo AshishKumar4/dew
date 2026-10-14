@@ -101,25 +101,48 @@ def reference(query, key, value, **kwargs):
                            precision=jax.lax.Precision.HIGHEST, **kwargs)
 
 
-def flash_query_gradient(query, key, value, *, softcap):
-    """Splash's published untiled flash-formula reference, over the same heads.
+def kept(q_len, k_len, *, causal=False, sliding_window=None, mask=None, segment_ids=None):
+    """The keys each query keeps, `[B or 1, 1, q, k]`: k <= q; a causal window's
+    w most recent, or without causality the keys within w - 1 of the query; the
+    explicit mask; equal segment ids."""
+    rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
+    keep = np.ones((1, 1, q_len, k_len), bool)
+    if causal:
+        keep = keep & (cols <= rows)
+    if sliding_window is not None:
+        keep = keep & (np.abs(cols - rows) < sliding_window)
+    if mask is not None:
+        keep = keep & np.asarray(mask, bool)
+    if segment_ids is not None:
+        ids = np.asarray(segment_ids)
+        keep = keep & (ids[:, None, :, None] == ids[:, None, None, :])
+    return keep
+
+
+def flash_gradients(query, key, value, sinks=None, *, softcap=None, live=None, **structure):
+    """The q, k and v gradients of `value_and_grads`' loss by Splash's published
+    untiled flash-formula reference, over the same heads and the keys `kept`
+    keeps.
 
     Its custom backward forms delta = rowsum(out * dout), as Splash and
     FlashAttention 2/3 do. The vanilla softmax derivative uses rowsum(dp * p),
-    an exact identity whose different roundings omit the output's error.
+    an exact identity whose different roundings omit the output's error; on a
+    query that keeps one key the two part at a zero gradient, the flash form by
+    its delta's rounding. Splash's backward is held to the formula it runs.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
-    heads, length, width = query.shape[2], query.shape[1], query.shape[-1]
-    keep = np.arange(key.shape[1])[None, :] <= np.arange(length)[:, None]
-    kernel = splash_attention_kernel.make_attention_reference(
-        np.broadcast_to(keep, (heads, *keep.shape)), is_mqa=False,
-        backward_impl="custom")
+    batch, length, heads, width = query.shape
+    keep = np.broadcast_to(kept(length, key.shape[1], **structure), (batch, heads, length, key.shape[1]))
+    kernels = [splash_attention_kernel.make_attention_reference(row, is_mqa=False, backward_impl="custom")
+               for row in keep]
 
     def loss(q, k, v):
-        out = jax.vmap(lambda q, k, v: kernel(q, k, v, attn_logits_soft_cap=softcap))(
-            jnp.moveaxis(q, -2, -3) / np.sqrt(width),
-            jnp.moveaxis(k, -2, -3), jnp.moveaxis(v, -2, -3))
+        q, k, v = jnp.moveaxis(q, -2, -3) / np.sqrt(width), jnp.moveaxis(k, -2, -3), jnp.moveaxis(v, -2, -3)
+        out = jnp.moveaxis(jnp.stack([kernel(*row, sinks=sinks, attn_logits_soft_cap=softcap)
+                                      for kernel, *row in zip(kernels, q, k, v, strict=True)]), -3, -2)
+        if live is not None:
+            out = jnp.where(np.asarray(live)[:, :, None, None], out, 0)
         return jnp.sum(out ** 2)
 
     pinned = splash_attention_kernel.jnp
@@ -128,7 +151,7 @@ def flash_query_gradient(query, key, value, *, softcap):
             # The reference's fp32 pins must widen with its inputs to measure
             # its exact flash identity, as the vanilla twin's inputs do.
             splash_attention_kernel.jnp = SimpleNamespace(**{**vars(jnp), "float32": jnp.float64})
-        return np.asarray(jax.jit(jax.grad(loss))(query, key, value))
+        return [np.asarray(x) for x in jax.jit(jax.grad(loss, argnums=(0, 1, 2)))(query, key, value)]
     finally:
         splash_attention_kernel.jnp = pinned
 
@@ -314,9 +337,8 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
     """`value_and_grads`' output and gradients in float64, from attention
     written out here apart from every Dew path: the logits of query head h
     against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`,
-    then the kept keys (k <= q; a causal window's w most recent, or without
-    causality the keys within w - 1 of the query; the explicit mask; equal
-    segment ids), a softmax whose denominator a sink joins, and the values."""
+    then the keys `kept` keeps, a softmax whose denominator a sink joins, and
+    the values."""
     def attention(q, k, v, s):
         _, q_len, heads, width = q.shape
         k_len, kv_heads = k.shape[1], k.shape[2]
@@ -324,17 +346,8 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
         logits = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(width)
         if softcap is not None:
             logits = softcap * jnp.tanh(logits / softcap)
-        rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
-        keep = np.ones((1, 1, q_len, k_len), bool)
-        if causal:
-            keep = keep & (cols <= rows)
-        if sliding_window is not None:
-            keep = keep & (np.abs(cols - rows) < sliding_window)
-        if mask is not None:
-            keep = keep & np.asarray(mask, bool)
-        if segment_ids is not None:
-            ids = np.asarray(segment_ids)
-            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :])
+        keep = kept(q_len, k_len, causal=causal, sliding_window=sliding_window, mask=mask,
+                    segment_ids=segment_ids)
         logits = jnp.where(keep, logits, -jnp.inf)
         if s is not None:
             sink = jnp.broadcast_to(s[None, :, None, None], (*logits.shape[:3], 1))
@@ -384,13 +397,14 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
     The sinks' gradients use 52 head-unit orders on both sides. Moving
     q, k and v's units together leaves the masks and sinks intact and only
     permutes the output and the three qkv gradients; the float64 oracle
-    checks that symmetry under every order. The softcapped query gradient
-    is held to Splash's published flash-formula reference. Its delta is
-    rowsum(out * dout), as in FlashAttention 2/3; vanilla AD takes
-    rowsum(dp * p), which omits the rounded output's error. Over 52 orders,
-    Splash and the untiled flash formula both sit at 1.79 times vanilla's
-    RMS error (default and AVX CPU), and within 1% of each other. Both
-    upstream backwards share the same tanh and recomputed probabilities.
+    checks that symmetry under every order. The qkv gradients are held to
+    Splash's published flash-formula reference (`flash_gradients`). Its
+    delta is rowsum(out * dout), as in FlashAttention 2/3; vanilla AD takes
+    rowsum(dp * p), which omits the rounded output's error. Over 52 orders
+    of the softcapped query gradient, Splash and the untiled flash formula
+    both sit at 1.79 times vanilla's RMS error (default and AVX CPU), and
+    within 1% of each other; on the packed window's single-key queries
+    Splash's worst row sits at 5.7 times vanilla's.
     """
     q_shape, kv_shape, structure = ORACLE_CASES[case]
     query, _, _ = qkv(q_shape, jnp.float32)
@@ -412,11 +426,10 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
     names = ("output", "query", "key", "value", "sinks")[:len(splash)]
     truth = exact_value_and_grads(query, key, value, **structure)
     expected = reference(query, key, value, **structure)
-    if case == "softcap":
-        expected[1] = flash_query_gradient(query, key, value, softcap=structure["softcap"])
-        with jax.enable_x64(new_val=True):
-            widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
-            twin[1] = flash_query_gradient(*widened, softcap=structure["softcap"])
+    expected[1:4] = flash_gradients(query, key, value, **structure)
+    with jax.enable_x64(new_val=True):
+        widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
+        twin[1:4] = flash_gradients(*widened, **wide)
     ordered = "sinks" if case in ("sinks", "sinks-window") else None
     for name, mine, theirs, wide_theirs, want in zip(
             names, splash, expected, twin, truth, strict=True):
