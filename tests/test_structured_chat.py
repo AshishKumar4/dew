@@ -19,6 +19,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from hub_support import native_builder
 from transformers import AutoTokenizer
 
 from dew.config.data import ChatData, loader
@@ -255,10 +256,7 @@ def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch
     messages = parquet_conversation()
     split = hf_datasets.Dataset.from_dict(
         {"messages": [messages], "tools": [json.dumps([WEATHER])], "id": ["row-0"]})
-    path = tmp_path / "chat.parquet"
-    split.to_parquet(path)
-    builder = hf_datasets.load_dataset_builder("parquet", data_files={"train": str(path), "test": str(path)},
-                                              cache_dir=str(tmp_path / "arrow"))
+    builder = native_builder({"train": split, "test": split}, tmp_path, tmp_path / "arrow")
     builder.download_and_prepare()
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="abc123"))
     monkeypatch.setattr(hf_datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
