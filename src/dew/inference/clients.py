@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
-from dew.nn.inputs import key_seed
+from dew.nn.inputs import key_seed, token_id
 from dew.records import JSON
 from dew.sampling.text import Sampling
 
@@ -414,9 +414,7 @@ def _token_rows(prompts: object) -> list[list[int]] | None:
     for row in prompts:
         if isinstance(row, str) or not isinstance(row, Sequence) or not row:
             raise ValueError("token prompts must be nonempty rows of token ids")
-        if any(type(token) is not int or token < 0 for token in row):
-            raise ValueError("token prompts must hold nonnegative integer ids")
-        rows.append(list(row))
+        rows.append([token_id(token, where="a token prompt") for token in row])
     return rows
 
 
