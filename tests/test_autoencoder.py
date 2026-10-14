@@ -8,6 +8,7 @@ contract to Diffusers' own VAE, posterior and SD3 pipeline normalization
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import jax
@@ -16,7 +17,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
@@ -111,3 +112,51 @@ def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
     decoded = sd3_tiny.decode(sd3_tiny.params, clip)
     assert_as_exact_as_the_reference(np.asarray(decoded).reshape(-1, *decoded.shape[2:]),
                                      contract["fp32.decoded"], contract["fp64.decoded"], "decoded")
+
+
+def _published(kind: str, directory: Path):
+    """A built-in autoencoder and its parameters, loaded from its fixture at `directory`."""
+    from interop_support import extract_fixture
+
+    from dew.nn.autoencoders.dc_ae import load_dc_ae
+    from dew.nn.autoencoders.flux2 import load_flux2_vae
+    from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
+    from dew.nn.autoencoders.rae import load_rae
+    from dew.nn.autoencoders.wan import load_wan_vae
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    archive, load = {
+        "dc_ae": ("dc_ae.tar.xz", lambda root: load_dc_ae(root / "conv")),
+        "wan": ("wan_vae.tar.xz", lambda root: load_wan_vae(root)),
+        "rae": ("rae.tar.xz", lambda root: load_rae(root / "dinov2")),
+        "flux2": ("flux2_source.tar.xz", lambda root: load_flux2_vae(root / "vae")),
+        "qwen_image": ("qwen_image_vae.tar.xz", lambda root: load_qwen_image_vae(root, jnp.float32)),
+    }[kind]
+    autoencoder, params, _, _ = load(extract_fixture(fixtures / archive, directory))
+    return autoencoder, params
+
+
+@pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])
+def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, tmp_path):
+    """A saved diffusion task records its autoencoder (`to_json`) and a run rebuilds it from that
+    record around the checkpoint's parameters (`from_json`), the source it was loaded from gone: the
+    record survives JSON, and the rebuilt autoencoder declares the same latent shape and encodes and
+    decodes bitwise as the one it recorded, its normalization included."""
+    if kind == "sd_vae":
+        original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
+        params = original.params
+    else:
+        original, params = _published(kind, tmp_path / "source")
+        shutil.rmtree(tmp_path / "source")
+    record = json.loads(json.dumps(original.to_json()))
+    rebuilt = AutoEncoder.from_json(record, params=params)
+    assert type(rebuilt) is type(original)
+    side = 2 * original.downscale_factor
+    frames = (5,) if kind == "wan" else ()
+    shape = (*frames, side, side, 3)
+    assert rebuilt.latent_shape(shape) == original.latent_shape(shape)
+    image = jax.random.uniform(jax.random.key(0), (1, *shape), minval=-1.0, maxval=1.0)
+    latent = original.encode(params, image)
+    np.testing.assert_array_equal(np.asarray(rebuilt.encode(params, image)), np.asarray(latent))
+    np.testing.assert_array_equal(np.asarray(rebuilt.decode(params, latent)),
+                                  np.asarray(original.decode(params, latent)))

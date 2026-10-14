@@ -480,10 +480,16 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
     """Native DC-AE weights and the pipeline's latent scaling,
     `z * scaling_factor` on the way out and `z / scaling_factor` on the way in."""
 
+    record_name = 'dc_ae'
+    record_module = DCAE
+
     def __init__(self, *, model: DCAE, params: Variables, latent_scale: float, latent_shift: float = 0.0):
         super().__init__(model, params)
         self.latent_scale = latent_scale
         self.latent_shift = latent_shift
+
+    def record_arguments(self) -> dict:
+        return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
 
     @property
     def downscale_factor(self) -> int:
