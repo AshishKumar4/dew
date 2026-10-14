@@ -65,18 +65,22 @@ from dew.interop.decoder_parts import (
     CODEC_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     IGNORED_FIELDS,
+    KDA_LEAVES,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
     DecoderFields,
     KindFields,
+    Leaves,
     MixtureFields,
+    Renames,
     SituFields,
     dew_path,
     record_float,
     record_int,
     refuse,
     refuse_encoder_fields,
+    renamed_path,
 )
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -311,61 +315,32 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     return _decoder(text, tied, context)
 
 
-_LAYER_SITES = {'self_attention_res_norm': ('attention_res', 'scale'),
-                'self_attention_res_proj': ('attention_res', 'kernel'),
-                'mlp_res_norm': ('mlp_res', 'scale'),
-                'mlp_res_proj': ('mlp_res', 'kernel')}
-_MOE_PROJECTIONS = {'w1': 'gate_proj', 'w3': 'up_proj', 'w2': 'down_proj'}
-# KDA's projections, both output gates, and the MLA query and gate of the
-# same names.
-_SELF_ATTN_KERNELS = ('q_proj', 'k_proj', 'v_proj', 'f_a_proj', 'f_b_proj', 'b_proj',
-                      'g_proj', 'g_a_proj', 'g_b_proj')
+_KIMI_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w3', 'up_proj'),
+                        ('w2', 'down_proj'))
+"""Kimi's MoE block and its experts' projections onto DeepSeek's names, which
+the shared map reads. Only a load respells them: the families keep their
+source layout on export."""
+_KIMI_LEAVES: Leaves = {'model.output_attn_res_norm.weight': ('output_res', 'scale'),
+                        'model.output_attn_res_proj.weight': ('output_res', 'kernel')}
+_KIMI_LAYER_LEAVES: Leaves = {
+    **KDA_LEAVES,
+    'self_attention_res_norm.weight': ('attention_res', 'scale'),
+    'self_attention_res_proj.weight': ('attention_res', 'kernel'),
+    'mlp_res_norm.weight': ('mlp_res', 'scale'), 'mlp_res_proj.weight': ('mlp_res', 'kernel'),
+    # K3's gated latent attention's gate, and its latent experts' projections and norm.
+    'self_attn.g_proj.weight': ('self_attn', 'g_proj', 'kernel'),
+    'mlp.routed_expert_down_proj.weight': ('mlp', 'routed_expert_down_proj', 'kernel'),
+    'mlp.routed_expert_up_proj.weight': ('mlp', 'routed_expert_up_proj', 'kernel'),
+    'mlp.routed_expert_norm.weight': ('mlp', 'routed_expert_norm', 'scale'),
+}
+"""Kimi's tensors the shared map has no place for: the attention residual
+sites, KDA's (`KDA_LEAVES`) and K3's."""
 
 
 def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path of a decoder tensor named below `model.`.
-
-    The standard norms, MLA projections and dense MLP map as DeepSeek's do;
-    Kimi's own names are the KDA projections and gates, the
-    `block_sparse_moe` block, and K3's attention residual sites and latent
-    projections.
-    """
-    parts = name.split('.')
-    if parts in (['output_attn_res_norm', 'weight'], ['output_attn_res_proj', 'weight']):
-        return ('params', 'output_res', 'scale' if parts[0].endswith('norm') else 'kernel')
-    if len(parts) < 3 or parts[0] != 'layers' or not parts[1].isdigit():
-        return dew_path('model.' + name, config)
-    layer, module, tail = f'layers_{parts[1]}', parts[2], parts[3:]
-    if tail == ['weight'] and module in _LAYER_SITES:
-        return ('params', layer, *_LAYER_SITES[module])
-    if module == 'self_attn':
-        if tail in (['A_log'], ['dt_bias'], ['o_norm', 'weight']):
-            return ('params', layer, 'self_attn', *tail)
-        if len(tail) == 2 and tail[1] == 'weight' and tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-            return ('params', layer, 'self_attn', *tail)
-        if len(tail) == 2 and tail[1] == 'weight' and tail[0] in _SELF_ATTN_KERNELS:
-            return ('params', layer, 'self_attn', tail[0], 'kernel')
-    if module == 'block_sparse_moe':
-        if tail == ['gate', 'weight']:
-            return ('params', layer, 'mlp', 'gate', 'kernel')
-        if tail == ['gate', 'e_score_correction_bias']:
-            return ('moe', layer, 'mlp', 'gate', 'e_score_correction_bias')
-        if (len(tail) == 4 and tail[0] == 'experts' and tail[1].isdigit()
-                and tail[2] in _MOE_PROJECTIONS and tail[3] == 'weight'):
-            return ('params', layer, 'mlp', 'experts', tail[1], _MOE_PROJECTIONS[tail[2]], 'kernel')
-        if (
-            len(tail) == 3
-            and tail[0] == "shared_experts"
-            and tail[2] == "weight"
-            and tail[1] in _MOE_PROJECTIONS.values()
-        ):
-            return ('params', layer, 'mlp', 'shared_experts', tail[1], 'kernel')
-        if tail in (['routed_expert_down_proj', 'weight'], ['routed_expert_up_proj', 'weight']):
-            return ('params', layer, 'mlp', tail[0], 'kernel')
-        if tail == ['routed_expert_norm', 'weight']:
-            return ('params', layer, 'mlp', 'routed_expert_norm', 'scale')
-        raise ValueError(f"unknown tensor name {name!r}")
-    return dew_path('model.' + name, config)
+    """Return the variables-tree path of a decoder tensor named below `model.`."""
+    return renamed_path(_KIMI_NAMES, 'model.' + name, config, leaves=_KIMI_LEAVES,
+                        layer_leaves=_KIMI_LAYER_LEAVES)
 
 
 def _kimi_linear_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
