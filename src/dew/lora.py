@@ -47,8 +47,7 @@ from typing import ClassVar, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
-from flax import traverse_util
+from flax import linen as nn, traverse_util
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
