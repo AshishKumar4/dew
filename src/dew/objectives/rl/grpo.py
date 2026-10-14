@@ -26,7 +26,7 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
-from dew.objectives.lm.chunked import head_cross_entropy
+from dew.objectives.lm.chunked import final_read, head_cross_entropy
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
@@ -384,9 +384,8 @@ class GRPOObjective(LMObjective):
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")
         padding = prompts.shape[1] - lengths
         aligned = _shift_rows(prompts, padding)
-        hidden = self.model.apply(params, aligned[:, :-1], train=False,
-                                  method="hidden_states")
-        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, aligned[:, 1:],
+        read = final_read(self.model, params, aligned[:, :-1], train=False)
+        losses, predicted, _ = head_cross_entropy(self.model, params, read, aligned[:, 1:],
                                                   self.head_chunks, predict=True)
         assert predicted is not None
         correct, _ = _unpadded(predicted == aligned[:, 1:], padding)
