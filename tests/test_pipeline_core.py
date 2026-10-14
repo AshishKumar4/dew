@@ -4,6 +4,7 @@ import dataclasses
 import importlib
 import itertools
 import json
+import multiprocessing
 import os
 from uuid import uuid4
 
@@ -208,6 +209,29 @@ def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(
     rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
     compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
     assert chosen == [4]
+
+
+def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
+    """A held pass of two batches starts two worker processes though training
+    reads with four: a third and a fourth would read nothing, yet each would
+    import the program and keep its pipes until the reader is collected."""
+    started = []
+    start = multiprocessing.context.SpawnProcess.start
+
+    def counted(process):
+        started.append(process)
+        start(process)
+
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", counted)
+    prefix = Pipeline(source(8))
+    data = compile(prefix.repeat().batch(4), validation=prefix.batch(4),
+                   loading=Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1))
+    reader = data.val(DataPartition())
+    try:
+        assert [row["id"].tolist() for row in reader] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    finally:
+        reader.close()
+    assert len(started) == 2
 
 
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
