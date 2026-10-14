@@ -19,6 +19,11 @@ read. A call the loss passes the weight into unchanged (`pjit`, a
 rematerialized region, a scan over stacked layers) is followed; any other
 use, a custom VJP's included, keeps it.
 
+A step that pools several microbatches into one update, by accumulation or
+a batch read in parts, reads one set of copies through its window and
+rewrites them as it commits. Each microbatch's gradient is widened as it is
+pooled, so the window sums in fp32 as it does without copies.
+
 Where: `gpu_target().kernels['narrow_copies']`, the CUDA generations it was measured to
 pay on (docs/performance.md). A TPU fuses the cast into the matmul, so the
 copy there only adds writes. The gradients are the cast's on split meshes

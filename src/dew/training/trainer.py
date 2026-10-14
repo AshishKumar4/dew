@@ -1242,7 +1242,7 @@ class Trainer(Generic[Loss, Effects]):
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        copies = self._narrow_copies(state, batch, window)
+        copies = self._narrow_copies(state, batch)
         if copies:
             prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
                 lambda variables: narrowed(variables, copies), prepared.variables))
@@ -1297,13 +1297,13 @@ class Trainer(Generic[Loss, Effects]):
             return jitted.trace(*placed, jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
                 lowering_platforms=('cuda',))
 
-    def _narrow_copies(self, state: TrainState, batch: Batch, window: int) -> dict:
+    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
         (`dew.training.narrow`), by path under `params`: on the CUDA
-        generations measured to gain, for a step this trainer composes that
-        commits every microbatch, a `window` of one, without a loss scale."""
+        generations measured to gain, for a step this trainer composes,
+        without a loss scale."""
         if (measured_kernel('narrow_copies', 'off') == 'off' or self.step is not None
-                or window != 1 or self.dynamic_scale or FROZEN in state.variables):
+                or self.dynamic_scale or FROZEN in state.variables):
             return {}
         variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 

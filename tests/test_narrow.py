@@ -51,11 +51,14 @@ def test_a_scan_copies_its_stacked_layers_not_its_constants():
     assert paths == {("stacked",): jnp.dtype(jnp.bfloat16)}
 
 
-def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0):
+def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0, accumulation=1, split=None,
+             mixture=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     copies on the generations named, on `mesh` with every parameter split
-    where it divides."""
+    where it divides, `accumulation` steps an update of `split`
+    microbatches each. A `mixture` routes its MLPs over four experts under
+    a balance loss."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -68,9 +71,11 @@ def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0):
         monkeypatch.setitem(target.kernels, 'narrow_copies', 'on')
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
                               mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.bfloat16)
-    trainer = Trainer(LMObjective(model, seq_len=8, pad_id=0), optimizer, key=jax.random.key(0),
-                      mesh=mesh or MeshSpec(), layout=Layout(min_shard=1, tolerance=1.0))
+                              tie_embeddings=True, dtype=jnp.bfloat16,
+                              mixture={"experts": 4, "top_k": 2} if mixture else None)
+    objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
+    trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh or MeshSpec(),
+                      layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split)
     state = trainer.initial_state()
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (8, 9)), jnp.int32)}
     step = trainer.compile(state, batch)
@@ -107,6 +112,33 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     for a, b in zip(losses, plain_losses, strict=True):
         np.testing.assert_array_equal(a, b)
     # The copies are the cast of the parameters the last update wrote.
+    for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
+                    strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("mixture", [False, True], ids=["pooled", "replayed"])
+@pytest.mark.parametrize(("accumulation", "split"), [(2, 1), (1, 2)], ids=["accumulated", "split"])
+def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
+        monkeypatch, accumulation, split, mixture):
+    """A step that pools several microbatches, by accumulation or a batch
+    read in parts, reads the copies through its window and rewrites them as
+    it commits. Each microbatch's gradient is widened as it is pooled, and a
+    loss whose balance terms pool apart (a mixture's) replays the window's
+    microbatches through the copies too: under SGD every parameter after
+    two windows is bitwise the plain run's, and the copies are the cast of
+    what the last commit wrote."""
+    run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture}
+    narrow, losses = _trained(monkeypatch, {device_generation()}, optax.sgd(0.5), **run)
+    plain, plain_losses = _trained(monkeypatch, set(), optax.sgd(0.5), **run)
+    assert plain.compute is None and int(narrow.updates) == int(plain.updates) == 2
+    paths = {tuple(key.key for key in path)[1:]: leaf.dtype
+             for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
+    assert paths
+    for a, b in zip(jax.tree.leaves(narrow.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for a, b in zip(losses, plain_losses, strict=True):
+        np.testing.assert_array_equal(a, b)
     for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
                     strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
