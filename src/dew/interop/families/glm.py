@@ -4,7 +4,8 @@ GLM 4.5 biases q/k/v over a bias-free output projection and rotates half the
 head. glm_moe_dsa is DeepSeek V3.2's sparse MLA block under those names, told
 apart by the indexer rotating interleaved pairs. GLM 5.3's text block pools its
 MLA keys without position, runs KDA layers beside them and carries mHC, so its
-export writes the whole variables tree rather than a leaf at a time.
+export names every persistent leaf itself, checking that the load reads each
+one back, and the shared writer stores them.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
@@ -30,6 +30,8 @@ from dew.interop.decoder_parts import (
     hf_tensor_name,
     kind_mixers,
     layer_depth_path,
+    layout_tensors,
+    leaf_layouts,
     plain_partial_rope,
     record_float,
     record_int,
@@ -39,6 +41,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import deepseek_config, deepseek_layout, deepseek_mixture
 from dew.interop.families.qwen import single_prediction_depth
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -299,53 +302,60 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
+def _glm5_next_names(path: tuple[str, ...], config: Mapping[str, object],
+                     fields: DecoderFields) -> str | tuple[str, ...]:
+    """The source name of the leaf at `path`, its collection first, or of each
+    expert's slice of a stacked expert kernel, refused unless the load reads
+    it back into that leaf (`layer_depth_path`).
+
+    Prediction depth d is layer `num_layers + d`, its block's leaves named as
+    a trunk layer's and its final norm as `shared_head.norm`. mHC's site
+    tensors are `hc_{site}_{leaf}`.
+    """
+    def checked(name: str | None, leaf: tuple[str, ...]) -> str:
+        if name is None or layer_depth_path(name, fields) != leaf:
+            refuse('.'.join(path), 'the source has no matching persistent leaf')
+        return name
+
+    head, *tail = path[1:]
+    if head.startswith('layers_'):
+        prefix = f"model.layers.{int(head.removeprefix('layers_'))}."
+    elif head.startswith('mtp_'):
+        layer = records.integer(fields['num_layers'], 'num_layers') + int(head.removeprefix('mtp_'))
+        prefix = f'model.layers.{layer}.'
+        tail = tail[1:] if tail[0] == 'block' else tail
+        if tail == ['final_norm', 'scale']:
+            tail = ['shared_head', 'norm', 'scale']
+    else:
+        return checked(hf_tensor_name('.'.join(path[1:]), config), path)
+    if len(tail) == 4 and tail[:2] == ['mlp', 'experts'] and tail[3] == 'kernel':
+        return tuple(checked(f'{prefix}mlp.experts.{expert}.{tail[2]}.weight',
+                             (*path[:-2], str(expert), *path[-2:]))
+                     for expert in range(records.integer(config['n_routed_experts'], 'n_routed_experts')))
+    if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
+        return checked(f"{prefix}hc_{tail[0].removesuffix('_hc')}_{tail[1]}", path)
+    ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
+    return checked(prefix + '.'.join([*tail[:-1], ending]), path)
+
+
 def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
-                              variables: Mapping[str, object], config: Mapping[str, object]
-                              ) -> dict[str, np.ndarray]:
+                              variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
+    """Write every collection but the decode cache under `_glm5_next_names`.
+
+    The collections are first held to the model's own (`check_decoder_tree`),
+    so a leaf the model does not declare is refused rather than dropped.
+    """
     persistent = {name: tree for name, tree in variables.items() if name != 'cache'}
     check_decoder_tree(persistent, model)
     fields = translated(config, family)
-    tensors: dict[str, np.ndarray] = {}
-    for name, raw in flatten_dict(persistent, sep='.').items():
-        collection, *path = name.split('.')
-        leaf = np.asarray(raw)
-        original = tuple(path)
-        if path[0].startswith('layers_'):
-            layer = int(path[0].removeprefix('layers_'))
-            tail = path[1:]
-        elif path[0].startswith('mtp_'):
-            layer = model.num_layers + int(path[0].removeprefix('mtp_'))
-            tail = path[2:] if path[1] == 'block' else path[1:]
-            if tail == ['final_norm', 'scale']:
-                tail = ['shared_head', 'norm', 'scale']
-        else:
-            target = hf_tensor_name('.'.join(path), config)
-            if target is None or layer_depth_path(target, fields) != (collection, *original):
-                refuse(name, 'the source has no matching persistent leaf')
-            tensors[target] = np.ascontiguousarray(leaf.T if path[-1] == 'kernel' else leaf)
-            continue
-        prefix = f'model.layers.{layer}.'
-        if len(tail) == 4 and tail[:2] == ['mlp', 'experts'] and tail[-1] == 'kernel':
-            for expert, value in enumerate(leaf):
-                target = prefix + f'mlp.experts.{expert}.{tail[2]}.weight'
-                expected = (collection, *original[:-2], str(expert), *original[-2:])
-                if layer_depth_path(target, fields) != expected:
-                    refuse(name, 'the expert tensor has no matching source path')
-                tensors[target] = np.ascontiguousarray(value.T)
-            continue
-        if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
-            target = prefix + f"hc_{tail[0].removesuffix('_hc')}_{tail[1]}"
-        else:
-            ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
-            target = prefix + '.'.join([*tail[:-1], ending])
-        if layer_depth_path(target, fields) != (collection, *original):
-            refuse(name, 'the source has no matching persistent leaf')
-        if target in tensors:
-            refuse(name, f'duplicate source tensor {target}')
-        tensors[target] = np.ascontiguousarray(leaf.T if tail[-1] == 'kernel' else leaf)
+    layouts = leaf_layouts(flatten_dict(persistent), lambda path: _glm5_next_names(path, config, fields))
     if model.tie_embeddings:
-        tensors['lm_head.weight'] = tensors['model.embed_tokens.weight']
-    return tensors
+        # transformers 5.16.1 ties the head only in the multimodal wrapper
+        # (modeling_glm5_next.py:2068), so a reader of the text model alone
+        # takes it from its own tensor.
+        layouts['lm_head.weight'] = dataclasses.replace(layouts['model.embed_tokens.weight'],
+                                                        name='lm_head.weight')
+    return layout_tensors(layouts, persistent)
 
 
 def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:

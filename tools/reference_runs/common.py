@@ -10,6 +10,7 @@ difference between the runs.
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import importlib.util
@@ -77,6 +78,36 @@ def register_plain_causal_sdpa() -> str:
     AttentionInterface.register(name, attention)
     AttentionMaskInterface.register(name, mask)
     return name
+
+
+def run_arguments() -> argparse.ArgumentParser:
+    """The arguments both sides of an LM run take, with their defaults: what
+    they train on, the schedule and solver, the router probes and the timed
+    window. Each side adds its own precision, attention and parallelism."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--work", required=True,
+                        help="the workload's count, which Dew's side writes and the reference reads")
+    parser.add_argument("--batch", type=int, required=True, help="global rows per step")
+    parser.add_argument("--steps", type=int, default=None, help="stop early; unset runs every epoch")
+    parser.add_argument("--lr-peak", type=float, default=2e-5)
+    parser.add_argument("--lr-init", type=float, default=2e-6)
+    parser.add_argument("--lr-end", type=float, default=2e-6)
+    parser.add_argument("--warmup", type=int, default=16)
+    parser.add_argument("--b1", type=float, default=0.9)
+    parser.add_argument("--b2", type=float, default=0.95)
+    parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--clip", type=float, default=1.0)
+    parser.add_argument("--probe-every", type=int, default=None,
+                        help="MoE: router loads and entropy on a fixed batch every this many steps")
+    parser.add_argument("--probe-rows", type=int, default=4)
+    parser.add_argument("--timing-warmup", type=int, default=10)
+    parser.add_argument("--profile-steps", type=int, default=5)
+    parser.add_argument("--trace-dir", default=None)
+    return parser
 
 
 def warmup_cosine(step: int, *, init: float, peak: float, warmup: int, decay_steps: int,
