@@ -127,9 +127,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
-    file that started a Python process, through subprocess or
-    multiprocessing, has no key, so it is in, and no task reuses its row;
-    one that ran a tool that runs no Python keeps its key. The command line
+    file that started a process, a shell's or multiprocessing's included,
+    has no key, so it is in, and no task reuses its row; one that asked a
+    native tool about the host (`executed.TOOLS`) keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -160,8 +160,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_lost.py": "def test_lost(): pass\n",
         "test_spawns.py": "import subprocess, sys\n"
                           "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
-        "test_tool.py": "import subprocess\n"
-                        "def test_tool(): subprocess.run(['true'], check=True)\n",
+        "test_tool.py": "import platform, subprocess\n"
+                        "def test_tool():\n"
+                        "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
+                        "    assert platform.platform()\n",
+        "test_shell.py": "import subprocess\n"
+                         "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n",
         "test_pool.py": "import multiprocessing, os\n"
                         "def test_pool():\n"
                         "    child = multiprocessing.get_context('spawn').Process(target=os.getpid)\n"
@@ -196,13 +200,14 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
         "tests/test_plain.py": ["changed"],
         "tests/test_pool.py": ["changed"],
+        "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
         "tests/test_spawns.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
-            for name in ("test_machine.py", "test_tool.py", "test_spawns.py", "test_pool.py")] == [
-        True, True, False, False]
+            for name in ("test_machine.py", "test_tool.py", "test_spawns.py", "test_pool.py",
+                         "test_shell.py")] == [True, True, False, False, False]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
