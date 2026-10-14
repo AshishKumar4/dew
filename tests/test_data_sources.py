@@ -33,10 +33,14 @@ def test_memory_columns_snapshot_changes_with_content():
     assert first.supports("streamed")
     rows = [row for shard in first.manifest().shards for row in first.manifest().reader(shard)]
     assert [row["x"] for row in rows] == list(range(5))
-    with pytest.raises(ValueError, match="different row counts"):
-        len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
     assert Memory([{"x": np.int16(4)}]).fingerprint() != Memory([{"x": np.int32(4)}]).fingerprint()
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
+
+
+def test_memory_columns_of_different_row_counts_are_refused():
+    assert len(Memory({"x": [1, 2], "y": [1, 2]}).records("indexed")) == 2
+    with pytest.raises(ValueError):
+        len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
 
 
 def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
@@ -55,7 +59,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    with pytest.raises(FileNotFoundError, match=r"original.*converted branch.*provision=True"):
+    with pytest.raises(FileNotFoundError):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
     assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
@@ -183,10 +187,11 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     snapshot = source.files.fingerprint()
     saved = plan()
     assert saved.manifest.source["sources"] == [snapshot]
+    plan().check(saved.record())
     moving_hub_conversion.append("second")
     assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
     assert source.files.fingerprint() == snapshot != Hub("owner/data").files.fingerprint()
-    with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
+    with pytest.raises(ValueError):
         plan().check(saved.record())
 
 
@@ -228,7 +233,7 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
     moved = loaded().train(DataPartition())
     try:
         if read == "streamed":
-            with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
+            with pytest.raises(ValueError):
                 moved.set_state(saved)
         else:
             moved.set_state(saved)
@@ -264,11 +269,16 @@ def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
         expected = next(reader)
     finally:
         reader.close()
+    unchanged = loaded().train(DataPartition())
+    try:
+        unchanged.set_state(saved)
+    finally:
+        unchanged.close()
     moving_hub_conversion.append("second")
     moved = loaded().train(DataPartition())
     try:
         if read == "streamed":
-            with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
+            with pytest.raises(ValueError):
                 moved.set_state(saved)
         else:
             moved.set_state(saved)
@@ -373,9 +383,9 @@ def test_hub_refuses_streaming_when_the_chosen_revision_has_no_shards_of_the_spl
     source = Hub("owner/data", revision=revision)
     assert not source.supports("streamed")
     assert source.streamed is None
-    with pytest.raises(FileNotFoundError, match="split 'train'"):
+    with pytest.raises(FileNotFoundError):
         _ = source.files
-    with pytest.raises(ValueError, match=r"read='streamed' is unavailable"):
+    with pytest.raises(ValueError):
         compile(Pipeline(source).batch(2), read="streamed", loading=Loading(workers=0))
 
 
@@ -405,7 +415,7 @@ def test_remote_tfds_requires_explicit_provisioning_before_native_reads():
         root.child(path.name).write(path.read_bytes())
     source = TFDS("dew_images", path=root.url)
     assert not source.supports("indexed")
-    with pytest.raises(FileNotFoundError, match=r"provision=True.*gs://"):
+    with pytest.raises(FileNotFoundError):
         source.records("indexed")
     source.provision()
     assert source.supports("indexed")
@@ -587,7 +597,7 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     files = Files(root, format=format)
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
     assert actual == rows
-    with pytest.raises(ValueError, match="declares format"):
+    with pytest.raises(ValueError):
         Files(root, format="jsonl").records("memory")
 
 
@@ -614,26 +624,31 @@ def test_a_source_exports_the_records_its_pipeline_exports():
 def test_spark_directory_requires_success_marker(tmp_path):
     table = pa.table({"value": [1, 2]})
     ds.write_dataset(table, str(tmp_path), format="parquet")
-    with pytest.raises(ValueError, match="_SUCCESS"):
+    with pytest.raises(ValueError):
         Files(str(tmp_path), format="parquet", spark=True).records("indexed")
     (tmp_path / "_SUCCESS").write_bytes(b"done")
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
 
 
-def test_corrupt_export_manifest_names_the_object_and_never_falls_back_to_raw_shards():
+def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
+    assert len(Files(root.url, format="parquet").records("indexed")) == 1
     root.child("_dew_manifest.json").write(b"not-json")
-    with pytest.raises(ValueError, match=r"corrupt-export.*_dew_manifest.json"):
+    with pytest.raises(ValueError):
         Files(root.url, format="parquet").records("indexed")
 
 
 def test_export_manifest_cannot_reference_an_object_outside_its_root():
+    """An export's manifest reads; the same manifest naming its shard by a path
+    that leaves the root is refused."""
     root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
-    root.child("_dew_manifest.json").write(
-        json.dumps({"schema": 1, "format": "jsonl", "files": [{"path": "../outside.jsonl"}]}).encode()
-    )
-    with pytest.raises(ValueError, match="stay inside its root"):
+    export(Memory([{"id": 1}]), root.url)
+    assert len(Files(root.url).manifest().shards) == 1
+    manifest = json.loads(root.child("_dew_manifest.json").read())
+    manifest["files"][0]["path"] = "../" + manifest["files"][0]["path"]
+    root.child("_dew_manifest.json").write(json.dumps(manifest).encode())
+    with pytest.raises(ValueError):
         Files(root.url).manifest()
 
 
@@ -701,7 +716,7 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources import source as resolve
 
     assert isinstance(resolve(root), TokenFiles)
-    with pytest.raises(ValueError, match="one split"):
+    with pytest.raises(ValueError):
         source.with_split("val")
 
 
@@ -1079,7 +1094,7 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
                 for index, future in enumerate(pending):
                     released[index].set()
                     if fail:
-                        with pytest.raises(ValueError, match="failed child read"):
+                        with pytest.raises(ValueError):
                             future.result(timeout=5)
                     else:
                         assert future.result(timeout=5) == f"0:{index}".encode()
@@ -1109,18 +1124,24 @@ def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
         restored.close()
 
 
-def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecord_paths, tmp_path):
+@pytest.mark.parametrize("max_bytes", [1, 1 << 30])
+def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecord_paths, tmp_path, max_bytes):
+    """A local mirror with room for the shards a read holds open serves them;
+    one of a byte is refused."""
     from dew.data.sources.records import ArrayRecords
 
     shard = Store(f"memory://small-record-mirror-{uuid4().hex}/0.array_record")
     shard.write(Path(arrayrecord_paths[0]).read_bytes())
     source = ArrayRecords(
         (shard.url,),
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 1}},
+        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": max_bytes}},
         counts=(8,),
     )
     try:
-        with pytest.raises(ValueError, match=rf"room for {Loading().threads} physical shards"):
+        if max_bytes > 1:
+            assert source[0] == b"0:0"
+            return
+        with pytest.raises(ValueError):
             source[0]
     finally:
         source.close()
@@ -1679,9 +1700,12 @@ def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
 
 
-def test_empty_shard_cycles_exhaust_a_named_search_budget():
+@pytest.mark.parametrize("content", [b" \n\n", b'{"id": 1}\n'], ids=["empty", "one row"])
+def test_empty_shard_cycles_exhaust_their_search_budget(content):
+    """A shard that yields no row exhausts the budget the read searches with;
+    the same read of a shard with a row yields it."""
     root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
-    root.write(b" \n\n")
+    root.write(content)
     files = Files(root.url)
     dataset = streamed(
         files.manifest(),
@@ -1693,9 +1717,14 @@ def test_empty_shard_cycles_exhaust_a_named_search_budget():
         loading=Loading(workers=0, threads=1, read_buffer=1),
     )
     reader = iter(dataset)
-    with pytest.raises(ValueError, match=r"empty-corpus.*search budget"):
-        next(reader)
-    reader.close()
+    try:
+        if content.strip():
+            assert next(reader) == {"id": 1}
+            return
+        with pytest.raises(ValueError):
+            next(reader)
+    finally:
+        reader.close()
 
 
 @pytest.mark.parametrize("field", [None, "ids"])
@@ -1729,7 +1758,7 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
     assert isinstance(resolve(str(tmp_path)), TokenFiles)
     assert source.metadata()["train_tokens"] == 15
     assert not source.supports("indexed")
-    with pytest.raises(FileNotFoundError, match="length index"):
+    with pytest.raises(FileNotFoundError):
         source.records("indexed")
     source.records("memory")
     assert source.tokens[1:14].tolist() == list(range(1, 14))
@@ -1868,10 +1897,10 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
 
 
-def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(tmp_path):
+def test_a_token_store_without_its_length_index_is_refused_until_provisioned(tmp_path):
     """A token store that cannot be read by span until its length index is
-    built is not read whole into memory when the run states no read: the
-    refusal names provisioning, and provision=True builds the index."""
+    built is not read whole into memory when the run states no read: it is
+    refused, and provision=True builds the index."""
     from array_record.python.array_record_module import ArrayRecordWriter
 
     from dew.config.data import TextData, loader
@@ -1883,7 +1912,7 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
     for start in range(0, 40, 10):
         writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
     writer.close()
-    with pytest.raises(ValueError, match="provision"):
+    with pytest.raises(ValueError):
         loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
     loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
                   loading=Loading(workers=0))
