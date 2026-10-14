@@ -538,9 +538,13 @@ class HiddenStatesConditioner(_LanguageText):
     def encode(self, params, tokens) -> DenoisingCondition:
         from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 
+        ids = jnp.asarray(tokens["input_ids"])
+        # The pipelines call their encoder without position ids, so transformers numbers every slot,
+        # the right padding included, by its index; Dew would rank the real tokens and hold the pads.
         _, kept = self.tower.apply(
-            {"params": params["text_encoder"]["params"]}, jnp.asarray(tokens["input_ids"]),
-            attention_mask=jnp.asarray(tokens["attention_mask"], bool), method="hidden_states",
+            {"params": params["text_encoder"]["params"]}, ids,
+            attention_mask=jnp.asarray(tokens["attention_mask"], bool),
+            positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape), method="hidden_states",
             capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
         states = [layer_output(kept[INTERMEDIATES], layer - 1) for layer in self.layers]
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)

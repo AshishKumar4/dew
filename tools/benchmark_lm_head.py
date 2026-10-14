@@ -5,7 +5,9 @@ this once per variant and read the JSON it prints.
 
 The variants are baseline (one full-vocabulary logits tensor), stored (the
 Python vocabulary loop holding its tiles), remat (that loop under
-`jax.checkpoint`) and bounded (the shipped recomputing custom VJP), each with
+`jax.checkpoint`), bounded (the shipped recomputing custom VJP) and fused
+(`fused_head_loss`, its gradient taken in the forward, `--token-tile` tokens a
+chunk against the whole vocabulary), each with
 an optional chunk count after the name (`bounded8`; 4 when absent) and the
 suffixes -noacc, which drops the top-1 prediction to price the metric, and
 -fp32, which keeps the states in fp32 (and so the head's product fp32; bf16
@@ -39,7 +41,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels.tuning import samples
 from dew.nn.protocols import OutputTable
-from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, vocabulary_chunks
 
 # The loss owns the measured default; reading it keeps one source for it.
 DEFAULT_TILE = inspect.signature(chunked_cross_entropy).parameters["tile"].default
@@ -95,6 +97,17 @@ def bounded(states, table, targets, variant: Variant):
     return finish(losses, predicted, log_z, targets, variant)
 
 
+def fused(states, table, targets, variant: Variant):
+    """The gradient-in-forward head (`fused_head_loss`), at most `--token-tile` tokens a chunk (`fused_tokens`)."""
+    total, (_, predicted, _) = fused_head_loss(
+        states, OutputTable(table.T, vocab_major=False, softcap=variant.softcap), targets,
+        jnp.ones(targets.shape, jnp.float32), z_loss=variant.z_loss, tile=variant.tile,
+        predict=variant.accuracy)
+    accuracy = (jnp.mean((predicted == targets).astype(jnp.float32)) if predicted is not None
+                else jnp.zeros((), jnp.float32))
+    return total / targets.size, accuracy
+
+
 def retained(states, table, targets, variant: Variant):
     """The pre-bounded vocabulary loop, held here so the baseline does not
     move when the shipped kernel does; `remat` is it under `jax.checkpoint`."""
@@ -143,6 +156,7 @@ HEADS: dict[str, Head] = {
     "stored": retained,
     "remat": retained,
     "bounded": bounded,
+    "fused": fused,
 }
 SUFFIXES = ("noacc", "fp32")
 
@@ -245,7 +259,7 @@ def measure(variant: Variant, shape: Shape) -> dict[str, object]:
         },
         "softcap": variant.softcap,
         "z_loss": variant.z_loss,
-        "tile": list(variant.tile) if variant.head == "bounded" else None,
+        "tile": list(variant.tile) if variant.head in ("bounded", "fused") else None,
         "accuracy": variant.accuracy,
         "states_dtype": variant.states_dtype.name,
         "head_dtype": str(embedding.dtype),
