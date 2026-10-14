@@ -104,7 +104,7 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off', 'narrow_copies': 'on',
-               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla'},
+               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100')),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
@@ -117,7 +117,7 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'grouped_matmul': 'pallas', 'rms_norm': 'pallas',
-               'swiglu': 'pallas', 'gated_delta_rule': 'fla'}, {
+               'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
