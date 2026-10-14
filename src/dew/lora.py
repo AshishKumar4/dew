@@ -48,6 +48,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax import traverse_util
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
@@ -333,10 +334,16 @@ class Adapter:
 
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
-        as PEFT's `merge_and_unload` does. The result is one `params` collection.
+        as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
+        codes decode to (`frozen_fp8_kernel`), targeted or not. The result is one
+        `params` collection.
         """
         variables = thaw(variables)
+        coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
+                 if path[-1] == FROZEN_FP8[0]}
         merged: dict = {}
+        for site in coded:
+            _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
             kernel, a, b = _base_kernel(variables, path), node["lora_A"], node["lora_B"]
