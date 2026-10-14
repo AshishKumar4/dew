@@ -244,7 +244,7 @@ class Unsized:
         source = _Endless()
         rows = [{"image": source[index]["image"], "label": source[index]["index"]}
                 for index in range(self.count)]
-        return ImageData(source=rows, image_size=self.image_size, augment=None).pipelines()
+        return ImageData(source=rows, image_size=self.image_size, augment=None, validation=None).pipelines()
 
 
 def test_a_source_without_a_length_needs_an_explicit_count():
@@ -713,7 +713,7 @@ class Augmenting:
                                                   self.augmentation_backend)
         return ImageData(source=Memory(rows), image_size=self.image_size,
                          staging_size=self.augmentation_size, caption_templates=CAPTION_TEMPLATES,
-                         classes=classes, augment=augment).pipelines()[0]
+                         classes=classes, augment=augment, validation=None).pipelines()[0]
 
     def pipelines(self):
         source = self.source()
@@ -936,8 +936,8 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
                       metadata={"image_size": 8})
     assert manifest["rows"] == 16 and manifest["metadata"]["image_size"] == 8
     assert len(manifest["files"]) == 2
-    data = loader(ImageData(source=str(tmp_path), image_size=8, augment=None), batch=4, read="memory",
-                **WORKERS, host=(EncodeCaptions(keep_captions),))
+    data = loader(ImageData(source=str(tmp_path), image_size=8, augment=None, validation=None), batch=4,
+                  read="memory", **WORKERS, host=(EncodeCaptions(keep_captions),))
     seen = {}
     stream = data.train(DataPartition())
     try:

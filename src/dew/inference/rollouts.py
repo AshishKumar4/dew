@@ -144,17 +144,23 @@ def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], ve
 class NativeRolloutServer:
     """Serves rollouts from Dew's `Server`, stepping it on a background thread.
 
-    One lock orders submissions and weight loads with the server's steps,
-    so a load happens between two steps. The server's own sampling policy
-    and transforms decide the draws, and a draw keeps both the raw and the
-    behavior likelihoods the server records. If the program ends without
-    `close`, an exit hook stops the stepping after the step in progress.
+    One lock orders weight loads with the server's steps, so a load happens
+    between two steps. A submission waits for a load in progress but not for a
+    step. The server takes it while a step runs and seats it at the next one.
+    The server's own sampling policy and transforms decide the draws, and a
+    draw keeps both the raw and the behavior likelihoods the server records.
+    If the program ends without `close`, an exit hook stops the stepping after
+    the step in progress.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
         self._server = server
         self._version = version
-        self._lock = threading.Condition()
+        # Reentrant, so a draw's callback may load weights from inside a step.
+        self._lock = threading.RLock()
+        self._loading = threading.Lock()
+        self._futures = threading.Lock()
+        self._arrived = threading.Event()
         self._outstanding: set[Future[Draw]] = set()
         self._closed = False
         self._failure: BaseException | None = None
@@ -180,64 +186,93 @@ class NativeRolloutServer:
         request = request_key(key)
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
-        with self._lock:
+        with self._futures:
             if self._failure is not None:
                 raise RuntimeError("the rollout server stopped") from self._failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
-            ticket = self._server.submit(np.asarray(ids, np.int32), budget, key=request)
             self._outstanding.add(future)
-            version = self._version
+        try:
+            with self._loading:
+                ticket = self._server.submit(np.asarray(ids, np.int32), budget, key=request)
+                version = self._version
+        except BaseException:
+            self._claimed(future)
+            raise
 
-            def resolve(done: Future[Generation[np.ndarray]]) -> None:
-                self._outstanding.discard(future)
-                failure = done.exception()
-                if failure is not None:
-                    future.set_exception(failure)
-                else:
-                    future.set_result(
-                        _native_draw(ids, done.result(), version).check_stops(self.sampling.stops)
-                    )
+        def resolve(done: Future[Generation[np.ndarray]]) -> None:
+            if not self._claimed(future):  # failed with the stepping thread or by `close`
+                return
+            failure = done.exception()
+            _completed(future, failure if failure is not None else
+                       _native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
 
-            ticket.add_done_callback(resolve)
-            self._lock.notify()
+        ticket.add_done_callback(resolve)
+        self._arrived.set()
         return future
 
+    def _claimed(self, future: Future[Draw]) -> bool:
+        """Whether this call takes `future` from the outstanding draws. The one
+        caller that takes it completes it, and the rest leave it."""
+        with self._futures:
+            if future not in self._outstanding:
+                return False
+            self._outstanding.remove(future)
+            return True
+
+    def _detached(self, failure: BaseException | None = None) -> list[Future[Draw]]:
+        """Take every outstanding draw, recording `failure` as the server's."""
+        with self._futures:
+            if failure is not None:
+                self._failure = failure
+            detached = list(self._outstanding)
+            self._outstanding.clear()
+        return detached
+
     def load(self, variables: Variables, version: int) -> None:
-        with self._lock:
+        with self._lock, self._loading:
             self._server.reload(thaw(variables))
             self._version = version
 
     def _run(self) -> None:
         try:
             while True:
+                # Cleared before the look, so a submission after it wakes the wait.
+                self._arrived.clear()
                 with self._lock:
-                    while not (self._closed or self._server.occupancy or self._server.queued):
-                        self._lock.wait()
                     if self._closed:
                         return
-                    self._server.step()
+                    busy = bool(self._server.occupancy or self._server.queued)
+                    if busy:
+                        self._server.step()
+                if not busy:
+                    self._arrived.wait()
         except BaseException as failure:
-            with self._lock:
-                self._failure = failure
-                for future in self._outstanding:
-                    if not future.done():
-                        future.set_exception(failure)
-                self._outstanding.clear()
+            for future in self._detached(failure):
+                _completed(future, failure)
 
     def _stop(self) -> None:
-        with self._lock:
+        with self._futures:
             self._closed = True
-            self._lock.notify()
+        self._arrived.set()
 
     def close(self) -> None:
         self._stop()
         self._thread.join()
         self._withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
-        for future in list(self._outstanding):
-            if not future.done():
-                future.set_exception(cancelled)
+        for future in self._detached():
+            _completed(future, cancelled)
+
+
+def _completed(future: Future[Draw], outcome: Draw | BaseException) -> None:
+    """Complete a draw its one owner took, unless its caller cancelled it."""
+    if not future.set_running_or_notify_cancel():
+        return
+    if isinstance(outcome, BaseException):
+        future.set_exception(outcome)
+    else:
+        future.set_result(outcome)
 
 
 def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
