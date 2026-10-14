@@ -146,8 +146,13 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
         *((ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found),
         (alone, tuning.AutotuningData({norm_swiglu.RowsConfig(2, 1): timing}))))
+    # Stored as every checkout writes its picks, and wrote them before a describing launch bypassed
+    # tokamax's device check: each op with the check on, which its picks' identity sets aside.
+    written = json.loads(picks.dumps())
+    for entry in written["data"]:
+        entry[0]["op"]["bypass_device_check"] = False
     flags = f"{os.environ.get('XLA_FLAGS', '')} {READ_ONLY}".strip()
-    [path] = fresh(STORED, with_foreign(picks.dumps()), cache_dir=tmp_path / "cache", flags=flags)
+    [path] = fresh(STORED, with_foreign(json.dumps(written)), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
     for rows in ("13", "15", "40"):
