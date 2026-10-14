@@ -467,10 +467,9 @@ def _compiled(
     validation_counts: Mapping[str, CorpusCounts],
     batch_tokens: int | None,
 ) -> Loader:
-    read, seed, loading, batch, global_order = (
+    read, seed, batch, global_order = (
         build.read,
         build.seed,
-        build.loading,
         build.batch,
         build.global_order,
     )
@@ -495,10 +494,7 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(train, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
+    build = build.tuned(train)
     train_host, device = _batch_steps(train)
     train_host = train_host + host
     statistics = _Statistics(counts)
@@ -519,7 +515,7 @@ def _compiled(
             pipeline=validation,
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
-            ),
+            ).tuned(validation),
             host=_held_steps(validation) + host,
         )
     )
@@ -844,9 +840,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
-    if loading.workers == "auto":
-        build = dataclasses.replace(build, loading=loading.resolved(build.batched(pipeline, DataPartition())))
-    return _Host(build.batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
+    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
@@ -943,11 +937,7 @@ def validation(
         pipeline = _materialize(pipeline, {}, training=False)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(pipeline, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
-    return functools.partial(_validation_reader, pipeline=pipeline, build=build,
+    return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=_held_steps(pipeline) + host)
 
 
