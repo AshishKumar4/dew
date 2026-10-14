@@ -127,14 +127,15 @@ def probe_ids(vocab_size: int) -> np.ndarray:
 
 
 def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
-    """Run a transformers model in eval mode with eager attention and return fp32 logits."""
+    """Run a transformers model in eval mode with eager attention on its
+    device and return fp32 logits."""
     import torch
 
     model.eval()
     model.set_attn_implementation("eager")
     with torch.no_grad():
-        out = model(input_ids=torch.from_numpy(ids), use_cache=False)
-    return out.logits.to(torch.float32).numpy()
+        out = model(input_ids=torch.from_numpy(ids).to(model.device), use_cache=False)
+    return out.logits.to(torch.float32).cpu().numpy()
 
 
 def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:

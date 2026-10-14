@@ -77,11 +77,11 @@ class Encoding:
     example, scoring the answered ones. With `shuffle`, a choice's options are
     laid out in a fresh random order every time the row is read (Laya's
     `--shuffle-options`), while a score's levels and a noul's two answers keep
-    their order, and a joint row asks its questions in a fresh order too, as
-    Clef's training permutes field orders. With `none_of_the_above` p, a
-    choice with a single right answer gains a "none of the above" option with
-    probability p, and half of those also lose their right option, which
-    makes "none of the above" the right answer. That teaches the model to say
+    their order, and a joint row asks its questions in a fresh order too.
+    With `none_of_the_above` p, a choice with a single right answer gains a
+    "none of the above" option with probability p, and half of those also
+    lose their right option, which makes "none of the above" the right
+    answer. That teaches the model to say
     that no option fits instead of picking the nearest wrong one. Each scored
     slot's target is its gold distribution (`Example.distribution`) in the
     order the row shows the options.

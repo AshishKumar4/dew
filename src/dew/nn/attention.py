@@ -1014,7 +1014,7 @@ FLASH_MAX_HEAD_DIM = 256
 # head dim > 192 requires A100/A800 or H100/H800", measured on an RTX 4080.
 FLASH_MAX_BACKWARD_HEAD_DIM = 192
 # Packed rows run as varlen sequences, each row's documents and its padding after them, so a row's
-# share of the grid is its declared document cap whatever it holds. At E1's attention (8 x 3072, 8
+# share of the grid is its declared document cap whatever it holds. At Qwen3.5-0.8B's attention (8 x 3072, 8
 # query heads over 2 of 256, causal) a cap of 64 ran forward and backward in 2.7 to 4.2 ms on an H100
 # and 6.7 to 13.7 on an A100 against the document mask's 12.3 to 12.7 and 22.7 to 24.7; the row
 # length's cap took 80 and 160 (docs/performance.md).

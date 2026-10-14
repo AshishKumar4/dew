@@ -1,15 +1,15 @@
 {
  "references": {
-  "clef/tiny/images.npz": {
-   "tool": "tools/clef_reference.py",
+  "joint_checkpoint/tiny/images.npz": {
+   "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "clef/tiny/logits.npz": {
-   "tool": "tools/clef_reference.py",
+  "joint_checkpoint/tiny/logits.npz": {
+   "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "clef/tiny/states.npz": {
-   "tool": "tools/clef_reference.py",
+  "joint_checkpoint/tiny/states.npz": {
+   "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/phi3-tiny/logits.npy": {
@@ -3837,9 +3837,9 @@
  },
  "inputs": [
   {
-   "tool": "tools/clef_reference.py",
-   "what": "a toy Clef joint schema head in Clef's release layout",
-   "files": ["clef/tiny/joint_head.safetensors", "clef/tiny/joint_head_config.json"]
+   "tool": "tools/joint_checkpoint_reference.py",
+   "what": "a toy joint schema head in its release's layout",
+   "files": ["joint_checkpoint/tiny/joint_head.safetensors", "joint_checkpoint/tiny/joint_head_config.json"]
   },
   {
    "tool": "tools/make_tiny_tokenizer.py",

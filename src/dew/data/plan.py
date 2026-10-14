@@ -301,6 +301,13 @@ def _digests(value: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return fingerprint(value)[:12]
 
 
+def same_order(saved: str, current: str) -> bool:
+    """Whether two orders, as a saved position and a stream state them in JSON, are one order:
+    compared without their sources' descriptions, which name where a host mounted them, as a
+    pool compares its processes' orders (`Plan.identity`)."""
+    return _unplaced(json.loads(saved)) == _unplaced(json.loads(current))
+
+
 def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
@@ -376,9 +383,12 @@ class Plan:
             raise ValueError(
                 "data plan contains a step without stable identity; resume='non-exact' is required"
             )
-        for name in ("version", "lowering", "rejections", "cache", "volatile", "order"):
+        for name in ("version", "lowering", "rejections", "cache", "volatile"):
             if current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
+        # An order is the same wherever its sources are mounted (`same_order`).
+        if _unplaced(json_value(saved.get("order"), "saved order")) != _unplaced(current["order"]):
+            raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)):
             if previous.get(name) != self.derived.get(name):
