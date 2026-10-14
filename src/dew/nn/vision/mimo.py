@@ -10,7 +10,7 @@ from flax import linen as nn
 from dew import records
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -88,7 +88,6 @@ class MiMoProjector(ProjectorBase):
                               width=grown, out_width=self.out_width, bias=False)
 
 
-_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
                ("mlp", "down_proj"): ("mlp", "down_proj")}
@@ -100,15 +99,9 @@ def mimo_vision_path(hf_name: str) -> tuple[str, ...] | None:
     parts = hf_name.split(".")
     if parts[0] == "merger":
         return None
-    path = None
-    if len(parts) > 3 and parts[0] == "blocks" and parts[1].isdigit():
-        block, leaf = f"blocks_{parts[1]}", parts[-1]
-        if parts[2:] == ["attn", "sinks"]:
-            path = (f"sinks_{parts[1]}",)
-        elif len(parts) == 4 and parts[2] in _BLOCK_NORMS and leaf == "weight":
-            path = (block, _BLOCK_NORMS[parts[2]], "scale")
-        elif len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS and leaf in ("weight", "bias"):
-            path = (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
+    if len(parts) == 4 and parts[0] == "blocks" and parts[1].isdigit() and parts[2:] == ["attn", "sinks"]:
+        return (f"sinks_{parts[1]}",)
+    path = block_tensor_path(parts, _BLOCK_MAPS, norm_bias=False)
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
