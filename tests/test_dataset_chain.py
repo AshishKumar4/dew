@@ -67,6 +67,30 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
 
 
+@dataclasses.dataclass(frozen=True)
+class SplitMemory(Memory):
+    """Records in memory with named splits of their own beside them, as a Hub repository holds."""
+
+    splits: tuple[tuple[str, tuple], ...] = ()
+
+    def with_split(self, name: str) -> Memory:
+        return Memory(dict(self.splits)[name], identity=f"{self.identity}:{name}")
+
+
+def test_holdout_returns_each_of_the_named_splits_a_store_holds_after_its_own():
+    """`holdout(split=("validation", "test"))` returns the store's default records, then each
+    named split in order, with the steps replayed on each."""
+    store = SplitMemory(rows("train", 3), identity="splits", splits=(
+        ("validation", tuple(rows("validation", 2))), ("test", tuple(rows("test", 1)))))
+    parts = store.map(lambda row: {**row, "seen": True}).holdout(split=("validation", "test"))
+    assert [[(row["origin"], int(row["i"])) for row in iterate(part, read="memory") if row["seen"]]
+            for part in parts] == [[("train", 0), ("train", 1), ("train", 2)],
+                                   [("validation", 0), ("validation", 1)], [("test", 0)]]
+    assert len(store.holdout(split="test")) == 2
+    with pytest.raises(ValueError):
+        store.holdout(split=("test", "test"))
+
+
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 @pytest.mark.parametrize("key", [None, "identity"])
 @pytest.mark.parametrize("nested", ["mapping", "arrays", "object_array"])

@@ -393,7 +393,7 @@ class Dataset:
         return Pipeline(self)
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
-                split: str | None = None, **named: float) -> tuple[Dataset, ...]:
+                split: str | tuple[str, ...] | None = None, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -405,7 +405,9 @@ class Dataset:
         that identifies a document (an id or a url), so its versions and
         chunks land together; without one, a record's identity is its whole
         content. `records=n` holds out the first n records, and
-        `split="validation"` the store's own split.
+        `split="validation"` the store's own split, or
+        `split=("validation", "test")` each of them, in order, after the
+        records the store reads by default.
         """
         from dew.data.holdout import holdout
 
