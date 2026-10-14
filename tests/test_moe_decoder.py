@@ -111,13 +111,13 @@ def token_batches():
         yield batch
 
 
-def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
+def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False, learning_rate=1e-3):
     config = moe_config()
     model = models.build("causal_transformer",
                          **{**config, "mixture": {**config["mixture"], "bias": bias}})
     return Trainer(
         LMObjective(model, SEQ_LEN, balance_rate=0.01 if bias else None),
-        optax.adam(1e-3), key=jax.random.key(0),
+        optax.adam(learning_rate), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp_size, expert=expert_size),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
 
@@ -161,11 +161,15 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
 
     The bias starts at zero on every expert and the router is skewed by the
     tokens, so after a run the busiest experts carry a negative bias, the
-    idlest a positive one, and the bias is not what a fresh init holds.
+    idlest a positive one, and the bias is not what a fresh init holds. The
+    parameters stay put (a zero learning rate, the optimizer's moments still
+    kept), so the bias alone moves the routing of the one batch the run
+    repeats: the busiest expert's load falls and the spread between it and
+    the idlest closes.
     """
     steps = 30
     tracker = RecordingTracker()
-    trainer = moe_trainer(1, 2, tracker=tracker, bias=True)
+    trainer = moe_trainer(1, 2, tracker=tracker, bias=True, learning_rate=0.0)
     fresh = trainer.initial_state()
     assert set(fresh.variables) == {"params", "moe"}
     np.testing.assert_array_equal(
@@ -183,6 +187,8 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     loads = [entry["train/moe/max_load"] for entry in ticks]
     assert len(loads) == steps and all(1 / 8 <= load <= 1.0 for load in loads)
     assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in ticks)
+    spread = [entry["train/moe/max_load"] - entry["train/moe/min_load"] for entry in ticks]
+    assert loads[-1] < loads[0] and spread[-1] < spread[0] / 2, (loads, spread)
     # The bias is state, not a parameter: the optimizer holds no moment for it.
     assert "moe" not in state.opt_state[0].mu
 
