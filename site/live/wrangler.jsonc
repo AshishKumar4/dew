@@ -120,7 +120,6 @@
 		"WALL_SECONDS": "1200",
 		"WARM_SECONDS": "600",
 		"IDLE_SECONDS": "300",
-		"CPU_SECONDS": "900",
 		"IP_WINDOW_SECONDS": "600",
 		"IP_STARTS": "10"
 	},
@@ -251,7 +250,6 @@
 				"WALL_SECONDS": "1200",
 				"WARM_SECONDS": "600",
 				"IDLE_SECONDS": "300",
-				"CPU_SECONDS": "900",
 				"IP_WINDOW_SECONDS": "600",
 				"IP_STARTS": "10"
 			}

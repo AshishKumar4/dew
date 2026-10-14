@@ -237,19 +237,6 @@ def continuations(start: StepState, n: int,
         continuation_keys(start.keys, n)))
 
 
-class _Emitted(NamedTuple):
-    """The rows a speculative loop has written so far, by response position.
-
-    `valid` marks the slots a row actually emitted, so a block that kept two
-    tokens writes two columns and the rest of the block writes none.
-    """
-
-    tokens: jax.Array
-    valid: jax.Array
-    behavior_log_probs: jax.Array
-    raw_log_probs: jax.Array
-
-
 @struct.dataclass
 class Sample:
     """Draws every row independently, one token per step.
@@ -762,57 +749,47 @@ def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement
     return emitted, behavior, original
 
 
-def _emitted_count(block_size: int, step: StepState, emitted: jax.Array, active: jax.Array,
-                   terminated: jax.Array, budget: int, stopping,
-                   matched: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """How many of the block's slots each row keeps, and which rows ended.
+def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated: jax.Array,
+               budget: int, stopping, matched: jax.Array) -> tuple[StepState, jax.Array, jax.Array]:
+    """The `StepState` the block's kept slots leave, how many each row keeps,
+    and which rows ended.
 
-    The accepted prefix and the token after it are walked one slot at a time
-    so every criterion sees the history it would have seen in an ordinary
-    loop; the row stops at the first slot one fires on.
+    A row keeps its accepted prefix and the token after it, within its
+    budget. The slots are committed one at a time, so every criterion sees
+    the history it would have seen in an ordinary loop, and the row stops at
+    the first slot one fires on. A row that ended or ran out of budget stops
+    being active.
     """
-    count = jnp.minimum(matched + 1, budget - step.step)
-    walked, hits = step, []
+    active = step.active
+    limit = jnp.where(active, jnp.minimum(matched + 1, budget - step.step), 0)
+    walked, live, ended = step, active, terminated
     for at in range(block_size + 1):
-        walked = walked.commit(emitted[:, at], active & (at < count))
-        hits.append(stopping(walked, emitted[:, at]) & active & (at < count))
-    firing = jnp.stack(hits, axis=1)
-    anywhere = jnp.any(firing, axis=1)
-    count = jnp.where(anywhere, jnp.minimum(count, jnp.argmax(firing, axis=1) + 1), count)
-    count = jnp.where(active, count, 0)
-    return count, terminated | (anywhere & (count == jnp.argmax(firing, axis=1) + 1))
+        kept = live & (at < limit)
+        walked = walked.commit(emitted[:, at], kept)
+        fired = stopping(walked, emitted[:, at]) & kept
+        ended, live = ended | fired, live & ~fired
+    walked = dataclasses.replace(walked, active=active & ~ended & (walked.step < budget))
+    return walked, walked.step - step.step, ended
 
 
-def _recorded(block_size: int, step: StepState, emitted: jax.Array, behavior: jax.Array,
-              original: jax.Array, count: jax.Array, slots: jax.Array, index: jax.Array,
-              active: jax.Array, terminated: jax.Array, budget: int, out):
-    """The kept slots, the `StepState` they leave, and the output rows.
-
-    Each kept slot lands at its own response position, so a block that
-    emitted two tokens writes two columns and the rest of the block writes
-    none. A row that ran out of budget or ended stops being active.
-    """
-    keep = slots < count[:, None]
-    committed = step
-    for at in range(block_size + 1):
-        committed = committed.commit(emitted[:, at], keep[:, at])
-    committed = dataclasses.replace(
-        committed, active=active & ~terminated & (step.step + count < budget))
+def _written(out: Draws, emitted: jax.Array, behavior: jax.Array, original: jax.Array, keep: jax.Array,
+             step: StepState, slots: jax.Array, index: jax.Array, terminated: jax.Array) -> Draws:
+    """`out` with each kept slot at its own response position, so a block
+    that emitted two tokens writes two columns and the rest of the block
+    writes none, and the rows that ended so far."""
     landing = jnp.where(keep, step.step[:, None] + slots, DROPPED)
-    return keep, committed, _Emitted(
-        out.tokens.at[index, landing].set(emitted, mode="drop"),
-        out.valid.at[index, landing].set(True, mode="drop"),
-        out.behavior_log_probs.at[index, landing].set(behavior, mode="drop"),
-        out.raw_log_probs.at[index, landing].set(original, mode="drop"))
+    return Draws(out.tokens.at[index, landing].set(emitted, mode="drop"),
+                 out.valid.at[index, landing].set(True, mode="drop"),
+                 out.behavior_log_probs.at[index, landing].set(behavior, mode="drop"),
+                 out.raw_log_probs.at[index, landing].set(original, mode="drop"), terminated)
 
 
 class _SpeculativeCarry(NamedTuple):
-    """The target state and accepted history, row termination, and emitted response slots."""
+    """The target state and accepted history, and the rows emitted so far, which rows ended included."""
 
     state: DecoderState
     step: StepState
-    terminated: jax.Array
-    out: _Emitted
+    out: Draws
 
 
 def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
@@ -844,13 +821,13 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
 
     emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
-    count, terminated = _emitted_count(block_size, step, emitted, active, carry.terminated, budget,
-                                       stopping, matched)
+    committed, count, terminated = _committed(block_size, step, emitted, carry.out.terminated, budget,
+                                              stopping, matched)
     checkify.check(
         jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
         "the model produced an emitted position without a distribution to score")
-    keep, committed, out = _recorded(block_size, step, emitted, behavior, original, count,
-                                     slots, index, active, terminated, budget, carry.out)
+    keep = slots < count[:, None]
+    out = _written(carry.out, emitted, behavior, original, keep, step, slots, index, terminated)
 
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
     assert seen is not None
@@ -870,7 +847,7 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
                                     state.logits))
-    return _SpeculativeCarry(following, committed, terminated, out), None
+    return _SpeculativeCarry(following, committed, out), None
 
 
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
@@ -878,8 +855,8 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                stopping: Callable[[StepState, jax.Array], jax.Array],
                budget: int, plan: Speculative) -> Draws:
     """`Speculative`'s loop of `_block`s. The carry is the model state, the
-    `StepState` the accepted tokens leave behind, which rows ended, and the
-    rows emitted so far."""
+    `StepState` the accepted tokens leave behind, and the rows emitted so
+    far, which rows ended included."""
     block_size, rows = plan.block, start.rows
     slots = jnp.arange(block_size + 1)[None, :]
     index = jnp.arange(rows)[:, None]
@@ -893,12 +870,9 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                                             slots, index),
                         lambda held: (held, None), carry)
 
-    empty = _Emitted(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
-                     jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))
-    finished, _ = lax.scan(
-        outer, _SpeculativeCarry(state, start, jnp.zeros(rows, bool), empty),
-        None, length=-(-budget // 2))
-    out = finished.out
-    return Draws(out.tokens, out.valid,
-                 jnp.where(out.valid, out.behavior_log_probs, 0.0),
-                 jnp.where(out.valid, out.raw_log_probs, 0.0), finished.terminated)
+    empty = Draws(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
+                  jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
+                  jnp.zeros(rows, bool))
+    out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=-(-budget // 2))[0].out
+    return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),
+                               raw_log_probs=jnp.where(out.valid, out.raw_log_probs, 0.0))
