@@ -491,14 +491,6 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
     def record_arguments(self) -> dict:
         return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
 
-    @property
-    def downscale_factor(self) -> int:
-        return self.model.downscale_factor
-
-    @property
-    def latent_channels(self) -> int:
-        return self.model.latent_channels
-
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None
