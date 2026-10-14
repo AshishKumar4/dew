@@ -941,7 +941,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     weights, the batch and the pass's key, or None when the objective scores
     no tokens."""
 
-    _validation_scores: Callable[..., tuple[Any, Artifacts]] | None = None
+    _validation_scores: Callable[..., tuple[Loss, Artifacts]] | None = None
     """One validation batch's loss statistics and the artifacts `evaluate`
     returns for it, from one scoring of the batch: a pure function of the
     evaluation weights, the batch and the pass's step in evaluation mode. None
