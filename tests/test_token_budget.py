@@ -55,46 +55,22 @@ def test_a_token_budget_of_part_rows_or_rebatched_rows_is_refused():
         compile(windows(32).rebatch(8), read="memory", loading=READ)
 
 
-@pytest.mark.parametrize("drop_remainder", [False, True])
-@pytest.mark.parametrize("shares", [1, 2])
-def test_a_finite_token_budget_marks_its_remainder_or_drops_it(drop_remainder, shares):
-    """A finite pass scores each kept record once, with a fixed shape even in its last batch."""
-    records = Memory(tuple({"id": np.int32(index), "text": np.arange(index * 8, (index + 1) * 8,
-                       dtype=np.int32)} for index in range(6)))
-    pipeline = (Pipeline(records).map(FixedTokens(8)).repeat(1)
-                .batch(tokens=32, drop_remainder=drop_remainder))
-    data = compile(pipeline, read="memory", loading=READ)
-    size = 4 // shares
-    delivered = []
-    for share in range(shares):
-        stream = data.train(DataPartition(share, shares))
-        try:
-            batches = list(stream)
-        finally:
-            stream.close()
-        expected_ids = [list(range(share, 4, shares))]
-        expected_masks = [[True] * size]
-        if not drop_remainder:
-            expected_ids.append(list(range(4 + share, 6, shares)) * 2)
-            expected_masks.append([True] * (size // 2) + [False] * (size // 2))
-        assert [batch["id"].tolist() for batch in batches] == expected_ids
-        masks = [np.asarray(batch.get(VALID_ROWS, np.ones(size, bool))) for batch in batches]
-        assert [mask.tolist() for mask in masks] == expected_masks
-        for batch, mask in zip(batches, masks, strict=True):
-            assert batch["id"].shape == (size,) and batch["text"].shape == (size, 8)
-            np.testing.assert_array_equal(batch["text"], batch["id"][:, None] * 8 + np.arange(8))
-            delivered.extend(batch["id"][mask].tolist())
-    assert sorted(delivered) == list(range(4 if drop_remainder else 6))
+def _batched(records: Pipeline, by: str, drop_remainder: bool) -> Pipeline:
+    """`records` in batches of 4 rows: 32 tokens of 8-token rows, or 4 rows."""
+    if by == "tokens":
+        return records.map(FixedTokens(8)).repeat(1).batch(tokens=32, drop_remainder=drop_remainder)
+    return records.repeat(1).batch(4, drop_remainder=drop_remainder)
 
 
+@pytest.mark.parametrize("by", ["tokens", "rows"])
 @pytest.mark.parametrize("drop_remainder", [False, True])
 @pytest.mark.parametrize("shares", [1, 2])
-def test_a_finite_row_batch_marks_its_remainder_or_drops_it(drop_remainder, shares):
-    """A finite pass scores each kept record once, with a fixed shape even in its last batch."""
+def test_a_finite_batch_marks_its_remainder_or_drops_it(by, drop_remainder, shares):
+    """A finite pass, batched by tokens or by rows, scores each kept record once, with a fixed
+    shape even in its last batch."""
     records = Memory(tuple({"id": np.int32(index), "text": np.arange(index * 8, (index + 1) * 8,
                        dtype=np.int32)} for index in range(6)))
-    pipeline = Pipeline(records).repeat(1).batch(4, drop_remainder=drop_remainder)
-    data = compile(pipeline, read="memory", loading=READ)
+    data = compile(_batched(Pipeline(records), by, drop_remainder), read="memory", loading=READ)
     size = 4 // shares
     delivered = []
     for share in range(shares):

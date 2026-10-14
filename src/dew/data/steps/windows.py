@@ -98,7 +98,7 @@ class WindowSource:
 
     def metadata(self) -> Mapping[str, object]:
         count = len(self.records("indexed"))
-        return {**self.original.metadata(), "windows": count, "valid_targets": count * self.length}
+        return {**self.original.metadata(), "rows": count, "valid_targets": count * self.length}
 
     def lengths(self) -> np.ndarray | None:
         return None

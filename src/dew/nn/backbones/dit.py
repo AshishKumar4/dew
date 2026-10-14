@@ -8,7 +8,7 @@ import numpy as np
 from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
-from ..flops import MissingFlopsCount, counted_flops
+from ..flops import MissingFlopsCount, counted_flops, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -64,10 +64,7 @@ class SimpleDiT(_DiTStackOptions):
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
         """Patch-token lengths from the actual latent/image shape, never a guessed channel count."""
-        if len(sample_shape) != 3 or any(side % self.patch_size for side in sample_shape[:2]):
-            raise MissingFlopsCount("SimpleDiT needs a divisible [height, width, channels] sample shape")
-        height, width, _ = sample_shape
-        return np.full((rows,), (height // self.patch_size) * (width // self.patch_size), np.int64)
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
 
     @nn.nowrap
     def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:

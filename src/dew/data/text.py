@@ -15,13 +15,13 @@ import hashlib
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.steps.text import Chunks, Dropped, MinChars, Tokenize
+    from dew.data.steps.text import Chunks, Dropped, MinChars, Normalized, Tokenize
 
 
 _load_lock = threading.Lock()
@@ -317,6 +317,15 @@ def drop(field: str = "caption", p: float = 0.1) -> Dropped:
     from dew.data.steps.text import Dropped
 
     return Dropped(field, p)
+
+
+def normalize(form: Literal["NFC", "NFKC", "NFD", "NFKD"] = "NFKC", *, field: str = "text") -> Normalized:
+    """A step (`map`) that puts the text in `field` into Unicode normal form
+    `form`, so text written with composed, decomposed or compatibility
+    characters (a ligature, a full-width digit) reads and tokenizes alike."""
+    from dew.data.steps.text import Normalized
+
+    return Normalized(form, field)
 
 
 def min_chars(count: int, field: str = "text") -> MinChars:
