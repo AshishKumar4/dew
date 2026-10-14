@@ -99,7 +99,7 @@ def _shaped(head: JointSchemaHead, params: dict) -> dict:
     hold their heads apart, `[in, heads, head_width]` and `[heads, head_width, out]`."""
     width = head.hidden_size
     one = jnp.ones((1, 1), bool)
-    inputs = DecisionInputs(tokens=jnp.zeros((1, 2), jnp.int32), valid=jnp.ones((1, 2), bool),
+    inputs = DecisionInputs(tokens=jnp.zeros((1, 2), jnp.int32), segments=jnp.ones((1, 2), jnp.int32),
                             kinds=jnp.zeros((1, 1), jnp.int32), questions=one, spans=jnp.asarray([[[0, 1]]]),
                             option_spans=jnp.asarray([[[[0, 1]]]]), options=one[..., None])
     shapes = jax.eval_shape(head.init, jax.random.key(0), jnp.zeros((1, 2, width)), inputs,

@@ -43,7 +43,7 @@ from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata, Coordinates, coordinates_of, valid_order
+from .inputs import AttentionMetadata, Coordinates, coordinates_of, cu_seqlens, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add
@@ -800,7 +800,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     dimension with them. None of them changes a real output or gradient:
     every padded product is an exact zero. The outputs are cut back. Packed
     documents (`starts`, with `max_segments`) are fla's varlen sequences over
-    the shard's rows (`_cu_seqlens`). The decay's shape picks the port: per
+    the shard's rows (`cu_seqlens`). The decay's shape picks the port: per
     head fla's gated delta rule, per key dimension its Kimi delta attention."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
@@ -826,26 +826,15 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    cu_seqlens = None if max_segments is None else _cu_seqlens(starts, max_segments)
+    offsets = None if max_segments is None else cu_seqlens(starts, starts.shape[0] * max_segments)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, cu_seqlens, scale, CHUNK_SIZE,
+    out, final = port(query, key, value, g, beta, state, offsets, scale, CHUNK_SIZE,
                       not generation.triton_runs())
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
     return out, final[..., :Dv]
-
-
-def _cu_seqlens(starts, max_segments: int):
-    """fla's `cu_seqlens` over the `[B * S]` tokens of `starts`' rows: each row and each document a row
-    holds (its first token marked) a sequence, at most `max_segments` a row, the unused ones empty at
-    the end."""
-    rows, length = starts.shape
-    first = starts.at[:, 0].set(True).reshape(-1)
-    count = rows * max_segments
-    begins = jnp.nonzero(first, size=count, fill_value=rows * length)[0]
-    return jnp.concatenate([begins, jnp.full((1,), rows * length, begins.dtype)]).astype(jnp.int32)
 
 
 def _padded(x, axis: int, size: int):

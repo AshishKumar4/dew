@@ -524,8 +524,10 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-3000:]
     loaded = json.loads(done.stdout.strip().splitlines()[-1])
-    trained = {**state.variables, FROZEN: unbanked(state.variables[FROZEN])}
-    expected = objective.model.apply(trained, jnp.asarray(prompt))
+    # Held to the fresh process's logits on its device, the CPU; the frozen base is the CPU's already.
+    trained = jax.device_get({**state.variables, FROZEN: unbanked(state.variables[FROZEN])})
+    with jax.default_device(jax.devices("cpu")[0]):
+        expected = objective.model.apply(trained, jnp.asarray(prompt))
     np.testing.assert_allclose(np.asarray(loaded["logits"]), np.asarray(expected), atol=1e-5)
     assert np.asarray(loaded["tokens"]).shape[-1] >= 2
 

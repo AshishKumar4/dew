@@ -23,6 +23,7 @@ class DecisionModel:
     part, so a backbone that `Pretrained.adapt` gave LoRA factors runs with its
     own adapter, with its base weights under `frozen`.
 
+    The rows a window packs reach the backbone as its documents (`Coordinates`).
     In the parallel layout an option attends to no other option's tokens, and the
     backbone's attention windows measure distance in positions
     (`attention_pairwise_mask`, `attention_key_positions`).
@@ -38,31 +39,32 @@ class DecisionModel:
 
     def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
-        """Return the backbone's `[B, L, features]` final states.
+        """Return the backbone's `[B, L, features]` final states, each packed
+        row read apart from the others in its window.
 
-        `media` are the backbone's own inputs for images the rows hold
-        (`Images.inputs`), with which it reads them.
+        `media` are the backbone's own inputs for images a request's one row
+        holds (`Images.inputs`), with which it reads them.
         """
         backbone = thaw(part(variables, "backbone"))
-        method = "hidden_states"
+        laid = inputs.coordinates()
         if media is not None:
-            if inputs.positions is not None:
+            if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
             return _array(self.backbone.apply(
                 backbone, inputs, media, rngs=rngs,
                 method=lambda module, rows, given: module.hidden_states(
-                    rows.tokens, train=train, attention_mask=rows.valid, right_padded=True,
-                    **given.kwargs())))
-        if inputs.positions is None or inputs.slots is None:
-            return _array(self.backbone.apply(backbone, inputs.tokens, train=train,
-                                              attention_mask=inputs.valid, right_padded=True,
-                                              method=method, rngs=rngs))
-        slots = inputs.slots
+                    rows.tokens, train=train, coordinates=laid, **given.kwargs())))
+        if inputs.slots is None:
+            return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
+                                              method="hidden_states", rngs=rngs))
+        slots, segments = inputs.slots, inputs.segments
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
-        visible = inputs.valid[:, None, :] & ~other
-        return _array(self.backbone.apply(backbone, inputs.tokens, train=train, positions=inputs.positions,
+        # A token reads its own row's, and the padding its own; an option reads no other option.
+        visible = (segments[:, :, None] == segments[:, None, :]) & ~other
+        return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
                                           attention_pairwise_mask=visible,
-                                          attention_key_positions=inputs.positions, method=method, rngs=rngs))
+                                          attention_key_positions=inputs.positions, method="hidden_states",
+                                          rngs=rngs))
 
     def table(self, variables: Variables) -> jax.Array:
         """Return the backbone's output table as `[V, D]` rows, which a head may read (`AffineHead`)."""

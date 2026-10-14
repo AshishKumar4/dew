@@ -1,9 +1,9 @@
 """Record vLLM's routing and sampling-support fixture for Dew's replay tests.
 
-Run in a vLLM environment on a GPU, from the repository root:
+Run in a vLLM environment on a GPU, with JAX for tests/reference_error.py, from the repository root:
 
-    python tools/vllm_replay_reference.py
-    python tools/vllm_replay_reference.py --reference   # only the transformers references, on the record
+    PYTHONPATH=tests python tools/vllm_replay_reference.py
+    PYTHONPATH=tests python tools/vllm_replay_reference.py --reference   # only the transformers references
 
 It serves `tests/fixtures/hf/qwen3-moe-vllm` in bf16 with top-k and top-p
 filtering, `logprobs_mode="processed_logprobs"`, `return_sampling_mask` and
@@ -18,7 +18,9 @@ log-probabilities from transformers at float32 and at float64 (the
 `tests/reference_error.py` rule's reference and truth), each the capped
 logit over the temperature renormalized over the recorded support. It
 refuses a record whose routing transformers' own float64 routers would not
-choose, so the references score what the engine routed.
+choose, so the references score what the engine routed, and one whose bf16
+behavior log-probabilities are farther from the float64 truth than
+transformers' bf16 run on its routing (`engine_as_exact`).
 
 The checkpoint is written here, from `CONFIG` with transformers' own
 initialization under seed 0, when it is missing. It is a Qwen3-MoE with a
@@ -91,6 +93,20 @@ def references(record: dict) -> None:
             call.setdefault("reference", {})[name] = scores
 
 
+def engine_as_exact(record: dict) -> None:
+    """The record's vLLM bf16 behavior log-probabilities as close to the float64 truth as transformers'
+    bf16 run on the record's routing, by tests/reference_error.py's rule."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    def joined(read):
+        return np.concatenate([read(call) for call in record["calls"]])
+
+    assert_as_exact_as_the_reference(joined(lambda call: call["behavior_log_probs"]),
+                                     joined(lambda call: call["reference"]["bfloat16"]),
+                                     joined(lambda call: call["reference"]["float64"]),
+                                     "vLLM's behavior log-probs")
+
+
 def _forced(gate, indices):
     """`Qwen3MoeTopKRouter.forward` choosing `indices` instead of its top-k."""
     import torch
@@ -110,6 +126,7 @@ def main() -> None:
     if sys.argv[1:] == ["--reference"]:
         record = json.loads(OUT.read_text())
         references(record)
+        engine_as_exact(record)
         OUT.write_text(json.dumps(record) + "\n")
         return
     from vllm import LLM, SamplingParams
@@ -145,6 +162,7 @@ def main() -> None:
     record = {"vllm": version("vllm"), "gpu": torch.cuda.get_device_name(), "model": MODEL.name,
               "sampling": SAMPLING, "calls": calls}
     references(record)
+    engine_as_exact(record)
     OUT.write_text(json.dumps(record) + "\n")
     print(f"wrote {len(calls)} calls to {OUT}")
 

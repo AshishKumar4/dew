@@ -9,6 +9,9 @@ one tensor at a time, and encodes dense weights back into those parts for
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
   beside `<m>.weight_scale_inv`, one float32 scale per square block.
+- MiMo-V2.6's storage of that config under `store_dtype: mxfp4`: FP8 blocks,
+  the fused qkv in runs over the key heads, and routed experts as MXFP4,
+  `<m>.weight` beside `<m>.weight_scale`.
 - DeepSeek-V4's storage of that config, which also declares `expert_dtype`:
   `<m>.weight` beside `<m>.scale`, an E8M0 exponent (a float32 power of two
   in the Base releases) per block of an FP8 Linear, per 32 values of a V4.1
@@ -513,12 +516,18 @@ def _sides(block: Block) -> tuple[int, int]:
 
 
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
-                          block: Block = BLOCK) -> np.ndarray:
+                          block: Block = BLOCK, *, runs: int = 1) -> np.ndarray:
     """Return float32(weight[i, j]) * float32(scale_inv[i // rows, j // cols])
     for `block` = (rows, cols), or `block` x `block`.
 
-    `weight` may be in any float dtype, `scale_inv` float32 or E8M0.
+    `weight` may be in any float dtype, `scale_inv` float32 or E8M0. With
+    `runs` the rows are that many equal runs, each tiled in blocks of its own
+    from its first row, the scales a run's after another's: a weight stored
+    pre-sharded for as many tensor-parallel ranks (MiMo-V2.6's fused qkv).
     """
+    if runs > 1:
+        return np.concatenate([dequantize_fp8_blocks(part, scale, block) for part, scale in
+                               zip(*_runs(weight, scale_inv, runs), strict=True)])
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
             f"block-scaled dequantization takes a [rows, cols] weight and its "
@@ -570,8 +579,16 @@ def _finite_matrix(weight: ArrayLike) -> np.ndarray:
     return values
 
 
+def _runs(weight: np.ndarray, scale: np.ndarray | None, runs: int) -> tuple[list, list]:
+    """`weight`'s rows as `runs` equal runs, and `scale`'s as many equal runs of block rows."""
+    if weight.ndim != 2 or weight.shape[0] % runs or (scale is not None and scale.shape[0] % runs):
+        raise ValueError(f"a {weight.shape} weight and its {None if scale is None else scale.shape} scale "
+                         f"do not split into {runs} equal runs of rows")
+    return np.split(weight, runs), [None] * runs if scale is None else np.split(scale, runs)
+
+
 def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
-                        ue8m0: bool = False) -> tuple[np.ndarray, np.ndarray]:
+                        ue8m0: bool = False, runs: int = 1) -> tuple[np.ndarray, np.ndarray]:
     """Cast `weight` to float8_e4m3fn blocks and the float32 scales that invert them.
 
     The inverse of `dequantize_fp8_blocks`: a [rows, cols] weight in any float
@@ -600,10 +617,15 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
     and that margin is where the libraries part: ml_dtypes sends a value
     above it to NaN where torch saturates. A weight that is not finite is
     refused by name rather than written as a block of NaN. The 1e-4 floor
-    keeps every scale a float32 normal.
+    keeps every scale a float32 normal. `runs` tiles each of that many equal
+    runs of rows on its own, as `dequantize_fp8_blocks` reads them.
 
     `fp8_block_cast` runs the same cast in a traced program, to the same bytes.
     """
+    if runs > 1:
+        parts = [quantize_fp8_blocks(part, block, ue8m0=ue8m0)
+                 for part in _runs(np.asarray(weight), None, runs)[0]]
+        return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
     rows, cols = _sides(block)
     return _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
                         rounded=_ue8m0 if ue8m0 else np.asarray)
@@ -653,6 +675,91 @@ def fp8_blocks(block: int = BLOCK, *, ue8m0: bool = False) -> SourceQuantization
         lambda tensors, name: dequantize_fp8_blocks(tensors[name], tensors[name + SCALE_SUFFIX], block),
         lambda name, weight: dict(zip((name, name + SCALE_SUFFIX),
                                       quantize_fp8_blocks(weight, block, ue8m0=ue8m0), strict=True)))
+
+
+# --------------------------------------------------------------------------
+# MiMo-V2.6: quant_method fp8 under store_dtype mxfp4
+# --------------------------------------------------------------------------
+
+STORE_SCALE_SUFFIX = '_scale'
+"""A routed expert's `<m>.weight` E2M1 pairs scale by `<m>.weight_scale`."""
+
+_ROUTED = re.compile(r'\.mlp\.experts\.\d+\.(gate|up|down)_proj\.weight$')
+"""A routed expert's projection, `model.layers.N.mlp.experts.E.gate_proj.weight`."""
+
+FUSED_QKV = '.self_attn.qkv_proj.weight'
+"""MiMo-V2.6 Pro's fused q, k and v projection."""
+
+
+def _store_partners(name: str) -> tuple[str, ...]:
+    return (name + (STORE_SCALE_SUFFIX if _ROUTED.search(name) else SCALE_SUFFIX),)
+
+
+def _store_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The weights a store_dtype 'mxfp4' checkpoint ships quantized: each
+    beside its `_scale_inv` (FP8 blocks) or, a routed expert's, its `_scale`
+    (MXFP4). A scale whose weight is absent is refused."""
+    names = [*scaled_names(tensors)]
+    for name in tensors:
+        if name.endswith(STORE_SCALE_SUFFIX) and _ROUTED.search(name.removesuffix(STORE_SCALE_SUFFIX)):
+            weight = name.removesuffix(STORE_SCALE_SUFFIX)
+            if weight not in tensors:
+                raise ValueError(f"{name} scales {weight}, which the checkpoint does not hold")
+            names.append(weight)
+    return tuple(names)
+
+
+def _qkv_runs(name: str, runs: int | None) -> int:
+    """The runs `name` is stored in: the key heads for the fused qkv, else one."""
+    if not name.endswith(FUSED_QKV):
+        return 1
+    if runs is None:
+        raise ValueError(f"{name} is stored in a run a key head, and the config states no "
+                         f"num_key_value_heads")
+    return runs
+
+
+def _decode_store(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
+                  runs: int | None) -> np.ndarray:
+    """A routed expert as MXFP4, `[out, in / 2]` uint8 E2M1 pairs (element 2i
+    in the low nibble) under `[out, in / 32]` uint8 E8M0 exponents, as vLLM's
+    `Mxfp4MoEMethod` reads them; anything else as FP8 blocks, the fused qkv
+    in `runs` runs."""
+    partner = _store_partners(name)[0]
+    value, scale = tensors[name], tensors[partner]
+    if _ROUTED.search(name):
+        if value.dtype != np.uint8 or scale.dtype != np.uint8 or value.ndim != 2 or (
+                scale.shape != (value.shape[0], 2 * value.shape[1] // GROUP)):
+            raise ValueError(f"{name} is a routed expert, which store_dtype 'mxfp4' ships as uint8 "
+                             f"[out, in / 2] E2M1 pairs beside a uint8 [out, in / {GROUP}] {partner}, "
+                             f"got {value.dtype} {value.shape} and {scale.dtype} {scale.shape}")
+        return decode_e2m1(value, scale)
+    return dequantize_fp8_blocks(value, scale, block, runs=_qkv_runs(name, runs))
+
+
+def _encode_store(name: str, weight: np.ndarray, *, block: int,
+                  runs: int | None) -> dict[str, np.ndarray]:
+    """`name` written back as `_decode_store` reads it. An expert takes the
+    MXFP4 rule `quantize_mxfp4` ports, the one whose bytes the release's
+    experts are (MiMo-V2.6-Pro-MOPD layer 1 expert 0's gate_proj re-encodes
+    to its own codes and exponents); the rest `quantize_fp8_blocks`."""
+    partner = _store_partners(name)[0]
+    if _ROUTED.search(name):
+        codes, exponents = quantize_mxfp4(np.asarray(weight).T[None])
+        return {name: codes.reshape(codes.shape[1], -1), partner: exponents[0]}
+    return dict(zip((name, partner), quantize_fp8_blocks(weight, block, runs=_qkv_runs(name, runs)),
+                    strict=True))
+
+
+def mxfp4_store(block: int, runs: int | None) -> SourceQuantization:
+    """vLLM's `Fp8Config` under store_dtype 'mxfp4' (fp8.py at 78b32b3, the
+    MiMo-V2.5 and V2.6 Pro releases): FP8 blocks for every Linear its
+    `ignored_layers` leave quantized, the fused qkv pre-sharded in `runs`
+    runs over the key heads (mimo_v2.py, `_shard_fp8_qkv_proj`), and MXFP4
+    for the routed experts (`Mxfp4MoEMethod`)."""
+    return SourceQuantization(_store_names, _store_partners,
+                              partial(_decode_store, block=block, runs=runs),
+                              partial(_encode_store, block=block, runs=runs))
 
 
 # --------------------------------------------------------------------------
@@ -1564,6 +1671,15 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
             raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
                              f"pairs or as fp8 blocks and nothing else")
         return deepseek_v4(block, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
+    if method == "fp8" and quantization.get("store_dtype") is not None:
+        block, ue8m0 = fp8_format(quantization)
+        stored, group = quantization["store_dtype"], quantization.get("mxfp4_block_size", GROUP)
+        if stored != "mxfp4" or group != GROUP or ue8m0:
+            raise ValueError(f"quantization_config stores fp8 as {stored!r} in groups of {group!r}; this "
+                             f"loader reads store_dtype 'mxfp4' in groups of {GROUP} beside float32 FP8 "
+                             f"block scales")
+        heads = config.get("num_key_value_heads")
+        return mxfp4_store(block, None if heads is None else records.integer(heads, "num_key_value_heads"))
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
         return fp8_blocks(block, ue8m0=ue8m0)

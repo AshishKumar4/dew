@@ -13,7 +13,7 @@ from dew import Trainer
 from dew.data import Loading, Memory, from_grain, from_iter, mix, presets
 from dew.data.compile import compile, fitted, validation
 from dew.data.dataset import DataPartition
-from dew.data.pipeline import ObjectiveData, TokenField
+from dew.data.pipeline import ObjectiveData
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective, Perplexity
@@ -47,9 +47,9 @@ def test_image_preset_accepts_execution_overrides_after_device_steps(override):
 
 @dataclasses.dataclass(frozen=True)
 class Tokens(grain.MapTransform):
+    """Rows of `max_length` tokens (`TokenGeometry`), `length` of them real."""
+
     max_length: int = 16
-    token_fields: tuple[TokenField, ...] = (TokenField("tokens"), TokenField("valid", pad=False))
-    length_field: str = "length"
 
     def map(self, row):
         return {**row, "tokens": np.full(self.max_length, row["id"], np.int32),
@@ -61,14 +61,14 @@ class Tokens(grain.MapTransform):
 def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):
     rows = [{"id": np.int32(index + 1), "length": np.int32(length)}
             for index, length in enumerate((3, 7, 14, 7, 3))]
-    chain = Memory(rows).map(Tokens()).batch(tokens=64, lengths=(4, 8, 16)).read(read)
+    chain = Memory(rows).map(Tokens()).batch(tokens=64).read(read)
     reader = (validation(chain, batch=1, read=read, loading=READ)(DataPartition())
               if entry == "validation" else chain.iterate())
     try:
         batches = list(reader)
         ids = []
         for batch in batches:
-            assert batch["tokens"].size == 64
+            assert batch["tokens"].shape == (4, 16)
             keep = batch.get(VALID_ROWS, np.ones(batch["id"].shape[0], bool))
             ids.extend(batch["id"][keep].tolist())
             np.testing.assert_array_equal(batch["tokens"][keep, 0], batch["id"][keep])
