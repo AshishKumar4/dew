@@ -1305,7 +1305,10 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
         kernel = name.endswith('.kernel') and value.ndim == 2
         layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
                                        if kernel else value.shape, (1, 0) if kernel else None)
-    return layout_tensors(_packed_layouts(layouts, family.packed, config), tree, model.layer_scalar)
+    # A packed tensor's geometry is the model's, read as a translated config spells it.
+    geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
+                'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
+    return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
 
 
 def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
