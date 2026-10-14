@@ -23,7 +23,16 @@ from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits
 from dew.objectives.rl.grpo import GRPOObjective
-from dew.objectives.rl.sessions import SUPPORT_COLUMNS_KEY, SUPPORT_KEY, Call, Session, Status, pack
+from dew.objectives.rl.sessions import (
+    SUPPORT_COLUMNS_KEY,
+    SUPPORT_KEY,
+    Call,
+    Session,
+    Status,
+    chain_lengths,
+    pack,
+    rows_needed,
+)
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -102,7 +111,7 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
     grpo = GRPOObjective(obj.model, obj.seq_len, sampling_temperature=sampling.temperature,
                          variables=params)
     # As many rows as the chains need, in whole rows for every device.
-    needed = len(pack(rollouts, PROMPT + NEW, support_capacity=12 * NEW)["response_mask"])
+    needed = rows_needed(chain_lengths(rollouts, PROMPT + NEW, truncation="mask"), PROMPT + NEW)
     rows = -(-needed // jax.device_count()) * jax.device_count()
     batch = pack(rollouts, PROMPT + NEW, rows=rows, support_capacity=12 * NEW)
     drawn_ids = batch["response_mask"] != 0

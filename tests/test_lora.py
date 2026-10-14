@@ -743,7 +743,7 @@ def _recorded(name: str) -> dict[str, np.ndarray]:
         return {key: data[key] for key in data if key != "meta"}
 
 
-def _layout(directory: Path) -> dict[str, object]:
+def _layout(directory: Path) -> dict:
     """Each file of an adapter as its reader parses it, values aside: a safetensors file's metadata
     and every tensor's name, dtype and shape, a JSON file's contents."""
     from safetensors import safe_open
