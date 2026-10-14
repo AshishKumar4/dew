@@ -291,7 +291,7 @@ class Manifest:
         return all(step.exact for step in (*self.ran, *self.steps))
 
 
-def _digests(value: JSON) -> JSON:
+def _digests(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`value` as digests short enough to read beside another process's: a
     mapping's values each apart, a list's entries one by one."""
     if isinstance(value, dict):
