@@ -585,7 +585,12 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
             "class TestReading:\n"
             "    from inspect import getsource as read\n"
             "    def test_default(self, text=read(graph)):\n"
-            "        assert text\n"),
+            "        assert text\n"
+            "def test_comprehension(readers):\n"
+            "    import inspect\n"
+            "    assert [inspect.getsource() for inspect in readers]\n"
+            "def test_lambda_default(text=(lambda inspect: inspect.getsource())(graph)):\n"
+            "    assert text\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
 
@@ -624,7 +629,10 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
             "def rebuilt():\n"
             "    import json\n"
             "    json = Edges()\n"
-            "    json.count = 0\n"),
+            "    json.count = 0\n"
+            "def install_again(json):\n"
+            "    import json\n"
+            "    json.dumps = repr\n"),
         "tools/bench.py": (
             "import json\n"
             "from sparx import graph\n"
@@ -650,7 +658,7 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
             "        pass\n"
             "    graph.run = repr\n"),
     })
-    assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20)],
+    assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
                      *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
 
 

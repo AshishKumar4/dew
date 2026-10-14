@@ -33,6 +33,9 @@ class bases, and Flax's Module from its installed source (never importing
 it), to know which classes are models. It sees what Python spells, not what
 dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
+SLOP011 and SLOP012 read each name through the imports of its own lexical
+scope, flow-insensitively: a name a scope both imports and assigns counts as
+assigned throughout it.
 SLOP004's isinstance half fires only when the annotation it needs is written in
 the same scope; a value whose type arrives from another module is not narrowed
 by this checker and is not reported. SLOP006 walks the handler body it can see,
@@ -817,36 +820,56 @@ def _outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.Cl
     return [*scope.decorator_list, *defaults, *(annotation for _, annotation in _annotations(scope))]
 
 
+def _comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str]) -> dict[int, Mapping[str, str]]:
+    """The table each node inside a comprehension reads, its targets bound
+    there (and in comprehensions inside it) but not in its first iterable,
+    which the enclosing scope evaluates. Keyed by node identity."""
+    tables: dict[int, Mapping[str, str]] = {}
+    for node in nodes:
+        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+            around = tables.get(id(node), table)
+            names = {name.id for generator in node.generators for name in ast.walk(generator.target)
+                     if isinstance(name, ast.Name)}
+            inside = {name: target for name, target in around.items() if name not in names}
+            first = {id(child) for child in ast.walk(node.generators[0].iter)}
+            for child in ast.walk(node):
+                if child is not node and id(child) not in first:
+                    tables[id(child)] = inside
+    return tables
+
+
 def _scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
-            bound: frozenset[str] = frozenset(), class_body: bool = False
+            parameters: frozenset[str] = frozenset(), class_body: bool = False
             ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
     """Every node of a scope's `body` and of the scopes in it, with what each
-    name imported there stands for (`visible` around it): a name the scope
-    only imports, its import; one it binds otherwise (`bound` parameters,
-    an assignment, a definition), none. A comprehension's targets stay its
-    own, and a class body's names reach no scope inside it."""
+    name imported there stands for (`visible` around it). A scope's own
+    import replaces its `parameters`; a name it otherwise binds (an
+    assignment, a definition) stands for no import. A comprehension's
+    targets are its own, and a class body's names reach no scope inside it."""
     nodes = [node for statement in body
              for node in (statement, *(() if isinstance(statement, SCOPES) else _own(statement)))]
     targets = {id(name) for node in nodes if isinstance(node, ast.comprehension)
                for name in ast.walk(node.target)}
-    stored = {node.id for node in nodes
-              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
-    defined = {node.name for node in nodes
-               if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
-    local = {*bound, *stored, *defined}
+    local = {node.id for node in nodes
+             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
+    local |= {node.name for node in nodes
+              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
     imported: dict[str, str] = {}
     for node in nodes:
         if isinstance(node, ast.Import | ast.ImportFrom):
             imported |= _bound_by(node, parent)
-    table = {name: target for name, target in {**visible, **imported}.items() if name not in local}
+    around = {name: target for name, target in visible.items() if name not in parameters}
+    table = {name: target for name, target in {**around, **imported}.items() if name not in local}
+    inside = _comprehended(nodes, table)
     for node in nodes:
-        yield node, table
+        here = inside.get(id(node), table)
+        yield node, here
         if isinstance(node, SCOPES):
-            yield from ((part, table) for outer in _outside(node) for part in ast.walk(outer))
+            yield from _scoped(_outside(node), here, parent)
             inner = node.body if isinstance(node.body, list) else [node.body]
-            parameters = frozenset() if isinstance(node, ast.ClassDef) else frozenset(
+            arguments = frozenset() if isinstance(node, ast.ClassDef) else frozenset(
                 argument.arg for argument in _arguments(node))
-            yield from _scoped(inner, visible if class_body else table, parent, parameters,
+            yield from _scoped(inner, visible if class_body else here, parent, arguments,
                                isinstance(node, ast.ClassDef))
 
 
