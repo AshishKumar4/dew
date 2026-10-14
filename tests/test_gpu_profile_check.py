@@ -3,6 +3,7 @@ judging reads XProf's reports and the captures' numbers, and runs anywhere;
 the captures themselves want a GPU."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,8 +16,9 @@ def test_the_check_runs_end_to_end_and_fails_without_a_gpu(tmp_path):
     device plane holds the step, as on a GPU session whose JAX lost its GPU.
     Each capture's own hlo_stats is read, which sits in the capture's
     directory below the profiler's."""
+    # On a CPU on every lane, the GPU tier's included.
     done = subprocess.run([sys.executable, str(TOOL), "--out", str(tmp_path)], capture_output=True, text=True,
-                          timeout=900)
+                          timeout=900, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     result = json.loads((tmp_path / "check.json").read_text())
     assert done.returncode == 1, done.stderr[-2000:]
     assert set(result["variants"]) == {"default", "attributed"}
