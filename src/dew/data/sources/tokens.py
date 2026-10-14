@@ -204,8 +204,14 @@ class TokenFiles(Dataset):
     storage_options: Mapping[str, object] | None = None
     field: str | None = None
 
+    @cached_property
+    def committed(self) -> Mapping[str, object] | None:
+        """The export's committed manifest, read through this store's own storage options, or None
+        for a legacy token directory."""
+        return Files(self.url, storage_options=self.storage_options).committed
+
     def with_split(self, name: str) -> TokenFiles:
-        if name != self.split and Files(self.url, storage_options=self.storage_options).committed is not None:
+        if name != self.split and self.committed is not None:
             raise ValueError(
                 f"token export {self.url!r} has one split; give an explicit TokenFiles URL for {name!r}"
             )
@@ -245,7 +251,7 @@ class TokenFiles(Dataset):
 
     @cached_property
     def meta(self) -> Mapping[str, object]:
-        committed = Files(self.url).committed
+        committed = self.committed
         if committed is not None:
             metadata = committed.get("metadata", {})
             if not isinstance(metadata, Mapping):
@@ -259,7 +265,7 @@ class TokenFiles(Dataset):
         eos = self.meta.get("eos_id")
         if eos is not None and not isinstance(eos, int):
             raise ValueError("token metadata eos_id must be an integer or null")
-        committed = Files(self.url).committed
+        committed = self.committed
         if committed is not None:
             if committed["format"] != "array_record":
                 raise ValueError("token exports must use ArrayRecord")
@@ -353,7 +359,7 @@ class TokenFiles(Dataset):
                 ).fingerprint(),
                 "index": _version(fs, path) if fs.exists(path) else None,
                 "shard_rows": None if self.tokens.record_codec else self.tokens.shard_rows,
-                "producer": Files(self.url, storage_options=self.storage_options).committed,
+                "producer": self.committed,
             }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
         return {

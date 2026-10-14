@@ -48,8 +48,8 @@ The specs in `dew.config.data` provide `.load(batch=..., read=...)`; `loader(spe
 | Recipe and alias | Fields after batching |
 |---|---|
 | `RecordsData` / `records` | The source's fields, with numeric values in JAX's configured widths |
-| `TextData` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds aligned segment and position arrays |
-| `ChatData` / `chat` | Packed token fields and aligned `text_roles` |
+| `TextData` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
+| `ChatData` / `chat` | Packed `text`, `text_coordinates` and aligned `text_roles` |
 | `PromptData` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
 | `PreferenceData` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
 | `ImageData` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
@@ -119,13 +119,13 @@ data = compile(train, validation=held, read="memory", loading=Loading(workers=0)
 
 Validation is finite and never inherits a training repeat or augmentation stage. `validation_records=N` on spec `.load()` caps accepted evaluation records, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
 
-`map_batch(step)` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
+`map(step)` after `batch` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to spec `.load()`. Without a caption reader, the default host stage removes strings before device transfer.
+For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to spec `.load()`. Without a caption reader, string fields stay on the host, where metrics read them: the prefetcher places only the fields a device holds.
 
 ## Text, chat and packing
 
-`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. Aligned segment IDs stop attention and target scoring at document boundaries, and positions restart within each document.
+`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
@@ -137,6 +137,7 @@ To produce token records, export a deterministic prefix. This example downloads 
 from dew.data import ByteTokenizer, Loading, Memory
 from dew.config.data import TextData, loader
 from dew.data.pipeline import Pipeline
+from dew.data.dataset import DataPartition
 from dew.data.sinks import export
 import tempfile
 from dew.data.steps.text import Tokenize
@@ -151,6 +152,13 @@ export(prefix, token_store, format="array_record", length_field="text",
                  "eos_id": tokenizer.eos_id})
 data = loader(TextData(source=token_store, seq_len=32, pack="first-fit"),
             batch=4, read="memory", loading=Loading(workers=0))
+stream = data.train(DataPartition())
+try:
+    packed = next(stream)
+    print(packed["text_coordinates"].segments[0])
+    print(packed["text_coordinates"].positions[0])
+finally:
+    stream.close()
 ```
 
 Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
@@ -159,7 +167,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`Pipeline.mix(other, weights=...)` mixes accepted records before sharding. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
 
 ## Token-budget batches
 
@@ -167,13 +175,13 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.chunk(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 
 `Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout and packing steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
 
-Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers`, `prefetch` and `map_batch` to choose that order. A global shuffle requires an indexed pipeline, and a host batch step requires batching first.
+Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers` and `prefetch` to choose that order; a `map` after `batch` is a host step on the training batch. A global shuffle requires an indexed pipeline.
 
 ## Cache and storage publication
 

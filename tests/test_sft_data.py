@@ -86,9 +86,11 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
 
 # --- packing -----------------------------------------------------------------
 
-def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
-    """Ids, roles, segment ids and positions pack together; the bins hold
-    whole conversations first-fit, padding reads segment 0 and role 0."""
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, tokenizer, read):
+    """Ids, roles, segment ids and positions pack together, by the memory read's planner or
+    Grain's packer as rows stream; the bins hold whole conversations first-fit, padding
+    reads segment 0 and role 0."""
     window = 96
     path = write_parquet(tmp_path, [SHORT, MEDIUM, LONG])
     rendered = [render(tokenizer, conversation) for conversation in (SHORT, MEDIUM, LONG)]
@@ -97,15 +99,15 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
     (a_ids, a_roles), (b_ids, b_roles), (c_ids, c_roles) = rendered
 
     data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
-        validation=path, long="chunk"), batch=2, read="memory", loading=Loading(workers=0),
+        validation=path, long="chunk"), batch=2, read=read, loading=Loading(workers=0),
             validation_records=4 * (2))
     assert data.val is not None
     batches = list(data.val(DataPartition()))
     assert len(batches) == 1
     batch = batches[0]
 
-    assert set(batch) == {"text", ROLES_KEY, "text_segment_ids", "text_positions"}, (
-        "one segment/position pair serves every aligned field")
+    assert set(batch) == {"text", ROLES_KEY, "text_coordinates"}, (
+        "one Coordinates value serves every aligned field")
     assert batch["text"].shape == (2, window)
     assert batch[ROLES_KEY].shape == (2, window)
     assert batch["text"].dtype == np.int32 and batch[ROLES_KEY].dtype == np.int8
@@ -113,14 +115,14 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
     np.testing.assert_array_equal(batch["text"][0], np.concatenate([a_ids, b_ids, np.zeros(6)]))
     np.testing.assert_array_equal(batch[ROLES_KEY][0],
                                   np.concatenate([a_roles, b_roles, np.zeros(6)]))
-    np.testing.assert_array_equal(batch["text_segment_ids"][0],
+    np.testing.assert_array_equal(batch["text_coordinates"].segments[0],
                                   [1] * 37 + [2] * 53 + [0] * 6)
-    np.testing.assert_array_equal(batch["text_positions"][0],
+    np.testing.assert_array_equal(batch["text_coordinates"].positions[0],
                                   list(range(37)) + list(range(53)) + [0] * 6)
     np.testing.assert_array_equal(batch["text"][1], np.concatenate([c_ids, np.zeros(24)]))
     np.testing.assert_array_equal(batch[ROLES_KEY][1], np.concatenate([c_roles, np.zeros(24)]))
-    np.testing.assert_array_equal(batch["text_segment_ids"][1], [1] * 72 + [0] * 24)
-    np.testing.assert_array_equal(batch["text_positions"][1], list(range(72)) + [0] * 24)
+    np.testing.assert_array_equal(batch["text_coordinates"].segments[1], [1] * 72 + [0] * 24)
+    np.testing.assert_array_equal(batch["text_coordinates"].positions[1], list(range(72)) + [0] * 24)
 
 
 def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
@@ -154,21 +156,23 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     path = write_parquet(tmp_path, [SHORT, MEDIUM, LONG])
     rendered = {tuple(render(tokenizer, conversation)[0].tolist())
                 for conversation in (SHORT, MEDIUM, LONG)}
-    columns = ("text", ROLES_KEY, "text_segment_ids", "text_positions")
+    columns = ("text", ROLES_KEY, "text_coordinates")
     data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"),
         batch=2, read="memory", loading=Loading(workers=2), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
 
     assert set(columns) <= set(batch)
-    assert all(batch[column].shape == (2, 96) for column in columns)
+    laid = batch["text_coordinates"]
+    assert all(value.shape == (2, 96) for value in
+               (batch["text"], batch[ROLES_KEY], laid.segments, laid.positions))
     assert batch["text"].dtype == np.int32 and batch[ROLES_KEY].dtype == np.int8
     for row in range(2):
-        segments = batch["text_segment_ids"][row]
+        segments = laid.segments[row]
         for segment in range(1, int(segments.max()) + 1):
             span = segments == segment
             assert tuple(batch["text"][row][span].tolist()) in rendered
-            np.testing.assert_array_equal(batch["text_positions"][row][span],
+            np.testing.assert_array_equal(laid.positions[row][span],
                                           np.arange(int(span.sum())))
     # Every conversation ends on an assistant turn, so a batch that lost the
     # roles crossing back from a worker would carry no targets at all.
