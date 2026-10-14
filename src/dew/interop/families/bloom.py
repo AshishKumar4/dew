@@ -10,11 +10,12 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
+    decoder_tensors,
+    grouped_qkv,
     refuse,
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -81,8 +82,8 @@ BLOOM = DecoderFamily(
     lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
     'bloom', 'BloomForCausalLM', _bloom_export,
     weight_path=_bloom_path, export_path=partial(renamed_name, _BLOOM_NAMES),
-    prepare=partial(gpt_neox_prepare, attention_name='self_attention'),
-    export_weights=partial(gpt_neox_export_weights, attention_name='self_attention'),
+    packed=grouped_qkv('.self_attention.query_key_value'),
+    export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
 )
