@@ -15,6 +15,7 @@ from functools import partial
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     DecoderFamily,
     DecoderFields,
@@ -22,6 +23,7 @@ from dew.interop.decoder_parts import (
     base_config,
     dew_path,
     every_layer_windowed,
+    read_rope,
     refuse,
     renamed,
     renamed_name,
@@ -33,8 +35,11 @@ from dew.nn.backbones.decoder_block import Mixture
 
 def llama_config(hf_config, used):
     # LlamaConfig declares attention_bias and no window: LlamaAttention
-    # attends every key.
-    return base_config(hf_config, used, reads=frozenset({'attention_bias'}))
+    # attends every key. LlamaRotaryEmbedding builds any rope_type the rope
+    # utilities do, YaRN among them (modeling_llama.py:82-86).
+    rope = read_rope(hf_config, used, records.integer(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+    return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias'}))
 
 
 def ministral_config(hf_config, used):
