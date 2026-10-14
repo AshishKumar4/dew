@@ -297,10 +297,10 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    """The source tensors no leaf binds, which `save` writes back as stored.
+    """The source tensors no forward reads, kept as stored for `save` to write back.
 
-    A pipeline keeps a text encoder's vision tower here, which no text prompt
-    reads, each tensor named under its component as its layouts are.
+    A pipeline keeps a text encoder's vision tower here, each tensor named
+    under its component as its layouts are.
     """
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
     """The encoder `export` writes through, installed by the route that built the model, or None
