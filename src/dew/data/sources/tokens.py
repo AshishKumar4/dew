@@ -202,6 +202,17 @@ class TokenShards:
         return np.concatenate(pieces) if pieces else np.empty(0, dtype=self.dtype)
 
 
+def _document_ends(tokens: TokenBytes | TokenRecords | TokenShards) -> np.ndarray:
+    """Each document ends just past its EOS, or at the stream's end for an unterminated tail."""
+    block = 1 << 24
+    found = [
+        np.flatnonzero(tokens[start : start + block] == tokens.eos_id) + start + 1
+        for start in range(0, len(tokens), block)
+    ]
+    ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
+    return ends if len(ends) and ends[-1] == len(tokens) else np.append(ends, len(tokens))
+
+
 @dataclass(frozen=True)
 class TokenFiles(Dataset):
     """A produced train/val token directory, with metadata and document boundaries."""
@@ -209,7 +220,6 @@ class TokenFiles(Dataset):
     url: str
     split: str = "train"
     storage_options: Mapping[str, object] | None = None
-    chunk_tokens: int = 65536
     field: str | None = None
 
     def with_split(self, name: str) -> TokenFiles:
@@ -343,10 +353,10 @@ class TokenFiles(Dataset):
 
     @cached_property
     def _fingerprint(self) -> Mapping[str, object]:
-        documents, indexed = self.document_index.resolve()
-        boundaries = {"documents": _version(documents, indexed)} if documents.exists(indexed) else {}
+        """Tokens and metadata: the document index is derived from the tokens' EOS positions."""
+        store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
-        place = {} if local(documents) else {"url": self.url}
+        place = {} if local(store) else {"url": self.url}
         if isinstance(self.tokens, (TokenRecords, TokenShards)):
             fs, path = self.length_index.resolve()
             return {
@@ -355,14 +365,12 @@ class TokenFiles(Dataset):
                 "split": self.split,
                 "metadata": self.meta,
                 "field": self.field,
-                "chunk_tokens": self.chunk_tokens,
                 "shards": Files(
                     self.tokens.paths, format="array_record", storage_options=self.storage_options
                 ).fingerprint(),
                 "index": _version(fs, path) if fs.exists(path) else None,
                 "shard_rows": self.tokens.shard_rows if isinstance(self.tokens, TokenRecords) else None,
                 "producer": Files(self.url, storage_options=self.storage_options).committed,
-                **boundaries,
             }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
         return {
@@ -371,10 +379,8 @@ class TokenFiles(Dataset):
             "split": self.split,
             "metadata": self.meta,
             "field": self.field,
-            "chunk_tokens": self.chunk_tokens,
             "bytes": fs.size(path),
             "version": _version(fs, path),
-            **boundaries,
         }
 
     def supports(self, read: Read) -> bool:
@@ -408,24 +414,15 @@ class TokenFiles(Dataset):
             self.row_manifest.write(json.dumps({"rows": counts}).encode())
             self.__dict__.pop("tokens", None)
         if tokens.eos_id is not None:
-            block = 1 << 24
-            found = [
-                np.flatnonzero(tokens[start : start + block] == tokens.eos_id) + start + 1
-                for start in range(0, len(tokens), block)
-            ]
-            ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
-            if not len(ends) or ends[-1] != len(tokens):
-                ends = np.append(ends, len(tokens))
             encoded = io.BytesIO()
-            np.save(encoded, ends, allow_pickle=False)
+            np.save(encoded, _document_ends(tokens), allow_pickle=False)
             self.document_index.write(encoded.getvalue())
             self.__dict__.pop("mapped_documents", None)
+            self.__dict__.pop("_ends", None)
         return self
 
     def records(self, read: Read) -> Records:
-        """Each document by index where the store has a document index
-        (`document_ends`), and otherwise uniform chunks of `chunk_tokens`,
-        or for a memory read the whole stream as one record."""
+        """Each document by index (`document_ends`), in every read; without EOS, one document."""
         if not self.supports(read):
             raise FileNotFoundError(
                 f"{self.describe()} needs its producer length index; "
@@ -434,21 +431,28 @@ class TokenFiles(Dataset):
         if read == "memory" and isinstance(self.tokens, TokenRecords):
             self.tokens.materialize_lengths()
         ends = self.document_ends()
-        if ends is not None:
-            return _TokenDocuments(self.tokens, ends)
-        if read == "memory":
-            return ({"text": self.tokens[:].astype(np.int32)},)
-        return _TokenChunks(self.tokens, self.chunk_tokens)
+        return _TokenDocuments(self.tokens, np.asarray([len(self.tokens)]) if ends is None else ends)
 
     def document_ends(self) -> np.ndarray | None:
-        """Where each document ends in the token stream, each running through
-        its EOS, from the index provisioning builds; None without one."""
+        """Document ends from the persisted index or one EOS scan; None without an EOS id."""
+        return self._ends
+
+    @property
+    def documented(self) -> bool:
+        """Whether an index or an EOS id states the documents, without scanning their tokens."""
         fs, path = self.document_index.resolve()
-        return np.asarray(self.mapped_documents.values, np.int64) if fs.exists(path) else None
+        return fs.exists(path) or self.tokens.eos_id is not None
+
+    @cached_property
+    def _ends(self) -> np.ndarray | None:
+        fs, path = self.document_index.resolve()
+        if fs.exists(path):
+            return np.asarray(self.mapped_documents.values, np.int64)
+        return None if self.tokens.eos_id is None else _document_ends(self.tokens)
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
-        size = 1 if self.document_ends() is None else 1024
+        size = 1024
         return ShardManifest(
             tuple(
                 Shard(f"{self.url}:{self.split}:{start}", self.url, start, min(start + size, count),
@@ -479,15 +483,3 @@ class _TokenDocuments:
     def __getitem__(self, index: int) -> Batch:
         start = int(self.ends[index - 1]) if index else 0
         return {"text": self.tokens[start : int(self.ends[index])].astype(np.int32)}
-
-
-@dataclass(frozen=True)
-class _TokenChunks:
-    tokens: TokenBytes | TokenRecords | TokenShards
-    size: int
-
-    def __len__(self) -> int:
-        return (len(self.tokens) + self.size - 1) // self.size
-
-    def __getitem__(self, index: int) -> Batch:
-        return {"text": self.tokens[index * self.size : (index + 1) * self.size].astype(np.int32)}

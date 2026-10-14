@@ -738,18 +738,41 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
 EXPORTS = ROOT / "tests" / "fixtures" / "lora_exports"
 
 
-def _recorded(name: str):
+def _recorded(name: str) -> dict[str, np.ndarray]:
     with np.load(EXPORTS / f"{name}.npz") as data:
-        arrays = {key: data[key] for key in data}
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+        return {key: data[key] for key in data if key != "meta"}
 
 
-def _assert_written_as_read(name: str, directory: Path, meta) -> None:
-    from tools.lora_export_reference import digests
+def _layout(directory: Path) -> dict:
+    """Each file of an adapter as its reader parses it, values aside: a safetensors file's metadata
+    and every tensor's name, dtype and shape, a JSON file's contents."""
+    from safetensors import safe_open
 
-    assert digests(directory) == meta["digests"], (
-        "Dew's adapter changed: rerun both halves of tools/lora_export_reference.py, "
+    layout = {}
+    for path in sorted(directory.iterdir()):
+        if path.suffix == ".safetensors":
+            with safe_open(str(path), "numpy") as file:
+                layout[path.name] = (file.metadata(), {name: (str(file.get_tensor(name).dtype),
+                                                              file.get_tensor(name).shape)
+                                                       for name in sorted(file.keys())})
+        else:
+            layout[path.name] = json.loads(path.read_text())
+    return layout
+
+
+def _written_as_read(name: str, source, variables, directory: Path) -> Adapter:
+    """The adapter `export_case` wrote into `directory` on this device reads back as the variables
+    it wrote, in the layout of the files PEFT or Diffusers read (tests/fixtures/lora_exports/<name>,
+    which tools/lora_export_reference.py's `export` wrote); returns the adapter those files hold,
+    which the reader's outputs were recorded from."""
+    assert _layout(directory) == _layout(EXPORTS / name), (
+        "Dew's adapter files changed: rerun both halves of tools/lora_export_reference.py, "
         "`consume` in its PEFT environment, so PEFT and Diffusers read the new files")
+    again = LoRA.load(source.model, source.variables, directory, layouts=source.layouts)
+    for written, read in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(again.variables["params"]),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(written))
+    return LoRA.load(source.model, source.variables, EXPORTS / name, layouts=source.layouts)
 
 
 @pytest.mark.parametrize("name", ["llama", "llama-rslora", "llama-patterns"])
@@ -759,14 +782,15 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     rsLoRA, and the committed one whose rank and alpha patterns Dew writes
     back, each with its factors moved) onto transformers' llama-tiny: every
     tensor of the file lands, and the adapted and `merge_and_unload` logits
-    are recorded in float32 and float64. The adapter written here is the
-    one that was read, and Dew's adapted and merged logits hold the float64
-    rule against PEFT's."""
+    are recorded in float32 and float64. The adapter written here, on this
+    device, reads back as written, in the layout of the files PEFT read, and
+    Dew's adapted and merged logits from those files hold the float64 rule
+    against PEFT's."""
     from tools.lora_export_reference import CASES, export_case
 
-    adapter, variables = export_case(CASES[name], decoder, tmp_path)
-    arrays, meta = _recorded(name)
-    _assert_written_as_read(name, tmp_path, meta)
+    _, written = export_case(CASES[name], decoder, tmp_path)
+    adapter = _written_as_read(name, decoder, written, tmp_path)
+    variables, arrays = adapter.variables, _recorded(name)
     ids = jnp.asarray(arrays["input_ids"])
     adapted = adapter.model.apply(variables, ids)
     merged = decoder.model.apply(adapter.merge(variables), ids)
@@ -789,9 +813,9 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
     from tools.lora_export_reference import CASES, export_case
 
     source = pipelines[family]
-    adapter, variables = export_case(CASES[family], source, tmp_path)
-    arrays, meta = _recorded(family)
-    _assert_written_as_read(family, tmp_path, meta)
+    _, written = export_case(CASES[family], source, tmp_path)
+    adapter = _written_as_read(family, source, written, tmp_path)
+    variables, arrays = adapter.variables, _recorded(family)
     model = torch_unet(source.model) if family == "sd" else source.model
     if family == "sd":
         adapter = _rebound(adapter, model)
