@@ -193,7 +193,8 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     # measured count lands on the closed form exactly (956,301,312 vs
     # 956,301,312, largest observed difference 0 FLOPs in 956 million). The
     # step is partitioned over the eight devices, so the count is per device.
-    assert trainer.flops_per_step * jax.device_count() == pytest.approx(analytic, rel=0.05)
+    assert trainer.step_flops is not None
+    assert trainer.step_flops.hardware * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
 @pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")

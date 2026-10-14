@@ -403,7 +403,7 @@ def parameter_movement(tool, case, steps: int = 2):
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
              for name, value in after.items()}
-    return moved, trainer.flops_per_step
+    return moved, trainer.step_flops and trainer.step_flops.hardware
 
 
 @pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])
