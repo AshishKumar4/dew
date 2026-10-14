@@ -48,7 +48,6 @@ from dew.data.pipeline import (
     RandomMap,
     Rebatch,
     Repeat,
-    ShardByHost,
     Shuffle,
     Slice,
     Stage,
@@ -452,6 +451,13 @@ def _analyzed(
     one canonical pass, so its split is whole."""
     source = pipeline.source
     nested = source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+    if isinstance(source, Mixture):
+        # A mixture reads its members' records and makes one batch of its own, so a member's batch,
+        # and every stage after it, would never run.
+        batched = next((child for child in nested if child.batched), None)
+        if batched is not None:
+            raise ValueError(f"mixture member {_name(batched)} is batched; a mixture batches once, after "
+                             f"mix: move the member's batch and the stages after it onto the mixture")
     children = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
@@ -592,7 +598,7 @@ def _checked(
                 _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
-        if isinstance(stage, (Slice, ShardByHost)) and not indexed and not promotion:
+        if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
         streams = isinstance(stage, (Interleave, Rebatch, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager

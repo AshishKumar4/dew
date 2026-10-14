@@ -72,7 +72,6 @@ from dew.data.pipeline import (
     Record,
     Rejected,
     Repeat,
-    ShardByHost,
     Shuffle,
     Slice,
     Stage,
@@ -572,7 +571,7 @@ class _Build:
             rows = gx.WindowShuffleIterDataset(
                 _as_iter(rows, self.loading), window_size=stage.window, seed=stage.seed
             )
-        elif isinstance(stage, (Shuffle, Slice, ShardByHost)):
+        elif isinstance(stage, (Shuffle, Slice)):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
         elif isinstance(stage, Repeat):

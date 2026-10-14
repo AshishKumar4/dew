@@ -32,7 +32,7 @@ from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
-from dew.data.pipeline import Pipeline, mix
+from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
@@ -1000,3 +1000,35 @@ def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
     finally:
         resumed.close()
     assert later == whole
+
+
+def _plus_one(batch):
+    return {**batch, "x": batch["x"] + 1}
+
+
+def test_a_mixture_refuses_a_batched_member_rather_than_drop_its_stages():
+    """A mixture reads its members' records and batches once, after mix: a member batched
+    before it, with a step after its batch, is refused, where the mixture once read the
+    member's records and the step never ran."""
+    first = Memory([{"x": np.int32(0)}], identity="first").batch(1).map(_plus_one)
+    second = Memory([{"x": np.int32(0)}], identity="second")
+    with pytest.raises(ValueError):
+        compile(mix([first, second]).batch(1), read="indexed", loading=READ)
+
+
+class _DevicePlusOne(DeviceStep):
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"] + 1}
+
+
+def test_phases_that_end_in_other_device_steps_are_refused():
+    """A run applies one set of device steps to every batch it reads, so a phase whose own
+    device steps differ from the first phase's is refused, where it once ran the first's."""
+    from dew.data.pipeline import Phases
+
+    def phase(name: str) -> Pipeline:
+        return Pipeline(Memory([{"x": np.int32(0)}] * 4, identity=name)).repeat().batch(1)
+
+    with pytest.raises(ValueError):
+        compile(Pipeline(Phases((phase("plain"), phase("stepped").map(_DevicePlusOne())), (1, None))),
+                read="memory", loading=READ)

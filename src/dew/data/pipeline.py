@@ -195,11 +195,6 @@ class Slice:
 
 
 @dataclasses.dataclass(frozen=True)
-class ShardByHost:
-    pass
-
-
-@dataclasses.dataclass(frozen=True)
 class Interleave:
     cycle_length: int = 16
 
@@ -316,7 +311,6 @@ type Stage = (
     | Shuffle
     | Repeat
     | Slice
-    | ShardByHost
     | Interleave
     | BatchStage
     | Pack
@@ -530,9 +524,6 @@ class Dataset:
 
     def slice(self, selection: slice) -> Pipeline:
         return self.then(Slice(selection))
-
-    def shard_by_host(self) -> Pipeline:
-        return self.then(ShardByHost())
 
     def interleave(self, cycle_length: int = 16) -> Pipeline:
         return self.then(Interleave(cycle_length))
