@@ -764,11 +764,14 @@ class Server:
         The admission's rows come group by group, as the slots do, and each
         names its slot within its group.
         """
-        now = time.perf_counter()
         size, share = self.slots // self.groups, self.admission // self.groups
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
                 for group in range(self.groups)]
-        for slot, row in self.rows.seat(self._queue, free, share):
+        seated = self.rows.seat(self._queue, free, share)
+        # After seating: a request another thread submitted while the queue
+        # was read is seated too, and is admitted after it was submitted.
+        now = time.perf_counter()
+        for slot, row in seated:
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row
