@@ -22,10 +22,10 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures
-from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
+from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -143,19 +143,20 @@ class Decide:
     def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya (`LayaCheckpoint`) or Clef (`ClefCheckpoint`) checkpoint as a task.
+        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
+        checkpoint (`JointCheckpoint`) as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
-        `rl_agent_config.json`; Clef ships none. Either answers with Jev's
-        confidence; `replace(task, confidence=...)` selects Laya's
-        (`EntropyConfidence`) or Clef's (`TopProbability`).
+        `rl_agent_config.json`; a joint-head release ships none. Either
+        answers with Jev's confidence; `replace(task, confidence=...)` selects
+        Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
         label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and ClefCheckpoint.exists(name, revision=revision):
-            clef = ClefCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                       attention_impl=attention_impl)
-            return cls(clef.model, clef.variables, JointLayout(), clef.tokenizer, clef.specials, name=label,
-                       processor=clef.processor)
+        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
+            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
+                                           attention_impl=attention_impl)
+            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
+                       name=label, processor=release.processor)
         checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl)
         choice, score, noul = checkpoint.temperatures
@@ -264,7 +265,7 @@ class Decide:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
         Images need a layout with a place for them (`Layout.image`) and the
-        backbone's processor, as a Clef release brings.
+        backbone's processor, as a joint-head release brings.
         """
         return self._seen(state, questions, images)[0] if images else self.batch([(state, questions)])[0][0]
 
@@ -509,7 +510,7 @@ class Decide:
         reports whether it abstained when the calibration gates, and `usage` reports
         how much of the state it kept.
 
-        Beyond Jev's fields a request may carry `images`, as Clef's does: a list of
+        Beyond Jev's fields a request may carry `images`: a list of
         images, each a PIL image, encoded image bytes, or a base64 string, bare or as
         a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
         extension fields are dropped and the response holds Jev's fields alone.

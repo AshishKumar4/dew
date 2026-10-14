@@ -193,7 +193,11 @@ delta = ["deltalake>=1.0"]
 # as part of that continuation.
 eval-harness = ["lm_eval>=0.4.10"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.
-tfds = ["tensorflow-datasets>=4.9.10"]
+# tensorflow-datasets 4.9.10 checks paths against `importlib_resources.abc.Traversable`
+# (core/utils/resource_utils, through etils' lazy imports) but declares the
+# backport for Python < 3.9 only, so a 3.12 environment lacks it; it goes when
+# tfds declares it or reads importlib.resources.
+tfds = ["tensorflow-datasets>=4.9.10", "importlib_resources"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
 # PyTorch on the host, never for a JAX computation: unpickling pytorch_model.bin

@@ -14,13 +14,16 @@ import json
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.artifacts import ImageGrid
+from dew.data.dataset import DataPartition
 from dew.eval import FID
+
+FLOWERS = "datasets/nkirschi/oxford-flowers@a37b1891609c0376fa81eced756e7863e1bd873b"
+"""Oxford Flowers 102 as published Parquet on the Hub, at a pinned commit."""
 
 INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "tiny"
                   / "inception_v3_fid.safetensors")
@@ -233,20 +236,25 @@ def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
     photographs score close, unrelated noise scores far.
 
     Measured on Oxford Flowers at 64px with the released weights, 64 images a
-    side: 123 between halves against 505 for noise. The absolute number is
+    side (TFDS's copy, bilinear): 123 between halves against 505 for noise. The absolute number is
     finite-sample bias, not the distance between the halves, and it falls with
     the sample count on the same photographs: 176 at 16 a side, 89 at 128, 63
     at 256, 41 at 512, while noise stays near 500 throughout. A comparison
     therefore needs the consumed population counts alongside its FID value.
     """
-    tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+    from dew.config.data import ImageData, loader
+    from dew.data import Loading
     from dew.inputs import unit_range
 
-    source = tfds.data_source("oxford_flowers102", split="all", try_gcs=False)
-    photos = np.stack([
-        np.asarray(jax.image.resize(jnp.asarray(source[index]["image"], jnp.float32),
-                                    (64, 64, 3), method="bilinear"))
-        for index in range(128)]).astype(np.uint8)
+    # Oxford Flowers' published Parquet copy, read and resized by dew.data's image recipe: no
+    # dataset preparation, which TFDS runs through TensorFlow.
+    data = loader(ImageData(source=f"hf://{FLOWERS}", image_size=64, augment=None), batch=128,
+                  read="streamed", seed=0, loading=Loading(workers=0, threads=1, read_buffer=2))
+    stream = data.train(DataPartition())
+    try:
+        photos = np.asarray(next(stream)["image"])
+    finally:
+        stream.close()
     metric = FID()
     first, second = photos[:64], photos[64:]
     noise = jax.random.normal(jax.random.PRNGKey(1), (64, 64, 64, 3)).clip(-1.0, 1.0)
