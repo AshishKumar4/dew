@@ -152,6 +152,40 @@ def test_a_partial_carries_its_array_configuration_without_recompiling(model):
     np.testing.assert_array_equal(np.asarray(draw(second).tokens)[0, 3:], [7, 7, 7])
 
 
+def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(model):
+    """A temperature, a filter's mass, a penalty and a length or count reach
+    the walk as data (`decoding.as_pytree`): other values of every one draw
+    from the program the first values compiled, and draw differently."""
+    from dew.sampling import text
+
+    module, params = model
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    eos = jnp.asarray([0], jnp.int32)
+
+    def draw(scale, budget):
+        chain = (decoding.RepetitionPenalty(scale), decoding.PromptRepetitionPenalty(scale),
+                 decoding.FrequencyPenalty(scale - 1), decoding.PresencePenalty(scale - 1),
+                 decoding.MinLength(budget + 1, eos), decoding.MinNewTokens(budget - 2, eos),
+                 decoding.BeginSuppressTokens(eos, budget - 3), decoding.ForcedBOS(budget),
+                 decoding.ExponentialDecayLengthPenalty(budget - 2, 1 + scale / 10, eos),
+                 decoding.ForcedEOS(eos, 3 + budget), decoding.Typical(1 / scale),
+                 decoding.EpsilonCutoff(1e-4 * scale), decoding.EtaCutoff(1e-4 * scale),
+                 decoding.TopH(1 / scale), decoding.Temperature(scale), decoding.TopP(1 / scale),
+                 decoding.MinP(0.01 * scale))
+        return generate(module, params, prompt, 6, key=jax.random.key(0), logits=chain,
+                        stopping=(decoding.MaxNewTokens(budget), decoding.MaxLength(4 + budget)))
+
+    first = draw(1.0, 4)
+    compiled = text._compiled(None)
+    traced = compiled._cache_size()
+    second = draw(1.5, 5)
+    assert compiled._cache_size() == traced
+    np.testing.assert_array_equal(np.asarray(first.lengths), [4])
+    np.testing.assert_array_equal(np.asarray(second.lengths), [5])
+    assert not np.allclose(np.asarray(first.behavior_log_probs)[:, :4],
+                           np.asarray(second.behavior_log_probs)[:, :4])
+
+
 def test_an_explicit_chain_runs_in_the_order_it_is_written(model):
     """A chain is complete and ordered. The bias is sized so that adding it
     before the temperature divides picks the runner-up and adding it after
