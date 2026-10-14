@@ -56,10 +56,10 @@ def _only_when(due, taken, kept, operand):
 
     XLA's conditional simplifier judges a branch by its ops' kinds, not their
     size: one of elementwise ops and reductions, an optimizer update among
-    them, it runs on every call and selects (`TryRemoveConditional`). On Qwen3.5-0.8B
-    that ran the whole AdamW update on every microbatch, about 44 ms of a
-    731 ms step on an A100. The barrier, an op it counts as expensive, keeps
-    the branch a branch.
+    them, it runs on every call and selects (`TryRemoveConditional`). In a
+    Qwen3.5-0.8B fine-tune at 8 x 3072, bf16, that ran the whole AdamW
+    update on every microbatch, about 44 ms of a 731 ms step on an A100. The
+    barrier, an op it counts as expensive, keeps the branch a branch.
     """
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
 

@@ -40,6 +40,22 @@ class TinyHead(nn.Module):
         return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
 
 
+class TinyLogits(nn.Module):
+    """`TinyHead`'s map as a model that gives its logits from its tokens
+    alone (`Logits`): no states and no head over them to score."""
+
+    vocab_size: int
+
+    def setup(self):
+        self.policy = TinyHead(self.vocab_size)
+
+    def logits(self, tokens, train: bool = False, **packing):
+        return self.policy(tokens, train=train)
+
+    def __call__(self, tokens, train: bool = False, **packing):
+        return self.logits(tokens, train=train)
+
+
 def token_mean(x, mask):
     """verl's token-mean aggregation, `agg_loss(loss_agg_mode="token-mean")`,
     which is how GRPO reduces these terms: masked values out before the

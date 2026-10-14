@@ -52,7 +52,7 @@ from dew.nn.precision import (
     rounded_to,
     rounds_to_bf16,
 )
-from dew.nn.protocols import AffineHead, HiddenStates, LogitsFromHidden, OutputTable
+from dew.nn.protocols import AffineHead, HiddenStates, Logits, LogitsFromHidden, OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -126,14 +126,35 @@ def reads_states(model) -> bool:
     return isinstance(model, HiddenStates) and isinstance(model, AffineHead | LogitsFromHidden)
 
 
-def model_logits(model, variables, hidden) -> jax.Array:
-    """`model`'s logits of its final states `hidden` over `variables`: the
-    matrix `AffineHead.output_table` gives (`OutputTable.logits`), or the model's exact head
-    (`LogitsFromHidden`) where no matrix alone is the head."""
+def refuse_without_logits(model, objective: str) -> None:
+    """Refuse a model `objective` reads no logits from: no head over its final
+    states (`reads_states`) and no logits from its tokens (`Logits`)."""
+    if not reads_states(model) and not isinstance(model, Logits):
+        raise TypeError(
+            f"{objective} scores a model's logits, and a {type(model).__name__} gives none: no head over "
+            f"its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+
+
+def final_read(model, variables, *args, **kwargs):
+    """`model.apply(variables, *args, **kwargs)` reading what a loss scores:
+    the final states of a model that scores them through a head
+    (`reads_states`), else the logits it gives from its tokens (`Logits`)."""
+    return model.apply(variables, *args, method="hidden_states" if reads_states(model) else "logits",
+                       **kwargs)
+
+
+def model_logits(model, variables, read) -> jax.Array:
+    """`model`'s logits of what `final_read` gave over `variables`: of its
+    final states, the matrix `AffineHead.output_table` gives
+    (`OutputTable.logits`), or the model's exact head (`LogitsFromHidden`)
+    where no matrix alone is the head; a model that gives its logits from
+    its tokens gave them already."""
+    if not reads_states(model):
+        return read
     table = head_table(model, variables)
     if table is None:
-        return model.apply(variables, hidden, method="logits_from_hidden")
-    return table.logits(hidden)
+        return model.apply(variables, read, method="logits_from_hidden")
+    return table.logits(read)
 
 
 def _without(logits, first, excluded):
@@ -719,11 +740,11 @@ _fused.defvjp(_fused_fwd, _fused_bwd)
 FUSED_LOGIT_BYTES = 2 << 30
 """The fp32 logits one chunk of `fused_head_loss` holds, when no tile asks
 for fewer tokens: the most tokens, a power of two, whose logits fit. On an
-A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320, 12288 tokens,
-bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against 1024's 129.3 and
-56.3 and 4096's 126.3, and at the 8B's (4096 wide, 128256, 4096 tokens)
-the one chunk this allows took 58.1 ms on the A100 against 2048's 70.8
-(tools/benchmark_lm_head.py fused)."""
+A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320,
+12288 tokens, bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against
+1024's 129.3 and 56.3 and 4096's 126.3, and at the 8B's (4096 wide,
+128256, 4096 tokens) the one chunk this allows took 58.1 ms on the A100
+against 2048's 70.8 (tools/benchmark_lm_head.py fused)."""
 
 
 def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -> int:
@@ -787,23 +808,25 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     return jnp.sum(shares), terms
 
 
-def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
+def head_cross_entropy(model, variables, read, targets, chunks: int, *,
                        tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
                        temperature: float = 1.0, excluded: int | None = None) -> Terms:
-    """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
+    """The cross entropy of what `final_read` gave, `read`, against `targets`.
 
-    The head is the matrix `AffineHead.output_table` gives, its bias,
-    softcap and precision included. Where no matrix alone is the head (a
-    prediction head past the final states, an adapter's factors on it), the
-    model's exact logits (`LogitsFromHidden`) are scored whole: that holds
-    the fp32 `[..., vocab]` logits for the backward pass, a vocabulary-sized
-    row per token, which the tiled head never does.
+    Final states are scored through `model`'s head over `variables`
+    (`chunked_cross_entropy`): the matrix `AffineHead.output_table` gives,
+    its bias, softcap and precision included. Where no matrix alone is the
+    head (a prediction head past the final states, an adapter's factors on
+    it), the model's exact logits (`LogitsFromHidden`), and the logits a
+    model gives from its tokens, are scored whole: that holds the fp32
+    `[..., vocab]` logits for the backward pass, a vocabulary-sized row per
+    token, which the tiled head never does.
     """
-    table = head_table(model, variables)
+    table = head_table(model, variables) if reads_states(model) else None
     if table is not None:
-        return chunked_cross_entropy(hidden, table, targets, chunks, tile=tile, predict=predict,
+        return chunked_cross_entropy(read, table, targets, chunks, tile=tile, predict=predict,
                                      temperature=temperature, excluded=excluded)
-    return logits_cross_entropy(model.apply(variables, hidden, method="logits_from_hidden"), targets,
+    return logits_cross_entropy(model_logits(model, variables, read), targets,
                                 predict=predict, temperature=temperature, excluded=excluded)
 
 
