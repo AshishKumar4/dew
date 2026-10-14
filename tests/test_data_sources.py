@@ -599,15 +599,16 @@ def test_a_source_exports_the_records_its_pipeline_exports():
 
     from dew.data import from_torch
 
-    stored = from_torch(TensorDataset(torch.arange(5)), fields=("id",), identity="five@1")
+    stored = from_torch(TensorDataset(torch.arange(10).reshape(5, 2)), fields=("id",), identity="five@1")
 
     def exported(values) -> list:
         root = f"memory://export-{uuid4().hex}"
         export(values, root, rows_per_shard=2)
         files = Files(root, format="parquet")
-        return [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
+                for row in files.manifest().reader(shard)]
 
-    assert exported(stored) == exported(stored.chain()) == [{"id": index} for index in range(5)]
+    assert exported(stored) == exported(stored.chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
