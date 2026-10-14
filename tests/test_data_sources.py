@@ -1904,3 +1904,25 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
         with pytest.raises(ValueError):
             Files(url, file_info={url: stale}).fingerprint()
+
+
+def test_provisioning_a_store_again_replaces_the_index_a_reader_has_mapped(tmp_path):
+    """Provisioning a token store again replaces its document index rather than rewriting it in
+    place. A rewrite truncated the file first, so a reader that had mapped it, in this process or
+    another sharing the disk, faulted (SIGBUS) on any page past the cut while it was written;
+    replaced, the old file stays whole under the reader's mapping."""
+    import os
+
+    from token_support import write_token_corpus
+
+    from dew.data.sources import TokenFiles
+
+    stream = np.tile(np.array([5, 6, 7, 255], np.uint16), 64)
+    write_token_corpus(tmp_path, stream, eos_id=255)
+    store = TokenFiles(str(tmp_path)).provision()
+    index = Path(store.document_index.url)
+    mapped = np.load(index, mmap_mode="r")
+    original = os.stat(index).st_ino
+    TokenFiles(str(tmp_path)).provision()
+    assert os.stat(index).st_ino != original
+    assert mapped.tolist() == np.load(index).tolist() == list(range(4, 257, 4))

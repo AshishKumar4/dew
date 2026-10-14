@@ -433,9 +433,20 @@ class Store:
         return size
 
     def write(self, payload: bytes) -> None:
+        """Write `payload` here whole, replacing what was. A local file is replaced, not
+        rewritten in place: a rewrite truncates it first, and a reader that mapped it, a
+        store's document index say, faults (SIGBUS) on any page past the cut until the
+        write ends. An object store replaces an object whole already."""
         fs, path = self.resolve()
         fs.makedirs(fs._parent(path), exist_ok=True)
-        fs.pipe_file(path, payload)
+        if not local(fs):
+            fs.pipe_file(path, payload)
+            return
+        with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
+            pending.write(payload)
+            pending.flush()
+            os.fsync(pending.fileno())
+        os.replace(pending.name, path)
 
     def verified(self, payload: bytes) -> ObjectInfo:
         self.put_if_absent(payload)
