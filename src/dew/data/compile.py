@@ -622,6 +622,11 @@ def _compile_phases(
                 "streamed, rejecting and online-packed phases are refused"
             )
         end = None if until is None else until * loaded.batch
+        if built and loaded.device != built[0][0].device:
+            # The run applies one set of device steps to every batch (`Loader.device`), so a phase
+            # whose own differ would run the first phase's.
+            raise ValueError(f"phase {index} ends in other device steps than phase 0; every phase of "
+                             f"a run runs the same ones, written after the phases")
         built.append((loaded, end))
         if end is not None:
             _delivered(pipeline, end - previous, consumed)
@@ -815,6 +820,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
     combined: Batch = {}
+    conflicted: set[str] = set()
     slots: dict[str, int] = {}
     for pipeline in pipelines:
         for _, source in _leaves(pipeline):
@@ -828,8 +834,10 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                 elif key not in combined:
                     combined[key] = value
                 elif combined[key] != value:
-                    combined.pop(key, None)
-    return {**combined, "slots": slots} if slots else combined
+                    # A fact two sources state differently is no fact of the run, whatever a third states.
+                    conflicted.add(key)
+    shared = {key: value for key, value in combined.items() if key not in conflicted}
+    return {**shared, "slots": slots} if slots else shared
 
 
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
