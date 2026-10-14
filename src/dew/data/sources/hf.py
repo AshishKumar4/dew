@@ -123,7 +123,7 @@ class HF(Dataset):
         return None
 
 
-def class_names(features: Mapping[str, Any] | None) -> dict[str, tuple[str, ...]]:
+def class_names(features: Mapping[str, object] | None) -> dict[str, tuple[str, ...]]:
     """The names of each `ClassLabel` feature's classes, by feature, which a
     configured caption reads in place of the label's number."""
     from datasets import ClassLabel
