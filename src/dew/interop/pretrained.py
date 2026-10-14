@@ -1090,11 +1090,12 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str
+def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str, *, media: bool
              ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray]]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
-    integer formats' grid."""
+    integer formats' grid. `media` is whether the loader reads the source as
+    a media wrapper (`_media_wrapper`)."""
     quantization = source_quantization(config)
     if quantization is None:
         return tensors, (), None, {}
@@ -1104,7 +1105,8 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     aliases: tuple[tuple[str, str], ...] = ()
     if param_dtype != "float32":
         aliases = decoders.validate_source_aliases(
-            quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
+            quantization.tensor_names(tensors), partial(quantization.read, tensors, set(quantized_tensors)),
+            config, media=media)
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
     return tensors, quantized_tensors, scale_dtype, grid
@@ -1282,10 +1284,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    tensors, quantized_tensors, scale_dtype, grid = _decoded(
-        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype)
-    export_adapter = None
     media = _media_wrapper(config)
+    tensors, quantized_tensors, scale_dtype, grid = _decoded(
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype, media=media)
+    export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 
