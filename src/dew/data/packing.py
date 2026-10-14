@@ -90,18 +90,16 @@ def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
 
 @dataclasses.dataclass(frozen=True)
 class PackingPlan:
-    """The plan a generation publishes for `pack`, cutting its documents where
-    a chunk step before the pack says to (`chunked`) and refusing to otherwise."""
+    """The plan a generation publishes for `pack`, which places its documents
+    whole: a chunk step in the cached prefix cuts them first."""
 
     pack: Pack
-    chunked: bool = False
 
     def __call__(self, generation: Generation) -> Mapping[str, np.ndarray]:
         lengths = generation.source().lengths()
         if lengths is None:
             raise ValueError("published packing needs certified per-document lengths")
-        if not self.chunked:
-            refuse_overlong(lengths, self.pack, generation.url)
+        refuse_overlong(lengths, self.pack, generation.url)
         planned = plan_windows(lengths, self.pack)
         return {plan_name(self.pack, field): value for field, value in planned.items()}
 
@@ -124,7 +122,8 @@ class _Published:
         return self.generation.url
 
     def refuse_cuts(self) -> None:
-        """Refuse a published plan that cut a document, which an unchunked pack does not."""
+        """Refuse a plan that cut a document, as one published before packs placed
+        documents whole may have: an unchunked pack does not cut."""
         if self.generation.plan(plan_name(self.pack, "offsets")).any():
             raise ValueError(
                 f"{self.generation.url} published windows that cut its documents, which its pack "

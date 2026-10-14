@@ -749,7 +749,9 @@ def test_memory_windows_and_packing_never_reread_the_store(stores, monkeypatch, 
     recipe = TextData(source=stored, pack=pack, seq_len=7, packing_bins=2)
     train, _, _ = recipe.pipelines()
     if pack is not None:
-        assert train.source is stored and len(train.stages) == 1
+        from dew.data.pipeline import FlatMap, Pack
+
+        assert train.source is stored and [type(stage) for stage in train.stages] == [FlatMap, Pack]
     data = loader(recipe,
                   batch=2, read="memory",
                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
