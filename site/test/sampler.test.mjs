@@ -331,6 +331,39 @@ test('a session the bridge ends says why, through the socket that closes', { tim
 	await page.close();
 });
 
+test('a session the page closes itself says so, not that the kernel stopped', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	const closed = Promise.withResolvers();
+	await page.routeWebSocket(SOCKET, (socket) => {
+		// As the bridge's websockets server answers a page's close: with the page's code and reason.
+		socket.onClose((code, reason) => {
+			socket.close({ code, reason });
+			closed.resolve(code);
+		});
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			socket.send(JSON.stringify({ id: message.id, type: 'display', png: PNG }));
+			socket.send(JSON.stringify({ id: message.id, type: 'done', status: 'ok', count: 1 }));
+		});
+	});
+	await page.goto(`${site.url}sample/`);
+	await page.locator('[data-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-status]').textContent.startsWith('The cell ran'));
+	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+	assert.equal(await closed.promise, 4000);
+	// The answer reaches the page's close listener within a few tasks; give it far longer.
+	await page.waitForTimeout(500);
+	assert.equal(await page.locator('[data-status]').textContent(), 'The kernel was closed. Press Run to start a new one.');
+	await page.close();
+});
+
 test('a stale model revision asks for a reload instead of showing a traceback', async () => {
 	const page = await browser.newPage();
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({

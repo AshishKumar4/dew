@@ -163,7 +163,8 @@ export class LiveSession {
 	}
 
 	close(): void {
-		this.socket.close(1000, 'done');
+		// The bridge answers with the page's code, which the close listener knows as the page's own.
+		this.socket.close(4000, 'done');
 	}
 }
 
