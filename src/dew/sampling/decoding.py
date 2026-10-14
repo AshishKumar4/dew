@@ -9,8 +9,10 @@ finished flag; criteria combine with OR after every committed token. A
 Transforms and criteria read `StepState`, which holds the token history and
 nothing about the model: no parameters and no cache. Every built-in here is a
 pytree, so a configuration holding arrays crosses `jax.jit` as data instead of
-entering a compilation cache key. A plain function works as well, and
-`jax.tree_util.Partial` can hold array configuration for one.
+entering a compilation cache key, and so do its numbers where they fix no
+shape (`as_pytree`): another temperature, penalty or length runs the same
+program. A plain function works as well, and `jax.tree_util.Partial` can hold
+array configuration for one.
 
 The numerical reference is Transformers 5.16.1
 `generation/logits_process.py` and `generation/stopping_criteria.py`, with two
@@ -228,30 +230,20 @@ class Greedy:
                          point, logits)
 
 
-# `as_pytree` binds each of these to its scalar as a `LogitsTransform`; none
-# reads the step state, which the chain hands every transform.
-def _temperature(value: float, state: StepState, logits: jax.Array) -> jax.Array:
-    return logits / value
+class _Numerical:
+    """A built-in whose numbers fix no shape. `as_pytree` passes it as
+    `numerical()`, its `apply` with those numbers bound as data, so another
+    value runs the program the first compiled; the built-in applies alike."""
 
+    def numerical(self) -> jax.tree_util.Partial:
+        raise NotImplementedError
 
-def _top_p(excluded_mass: float, state: StepState, logits: jax.Array) -> jax.Array:
-    order = jnp.argsort(logits, axis=-1, stable=True)
-    ascending = jnp.take_along_axis(logits, order, axis=-1)
-    tail = jnp.cumsum(jax.nn.softmax(ascending), axis=-1) <= excluded_mass
-    tail = tail.at[:, -1].set(False)
-    rows = jnp.arange(logits.shape[0])[:, None]
-    removed = jnp.zeros_like(tail).at[rows, order].set(tail)
-    return jnp.where(removed, FILTER, logits)
-
-
-def _min_p(p: float, state: StepState, logits: jax.Array) -> jax.Array:
-    probabilities = jax.nn.softmax(logits)
-    cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * p
-    return jnp.where(probabilities < cutoff, FILTER, logits)
+    def __call__(self, state: StepState, values: jax.Array) -> jax.Array:
+        return self.numerical()(state, values)
 
 
 @struct.dataclass
-class Temperature:
+class Temperature(_Numerical):
     """Divides the logits by `value`, as `TemperatureLogitsWarper`."""
 
     value: float = struct.field(pytree_node=False, default=1.0)
@@ -259,8 +251,12 @@ class Temperature:
     def __post_init__(self) -> None:
         _positive("temperature", self.value)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _temperature(self.value, state, logits)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(Temperature.apply, self.value)
+
+    @staticmethod
+    def apply(value: float, state: StepState, logits: jax.Array) -> jax.Array:
+        return logits / value
 
 
 @struct.dataclass
@@ -279,7 +275,7 @@ class TopK:
 
 
 @struct.dataclass
-class TopP:
+class TopP(_Numerical):
     """Nucleus filtering, as `TopPLogitsWarper`.
 
     The ascending tail holding cumulative mass at most `1 - p` is removed and
@@ -291,12 +287,23 @@ class TopP:
     def __post_init__(self) -> None:
         _unit("top_p", self.p)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _top_p(1.0 - self.p, state, logits)
+    def numerical(self) -> jax.tree_util.Partial:
+        # The tail's mass is subtracted on the host, as the reference does, before it is traced.
+        return jax.tree_util.Partial(TopP.apply, 1.0 - self.p)
+
+    @staticmethod
+    def apply(excluded_mass: float, state: StepState, logits: jax.Array) -> jax.Array:
+        order = jnp.argsort(logits, axis=-1, stable=True)
+        ascending = jnp.take_along_axis(logits, order, axis=-1)
+        tail = jnp.cumsum(jax.nn.softmax(ascending), axis=-1) <= excluded_mass
+        tail = tail.at[:, -1].set(False)
+        rows = jnp.arange(logits.shape[0])[:, None]
+        removed = jnp.zeros_like(tail).at[rows, order].set(tail)
+        return jnp.where(removed, FILTER, logits)
 
 
 @struct.dataclass
-class MinP:
+class MinP(_Numerical):
     """Relative filtering at `p` times the top probability, as `MinPLogitsWarper`."""
 
     p: float = struct.field(pytree_node=False, default=0.0)
@@ -304,12 +311,18 @@ class MinP:
     def __post_init__(self) -> None:
         _unit("min_p", self.p)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _min_p(self.p, state, logits)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(MinP.apply, self.p)
+
+    @staticmethod
+    def apply(p: float, state: StepState, logits: jax.Array) -> jax.Array:
+        probabilities = jax.nn.softmax(logits)
+        cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * p
+        return jnp.where(probabilities < cutoff, FILTER, logits)
 
 
 @struct.dataclass
-class Typical:
+class Typical(_Numerical):
     """Locally typical filtering, as `TypicalLogitsWarper`."""
 
     mass: float = struct.field(pytree_node=False, default=1.0)
@@ -317,7 +330,11 @@ class Typical:
     def __post_init__(self) -> None:
         _unit("typical_p", self.mass)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(Typical.apply, self.mass)
+
+    @staticmethod
+    def apply(mass: float, state: StepState, logits: jax.Array) -> jax.Array:
         normalized = jax.nn.log_softmax(logits)
         probabilities = jnp.exp(normalized)
         entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities),
@@ -326,7 +343,7 @@ class Typical:
         order = jnp.argsort(shifted, axis=-1, stable=True)
         sorted_shift = jnp.take_along_axis(shifted, order, axis=-1)
         cumulative = jnp.cumsum(jax.nn.softmax(jnp.take_along_axis(logits, order, axis=-1)), axis=-1)
-        last = jnp.clip(jnp.sum(cumulative < self.mass, axis=-1), 0, logits.shape[-1] - 1)
+        last = jnp.clip(jnp.sum(cumulative < mass, axis=-1), 0, logits.shape[-1] - 1)
         removed = sorted_shift > jnp.take_along_axis(sorted_shift, last[:, None], axis=-1)
         removed = removed.at[:, 0].set(False)
         rows = jnp.arange(logits.shape[0])[:, None]
@@ -335,7 +352,7 @@ class Typical:
 
 
 @struct.dataclass
-class EpsilonCutoff:
+class EpsilonCutoff(_Numerical):
     """Removes tokens below an absolute probability, as `EpsilonLogitsWarper`."""
 
     epsilon: float = struct.field(pytree_node=False, default=0.0)
@@ -343,32 +360,42 @@ class EpsilonCutoff:
     def __post_init__(self) -> None:
         _unit("epsilon_cutoff", self.epsilon)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(EpsilonCutoff.apply, self.epsilon)
+
+    @staticmethod
+    def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
         best = jnp.max(logits, axis=-1, keepdims=True)
-        removed = (jax.nn.softmax(logits) < self.epsilon) & (logits < best)
+        removed = (jax.nn.softmax(logits) < epsilon) & (logits < best)
         return jnp.where(removed, FILTER, logits)
 
 
 @struct.dataclass
-class EtaCutoff:
-    """Entropy-scaled cutoff, as `EtaLogitsWarper`."""
+class EtaCutoff(_Numerical):
+    """Entropy-scaled cutoff, as `EtaLogitsWarper`, which takes the square
+    root of its float32 epsilon on the device."""
 
     epsilon: float = struct.field(pytree_node=False, default=0.0)
 
     def __post_init__(self) -> None:
         _unit("eta_cutoff", self.epsilon)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(EtaCutoff.apply, self.epsilon)
+
+    @staticmethod
+    def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
         normalized = jax.nn.log_softmax(logits)
         probabilities = jnp.exp(normalized)
         entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities), axis=-1)
-        eta = jnp.minimum(self.epsilon, math.sqrt(self.epsilon) * jnp.exp(-entropy))[:, None]
+        cutoff = jnp.asarray(epsilon, jnp.float32)
+        eta = jnp.minimum(cutoff, jnp.sqrt(cutoff) * jnp.exp(-entropy))[:, None]
         best = jnp.max(logits, axis=-1, keepdims=True)
         return jnp.where((probabilities < eta) & (logits < best), FILTER, logits)
 
 
 @struct.dataclass
-class TopH:
+class TopH(_Numerical):
     """Entropy-budget filtering, as `TopHLogitsWarper`.
 
     Tokens enter in probability order while the cumulative entropy of the
@@ -391,12 +418,16 @@ class TopH:
         if _unit("top_h", self.fraction) <= 0:
             raise ValueError("top_h must be finite and above zero up to one")
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(TopH.apply, self.fraction)
+
+    @staticmethod
+    def apply(fraction: float, state: StepState, logits: jax.Array) -> jax.Array:
         head, index = lax.top_k(logits, min(100, logits.shape[-1]))
         normalized = head - jax.scipy.special.logsumexp(head, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(normalized)
         budget = -jnp.sum(jnp.maximum(normalized, jnp.finfo(head.dtype).min) * probabilities,
-                          axis=-1, keepdims=True) * self.fraction
+                          axis=-1, keepdims=True) * fraction
         selected = jnp.cumsum(-probabilities * jnp.log(probabilities), axis=-1) <= budget
         selected = selected.at[:, 0].set(True)
         rows = jnp.arange(logits.shape[0])[:, None]
@@ -425,7 +456,7 @@ class RemoveInvalidValues:
 
 
 @struct.dataclass
-class RepetitionPenalty:
+class RepetitionPenalty(_Numerical):
     """Divides the positive scores of seen tokens by the penalty and multiplies negative ones.
 
     The history is the row's valid prompt and drawn tokens, as
@@ -437,13 +468,17 @@ class RepetitionPenalty:
     def __post_init__(self) -> None:
         _positive("repetition_penalty", self.penalty)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(RepetitionPenalty.apply, self.penalty)
+
+    @staticmethod
+    def apply(penalty: float, state: StepState, logits: jax.Array) -> jax.Array:
         seen = _present(state.tokens, state.valid, logits.shape[-1])
-        return jnp.where(seen, _scaled(logits, self.penalty), logits)
+        return jnp.where(seen, _scaled(logits, penalty), logits)
 
 
 @struct.dataclass
-class PromptRepetitionPenalty:
+class PromptRepetitionPenalty(_Numerical):
     """Raises the scores of prompt tokens, as `EncoderRepetitionPenaltyLogitsProcessor`.
 
     The reference inverts its argument, so a penalty above one rewards
@@ -455,10 +490,15 @@ class PromptRepetitionPenalty:
     def __post_init__(self) -> None:
         _positive("encoder_repetition_penalty", self.penalty)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        # The reference's inversion, on the host.
+        return jax.tree_util.Partial(PromptRepetitionPenalty.apply, 1.0 / self.penalty)
+
+    @staticmethod
+    def apply(inverted: float, state: StepState, logits: jax.Array) -> jax.Array:
         width = state.prompt_width
         seen = _present(state.tokens[:, :width], state.valid[:, :width], logits.shape[-1])
-        return jnp.where(seen, _scaled(logits, 1.0 / self.penalty), logits)
+        return jnp.where(seen, _scaled(logits, inverted), logits)
 
 
 def _scaled(logits: jax.Array, penalty: float) -> jax.Array:
@@ -466,7 +506,7 @@ def _scaled(logits: jax.Array, penalty: float) -> jax.Array:
 
 
 @struct.dataclass
-class FrequencyPenalty:
+class FrequencyPenalty(_Numerical):
     """Subtracts `penalty` times each token's count among the drawn tokens.
 
     This is vLLM's formula, `logits -= frequency_penalties * output_bin_counts`
@@ -476,14 +516,18 @@ class FrequencyPenalty:
 
     penalty: float = struct.field(pytree_node=False, default=0.0)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(FrequencyPenalty.apply, self.penalty)
+
+    @staticmethod
+    def apply(penalty: float, state: StepState, logits: jax.Array) -> jax.Array:
         width = state.prompt_width
         counts = _counts(state.tokens[:, width:], state.valid[:, width:], logits.shape[-1])
-        return logits - self.penalty * counts
+        return logits - penalty * counts
 
 
 @struct.dataclass
-class PresencePenalty:
+class PresencePenalty(_Numerical):
     """Subtracts `penalty` from every token already drawn.
 
     This is vLLM's `logits -= presence_penalties * output_mask`, which is also
@@ -492,10 +536,14 @@ class PresencePenalty:
 
     penalty: float = struct.field(pytree_node=False, default=0.0)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(PresencePenalty.apply, self.penalty)
+
+    @staticmethod
+    def apply(penalty: float, state: StepState, logits: jax.Array) -> jax.Array:
         width = state.prompt_width
         seen = _present(state.tokens[:, width:], state.valid[:, width:], logits.shape[-1])
-        return logits - self.penalty * seen.astype(logits.dtype)
+        return logits - penalty * seen.astype(logits.dtype)
 
 
 @struct.dataclass
@@ -625,7 +673,7 @@ class SuppressTokens:
 
 
 @struct.dataclass
-class BeginSuppressTokens:
+class BeginSuppressTokens(_Numerical):
     """Removes tokens at one generated position, as `SuppressTokensAtBeginLogitsProcessor`.
 
     The reference suppresses where the sequence still has its prompt width, so
@@ -636,8 +684,12 @@ class BeginSuppressTokens:
     tokens: jax.Array
     offset: int = struct.field(pytree_node=False, default=0)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        removed = _membership(self.tokens, logits.shape[-1])[None, :] & (state.step == self.offset)[:, None]
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(BeginSuppressTokens.apply, self.tokens, self.offset)
+
+    @staticmethod
+    def apply(tokens: jax.Array, offset: int, state: StepState, logits: jax.Array) -> jax.Array:
+        removed = _membership(tokens, logits.shape[-1])[None, :] & (state.step == offset)[:, None]
         return jnp.where(removed, FILTER, logits)
 
 
@@ -646,17 +698,21 @@ def _membership(tokens: jax.Array, vocab: int) -> jax.Array:
 
 
 @struct.dataclass
-class ForcedBOS:
+class ForcedBOS(_Numerical):
     """Forces one token as the first of the whole sequence, as `ForcedBOSTokenLogitsProcessor`."""
 
     token: int = struct.field(pytree_node=False, default=0)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _forced(logits, self.token, state.total() == 1)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(ForcedBOS.apply, self.token)
+
+    @staticmethod
+    def apply(token: int, state: StepState, logits: jax.Array) -> jax.Array:
+        return _forced(logits, token, state.total() == 1)
 
 
 @struct.dataclass
-class ForcedEOS:
+class ForcedEOS(_Numerical):
     """Forces EOS one step before the end, as `ForcedEOSTokenLogitsProcessor`.
 
     `eos` may name several ids, all of which the forced step allows, as the
@@ -670,10 +726,14 @@ class ForcedEOS:
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
     max_length: int | None = struct.field(pytree_node=False, default=None)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        rows = (state.step == state.budgets() - 1 if self.max_length is None
-                else state.total() == self.max_length - 1)
-        only = jnp.where(_membership(self.eos, logits.shape[-1])[None, :], 0.0, FILTER)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(ForcedEOS.apply, self.eos, self.max_length)
+
+    @staticmethod
+    def apply(eos: jax.Array, max_length: int | None, state: StepState, logits: jax.Array) -> jax.Array:
+        rows = (state.step == state.budgets() - 1 if max_length is None
+                else state.total() == max_length - 1)
+        only = jnp.where(_membership(eos, logits.shape[-1])[None, :], 0.0, FILTER)
         return jnp.where(rows[:, None], only, logits)
 
 
@@ -683,25 +743,33 @@ def _forced(logits: jax.Array, token: int, rows: jax.Array) -> jax.Array:
 
 
 @struct.dataclass
-class MinLength:
+class MinLength(_Numerical):
     """Suppresses EOS until the whole sequence reaches `length`, as `MinLengthLogitsProcessor`."""
 
     length: int = struct.field(pytree_node=False, default=0)
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _suppress_eos(logits, self.eos, state.total() < self.length)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(MinLength.apply, self.length, self.eos)
+
+    @staticmethod
+    def apply(length: int, eos: jax.Array, state: StepState, logits: jax.Array) -> jax.Array:
+        return _suppress_eos(logits, eos, state.total() < length)
 
 
 @struct.dataclass
-class MinNewTokens:
+class MinNewTokens(_Numerical):
     """Suppresses EOS until `count` tokens are drawn, as `MinNewTokensLengthLogitsProcessor`."""
 
     count: int = struct.field(pytree_node=False, default=0)
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _suppress_eos(logits, self.eos, state.step < self.count)
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(MinNewTokens.apply, self.count, self.eos)
+
+    @staticmethod
+    def apply(count: int, eos: jax.Array, state: StepState, logits: jax.Array) -> jax.Array:
+        return _suppress_eos(logits, eos, state.step < count)
 
 
 def _suppress_eos(logits: jax.Array, eos: jax.Array, rows: jax.Array) -> jax.Array:
@@ -709,7 +777,7 @@ def _suppress_eos(logits: jax.Array, eos: jax.Array, rows: jax.Array) -> jax.Arr
 
 
 @struct.dataclass
-class ExponentialDecayLengthPenalty:
+class ExponentialDecayLengthPenalty(_Numerical):
     """Raises the EOS score after `start` drawn tokens, as `ExponentialDecayLengthPenalty`.
 
     The reference measures from `start_index + prompt_width`, which is the
@@ -725,10 +793,14 @@ class ExponentialDecayLengthPenalty:
     def __post_init__(self) -> None:
         _positive("exponential_decay_length_penalty factor", self.factor)
 
-    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        index = jnp.maximum(state.step - self.start, 0)
-        growth = jnp.where(state.step > self.start, self.factor ** index.astype(jnp.float32) - 1.0, 0.0)
-        selected = _membership(self.eos, logits.shape[-1])[None, :]
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(ExponentialDecayLengthPenalty.apply, self.start, self.factor, self.eos)
+
+    @staticmethod
+    def apply(start: int, factor: float, eos: jax.Array, state: StepState, logits: jax.Array) -> jax.Array:
+        index = jnp.maximum(state.step - start, 0)
+        growth = jnp.where(state.step > start, factor ** index.astype(jnp.float32) - 1.0, 0.0)
+        selected = _membership(eos, logits.shape[-1])[None, :]
         return logits + jnp.where(selected & jnp.isfinite(logits), jnp.abs(logits) * growth[:, None], 0.0)
 
 
@@ -743,7 +815,7 @@ class EndOfSequence:
 
 
 @struct.dataclass
-class MaxNewTokens:
+class MaxNewTokens(_Numerical):
     """Finishes a row once it has drawn `count` tokens."""
 
     count: int = struct.field(pytree_node=False, default=0)
@@ -752,12 +824,16 @@ class MaxNewTokens:
         if type(self.count) is not int or self.count < 0:
             raise ValueError("max new tokens must be a non-negative integer")
 
-    def __call__(self, state: StepState, tokens: jax.Array) -> jax.Array:
-        return state.step >= self.count
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(MaxNewTokens.apply, self.count)
+
+    @staticmethod
+    def apply(count: int, state: StepState, tokens: jax.Array) -> jax.Array:
+        return state.step >= count
 
 
 @struct.dataclass
-class MaxLength:
+class MaxLength(_Numerical):
     """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`."""
 
     length: int = struct.field(pytree_node=False, default=0)
@@ -766,8 +842,12 @@ class MaxLength:
         if type(self.length) is not int or self.length < 0:
             raise ValueError("max length must be a non-negative integer")
 
-    def __call__(self, state: StepState, tokens: jax.Array) -> jax.Array:
-        return state.total() >= self.length
+    def numerical(self) -> jax.tree_util.Partial:
+        return jax.tree_util.Partial(MaxLength.apply, self.length)
+
+    @staticmethod
+    def apply(length: int, state: StepState, tokens: jax.Array) -> jax.Array:
+        return state.total() >= length
 
 
 @struct.dataclass
@@ -873,18 +953,15 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
 def as_pytree(value: LogitsTransform) -> LogitsTransform:
     """`value` in a form `jax.jit` accepts as data.
 
-    Validated scalar policies lower to partials whose numerical arguments
-    are dynamic leaves. Other built-ins retain their registered pytrees.
+    A built-in whose numbers fix no shape lowers to its `apply` with them
+    bound as dynamic leaves (`_Numerical`): a temperature, a filter's mass, a
+    penalty, a length or count. Other built-ins retain their registered
+    pytrees, with what fixes a shape (a top-k width, an n-gram size) static.
     A plain function is wrapped in a Partial that keeps the function static
     and its bound arguments as data; strategies use that same callable rule.
     """
-    if type(value) is Temperature:
-        return jax.tree_util.Partial(_temperature, value.value)
-    if type(value) is TopP:
-        # Match the public callable's host subtraction before scalar tracing.
-        return jax.tree_util.Partial(_top_p, 1.0 - value.p)
-    if type(value) is MinP:
-        return jax.tree_util.Partial(_min_p, value.p)
+    if isinstance(value, _Numerical):
+        return value.numerical()
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 

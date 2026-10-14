@@ -27,7 +27,6 @@ value head.
 """
 
 import functools
-import math
 from collections.abc import Sequence
 from typing import overload
 
@@ -54,6 +53,7 @@ from .sharding import (
     RESIDUAL,
     MeshAxes,
     constrain,
+    grouped_heads,
     logical_axes,
     logical_spec,
     manual_map,
@@ -783,10 +783,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     blocked = functools.partial(_blocked_rule, max_segments=max_segments)
     if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
         return blocked(query, key, value, g, beta, state, starts)
-    spec = logical_spec(HEADS, value.shape)
-    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
-    if key.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
-        heads = None
+    rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
     return manual_map(blocked, (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
