@@ -14,7 +14,7 @@ import queue
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import jax
@@ -805,7 +805,7 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
     return jax.tree.map(leaf_sharding, batch)
 
 
-def shard_batch(mesh: Mesh, batch: Batch, reads: Sequence[bool] | None = None) -> Batch:
+def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, ...]] | None = None) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
     The placed batch owns its memory because reader buffers are borrowed until
@@ -825,10 +825,15 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Sequence[bool] | None = None) -
     drew. One process changes nothing and keeps the omission the fused
     attention kernel wants.
 
-    `reads`, in the leaf order of its device fields (`device_fields`), says which leaves the step reads
-    (`Trainer`'s, from its executable's pruned inputs); one it does not read
-    stays a host copy of its own, no transfer made, the reader's buffer still
-    released at the next read. None places every leaf.
+    `reads` holds, by the signature of a batch as placed (`batch_signature`
+    of what this returns), which of its leaves the step compiled for it reads
+    (`step_reads`); one it does not read stays on the host, no transfer
+    made, the reader's buffer still released at the next read: a copy of its
+    own where this process holds every row, else a stand-in of the placed
+    shape, which the executable checks and drops, its values unread. A
+    batch whose placed signature it lacks is placed whole. The lookup is
+    here, where the placed shapes are made, so the step that publishes a
+    mask and the placement that reads it name one batch alike.
 
     The rule is deliberately local. Placement runs on
     `DevicePrefetchIterator`'s worker thread while the step's collectives run
@@ -843,15 +848,24 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Sequence[bool] | None = None) -
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     leaves, tree = jax.tree.flatten(batch)
-    reads = (True,) * len(leaves) if reads is None else tuple(reads)
-    if len(reads) != len(leaves):
-        raise ValueError(f"a batch of {len(leaves)} leaves, and {len(reads)} said which the step reads")
-    held = {index: np.array(leaf, copy=True) for index, (leaf, read) in enumerate(zip(leaves, reads,
-                                                                                       strict=True))
-            if not read and not isinstance(leaf, jax.Array)}
+    count = DataPartition.of(mesh).count
+
+    def placed(shape: tuple[int, ...]) -> tuple[int, ...]:
+        # The share holds whole rows: `count` shares make the rows, and every other dimension is whole.
+        return (shape[0] * count, *shape[1:]) if shape else ()
+
+    signature = tree, tuple(jax.ShapeDtypeStruct(placed(np.shape(leaf)), jnp.result_type(leaf))
+                            for leaf in leaves)
+    read = (reads or {}).get(signature, (True,) * len(leaves))
+    # An unread leaf is still an argument the executable checks against the placed shapes before it
+    # drops it, so in a pool, whose process holds a share of the rows, it is a zero-cost stand-in
+    # of the placed shape; a process that holds every row keeps its own copy.
+    held = {index: np.array(leaf, copy=True) if placed(np.shape(leaf)) == np.shape(leaf)
+            else np.broadcast_to(np.zeros((), np.asarray(leaf).dtype), placed(np.shape(leaf)))
+            for index, (leaf, kept) in enumerate(zip(leaves, read, strict=True))
+            if not kept and not isinstance(leaf, jax.Array)}
     moving = [leaf if isinstance(leaf, jax.Array) else np.array(leaf, copy=True) if cpu else np.asarray(leaf)
               for index, leaf in enumerate(leaves) if index not in held]
-    count = DataPartition.of(mesh).count
     every: list[NamedSharding] = jax.tree.leaves(batch_shardings(mesh, batch))
     shardings = [sharding for index, sharding in enumerate(every) if index not in held]
     if jax.process_count() == 1:
@@ -861,12 +875,8 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Sequence[bool] | None = None) -
         moved = iter(jax.device_put(moving, shardings))
     else:
         def place(leaf, sharding: NamedSharding) -> jax.Array:
-            # The share holds whole rows: `count` shares make the rows, and every
-            # other dimension is already whole, so a device of a sequence or a
-            # stage that spans processes picks its own slice out of it.
-            shape = np.shape(leaf)
-            return jax.make_array_from_process_local_data(
-                sharding, leaf, (shape[0] * count, *shape[1:]) if shape else ())
+            # A device of a sequence or a stage that spans processes picks its own slice out of it.
+            return jax.make_array_from_process_local_data(sharding, leaf, placed(np.shape(leaf)))
 
         moved = iter([place(leaf, sharding) for leaf, sharding in zip(moving, shardings, strict=True)])
     return tree.unflatten([held[index] if index in held else next(moved) for index in range(len(leaves))])
@@ -950,9 +960,9 @@ class DevicePrefetchIterator:
 
     `prepare`, when supplied, transforms the source's host batch before
     placement, on the same worker and after its checkpoint position is read.
-    `reads` holds, by batch signature (`batch_signature`), which leaves a
-    compiled step reads (`step_reads`); a batch of a signature it lacks, its
-    step not yet compiled, is placed whole (`shard_batch`).
+    `reads` holds, by the placed batch's signature, which leaves a compiled
+    step reads (`step_reads`); a batch of a signature it lacks, its step not
+    yet compiled, is placed whole (`shard_batch`).
     Analytical per-row telemetry therefore travels with its own batch and
     never requires a synchronous device-to-host read in the step loop.
 
@@ -1061,7 +1071,7 @@ class DevicePrefetchIterator:
                 with region("data.place"):
                     if self._prepare is not None:
                         batch = self._prepare(batch)
-                    placed = shard_batch(mesh, batch, self._reads.get(batch_signature(device_fields(batch))))
+                    placed = shard_batch(mesh, batch, self._reads)
                 batch = None
                 with region("data.enqueue"):
                     while not self._stop.is_set():

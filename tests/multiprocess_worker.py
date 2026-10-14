@@ -467,6 +467,30 @@ class Recording:
         self._source.close()
 
 
+def mode_reads(args) -> dict:
+    """A field no step reads stays on the host in a pool too: the mask the step
+    publishes under its placed batch's signature is the one placement finds,
+    though each process places a share of the rows."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.training import MeshSpec
+    from dew.training.distributed import batch_signature, shard_batch, step_reads
+
+    mesh = MeshSpec().build()
+    rows = len(mesh.local_devices)
+    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
+    first = shard_batch(mesh, batch)
+    step = jax.jit(lambda state, batch: state + jnp.sum(batch["x"]))
+    compiled = step.lower(jnp.zeros(()), first).compile()
+    placed = shard_batch(mesh, batch, {batch_signature(first): step_reads(compiled)})
+    return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
+            "unused_on_host": isinstance(placed["unused"], np.ndarray),
+            "unused_shape": list(np.shape(placed["unused"])),
+            "x_placed": isinstance(placed["x"], jax.Array),
+            "sum": float(compiled(jnp.zeros(()), placed))}
+
+
 def mode_packed_fit(args) -> dict:
     """`--steps` steps of a real fit over the packed training stream, with
     the windows this process read.
@@ -2330,7 +2354,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "whole_validation": mode_whole_validation,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
-         "packed_fit": mode_packed_fit,
+         "packed_fit": mode_packed_fit, "reads": mode_reads,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
          "decoding_components": mode_decoding_components,
