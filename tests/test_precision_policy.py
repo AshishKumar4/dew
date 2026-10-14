@@ -389,6 +389,26 @@ def test_a_rounding_survives_the_reduction_it_feeds(helper):
     assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
+def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
+    """Chained `compensated_add`s keep the pair renormalised: after -1 and 63 additions of -2^-25,
+    each a quarter of a float32 step of the running sum and so lost from a plain one, the high half
+    is the exact sum rounded once and the low half what that rounding dropped."""
+    from dew.nn import precision
+    tokens = np.full(64, -2.0 ** -25, np.float32)
+    tokens[0] = -1
+    zero = jnp.zeros((), jnp.float32)
+
+    def running(values):
+        return jax.lax.fori_loop(0, 64, lambda i, total: precision.compensated_add(total, (values[i], zero)),
+                                 (zero, zero))
+
+    high, low = (np.asarray(x) for x in jax.jit(running)(tokens))
+    exact = -1 - 63 * 2.0 ** -25
+    assert np.cumsum(tokens, dtype=np.float32)[-1] == -1
+    assert high == np.float32(exact)
+    assert np.float64(high) + np.float64(low) == exact
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
