@@ -194,8 +194,6 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
-        # The plan reads the test cache with a token that cannot write it.
-        DEW_TEST_CACHE_TOKEN: ${{ secrets.DEW_TEST_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
       run: |
         armada="bunx --bun $ARMADA"
