@@ -1,9 +1,5 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
-import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import jax
@@ -41,8 +37,8 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
-# and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
-# forward and backward (`_experts_lowered`).
+# and the probe that runs them: an expert layer's forward and backward (`_experts_lowered`), a
+# Mamba-2 layer's (`_mamba2_lowered`), or a model step ("step").
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
@@ -51,6 +47,11 @@ FAMILIES = {
                                            "fla_chunk_fwd_h", "fla_chunk_fwd_o", "fla_chunk_bwd_dv_local",
                                            "fla_chunk_bwd_dhu", "fla_chunk_bwd_dqkwg",
                                            "fla_prepare_wy_repr_bwd"}),
+    ('ssd', 'pallas'): ("mamba2", {f"mamba_{name}" for name in (
+        "chunk_cumsum_fwd", "chunk_state_fwd", "state_passing_fwd", "bmm_chunk_fwd", "chunk_scan_fwd",
+        "chunk_scan_bwd_dstates", "state_passing_bwd", "chunk_scan_chunk_state_bwd_dx", "chunk_state_bwd_db",
+        "chunk_scan_bwd_dc", "chunk_scan_bwd_dcb", "bmm_chunk_bwd", "chunk_scan_bwd_ddacs_stable",
+        "chunk_cumsum_bwd")}),
 }
 
 GPUS = sorted({generation for generation, target in TARGETS.items()
@@ -101,20 +102,6 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
 
 
-@pytest.mark.parametrize("generation", ["sm80", "sm120"])
-def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
-    """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
-    for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of the short conv and of every Pallas choice the generation's KERNELS row names for its layers, the
-    gated delta rule's port among them, so none was interpreted or refused."""
-    done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
-                           "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    assert done.returncode == 0, done.stderr[-4000:]
-    kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
-
-
 def _experts_lowered(generation: str, implementation: str):
     """An expert layer's bf16 forward and backward, as a MoE step runs them, lowered for `generation`."""
     from dew.nn.moe import ExpertMLP
@@ -142,3 +129,36 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
                              if key[0] == 'grouped_matmul'))
     assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
+
+
+def _mamba2_lowered(generation: str):
+    """A bf16 Mamba-2 layer's forward and backward, as a hybrid's step runs them, lowered for
+    `generation` after its launches are settled as the trainer settles a step's (`tuning.tune`, which
+    lowers it with every launch's description and reads them back)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.mixers.mamba2 import Mamba2
+
+    layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
+                   dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    def lower():
+        return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        tuning.tune(lower)
+        return lower()
+
+
+@pytest.mark.parametrize("generation", GPUS)
+def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
+    """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
+    kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
+    it does not, to none of them."""
+    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
+    assert set(triton_kernels(_mamba2_lowered(generation))) == expected

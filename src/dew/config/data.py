@@ -16,7 +16,8 @@ from dew.data.holdout import HoldOut, SourceValue, Split, Validation, _branches,
 from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, ObjectiveData, Phases, Pipeline, mix
 
 if TYPE_CHECKING:
-    from dew.data.cache import Cache, Generation
+    from dew.data.cache import Cache
+    from dew.data.generation import Generation
 from dew.data import audio, images, video
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
@@ -85,7 +86,7 @@ class TextData:
             raise ValueError("packing_bins must be positive")
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.sources.files import TokenFiles
+        from dew.data.sources.tokens import TokenFiles
 
         if self.phases:
             if self.source:
