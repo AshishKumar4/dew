@@ -88,7 +88,7 @@ def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
     with open(media["clip"], "rb") as file:
         clip = file.read()
     rows = [{"mp4": clip if index % 2 else media["clip"], "id": index} for index in range(8)]
-    chain = (Memory(rows).filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
+    chain = (Memory(rows).random_filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
              .filter_map(video.decode(8, fps=FPS, size=32))
              .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS))
              .select_columns("clip", "video", "audio", "audio_valid"))
@@ -109,7 +109,7 @@ def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
 
 def test_a_sound_file_reads_through_the_same_stages(media):
     chain = (Memory([{"wav": media["sound"], "id": index} for index in range(4)])
-             .filter_map(video.pick_clip(0.5, field="wav"))
+             .random_filter_map(video.pick_clip(0.5, field="wav"))
              .filter_map(audio.decode(SAMPLE_RATE, field="wav")))
 
     for record in _records(chain):
@@ -158,10 +158,10 @@ def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
 def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_raise(media):
     rows = [{"mp4": media["clip"], "id": 0}, {"mp4": b"not a clip" * 64, "id": 1}]
 
-    assert _records(Memory(rows).filter_map(video.pick_clip(3.0))) == []
+    assert _records(Memory(rows).random_filter_map(video.pick_clip(3.0))) == []
     with pytest.raises(ValueError):
         dataclasses.replace(video.pick_clip(3.0), rejects=False).random_map(rows[0], np.random.default_rng(0))
-    picked = _records(Memory(rows).filter_map(video.pick_clip(1.0)))
+    picked = _records(Memory(rows).random_filter_map(video.pick_clip(1.0)))
     assert [int(record["id"]) for record in picked] == [0]
     with pytest.raises(ValueError):
         video.decode(10, fps=FPS).map({"mp4": media["clip"], "clip": np.asarray([0.0, 8 / FPS])})
@@ -170,7 +170,7 @@ def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_r
 def test_a_clip_that_fits_its_window_exactly_is_read(media):
     """Twelve frames hold an eight-frame window two frames clear of either end in one place only."""
     chain = (Memory([{"mp4": media["exact"], "id": 0}])
-             .filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
+             .random_filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
              .filter_map(video.decode(8, fps=FPS, size=32))
              .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS)))
 

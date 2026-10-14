@@ -119,9 +119,9 @@ data = compile(train, validation=held, read="memory", loading=Loading(workers=0)
 
 Validation is finite and never inherits a training repeat or augmentation stage. `validation_records=N` on spec `.load()` caps accepted evaluation records, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
 
-`map_batch(step)` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
+`map(step)` after `batch` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to spec `.load()`. Without a caption reader, the default host stage removes strings before device transfer.
+For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to spec `.load()`. Without a caption reader, string fields stay on the host, where metrics read them: the prefetcher places only the fields a device holds.
 
 ## Text, chat and packing
 
@@ -173,7 +173,7 @@ Run configurations select this with --trainer.batch-size None, --trainer.batch-t
 
 `Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout and packing steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
 
-Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers`, `prefetch` and `map_batch` to choose that order. A global shuffle requires an indexed pipeline, and a host batch step requires batching first.
+Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers` and `prefetch` to choose that order; a `map` after `batch` is a host step on the training batch. A global shuffle requires an indexed pipeline.
 
 ## Cache and storage publication
 

@@ -607,10 +607,10 @@ def _checked(
             workers = True
         if isinstance(stage, MapBatch):
             if not batched:
-                raise ValueError(f"map_batch in {name} must follow batch")
+                raise ValueError(f"the host batch step in {name} must follow batch")
             host = True
         elif host and not isinstance(stage, (Workers, Prefetch)):
-            raise ValueError(f"{type(stage).__name__} in {name} follows the host map_batch stage")
+            raise ValueError(f"{type(stage).__name__} in {name} follows a host batch step")
         prefix.append(stage)
     return per_share
 

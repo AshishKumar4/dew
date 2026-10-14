@@ -17,7 +17,7 @@ trainer.fit(train.shuffle(seed=0).batch(64), validation=val.batch(64), epochs=1)
 ```mermaid
 flowchart LR
   S["Source<br/>Files · Hub · TFDS · Memory<br/>from_hf · from_torch · from_grain · from_iter"]
-  R["Per-record functions<br/>map · random_map · filter<br/>filter_map · flat_map"]
+  R["Per-record functions<br/>map · random_map · filter<br/>filter_map · random_filter_map · flat_map"]
   X["Cross-record verbs<br/>pack · shuffle · mix · concat<br/>interleave · schedule · holdout · cache"]
   B["batch(n)<br/>the global training batch"]
   T["Trainer<br/>host share from the mesh<br/>device prefetch"]
@@ -44,6 +44,7 @@ Three types, six function shapes.
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
 | `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
+| `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
 | `DatasetFn` | `(Dataset, *settings) -> Dataset` | `pipe(fn, *settings)` | any |
 
@@ -56,7 +57,9 @@ flowchart TD
   Rn -- no --> M["map"]
   Rn -- yes --> RM["random_map"]
   D -- "yes, a yes/no test" --> FI["filter"]
-  D -- "yes, while transforming" --> FM["filter_map"]
+  D -- "yes, while transforming" --> Rt{"Random?"}
+  Rt -- no --> FM["filter_map"]
+  Rt -- yes --> RFM["random_filter_map"]
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
@@ -82,7 +85,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
 | Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
@@ -246,7 +249,7 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 ```python
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
-           .random_map(video.pick_clip(seconds=2.0))       # writes one start/stop descriptor
+           .random_filter_map(video.pick_clip(seconds=2.0))  # writes one start/stop descriptor
            .filter_map(video.decode(frames=32, fps=16, size=256))            # reads the descriptor
            .filter_map(audio.decode(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
