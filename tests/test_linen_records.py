@@ -62,8 +62,8 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
                       "params": flax.serialization.to_bytes(params).hex(), "x": np.asarray(x).tolist()}
         expected[name] = [np.asarray(model.apply(params, x)).tobytes().hex(), sorted(params["params"])]
     root = Path(__file__).resolve().parents[1]
-    env = {**os.environ, "JAX_PLATFORMS": "cpu",
-           "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    # The fresh process runs on the lane's backend, under its flags, as this one does: the same bits.
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
     done = subprocess.run([sys.executable, "-c", REBUILD], input=json.dumps(held), capture_output=True,
                           text=True, env=env, timeout=300, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
