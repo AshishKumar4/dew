@@ -113,6 +113,19 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
 
 
 @pytest.mark.distributed
+
+def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
+    """Each process places its share of the rows, so a batch as placed is
+    bigger than as read; the read mask is found by the placed signature, and
+    the step runs on the batch with its unread field left on the host."""
+    for report in run_pool("reads", tmp_path / "out", 2):
+        # The batch as read has a share of the rows, so its own signature names no mask.
+        assert report["read_differs_from_placed"]
+        assert report["unused_on_host"] and report["x_placed"]
+        # A stand-in of the placed rows, which the executable checks and drops.
+        assert report["unused_shape"] == [DEVICES]
+        assert report["sum"] == 3 * DEVICES
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus, timeout=60)
@@ -1059,6 +1072,24 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
         worker.mixed_validity_trainer(2),
         {"text": ModelInputs(jnp.asarray(worker.token_batch()))})["update"]
     assert relative_difference(unmasked, reference) > 1e-2
+
+
+@pytest.mark.distributed
+def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
+    """The frozen FP8 sites decide which kernels a rank's train state holds
+    packed, so process 0 decides them for the pool: on CPUs it refuses for
+    want of FP8 tensor cores and its peer hears of it at the agreement,
+    deciding nothing itself. A tree that lacks a site on process 1 alone is
+    refused there and heard of on process 0, and both pass the next
+    agreement."""
+    reports = run_pool("fp8_sites", tmp_path / "pool", 2, timeout=180)
+    unsupported = [report["unsupported"] for report in reports]
+    assert unsupported[0].startswith("ValueError") and "no FP8 tensor cores" in unsupported[0]
+    assert unsupported[1].startswith("PeerFailure")
+    missing = [report["missing"] for report in reports]
+    assert missing[0].startswith("PeerFailure")
+    assert missing[1].startswith("ValueError") and "frozen FP8 site narrow" in missing[1]
+    assert [report["after"] for report in reports] == [True, True]
 
 
 @pytest.mark.distributed

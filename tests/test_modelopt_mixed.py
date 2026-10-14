@@ -67,3 +67,30 @@ def test_a_mixed_export_keeps_its_source_codes_and_layer_table(mixed, tmp_path):
     reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     actual = reloaded.model.apply(reloaded.variables, reference['ids'].astype(np.int32))
     assert_as_exact_as_the_reference(actual, reference['logits'], reference['logits_f64'], 'mixed export')
+
+
+def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tmp_path):
+    """The mixed table quantizes the projections alone, so a tied source's
+    dense lm_head.weight is read as stored and checked against the
+    embedding before the bfloat16 cast: an equal copy loads as the source
+    without it does, and an unequal one is refused."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    tensors = read_weights(FIXTURE)
+    config = json.loads((FIXTURE / 'config.json').read_text())
+    embedding = tensors['model.embed_tokens.weight']
+    without = Pretrained.load(FIXTURE, dtype='float32', param_dtype='bfloat16', attention_impl='reference')
+
+    for name, head in (('equal', embedding.copy()), ('unequal', embedding + 1)):
+        directory = tmp_path / name
+        save_hf_layout({**tensors, 'lm_head.weight': head}, config, directory)
+        (directory / 'hf_quant_config.json').write_text((FIXTURE / 'hf_quant_config.json').read_text())
+    copied = Pretrained.load(tmp_path / 'equal', dtype='float32', param_dtype='bfloat16',
+                             attention_impl='reference')
+    assert jax.tree.structure(copied.variables) == jax.tree.structure(without.variables)
+    for ours, theirs in zip(jax.tree.leaves(copied.variables), jax.tree.leaves(without.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError, match=r'lm_head\.weight is not the embedding'):
+        Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16',
+                        attention_impl='reference')
