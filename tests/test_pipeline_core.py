@@ -4,6 +4,7 @@ import dataclasses
 import importlib
 import itertools
 import json
+import multiprocessing
 import os
 from uuid import uuid4
 
@@ -97,18 +98,33 @@ def test_global_position_resumes_across_share_counts_with_rng():
     assert joined == expected
 
 
-def test_host_steps_are_branch_scoped_and_common_steps_run_on_both():
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
     prefix = Pipeline(source(8))
     data = compile(prefix.batch(4).map(Shift(10)), validation=prefix.batch(4),
-                   host=(Shift(100),), loading=READ)
+                   host=(Shift(100),), read=read, loading=READ)
     train = data.train(DataPartition())
     held = data.val(DataPartition())
     try:
         assert take(train, 1)[0]["id"] == [110, 111, 112, 113]
+        saved = train.get_state()
+        expected = take(train, 2)
+        if read != "streamed":
+            assert train.records == 12
+            assert train.order == json.loads(saved)["dew_global_position"]["order"]
         assert take(held, 1)[0]["id"] == [100, 101, 102, 103]
     finally:
         train.close()
         held.close()
+    train.close()
+    with pytest.raises(StopIteration):
+        next(train)
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert take(resumed, 2) == expected
+    finally:
+        resumed.close()
 
 
 def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
@@ -193,6 +209,29 @@ def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(
     rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
     compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
     assert chosen == [4]
+
+
+def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
+    """A held pass of two batches starts two worker processes though training
+    reads with four: a third and a fourth would read nothing, yet each would
+    import the program and keep its pipes until the reader is collected."""
+    started = []
+    start = multiprocessing.context.SpawnProcess.start
+
+    def counted(process):
+        started.append(process)
+        start(process)
+
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", counted)
+    prefix = Pipeline(source(8))
+    data = compile(prefix.repeat().batch(4), validation=prefix.batch(4),
+                   loading=Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1))
+    reader = data.val(DataPartition())
+    try:
+        assert [row["id"].tolist() for row in reader] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    finally:
+        reader.close()
+    assert len(started) == 2
 
 
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
@@ -464,6 +503,80 @@ def test_causal_windows_keep_each_boundary_target_and_restore_carry():
     assert take(resumed, 10) == rest
     reader.close()
     resumed.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_causal_windows_reject_per_document_field_drift_in_every_read(read):
+    stored = Memory([
+        {"text": np.asarray([1, 2], np.int32), "roles": np.asarray([10], np.int8)},
+        {"text": np.asarray([3], np.int32), "roles": np.asarray([20, 30], np.int8)},
+    ])
+    windows = Pipeline(stored).windows(2, fields=("text", "roles"))
+    with pytest.raises(ValueError):
+        list(iterate(windows, read=read, loading=READ))
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_chunk_statistics_count_fanout_per_input_document_and_resume(read, filtered):
+    from dew.data.steps.text import Chunks
+
+    stored = Memory([
+        {"text": np.arange(1, 8, dtype=np.int32)},
+        {"text": np.arange(11, 15, dtype=np.int32)},
+    ])
+    pipeline = Pipeline(stored, name="chunks").flat_map(Chunks(3, overlap=1))
+    if filtered:
+        pipeline = pipeline.filter(lambda row: len(row["text"]) == 3, identity="full-chunk@1")
+    data = compile(pipeline.repeat(1).batch(1), read=read, loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        first = take(reader, 1)
+        saved = reader.get_state()
+        rest = take(reader, 10)
+        metrics = dict(data.statistics())
+        expected = [
+            [1, 2, 3], [3, 4, 5], [5, 6, 7], [11, 12, 13], [13, 14],
+        ]
+        assert [row["text"][0] for row in first + rest] == (expected[:-1] if filtered else expected)
+        assert metrics["data/chunks_per_record/chunks"] == 2.5
+    finally:
+        reader.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert take(resumed, 10) == rest
+        assert data.statistics()["data/chunks_per_record/chunks"] == 2.5
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("stride", [1, 2, 3, 7])
+def test_aligned_causal_windows_share_spans_and_resume_across_document_edges(read, stride):
+    text = np.arange(1, 15, dtype=np.int32)
+    roles = text + 100
+    cuts = (0, 2, 3, 3, 8, 14)
+    stored = Memory([{"text": text[start:stop], "roles": roles[start:stop]}
+                     for start, stop in itertools.pairwise(cuts)])
+    pipeline = Pipeline(stored).windows(2, stride=stride, fields=("text", "roles")).repeat(1).batch(1)
+    data = compile(pipeline, read=read, loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        first = take(reader, 1)
+        saved = reader.get_state()
+        rest = take(reader, 20)
+        assert first + rest == [{"text": [text[start:start + 3].tolist()],
+                                 "roles": [roles[start:start + 3].tolist()]}
+                                for start in range(0, len(text) - 2, stride)]
+    finally:
+        reader.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert take(resumed, 20) == rest
+    finally:
+        resumed.close()
 
 
 def test_validation_takes_accepted_rows_before_the_share_cut():
@@ -854,7 +967,8 @@ def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
     published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
                         Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3), batch=2,
+    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3,
+                           eos=False, token_holdout=None), batch=2,
                   cache=published,
                 read="indexed", loading=READ)
     assert data.plan is not None
