@@ -329,13 +329,18 @@ class HostExecution:
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
-        # The objective owns the program, which its fit ladder replaces with its model. The dataset's
-        # device steps run in it, on the accelerator, before the loss; its name says which they are.
-        self.forward = objective._compiled_program(
-            "host_forward" + "".join(f" then {_named(step)}" for step in device),
-            functools.partial(_forward, functools.partial(_after, device, objective._loss)),
-            static_argnames=("layout",))
+        self.device = device
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
+
+    @property
+    def forward(self):
+        """The loss and its pullback, compiled for the objective's modules as they are now: the
+        objective owns the program, which its fit ladder replaces with its model. The dataset's
+        device steps run in it, on the accelerator, before the loss; its name says which they are."""
+        return self.objective.program(
+            "host_forward" + "".join(f" then {_named(step)}" for step in self.device),
+            functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
+            static_argnames=("layout",))
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.

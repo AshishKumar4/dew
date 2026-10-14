@@ -101,12 +101,6 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     return jnp.where(jnp.asarray(positions) >= 0, index, 1)
 
 
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    ("o_proj",): ("attention", "embed"),
-})
 class _Masking(NamedTuple):
     """`CausalSelfAttention._masking`'s result: the kernel's operands and
     the visibility they are read under."""
@@ -122,6 +116,15 @@ class _Masking(NamedTuple):
     cursor: jax.Array | None
 
 
+@logical_axes({
+    ("q_proj",): ("embed", "heads"),
+    ("k_proj",): ("embed", "kv"),
+    ("v_proj",): ("embed", "kv"),
+    # The output gate's own projection (`gate_projection='own'`) is per head
+    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
+    ("self_attn", "gate_proj"): ("embed", "heads"),
+    ("o_proj",): ("attention", "embed"),
+})
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
@@ -176,6 +179,11 @@ class CausalSelfAttention(nn.Module):
     attn_logit_softcap: float | None = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
     k_eq_v: bool = False  # Gemma 4's global layers project no values: the raw keys, values-normed
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
+    gate_projection: Literal['query', 'own'] = 'query'
+    """Where the output gate comes from: the doubled query projection
+    (Qwen3.5), or a `gate_proj` of its own over the layer's input (Muse
+    Glimmer, modeling_muse_glimmer.py:305, 351). Either way the branch
+    multiplies by its sigmoid."""
     partial_rotary_factor: float | None = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     dtype: Dtype | None = None
@@ -251,6 +259,8 @@ class CausalSelfAttention(nn.Module):
             self.k_proj = dense(projections['k_proj'][1], name='k_proj')
             if not self.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
+        if 'gate_proj' in projections:
+            self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False)
         self.o_proj = dense(projections['o_proj'][1], name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias),
             **normal_kernel(self.init_std if self.output_init_std is None else self.output_init_std))
@@ -313,9 +323,12 @@ class CausalSelfAttention(nn.Module):
         # The gate doubles the query projection: the reference chunks its
         # output in half, one half the query and the other the gate the
         # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
-        query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        doubled = self.output_gate and self.gate_projection == 'query'
+        query = self.num_heads * self.head_dim * (2 if doubled else 1)
         sites = {'q_proj': (self.emb_features, query),
                  'o_proj': (self.num_heads * self.value_dim, self.emb_features)}
+        if self.output_gate and self.gate_projection == 'own':
+            sites['gate_proj'] = (self.emb_features, self.num_heads * self.head_dim)
         if not self.kv_shared:
             sites['k_proj'] = (self.emb_features, self.num_kv_heads * self.head_dim)
             if not self.k_eq_v:
@@ -514,7 +527,7 @@ class CausalSelfAttention(nn.Module):
         if whole:
             projected = self.q_norm(projected)
         gate = None
-        if self.output_gate:
+        if self.output_gate and self.gate_projection == 'query':
             # The reference views the doubled output as [.., heads, 2*head_dim]
             # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
             query, gate = jnp.split(
@@ -522,6 +535,9 @@ class CausalSelfAttention(nn.Module):
                 2, axis=-1)
         else:
             query = projected.reshape(B, S, self.num_heads, self.head_dim)
+        if self.output_gate and self.gate_projection == 'own':
+            gate = checkpoint_name(self.gate_proj(x), 'output_gate')
+            gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         if self.kv_shared:
             key, value, positions = self._shared_kv(kv_store)
         else:
@@ -1016,7 +1032,7 @@ class AttentionMixer(MixerBase):
     (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'output_gate', 'o_proj', 'context')
 
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
@@ -1030,6 +1046,11 @@ class AttentionMixer(MixerBase):
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
+    gate_projection: Literal['query', 'own'] = 'query'
+    """Where the decoder's output gate comes from (`CausalSelfAttention.gate_projection`)."""
+    qk_norm_weight: bool = True
+    """Whether the decoder's qk norm has a weight (`CausalSelfAttention.qk_norm_weight`): Muse
+    Glimmer's has none (modeling_muse_glimmer.py:307)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
     mixed_step = True
