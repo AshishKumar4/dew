@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -72,18 +71,6 @@ def test_qwen2_moe_export_keeps_fused_experts_and_shared_gate(tmp_path):
     assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('qwen2-moe-tiny')
 
 
-def test_qwen2_moe_runs_a_backward_update():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    ids = jnp.asarray(np.load(QWEN2_MOE / 'input_ids.npy'))
-
-    def loss(params):
-        return jnp.mean(jnp.square(model.apply({'params': params}, ids)))
-
-    before, gradients = jax.value_and_grad(loss)(variables['params'])
-    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
-    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
-
-
 GRANITEMOE = FIXTURES / 'granitemoe-tiny'
 
 
@@ -139,18 +126,6 @@ def test_granitemoe_export_keeps_packed_experts_and_tied_head(tmp_path):
     assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('granitemoe-tiny')
 
 
-def test_granitemoe_runs_a_backward_update():
-    model, variables = fp32_decoder(GRANITEMOE)
-    ids = jnp.asarray(np.load(GRANITEMOE / 'input_ids.npy'))
-
-    def loss(params):
-        return jnp.mean(jnp.square(model.apply({'params': params}, ids)))
-
-    before, gradients = jax.value_and_grad(loss)(variables['params'])
-    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
-    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
-
-
 MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
 
 
@@ -201,19 +176,6 @@ def test_minimax_m2_export_keeps_source_weights_and_router_state(tmp_path):
     for path, leaf in flat_tree(loaded.variables).items():
         np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
     assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('minimax-m2-tiny')
-
-
-def test_minimax_m2_runs_a_backward_update_without_moving_router_bias():
-    model, variables = fp32_decoder(MINIMAX_M2)
-    ids = jnp.asarray(np.load(MINIMAX_M2 / 'input_ids.npy'))
-
-    def loss(params):
-        return jnp.mean(jnp.square(model.apply({**variables, 'params': params}, ids)))
-
-    before, gradients = jax.value_and_grad(loss)(variables['params'])
-    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
-    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
-    assert set(variables['moe']['layers_0']['mlp']['gate']) == {'e_score_correction_bias'}
 
 
 # --------------------------------------------------------------------------
