@@ -540,12 +540,11 @@ def packed_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    # A store that states its documents' lengths is packed by a plan over the whole store, which
-    # its source names; one read as it streams is packed by a stage.
+    # The token store states its documents' lengths, so a plan over the whole store packs it: the
+    # order's source names that packing, and no Pack stage is left to run per share.
     order = json.loads(saved["order"])
-    named = ("Pack(" in json.dumps(order["source"])
-             or any(stage.startswith("Pack(") for stage in order["stages"]))
-    assert named, "the order has to name the packing"
+    assert "packing=Pack(" in json.dumps(order["source"]), "the order has to name the store's packing"
+    assert not any(stage.startswith("Pack(") for stage in order["stages"])
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 
