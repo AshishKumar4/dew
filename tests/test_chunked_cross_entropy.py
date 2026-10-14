@@ -724,11 +724,10 @@ def float64_bounds(hidden, head, weights, exact, chunks=None):
     softcap's divide, tanh and multiply; the largest of a row's is E. The
     partition's exponentials are each off by |dz| + 2 u relative, and their
     sum by lambda sqrt(V) u relative more, so log Z is off by at most
-    E + (lambda sqrt(V) + 4) u + C u |log Z|, where C counts the roundings
-    of log Z itself: one for the whole row, one per chunk for the chunked
-    loop, whose logaddexp rounds the running log Z at every chunk (observed:
-    the log Z error grows from 1.0e-06 unchunked to 2.9e-06 at 16 chunks, on
-    log Z near 17, where u |log Z| is 1.0e-06). A loss is off by that plus its target
+    E + (lambda sqrt(V) + 4 + 3 C) u + u |log Z|: the row's sum carries
+    one rescaling (an exponential, a multiply and an add, 3 u relative) per
+    one of its C chunks, and log Z itself is rounded once, as the maximum
+    plus the sum's log. A loss is off by that plus its target
     logit's error. A probability exp(z - log Z) carries the same E + log Z
     error plus 2 u relative, and the gradients sum weight * (p - onehot)
     against the head over V columns and against the states over T tokens.
@@ -739,7 +738,7 @@ def float64_bounds(hidden, head, weights, exact, chunks=None):
     tokens = hidden.shape[0]
     logit_error = LAMBDA * np.sqrt(features) * U32 * exact["magnitude"] + 3 * U32 * np.abs(exact["logits"])
     largest = logit_error.max(-1)
-    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4) * U32 + (chunks or 1) * U32 * np.abs(exact["log_z"])
+    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4 + 3 * (chunks or 1)) * U32 + U32 * np.abs(exact["log_z"])
     probability_error = (largest + z_error + 2 * U32)[:, None] * exact["probabilities"]
     spread = weights[:, None] * exact["slope"]
     gradient_error = spread * probability_error

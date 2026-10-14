@@ -216,10 +216,9 @@ def _row_terms(logits, predict: bool) -> tuple[
 
 
 class _ChunkTerms(NamedTuple):
-    """One tile's logsumexp and target logit, its best logit and column when
-    a prediction is asked for, and its maximum and the sum of exponentials
-    scaled to it."""
-    lse: jax.Array
+    """One tile's target logit, its best logit and column when a prediction
+    is asked for, and its maximum and the sum of exponentials scaled to it,
+    from which its rows' log partitions follow (`_forward`)."""
     picked: jax.Array
     best: jax.Array | None
     column: jax.Array | None
@@ -237,10 +236,10 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
     picked = jnp.where(inside, jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0], 0.0)
-    lse, top, normalizer = _row_terms(logits, predict)
+    _, top, normalizer = _row_terms(logits, predict)
     if top is None:
-        return _ChunkTerms(lse, picked, None, None, *normalizer)
-    return _ChunkTerms(lse, picked, top[0], top[1] + start, *normalizer)
+        return _ChunkTerms(picked, None, None, *normalizer)
+    return _ChunkTerms(picked, top[0], top[1] + start, *normalizer)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
@@ -260,7 +259,9 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
              softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float, bias=None):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
     token tile at a time, and apart from them each row's maximum and the sum
-    of its exponentials scaled to it."""
+    of its exponentials scaled to it. The vocabulary tiles carry only that
+    maximum and sum; a row's log partition is formed from them once, after
+    its last tile."""
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
@@ -280,20 +281,21 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
                 picked_targets, first, first + count, softcap, precision, predict, temperature, excluded,
                 None if bias is None else jax.lax.dynamic_slice_in_dim(bias, first, count))
-            peak = jnp.maximum(carry[2], terms.peak)
-            merged = (jnp.logaddexp(carry[0], terms.lse), carry[1] + terms.picked, peak,
-                      _rescaled(carry[2], carry[3], peak) + _rescaled(terms.peak, terms.mass, peak))
+            peak = jnp.maximum(carry[1], terms.peak)
+            merged = (carry[0] + terms.picked, peak,
+                      _rescaled(carry[1], carry[2], peak) + _rescaled(terms.peak, terms.mass, peak))
             if terms.best is None or terms.column is None:
                 return merged
-            better = terms.best > carry[4]
-            return (*merged, jnp.where(better, terms.best, carry[4]),
-                    jnp.where(better, terms.column, carry[5]))
+            better = terms.best > carry[3]
+            return (*merged, jnp.where(better, terms.best, carry[3]),
+                    jnp.where(better, terms.column, carry[4]))
 
-        initial = (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work)) * 2
+        initial = (jnp.zeros((size,), work), jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work))
         if predict:
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
-        total, target_logit, *rest = _over_tiles(initial, table.shape[0], width, columns)
-        values = (total - target_logit, total, *rest[:2], *rest[3:])
+        target_logit, peak, mass, *rest = _over_tiles(initial, table.shape[0], width, columns)
+        total = peak + jnp.log(mass)
+        values = (total - target_logit, total, peak, mass, *rest[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
