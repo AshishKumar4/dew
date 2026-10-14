@@ -33,6 +33,7 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.interop.weights import decoding_storage
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, valid_order
@@ -927,8 +928,12 @@ def generate(model: nn.Module, params: Variables,
     the cache and logical-position state the model keeps. Each cache
     compacts the real input tokens and leaves paused rows unchanged.
 
-    Parameters keep their placement. On a mesh, the rows are split over its
-    batch axes and the result keeps that sharding; ``Generation.host()``
+    Parameters keep their placement, and decode at the model's compute
+    dtype: a call casts a parameter stored wider to it once, before its
+    loop (`dew.interop.weights.decoding_storage`), and holds that copy
+    beside the caller's weights while it runs (fp32 weights under bf16
+    compute: half their bytes again). On a mesh, the rows are split over
+    its batch axes and the result keeps that sharding; ``Generation.host()``
     reads a process's own rows back. All cooperating processes must use the
     same input shapes, effective decoding components, padding id and
     continuation count. The decode loops have fixed bounds, and the
@@ -968,9 +973,10 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    failure, output = _compiled(plan.sharding)(model, params, plan.place(request.padded()),
-                                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned,
-                                               sampling.pad, n, *components)
+    failure, output = _compiled(plan.sharding)(model, decoding_storage(model, params),
+                                               plan.place(request.padded()), plan.keys(request.key),
+                                               jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                                               *components)
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

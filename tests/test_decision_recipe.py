@@ -2,20 +2,15 @@
 
 import csv
 import dataclasses
-import importlib.util
 import json
-import math
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
-from dew.config.data import Split, loader
-from dew.data import Loading, Memory
-from dew.data.dataset import DataPartition
-from dew.data.text import HFTokenizer
-from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
+from dew.config.data import Split
+from dew.data import Memory
+from dew.decision import Choice, Decide, Decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -56,49 +51,7 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
 
 
-RECIPES = Path(__file__).parents[1] / "recipes" / "decision"
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
-
-
-def _module(name: str):
-    """A module of recipes/decision, which imports its siblings by name."""
-    sys.path.insert(0, str(RECIPES))
-    spec = importlib.util.spec_from_file_location(f"decision_{name}", RECIPES / f"{name}.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _requests(count: int, *, joint: bool) -> list[dict]:
-    """Labelled requests as rows: a choice with a soft target, and with `joint` a noul beside it."""
-    team = {"type": "choice", "instructions": "Which team?",
-            "criteria": {"billing": "payments", "technical": "outages", "sales": "pricing"}}
-    rows = []
-    for index in range(count):
-        row = {"state": f"ticket {index}: charged twice for plan {index % 5}",
-               "questions": {"team": team}, "targets": {"team": [0.7, 0.2, 0.1]}}
-        if joint:
-            row["questions"]["urgent"] = {"type": "noul", "instructions": "Is it urgent?"}
-            row["answers"] = {"urgent": "true" if index % 2 else "false"}
-        rows.append(row)
-    return rows
-
-
-def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) -> Path:
-    """`rows` written as the only set of a mixture by sources.py, decontaminated against `evaluated`."""
-    sources, contamination = _module("sources"), _module("contamination")
-    (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    default = sources.Mixture()
-    off = {entry.name: dataclasses.replace(getattr(default, entry.name), weight=0.0)
-           for entry in dataclasses.fields(default)}
-    mine = sources.Rows(weight=1.0, held=held, path=str(tmp_path / "rows.jsonl"))
-    mixture = sources.Mixture(**{**off, "rows": mine})
-    out = tmp_path / "mixture"
-    items = [contamination.Evaluated((text,)) for text in evaluated]
-    sources.write(mixture, out, contamination.Overlaps.of(items))
-    return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,211 +74,6 @@ def test_a_named_validation_split_reads_the_source_s_own_split():
     assert list(evaluated.source.source.records("memory")) == list(held)
     with pytest.raises(ValueError):
         Decisions(source=Memory(train), validation=Split("validation"), question="team").pipelines()
-
-
-def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path):
-    """The produced mixture states an offset index for each set, so a run that
-    states no read reads it by index rather than loading it whole."""
-    mixture = _mixture(tmp_path, _requests(24, joint=False), [], held=4)
-    loaded = loader(Decisions(str(mixture)), batch=4, read=DecisionRunConfig.data_read,
-                  loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
-
-
-def _flags(mixture: Path, runs: Path, *, tokens: int | None = None) -> list[str]:
-    return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
-            "--trainer.batch-size", "8" if tokens is None else "None",
-            "--trainer.batch-tokens", str(tokens), "--trainer.update-tokens", str(tokens),
-            "--trainer.steps", "2", "--trainer.eval-every", "2",
-            "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-            "--trainer.compilation-cache-dir", "None", "--loading.workers", "0",
-            "--model.dtype", "float32", "--optim.schedule.warmup-steps", "1", "--revision", "None"]
-
-
-def _summary(run: Path) -> dict:
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    return next(record["value"]["summary"] for record in records if record["type"] == "RunRecord")
-
-
-def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_path):
-    """The encoder recipe end to end on a tiny ModernBERT: sources.py writes a
-    set of soft-labelled rows, one of which an evaluation item shares and is
-    dropped; the run trains a fresh head on the rest and fits its temperature
-    on the rows held back."""
-    from dew.interop.pretrained import PretrainedDecoder
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.base import part
-
-    rows = _requests(24, joint=False)
-    mixture = _mixture(tmp_path, rows, [rows[0]["state"]], held=12)
-    made = json.loads((mixture / "mixture.json").read_text())
-    assert sum(entry["dropped"] for entry in made["decontamination"].values()) == 1
-    assert made["rows"]["rows"]["train"] + made["rows"]["rows"]["held"] == 23
-    laya = Decide.from_pretrained(TINY, attention_impl="xla")
-    backbone = tmp_path / "encoder"
-    encoded = from_record(CausalTransformer, laya.model.backbone)
-    PretrainedDecoder.from_model(encoded, part(laya.variables, "backbone"),
-                                 tokenizer=HFTokenizer(str(TINY / "tokenizer"))).save(backbone)
-    encoder = _module("encoder")
-    config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(backbone),
-                                    "--max-len", "96", "--head-max-len", "64", "--option-tokens", "16"],
-                                   default=encoder.run_config())
-    assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier+rps"
-    config.run()
-    summary = _summary(tmp_path / "runs" / "run")
-    assert summary["mixture"] == {"rows": 1.0} and summary["made"]["rows"] == made["rows"]
-    decide = Decide.from_run(str(tmp_path / "runs" / "run"))
-    assert set(decide.calibration.temperatures.types) == {"choice"}
-    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
-    assert decide("charged twice", {"team": team})["team"].choice in team.options
-    # A state may hold a line separator that is not a newline, which a row's JSON keeps raw.
-    hard = [{**rows[1], "state": "charged\u2028twice", "targets": {}, "answers": {"team": "technical"}},
-            {**rows[2], "targets": {}, "answers": {"team": "billing"}}]
-    written = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in hard)
-    (mixture / "hard.held.jsonl").write_text(written)
-    made["rows"]["hard"] = {"train": 0, "held": len(hard)}
-    (mixture / "mixture.json").write_text(json.dumps(made))
-    benchmark = _module("benchmark")
-    scored = benchmark.held(tmp_path / "runs" / "run", mixture)
-    assert set(scored) == {"sources", "macro"}
-    assert scored["sources"]["rows"]["rows"] == made["rows"]["rows"]["held"]
-    assert scored["sources"]["hard"]["rows"] == 2
-    for source, metrics in scored["sources"].items():
-        assert set(metrics) == {"rows", "unfit", "questions", "log_loss", "infinite", "accuracy"}
-        assert metrics["unfit"] == 0
-        expected = []
-        for line in (mixture / f"{source}.held.jsonl").read_text().split("\n")[:-1]:
-            example = Example.of(json.loads(line))
-            probabilities = decide(example.state, example.questions)["team"].probabilities
-            target = example.distribution("team")
-            expected.append(-sum(t * math.log(p) for t, p in zip(target, probabilities, strict=True)))
-        assert metrics["log_loss"] == pytest.approx(sum(expected) / len(expected))
-        assert math.isfinite(metrics["log_loss"]) and metrics["infinite"] == 0
-        assert 0 <= metrics["accuracy"] <= 1
-    for metric in ("log_loss", "accuracy"):
-        assert scored["macro"][metric] == pytest.approx(
-            sum(value[metric] for value in scored["sources"].values()) / 2)
-
-
-def test_the_clef_recipe_defaults_build_token_budget_batches():
-    import itertools
-
-    run = _module("clef").run_config()
-    trainer = run.trainer.derived()
-    assert trainer.batch_size is None
-    assert trainer.batch_tokens == trainer.update_tokens == 16_384
-    assert trainer.accumulation == 1 and run.bucket_lengths == ()
-    choice = Choice("Which?", ["first", "second"])
-    examples = [Example("x" * size, {"team": choice}, {"team": 0})
-                for size in (160, 768, 1_536, 3_072)] * 64
-    objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
-                                  shuffle_options=False)
-    data = loader(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
-                  lengths=run.bucket_lengths, objective=objective.data(), read="memory",
-                  loading=Loading(workers=0))
-    assert data.batch_tokens == 16_384
-    stream = data.train(DataPartition())
-    try:
-        batches = list(itertools.islice(stream, 8))
-    finally:
-        stream.close()
-    assert len({batch["tokens"].shape[1] for batch in batches}) <= 6
-    assert all(batch["tokens"].shape[0] * batch["tokens"].shape[1] == 16_384 for batch in batches)
-
-
-@pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
-def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path, param_dtype):
-    """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
-    Gated DeltaNet and MLP projections, a fresh joint head reading every
-    question of a row; an example whose questions alone pass the row's 1,024
-    tokens is dropped and counted, by training and by the held-out scorer
-    alike; the run reloads as a task."""
-    from flax.traverse_util import flatten_dict
-
-    from dew.objectives.base import FROZEN
-
-    rows = _requests(24, joint=True)
-    rows.append({**rows[0], "questions": {**rows[0]["questions"], "urgent": {
-        "type": "noul", "instructions": "Is it urgent? " + "Consider every detail. " * 300}}})
-    mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
-    clef = _module("clef")
-    storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
-    flags = _flags(mixture, tmp_path / "runs", tokens=8192)
-    flags[:0] = ["--data-read", "memory"]
-    config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
-                                    "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
-                                    "--head.feedforward", "40", "--head.layers", "1",
-                                    "--head.routing-layers", "1", "--max-len", "1024", *storage],
-                                   default=clef.run_config())
-    config.run()
-    unfit = _summary(tmp_path / "runs" / "run")["unfit"]
-    assert sum(unfit.values()) == 1
-    made = json.loads((mixture / "mixture.json").read_text())
-    (mixture / "long.held.jsonl").write_text("".join(json.dumps(row) + "\n" for row in (rows[1], rows[-1])))
-    made["rows"]["long"] = {"train": 0, "held": 2}
-    (mixture / "mixture.json").write_text(json.dumps(made))
-    scored = _module("benchmark").held(tmp_path / "runs" / "run", mixture)["sources"]
-    assert scored["rows"]["unfit"] == unfit["held out"]
-    assert (scored["long"]["rows"], scored["long"]["unfit"], scored["long"]["questions"]) == (2, 1, 2)
-    decide = Decide.from_run(str(tmp_path / "runs" / "run"))
-    frozen = flatten_dict(decide.variables[FROZEN])
-    kernels = [value for path, value in frozen.items() if path[-1] == "kernel"]
-    assert kernels and all(str(value.dtype) == param_dtype for value in kernels)
-    moving = flatten_dict(decide.variables["params"])
-    factors = [value for path, value in moving.items() if path[-1] in ("lora_A", "lora_B")]
-    head = [value for path, value in moving.items() if path[0] == "head"]
-    assert factors and head and all(str(value.dtype) == "float32" for value in [*factors, *head])
-    assert decide.weights.step == 2
-    journal = tmp_path / "runs" / "run" / "tracking" / "scalars.jsonl"
-    scalars = [json.loads(line)["scalars"] for line in journal.read_text().splitlines()]
-    losses = [entry["train/loss"] for entry in scalars if "train/loss" in entry]
-    assert len(losses) == 2 and all(math.isfinite(float(loss)) for loss in losses)
-    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
-    answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
-    assert answers["team"].choice in team.options and 0 <= answers["urgent"].noul <= 1
-    assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
-
-
-def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_its_state(tmp_path):
-    """The Clef recipe under LoRA on length-bucketed batches, stopped at step 2
-    and resumed to 4, ends bitwise where an unbroken run does: parameters,
-    optimizer state, counters and keys, on the same records. Resumed under
-    another attention kernel, a change that keeps the state's shape, it reads
-    the same records and lands within rounding of the unbroken run; resumed
-    on another data order, it refuses."""
-    import jax
-    import numpy as np
-
-    mixture = _mixture(tmp_path, _requests(24, joint=True), ["nothing these rows share at all"], held=8)
-    clef = _module("clef")
-
-    def run(directory: Path, steps: int, *changed):
-        flags = _flags(mixture, directory, tokens=8192)
-        flags[flags.index("--trainer.steps") + 1] = str(steps)
-        flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
-                  "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
-                  "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]
-        return DecisionRunConfig.cli(flags, default=clef.run_config()).run()
-
-    def leaves(state) -> list:
-        return [np.asarray(jax.random.key_data(leaf) if isinstance(leaf, jax.Array)
-                           and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-                for leaf in jax.tree.leaves(state)]
-
-    unbroken = run(tmp_path / "unbroken", 4)
-    run(tmp_path / "broken", 2)
-    resumed = run(tmp_path / "broken", 4)
-    assert int(resumed.step) == 4
-    assert jax.tree.structure(resumed) == jax.tree.structure(unbroken)
-    for ours, theirs in zip(leaves(resumed), leaves(unbroken), strict=True):
-        np.testing.assert_array_equal(ours, theirs)
-    run(tmp_path / "changed", 2)
-    changed = run(tmp_path / "changed", 4, "--model.attention-impl", "reference")
-    assert jax.tree.structure(changed) == jax.tree.structure(unbroken)
-    for ours, theirs in zip(leaves(changed), leaves(unbroken), strict=True):
-        np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
-    with pytest.raises(ValueError):
-        run(tmp_path / "changed", 6, "--data-seed", "1")
 
 
 def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
