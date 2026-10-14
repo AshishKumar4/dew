@@ -214,15 +214,15 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     laya = DecisionHead(8, layers=1)
     expected = 24 * 8 * 8 * 7 + 4 * 8 * 29 + (2 * 8 * 8 + 2 * 8) * 8
     assert laya.decision_flops(LENGTHS, questions, options) == expected
-    clef = JointSchemaHead(8, width=16, routing_layers=1, layers=0, feedforward=32)
+    joint = JointSchemaHead(8, width=16, routing_layers=1, layers=0, feedforward=32)
     projected = 2 * 8 * 16 * (7 + 2 * 3 + 2 * 8 + 2)
     evidence = 4 * 16 * 16 * (7 + 8) + 4 * 16 * (2 * 2 + 5 * 6) + 4 * 16 * 32 * 8
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
     pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
-    assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
-    assert isinstance(clef, CountedDecisions) and not isinstance(clef, Counted)
+    assert joint.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
+    assert isinstance(joint, CountedDecisions) and not isinstance(joint, Counted)
     with pytest.raises(MissingFlopsCount):
-        counted_flops(clef, LENGTHS)
+        counted_flops(joint, LENGTHS)
 
 
 def test_host_row_counts_add_to_objectives_total_without_padding():
@@ -611,7 +611,7 @@ def test_s5_write_read_matches_the_native_scanned_path():
     assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)
 
 
-@pytest.mark.parametrize("kind", ["laya", "clef"])
+@pytest.mark.parametrize("kind", ["laya", "joint"])
 def test_decision_heads_match_every_forward_product_including_pooling(kind):
     states = jnp.ones((1, 4, 8))
     inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), segments=jnp.ones((1, 4), jnp.int32),
@@ -621,11 +621,11 @@ def test_decision_heads_match_every_forward_product_including_pooling(kind):
     model = (DecisionHead(8, layers=1, attention_impl="reference") if kind == "laya" else
              JointSchemaHead(8, width=8, heads=2, layers=1, routing_layers=1, feedforward=16,
                               attention_impl="reference"))
-    table = jnp.ones((16, 8)) if kind == "clef" else None
+    table = jnp.ones((16, 8)) if kind == "joint" else None
     variables = model.init(jax.random.key(205), states, inputs, table)
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
-    # Clef writes its field/option cosine as multiply+reduce, not dot_general.
-    scalar_cosine = 2 * 8 * 2 if kind == "clef" else 0
+    # The joint head writes its field/option cosine as multiply+reduce, not dot_general.
+    scalar_cosine = 2 * 8 * 2 if kind == "joint" else 0
     assert count == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
 
 

@@ -6,7 +6,7 @@ and head. `pretrained` names another: a Laya-style repository (one with an
 `rl_agent_config.json`), or any Hugging Face model, whose head is then drawn
 fresh, with `lora` to train an adapter in place of the whole model. A fresh
 head is Laya's, reading the layout the backbone's order asks for, or with
-`head` Clef's joint schema head, reading every question of an example in one
+`head` the joint schema head, reading every question of an example in one
 row (`JointLayout`). A `Decisions` recipe reads a table or a mixture manifest
 whose sets contribute their recorded shares. A tenth
 of the table's rows, at most 400, are held out by the default `HoldOut`;
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(frozen=True)
 class JointShape:
-    """The sizes of Clef's joint schema head (`JointSchemaHead`), Clef-flash's by default.
+    """The sizes of the joint schema head (`JointSchemaHead`).
 
     Its input width is the backbone's, which the run reads from the model.
     """
@@ -101,7 +101,7 @@ class DecisionRunConfig(RunConfig):
     looping and LoRA. The trainer's fitting ladder starts here; a policy
     outside `DECODER_REMAT` cannot climb. None keeps the checkpoint's policy."""
     head: JointShape | None = None
-    """Clef's joint schema head over a fresh backbone, which then reads Clef's
+    """The joint schema head over a fresh backbone, which then reads the
     joint layout; None draws Laya's head."""
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
@@ -227,7 +227,7 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
 
 
 def _fresh_layout(causal: bool, joint: bool, budgets: dict[str, int]) -> Layout:
-    """The layout a fresh head reads: Clef's joint one, or the one a backbone's order asks for."""
+    """The layout a fresh head reads: the joint one, or the one a backbone's order asks for."""
     return _budgeted(JointLayout() if joint else StateFirstLayout() if causal else MarkerLayout(), budgets)
 
 
