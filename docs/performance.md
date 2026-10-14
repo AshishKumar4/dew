@@ -3161,6 +3161,21 @@ projections gain. Which sites run FP8 is that measurement on the run's own GPU a
 (`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
 refused rather than reusing it. The function changes by E4M3's rounding of both operands.
 
+The packed codes stand in the train state in place of the frozen kernels they encode, two bytes a
+parameter as bf16's are, and a merge decodes them (`frozen_fp8_kernel`). A whole run, Qwen3.5-9B
+under a rank-16 LoRA on its attention and MLP projections, 2 x 2048 fineweb-edu tokens a step, 300
+steps on an H100 80GB HBM3 (jax 0.11.2), each arm on the same windows:
+
+| base | step ms | peak GiB | loss over bf16's, last 50 steps |
+|---|---:|---:|---:|
+| bf16 | 299.8 | 44.59 | |
+| bf16, another LoRA seed | 299.8 | 44.59 | under 0.02% |
+| FP8 at the 189 sites measured faster | 255.3 | 44.83 | +0.40% |
+
+The FP8 run's loss sits about 0.4% above bf16's from the first step on, the rounding of both
+operands, where another seed of the bf16 run moves it by under 0.02%; a run that wants bf16's
+function keeps its base in bf16.
+
 ### Faster kernels not adopted
 
 Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each of these needs a kernel or a dependency that Dew does not have yet:
