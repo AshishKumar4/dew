@@ -57,7 +57,7 @@ from dew.nn.attention import (
     unweighted_rmsnorm,
 )
 from dew.nn.attention_sinks import sink_softmax
-from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
+from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -203,7 +203,7 @@ class GroupedLinear(nn.Module):
                           precision=self.precision)
 
 
-class CompressedEntries(nn.Module):
+class CompressedEntries(FakeQuantizing):
     """The projections behind a compressor's entries: `kv_proj` and
     `gate_proj` into the entry width (twice it for the two-series CSA layout),
     the position bias and the entry norm; `entries` pools the windows and
@@ -285,7 +285,7 @@ class CompressedEntries(nn.Module):
 
     def _stored(self, latents, windows):
         rotated = self.rotate(latents, windows)
-        return fake_quant_fp4(rotated, 16, e4m3_scale=True) if self.quantized else rotated
+        return self.fp4(rotated, 16, e4m3_scale=True) if self.quantized else rotated
 
     @nn.compact
     def cached_entries(self, x, slots, capacity: int, write: bool):
@@ -410,7 +410,7 @@ class Compressor(CompressedEntries):
         return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
 
 
-class Csa2Indexer(nn.Module):
+class Csa2Indexer(FakeQuantizing):
     """CSA2's indexer (v41:488-580): queries from the query residual, scored
     against index keys a Full layer projects from its compressor's latent (`wk`,
     `k_norm`) and the other layers read from the store, under V3.2's leaf names.
@@ -440,7 +440,7 @@ class Csa2Indexer(nn.Module):
                                   dtype=self.dtype, name='k_norm')
 
     def _fp4(self, x):
-        return fake_quant_fp4(x, 32, e4m3_scale=False) if self.quantized else x
+        return self.fp4(x, 32, e4m3_scale=False) if self.quantized else x
 
     def keys(self, latents, cos, sin):
         """Index keys `[B, T, head_dim]` off the latents, rotated at their
@@ -485,7 +485,7 @@ def _published(kv_store, name: str, layer: str):
     ("indexer", "weights_proj"): ("embed", "index"),
     ("scorer", "weights_proj"): ("embed", "index"),
 })
-class DeepseekV4Attention(nn.Module):
+class DeepseekV4Attention(FakeQuantizing):
     """One V4 attention layer, sliding or compressed (see the module doc).
 
     `compressor` is None, 'hca', 'csa' or V4.1's 'csa2', with `compress_rate`
@@ -744,7 +744,7 @@ class DeepseekV4Attention(nn.Module):
         for the query heads the tensor axis splits."""
         projected = constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place)
         keys = constrain(_rotate_rope(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
-        return fake_quant_fp8(keys, 32) if self.kv_qat else keys
+        return self.fp8(keys, 32) if self.kv_qat else keys
 
     def _attend(self, query, keys, allowed, cos, sin):
         batch, length = query.shape[:2]

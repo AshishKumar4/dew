@@ -132,6 +132,9 @@ test = [
     "diffusers==0.34.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "ftfy",
+    # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
+    # release its container installs (the live extra).
+    "dewml[live]",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
@@ -186,6 +189,8 @@ tensorboard = ["tensorboard"]
 hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
+# The live site's container (site/live/container/setup-managed.sh): its bridge's WebSocket release.
+live = ["websockets==17.1"]
 delta = ["deltalake>=1.0"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
