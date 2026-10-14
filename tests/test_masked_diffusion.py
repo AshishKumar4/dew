@@ -28,7 +28,7 @@ from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.nn.inputs import BATCH_AXES, ModelInputs
+from dew.nn.inputs import ModelInputs, request_axes
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -250,7 +250,7 @@ def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     expected = task(inputs, 8, key=7, steps=5, n=2).host()
     placed = task.bind(variables)(inputs, 8, key=7, steps=5, n=2)
     actual = placed.host()
-    assert placed.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert placed.tokens.sharding.spec == jax.sharding.PartitionSpec(request_axes(mesh))
     assert placed.tokens.shape[0] == jax.device_count() * 2
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(left, right)

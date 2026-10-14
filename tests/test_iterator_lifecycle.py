@@ -1,12 +1,15 @@
 """Owned iterator shutdown without changing which batches train or resume."""
 
+import contextlib
 import gc
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from pathlib import Path
 
@@ -273,13 +276,17 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     """Once a step of a batch's signature compiles, the prefetcher places
     only the leaves its executable kept: a field the step never reads stays a
     host array of its own, and the step runs on the batch as placed. A batch
-    of a signature no step has compiled for is placed whole."""
+    of a signature no step has compiled for is placed whole. A field held as
+    None, as an optional part of `Coordinates` is, is no leaf to place."""
     mesh = MeshSpec().build()
     rows = jax.device_count()
-    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
+    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
     step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
-    compiled = step.lower(jnp.zeros(()), shard_batch(mesh, batch), jnp.int32(0)).compile()
-    reads = {batch_signature(batch): step_reads(compiled)}
+    first = shard_batch(mesh, batch)
+    compiled = step.lower(jnp.zeros(()), first, jnp.int32(0)).compile()
+    # The trainer publishes the mask under the placed batch's signature.
+    signature = batch_signature(first)
+    reads = {signature: step_reads(compiled, signature)}
     wider = {**batch, "x": np.ones((rows, 4), np.float32)}
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
         placed, whole = next(stream), next(stream)
@@ -710,3 +717,75 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
     )
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def _running(pid: int) -> bool:
+    """Whether process `pid` runs: it exists and has not ended (a zombie has)."""
+    try:
+        status = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return status.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def _segments_marked(mark: bytes) -> set[str]:
+    """The shared memory segments on this host that begin with `mark`: those a run whose every
+    batch begins with it handed its batches over in, whatever else shares the host. Python names a
+    segment at random (`psm_...`), so its content, not its name, says whose it is."""
+    marked = set()
+    for name in os.listdir("/dev/shm"):
+        if name.startswith("psm_"):
+            with contextlib.suppress(OSError), Path("/dev/shm", name).open("rb") as segment:
+                if segment.read(len(mark)) == mark:
+                    marked.add(name)
+    return marked
+
+
+@pytest.mark.skipif(not (Path("/proc/self/stat").exists() and Path("/dev/shm").is_dir()),
+                    reason="reads process states from /proc and shared memory from /dev/shm")
+def test_a_killed_program_leaves_no_loading_worker_running():
+    """A program killed mid-read, as a timeout or the kernel kills one, takes its loading workers
+    with it, and the shared memory its batches were handed over in. Each worker read until its
+    parent asked it to stop, so a killed parent left them reading into a queue no one empties,
+    holding their memory until the host was rebooted."""
+    program = (
+        "import multiprocessing, sys, time\n"
+        "import numpy as np\n"
+        "from dew.data import Loading, Memory\n"
+        "from dew.data.compile import compile\n"
+        "from dew.data.dataset import DataPartition\n"
+        "from dew.data.pipeline import Pipeline\n"
+        "rows = Memory(tuple({'x': np.full(4, int(sys.argv[1]), np.int64)} for _ in range(64)))\n"
+        "loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)\n"
+        "stream = compile(Pipeline(rows).repeat().batch(2), read='memory', loading=loading)"
+        ".train(DataPartition())\n"
+        "next(stream)\n"
+        "print(' '.join(str(child.pid) for child in multiprocessing.active_children()), flush=True)\n"
+        "time.sleep(600)\n")
+    # Every batch is two records of four copies of this run's own token, so its segments are found by it.
+    token = secrets.randbits(63)
+    mark = np.full((2, 4), token, np.int64).tobytes()
+    root = Path(__file__).resolve().parents[1]
+    parent = subprocess.Popen(
+        [sys.executable, "-c", program, str(token)], cwd=root, stdout=subprocess.PIPE, text=True,
+        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    workers: list[int] = []
+    try:
+        assert parent.stdout is not None
+        workers = [int(pid) for pid in parent.stdout.readline().split()]
+        assert len(workers) >= 2, "the program started no loading workers"
+        assert _segments_marked(mark), "the program's workers handed over no batch in shared memory"
+        parent.send_signal(signal.SIGKILL)
+        parent.wait(timeout=30)
+        deadline = time.monotonic() + 60
+        while (any(map(_running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert [pid for pid in workers if _running(pid)] == []
+        assert _segments_marked(mark) == set()
+    finally:
+        parent.kill()
+        for pid in workers:
+            if _running(pid):
+                os.kill(pid, signal.SIGKILL)
+        for name in _segments_marked(mark):
+            Path("/dev/shm", name).unlink(missing_ok=True)
