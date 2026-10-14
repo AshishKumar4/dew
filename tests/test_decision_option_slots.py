@@ -16,8 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
-from reference_error import assert_leaves_as_exact, distance, widened
+from reference_error import assert_leaves_as_exact, float64_terms, widened
 from safetensors.numpy import load_file
 
 from dew.config.data import loader
@@ -117,34 +116,6 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-def bias_cancellation_scales(loss, variables, rows, paths) -> dict[str, float]:
-    """The absolute cotangents each declared bias sums, before cancellation.
-
-    An independent offset at each projection position exposes the terms of
-    its broadcast bias's gradient. Measure them in float64 so cancellation
-    noise in the tested float32 paths never determines their bound.
-    """
-    shapes = {}
-
-    def shifted(offsets):
-        def project(next_fun, args, kwargs, context):
-            value = next_fun(*args, **kwargs)
-            path = context.module.scope.path
-            if context.method_name == "__call__" and path in paths:
-                shapes[path] = value.shape
-                return value + offsets.get(path, 0)
-            return value
-
-        with nn.intercept_methods(project):
-            return loss(variables, rows)
-
-    shifted({})
-    terms = jax.grad(shifted)({path: jnp.zeros(shapes[path], jnp.float64) for path in paths})
-    return {jax.tree_util.keystr(tuple(jax.tree_util.DictKey(key)
-                                     for key in ("params", "head", *path, "bias"))):
-            distance(np.sum(np.abs(term), axis=(0, 1)), 0) for path, term in terms.items()}
-
-
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """A batch of 100, 17 x 3 and 24 real options in a 17 x 100 grid, which
     the encoding compacts into 128 slots: the loss and every parameter's
@@ -183,33 +154,26 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
                                                       for rows in (batch, slotted))
     # Float64 truth: the grid's step in float64 (the head and its scoring rule
-    # keep a float64 input's dtype). The compacted step is held to it as the
-    # grid is, per tensor (tests/reference_error.py).
-    invariant_paths = (
-        ("evidence_layers_0", "attention", "to_k"),  # q.b shifts every key's logit alike.
-        ("evidence_layers_1", "attention", "to_k"),  # q.b shifts every key's logit alike.
-        ("layers_0", "self_attn", "to_k"),  # q.b shifts every key's logit alike.
-        ("layers_0", "multihead_attn", "to_k"),  # q.b shifts every key's logit alike.
-        ("scorer_out",),  # The shared residual gate gives every option the same bias shift.
-    )
-    # These head keys are unrotated and unnormalized. The backbone has no
-    # attention biases, and its normalized, rotated keys would not share q.b.
+    # keep a float64 input's dtype), with each gradient leaf's terms: a key
+    # bias's and the scorer's shared bias gradients cancel (q.b shifts every
+    # key's logit alike; the residual gate shifts every option's), so their
+    # terms, not their near-zero sizes, are their rounding's scale. The
+    # compacted step is held to it as the grid is, per tensor
+    # (tests/reference_error.py).
     with jax.enable_x64(new_val=True):
         wide_variables, wide_batch = widened((variables, batch))
-        truth, truth_gradient = jax.value_and_grad(loss)(wide_variables, wide_batch)
-        invariants = bias_cancellation_scales(loss, wide_variables, wide_batch, invariant_paths)
+        (truth, truth_gradient), (_, terms) = float64_terms(jax.value_and_grad(loss), wide_variables,
+                                                            wide_batch)
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
     # The compaction reorders the sums over the grid's option slots.
     slots = options.shape[1] * options.shape[2]
     assert_leaves_as_exact(fewer, grid, truth, reductions=slots)
-    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots,
-                           invariants=invariants)
+    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots, terms=terms)
     # A NaN in one gradient leaf fails the same comparison.
     leaves, structure = jax.tree.flatten(fewer_gradient)
     poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots,
-                               invariants=invariants)
+        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots, terms=terms)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
