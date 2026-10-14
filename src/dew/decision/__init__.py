@@ -3,19 +3,22 @@
 A request is a state (text, or any JSON) and named questions, each a
 `Noul`, a `Choice` or a `Score` (TypeSafe Jev's three, docs.typesafe.ai).
 The model lays the questions out with the state (Laya's `MarkerLayout`, the
-`StateFirstLayout` for a causal backbone, or Clef's `JointLayout`), reads
-the rows with a backbone, scores every option with a head (Laya's
-`DecisionHead` or Clef's `JointSchemaHead`), and answers with a
-distribution over exactly the options each question names. `Decide` is the
-task that answers requests, and `DecisionObjective` trains one on proper
-scoring rules. `LayaCheckpoint` reads convaiinnovations/laya's released
-checkpoints, and `ClefCheckpoint` Cloudflare/clef's, whose head `ClefHead` reads.
+`StateFirstLayout` for a causal backbone, or the `JointLayout`, every
+question of a request in one row), reads the rows with a backbone, scores
+every option with a head (Laya's `DecisionHead`, or the `JointSchemaHead`,
+which decides a row's questions together), and answers with a distribution
+over exactly the options each question names. `Decide` is the task that
+answers requests, and `DecisionObjective` trains one on proper scoring
+rules. `LayaCheckpoint` reads convaiinnovations/laya's released
+checkpoints, and `JointCheckpoint` a released joint-head checkpoint, a
+backbone with its joint schema head beside it, whose head `StoredJointHead`
+reads.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.clef import ClefCheckpoint, ClefHead
 from dew.decision.data import Decisions, Example
 from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
+from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -68,8 +71,6 @@ __all__ = [
     "Calibration",
     "Choice",
     "ChoiceAnswer",
-    "ClefCheckpoint",
-    "ClefHead",
     "Combined",
     "Confidence",
     "Decide",
@@ -84,6 +85,7 @@ __all__ = [
     "Example",
     "Head",
     "JevConfidence",
+    "JointCheckpoint",
     "JointLayout",
     "JointSchemaHead",
     "Laid",
@@ -103,6 +105,7 @@ __all__ = [
     "Specials",
     "Spherical",
     "StateFirstLayout",
+    "StoredJointHead",
     "Temperatures",
     "TopProbability",
     "Usage",
