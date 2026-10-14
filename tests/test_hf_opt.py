@@ -49,8 +49,9 @@ def test_opt_export_uses_the_reference_checkpoint_names(tmp_path):
 
 
 @pytest.mark.network
-def test_released_opt125m_logits_and_cached_greedy_generation(tmp_path):
+def test_released_opt125m_logits_and_cached_generation_after_safe_repacking(tmp_path):
     from tools.classic_gpt_reference import check_checkpoint
 
     check_checkpoint('facebook/opt-125m', tmp_path / 'parity.json',
-                     revision='27dcfa74d334bc871f3234de431e71c6eeba5dd6')
+                     revision='27dcfa74d334bc871f3234de431e71c6eeba5dd6',
+                     safetensors_directory=str(tmp_path / 'safetensors'))
