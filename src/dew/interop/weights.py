@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -12,6 +13,8 @@ from dew import records
 from dew.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
     from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
 
 type Tree[LeafT] = dict[str, LeafT | Tree[LeafT]]
@@ -56,6 +59,32 @@ def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         raise ValueError(f"param_dtype {param_dtype!r} must name floating parameter storage")
     return np.dtype(dtype) if jnp.issubdtype(stored, jnp.floating) else stored
+
+
+def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
+    """`variables` stored as decoding reads them: each floating parameter
+    stored wider than `model`'s compute dtype cast to it, but for those
+    `checkpoint_dtype` keeps in fp32, as a checkpoint loaded at that storage
+    holds them, and as HF's `torch_dtype` and vLLM's `dtype` store a model.
+    Other collections, and a model that declares no compute dtype, keep
+    theirs, and so do the layers a `SafetensorsBanks` streams, which read at
+    the storage its own `param_dtype` states. A caller casts before its
+    program, not inside it, so the program is the one a load at that storage
+    runs."""
+    compute = getattr(model, "dtype", None)
+    if compute is None:
+        return variables
+
+    def stored(path: tuple[jax.tree_util.KeyEntry, ...], leaf):
+        names = tuple(jax.tree_util.keystr((key,), simple=True) for key in path)
+        dtype = np.dtype(leaf.dtype)
+        if (names[0] != "params" or not jnp.issubdtype(dtype, jnp.floating)
+                or dtype.itemsize <= jnp.dtype(compute).itemsize):
+            return leaf
+        target = checkpoint_dtype(dtype, dtype_name(compute), path=names)
+        return leaf if target == dtype else leaf.astype(target)
+
+    return jax.tree_util.tree_map_with_path(stored, variables)
 
 
 def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
