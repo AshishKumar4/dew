@@ -1270,6 +1270,39 @@ def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, fo
     assert first_identity == second_identity
 
 
+@pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
+def test_a_copied_corpus_resumes_a_position_saved_at_another_mount(tmp_path, format):
+    """A position saved reading one copy of a corpus resumes on a copy mounted elsewhere: an
+    order is the same wherever its sources are mounted, as the pool's identity already
+    holds, and the copy reads on from the saved record."""
+    from dew.data.compile import compile
+
+    first = tmp_path / "host0" / "corpus"
+    first.mkdir(parents=True)
+    suffix = "txt" if format == "text" else format
+    rows = [f"row {index}" for index in range(4)]
+    (first / f"part-0.{suffix}").write_text(("text\n" if format == "csv" else "") + "\n".join(
+        json.dumps({"text": row}) if format == "jsonl" else row for row in rows) + "\n")
+    Files(str(first), format=format).provision()
+    second = tmp_path / "elsewhere" / "mounted"
+    shutil.copytree(first, second)
+
+    def reader(directory):
+        return compile(Files(str(directory), format=format).repeat().batch(1),
+                       read="indexed", loading=Loading(workers=0)).train(DataPartition())
+
+    saving, resumed = reader(first), reader(second)
+    try:
+        next(saving)
+        saved = saving.get_state()
+        expected = next(saving)["text"].tolist()
+        resumed.set_state(saved)
+        assert next(resumed)["text"].tolist() == expected
+    finally:
+        saving.close()
+        resumed.close()
+
+
 def test_a_pool_is_shown_which_part_of_its_plan_differs():
     """Processes whose plans differ are refused with each one's plan, part by
     part, a digest each: a step's identity or a source's content shows as the

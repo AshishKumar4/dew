@@ -262,7 +262,6 @@ class PackedSource:
     def metadata(self) -> Mapping[str, object]:
         return {
             **self.documents.metadata(),
-            "windows": len(self.plan),
             "rows": len(self.plan),
             "valid_targets": self.plan.at("totals", 0),
             "zero_target_windows": 0,
