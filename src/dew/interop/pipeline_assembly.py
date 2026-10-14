@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, TypedDict
 
 import jax
+import numpy as np
 from flax import linen as nn
 
 from dew import records
@@ -174,7 +175,8 @@ class _TextTowers:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[DiffusionConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+              ) -> tuple[DiffusionConditioner, tuple[WeightLayout, ...], dict[str, np.ndarray],
+                         dict[str, Mapping[str, object]]]:
         """Construct the published text composition from metadata and either weight source."""
         names = tuple(name for name in self.towers if component_present(index, name))
         if not names:
@@ -197,7 +199,7 @@ class _TextTowers:
             denoiser.context_width, composition=self.composition, t5=t5,
             guidance=policy.guidance if self.embeds_guidance and not policy.guided else None,
             aesthetics=bool(index.get("requires_aesthetics_score", False)), param_dtype=param_dtype)
-        return encoder, layouts, components
+        return encoder, layouts, {}, components
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
         """The empty-prompt row a file's own pipeline guides against: the XL
@@ -217,7 +219,8 @@ class _QwenImageText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, np.ndarray],
+                         dict[str, Mapping[str, object]]]:
         """Construct `QwenImageConditioner` at the pipeline's prompt budget."""
         return _qwen_image_conditioning(directory, index, compute, tokens=policy.sequence,
                                         param_dtype=param_dtype, attention_impl=attention_impl,
@@ -243,7 +246,8 @@ class _HiddenStatesText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, np.ndarray],
+                         dict[str, Mapping[str, object]]]:
         """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
         return _hidden_states_conditioning(
             directory, index, compute, pipeline=self.pipeline, tokens=policy.sequence,
@@ -265,10 +269,12 @@ class _WanText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+              ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, np.ndarray],
+                         dict[str, Mapping[str, object]]]:
         """Construct `WanConditioner` at the pipeline's prompt budget."""
-        return _wan_conditioning(directory, compute, tokens=policy.sequence, param_dtype=param_dtype,
-                                 params=params, lazy=lazy)
+        encoder, layouts, components = _wan_conditioning(
+            directory, compute, tokens=policy.sequence, param_dtype=param_dtype, params=params, lazy=lazy)
+        return encoder, layouts, {}, components
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
         """The empty negative prompt `WanPipeline` encodes by default."""
@@ -339,7 +345,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
         params=None if variables is None else variables["autoencoder"], lazy=lazy)
     rows, columns = denoiser.sample_size
     size = (rows * autoencoder.downscale_factor, columns * autoencoder.downscale_factor)
-    encoder, text_layouts, components = denoiser.text.build(
+    encoder, text_layouts, text_retained, components = denoiser.text.build(
         directory, index, denoiser, policy, compute, size, param_dtype=param_dtype,
         attention_impl=attention_impl, params=held.get("conditioning"), lazy=lazy)
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
@@ -381,6 +387,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     return PipelineParts(model=denoiser.model, variables=variables, config=config,
                               source=directory, model_config=denoiser.built,
                               weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
+                              retained_tensors=text_retained,
                               process=schedule.training_process(tokens), inputs=inputs,
                               autoencoder=autoencoder, schedule=schedule, finish=finish, task=task)
 
@@ -423,7 +430,7 @@ def load_diffusion_conditioner[C: ConditionEncoder](
              .downscale_factor if towers else 16)
     rows, columns = denoiser.sample_size
     streaming = params is None and (mesh is not None or layout is not None)
-    encoder, _, _ = text.build(
+    encoder, _, _, _ = text.build(
         directory, index, denoiser, policy if tokens is None else policy._replace(sequence=tokens), compute,
         (rows * scale, columns * scale), param_dtype=param_dtype, attention_impl=attention_impl,
         params=params, lazy=streaming)
@@ -796,22 +803,32 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
 def _bind_language_model[C: ConditionEncoder](
         directory: Path, config: Mapping[str, object], decoder: CausalTransformer,
         path: Callable[[str], tuple[str, ...] | None], conditioner: Callable[[Variables], C], *,
-        param_dtype: str, params: Variables | None, lazy: bool) -> tuple[C, tuple[WeightLayout, ...]]:
+        vision: tuple[str, ...], param_dtype: str, params: Variables | None, lazy: bool
+        ) -> tuple[C, tuple[WeightLayout, ...], dict[str, np.ndarray]]:
     """Bind a language-model text encoder (`bind_component`) into the
     conditioner its pipeline runs: supplied `params` as they are, or the
-    `text_encoder` component's tensors that `path` maps, with their layouts."""
+    `text_encoder` component's tensors that `path` maps, with their layouts.
+
+    The tensors under a `vision` prefix are a vision tower no text prompt
+    reads, so they stay out of the variables and come back as stored, under
+    their export names, for a source export to write back
+    (`Pretrained.retained_tensors`).
+    """
+    from dew.interop import diffusion
+
+    stored = {} if params is not None else diffusion.component_tensors(directory, "text_encoder")
     encoder, _, layouts, _ = bind_component(
         directory / "text_encoder", "text_encoder", config, decoder, lambda name, rank: path(name),
         lambda bound: conditioner(bound if params is not None else {"text_encoder": bound}),
         prefix=("encoders", "conditioning", "text_encoder"), params=params, param_dtype=param_dtype,
-        lazy=lazy)
-    return encoder, layouts
+        lazy=lazy, tensors={name: tensor for name, tensor in stored.items() if not name.startswith(vision)})
+    return encoder, layouts, {f"text_encoder/{name}": tensor for name, tensor in stored.items()
+                              if name.startswith(vision)}
 
 
 def _qwen_text_path(record: decoder_parts.DecoderFields):
-    """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
-    decoder's, its head too, and its vision tower held as stored, which the
-    text-to-image prompt never reads and an export writes back."""
+    """Map a Qwen3-VL checkpoint's language model as the Qwen3 decoder's, its
+    head too."""
     family = decoders.families()["qwen3"]
 
     def path(name: str) -> tuple[str, ...] | None:
@@ -819,10 +836,6 @@ def _qwen_text_path(record: decoder_parts.DecoderFields):
             return family.weight_path("model." + name.removeprefix("model.language_model."), record)
         if name == "lm_head.weight":
             return family.weight_path(name, record)
-        if name.startswith("model.visual."):
-            # One flat leaf per stored tensor: these are carried, not run,
-            # so no module path, and no sharding rule, reads them.
-            return ("visual", name.removeprefix("model.visual."))
         raise ValueError(f"unknown tensor name {name!r}")
     return path
 
@@ -830,10 +843,12 @@ def _qwen_text_path(record: decoder_parts.DecoderFields):
 def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, *,
                              tokens: int, param_dtype: str, attention_impl: str,
                              params: Variables | None = None, lazy: bool = False
-                             ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...],
+                             ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, np.ndarray],
                                         dict[str, Mapping[str, object]]]:
     """Build Qwen-Image's conditioner: the Qwen3-VL language model, its
-    processor's tokenizer and chat template, the parameters and their layouts."""
+    processor's tokenizer and chat template, the parameters, their layouts
+    and the vision tower as stored, which the text-to-image prompt never
+    reads and an export writes back."""
     from dew.data.text import load_tokenizer
 
     config = _component_config(directory, "text_encoder")
@@ -842,12 +857,12 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
-    encoder, layouts = _bind_language_model(
+    encoder, layouts, retained = _bind_language_model(
         directory, config, decoder, _qwen_text_path(record),
         lambda bound: QwenImageConditioner(decoder, load_tokenizer(str(directory / "processor")), bound,
                                            str(directory), tokens=tokens, param_dtype=param_dtype),
-        param_dtype=param_dtype, params=params, lazy=lazy)
-    return encoder, layouts, {"text_encoder": config}
+        vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy)
+    return encoder, layouts, retained, {"text_encoder": config}
 
 
 _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] = MappingProxyType({
@@ -855,13 +870,17 @@ _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] 
 """Each FLUX.2 text encoder's `model_type`, the template its pipeline
 formats a prompt with, and the `hidden_states` it stacks."""
 
+_MISTRAL3_VISION = ("vision_tower.", "multi_modal_projector.", "model.vision_tower.",
+                    "model.multi_modal_projector.")
+"""Where a Mistral-3 checkpoint keeps its vision tower and projector: at its
+root beside `language_model.model.`, or under `model.` beside
+`model.language_model.` (`_hidden_states_path`)."""
+
 
 def _hidden_states_path(record: decoder_parts.DecoderFields, family: str, multimodal: bool):
-    """Map a hidden-states text encoder's tensors: a Qwen3 language model's
-    own names, or a Mistral-3's language model as the Mistral decoder's with
-    its vision tower and projector held as stored, which a text prompt never
-    reads and an export writes back. A Mistral-3 checkpoint names its
-    language model `language_model.model.` and its head
+    """Map a hidden-states text encoder's language model: a Qwen3's own
+    names, or a Mistral-3's as the Mistral decoder's. A Mistral-3 checkpoint
+    names its language model `language_model.model.` and its head
     `language_model.lm_head` (transformers 4.50 and 5 write these), or
     `model.language_model.` and `lm_head` (4.52 to 4.57)."""
     decoder = decoders.families()[family]
@@ -874,8 +893,6 @@ def _hidden_states_path(record: decoder_parts.DecoderFields, family: str, multim
         for prefix in ("model.language_model.", "language_model.model."):
             if name.startswith(prefix):
                 return decoder.weight_path("model." + name.removeprefix(prefix), record)
-        if name.removeprefix("model.").startswith(("vision_tower.", "multi_modal_projector.")):
-            return ("visual", name)
         raise ValueError(f"unknown tensor name {name!r}")
     return path
 
@@ -885,11 +902,12 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
                                 param_dtype: str, attention_impl: str, params: Variables | None = None,
                                 lazy: bool = False
                                 ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],
-                                           dict[str, Mapping[str, object]]]:
+                                           dict[str, np.ndarray], dict[str, Mapping[str, object]]]:
     """Build FLUX.2's or Z-Image's conditioner: the text encoder's language
-    model, the tokenizer and chat template, the parameters and their layouts.
-    Z-Image reads the output of the encoder's second-to-last layer with the
-    template's thinking on."""
+    model, the tokenizer and chat template, the parameters, their layouts and
+    a Mistral-3's vision tower and projector as stored, which a text prompt
+    never reads and an export writes back. Z-Image reads the output of the
+    encoder's second-to-last layer with the template's thinking on."""
     from dew.data.text import load_tokenizer
 
     config = _component_config(directory, "text_encoder")
@@ -915,15 +933,15 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         # none of these pipelines reads of its released encoder.
         raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
                          "encoder does not have before its final norm")
-    encoder, layouts = _bind_language_model(
+    encoder, layouts, retained = _bind_language_model(
         directory, config, decoder,
         _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
         lambda bound: HiddenStatesConditioner(
             decoder, load_tokenizer(str(directory / "tokenizer")), bound, str(directory),
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,
             guidance=guidance, param_dtype=param_dtype),
-        param_dtype=param_dtype, params=params, lazy=lazy)
-    return encoder, layouts, {"text_encoder": config}
+        vision=_MISTRAL3_VISION if multimodal else (), param_dtype=param_dtype, params=params, lazy=lazy)
+    return encoder, layouts, retained, {"text_encoder": config}
 
 
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
@@ -983,6 +1001,7 @@ class PipelineParts(TypedDict):
     source: Path | None
     model_config: Mapping[str, object]
     weight_layouts: tuple[WeightLayout, ...]
+    retained_tensors: Mapping[str, np.ndarray]
     process: Process
     inputs: InputSpec
     autoencoder: AutoEncoder | None
