@@ -208,7 +208,9 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
     `intra_diagonal`'s. A block below the diagonal, rows `i` and columns `j` of sub-chunks `I > J`,
     factors the decay through `g_n`, the first row of `I`: `(x_I exp2(g_I - g_n)) (k_J exp2(g_n -
     g_J))^T`, each exponent from the decay's two halves (`compensated_difference`), fp32 products at
-    fla's TF32 (`_tf32_dot`), then scaled by `scale` or by beta. The
+    fla's TF32 (`_tf32_dot`), then scaled by `scale` or by beta. `k_J exp2(g_n - g_J)` is held from
+    one `I` to the next and moved on by the row between their first rows, `exp2(g_n' - g_n)`, so
+    each earlier sub-chunk's keys are decayed once, where fla decays them again for every `I`. The
     diagonal blocks of `I + Akk` invert by forward substitution and merge in fla's order, `X_IJ =
     -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at TF32. `Aqk` and the
     inverse are stored in the keys' dtype, zero above the diagonal; a chunk's rows past its end read
@@ -228,7 +230,8 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
 
         def block(c, sums):
             """One block of key columns for every pair in fla's order: each row's sub-chunk loaded after
-            the rows before it are summed, and the earlier sub-chunks' keys and decays held."""
+            the rows before it are summed, and the earlier sub-chunks' keys held, decayed to its first
+            row."""
             columns = pl.ds(c * bk, bk)
 
             def load(ref, i):
@@ -237,19 +240,26 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
             def gates(i):
                 return _halves(g_ref, lo_ref, start, taken, SUB, i * SUB, columns)
 
-            found = dict(zip(pairs, sums, strict=True))
-            held = [(load(k_ref, 0), gates(0))]
-            for i in range(1, count):
-                key, gate = load(k_ref, i), gates(i)
+            def origin(i):
+                """The decay's halves at sub-chunk `i`'s first row, or the chunk's last past its end."""
                 at = jnp.minimum(start + i * SUB, start + taken - 1)
-                origin = tuple(x[None, :] for x in _row(g_ref, lo_ref, (at, columns)))
-                ahead = jnp.exp2(compensated_difference(gate, origin))
+                return tuple(x[None, :] for x in _row(g_ref, lo_ref, (at, columns)))
+
+            found = dict(zip(pairs, sums, strict=True))
+            key, gate, held, before = load(k_ref, 0), gates(0), [], None
+            for i in range(1, count):
+                # The earlier sub-chunks' keys, decayed to this sub-chunk's first row.
+                here = origin(i)
+                if before is not None:
+                    moved = jnp.exp2(compensated_difference(here, before))
+                    held = [earlier * moved for earlier in held]
+                held.append(key * jnp.exp2(compensated_difference(here, gate)))
+                key, gate, before = load(k_ref, i), gates(i), here
+                ahead = jnp.exp2(compensated_difference(gate, here))
                 read, written = load(q_ref, i) * ahead, key * ahead
-                for j, (earlier, decay) in enumerate(held):
-                    behind = (earlier * jnp.exp2(compensated_difference(origin, decay))).T
+                for j, earlier in enumerate(held):
                     qk, kk = found[i, j]
-                    found[i, j] = (qk + _tf32_dot(read, behind), kk + _tf32_dot(written, behind))
-                held.append((key, gate))
+                    found[i, j] = (qk + _tf32_dot(read, earlier.T), kk + _tf32_dot(written, earlier.T))
             return [found[pair] for pair in pairs]
 
         found = jax.lax.fori_loop(0, width // bk, block, [(zero, zero)] * len(pairs))
