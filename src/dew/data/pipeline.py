@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch, LengthGroups
+from dew.data.dataset import Batch
 
 if TYPE_CHECKING:
     import jax
@@ -63,50 +63,27 @@ class SingleReader(Protocol):
     single_reader: bool
 
 
-@dataclasses.dataclass(frozen=True)
-class TokenField:
-    name: str
-    extra: int = 0
-    side: Literal["left", "right"] = "right"
-    pad: int | bool = 0
-
-
 @runtime_checkable
 class TokenGeometry(Protocol):
+    """A record step whose rows each hold `max_length` tokens, which a token
+    budget divides into rows (`TokenBudget`)."""
+
     @property
     def max_length(self) -> int: ...
-    @property
-    def token_fields(self) -> tuple[TokenField, ...]: ...
-    @property
-    def length_field(self) -> str: ...
-
-
-@dataclasses.dataclass(frozen=True)
-class Geometry:
-    max_length: int
-    token_fields: tuple[TokenField, ...]
-    length_field: str
 
 
 @dataclasses.dataclass(frozen=True)
 class TokenBudget:
+    """A batch of `tokens` tokens: as many rows as the pipeline's fixed row
+    length (`TokenGeometry`) divides it into, resolved when it compiles."""
+
     tokens: int
-    lengths: tuple[int, ...] = ()
-    window: int = 8
-    geometry: Geometry | None = None
     drop_remainder: bool = True
+    batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
     def __post_init__(self) -> None:
-        if self.tokens <= 0 or self.window <= 0:
-            raise ValueError("token budget and grouping window must be positive")
-        if self.lengths and (
-            len(self.lengths) > 6
-            or tuple(sorted(set(self.lengths))) != self.lengths
-            or any(length <= 0 or self.tokens % length for length in self.lengths)
-        ):
-            raise ValueError(
-                "token budget lengths need at most six increasing positive divisors of the budget"
-            )
+        if self.tokens <= 0:
+            raise ValueError("a token budget must be positive")
 
 
 @runtime_checkable
@@ -236,10 +213,32 @@ class BatchStage:
 
 @dataclasses.dataclass(frozen=True)
 class Pack:
+    """Documents packed into windows of `seq_len` tokens along `fields`.
+
+    `along` packs other fields on axes of their own, each to its own length,
+    and `segments` bounds the documents a window holds. A first-fit or
+    best-fit window closes when any of them is full, as Grain's packer does
+    with its `length_struct` and `max_sequences_per_bin`.
+    """
+
     seq_len: int
     fields: tuple[str, ...] = ("text",)
     bins: int = 32
     policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+    segments: int | None = None
+    along: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def packed(self) -> tuple[str, ...]:
+        """Every field a window holds: `fields` and those `along` axes of their own."""
+        return (*self.fields, *(name for name, _ in self.along))
+
+    def __post_init__(self) -> None:
+        if self.policy == "concat" and (self.segments is not None or self.along):
+            raise ValueError("concatenated packing cuts documents across windows; it takes no "
+                             "segment bound or fields along other axes")
+        if self.segments is not None and self.segments < 1:
+            raise ValueError(f"a window holds at least one document, not {self.segments}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -247,6 +246,10 @@ class Windows:
     seq_len: int
     stride: int | None = None
     fields: tuple[str, ...] = ("text",)
+
+    def __post_init__(self) -> None:
+        if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
+            raise ValueError("causal windows need fields and positive lengths and strides")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,11 +282,6 @@ class Workers:
 @dataclasses.dataclass(frozen=True)
 class Limit:
     count: int
-
-
-@dataclasses.dataclass(frozen=True)
-class Group:
-    groups: LengthGroups
 
 
 class DeviceStep:
@@ -326,7 +324,6 @@ type Stage = (
     | Prefetch
     | Workers
     | Limit
-    | Group
     | MapBatch
     | Artifact
     | Windows
@@ -545,16 +542,13 @@ class Dataset:
         size: int | None = None,
         *,
         tokens: int | None = None,
-        lengths: tuple[int, ...] = (),
         drop_remainder: bool = True,
         batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
     ) -> Pipeline:
         if (size is None) == (tokens is None):
             raise ValueError("batch needs exactly one of row size or tokens")
         if tokens is not None:
-            if batch_fn is not None:
-                raise ValueError("token batching owns its variable-size stack; batch_fn needs row batching")
-            return self.then(TokenBudget(tokens, lengths, drop_remainder=drop_remainder))
+            return self.then(TokenBudget(tokens, drop_remainder, batch_fn))
         if size is None or size < 1:
             raise ValueError("batch size must be positive")
         return self.then(BatchStage(size, drop_remainder, batch_fn))
@@ -566,11 +560,14 @@ class Dataset:
         fields: tuple[str, ...] = ("text",),
         bins: int = 32,
         policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
+        segments: int | None = None,
+        along: tuple[tuple[str, int], ...] = (),
     ) -> Pipeline:
         """Records laid end to end in rows of `seq_len` tokens: each row holds
-        the per-token `fields` of the records it packs; a field that is one
-        value a record has no place in a row of several and is left out."""
-        return self.then(Pack(seq_len, fields, bins, policy))
+        the per-token `fields` of the records it packs, each `along` field on
+        an axis of its own, and at most `segments` records; a field that is
+        one value a record has no place in a row of several and is left out."""
+        return self.then(Pack(seq_len, fields, bins, policy, segments, along))
 
     def windows(
         self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
@@ -606,9 +603,6 @@ class Dataset:
         from dew.data.cache import Cache
 
         return self.then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
-
-    def group(self, length: Callable[[Batch], int], *, window: int = 64) -> Pipeline:
-        return self.then(Group(LengthGroups(length, window)))
 
     def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
                  rows_per_shard: int = 100_000) -> Mapping[str, object]:
@@ -785,7 +779,8 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
 class ObjectiveData:
     train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion | Configured, ...] = ()
     evaluate: tuple[RecordStep | Expansion | Configured, ...] = ()
-    group: LengthGroups | None = None
+    pack: Pack | None = None
+    packed: tuple[RecordStep, ...] = ()
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
 

@@ -754,6 +754,17 @@ def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -
     return min(tokens, fitting, tokens if tile is None else tile[0])
 
 
+def fused_chunks(shape: tuple[int, ...], vocab: int, tile: tuple[int, int] | None = None) -> int:
+    """The chunks (`fused_tokens`) `fused_head_loss` cuts one device's share
+    of targets of `shape` into, its tokens split over the mesh in context as
+    `_sharded_head` splits them (`_token_spec`)."""
+    mesh = jax.sharding.get_abstract_mesh()
+    shards = 1 if mesh.empty else math.prod(
+        mesh.shape[axis] for entry in _token_spec(shape) for axis in mesh_axes(entry))
+    tokens = math.prod(shape) // shards
+    return -(-tokens // fused_tokens(tokens, vocab, tile))
+
+
 def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
                     tile: tuple[int, int] | None = None, predict: bool = True, temperature: float = 1.0,
                     excluded: int | None = None) -> tuple[jax.Array, Terms]:

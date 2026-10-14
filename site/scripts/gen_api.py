@@ -43,7 +43,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.rl.flow",
                     "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.harbor"]),
     ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
-              "dew.data.dataset", "dew.data.plan", "dew.data.mixing", "dew.data.batching", "dew.data.cache",
+              "dew.data.dataset", "dew.data.plan", "dew.data.mixing", "dew.data.cache",
               "dew.data.storage", "dew.data.sinks",
               "dew.data.sources", "dew.data.sources.base", "dew.data.sources.files", "dew.data.sources.memory",
               "dew.data.sources.hub", "dew.data.sources.tfds", "dew.data.sources.pytorch", "dew.data.sources.hf",
@@ -537,7 +537,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     bound.update(built)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
-    # Each outermost dotted name once: `dew.interop.hub.pull_from_hub`, not also `dew.interop.hub`.
+    # Only the outermost dotted name counts, so a method and its class are not counted twice.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     seen = set()
     for node in ast.walk(tree):

@@ -8,7 +8,7 @@ the accepted rows, each with the source position it came from, as a
 other. Record steps, token splits, Grain's packers and cache reads run by
 the Grain lowering's own definitions (`dew.data.lowering`); first-fit
 packing and windows run by their indexed plans (`PackedWindows`,
-`WindowRecords`), so the plan can fingerprint them. It counts what it
+`IndexedWindows`), so the plan can fingerprint them. It counts what it
 attempted, accepted and rejected, and records the derived order facts a
 resume checks.
 """
@@ -23,12 +23,11 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _name
-from dew.data.dataset import Batch, LengthGroups, Records
+from dew.data.dataset import Batch, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
-    Group,
     Map,
     Mixture,
     Pack,
@@ -108,15 +107,13 @@ class _Memory:
 def _materialize(
     pipeline: Pipeline,
     counts: dict[str, CorpusCounts],
-    groups: LengthGroups | None = None,
     *,
     training: bool = True,
 ) -> Pipeline:
-    groups = next((stage.groups for stage in pipeline.stages if isinstance(stage, Group)), groups)
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
     if isinstance(pipeline.source, (Mixture, Phases)):
-        return _memory_mixture(pipeline, pipeline.source, counts, groups, training=training)
+        return _memory_mixture(pipeline, pipeline.source, counts, training=training)
     source = pipeline.source
     stored = source.records("memory")
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
@@ -125,7 +122,7 @@ def _materialize(
     lowering = _analyzed(pipeline, "memory", validation=not training)
     rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
     return _memory_stages(
-        pipeline, source, stored, rows, consumed, lowering.eager, counter, groups, training=training
+        pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training
     )
 
 
@@ -170,7 +167,6 @@ def _memory_stages(
     consumed: int,
     eager: int,
     counter: CorpusCounts,
-    groups: LengthGroups | None,
     *,
     training: bool,
 ) -> Pipeline:
@@ -190,40 +186,46 @@ def _memory_stages(
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):
-            from dew.data.steps.windows import WindowRecords
+            from dew.data.steps.windows import IndexedWindows
 
             derived[f"accepted_before_windows_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            windows = WindowRecords(tuple(record(value, "window document") for _, value in rows), stage)
+            windows = IndexedWindows.from_records(
+                tuple(record(value, "window document") for _, value in rows), stage
+            )
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
-            rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter)
+            rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
+                                      stage.fields[0])
         elif isinstance(stage, Pack):
             from dew.data.tokens import PackedWindows
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            kept = Fields(stage.fields)
+            kept = Fields(stage.packed)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
-            if stage.policy == "first-fit":
+            if stage.policy == "first-fit" and not stage.along:
                 packed = PackedWindows(
-                    pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
+                    pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe(),
+                    segments=stage.segments,
                 )
                 derived["packing"] = fingerprint([packed.order.tolist(), packed.starts.tolist()])
             else:
-                # Only first-fit has an indexed plan; the other policies are Grain's
+                # Only first-fit of tokens alone has an indexed plan; the rest is Grain's
                 # own packer, run once over the corpus as an indexed read streams it.
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
-            rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter)
+            rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter,
+                                      stage.fields[0])
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
             counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
             for identifier, value in rows:
-                for child, output in enumerate(_outputs(stage, identifier[0], value)):
+                outputs = _outputs(stage, identifier[0], value, counts=counter)
+                for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1
                     else:
@@ -242,18 +244,19 @@ def _memory_stages(
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, groups, targets, counted)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted)
 
 
 def _targeted(
-    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts
+    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
-    """The windows a pack or windows stage made that hold a valid target, and
-    their counts before record steps rename or remove their token fields."""
+    """The windows a pack or windows stage made that hold a valid target of
+    their token `field`, and their counts before record steps rename or remove
+    their token fields."""
 
     kept, total = [], 0
     for identifier, value in rows:
-        count = ValidTargets()(record(value, "packed window"))
+        count = ValidTargets(field)(record(value, "packed window"))
         if count:
             kept.append((identifier, value))
             total += count
@@ -266,11 +269,10 @@ def _memory_mixture(
     pipeline: Pipeline,
     mixture: Mixture,
     counts: dict[str, CorpusCounts],
-    groups: LengthGroups | None,
     *,
     training: bool,
 ) -> Pipeline:
-    children = tuple(_materialize(child, counts, groups, training=training) for child in mixture.pipelines)
+    children = tuple(_materialize(child, counts, training=training) for child in mixture.pipelines)
     kept = tuple(
         (child, weight)
         for child, weight in zip(children, mixture.weights, strict=True)
@@ -302,7 +304,6 @@ def _memory_order(
     inputs: int,
     counter: CorpusCounts,
     derived: dict[str, str],
-    groups: LengthGroups | None,
     packed: Mapping[str, int] | None,
     counted: Mapping[tuple[int, ...], int] | None,
 ) -> Pipeline:
@@ -311,13 +312,7 @@ def _memory_order(
         for identifier, value in collected
     ]
     remaining = pipeline.stages[consumed:]
-    lengths = (
-        np.asarray([groups.length(record(value, "grouped record")) for _, value in rows], np.int64)
-        if groups is not None
-        else source.lengths()
-        if consumed == 0
-        else None
-    )
+    lengths = source.lengths() if consumed == 0 else None
     fanouts = np.zeros(inputs, np.int64)
     for identifier, _ in rows:
         if identifier[0] < len(fanouts):

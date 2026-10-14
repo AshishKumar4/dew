@@ -390,7 +390,7 @@ class _Rope:
 
 
 def _rope_entry(entry: Mapping[str, object] | None, field: str,
-                yarn_max_pos: int | None = None) -> _Rope:
+                yarn_max_pos: int | None = None, *, ramps: tuple[str, ...] | None = None) -> _Rope:
     """Read one rope_parameters entry, if it names a base or a ramp.
 
     Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
@@ -406,10 +406,14 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
     entry needs for the factor the reference falls back to. Passing it is
     how a family whose attention builds the YaRN frequencies opts in; the
     families that only rotate plainly leave it None and refuse the type.
+    `ramps` restricts the scaled types to those the caller's family computes.
     """
     if entry is None:
         return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if ramps is not None and rope_type not in ('default', 'none', *ramps):
+        refuse(f"{field} (rope_type {rope_type!r})",
+                f"this family applies plain rotary positions or {list(ramps)} ramps")
     theta = entry.get('rope_theta')
     theta = None if theta is None else records.number(theta, 'rope_theta')
     if rope_type == 'llama3':
@@ -452,8 +456,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
 def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
     """Read one plain rope base frequency.
 
-    A llama3 entry refuses where only plain rope has a place: the DeepSeek and
-    Gemma 4 readers.
+    A llama3 entry refuses where only plain rope has a place, as in Gemma 4.
     """
     rope = _rope_entry(entry, field)
     if rope.scaling is not None:
@@ -576,7 +579,8 @@ def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
 
 
 def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
-              spelling: RopeSpelling = PLAIN_SPELLING) -> Ropes:
+              spelling: RopeSpelling = PLAIN_SPELLING, *,
+              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
     The class's records come first (`RopeSpelling`): flat rope_theta with a
@@ -585,19 +589,22 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
     a record that names its type as plain clearing an earlier ramp. Each is
     then parsed once (`_rope_entry`): the full layers' base and ramp are the
     model's, the sliding layers' their kind's where they differ. YaRN reads
-    `yarn_max_pos`, as `_rope_entry` describes.
+    `yarn_max_pos`, as `_rope_entry` describes. `ramps` names the scaling
+    types the family computes; `per_kind=False` refuses nested records.
     """
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
     if spelling.local_field is not None:
         used.add(spelling.local_field)
     (full_field, full_record), sliding = _rope_records(hf_config, spelling)
-    full = _rope_entry(full_record, full_field, yarn_max_pos)
+    if not per_kind and '.' in full_field:
+        refuse(full_field, 'this family reads one rotary record for every layer')
+    full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
     full_ramp = _at_base(full.scaling, theta)
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
-    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos)
+    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
     sliding_ramp = _at_base(local.scaling, sliding_theta)
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
@@ -1306,11 +1313,14 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
         kernel = name.endswith('.kernel') and value.ndim == 2
         layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
                                        if kernel else value.shape, (1, 0) if kernel else None)
-    return layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
+    # A packed tensor's geometry is the model's, read as a translated config spells it.
+    geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
+                'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
+    return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout],
-                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
     """`layouts` with each `packed` source tensor built from its parts' layouts,
     in the place of its first part."""
     source: dict[str, WeightLayout] = {}
@@ -1327,7 +1337,7 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
-                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+                stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
 
 
@@ -1385,7 +1395,10 @@ class Packed:
     Each name is a suffix after the stem a tensor and its parts share. A load
     splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
     and an export packs their leaves back (`layout`), so the one entry is
-    both directions.
+    both directions. With `chunks` the tensor is that many equal runs on
+    `axis`, each holding its share of every part in turn, as a checkpoint
+    pre-sharded for as many tensor-parallel ranks stores them; each part is
+    its shares in run order.
     """
 
     name: str
@@ -1393,25 +1406,38 @@ class Packed:
     axis: int = -1
     transpose: tuple[int, ...] | None = None
     widths: Callable[[Mapping[str, object]], tuple[int, ...]] | None = None
-    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv."""
+    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv;
+    with `chunks`, one run's."""
+    chunks: Callable[[Mapping[str, object]], int] | None = None
+    """Config-derived count of the runs the parts are interleaved in, as in
+    MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
-        """The parts of the source tensor `name`, as views of it."""
+        """The parts of the source tensor `name`, as views of it, or copies
+        where they are interleaved in runs."""
         stem = name.removesuffix(self.name)
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        if (self.widths is not None or self.chunks is not None) and config is None:
+            raise ValueError(f'{name} needs translated geometry to split its projections')
+        axis = self.axis % stored.ndim
+        runs = 1 if self.chunks is None or config is None else self.chunks(config)
+        if runs < 1 or stored.shape[axis] % runs:
+            raise ValueError(f'{name} has shape {stored.shape}, which {runs} equal runs do not divide')
+        run = stored.reshape(*stored.shape[:axis], runs, stored.shape[axis] // runs, *stored.shape[axis + 1:])
         sections: int | np.ndarray = len(self.parts)
-        if self.widths is not None:
-            if config is None:
-                raise ValueError(f'{name} needs translated geometry to split its projections')
+        if self.widths is not None and config is not None:
             widths = self.widths(config)
-            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != stored.shape[self.axis]:
-                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths}')
+            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != run.shape[axis + 1]:
+                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths} '
+                                 f'in {runs} runs')
             sections = np.cumsum(widths[:-1])
-        return {stem + part: piece for part, piece in
-                zip(self.parts, np.split(stored, sections, axis=self.axis), strict=True)}
+        pieces = np.split(run, sections, axis=axis + 1)
+        return {stem + part: piece.reshape(*stored.shape[:axis], -1, *stored.shape[axis + 1:])
+                for part, piece in zip(self.parts, pieces, strict=True)}
 
-    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+    def layout(self, name: str, parts: Sequence[WeightLayout],
+               config: Mapping[str, object] | None = None) -> WeightLayout:
         """The layout of the source tensor `name`, from each part's one-leaf layout."""
         ndim = len(parts[0].shape)
         # A part's axis k is its leaf's axis order[k].
@@ -1422,10 +1448,41 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
-                            None if len(parts) == 1 else order[axis] - ndim)
+                            None if len(parts) == 1 else order[axis] - ndim,
+                            chunks=None if runs == 1 else runs)
+
+
+_QKV = ('q_proj', 'k_proj', 'v_proj')
+
+
+def _key_runs(config: Mapping[str, object]) -> int:
+    """A grouped qkv's runs: one a key head."""
+    return records.integer(config['num_kv_heads'], 'num_kv_heads')
+
+
+def _key_run_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
+    """One run's query, key and value rows: its key head's group of query heads, then the key and
+    value head."""
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    return (records.integer(config['num_heads'], 'num_heads') // _key_runs(config) * head_dim, head_dim,
+            records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
+
+
+def grouped_qkv(name: str) -> tuple[Packed, Packed]:
+    """The weight and bias of a fused q, k and v projection under `name`
+    (`.attention.query_key_value`), stored in one run a key head, each run
+    its group's query rows, then its key's and its value's. GPT-NeoX's and
+    BLOOM's per-head interleave is the run of a model whose every head keys
+    itself, Falcon-7B's and GPTBigCode's multi-query [q | k | v] the one run
+    of one key head, and MiMo-V2.6's fused qkv the run vLLM pre-shards it in
+    (`_shard_fp8_qkv_proj`)."""
+    weight, bias = (Packed(f'{name}.{leaf}', tuple(f'.self_attn.{part}.{leaf}' for part in _QKV), 0,
+                           widths=_key_run_widths, chunks=_key_runs) for leaf in ('weight', 'bias'))
+    return weight, bias
 
 
 # Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch

@@ -66,8 +66,6 @@ from dew.data.pipeline import (
     Expansion,
     Filter,
     FlatMap,
-    Geometry,
-    Group,
     HostStep,
     Interleave,
     Limit,
@@ -97,7 +95,6 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.generic import Placed
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -242,54 +239,51 @@ def _configured(
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
-def _geometry(pipeline: Pipeline) -> Geometry | None:
+def _row_tokens(pipeline: Pipeline) -> int | None:
+    """The tokens each row of `pipeline` holds, as its last record step
+    declaring them states (`TokenGeometry`), or its corpora alike."""
     declared = [
         stage.step
         for stage in pipeline.stages
         if isinstance(stage, (Map, RandomMap)) and isinstance(stage.step, TokenGeometry)
     ]
     if declared:
-        last = declared[-1]
-        return Geometry(last.max_length, last.token_fields, last.length_field)
+        return declared[-1].max_length
     if isinstance(pipeline.source, (Mixture, Phases)):
-        children = [_geometry(child) for child in pipeline.source.pipelines]
-        if not children or any(child is None for child in children):
-            return None
-        known = [child for child in children if child is not None]
-        if any(
-            child.token_fields != known[0].token_fields or child.length_field != known[0].length_field
-            for child in known
-        ):
-            raise ValueError("mixed token geometries need matching token fields and length columns")
-        return dataclasses.replace(known[0], max_length=max(child.max_length for child in known))
+        lengths = {_row_tokens(child) for child in pipeline.source.pipelines}
+        if len(lengths) > 1:
+            raise ValueError(f"a token budget needs rows of one length, and the corpora's are {lengths}")
+        return lengths.pop()
     return None
 
 
-def _token_geometry(pipeline: Pipeline, fallback: Geometry | None = None) -> Pipeline:
-    if not any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
+def _budgeted(pipeline: Pipeline, fallback: int | None = None) -> Pipeline:
+    """`pipeline` with its token budget as the rows of fixed length it divides into."""
+    budget = next((stage for stage in pipeline.stages if isinstance(stage, TokenBudget)), None)
+    if budget is None:
         return pipeline
-    geometry = _geometry(pipeline) or fallback
-    if geometry is None:
+    length = _row_tokens(pipeline) or fallback
+    if length is None:
         raise ValueError(
             f"token-budget pipeline {_name(pipeline)} needs a record step declaring TokenGeometry"
         )
+    if budget.tokens % length:
+        raise ValueError(f"a token budget of {budget.tokens} is not whole rows of {length} tokens")
+    rows = BatchStage(budget.tokens // length, budget.drop_remainder, budget.batch_fn)
     return dataclasses.replace(
-        pipeline,
-        stages=tuple(
-            dataclasses.replace(stage, geometry=geometry) if isinstance(stage, TokenBudget) else stage
-            for stage in pipeline.stages
-        ),
+        pipeline, stages=tuple(rows if stage is budget else stage for stage in pipeline.stages)
     )
 
 
-def _batch_rows(batching: BatchStage | TokenBudget) -> int:
-    """The declared row batch, or the largest row count of a fixed token budget."""
-    if isinstance(batching, BatchStage):
-        return batching.size
-    from dew.data.batching import bucket_lengths
-
-    lengths = bucket_lengths(batching)
-    return batching.tokens // min(lengths)
+def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
+    """`pipeline` with the objective's packing, and the steps over each window, before its batch."""
+    if objective.pack is None:
+        return pipeline
+    at = _until(pipeline.stages, (BatchStage, TokenBudget))
+    windows = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).then(objective.pack)
+    for step in objective.packed:
+        windows = windows.map(step)
+    return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
 def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
@@ -373,6 +367,12 @@ def _prepared(
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
         branches = tuple(_configured(branch, metadata, read) for branch in branches)
+    if objective is not None:
+        branches = tuple(_windowed(branch, objective) for branch in branches)
+    if any(isinstance(stage, TokenBudget) for branch in branches for stage in branch.stages):
+        # A token budget's rows are the training rows' fixed length (`_budgeted`).
+        trained = _row_tokens(branches[0])
+        branches = tuple(_budgeted(branch, trained) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     return branches
@@ -415,6 +415,8 @@ def compile(
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
         )
+    stated = next((stage for stage in train.stages if isinstance(stage, TokenBudget)), None)
+    batch_tokens = None if stated is None else stated.tokens
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
     branches = _prepared(
@@ -426,14 +428,10 @@ def compile(
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
     train, validation = branches[0], (None if validation is None else branches[1])
-    train = _token_geometry(train)
-    if validation is not None:
-        validation = _token_geometry(validation, _geometry(train))
-    batching = next((stage for stage in train.stages if isinstance(stage, (BatchStage, TokenBudget))), None)
+    batching = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
     if batching is None:
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = _batch_rows(batching)
-    batch_tokens = None if isinstance(batching, BatchStage) else batching.tokens
+    batch = batching.size
     original = train
     if read == "memory":
         train = _materialize(train, counts)
@@ -468,10 +466,9 @@ def _compiled(
     validation_counts: Mapping[str, CorpusCounts],
     batch_tokens: int | None,
 ) -> Loader:
-    read, seed, loading, batch, global_order = (
+    read, seed, batch, global_order = (
         build.read,
         build.seed,
-        build.loading,
         build.batch,
         build.global_order,
     )
@@ -496,10 +493,7 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(train, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
+    build = build.tuned(train)
     train_host, device = _batch_steps(train)
     train_host = train_host + host
     statistics = _Statistics(counts)
@@ -520,7 +514,7 @@ def _compiled(
             pipeline=validation,
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
-            ),
+            ).tuned(validation),
             host=_held_steps(validation) + host,
         )
     )
@@ -743,9 +737,9 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
         )
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     boundary = (
-        (Shuffle, Repeat, Group, BatchStage, TokenBudget)
+        (Shuffle, Repeat, BatchStage, TokenBudget)
         if read == "memory"
-        else (Group, BatchStage, TokenBudget)
+        else (BatchStage, TokenBudget)
     )
     # The objective's steps read the rows a pack or window makes, never the documents it packs.
     layouts = [index + 1 for index, stage in enumerate(pipeline.stages) if isinstance(stage, (Pack, Windows))]
@@ -787,13 +781,12 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     at = _until(branch.stages, (BatchStage, TokenBudget))
     suffix = branch.stages[at:]
     branch = dataclasses.replace(branch, stages=branch.stages[:at])
-    if objective.group is not None and not any(isinstance(stage, TokenBudget) for stage in suffix):
-        branch = branch.then(Group(objective.group))
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
-    # The objective's batch goes to the accelerator: its string and object fields stay here.
-    return branch.then(*(MapBatch(step) for step in steps), MapBatch(Placed()))
+    # A string or object field stays in the batch for the host code and metrics that read it; the
+    # prefetcher places the rest (`dew.training.distributed.device_fields`).
+    return branch.then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
@@ -829,14 +822,14 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     if not pipeline.batched:
         pipeline = pipeline.batch(1, drop_remainder=False)
     counts: dict[str, CorpusCounts] = {}
-    (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
-                            counts=(counts,) if records is None else None)
     finite = not any(isinstance(stage, Repeat) for stage in _steps(pipeline))
     if finite:
+        # A finite pass keeps a token budget's last rows; its budget becomes rows of fixed length.
         pipeline = dataclasses.replace(pipeline, stages=tuple(
             dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, TokenBudget) else stage
             for stage in pipeline.stages))
-    pipeline = _token_geometry(pipeline)
+    (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
+                            counts=(counts,) if records is None else None)
     if read == "memory" and records is None:
         pipeline = _materialize(pipeline, counts)
     lowering = _analyzed(pipeline, read)
@@ -844,12 +837,10 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         lowering = _cut(lowering, per_share=True)
     if finite:
         lowering = _finite(lowering)
-    batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
-    batch = _batch_rows(batching)
+    # A token budget is fixed-length rows by now (`_budgeted`).
+    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
-    if loading.workers == "auto":
-        build = dataclasses.replace(build, loading=loading.resolved(build.batched(pipeline, DataPartition())))
-    return _Host(build.batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
+    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
@@ -876,7 +867,7 @@ def iterate(
         pipeline = _materialize(pipeline, {}, training=False)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, 0, 1, budget, lowering, training=False)
-    rows, _ = build.records(pipeline, DataPartition())
+    rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
 
@@ -940,18 +931,13 @@ def validation(
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
-    pipeline = _token_geometry(pipeline)
-    batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
-    batch = _batch_rows(batching)
+    # A token budget is fixed-length rows by now (`_budgeted`).
+    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(pipeline, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
-    return functools.partial(_validation_reader, pipeline=pipeline, build=build,
+    return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=_held_steps(pipeline) + host)
 
 

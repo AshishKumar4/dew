@@ -236,6 +236,13 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
         prepare_counts(objective, counted, count_model=True)
 
 
+def packed_windows(questions: int = 2) -> dict[str, np.ndarray]:
+    """Two packed windows of eight tokens, each holding one row of `LENGTHS`
+    tokens whose questions all start at its first token."""
+    return {"segments": (np.arange(8)[None, :] < LENGTHS[:, None]).astype(np.int32),
+            "spans": np.zeros((2, questions, 2), np.int32)}
+
+
 def test_decision_objective_supplies_the_layout_geometry_to_the_head():
     model = decoder()
     head = DecisionHead(8, layers=1)
@@ -243,8 +250,7 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
                                   layout=StateFirstLayout(max_len=16))
-    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
-             "questions": np.array([[True, False], [True, True]]),
+    batch = {**packed_windows(), "questions": np.array([[True, False], [True, True]]),
              "options": np.array([[[True, True, False], [False, False, False]],
                                   [[True, True, True], [True, True, True]]])}
     np.testing.assert_array_equal(objective.real_lengths(batch), LENGTHS)
@@ -284,8 +290,8 @@ def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_h
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
                                   layout=StateFirstLayout(max_len=8))
-    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
-             "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
+    batch = {**packed_windows(questions=1), "questions": np.ones((2, 1), bool),
+             "options": np.ones((2, 1, 2), bool)}
     frozen = 4 * 8 * 8 * np.sum(LENGTHS)
     factors = 6 * (8 + 8) * np.sum(LENGTHS)
     head_work = head.decision_flops(LENGTHS, np.ones(2, np.int64), np.full(2, 2, np.int64))
@@ -345,18 +351,28 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
 
 
 def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
-    interval = Interval(last_log_time=0, last_saved=None)
+    """A log takes the interval's work and tokens and starts the next
+    interval's at zero, and the run's lifetime tokens keep both logs'."""
+    interval = Interval(last_log_time=0, last_saved=None, tokens_before_log=5)
     loss = jnp.asarray(1.0)
-    for forward, tokens in ((100, 4), (200, 3)):
-        interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                        jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                   TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    def counted(steps):
+        for forward, tokens in steps:
+            interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
+                           jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
+                                                      TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    counted(((100, 4), (200, 3)))
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
-    interval.logged(3.0)
+    taken = interval.take(3, loss, {}, jnp.asarray(a=True), (None, None), {}, {})
+    assert float(taken.reading.training) == 900 and _TokenCount.host(taken.reading.tokens) == 7
     assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
+    assert interval.real_tokens == 12
+    counted(((50, 2),))
+    assert interval.real_tokens == 14
 
 
 def forward_products(function, *operands, state_mac: bool = False):
@@ -602,7 +618,7 @@ def test_s5_write_read_matches_the_native_scanned_path():
 @pytest.mark.parametrize("kind", ["laya", "clef"])
 def test_decision_heads_match_every_forward_product_including_pooling(kind):
     states = jnp.ones((1, 4, 8))
-    inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), valid=jnp.ones((1, 4), bool),
+    inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), segments=jnp.ones((1, 4), jnp.int32),
         kinds=jnp.zeros((1, 1), jnp.int32), questions=jnp.ones((1, 1), bool),
         spans=jnp.array([[[0, 2]]]), option_spans=jnp.array([[[[2, 3], [3, 4]]]]),
         options=jnp.ones((1, 1, 2), bool))

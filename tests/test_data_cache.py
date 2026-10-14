@@ -98,6 +98,8 @@ def test_deterministic_cache_serves_prefix_on_later_passes(tmp_path):
 
 
 def test_expansion_publication_certifies_empty_and_nonempty_inputs():
+    from dew.data.sources.codec import encode
+
     source = Memory([{"id": index} for index in range(5)])
     cache, key = _cache(), Manifest()
 
@@ -108,6 +110,20 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
     cold = [rows[index] for index in range(len(rows))]
     rows.finish()
     rows.close()
+    legacy = {}
+    for index, outputs in enumerate(cold):
+        digest = hashlib.sha256()
+        for value in outputs:
+            payload = encode(value)
+            digest.update(len(payload).to_bytes(8, "little"))
+            digest.update(payload)
+        legacy[str(index)] = digest.hexdigest()
+    fs, path = Store(cache.url + "/" + key.key + "/segments").resolve()
+    for location in fs.find(path):
+        if location.endswith("/seal.json"):
+            continue
+        for completion in json.loads(fs.cat_file(location))["completions"]:
+            assert completion["payload_sha256"] == completion["sha256"] == legacy[completion["id"]]
     generation = cache.publish(key, source)
     assert len(generation) == 10
     assert generation.outputs(0) == ()

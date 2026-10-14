@@ -90,11 +90,13 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 from reference_error import (
+    FACTOR,
     ORDERS,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
+    within,
 )
 from residual_orders import orders, permuted, residual_width
 
@@ -127,7 +129,6 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -334,13 +335,25 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
     Selector gradients must be absent in the reference and exactly zero in
     Dew. The helper starts from every non-None upstream gradient and
     enforces the source/layout bijection before reporting errors.
+
+    The gradients are held to the reference's in float64 by the float64
+    rule: Dew's deviation from them, entry by entry relative to
+    max(1, |truth|) and pooled over every compared tensor, within FACTOR of
+    the reference's own. Pooled, one tensor's rounding draw does not decide
+    it, and a wrong tensor still adds its whole error: Dew and the reference
+    each sit about 6e-5 from float64 on qwen3_next's first conv taps on an
+    H100, and 1.05e-4 apart, which a constant bound between the two read as
+    a failure, Dew the nearer.
     """
     trip = trips(name)
     errors = tool.gradient_parity(trip)
-    nonfinite = {tensor: error for tensor, error in errors.items() if not np.isfinite(error)}
-    assert not nonfinite, nonfinite
-    worst = max(errors, key=errors.__getitem__)
-    assert errors[worst] < GRADIENT, f"{worst} gradient scaled error {errors[worst]:.3e}"
+    mine, theirs = (np.concatenate([pair[side] for pair in errors.values()]) for side in (0, 1))
+    assert np.all(np.isfinite(mine)), sorted(tensor for tensor, (ours, _) in errors.items()
+                                             if not np.all(np.isfinite(ours)))
+    worst = max(errors, key=lambda tensor: float(np.max(np.abs(errors[tensor][0]))))
+    assert within(distance(mine, 0), FACTOR * distance(theirs, 0)), (
+        f"dew is {distance(mine, 0):.3e} from float64, the reference {distance(theirs, 0):.3e}; "
+        f"dew's largest deviation is on {worst}")
 
 
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)

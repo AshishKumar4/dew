@@ -154,47 +154,6 @@ def test_a_mixtures_position_resumes_on_another_process_count():
 
 
 @dataclasses.dataclass(frozen=True)
-class Length:
-    """A record's length for `LengthGroups`, read off its id. A value, so the
-    plan names it and a position saved under it resumes exactly."""
-
-    def __call__(self, record) -> int:
-        return int(record["id"]) % 7
-
-
-def grouped(corpora, batch=4, window=3):
-    return compile(corpora.group(Length(), window=window).batch(batch), read="memory", loading=READ).train
-
-
-def test_length_groups_read_each_window_as_batches_of_like_length():
-    """Every window of three batches holds the records the plain order puts
-    there, sorted into batches whose lengths do not interleave, and the
-    batches come in an order of the window's own."""
-    plain = taken(mixed(two_corpora())(DataPartition()), 6)
-    read = taken(grouped(two_corpora())(DataPartition()), 6)
-    for first in (0, 3):
-        theirs, ours = plain[first:first + 3], read[first:first + 3]
-        assert sorted(itertools.chain(*theirs)) == sorted(itertools.chain(*ours))
-        spans = sorted((min(record % 7 for record in batch), max(record % 7 for record in batch))
-                       for batch in ours)
-        assert all(below[1] <= above[0] for below, above in itertools.pairwise(spans))
-    assert read != plain
-    assert taken(grouped(two_corpora())(DataPartition()), 6) == read
-
-
-def test_a_grouped_stream_resumes_mid_window_and_refuses_another_grouping():
-    stream = grouped(two_corpora())(DataPartition())
-    taken(stream, 2)
-    state = stream.get_state()
-    rest = taken(stream, 4)
-    resumed = grouped(two_corpora())(DataPartition())
-    resumed.set_state(state)
-    assert taken(resumed, 4) == rest
-    with pytest.raises(ValueError):
-        mixed(two_corpora())(DataPartition()).set_state(state)
-
-
-@dataclasses.dataclass(frozen=True)
 class Halved:
     """A host step that cuts each batch to a shape of its own, as a stream
     that pads each batch only to its longest record does."""

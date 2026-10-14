@@ -4,7 +4,6 @@ import itertools
 import re
 
 import numpy as np
-import pytest
 
 from dew.config.data import ChatData, PromptData, TextData, loader
 from dew.data import ByteTokenizer, Loading
@@ -12,48 +11,54 @@ from dew.data.dataset import DataPartition
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.decision.data import Decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
 
-def _objective(bucket=None):
+def _objective():
     return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16),
         tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
-        layout=StateFirstLayout(max_len=128), shuffle_options=True, bucket=bucket)
+        layout=StateFirstLayout(max_len=128), shuffle_options=True)
 
 
-@pytest.mark.parametrize("bucket", [None, 16])
-def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_both_alike(bucket):
+def _rows(batch):
+    """Each packed row of a batch's real windows: its text and its one question's label."""
+    real = batch.get(VALID_ROWS, np.ones(len(batch["tokens"]), bool))
+    names = ("segments", "tokens", "spans", "labels", "questions")
+    columns = zip(*(batch[name] for name in names), strict=True)
+    for (segments, tokens, spans, labels, asked), kept in zip(columns, real, strict=True):
+        for slot in np.flatnonzero(asked & kept):
+            yield ByteTokenizer().decode(tokens[segments == segments[spans[slot, 0]]]), int(labels[slot])
+
+
+def test_decision_branches_keep_labels_aligned_with_option_order_in_packed_windows():
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
-    objective = _objective(bucket)
     recipe = Decisions(examples, validation=examples[:5])
-    ours = loader(recipe, batch=4, read="memory", objective=objective.data(),
-                seed=7, loading=READ)
+    ours = loader(recipe, batch=4, read="memory", objective=_objective().data(), seed=7, loading=READ)
 
-    def width(batch) -> int:
-        longest = int(batch["valid"].sum(axis=1).max())
-        return 128 if bucket is None else min(128, -(-longest // bucket) * bucket)
+    def aligned(text: str, label: int) -> int:
+        matched = re.search(r"state (\d+)", text)
+        assert matched is not None
+        index = int(matched[1])
+        order = ("yes", "no") if text.index("yes") < text.index("no") else ("no", "yes")
+        assert order[label] == ("yes" if index % 2 == 0 else "no")
+        return index
 
     reader = ours.train(DataPartition())
     try:
         for batch in itertools.islice(reader, 8):
-            for tokens, valid, labels in zip(batch["tokens"], batch["valid"], batch["labels"], strict=True):
-                text = ByteTokenizer().decode(tokens[valid])
-                matched = re.search(r"state (\d+)", text)
-                assert matched is not None
-                index = int(matched[1])
-                order = ("yes", "no") if text.index("yes") < text.index("no") else ("no", "yes")
-                assert order[int(labels[0])] == ("yes" if index % 2 == 0 else "no")
-            assert batch["tokens"].shape[1] == width(batch)
+            assert batch["tokens"].shape == (4, 128)
+            for text, label in _rows(batch):
+                aligned(text, label)
     finally:
         reader.close()
     held = ours.val(DataPartition())
     try:
-        batch = next(held)
-        assert batch["tokens"].shape[1] == width(batch)
-        np.testing.assert_array_equal(batch["labels"][:, 0], [0, 1, 0, 1])
+        indices = [aligned(text, label) for batch in held for text, label in _rows(batch)]
+        assert sorted(indices) == list(range(5))
     finally:
         held.close()
 
@@ -61,7 +66,7 @@ def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_both_al
 def test_text_windows_keep_document_continuations_and_global_resume():
     documents = ({"text": "abcdefgh"}, {"text": "ijklmnopqrstuvwx"})
     loaded = loader(TextData(documents, seq_len=3), batch=2, read="memory", loading=READ)
-    assert loaded.records == 7
+    assert loaded.records == 8
     reader = loaded.train(DataPartition())
     first = next(reader)["text"]
     assert first.shape == (2, 4)

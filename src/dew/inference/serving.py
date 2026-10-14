@@ -65,6 +65,7 @@ import dataclasses
 import functools
 import logging
 import math
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -434,6 +435,11 @@ class Server:
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
+        self._incoming: deque[_Row] = deque()
+        """Requests `submit` took since the last step. The next step moves
+        them into the queue, so a submitting thread never waits for a step."""
+        self._ingress = threading.Lock()
+        """Orders a submission's append with a failure's sweep."""
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
         self._failed: BaseException | None = None
@@ -618,7 +624,7 @@ class Server:
 
     @property
     def queued(self) -> int:
-        return len(self._queue)
+        return len(self._queue) + len(self._incoming)
 
     def reload(self, variables: Variables) -> None:
         """Serve `variables` from the next step on, in place of the current weights.
@@ -671,19 +677,22 @@ class Server:
         against the server's capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies. A
         request with a zero budget resolves at once, with the prompt alone.
+        Another thread may submit while one steps. The request is validated
+        here and joins the queue at the next step.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
         return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int) -> Ticket:
-        if self._failed is not None:
-            raise RuntimeError("the server stopped after a device check failed") from self._failed
         row = self._prepared(prompt, max_new_tokens, seed, fold)
-        if row.budget == 0:
+        with self._ingress:
+            if self._failed is not None:
+                raise RuntimeError("the server stopped after a device check failed") from self._failed
+            if row.budget:
+                self._incoming.append(row)
+        if not row.budget:
             self._finish(row, terminated=False)
-        else:
-            self._queue.append(row)
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
@@ -721,6 +730,8 @@ class Server:
         """
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
+        while self._incoming:
+            self._queue.append(self._incoming.popleft())
         admission = self._admit()
         with self._context():
             program = self._step if admission is None else self._admitting
@@ -733,7 +744,7 @@ class Server:
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
-        while self._queue or self._rows:
+        while self._queue or self._incoming or self._rows:
             self.step()
         self._settle()
 
@@ -874,11 +885,14 @@ class Server:
             row.ticket._drew(row.tokens)
 
     def _fail(self, failure: BaseException) -> None:
-        self._failed = failure
-        for row in [*self._rows.values(), *self._queue]:
+        with self._ingress:
+            self._failed = failure
+            waiting = [*self._rows.values(), *self._queue, *self._incoming]
+            self._rows.clear()
+            self._queue.clear()
+            self._incoming.clear()
+        for row in waiting:
             row.ticket.set_exception(failure)
-        self._rows.clear()
-        self._queue.clear()
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget
