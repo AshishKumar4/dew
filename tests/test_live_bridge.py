@@ -28,16 +28,18 @@ def bridge():
 class Kernels:
     """The Kernel Gateway's REST and channel protocol over a set of kernels. Creating one takes
     `creating` seconds and running its preload `preloading`; a cell whose code is `sleep N` runs N
-    seconds, or until the kernel is interrupted. `live` holds the kernels created and not deleted."""
+    seconds, or until the kernel is interrupted. `live` holds the kernels created and not deleted, and
+    `created` counts every one."""
 
     def __init__(self, creating=0.0, preloading=0.0):
         self.creating, self.preloading = creating, preloading
-        self.live, self.interrupts = set(), {}
+        self.live, self.interrupts, self.created = set(), {}, 0
 
     async def create(self, request):
         await asyncio.sleep(self.creating)
         identifier = str(uuid.uuid4())
         self.live.add(identifier)
+        self.created += 1
         self.interrupts[identifier] = asyncio.Event()
         return web.json_response({"id": identifier, "name": (await request.json())["name"]})
 
@@ -183,6 +185,9 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
         try:
             session = str(uuid.uuid4())
             socket = await page(port, session)
+            # The page's first cell takes the context made ready as it connected; its second starts one.
+            await socket.send(json.dumps({"op": "execute", "id": "first", "cell": "a", "code": "print(1)"}))
+            await answer(socket, "first")
             kernels.creating, kernels.preloading = 1.0, 1.0
             await socket.send(json.dumps({"op": "execute", "id": "fresh", "cell": "b", "code": "print(2)"}))
             await asyncio.sleep(0.5 if phase == "creating" else 1.5)
@@ -194,6 +199,7 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
             await asyncio.sleep(1.5)
             await settled(kernels)
             assert kernels.live == set()
+            assert kernels.created >= 2, "the second cell's kernel was being made"
             kernels.creating, kernels.preloading = 0.0, 0.0
             socket = await page(port, session)
             await socket.send(json.dumps({"op": "execute", "id": "next", "cell": "b", "code": "print(3)"}))
