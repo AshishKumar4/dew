@@ -163,7 +163,11 @@ def test_a_flow_preset_reproduces_a_diffusers_scripts_default_draw_and_weighting
     from diffusers import FlowMatchEulerDiscreteScheduler
 
     schedule = preset().schedule
-    times = np.asarray(schedule.sample_t(jax.random.key(int(DRAWS["key"])), DRAWS[f"{family}/times"].size))
+    # Drawn on the CPU the fixture's draws were made on: a GPU's normal draws and exponentials differ
+    # from a CPU's in their last bits, and the script's table index is a function of the draw's bits.
+    with jax.default_device(jax.devices("cpu")[0]):
+        times = np.asarray(schedule.sample_t(jax.random.key(int(DRAWS["key"])),
+                                             DRAWS[f"{family}/times"].size))
     np.testing.assert_array_equal(times, DRAWS[f"{family}/times"])
     indices = np.floor((np.float32(1) - times) * np.float32(1000)).astype(np.int64)
     np.testing.assert_array_equal(indices, DRAWS[f"{family}/indices"])

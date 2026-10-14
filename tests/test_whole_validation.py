@@ -283,3 +283,43 @@ def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
     """On one process (`tests/test_multiprocess.py` runs the same on two,
     where one record leaves process 1's share empty)."""
     assert_the_metric_over_every_record(perplexity(windows, count), count)
+
+
+def test_a_metric_reads_the_fields_no_device_holds():
+    """A held record's name, a string no accelerator holds, reaches the
+    metrics with the rest of its batch: the objective's programs read what a
+    device holds, and a metric reads the whole batch, its last batch's
+    repeats left out."""
+    from affine_run import FEATURES, Features
+
+    from dew.artifacts import Representations
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Memory
+
+    records = Memory(tuple({"x": np.full(FEATURES, index, np.float32), "y": np.full(2, index, np.float32),
+                            "index": np.int32(index), "name": f"record {index}"} for index in range(RECORDS)))
+    data = compile(Pipeline(records).repeat().batch(ROWS), validation=Pipeline(records).batch(ROWS),
+                   objective=Features().data(), read="memory",
+                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+
+    class Names:
+        name, reads = "names", Representations
+
+        def __init__(self):
+            self.seen = []
+
+        def __call__(self, artifact, batch):
+            self.seen += [(str(name), int(index)) for name, index in zip(batch["name"], artifact.labels,
+                                                                         strict=True)]
+            return 0.0, 1
+
+        def merge(self, accumulated, contribution):
+            return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+        def finalize(self, accumulated):
+            return accumulated[0] / accumulated[1]
+
+    objective, names = Features(), Names()
+    Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(names,))
+    assert names.seen == [(f"record {index}", index) for index in range(RECORDS)]

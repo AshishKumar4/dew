@@ -20,29 +20,12 @@ from dew.data.sources.tokens import TokenFiles
 from dew.records import integers, record
 
 
-class WindowRecords:
-    def __init__(self, rows: Sequence[Batch], windows: Windows):
-        self.windows = windows
-        self.tokens = {
-            name: np.concatenate([np.asarray(row[name]) for row in rows]) if rows else np.zeros(0, np.int32)
-            for name in windows.fields
-        }
-        sizes = {len(value) for value in self.tokens.values()}
-        if len(sizes) != 1:
-            raise ValueError("causal window fields have different token counts")
-        self.size = next(iter(sizes))
-
-    def __len__(self) -> int:
-        stride = self.windows.stride or self.windows.seq_len
-        return max(0, (self.size - self.windows.seq_len - 1) // stride + 1)
-
-    def __getitem__(self, index: int) -> Batch:
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        start = index * (self.windows.stride or self.windows.seq_len)
-        return {
-            name: values[start : start + self.windows.seq_len + 1] for name, values in self.tokens.items()
-        }
+def _aligned(row: Batch, fields: tuple[str, ...]) -> Batch:
+    """The fields of one document, refusing alignment drift before joining documents."""
+    tokens = {name: np.asarray(row[name]) for name in fields}
+    if len({len(value) for value in tokens.values()}) != 1:
+        raise ValueError("causal window fields have different record lengths")
+    return tokens
 
 
 class TokenSpan(Protocol):
@@ -52,18 +35,35 @@ class TokenSpan(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class IndexedWindows:
-    tokens: TokenSpan
+    """Complete causal windows of aligned fields backed by contiguous token spans."""
+
+    tokens: Mapping[str, TokenSpan | np.ndarray]
     length: int
     stride: int
+    dtype: str | None = None
+
+    @classmethod
+    def from_records(cls, rows: Sequence[Batch], windows: Windows) -> IndexedWindows:
+        aligned = [_aligned(row, windows.fields) for row in rows]
+        tokens = {
+            name: np.concatenate([row[name] for row in aligned]) if aligned else np.zeros(0, np.int32)
+            for name in windows.fields
+        }
+        return cls(tokens, windows.seq_len, windows.stride or windows.seq_len)
+
+    @property
+    def size(self) -> int:
+        return len(next(iter(self.tokens.values())))
 
     def __len__(self) -> int:
-        return max(0, (len(self.tokens) - self.length - 1) // self.stride + 1)
+        return max(0, (self.size - self.length - 1) // self.stride + 1)
 
     def __getitem__(self, index: int) -> Batch:
         if not 0 <= index < len(self):
             raise IndexError(index)
         start = index * self.stride
-        return {"text": np.asarray(self.tokens[start : start + self.length + 1], np.int32)}
+        return {name: np.asarray(tokens[start : start + self.length + 1], dtype=self.dtype)
+                for name, tokens in self.tokens.items()}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,7 +94,7 @@ class WindowSource:
     def records(self, read: Read) -> IndexedWindows:
         if read == "memory":
             self.original.records(read)
-        return IndexedWindows(self.tokens, self.length, self.stride)
+        return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
     def metadata(self) -> Mapping[str, object]:
         count = len(self.records("indexed"))
@@ -131,23 +131,22 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         self._skip = 0
 
     def __next__(self) -> Batch:
-        size = self._windows.seq_len + 1
-        while len(self._held[self._windows.fields[0]]) < size + self._skip:
-            row = next(self._read)
-            counts = {len(row[name]) for name in self._windows.fields}
-            if len(counts) != 1:
-                raise ValueError("causal window fields have different record lengths")
+        while True:
+            windows = IndexedWindows(
+                {name: value[self._skip :] for name, value in self._held.items()},
+                self._windows.seq_len,
+                self._windows.stride or self._windows.seq_len,
+            )
+            if len(windows):
+                break
+            row = _aligned(next(self._read), self._windows.fields)
             self._held = {
-                name: np.concatenate([self._held[name], np.asarray(row[name])])
+                name: np.concatenate([self._held[name], row[name]])
                 for name in self._windows.fields
             }
-        if self._skip:
-            self._held = {name: value[self._skip :] for name, value in self._held.items()}
-        emitted = {name: value[:size] for name, value in self._held.items()}
-        stride = self._windows.stride or self._windows.seq_len
-        available = len(self._held[self._windows.fields[0]])
-        self._held = {name: value[stride:] for name, value in self._held.items()}
-        self._skip = max(0, stride - available)
+        emitted = windows[0]
+        self._held = {name: value[self._skip + windows.stride :] for name, value in self._held.items()}
+        self._skip = max(0, windows.stride - windows.size)
         return emitted
 
     def get_state(self) -> Mapping[str, object]:
@@ -180,8 +179,6 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
 
 class CausalWindows(grain.IterDataset[Batch]):
     def __init__(self, parent: grain.IterDataset[Batch], windows: Windows):
-        if windows.seq_len < 1 or (windows.stride is not None and windows.stride < 1):
-            raise ValueError("causal window lengths and strides must be positive")
         super().__init__(parent)
         self._records, self._windows = parent, windows
 
