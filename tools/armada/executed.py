@@ -33,7 +33,8 @@ TOOL = 3
 SPAWNS = {"subprocess.Popen": 1, "_posixsubprocess.fork_exec": 1, "os.posix_spawn": 1, "os.spawn": 2,
           "os.exec": 1, "os.fork": None, "os.forkpty": None}
 """Audit events of a process start, and where in their arguments the child's command line is: a fork
-has none, its child being this process's copy."""
+has none, its child being this process's copy. Python 3.12 raises none for multiprocessing's spawn
+and forkserver children, which 3.13's `_posixsubprocess.fork_exec` names."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()
