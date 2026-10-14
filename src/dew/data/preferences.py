@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from dew.nn.inputs import token_id
+
 if TYPE_CHECKING:
     from dew.data.steps.chat import PreferencePair
 
@@ -28,12 +30,7 @@ def _ids(values: object, name: str, where: str) -> list[int]:
     """One id list: integers only, non-empty."""
     if not isinstance(values, list) or not values:
         raise ValueError(f"{where}: {name} is a non-empty id list, got {values!r}")
-    ids: list[int] = []
-    for token in values:
-        if not isinstance(token, int):
-            raise ValueError(f"{where}: {name} holds token ids, got {token!r}")
-        ids.append(token)
-    return ids
+    return [token_id(token, where=f"{where}: {name}") for token in values]
 
 
 def _mask(values: object, name: str, length: int, where: str) -> list[int]:
