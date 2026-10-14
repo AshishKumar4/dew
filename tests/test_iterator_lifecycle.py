@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from pathlib import Path
 
@@ -710,3 +711,53 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
     )
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def _running(pid: int) -> bool:
+    """Whether process `pid` runs: it exists and has not ended (a zombie has)."""
+    try:
+        status = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return status.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads process states from /proc")
+def test_a_killed_program_leaves_no_loading_worker_running():
+    """A program killed mid-read, as a timeout or the kernel kills one, takes its loading workers
+    with it. Each worker read until its parent asked it to stop, so a killed parent left them
+    reading into a queue no one empties, holding their memory until the host was rebooted."""
+    program = (
+        "import multiprocessing, time\n"
+        "import numpy as np\n"
+        "from dew.data import Loading, Memory\n"
+        "from dew.data.compile import compile\n"
+        "from dew.data.dataset import DataPartition\n"
+        "from dew.data.pipeline import Pipeline\n"
+        "rows = Memory(tuple({'x': np.int32(index)} for index in range(64)))\n"
+        "loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)\n"
+        "stream = compile(Pipeline(rows).repeat().batch(2), read='memory', loading=loading)"
+        ".train(DataPartition())\n"
+        "next(stream)\n"
+        "print(' '.join(str(child.pid) for child in multiprocessing.active_children()), flush=True)\n"
+        "time.sleep(600)\n")
+    root = Path(__file__).resolve().parents[1]
+    parent = subprocess.Popen(
+        [sys.executable, "-c", program], cwd=root, stdout=subprocess.PIPE, text=True,
+        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    workers: list[int] = []
+    try:
+        assert parent.stdout is not None
+        workers = [int(pid) for pid in parent.stdout.readline().split()]
+        assert len(workers) >= 2, "the program started no loading workers"
+        parent.send_signal(signal.SIGKILL)
+        parent.wait(timeout=30)
+        deadline = time.monotonic() + 60
+        while any(map(_running, workers)) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert [pid for pid in workers if _running(pid)] == []
+    finally:
+        parent.kill()
+        for pid in workers:
+            if _running(pid):
+                os.kill(pid, signal.SIGKILL)
