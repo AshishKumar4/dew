@@ -17,12 +17,14 @@ import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config, OPTConfig
 
 from dew.interop import Pretrained
-from dew.interop.verify import _ROUNDING, probe_ids, scatter_weights
-
-FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
+from dew.interop.verify import _ROUNDING
 
 
 def write_fixture(family):
+    # The tests import this module as tools.classic_gpt_reference, where
+    # hf_reference is not on the path; the fixture runs as a script beside it.
+    from hf_reference import write_device_tiny
+
     config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
                         num_attention_heads=4, ffn_dim=48, max_position_embeddings=64,
                         dropout=0, attention_dropout=0, bos_token_id=1,
@@ -32,26 +34,8 @@ def write_fixture(family):
                         embd_pdrop=0, attn_pdrop=0, activation_function='gelu_new',
                         bos_token_id=1, eos_token_id=None, pad_token_id=0))
     model = AutoModelForCausalLM.from_config(config, attn_implementation='eager')
-    scatter_weights(model)
-    model = model.float().eval().to('cuda')
-    directory = FIXTURES / f'{family}-tiny'
-    directory.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(directory)
-    ids = probe_ids(config.vocab_size)
-    with torch.no_grad():
-        logits = model(torch.tensor(ids, device='cuda'), use_cache=False).logits.cpu().numpy()
-        generated = model.generate(torch.tensor(ids[:1, :4], device='cuda'),
-                                   do_sample=False, max_new_tokens=6,
-                                   eos_token_id=None, pad_token_id=0).cpu().numpy()
-    np.save(directory / 'input_ids.npy', ids)
-    np.save(directory / 'logits.npy', logits)
-    np.save(directory / 'generated.npy', generated)
-    (directory / 'meta.json').write_text(json.dumps({
-        'transformers': transformers.__version__, 'torch': torch.__version__,
-        'dtype': 'float32', 'attention': 'eager', 'seed': 1234,
-        'device': torch.cuda.get_device_name(),
-        'command': f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}',
-    }, indent=2) + '\n')
+    write_device_tiny(f'{family}-tiny', model, 'cuda',
+                      f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}')
 
 
 def greedy(loaded, ids, steps):
