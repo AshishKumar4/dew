@@ -111,6 +111,22 @@ class Encoded:
     """Whether the layout shortened the question's instructions or options to fit its budgets."""
 
 
+def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
+    """`row`'s questions as fixed-shape arrays, `count` question slots of
+    `width` option slots each: `kinds` [Q], `questions` [Q] (the real ones),
+    `spans` [Q, 2], `option_spans` [Q, K, 2] and `options` [Q, K] (the real
+    ones). A training row (`Encoding`) and a served batch
+    (`DecisionInputs.collate`) both read a row through this."""
+    fields = {"kinds": np.zeros(count, np.int32), "questions": np.zeros(count, bool),
+              "spans": np.zeros((count, 2), np.int32), "option_spans": np.zeros((count, width, 2), np.int32),
+              "options": np.zeros((count, width), bool)}
+    for slot, laid in enumerate(row.questions):
+        fields["kinds"][slot], fields["questions"][slot], fields["spans"][slot] = laid.kind, True, laid.span
+        fields["option_spans"][slot, : len(laid.options)] = laid.options
+        fields["options"][slot, : len(laid.options)] = True
+    return fields
+
+
 def render(value: JSON) -> str:
     """Return a value as the model reads it: text as it is, and anything structured as JSON."""
     match value:
@@ -567,18 +583,10 @@ class DecisionInputs:
         valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
-        kinds = np.zeros((len(rows), count), np.int32)
-        real = np.zeros((len(rows), count), bool)
-        spans = np.zeros((len(rows), count, 2), np.int32)
-        option_spans = np.zeros((len(rows), count, width, 2), np.int32)
-        real_options = np.zeros((len(rows), count, width), bool)
-        for index, row in enumerate(rows):
-            for slot, laid in enumerate(row.questions):
-                kinds[index, slot] = laid.kind
-                real[index, slot] = True
-                spans[index, slot] = laid.span
-                option_spans[index, slot, :len(laid.options)] = laid.options
-                real_options[index, slot, :len(laid.options)] = True
+        laid = [question_fields(row, count, width) for row in rows]
+        kinds, real, spans, option_spans, real_options = (
+            np.stack([fields[name] for fields in laid])
+            for name in ("kinds", "questions", "spans", "option_spans", "options"))
         if option_slots is None:
             most = int(real_options.reshape(len(rows), -1).sum(axis=1).max())
             option_slots = -(-max(most, 1) // OPTION_TILE) * OPTION_TILE
