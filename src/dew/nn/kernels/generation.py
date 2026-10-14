@@ -200,16 +200,20 @@ def _compute_capability(device) -> str | None:
 
 
 def device_generation() -> str:
-    """Return the default device's hardware generation.
+    """Return the hardware generation of the devices a call is placed on.
 
     The generation is 'sm89' for a GPU of compute capability 8.9, 'v6e' for a
     TPU v6e, and the platform's name otherwise; within `assumed`, the one it
-    names.
+    names. A call placed off the process's default backend (`placed_platform`),
+    as a host-layout run's on a GPU host's CPU, takes its platform's name, so
+    every choice a target row measures (`measured_kernel`) follows it there.
     """
     import jax
     generation = ASSUMED.get()
     if generation is not None:
         return generation
+    if (platform := placed_platform()) != jax.default_backend():
+        return platform
     device = jax.devices()[0]
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
