@@ -58,6 +58,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, unweighted_rmsnorm
@@ -546,7 +547,8 @@ def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype):
     stream = jnp.concatenate([history, mixed], axis=1)
     convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
-    return out
+    # The scan's output, attention's 'context' (a remat policy's `RESIDUALS`), as `held_scan` names it.
+    return checkpoint_name(out, 'context')
 
 
 def _over_sequence(mix, shards: int, mixed, dt, segments, starts, weights):

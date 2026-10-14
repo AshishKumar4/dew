@@ -62,7 +62,6 @@ class JepaRunConfig(RunConfig):
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
-        self = dataclasses.replace(self, trainer=self.trainer.derived())
         dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
                        read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
