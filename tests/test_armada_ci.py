@@ -129,7 +129,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process has no key, so it is in, and no task reuses
     its row. The command line spreads the tier over its shards, each file
-    once."""
+    once, and per batch names the files with a marked test and those no
+    record covers."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -199,6 +200,10 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     shards = [line.split() for line in capsys.readouterr().out.splitlines()]
     assert len(shards) == 2 and all(shards)
     assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
+    assert ci.main() == 0
+    marked = capsys.readouterr().out.split()
+    assert marked == ["tests/test_lost.py", "tests/test_marked.py", "tests/test_new.py"]
 
 
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
