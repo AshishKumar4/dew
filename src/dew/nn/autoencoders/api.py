@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -32,30 +33,58 @@ class AutoEncoder(ABC):
     latent_shift: float | np.ndarray | jax.Array = 0.0
     latent_scale: float | np.ndarray | jax.Array = 1.0
     params: Variables
+    model: nn.Module
+
+    record_name: ClassVar[str | None] = None
+    """The name a built-in subclass's record goes by (`to_json`); None for
+    an autoencoder no record declares."""
+    record_module: ClassVar[type[Any]]
+    """The native module class a built-in subclass's `model` is, which its
+    record's 'model' rebuilds (each subclass's own `model` type)."""
+
+    def record_arguments(self) -> dict:
+        """The built-in subclass's constructor arguments besides `model` and
+        `params`, as it was given them: its compute dtype and latent
+        normalization."""
+        raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
 
     def to_json(self) -> dict:
-        """Return the record of this built-in autoencoder's constructor, without its parameters.
+        """Return the record of this built-in autoencoder's constructor, without its parameters:
+        `record_name`, its module's fields and `record_arguments`.
 
-        The base class raises `TypeError`; a built-in subclass returns its own
-        record.
+        One no record declares (`record_name` None) raises `TypeError`.
         """
-        raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+        if self.record_name is None:
+            raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+        from dew.registry import record_fields
+        arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
+                     for name, value in self.record_arguments().items()}
+        return {'name': self.record_name,
+                'fields': {'model': record_fields(self.model, self.record_module), **arguments}}
 
     @classmethod
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
-        """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`.
-
-        The built-in record is 'sd_vae'; any other name raises `ValueError`.
+        """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`,
+        reading no source. A name no built-in declares raises `ValueError`.
         """
-        from .sd_vae import StableDiffusionVAE
-        if record['name'] == 'sd_vae':
-            from dew.registry import from_record
+        from dew.registry import from_record
 
-            from .kl import AutoencoderKL
-            fields = dict(record['fields'])
-            return StableDiffusionVAE(model=from_record(AutoencoderKL, fields.pop('model')), params=params,
-                                      **fields)
-        raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
+        from .dc_ae import DCAutoencoder
+        from .flux2 import Flux2Autoencoder
+        from .qwen_image import QwenImageAutoencoder
+        from .rae import RAEAutoencoder
+        from .sd_vae import StableDiffusionVAE
+        from .wan import WanAutoencoder
+
+        built = {wrapper.record_name: wrapper for wrapper in (
+            StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
+            QwenImageAutoencoder)}
+        if record['name'] not in built:
+            raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
+        wrapper = built[record['name']]
+        fields = dict(record['fields'])
+        model = from_record(wrapper.record_module, fields.pop('model'))
+        return wrapper(model=model, params=params, **fields)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,
@@ -152,3 +181,13 @@ class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
 
     def decode_batch(self, params, z):
         return self.decode_single_frame(params, z)
+
+    @property
+    def downscale_factor(self) -> int:
+        """The module's own, where encoding adds nothing to it."""
+        return self.model.downscale_factor
+
+    @property
+    def latent_channels(self) -> int:
+        """The module's own, where encoding adds nothing to it."""
+        return self.model.latent_channels

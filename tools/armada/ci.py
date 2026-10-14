@@ -40,8 +40,8 @@ recomputes each of its files' keys from the record made on its own class
 (`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
 and reports the recorded green row
 instead of running a file whose key matches, which ran green on exactly these
-inputs there. A file that started another process is never reused, since no
-event saw that process's code. The records live in the dew-xla-cache Worker
+inputs there. A file that started another Python process is never reused, since
+no event saw that process's code. The records live in the dew-xla-cache Worker
 under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
@@ -234,7 +234,7 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
     """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
-    or one of a file that started another process, whose code no event saw, leaves no key."""
+    or one of a file that started another Python process, whose code no event saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
 
 
@@ -623,9 +623,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`; files so measured
     start heaviest first while their shares fit the share this process was given
     (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file no
-    run has measured, one that started another process (its children's memory is measured nowhere,
-    and they size what they run by the device they see) and one whose last run left no report each
-    run alone with the whole share. A file that runs out of a measured share is red: it took more
+    run has measured, one that started another Python process (its children's memory is measured
+    nowhere, and they size what they run by the device they see) and one whose last run left no
+    report each run alone with the whole share. A file that runs out of a measured share is red: it took more
     than its last run, whose peak its next run is given."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
