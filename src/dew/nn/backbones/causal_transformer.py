@@ -37,7 +37,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.objectives.base import merge
 from dew.records import JSON
-from dew.registry import from_record, mixers
+from dew.registry import from_record, read_arguments
 
 from ..activations import ungated_activation
 from ..attention import RMSNorm
@@ -256,6 +256,11 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    residual_in_fp32: bool = False
+    """Whether the residual stream between layers sums in at least fp32 whatever
+    the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
+    Mamba, Mamba2 and FalconMamba blocks): each sublayer reads the stream in the
+    compute dtype and its output adds to the stream in fp32 (`stack`)."""
     logits_scaling: float = 1.0
     """The divisor of the logits: lm-engine's m_width (`lm_logits *
     (1 / m_width)`), and GraniteMoeHybrid's `logits_scaling`. The division is
@@ -393,16 +398,16 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "activation_sparsity_pattern",
                                tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
         # A value arrives as a record from a config and as itself from code,
-        # and `models.build` already reads one; doing it here too means the
-        # plain constructor takes the same records, as a test or a notebook
-        # writes them.
-        for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
-                             ("mtp_hyper_connections", HyperConnections),
-                             ("attention_residuals", AttentionResiduals), ("engram", Engram),
-                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture), ("loop", Loop)):
-            value = getattr(self, name)
-            if isinstance(value, Mapping):
-                object.__setattr__(self, name, record(**value))
+        # and `models.build` already reads one; reading every field that holds
+        # a record here too, as its annotation declares (`read_arguments`),
+        # means the plain constructor takes the same records, as a test or a
+        # notebook writes them. A bare rotary record and SiTU's betas name no
+        # class, so their own readers take them.
+        records = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                   if field.name not in ("rope_scaling", "mlp")
+                   and isinstance(getattr(self, field.name), Mapping)}
+        for name, value in read_arguments(type(self), records).items():
+            object.__setattr__(self, name, value)
         if isinstance(self.rope_scaling, Mapping):
             object.__setattr__(self, 'rope_scaling', rope_scaling_from_record(self.rope_scaling))
         if isinstance(self.mlp, Mapping):
@@ -413,22 +418,12 @@ class CausalTransformer(nn.Module):
             if unknown:
                 raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
                                  f"it builds {list(NORM_SITES)}")
-            object.__setattr__(self, "norms", flax.core.freeze({
-                name: spec if isinstance(spec, NormSpec) else NormSpec(**spec)
-                for name, spec in self.norms.items()}))
-        if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
-            object.__setattr__(self, "kinds", flax.core.freeze({
-                name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
-                for name, kind in self.kinds.items()}))
-        # A mixer arrives as a kind value from code and as a {"name": ...,
-        # "fields": ...} record from a config; the record dispatches on its
-        # name through the same `mixers.build` a value is constructed with,
-        # so an unknown kind or field raises either way. Anything else is neither.
-        if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
-        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
+            object.__setattr__(self, "norms", flax.core.freeze(dict(self.norms)))
+        if self.kinds is not None:
+            object.__setattr__(self, "kinds", flax.core.freeze(dict(self.kinds)))
+        if self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         object.__setattr__(self, "remat", remat_policy(self.remat))
@@ -1859,8 +1854,13 @@ class CausalTransformer(nn.Module):
         settles in (`residual_dtype`). A store built bank by bank
         (`dew.inference.banks`) already holds one array per run, and the view
         leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
-        for a banked store.
+        for a banked store. With `residual_in_fp32` the stream enters widened,
+        so every sublayer's output adds to it in fp32 whichever loop runs.
         """
+        if self.residual_in_fp32 and isinstance(x, Carried):
+            x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
+        elif self.residual_in_fp32:
+            x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
         spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],

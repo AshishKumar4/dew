@@ -100,6 +100,27 @@ _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 
+_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
+"""A ViT block's two norms as `clip_layer`'s decoder block names them."""
+
+
+def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str, str]], *,
+                      prefix: str = "blocks", norm_bias: bool = True) -> tuple[str, ...] | None:
+    """A shared-trunk ViT's block tensor, `{prefix}.N.norm1|norm2.weight|bias` or
+    `{prefix}.N.<module>.<linear>.weight|bias`, its name split on dots, into its path under
+    `blocks_N`: `maps` places each release's (module, linear) pair, and a release whose norms carry
+    no bias says so (`norm_bias`). None for any other name, which the family reads or refuses."""
+    if (len(parts) not in (4, 5) or parts[0] != prefix or not parts[1].isdigit()
+            or parts[-1] not in ("weight", "bias")):
+        return None
+    block, leaf = f"blocks_{parts[1]}", parts[-1]
+    if len(parts) == 4 and parts[2] in _BLOCK_NORMS and (norm_bias or leaf == "weight"):
+        return (block, _BLOCK_NORMS[parts[2]], "scale" if leaf == "weight" else "bias")
+    if len(parts) == 5 and (parts[2], parts[3]) in maps:
+        return (block, *maps[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
+    return None
+
+
 def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
     """The projector's canonical tensor path, shared by load and source export."""
     if kind in ("qwen3_5", "mimo"):
