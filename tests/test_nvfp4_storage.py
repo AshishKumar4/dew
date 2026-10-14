@@ -25,4 +25,4 @@ def test_weight_only_storage_decodes_as_the_same_file_reference_reader(checkpoin
     codec = codecs.source_quantization(json.loads((directory / "config.json").read_text()))
     assert codec is not None and len(codec.names(stored)) == 7
     for name in codec.names(stored):
-        np.testing.assert_array_equal(codec.read(stored, name), reference[name], err_msg=name)
+        np.testing.assert_array_equal(codec.decode(stored, name), reference[name], err_msg=name)

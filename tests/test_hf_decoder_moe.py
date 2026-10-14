@@ -546,6 +546,32 @@ def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
         Pretrained.load(directory, dtype='float32', attention_impl='reference')
 
 
+def test_a_v4_grouped_output_projection_under_the_reference_models_names_loads_as_released(tmp_path):
+    """The reference model's own state dict names the grouped output
+    projection and its query `model.layers.N.self_attn.o_a_proj` and
+    `q_b_proj`. Stored `[groups * rank, in]` under either spelling, the
+    projection is regrouped by its query's width, and the model computes
+    the released checkpoint's logits."""
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
+
+    spellings = {'.attn.wo_a.weight': '.self_attn.o_a_proj.weight',
+                 '.attn.wq_b.weight': '.self_attn.q_b_proj.weight'}
+    renamed = {}
+    for name, tensor in load_shards(DEEPSEEK_V4).items():
+        theirs = next((suffix for suffix in spellings if name.endswith(suffix)), None)
+        if name.startswith('layers.') and theirs is not None:
+            name = 'model.' + name.removesuffix(theirs) + spellings[theirs]
+        renamed[name] = tensor
+    assert sum(name.endswith('.self_attn.o_a_proj.weight') for name in renamed) > 0
+    save_hf_layout(renamed, fixture_config('deepseek-v4-tiny'), tmp_path)
+    module = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    released = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
+    np.testing.assert_array_equal(module.model.apply(module.variables, ids),
+                                  released.model.apply(released.variables, ids))
+
+
 def test_deepseek_v4_public_speculation_preserves_padded_rows():
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, Speculative
