@@ -182,12 +182,12 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
             return lambda count: self.start * 0.5 ** count
 
     assert scaled(Halving()) == (1.0, Halving())
-    solver = OptimConfig(optimizer="sgd", learning_rate=Halving(), clip_grads=None).build(4)
+    solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=None).build(4)
     params = {"w": jnp.ones(3)}
     state = solver.init(params)
     for step in range(3):
-        updates, state = solver.update({"w": jnp.ones(3)}, state, params)
-        np.testing.assert_allclose(np.asarray(updates["w"]), -0.4 * 0.5 ** step, rtol=1e-6)
+        _, state = solver.update({"w": jnp.ones(3)}, state, params)
+        np.testing.assert_allclose(float(learning_rate(state)), 0.4 * 0.5 ** step, rtol=1e-6)
 
 def test_weight_decay_reaches_the_norm_scales():
     """Decay on the norm scale is the piece of the recipe that lives in the
