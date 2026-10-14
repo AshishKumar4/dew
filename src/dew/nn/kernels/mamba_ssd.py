@@ -802,14 +802,23 @@ def _heads_of(s, g, *, ratio: int, heads: int):
     return g * ratio + s * heads, count
 
 
-def _db_kernel(x_ref, dstates_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length: int, chunk: int,
-               groups: int, ratio: int, heads: int, state: int, bm: int, bn: int, exact: bool):
-    """mamba_ssm's `_chunk_state_bwd_db_kernel` (ssd_chunk_state.py:397-497) with `B`, for one chunk of
-    one split of a group's heads and a `[BM, BN]` block of `B`'s gradient: over the split's heads, `x_m
-    dleave` scaled by `exp(min(acs_last - acs_m, 0)) dt_m` (zero for a token of an earlier document
-    than the chunk's last), summed; and per head the gradient of `acs_last - acs_m`, its row's sum with
-    `B_m`, unshifted (XLA cumulates it, `_decay_gradient`)."""
-    *seq, db_ref, dacs_ref = refs
+def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, batch: int, length: int,
+                           chunk: int, groups: int, ratio: int, heads: int, state: int, bm: int, bn: int,
+                           exact: bool):
+    """mamba_ssm's `_chunk_state_bwd_db_kernel` (ssd_chunk_state.py:397-497) with `B` where `leaving`,
+    else its `_chunk_scan_bwd_dc_kernel` (ssd_chunk_scan.py:529-618) with `C`, for one chunk of one
+    split of a group's heads and a `[BM, BN]` block of `B`'s or `C`'s gradient: over the split's heads,
+    the token's left operand (`x`, `dout`) times the state's gradient the chunk leaves with or the
+    state it entered (in the operand's dtype), scaled by the decay from the token to the chunk's end
+    and the token's step, `exp(min(acs_last - acs_m, 0)) dt_m` (zero for a token of an earlier
+    document than the chunk's last), or by the decay from the chunk's start, `exp(acs_m)` (zero for a
+    token of a later document than the entered state's), summed; and per head the gradient of that
+    decay's exponent, its row's sum with `B_m` or `C_m`, unshifted (XLA cumulates it,
+    `_decay_gradient`). `refs` hold the step where `leaving`, the cumulated decay, the documents if
+    any, then the two outputs."""
+    dt_ref = refs[0] if leaving else None
+    da_ref, *seq = refs[int(leaving):-2]
+    grad_ref, dacs_ref = refs[-2:]
     columns = state // bn
     m = pl.program_id(0) // columns
     c = pl.program_id(1) // batch
@@ -819,26 +828,69 @@ def _db_kernel(x_ref, dstates_ref, b_ref, dt_ref, da_ref, *refs, batch: int, len
     limit = _limit(c, length, chunk)
     rows = pl.ds(start + m * bm, bm)
     taken = _from(limit, m * bm)
-    bmat = _read(b_ref.at[rows], taken).astype(jnp.float32)
-    # The tokens of the chunk's last document (mamba_ssm's `seq_idx_m == seq_idx_last`).
-    same = seq[0][rows] == seq[0][start + chunk - 1] if seq else True
+    mat = _read(mat_ref.at[rows], taken).astype(jnp.float32)
+    # The tokens of the chunk's last document (mamba_ssm's `seq_idx_m == seq_idx_last`), or of the
+    # entered state's (`seq_idx_m == seq_idx_prev`).
+    same = True
+    if seq:
+        same = seq[0][rows] == (seq[0][start + chunk - 1] if leaving else _earlier(seq[0], start, c))
 
     def head(i, acc):
         h = first + i
-        x = _read(x_ref.at[rows, h], taken)
-        db = _dot(x, dstates_ref[h].astype(x.dtype), exact=exact)
-        to_end = jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0)
-        scale = jnp.where(same, jnp.exp(to_end), 0.0)
-        db = db * (scale * dt_ref[h, rows])[:, None]
-        dacs_ref[h, rows] = jnp.sum(db * bmat, axis=1)
-        return acc + db
+        left = _read(left_ref.at[rows, h], taken)
+        grad = _dot(left, states_ref[h].astype(left.dtype), exact=exact)
+        if leaving:
+            decay = jnp.exp(jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0))
+        else:
+            decay = jnp.exp(da_ref[h, rows])
+        scale = jnp.where(same, decay, 0.0)
+        if dt_ref is not None:
+            scale = scale * dt_ref[h, rows]
+        grad = grad * scale[:, None]
+        dacs_ref[h, rows] = jnp.sum(grad * mat, axis=1)
+        return acc + grad
 
-    _write(db_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
+    _write(grad_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
+
+
+def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, interpret: bool,
+                    config: Tiles, name: str):
+    """`_state_gradient_kernel`'s launch: `B`'s gradient where the step `dt` is given, else `C`'s, and
+    each head's decay-exponent gradient, the head splits' and the state blocks' workspaces summed."""
+    batch, length, heads, width = left.shape
+    state = mat.shape[-1]
+    padded = da.shape[-1]
+    ratio = heads // groups
+    bm, bn = config.bm, config.bn
+    columns = state // bn
+    splits = -(-ratio // config.heads)
+    steps = [] if dt is None else [dt]
+    grad, dacs = pl.pallas_call(
+        functools.partial(_state_gradient_kernel, leaving=dt is not None, batch=batch, length=length,
+                          chunk=chunk, groups=groups, ratio=ratio, heads=config.heads, state=state, bm=bm,
+                          bn=bn, exact=interpret),
+        grid=(chunk // bm * columns, batch * (padded // chunk), splits * groups),
+        in_specs=[pl.BlockSpec((None, length, heads, width), lambda mn, bc, sg: (bc % batch, 0, 0, 0)),
+                  pl.BlockSpec((None, None, heads, width, bn),
+                               lambda mn, bc, sg: (bc % batch, bc // batch, 0, 0, mn % columns)),
+                  pl.BlockSpec((None, length, None, bn),
+                               lambda mn, bc, sg: (bc % batch, 0, sg % groups, mn % columns)),
+                  *[_token(batch, padded, heads=heads)] * (len(steps) + 1),
+                  *([] if seq is None else [_documents(batch, padded)])],
+        out_specs=[pl.BlockSpec((None, length, None, None, bn),
+                                lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups, mn % columns)),
+                   pl.BlockSpec((None, None, heads, padded),
+                                lambda mn, bc, sg: (mn % columns, bc % batch, 0, 0))],
+        out_shape=[jax.ShapeDtypeStruct((batch, length, splits, groups, state), jnp.float32),
+                   jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
+        compiler_params=_compiled(config.warps, config.stages), interpret=interpret, name=name,
+    )(left, states, mat, *steps, da, *([] if seq is None else [seq]))
+    return (jnp.sum(grad, axis=2), jnp.sum(dacs, axis=0)), None
 
 
 @dataclasses.dataclass(frozen=True)
 class ChunkStateBwdDb(_Launch):
-    """`chunk_state_bwd_db`'s launch (tuning.KernelOp)."""
+    """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
     SPANS = ("chunk", ("b", 3), None)
@@ -846,73 +898,13 @@ class ChunkStateBwdDb(_Launch):
     def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
              seq: jax.Array | None, *, chunk: int, groups: int, interpret: bool, config: Tiles,
              return_residuals: bool = False):
-        batch, length, heads, width = x.shape
-        state = b.shape[-1]
-        padded = dt.shape[-1]
-        ratio = heads // groups
-        bm, bn = config.bm, config.bn
-        columns = state // bn
-        splits = -(-ratio // config.heads)
-        db, dacs = pl.pallas_call(
-            functools.partial(_db_kernel, batch=batch, length=length, chunk=chunk, groups=groups, ratio=ratio,
-                              heads=config.heads, state=state, bm=bm, bn=bn, exact=interpret),
-            grid=(chunk // bm * columns, batch * (padded // chunk), splits * groups),
-            in_specs=[pl.BlockSpec((None, length, heads, width), lambda mn, bc, sg: (bc % batch, 0, 0, 0)),
-                      pl.BlockSpec((None, None, heads, width, bn),
-                                   lambda mn, bc, sg: (bc % batch, bc // batch, 0, 0, mn % columns)),
-                      pl.BlockSpec((None, length, None, bn),
-                                   lambda mn, bc, sg: (bc % batch, 0, sg % groups, mn % columns)),
-                      _token(batch, padded, heads=heads), _token(batch, padded, heads=heads),
-                      *([] if seq is None else [_documents(batch, padded)])],
-            out_specs=[pl.BlockSpec((None, length, None, None, bn),
-                                    lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups,
-                                                        mn % columns)),
-                       pl.BlockSpec((None, None, heads, padded),
-                                    lambda mn, bc, sg: (mn % columns, bc % batch, 0, 0))],
-            out_shape=[jax.ShapeDtypeStruct((batch, length, splits, groups, state), jnp.float32),
-                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
-            compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
-            name="mamba_chunk_state_bwd_db",
-        )(x, dstates, b, dt, da, *([] if seq is None else [seq]))
-        return (jnp.sum(db, axis=2), jnp.sum(dacs, axis=0)), None
-
-
-def _dc_kernel(dout_ref, states_ref, c_ref, da_ref, *refs, batch: int, length: int, chunk: int,
-               groups: int, ratio: int, heads: int, state: int, bm: int, bn: int, exact: bool):
-    """mamba_ssm's `_chunk_scan_bwd_dc_kernel` (ssd_chunk_scan.py:529-618) with `C`, for one chunk of one
-    split of a group's heads and a `[BM, BN]` block of `C`'s gradient: over the split's heads, `dout_m`
-    times the state the chunk entered (in `dout`'s dtype), scaled by `exp(acs_m)` (zero for a token of a
-    later document than the state's), summed; and per head the gradient of `acs_m`, its row's sum with
-    `C_m`."""
-    *seq, dc_ref, dacs_ref = refs
-    columns = state // bn
-    m = pl.program_id(0) // columns
-    c = pl.program_id(1) // batch
-    split, group = pl.program_id(2) // groups, pl.program_id(2) % groups
-    first, count = _heads_of(split, group, ratio=ratio, heads=heads)
-    start = c * chunk
-    limit = _limit(c, length, chunk)
-    rows = pl.ds(start + m * bm, bm)
-    taken = _from(limit, m * bm)
-    cmat = _read(c_ref.at[rows], taken).astype(jnp.float32)
-    # The tokens of the entered state's document (mamba_ssm's `seq_idx_m == seq_idx_prev`).
-    same = seq[0][rows] == _earlier(seq[0], start, c) if seq else True
-
-    def head(i, acc):
-        h = first + i
-        dout = _read(dout_ref.at[rows, h], taken)
-        dc = _dot(dout, states_ref[h].astype(dout.dtype), exact=exact)
-        scale = jnp.where(same, jnp.exp(da_ref[h, rows]), 0.0)
-        dc = dc * scale[:, None]
-        dacs_ref[h, rows] = jnp.sum(dc * cmat, axis=1)
-        return acc + dc
-
-    _write(dc_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
+        return _state_gradient(x, dstates, b, dt, da, seq, chunk=chunk, groups=groups, interpret=interpret,
+                               config=config, name="mamba_chunk_state_bwd_db")
 
 
 @dataclasses.dataclass(frozen=True)
 class ChunkScanBwdDc(_Launch):
-    """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp)."""
+    """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
     HEADS = "dout"
@@ -920,35 +912,8 @@ class ChunkScanBwdDc(_Launch):
 
     def _fwd(self, dout: jax.Array, states: jax.Array, c: jax.Array, da: jax.Array, seq: jax.Array | None, *,
              chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
-        batch, length, heads, width = dout.shape
-        state = c.shape[-1]
-        padded = da.shape[-1]
-        ratio = heads // groups
-        bm, bn = config.bm, config.bn
-        columns = state // bn
-        splits = -(-ratio // config.heads)
-        dc, dacs = pl.pallas_call(
-            functools.partial(_dc_kernel, batch=batch, length=length, chunk=chunk, groups=groups, ratio=ratio,
-                              heads=config.heads, state=state, bm=bm, bn=bn, exact=interpret),
-            grid=(chunk // bm * columns, batch * (padded // chunk), splits * groups),
-            in_specs=[pl.BlockSpec((None, length, heads, width), lambda mn, bc, sg: (bc % batch, 0, 0, 0)),
-                      pl.BlockSpec((None, None, heads, width, bn),
-                                   lambda mn, bc, sg: (bc % batch, bc // batch, 0, 0, mn % columns)),
-                      pl.BlockSpec((None, length, None, bn),
-                                   lambda mn, bc, sg: (bc % batch, 0, sg % groups, mn % columns)),
-                      _token(batch, padded, heads=heads),
-                      *([] if seq is None else [_documents(batch, padded)])],
-            out_specs=[pl.BlockSpec((None, length, None, None, bn),
-                                    lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups,
-                                                        mn % columns)),
-                       pl.BlockSpec((None, None, heads, padded),
-                                    lambda mn, bc, sg: (mn % columns, bc % batch, 0, 0))],
-            out_shape=[jax.ShapeDtypeStruct((batch, length, splits, groups, state), jnp.float32),
-                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
-            compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
-            name="mamba_chunk_scan_bwd_dc",
-        )(dout, states, c, da, *([] if seq is None else [seq]))
-        return (jnp.sum(dc, axis=2), jnp.sum(dacs, axis=0)), None
+        return _state_gradient(dout, states, c, None, da, seq, chunk=chunk, groups=groups,
+                               interpret=interpret, config=config, name="mamba_chunk_scan_bwd_dc")
 
 
 def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int, chunk: int, groups: int,
