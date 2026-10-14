@@ -215,11 +215,13 @@ def passed(objective, variables, examples):
     reader = validation(pipeline, batch=8, objective=objective.data(), read="memory")
     for batch in reader(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
-        logits = np.asarray(objective._logits(variables, laid_out(batch)))
-        # A batch the pass filled with repeats marks its real rows.
-        for row in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
-            count = int(batch["options"][row, 0].sum())
-            rows.append((int(batch["kinds"][row, 0]), logits[row, 0, :count], probabilities[row, 0, :count]))
+        logits = np.asarray(objective._logits(variables, laid_out(batch, objective.bounds.segments)))
+        # A batch the pass filled with repeats marks its real windows.
+        for window in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
+            for slot in np.flatnonzero(batch["questions"][window]):
+                count = int(batch["options"][window, slot].sum())
+                rows.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
+                             probabilities[window, slot, :count]))
     return rows
 
 

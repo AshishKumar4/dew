@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
 from typing import overload
 
 import grain.python as grain
@@ -76,19 +75,3 @@ class BlockShuffle(grain.MapDataset[Batch]):
     def __getitem__(self, index: int) -> Batch | None: ...
     def __getitem__(self, index: int | slice) -> Batch | grain.MapDataset[Batch] | None:
         return self.slice(index) if isinstance(index, slice) else self._rows[self.index(index)]
-
-
-class PermutedLengths(grain.MapDataset[int]):
-    def __init__(self, parent: grain.MapDataset[int], index: Callable[[int], int]):
-        super().__init__(parent)
-        self._lengths, self._index = parent, index
-
-    def __len__(self) -> int:
-        return len(self._lengths)
-
-    @overload
-    def __getitem__(self, index: slice) -> grain.MapDataset[int]: ...
-    @overload
-    def __getitem__(self, index: int) -> int | None: ...
-    def __getitem__(self, index: int | slice) -> int | grain.MapDataset[int] | None:
-        return self.slice(index) if isinstance(index, slice) else self._lengths[self._index(index)]
