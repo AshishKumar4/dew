@@ -328,12 +328,14 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
-    (the daily full run) runs it again. Each task runs as armada starts it: .armada.json's command
-    filled from its plan entry."""
+    (the daily full run) runs it again, and once it has run red on those inputs, so does every task
+    after. Each task runs as armada starts it: .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
+        "import os\n"
         "from pathlib import Path\n"
         "def test_ok():\n"
-        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    assert not os.environ.get('FAIL')\n")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -362,7 +364,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         monkeypatch.delenv("DEW_TEST_CACHE")
         assert ci.main() == 0
         [only] = json.loads(out.read_text())["rows"]
-        assert only["exitCode"] == 0
+        assert only["exitCode"] == int(bool(os.environ.get("FAIL")))
         return len((tmp_path / "runs").read_text())
 
     assert run("GenuineIntel-6-143") == 1
@@ -373,6 +375,11 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     (tmp_path / "tests/test_counted.py").write_text(
         (tmp_path / "tests/test_counted.py").read_text() + "def test_more(): pass\n")
     assert run("GenuineIntel-6-143") == 4
+    # A flaky red on the inputs a green run recorded: the green row is not reused after it.
+    monkeypatch.setenv("FAIL", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 5
+    monkeypatch.delenv("FAIL")
+    assert run("GenuineIntel-6-143") == 6
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
