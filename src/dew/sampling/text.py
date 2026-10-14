@@ -892,8 +892,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     An undefined draw has to reach the caller as an exception rather than a
     fabricated token, and a device loop cannot raise. `checkify` carries the
     failure out of the computation; with no check emitted the error is empty
-    and throwing it costs nothing. The weights are cast to their decoding
-    storage once, before the loop (`dew.interop.weights.decoding_storage`).
+    and throwing it costs nothing.
     """
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy):
@@ -901,7 +900,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
-        decoding_storage(model, params), inputs, keys, budget, transforms, stopping, strategy)
+        params, inputs, keys, budget, transforms, stopping, strategy)
 
 
 @functools.cache
@@ -974,9 +973,10 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    failure, output = _compiled(plan.sharding)(model, params, plan.place(request.padded()),
-                                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned,
-                                               sampling.pad, n, *components)
+    failure, output = _compiled(plan.sharding)(model, decoding_storage(model, params),
+                                               plan.place(request.padded()), plan.keys(request.key),
+                                               jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                                               *components)
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

@@ -237,7 +237,7 @@ class BlockProcess:
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
         generation = _compiled(plan.sharding)(
-            model, variables, plan.place(plan.pad(request.inputs)), request.key,
+            model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
@@ -365,7 +365,6 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
-    variables = decoding_storage(model, variables)
     initial = _begin(model, variables, inputs, plan)
     prompt_length = inputs.tokens.shape[1]
 

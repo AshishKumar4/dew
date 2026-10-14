@@ -179,9 +179,9 @@ class DiscreteProcess:
 
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
-        generated = _compiled(plan.sharding)(model, variables, plan.place(request.padded()),
-                                             plan.keys(request.key), self, solver, max_new_tokens, steps, n,
-                                             eos_token_ids, pad_token_id)
+        generated = _compiled(plan.sharding)(model, decoding_storage(model, variables),
+                                             plan.place(request.padded()), plan.keys(request.key), self,
+                                             solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
@@ -341,12 +341,10 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 
     Each row is sampled on its own so the response span is the only mutable
     part of it. A continuation keeps the tokens up to its first EOS, pads the
-    rest, and reports the steps it took. The weights are read at their
-    decoding storage (`dew.interop.weights.decoding_storage`).
+    rest, and reports the steps it took.
     """
     from dew.sampling.sample import sample
 
-    variables = decoding_storage(model, variables)
     batch, prompt = inputs.tokens.shape
     if budget == 0:
         zeros = jnp.zeros((batch * n,), jnp.int32)
