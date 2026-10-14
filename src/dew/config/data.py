@@ -490,7 +490,6 @@ def loader(
     *,
     batch: int | None = None,
     tokens: int | None = None,
-    lengths: tuple[int, ...] = (),
     read: Read | None = "indexed",
     provision: bool = False,
     cache: Cache | Generation | str | None = None,
@@ -533,10 +532,10 @@ def loader(
     train, held = _promoted(train), None if held is None else _promoted(held)
 
     def compiled(at: Read) -> tuple[Pipeline, ...]:
-        ordered = _batched(_ordered(train, at, seed), batch, train=True, tokens=tokens, lengths=lengths)
+        ordered = _batched(_ordered(train, at, seed), batch, train=True, tokens=tokens)
         if held is None:
             return (ordered,)
-        return ordered, _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
+        return ordered, _batched(held, batch, train=False, tokens=tokens)
 
     read = read or _preferred_read(compiled, provision=provision)
     branches = compiled(read)
@@ -567,7 +566,6 @@ def _batched(
     *,
     train: bool,
     tokens: int | None = None,
-    lengths: tuple[int, ...] = (),
 ) -> Pipeline:
     from dew.data.pipeline import BatchStage, MapBatch
 
@@ -579,7 +577,7 @@ def _batched(
 
     at = _until(pipeline.stages, MapBatch)
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(
-        batch, tokens=tokens, lengths=lengths, drop_remainder=train
+        batch, tokens=tokens, drop_remainder=train
     )
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
