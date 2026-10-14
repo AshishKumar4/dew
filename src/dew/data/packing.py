@@ -39,9 +39,12 @@ def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
     out."""
     if pack.policy != "first-fit":
         raise ValueError("indexed packing currently needs policy='first-fit'")
+    if pack.along:
+        raise ValueError("a plan of document lengths packs tokens alone; fields along other axes "
+                         "pack as their rows arrive")
     chunk_sizes = chunk_lengths(lengths, pack.seq_len)
     documents, offsets = chunk_table(lengths, pack.seq_len)
-    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins)
+    order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments)
     targets = np.asarray(
         [
             sum(max(0, int(chunk_sizes[index]) - 1) for index in order[starts[window] : starts[window + 1]])

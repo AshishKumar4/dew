@@ -376,6 +376,60 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
+@on_gpu
+@pytest.mark.parametrize("window, sinks", [(None, False), (128, True)])
+def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, sinks,
+                                                                             without_deterministic_ops):
+    """Rows packing documents of uneven lengths, padding after them, through flash as its varlen
+    sequences (`segment_ids` with their declared `max_segments`), causal, also with a 128-key window
+    and sinks: every real token's output and query gradient, and every key and value gradient, lie
+    within tests/reference_error.py's rule of the xla kernel's under the document mask, both measured
+    from float64 per document. The padding attends among itself on flash and to nothing under the
+    mask, and its rows carry no gradient."""
+    flash_here()
+    rng = np.random.default_rng(23)
+    lengths = [[700, 1, 220, 103], [129, 383, 400, 112]]
+    segments = np.stack([np.concatenate([np.repeat(np.arange(1, len(row)), row[:-1]),
+                                         np.zeros(row[-1], int)]) for row in lengths]).astype(np.int32)
+    real = segments != 0
+    query = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
+    key = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
+    value = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)) * real[:, :, None, None], jnp.bfloat16)
+    logits = jnp.asarray(rng.normal(size=(8,)) * 2, jnp.float32)
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v, s: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, causal=True, sliding_window=window,
+            sinks=s if sinks else None, segment_ids=jnp.asarray(segments), max_segments=3))
+
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
+    sides = (-1, -1) if window is None else (window - 1, 0)
+    truth = [np.zeros_like(x) for x in fused]
+    with jax.enable_x64(new_val=True):
+        for row in range(2):
+            begin = 0
+            for length in lengths[row][:-1]:
+                piece = slice(begin, begin + length)
+                wide = [jnp.asarray(np.asarray(x[row, piece], np.float64))
+                        for x in (query, key, value, cotangent)]
+                exact = output_and_gradients(
+                    lambda q, k, v, s: float64_attention(q, k, v, causal=True, window=sides,
+                                                         sinks=s if sinks else None),
+                    wide[3], *wide[:3], jnp.asarray(np.asarray(logits, np.float64)))
+                for whole, part in zip(truth[:4], exact[:4], strict=True):
+                    whole[row, piece] = part
+                truth[4] += exact[4]
+                begin += length
+    for name, index in (("o", 0), ("dq", 1)):
+        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
+    for name, index in (("dk", 2), ("dv", 3)):
+        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+    if sinks:
+        assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
+
+
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
     """The output and the three input gradients of one call that ends each
     row's keys at `lengths`, either as lengths or as the mask they mean."""

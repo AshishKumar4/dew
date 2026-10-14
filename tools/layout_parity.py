@@ -473,7 +473,7 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     state, _, _ = trainer.place()
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
-    compiled = {"flops_per_device": trainer.flops_per_step,
+    compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
     return state, data, step, compiled
 

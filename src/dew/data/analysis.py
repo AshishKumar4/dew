@@ -34,7 +34,6 @@ from dew.data.pipeline import (
     Configured,
     Filter,
     FlatMap,
-    Group,
     Interleave,
     Limit,
     Map,
@@ -108,8 +107,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     """The pipeline as the run reads it. Each published generation it caches
     is read as a source, in place of the steps the generation already ran,
     with its published packing in place of the pack stage that follows it.
-    A first-fit pack directly on a source that reads its documents by index
-    and states their lengths reads that source's planned windows
+    A first-fit pack of tokens alone directly on a source that reads its
+    documents by index and states their lengths reads that source's planned windows
     (`PackedSource.planned`), by the plan a published generation stores, so
     the windows are indexed and the order is global in every read. A source
     read only as a stream, such as one filtered by a predicate, is packed as
@@ -134,6 +133,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     if (
         isinstance(pack, Pack)
         and pack.policy == "first-fit"
+        and not pack.along
         and not isinstance(source, (Mixture, Phases))
         and source.supports("indexed")
         and source.lengths() is not None
@@ -505,10 +505,6 @@ def _analyzed(
                 for stage in written
                 if isinstance(stage, (Shuffle, Repeat, Slice, Limit, TokenSplit, Pack, Windows, BatchStage))
             ],
-            "groups": [stage.groups.window for stage in written if isinstance(stage, Group)],
-            "token_budgets": [
-                dataclasses.asdict(stage) for stage in written if isinstance(stage, TokenBudget)
-            ],
         }
     lowering = _Lowering(
         per_share,
@@ -575,14 +571,14 @@ def _checked(
                 f"interleave in {name} needs a shard-manifest source and only record steps before it, "
                 "which run inside each shard"
             )
-        layout = isinstance(stage, (Pack, Windows, Group, BatchStage, TokenBudget))
+        layout = isinstance(stage, (Pack, Windows, BatchStage, TokenBudget))
         combined = combined or (type(stage).__name__ if layout else None)
         finite = finite and not isinstance(stage, Repeat)
         if _random(stage):
             random = _identity(stage).name
             if validation and not canonical:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
-        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Group, Limit)) or _drops(stage)
+        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or _drops(stage)
         canonical = canonical and not reorders
         if isinstance(stage, Artifact):
             if random is not None:
