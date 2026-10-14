@@ -827,15 +827,6 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     return {name: _read(function, name, value, dtypes=dtypes) for name, value in fields.items()}
 
 
-def read_arguments(member: type | Callable[..., Configured], record: Mapping[str, object]
-                   ) -> Mapping[str, object]:
-    """`record`'s fields of the dataclass `member`, or arguments of the
-    function or constructor `member`, each read as `build` reads it, without
-    asking whether they are all that `member` takes."""
-    with _reading(record):
-        return {name: _read(member, name, value, dtypes=True) for name, value in record.items()}
-
-
 def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes: bool):
     """One field of the dataclass `member`, walked against its own annotation;
     or one argument of the function or constructor `member`, a record or a

@@ -42,12 +42,6 @@ def prompt_rows(rows, tokenizer, width, pad_id, thinking=None):
     return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
 
 
-def prompt_file(path, tokenizer, width, pad_id):
-    pipeline, _, _ = PromptData(source=path, tokenizer=tokenizer, max_prompt_len=width,
-                            pad_id=pad_id, long="truncate").pipelines()
-    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
-
-
 def test_a_string_prompt_encodes_on_its_own():
     """Plain text is tokenized as it is: no chat template, no special tokens."""
     from dew.data.text import load_tokenizer

@@ -299,18 +299,6 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
 
 
-def _selects(jaxpr, shape) -> bool:
-    """Whether `jaxpr` or a jaxpr it calls selects an array of `shape`."""
-    for eqn in jaxpr.eqns:
-        if eqn.primitive.name == "select_n" and eqn.outvars[0].aval.shape == shape:
-            return True
-        for value in eqn.params.values():
-            inner = getattr(value, "jaxpr", value)
-            if hasattr(inner, "eqns") and _selects(inner, shape):
-                return True
-    return False
-
-
 def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
     """Text requests of one bucket after the first run the program it
     compiled, and the host waits on nothing but what a request asks for:

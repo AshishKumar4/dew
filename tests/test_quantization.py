@@ -113,22 +113,6 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
-def int8_products(jaxpr) -> int:
-    """How many convolutions and matmuls of two int8 operands `jaxpr` runs,
-    a scan's body counted once per iteration."""
-    count = 0
-    for equation in jaxpr.eqns:
-        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
-                and all(operand.aval.dtype == jnp.int8 for operand in equation.invars)):
-            count += 1
-        repeats = equation.params["length"] if equation.primitive.name == "scan" else 1
-        for value in equation.params.values():
-            inner = getattr(value, "jaxpr", value)
-            if hasattr(inner, "eqns"):
-                count += repeats * int8_products(inner)
-    return count
-
-
 @pytest.mark.skipif(jax.default_backend() == "gpu",
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
@@ -618,23 +602,6 @@ def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
     products = jax.lax.dot(activations.qvalue, kernel.qvalue, preferred_element_type=jnp.int32)
     scaled = products * activations.scale.astype(jnp.float32) * kernel.scale.astype(jnp.float32)
     np.testing.assert_array_equal(served.apply(served_variables, x), scaled.astype(jnp.bfloat16))
-
-
-def converted_int32_products(jaxpr) -> set:
-    """The dtypes the int32 results of the convolutions and matmuls in
-    `jaxpr`, and in the jaxprs it calls, are converted to."""
-    products, dtypes = set(), set()
-    for equation in jaxpr.eqns:
-        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
-                and equation.outvars[0].aval.dtype == jnp.int32):
-            products.add(id(equation.outvars[0]))
-        if equation.primitive.name == "convert_element_type" and id(equation.invars[0]) in products:
-            dtypes.add(jnp.dtype(equation.params["new_dtype"]))
-        for value in equation.params.values():
-            inner = getattr(value, "jaxpr", value)
-            if hasattr(inner, "eqns"):
-                dtypes |= converted_int32_products(inner)
-    return dtypes
 
 
 def test_quantized_training_differentiates_through_complex_matmuls_in_float():
