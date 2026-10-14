@@ -591,6 +591,18 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
         assert [generation[index]["i"] for index in range(len(generation))] == list(range(12))
 
 
+@pytest.mark.parametrize("form", ["NFKC", "NFC"])
+def test_text_normalize_reads_composed_and_compatibility_characters_alike(form):
+    """text.normalize puts a record's text into one Unicode form, so a decomposed accent reads as
+    its composed letter and, under NFKC, a ligature and a full-width digit as their plain ones;
+    the record's other fields pass through."""
+    records = [{"text": "cafe\u0301 \ufb01ne \uff11", "id": 7}, {"text": b"plain", "id": 8}]
+    normalized = list(Memory(records).map(text.normalize(form)).iterate())
+    assert [row["text"] for row in normalized] == [
+        "caf\u00e9 fine 1" if form == "NFKC" else "caf\u00e9 \ufb01ne \uff11", "plain"]
+    assert [int(row["id"]) for row in normalized] == [7, 8]
+
+
 def test_chunks_cut_long_documents_keeping_every_target():
     pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.chunk(4, overlap=1)).iterate())
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
