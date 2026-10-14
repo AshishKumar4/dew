@@ -134,10 +134,10 @@ class Measurement:
             with region("compile"):
                 self.compiled[shape] = self.trainer.compile(state, batch)
             compile_seconds = time.perf_counter() - began
-            self.hardware[shape] = self.trainer.flops_per_step
+            self.hardware[shape] = (self.trainer.step_flops and self.trainer.step_flops.hardware)
             self.compiles.append({
                 "microstep": index, "shape": list(batch["tokens"].shape), "seconds": compile_seconds,
-                "hlo_flops": self.trainer.flops_per_step, "memory": self.trainer.memory,
+                "hlo_flops": self.hardware[shape], "memory": self.trainer.memory,
             })
         with region("train.step"):
             state, loss, _, finite, accepted = self.compiled[shape](state, batch)

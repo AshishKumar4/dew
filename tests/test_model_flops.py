@@ -61,14 +61,7 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import (
-    FORWARD_FLOPS,
-    TOKENS,
-    TRAINING_FLOPS,
-    _TokenCount,
-    prepare_counts,
-    step_counts,
-)
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -236,7 +229,7 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
     np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
-    assert counted[FORWARD_FLOPS].sum() == objective.model_flops(None, batch)
+    assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
         prepare_counts(objective, counted, count_model=True)
@@ -346,7 +339,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
         assert _TokenCount.host(measured[TOKENS]) == 7
-        assert float(measured[FORWARD_FLOPS]) == objective.model_flops(None, batch)
+        assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
 
@@ -355,8 +348,7 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     loss = jnp.asarray(1.0)
     for forward, tokens in ((100, 4), (200, 3)):
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                        jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
-                                                   TRAINING_FLOPS: jnp.asarray(3 * forward),
+                        jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
                                                    TOKENS: jnp.asarray(_TokenCount.words(tokens))})
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
