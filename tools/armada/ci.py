@@ -171,19 +171,21 @@ def cpu_class() -> str:
 
 def device_class() -> str:
     """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as
-    tests/lane_environment.py reads it) the model of the GPU it was given (`CUDA_VISIBLE_DEVICES`) as
-    the driver names it, before the CPU's class, whose float32 the lane's CPU devices compute
-    (`cpu_class`); else the CPU's class alone."""
+    tests/lane_environment.py reads it) the models of the GPUs it sees as the driver names them,
+    before the CPU's class, whose float32 the lane's CPU devices compute (`cpu_class`); else the
+    CPU's class alone."""
     if "cuda" not in os.environ.get("JAX_PLATFORMS", "").split(","):
         return cpu_class()
-    return "-".join([re.sub(r"[^A-Za-z0-9.]+", "-", gpu_query("name")), cpu_class()])
+    return "-".join([*(re.sub(r"[^A-Za-z0-9.]+", "-", model) for model in sorted(set(gpu_query("name")))),
+                     cpu_class()])
 
 
-def gpu_query(field: str) -> str:
-    """`nvidia-smi`'s `field` of the GPU this process was given (`CUDA_VISIBLE_DEVICES`)."""
-    return subprocess.run(["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits", "-i",
-                           os.environ["CUDA_VISIBLE_DEVICES"]], capture_output=True, text=True,
-                          check=True).stdout.strip()
+def gpu_query(field: str) -> list[str]:
+    """`nvidia-smi`'s `field` of each GPU this process sees (`CUDA_VISIBLE_DEVICES`, when set)."""
+    given = os.environ.get("CUDA_VISIBLE_DEVICES")
+    return subprocess.run(["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits",
+                           *(["-i", given] if given else [])], capture_output=True, text=True,
+                          check=True).stdout.split("\n")[:-1]
 
 
 def worker() -> str:
@@ -588,8 +590,8 @@ GPU_UNRECORDED = 4
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
-    """Run `tests` on this process's GPU share, each file as a task of its own (`tested`), and write
-    their verdict rows to `out`.
+    """Run `tests` on this process's share of the one GPU it sees, each file as a task of its own
+    (`tested`), and write their verdict rows to `out`.
 
     A file's process may hold `GPU_HEADROOM` times the peak memory its record on this GPU's class
     holds (tools/armada/executed.py's `gpu_peak`), and one without a peak a `GPU_UNRECORDED`th of
@@ -597,7 +599,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that
     runs out of its share is red: it took more than it took before."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
-    total = int(gpu_query("memory.total")) * 2 ** 20
+    [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
