@@ -499,7 +499,7 @@ def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monk
 @pytest.mark.parametrize("joint", [False, True])
 def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint):
     """A missing head drawn in a trace of the state (the abstract state a restore builds) has the
-    shapes a concrete init gives it. Clef's head reads the backbone's output table as well."""
+    shapes a concrete init gives it. The joint head reads the backbone's output table as well."""
     from dew.decision import JointLayout, JointSchemaHead
 
     layout = JointLayout(max_len=96) if joint else LAYOUT
