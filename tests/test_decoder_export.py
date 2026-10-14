@@ -82,6 +82,7 @@ not established by the tiny untied-cutoff fixtures.
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import jax
@@ -90,11 +91,13 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 from reference_error import (
+    FACTOR,
     ORDERS,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
+    within,
 )
 from residual_orders import orders, permuted, residual_width
 
@@ -127,7 +130,6 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -334,13 +336,20 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
     Selector gradients must be absent in the reference and exactly zero in
     Dew. The helper starts from every non-None upstream gradient and
     enforces the source/layout bijection before reporting errors.
+
+    Each tensor is held to the reference's float64 gradient by the float64
+    rule, in the helper's `max |g - truth| / max(1, |truth|)`: Dew within
+    FACTOR times the reference's own distance, which counts as at least the
+    sqrt(tokens) fp32 units a sum over the loss's tokens rounds by in
+    another order. Two fp32 implementations each 6e-5 from float64 differ by
+    1.05e-4 on qwen3_next's first conv taps on an H100, Dew the nearer.
     """
     trip = trips(name)
     errors = tool.gradient_parity(trip)
-    nonfinite = {tensor: error for tensor, error in errors.items() if not np.isfinite(error)}
-    assert not nonfinite, nonfinite
-    worst = max(errors, key=errors.__getitem__)
-    assert errors[worst] < GRADIENT, f"{worst} gradient scaled error {errors[worst]:.3e}"
+    floor = math.sqrt(trip.ids.size) * float(np.finfo(np.float32).eps)
+    over = {tensor: f"dew {mine:.3e}, the reference {theirs:.3e} from float64"
+            for tensor, (mine, theirs) in errors.items() if not within(mine, FACTOR * max(theirs, floor))}
+    assert not over, over
 
 
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
