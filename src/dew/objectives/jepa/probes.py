@@ -59,7 +59,9 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
         p, opt_state = carry
         grads = jax.grad(objective)(p)
         updates, opt_state = optimizer.update(grads, opt_state, p)
-        return (optax.apply_updates(p, updates), opt_state), None
+        p = optax.apply_updates(p, updates)
+        assert isinstance(p, dict)  # optax types its result as any parameter tree
+        return (p, opt_state), None
 
     (params, _), _ = jax.lax.scan(step, (params, optimizer.init(params)), None, length=steps)
     predicted = jnp.argmax(test_x @ params["w"] + params["b"], axis=-1)
