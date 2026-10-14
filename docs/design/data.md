@@ -86,12 +86,12 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Group | Verbs |
 |---|---|
 | Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
-| Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
+| Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, ...)` forwards Grain's packer options; `text.chunk(length, overlap=)` cuts long documents first |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.chunk(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
-| Combine | `mix(datasets, weights=, by="records" \| "tokens", stop=)`, `concat(datasets)`, `interleave(datasets, cycle_length=)`, `schedule([(dataset, tokens), ...])` |
+| Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
 | Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
@@ -406,11 +406,12 @@ The chain lowers one stage per Grain operator. On top of that, Dew fuses adjacen
 
 | Area | Status |
 |---|---|
-| `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`flat_map`, `mix([..], weights=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built on `feat/data-fetch` (verb names being aligned to this page) |
+| `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`random_filter_map`/`flat_map`, `mix([..], weights=, by=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built |
 | `images.fetch`/`decode`, albumentations and torchvision adapters, `images.augmentation_key`/`device_augment` | Built |
-| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Being built (replaces `video.decode_clip` and `video.audio`) |
-| `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Being built |
+| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Built |
+| `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Built |
 | `fit(data, validation=, steps=/epochs=/tokens=)` | Built |
-| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `mix(by=, stop=)` keyed members, `schedule` in tokens, `snapshot`, `text.chunk`, `stats` | Planned |
+| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `snapshot`, `text.chunk`, `text.normalize`, `stats` | Built |
+| `mix` members keyed by name, `schedule` in tokens | Planned |
 | Elastic resume, `text.decontaminate`, `text.dedup_minhash`, language and quality filters, fusion, measured defaults, GPU decode | Planned |
 | Native `jax.Mesh` with any axes | Planned (training) |

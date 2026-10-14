@@ -159,7 +159,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`Pipeline.mix(other, weights=...)` mixes accepted records before sharding. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
 
 ## Token-budget batches
 
@@ -167,7 +167,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 
