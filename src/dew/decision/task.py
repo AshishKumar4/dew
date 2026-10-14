@@ -414,7 +414,7 @@ class Decide:
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
-        scored = self._scored_reader(held_out) if callable(held_out) else self._scored(held_out)
+        scored = self._scored(held_out if callable(held_out) else self._held(held_out))
         if not scored:
             raise ValueError("calibration needs examples with answers")
         temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
@@ -433,23 +433,27 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
-        from dew.data.compile import validation
-        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.scoring import LogLoss
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
-        objective = self._scoring
-        # A batch is one pass within the budget, as `batch` packs its rows, on
-        # one device, as an answer is: a short last batch need not divide.
-        rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
-        reader = validation(held, batch=rows, objective=objective.data(), read="memory")
-        evaluation = Evaluation.run(objective, self.variables, reader,
+        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
+
+    def _held(self, examples: Iterable[Example | Mapping[str, object]]) -> Reader:
+        """`examples` as a validation reader of this task's rows, laid out as
+        its objective evaluates them. A batch is one pass within the budget, as
+        `batch` packs its rows, on one device, as an answer is: a short last
+        batch need not divide."""
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
+
+        rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        return validation(held, batch=rows, objective=self._scoring.data(), read="memory")
 
     @functools.cached_property
     def _scoring(self) -> "DecisionObjective":
@@ -459,21 +463,9 @@ class Decide:
 
         return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
-    def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
-        scored = []
-        for example in map(Example.of, examples):
-            labels = example.labels()
-            # A joint row reads every question, answered or not; a row per
-            # question needs the answered ones alone.
-            asked = (example.questions if self.layout.joint
-                     else {name: example.questions[name] for name in labels})
-            rows = self._encoded(example.state, asked)
-            for encoded, logits in zip(rows, self.logits(rows), strict=True):
-                scored.extend(Scored(asked[laid.name].kind, _ordered(laid, logits[slot]), labels[laid.name])
-                              for slot, laid in enumerate(encoded.questions) if laid.name in labels)
-        return scored
-
-    def _scored_reader(self, reader: Reader) -> list[Scored]:
+    def _scored(self, reader: Reader) -> list[Scored]:
+        """Each answered question of `reader`'s rows, with its raw logits in the
+        order the row shows its options and its label."""
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
