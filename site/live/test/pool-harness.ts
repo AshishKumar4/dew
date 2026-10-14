@@ -2,8 +2,8 @@ import { DurableObject } from 'cloudflare:workers';
 import { ModelPool } from '../src/model-pool';
 export class Pool extends ModelPool {
 	async runAlarm() { await this.alarm(); }
-	async seed(hosts: string[]) {
-		await this.ctx.storage.put('pool', { hosts: hosts.map((id) => ({ id, ready: true, lastUsed: 0 })), sessions: {} });
+	async seed(hosts: string[], sessions: Record<string, string> = {}) {
+		await this.ctx.storage.put('pool', { hosts: hosts.map((id) => ({ id, ready: true, lastUsed: 0 })), sessions });
 		await this.ctx.storage.setAlarm(Date.now() + 60_000);
 	}
 	async left() { return { pool: (await this.ctx.storage.get<any>('pool')) ?? null, alarm: await this.ctx.storage.getAlarm() }; }
@@ -15,21 +15,55 @@ export class Pool extends ModelPool {
 }
 // A pool of another namespace than POOL, as a Worker's old pool is once POOL moved to another script.
 export class Orphan extends Pool {}
-export class Host extends DurableObject {
+export class Host extends DurableObject<{ POOL: DurableObjectNamespace<Pool> }> {
 	async configure() {}
-	async warm() { await this.ctx.storage.put('ready', true); }
-	async available() { return (await this.ctx.storage.get('ready')) === true; }
-	async allocate() { if (!(await this.available())) throw new Error('a visitor cannot start a cold host'); }
-	async has() { return true; }
-	async retire() { await this.ctx.storage.put('ready', false); await this.ctx.storage.put('retired', true); }
-	async health() { return (await this.ctx.storage.get('ready')) ? { available_mib: 6000 } : null; }
+	async warm() { if (!(await this.ctx.storage.get('running'))) await this.start(); }
+	async restart() {
+		await this.ctx.storage.put('restarts', await this.restarts() + 1);
+		await this.start();
+	}
+	async available() {
+		// A visitor's session attaches while this health check is in flight, which then times out.
+		const racer = await this.ctx.storage.get<string>('racer');
+		if (racer) {
+			await this.ctx.storage.delete('racer');
+			await this.env.POOL.get(this.env.POOL.idFromName('global')).allocate(racer, 'snapshot');
+			await this.sicken();
+		}
+		return (await this.ctx.storage.get('healthy')) === true;
+	}
+	async allocate(session: string) {
+		if (!(await this.available())) throw new Error('a visitor cannot start a cold host');
+		await this.ctx.storage.put('sessions', [...await this.sessions(), session]);
+	}
+	async has(session: string) { return (await this.sessions()).includes(session); }
+	async close(session: string) { await this.ctx.storage.put('sessions', (await this.sessions()).filter((held) => held !== session)); }
+	async retire() { await this.ctx.storage.put({ running: false, healthy: false, retired: true }); }
+	async health() { return (await this.ctx.storage.get('healthy')) ? { available_mib: 6000 } : null; }
 	async retired() { return (await this.ctx.storage.get('retired')) === true; }
+	async restarts() { return (await this.ctx.storage.get<number>('restarts')) ?? 0; }
+	async sicken() { await this.ctx.storage.put('healthy', false); }
+	async race(session: string) { await this.ctx.storage.put('racer', session); }
+	private async start() { await this.ctx.storage.put({ running: true, healthy: true, sessions: [] }); }
+	private async sessions() { return (await this.ctx.storage.get<string[]>('sessions')) ?? []; }
 }
 const generation = { snapshot: { id: 'snapshot' }, commit: 'a'.repeat(40), created: Date.now(), prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
 export default {
 	async fetch(request: Request, env: { POOL: DurableObjectNamespace<Pool>; ORPHAN: DurableObjectNamespace<Orphan>;
 		SHARED: DurableObjectNamespace<Host> }) {
 		const scenario = new URL(request.url).pathname.slice(1);
+		const host = (id: string) => env.SHARED.get(env.SHARED.idFromName(id));
+		if (scenario === 'drain') {
+			const orphan = env.ORPHAN.get(env.ORPHAN.idFromName('global'));
+			await host('old:a').warm();
+			await host('old:a').allocate('session-0');
+			await orphan.seed(['old:a', 'old:b'], { 'session-0': 'old:a' });
+			await orphan.runAlarm();
+			const busy = { retired: await Promise.all(['old:a', 'old:b'].map((id) => host(id).retired())), left: await orphan.left() };
+			await host('old:a').close('session-0');
+			await orphan.runAlarm();
+			return Response.json({ busy, retired: await host('old:a').retired(), left: await orphan.left() });
+		}
 		if (scenario === 'orphan') {
 			const orphan = env.ORPHAN.get(env.ORPHAN.idFromName('global'));
 			await orphan.seed(['old:a', 'old:b']);
@@ -50,6 +84,28 @@ export default {
 			const stopped = await env.SHARED.get(env.SHARED.idFromName(other)).retired();
 			return Response.json({ held, other, busy, retired: retired.status, assigned: assigned.status === 'fulfilled' ? assigned.value : null,
 				stopped, hosts: (await pool.left()).pool!.hosts.map((host: { id: string }) => host.id) });
+		}
+		if (scenario === 'health' || scenario === 'race') {
+			await pool.configure(generation);
+			await pool.runAlarm();
+			const [first, second] = Object.keys((await pool.status()).hosts);
+			if (scenario === 'race') {
+				// A session attaches to the first host while its health check is in flight; the check then fails.
+				await host(first).race('session-0');
+				await pool.runAlarm();
+				return Response.json({ first, held: (await pool.left()).pool!.sessions['session-0'], restarts: await host(first).restarts(),
+					has: await host(first).has('session-0') });
+			}
+			const held = await pool.allocate('session-0', 'snapshot');
+			const idle = held === first ? second : first;
+			await host(held).sicken();
+			await host(idle).sicken();
+			const restarts = [];
+			for (let check = 0; check < 3; check++) {
+				await pool.runAlarm();
+				restarts.push({ idle: await host(idle).restarts(), held: await host(held).restarts(), ready: (await pool.status()).ready });
+			}
+			return Response.json({ restarts });
 		}
 		if (scenario === 'older') {
 			await pool.configure({ ...generation, snapshot: { id: 'newer' }, created: generation.created + 1 });
