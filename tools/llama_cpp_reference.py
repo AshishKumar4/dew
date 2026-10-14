@@ -217,7 +217,6 @@ def fetch() -> Path:
             member.name = member.name.split("/", 1)[1] if "/" in member.name else ""
         source.extractall(SOURCE, members=[m for m in source.getmembers() if m.name], filter="data")
     return SOURCE
-    return SOURCE
 
 
 def build(source: Path) -> Path:
