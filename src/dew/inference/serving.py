@@ -434,9 +434,9 @@ class Server:
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
-        self._incoming: deque[_Row] = deque()
-        """Requests `submit` took since the last step. The next step moves
-        them into the queue, so a submitting thread never waits for a step."""
+        """The requests waiting for a slot, oldest first. `submit` appends on
+        the right while a step seats from the left, so a submitting thread
+        never waits for a step (a deque's append and popleft are atomic)."""
         self._ingress = threading.Lock()
         """Orders a submission's append with a failure's sweep."""
         self._rows: dict[int, _Row] = {}
@@ -613,7 +613,7 @@ class Server:
 
     @property
     def queued(self) -> int:
-        return len(self._queue) + len(self._incoming)
+        return len(self._queue)
 
     def reload(self, variables: Variables) -> None:
         """Serve `variables` from the next step on, in place of the current weights.
@@ -667,7 +667,7 @@ class Server:
         Without `max_new_tokens`, the task's default budget applies. A
         request with a zero budget resolves at once, with the prompt alone.
         Another thread may submit while one steps. The request is validated
-        here and joins the queue at the next step.
+        here and queued at once; a step seats it when a slot is free.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
         return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
@@ -679,7 +679,7 @@ class Server:
             if self._failed is not None:
                 raise RuntimeError("the server stopped after a device check failed") from self._failed
             if row.budget:
-                self._incoming.append(row)
+                self._queue.append(row)
         if not row.budget:
             self._finish(row, terminated=False)
         return row.ticket
@@ -719,8 +719,6 @@ class Server:
         """
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
-        while self._incoming:
-            self._queue.append(self._incoming.popleft())
         admission = self._admit()
         with self._context():
             program = self._step if admission is None else self._admitting
@@ -733,7 +731,7 @@ class Server:
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
-        while self._queue or self._incoming or self._rows:
+        while self._queue or self._rows:
             self.step()
         self._settle()
 
@@ -766,11 +764,14 @@ class Server:
         The admission's rows come group by group, as the slots do, and each
         names its slot within its group.
         """
-        now = time.perf_counter()
         size, share = self.slots // self.groups, self.admission // self.groups
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
                 for group in range(self.groups)]
-        for slot, row in self.rows.seat(self._queue, free, share):
+        seated = self.rows.seat(self._queue, free, share)
+        # After seating: a request another thread submitted while the queue
+        # was read is seated too, and is admitted after it was submitted.
+        now = time.perf_counter()
+        for slot, row in seated:
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row
@@ -876,10 +877,9 @@ class Server:
     def _fail(self, failure: BaseException) -> None:
         with self._ingress:
             self._failed = failure
-            waiting = [*self._rows.values(), *self._queue, *self._incoming]
+            waiting = [*self._rows.values(), *self._queue]
             self._rows.clear()
             self._queue.clear()
-            self._incoming.clear()
         for row in waiting:
             row.ticket.set_exception(failure)
 

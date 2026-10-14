@@ -34,7 +34,7 @@ test('a cold request schedules durable preparation instead of detaching a long R
 test('the preparation alarm leases a first dependency-hash generation and its report promotes it', async () => {
 	const result = await scenario('hash-alarm');
 	assert.ok(result.leased.until);
-	assert.equal(result.generation.commit, 'c'.repeat(64));
+	assert.equal(result.generation.commit, 'c'.repeat(40));
 	assert.equal(result.calls, 1);
 });
 test('a failed preparation alarm preserves the old snapshot and schedules its retry', async () => {
