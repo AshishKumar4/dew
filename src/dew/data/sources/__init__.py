@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 from dew.data.dataset import Batch
 
 from .base import Read, Shard, ShardManifest, Source
-from .files import Files, Format
+from .files import Files, Format, _inferred
 from .grain import Grain, from_grain
 from .hf import HF, from_hf
 from .hub import Hub
@@ -36,9 +36,8 @@ def source(
         if url.startswith("tfds://"):
             name, _, version = url[7:].partition(":")
             resolved = TFDS(name=name, version=version or None, split=split or "train")
-        elif url.startswith("hf://") and not any(
-            character in url for character in ("*", ".parquet", ".arrow")
-        ):
+        elif url.startswith("hf://") and format is None and "*" not in url and _inferred(url) is None:
+            # A repository's own URL; a file or glob in it, or any URL given a format, is read as files.
             repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").partition("@")
             resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
         else:

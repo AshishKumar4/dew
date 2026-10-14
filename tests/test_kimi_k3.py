@@ -186,3 +186,23 @@ def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
         pieces.append(np.asarray(out))
     assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1)[0], reference["logits"][0],
                                      reference["logits_f64"][0], "cached decode")
+
+
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "auto"])
+def test_a_narrow_storage_load_holds_the_float32_loads_weights_rounded_once(source, param_dtype):
+    """K3 nests its decoder under text_config and reads it whole, as a
+    registered family rather than a media wrapper, so its narrow load's
+    alias check reads it the same way: the MXFP4 experts decode in float32
+    and every leaf is the float32 load's, rounded once to the storage dtype
+    (bfloat16, the config's own for 'auto')."""
+    loaded, _, _ = source
+    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference")
+    assert jax.tree.structure(narrow.variables) == jax.tree.structure(loaded.variables)
+    stored = set()
+    for (path, ours), wide in zip(jax.tree_util.tree_leaves_with_path(narrow.variables),
+                                  jax.tree.leaves(loaded.variables), strict=True):
+        ours = np.asarray(ours)
+        stored.add(ours.dtype)
+        np.testing.assert_array_equal(ours, np.asarray(wide).astype(ours.dtype),
+                                      err_msg=jax.tree_util.keystr(path))
+    assert np.dtype(jnp.bfloat16) in stored

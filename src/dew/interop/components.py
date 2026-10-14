@@ -34,12 +34,15 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
     lazy: bool = False, inputs: tuple[jax.Array | np.ndarray | jax.ShapeDtypeStruct, ...] = (),
     tensors: Mapping[str, np.ndarray] | None = None,
     validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+    state: Callable[[str], bool] | None = None,
 ) -> tuple[ComponentT, Variables, tuple[WeightLayout, ...], ConfigT]:
     """Translate absent parameters, validate the native geometry and bind a wrapper.
 
     Supplied parameters remain authoritative and return no source layouts.
     Explicit tensors let components read non-parameter state, such as FLUX.2's
-    latent statistics, even when their parameters were supplied.
+    latent statistics, even when their parameters were supplied. The tensors
+    `state` selects are state rather than weights, such as a safety head's
+    scoring vectors and thresholds, and keep FP32 whatever `param_dtype` says.
     """
     from dew.interop.safetensors_io import read_weights
     from dew.nn.text_encoders import check_tree
@@ -49,9 +52,19 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
         stored = read_weights(directory) if tensors is None else tensors
         if validate is not None:
             validate(stored)
+
+        def path(name: str) -> tuple[str, ...] | None:
+            return path_of(name, np.ndim(stored[name]))
+
+        held = {} if state is None else {name: tensor for name, tensor in stored.items() if state(name)}
         params, layouts = record_layouts(
-            component, stored, lambda name: path_of(name, np.ndim(stored[name])), prefix,
+            component, {name: tensor for name, tensor in stored.items() if name not in held}, path, prefix,
             param_dtype=param_dtype, lazy=lazy)
+        if held:
+            scoring, state_layouts = record_layouts(component, held, path, prefix, param_dtype="float32",
+                                                    lazy=lazy)
+            params.update(scoring)
+            layouts += state_layouts
     if inputs:
         check_tree({"params": params}, model, *inputs)
     return wrap(params), params, layouts, config
