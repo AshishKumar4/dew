@@ -62,11 +62,10 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     used.add("hidden_act")
     if activation != "silu":
         refuse(f"hidden_act {activation!r}", "the mixer's conv activates with silu")
-    # Init-time, kernel and dtype policy fields of the reference, nothing
-    # the forward reads at fp32.
+    # Init-time and kernel fields of the reference, nothing the forward
+    # reads at fp32.
     used.update(("time_step_scale", "time_step_min", "time_step_max", "time_step_init_scheme",
-                 "time_step_floor", "rescale_prenorm_residual", "residual_in_fp32", "use_mambapy",
-                 "use_associative_scan"))
+                 "time_step_floor", "rescale_prenorm_residual", "use_mambapy", "use_associative_scan"))
     used.add("layer_norm_epsilon")
     mixer = MambaMixer(
         intermediate_size=expand * hidden,
@@ -86,6 +85,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         qk_norm=False,
         norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
         tie_embeddings=flag("tie_word_embeddings", default=True),
+        residual_in_fp32=flag("residual_in_fp32", default=True),
         mixer=mixer,
     )
 
@@ -101,6 +101,7 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
         "expand": expand, "state_size": mixer.state_size, "time_step_rank": mixer.time_step_rank,
         "conv_kernel": mixer.conv_kernel, "use_bias": mixer.use_bias, "use_conv_bias": mixer.use_conv_bias,
         "layer_norm_epsilon": model.norm_eps, "hidden_act": "silu",
+        "residual_in_fp32": model.residual_in_fp32,
         "intermediate_size": mixer.intermediate_size,
         "num_attention_heads": None, "num_key_value_heads": None, "head_dim": None, "rms_norm_eps": None,
         "attention_bias": None, "rope_theta": None, "max_position_embeddings": None,

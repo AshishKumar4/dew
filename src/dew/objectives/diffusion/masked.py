@@ -225,6 +225,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         mask_id = self.process.mask_id
         losses, predicted, _ = head_cross_entropy(self.model, params, read, tokens, self.head_chunks,
                                                   excluded=mask_id)
+        # A slot that holds no text scores nothing: its token may be the mask's, which the partition
+        # leaves out, and its +inf times a zero weight would be NaN.
+        losses = jnp.where(real, losses, 0.0)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
