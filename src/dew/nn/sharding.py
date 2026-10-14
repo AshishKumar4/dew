@@ -305,7 +305,7 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
 def trace_context() -> tuple:
     """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
     pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
-    its arguments' shapes is reused only under the same (`Objective._compiled_program`)."""
+    its arguments' shapes is reused only under the same (`Objective.program`)."""
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
                          for axis, link in _LINKS.get().items()))
@@ -469,6 +469,19 @@ def axis_rules() -> LogicalAxisRules:
     """The rules in context, `flax.linen.logical_axis_rules`'s, where the
     trainer puts its layout's; the default table outside one."""
     return tuple(nn.get_logical_axis_rules()) or DEFAULT_RULES
+
+
+def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
+    """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
+    (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
+    rule's key heads, Mamba-2's B and C), so no group's gradient is summed across shards: a
+    per-shard kernel's placement (`manual_map`)."""
+    spec = logical_spec(HEADS, shape)
+    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    mesh = jax.sharding.get_abstract_mesh()
+    if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
+    return rows, heads
 
 
 def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
