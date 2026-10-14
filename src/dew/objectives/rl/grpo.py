@@ -357,13 +357,19 @@ class GRPOObjective(LMObjective):
 
     def validation_loss(self, variables, batch, step):
         """Score the source prompts' NLL, not the surrogate's rollout-only fields."""
-        scores = self.evaluate(variables, batch, step)
+        scores = self._evaluation_scores(variables, batch, step.key)
         assert scores.weights is not None
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total)
 
     def evaluate(self, params, batch, step):
-        """Return the per-token scores of the prompts under the policy, for their perplexity.
+        """Return the per-token scores of the prompts under the policy, for their perplexity,
+        compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
+        prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
+        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.key)
+
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        """The prompts' per-token scores.
 
         Prompts are left-padded, so a row's real tokens are its last
         `prompt_length` columns. Each row's score is its shifted cross entropy

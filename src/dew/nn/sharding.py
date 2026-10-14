@@ -305,7 +305,7 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
 def trace_context() -> tuple:
     """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
     pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
-    its arguments' shapes is reused only under the same (`Objective._compiled_program`)."""
+    its arguments' shapes is reused only under the same (`Objective.program`)."""
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
                          for axis, link in _LINKS.get().items()))

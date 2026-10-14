@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax
@@ -300,8 +300,6 @@ class FlowRollout:
     groups: int = 4
     steps: int = 11
     train_steps: int | None = None
-    _generate: Callable[[Variables, Batch, jax.Array], tuple[FlowTrajectory, jax.Array]] = field(
-        init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.groups < 2:
@@ -316,7 +314,6 @@ class FlowRollout:
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
             raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
-        object.__setattr__(self, "_generate", jax.jit(self._generate_impl))
 
 
 
@@ -425,7 +422,9 @@ class FlowRollout:
         succeeded before the next collective runs.
         """
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        generated = agreed("flow rollout generation", lambda: self._generate(state.variables, expanded, key))
+        # The objective owns the program; the rollout fixes only its count of time points.
+        generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
+        generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
 

@@ -13,6 +13,7 @@ An `Objective` defines what a run learns. It creates the variables, computes the
 | `ema` | No | An `EMASpec`, or `None` for no moving average |
 | `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
 | `averages(update)` | No | Whether an update moves the EMA; every update by default |
+| `program(name, function, *, static_argnames=())` | No; you call it | `function` jitted as the objective's program `name`, compiled again when the trainer replaces its modules |
 
 You pass `Trainer` an instance of the objective. A configuration file or a saved run names it by its import path and the constructor arguments it states (`ObjectiveConfig`).
 
