@@ -1563,8 +1563,12 @@ class DecoderFamily:
 
         A fused tensor and a part stored under its own name, such as Qwen's
         `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
-        part; they are compared before any cast, so unequal copies are
-        refused whichever the checkpoint lists first."""
+        part, and one leaf reads it. A quantized copy reaches this already
+        decoded and rounded to the storage dtype (`Pretrained.load`), so the
+        two copies are compared at the narrower of their dtypes, the most
+        precision both hold, and the wider is kept: unequal copies are refused,
+        and equal ones load the same leaf whichever the checkpoint lists
+        first."""
         prepared = self.prepare(tensors, config)
         if not self.packed:
             return prepared
@@ -1574,9 +1578,13 @@ class DecoderFamily:
             parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
             for part, value in parts.items():
                 held = split.setdefault(part, value)
-                if held is not value and not np.array_equal(np.asarray(held), np.asarray(value)):
-                    raise ValueError(f"{name} holds {part}, which another of the checkpoint's tensors "
-                                     "holds with other values")
+                if held is not value:
+                    wide, narrow = sorted((np.asarray(held), np.asarray(value)),
+                                          key=lambda copy: copy.dtype.itemsize, reverse=True)
+                    if not np.array_equal(wide.astype(narrow.dtype), narrow):
+                        raise ValueError(f"{name} holds {part}, which another of the checkpoint's "
+                                         "tensors holds with other values")
+                    split[part] = wide
         return split
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
