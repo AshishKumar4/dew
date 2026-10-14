@@ -209,14 +209,13 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
 
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
-    """The GPU lane gives each file a process of its own and a part of the
-    lane's memory share, a quarter where no run has measured the file's
-    peak, so four run at once, each with its part. A file red on that guess
-    runs again at once, alone with the whole share, and its row is the
-    second run's. A file that started a process runs alone with the whole
-    share from then on. The rows join one verdict, each recorded as a task's
-    are, and a second lane reuses the green ones."""
-    url, _, _ = cache_worker
+    """The GPU lane runs each file once, in a process of its own. A file no
+    run has measured runs alone with the lane's whole share, and so does one
+    that started a process; files with a measured peak run side by side,
+    each with its peak and headroom. A red row stays red: nothing is run
+    again. The rows join one verdict, each recorded as a task's are, and a
+    later lane reuses the green ones."""
+    url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
@@ -238,11 +237,11 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     names = [f"tests/test_file_{index}.py" for index in range(5)]
     for name in names:
         (tmp_path / name).write_text(source)
-    # One that needs more than a guess gives it, and one that starts a process.
-    (tmp_path / "tests/test_needy.py").write_text(source + "    assert float(share) >= 0.5\n")
+    # One that fails on any share, and one that starts a process.
+    (tmp_path / "tests/test_red.py").write_text(source + "    assert share == 'all of it'\n")
     (tmp_path / "tests/test_spawner.py").write_text(
         source + "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n")
-    every = [*names, "tests/test_needy.py", "tests/test_spawner.py"]
+    every = [*names, "tests/test_red.py", "tests/test_spawner.py"]
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -252,24 +251,33 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
                                                             key=lambda path: path.stat().st_mtime)]
 
+    def overlapping(runs: list[list[str]]) -> int:
+        spans = [(float(began), float(ended)) for _, began, ended in runs]
+        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+
     out = tmp_path / "verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
-    assert [(row["name"], row["exitCode"]) for row in rows] == [(f"3.12:{name}", 0) for name in every]
-    plain = [run for index in range(5) for run in ran(f"test_file_{index}")]
-    assert [share for share, *_ in plain] == ["0.125"] * len(names), "a process a file, a quarter each"
-    spans = [(float(began), float(ended)) for _, began, ended in plain]
-    overlapping = max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
-    assert 2 <= overlapping <= 4
-    [guess, alone] = ran("test_needy")
-    assert (guess[0], alone[0]) == ("0.125", "0.5")
-    assert not any(float(began) < float(alone[2]) and float(alone[1]) < float(ended)
-                   for _, began, ended in [*plain, *ran("test_spawner")]), "the second run ran alone"
-    assert [share for share, *_ in ran("test_spawner")] == ["0.125"]
+    assert [(row["name"], row["exitCode"]) for row in rows] == [
+        (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
+    first = [run for name in every for run in ran(Path(name).stem)]
+    assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
+    assert overlapping(first) == 1
+    assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
+    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once.
+    for name in names:
+        stored[ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class())[len(url):]] = json.dumps(
+            {"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
-    assert all(len(ran(Path(name).stem)) == 1 for name in names), "the second lane reused the green rows"
-    assert len(ran("test_needy")) == 2, "and the retry's green row"
-    assert [share for share, *_ in ran("test_spawner")] == ["0.125", "0.5"], "a spawner runs alone"
+    rows = json.loads(out.read_text())["rows"]
+    assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
+    measured = [ran(Path(name).stem)[-1] for name in names]
+    assert [share for share, *_ in measured] == [str(6 * 2 ** 30 / (81920 * 2 ** 20))] * len(names)
+    assert 2 <= overlapping(measured) <= 4
+    assert [share for share, *_ in ran("test_spawner")] == ["0.5", "0.5"], "a spawner runs alone"
+    assert len(ran("test_red")) == 2, "a red row is never reused"
+    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
