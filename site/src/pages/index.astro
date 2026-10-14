@@ -60,10 +60,6 @@ const reward = readPublic('examples', 'framework', 'grpo', 'tracking', 'scalars.
 	.map((row) => ({ step: row.step as number, reward: row.scalars['rollout/reward/mean'] as number }));
 if (reward.length !== 150) throw new Error('GRPO recording is missing reward reports');
 const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, reward.at(-1)!.step - 1) * 300},${140 - row.reward * 100}`).join(' ');
-const tutorialNames: Record<string, string> = {
-	'01': 'Diffusion from scratch', '02': 'Image diffusion', '03': 'Text to image', '04': 'Samplers',
-	'05': 'Language model', '06': 'I-JEPA', '07': 'Many devices', '08': 'Pretrained decoders',
-};
 ---
 
 <StarlightPage frontmatter={{ title: 'Dew', description: 'A JAX/Flax framework for training, generation and serving.', template: 'splash', hero: { title: 'Train models with JAX and Flax.' }, pagefind: false }} hasSidebar={false}>
@@ -192,7 +188,7 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band tutorials" data-reveal>
 			<h2 class="band-title">Tutorials</h2>
-			<ol class="tutorial-list">{tutorials.map((entry) => <li><a class="tutorial-link" href={`/${entry.slug}/`}><span class="tutorial-number">{entry.number}</span><span class="tutorial-name">{tutorialNames[entry.number]}</span><span class="tutorial-device">{entry.accelerator}</span></a></li>)}</ol>
+			<ol class="tutorial-list">{tutorials.map((entry) => <li><a class="tutorial-link" href={`/${entry.slug}/`}><span class="tutorial-number">{entry.number}</span><span class="tutorial-name">{entry.label}</span><span class="tutorial-device">{entry.accelerator}</span></a></li>)}</ol>
 		</section>
 		<details class="band framework-note">
 			<summary>How each example above was recorded</summary>

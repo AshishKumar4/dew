@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from flax import linen as nn
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -123,6 +124,19 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
             jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
         rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))
+
+
+class FakeQuantizing(nn.Module):
+    """A layer whose activations round through the fake quantizers as its own
+    methods, so a caller sees and can stand in for each rounding through
+    `nn.intercept_methods`, as `tools/deepseek_v41_numerics.py` does to replay
+    a float64 twin's roundings in the given run."""
+
+    def fp8(self, x, block: int):
+        return fake_quant_fp8(x, block)
+
+    def fp4(self, x, block: int, e4m3_scale: bool):
+        return fake_quant_fp4(x, block, e4m3_scale)
 
 
 def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
