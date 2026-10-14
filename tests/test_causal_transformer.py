@@ -684,11 +684,12 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
 
 def test_a_packed_row_refuses_a_decode_cache(rng):
     """A cache stores no document ids, so a packed row appended to one would attend across its
-    documents: the model refuses it, and runs the same row into a cache without its segments."""
+    documents: the model refuses it, and runs the same row and positions into a cache without
+    its segments."""
     model = tiny()
     ids, segment_ids, positions = packed_pair(rng)
     params = model.init(rng, ids)
-    model.apply(params, ids, decode=True, mutable=["cache"])
+    model.apply(params, ids, decode=True, positions=positions, mutable=["cache"])
     with pytest.raises(ValueError):
         model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
                     mutable=["cache"])

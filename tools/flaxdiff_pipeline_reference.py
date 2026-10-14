@@ -146,13 +146,14 @@ class TorchCLIP:
 
 def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
     """Dew's own call on the run: its initial state, each ancestral step's
-    unit noise in order, and its images. The call runs the task's own solver
-    through one that records, step by step, the unit normal an ancestral
-    step draws from the key the walk hands it (`EulerAncestral.step`)."""
+    unit noise in order, and its images. The call runs the task's own solver,
+    `EulerAncestral`, through one that records, step by step, the noise it
+    draws from the key the walk hands it (`_ancestral_noise`)."""
     from flax import struct
 
     from dew.sampling import TextToImage
     from dew.sampling.solvers import Solver
+    from dew.sampling.solvers.sigma import _ancestral_noise
 
     task = TextToImage.from_flaxdiff(step, config, jax_version=jax.__version__)
     noise: list[np.ndarray] = []
@@ -165,7 +166,7 @@ def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.nd
             return self.solver.init(x, times, process, key=key)
 
         def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-            drawn = jax.random.normal(key, x.shape)
+            drawn = _ancestral_noise(key, x)
             jax.debug.callback(lambda value: noise.append(np.asarray(value)), drawn, ordered=True)
             return self.solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)
 

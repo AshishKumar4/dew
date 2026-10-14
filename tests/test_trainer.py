@@ -289,10 +289,16 @@ class Preempting(RecordingTracker):
             os.kill(os.getpid(), signal.SIGTERM)
 
 
-def preempted_and_resumed(tmp_path, data, at=3, steps=6):
-    """`data` trained to `steps`, preempted when step `at` is logged, and resumed in a fresh trainer."""
+def preempted(tmp_path, data, at=3, steps=6):
+    """`data` trained toward `steps` and preempted when step `at` is logged, its checkpoint written."""
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+    assert Checkpoints(str(tmp_path / "run")).latest is not None
+
+
+def preempted_and_resumed(tmp_path, data, at=3, steps=6):
+    """`data` trained to `steps`, preempted when step `at` is logged, and resumed in a fresh trainer."""
+    preempted(tmp_path, data, at, steps)
     return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
 
 
@@ -317,15 +323,19 @@ def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
     """A plain generator trains and checkpoints, but its checkpoint holds no
     position, so a resume, which would read its data again from the start,
     is refused."""
+    data = stream(lambda partition: drawn())
+    preempted(tmp_path, data)
     with pytest.raises(ValueError):
-        preempted_and_resumed(tmp_path, stream(lambda partition: drawn()))
+        make_trainer(tmp_path).fit(data, steps=6, log_every=1)
 
 
 def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
     """The replay guard: a stream declared to replay that reads back another
     batch at its position, one over fresh entropy, is refused."""
+    data = stream(replayed(lambda partition: drawn(None)))
+    preempted(tmp_path, data)
     with pytest.raises(ValueError):
-        preempted_and_resumed(tmp_path, stream(replayed(lambda partition: drawn(None))))
+        make_trainer(tmp_path).fit(data, steps=6, log_every=1)
 
 
 def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):

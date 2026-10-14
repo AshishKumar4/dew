@@ -136,26 +136,33 @@ def pulled(forward, variables, cotangent):
     return logits, pull(cotangent.astype(logits.dtype))[0]
 
 
-def packed_and_alone(model, variables, tokens, cotangent):
-    """Logits and parameter gradients of the documents' `tokens` `[1, sum(DOCUMENTS)]` run packed
-    (segment ids and positions restarting per document, then PADDING segment-0 slots whose logits
-    the loss ignores) and of each document run alone, the latter concatenated (`documents_alone`)."""
+def packed_forward(model, tokens, *, segmented=True):
+    """The forward of the documents' `tokens` `[1, sum(DOCUMENTS)]` packed in one row (positions
+    restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
+    given, or with `segmented` False the same row and positions without them."""
     total = sum(DOCUMENTS)
+    assert tokens.shape == (1, total)
     documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
     segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     positions = jnp.concatenate([*(jnp.arange(length)[None] for length in DOCUMENTS),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
+    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1)
+                 if segmented else coordinates(positions=positions))
 
-    def packed(variables):
-        return model.apply(variables, row, coordinates=coordinates(
-            segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1))[:, :total]
+    def forward(variables):
+        return model.apply(variables, row, coordinates=tokens_at)[:, :total]
 
+    return forward
+
+
+def packed_and_alone(model, variables, tokens, cotangent):
+    """Logits and parameter gradients of the documents' `tokens` run packed (`packed_forward`) and
+    of each document run alone, the latter concatenated (`documents_alone`)."""
     def run(forward):
         return jax.jit(functools.partial(pulled, forward))(variables, cotangent)
 
-    assert tokens.shape == (1, total)
-    return run(packed), run(documents_alone(model, tokens))
+    return run(packed_forward(model, tokens)), run(documents_alone(model, tokens))
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
@@ -193,8 +200,8 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
     if kind in REFUSED:
-        jax.block_until_ready(jax.jit(functools.partial(pulled, documents_alone(model, tokens)))(
-            variables, cotangent))
+        unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
+        jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
         with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return

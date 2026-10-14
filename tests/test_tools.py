@@ -552,56 +552,79 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
-    """SLOP011: `match=` on a raise, a read of a function's source and a test
-    that names a source file each prove text, not behaviour. A raise without
-    `match`, and a library that names its own file, are not reported."""
+    """SLOP011: `match=` on pytest's raise, a read of a function's source and a
+    test that names a source file each prove text, not behaviour, however the
+    test imports them. A raise without `match`, another object's `raises`, a
+    local `getsource`, and a library that names its own file, are not reported."""
     found = _linted(tmp_path, {
         "src/sparx/graph.py": 'HOME = "src/sparx/graph.py"\n',
         "tests/test_graph.py": (
             "import inspect\n"
             "import pytest\n"
+            "from inspect import getsource as source\n"
+            "from pytest import raises as refused\n"
             "from sparx import graph\n"
             "def test_wording():\n"
             "    with pytest.raises(ValueError, match='empty'):\n"
             "        graph.edges({})\n"
+            "    with refused(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"
             "def test_source():\n"
-            "    assert 'return' in inspect.getsource(graph)\n"
+            "    assert 'return' in inspect.getsource(graph) + source(graph)\n"
             "def test_file():\n"
             "    assert open('src/sparx/graph.py').read()\n"
-            "def test_refusal():\n"
-            "    with pytest.raises(ValueError):\n"
-            "        graph.edges({})\n"),
+            "def test_refusal(table):\n"
+            "    def getsource():\n"
+            "        return ''\n"
+            "    with pytest.raises(ValueError), table.raises(ValueError, match='empty'):\n"
+            "        graph.edges({getsource(): 1})\n"),
     })
-    assert found == [("tests/test_graph.py", 5, "SLOP011"), ("tests/test_graph.py", 8, "SLOP011"),
-                     ("tests/test_graph.py", 10, "SLOP011")]
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
-    """SLOP012: a script that assigns over the package's own functions, and a
-    library that assigns over anything it imported, change them for every
-    caller. A script's rebinding of another library, an interpreter hook, and
-    an attribute of an object a file made are not reported."""
+    """SLOP012: a script that replaces or deletes the package's own functions,
+    by any assignment or `setattr`, and a library that does so to anything it
+    imported, a sibling module by a relative import included, change them for
+    every caller. A script's rebinding of another library, an interpreter
+    hook however it is spelled, and an attribute of an object a function
+    holds as its own name are not reported."""
     found = _linted(tmp_path, {
+        "src/sparx/conv.py": "",
         "src/sparx/graph.py": (
             "import sys\n"
+            "import sys as system\n"
             "import json\n"
+            "from . import conv\n"
             "class Edges:\n"
             "    pass\n"
             "def install():\n"
             "    json.dumps = repr\n"
+            "    conv.convolve = print\n"
             "    sys.excepthook = print\n"
-            "    edges = Edges()\n"
-            "    edges.count = 0\n"),
+            "    system.displayhook = print\n"
+            "    setattr(sys, 'breakpointhook', print)\n"
+            "def fill(json):\n"
+            "    conv = Edges()\n"
+            "    conv.count = 0\n"
+            "    json.dumps = repr\n"),
         "tools/bench.py": (
             "import json\n"
             "from sparx import graph\n"
             "import sparx.graph\n"
+            "import sparx.graph as sys\n"
             "graph.install = print\n"
             "setattr(sparx.graph, 'install', print)\n"
-            "json.dumps = repr\n"),
+            "graph.install: object = print\n"
+            "graph.install, graph.edges = print, repr\n"
+            "del graph.edges\n"
+            "sys.excepthook = print\n"
+            "json.dumps = repr\n"
+            "def fill(graph):\n"
+            "    graph.count = 0\n"),
     })
-    assert found == [("src/sparx/graph.py", 6, "SLOP012"), ("tools/bench.py", 4, "SLOP012"),
-                     ("tools/bench.py", 5, "SLOP012")]
+    assert found == [("src/sparx/graph.py", 8, "SLOP012"), ("src/sparx/graph.py", 9, "SLOP012"),
+                     *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10)]]
 
 
 # ---------------------------------------------------------------------------
