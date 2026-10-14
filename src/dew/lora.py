@@ -728,18 +728,26 @@ def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
                           for path in sorted(targets) if path in bindings})
 
 
-def _base_kernel(variables: Variables, path: Path, *, decoded: bool = True):
-    """The kernel of the module at `path` (under `params`): its own, or a
-    frozen FP8 site's from its packed codes (`frozen_fp8_kernel`), whose
-    shape alone is read where `decoded` is False."""
+def _site_codes(variables: Variables, path: Path) -> Mapping | None:
+    """A frozen FP8 site's packed leaves for the module at `path` (under
+    `params`), or None where the module holds its own kernel."""
     leaves = variables.get(QUANTIZATION, {})
     for name in path[1:]:
         leaves = leaves.get(name, {})
-    if FROZEN_FP8[0] not in leaves:
-        return _node(variables, path)["kernel"]
-    if not decoded:
-        return jax.ShapeDtypeStruct(np.shape(leaves[FROZEN_FP8[0]])[::-1], jnp.float32)
-    return jnp.asarray(frozen_fp8_kernel(leaves))
+    return leaves if FROZEN_FP8[0] in leaves else None
+
+
+def _base_kernel(variables: Variables, path: Path) -> jax.Array:
+    """The kernel of the module at `path`: its own, or a frozen FP8 site's
+    decoded from its packed codes (`frozen_fp8_kernel`)."""
+    codes = _site_codes(variables, path)
+    return _node(variables, path)["kernel"] if codes is None else jnp.asarray(frozen_fp8_kernel(codes))
+
+
+def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
+    """The shape of `_base_kernel`, read without decoding a frozen FP8 site."""
+    codes = _site_codes(variables, path)
+    return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
 
 
 def _node(tree: Mapping, path: Path) -> Mapping:
@@ -798,7 +806,7 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
             "delta on the assembled tensor does not split into one per leaf")
     if len(layout.shape) != 2:
         raise ValueError(f"{name} stores {layout.shape}, not a [out, in] matrix")
-    kernel_shape = tuple(np.shape(_base_kernel(variables, layout.paths[0][:-1], decoded=False)))
+    kernel_shape = _kernel_shape(variables, layout.paths[0][:-1])
     out, inner = layout.shape
     transpose = layout.transpose or tuple(range(len(kernel_shape)))
     stored = tuple(kernel_shape[axis] for axis in transpose)
