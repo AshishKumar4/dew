@@ -59,6 +59,7 @@ from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
+    from dew.decision.objective import DecisionObjective
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -432,13 +433,12 @@ class Decide:
         from dew.data.compile import validation
         from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
-        from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
-        objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
+        objective = self._scoring
         # A batch is one pass within the budget, as `batch` packs its rows, on
         # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
@@ -447,6 +447,14 @@ class Decide:
         evaluation = Evaluation.run(objective, self.variables, reader,
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
+
+    @functools.cached_property
+    def _scoring(self) -> "DecisionObjective":
+        """The objective `score` evaluates through, one for the task, so a
+        later call runs the forward the first compiled (`Objective.program`)."""
+        from dew.decision.objective import DecisionObjective
+
+        return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
