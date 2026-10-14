@@ -154,16 +154,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, variables, batch, step: Step):
-        tokens, losses, weights, counted, predicted, real = self._token_losses(
-            variables, batch, step.key, train=step.training)
-        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
-                      self.row_mean(real.astype(jnp.float32), batch).total)
-        correct = (predicted == tokens).astype(losses.dtype)
-        accuracy, _ = self.accuracy(correct, batch, counted).mean()
-        return nelbo, Aux(metrics={
-            "masked_accuracy": accuracy,
-            "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
-        })
+        nelbo, aux, _ = self._scored(variables, batch, step.key, train=step.training)
+        return nelbo, aux
 
     def _evaluation_scores(self, params, batch, key) -> TokenScores:
         """Return the negative ELBO of every token in the batch.
@@ -174,8 +166,24 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         packed window's padding has no weight. So `perplexity` over a
         validation pass is the exponential of the ELBO bound per token, the
         number MDLM reports."""
-        tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
-        return TokenScores(losses * weights, real.astype(losses.dtype), predicted == tokens)
+        return self._scored(params, batch, key, train=False)[2]
+
+    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio, TokenScores]:
+        nelbo, _, scores = self._scored(params, batch, step.key, train=False)
+        return nelbo, scores
+
+    def _scored(self, params, batch, key, *, train: bool) -> tuple[Ratio, Aux, TokenScores]:
+        """The negative ELBO, its reports and the per-token scores, from one corruption of the batch."""
+        tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, key,
+                                                                               train=train)
+        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
+                      self.row_mean(real.astype(jnp.float32), batch).total)
+        correct = predicted == tokens
+        accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
+        return nelbo, Aux(metrics={
+            "masked_accuracy": accuracy,
+            "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
+        }), TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, key, *, train: bool):
         """Corrupt the batch once and score it.
