@@ -34,7 +34,7 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +46,7 @@ from dew.nn.precision import (
     at_least_fp32,
     biased_logits,
     capped_logits,
+    compensated_sum,
     head_product,
     rounded_operand,
     rounded_to,
@@ -82,6 +83,10 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
 
 
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+
+
+Terms = tuple[jax.Array, jax.Array | None, jax.Array]
+"""Each token's loss, top-1 column (None unless asked for) and log Z."""
 
 
 def _operand_dtype(precision: jax.lax.PrecisionLike, work: jnp.dtype):
@@ -521,7 +526,7 @@ def _token_spec(shape: tuple[int, ...]) -> P:
 def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                           tile: tuple[int, int] | None = (1024, 8192),
                           predict: bool = True, temperature: float = 1.0,
-                          excluded: int | None = None):
+                          excluded: int | None = None) -> Terms:
     """Per-token cross entropy of `head.logits(hidden)`, its top-1 column
     and its log partition, the head contracted in tiles.
 
@@ -618,9 +623,173 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                          predict=predict)
 
 
+def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk: int,
+                 precision: jax.lax.PrecisionLike, predict: bool, temperature: float, excluded,
+                 gradients: bool):
+    """`fused_head_loss`'s per-token terms, a `chunk` of tokens at a time
+    against the whole vocabulary, and with `gradients` the loss's gradients
+    taken in the same chunk: the states', the head's (fp32 until every chunk
+    is in) and the bias's."""
+    count, features = hidden.shape
+    work = at_least_fp32(hidden.dtype)
+    operands = _operand_dtype(precision, work)
+    # Once, not per chunk: every chunk multiplies the same rounded table.
+    matrix = rounded_operand(table.astype(work), operands)
+    product_matrix = table.astype(jnp.bfloat16) if precision is BF16 else matrix
+
+    def tokens(start, carry, size):
+        outputs, d_table, d_bias = carry
+        states = rounded_operand(jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(work), operands)
+        targets = jax.lax.dynamic_slice_in_dim(labels, start, size)
+        logits, pullback = jax.vjp(lambda raw: capped_logits(raw, cap, temperature),
+                                   biased_logits(_tile_logits(states, matrix, precision), bias))
+        log_z, top, (peaks, masses) = _row_terms(_without(logits, 0, excluded), predict)
+        inside = (targets >= 0) & (targets < table.shape[0])
+        picked = jnp.where(inside, jnp.take_along_axis(
+            logits, jnp.clip(targets, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
+        values = [log_z - picked, log_z]
+        if predict:
+            assert top is not None
+            values.append(top[1])
+        if gradients:
+            weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
+            cotangent = _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
+                                           2 * z_loss * log_z * weight)
+            d_raw = jnp.asarray(pullback(cotangent)[0])
+            d_bias = None if d_bias is None else d_bias + jnp.sum(d_raw, axis=0)
+            d_raw = _logits_cotangent(d_raw, precision)
+            values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+                                     preferred_element_type=work))
+            operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
+            d_table = d_table + jnp.einsum('tv,td->vd', d_raw, operand, precision=precision,
+                                           preferred_element_type=work)
+        outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
+                        for out, value in zip(outputs, values, strict=True))
+        return outputs, d_table, d_bias
+
+    outputs = (jnp.zeros((count,), work),) * 2
+    if predict:
+        outputs += (jnp.zeros((count,), jnp.int32),)
+    if gradients:
+        outputs += (jnp.zeros((count, features), work),)
+    d_table = jnp.zeros(table.shape, work) if gradients else None
+    d_bias = jnp.zeros(bias.shape, work) if gradients and bias is not None else None
+    return _over_tiles((outputs, d_table, d_bias), count, chunk, tokens)
+
+
+def _fused_total(losses, log_z, weights, z_loss: float):
+    """The weighted sum of the losses and the z-loss, summed as `Objective.row_mean` sums."""
+    terms = weights.astype(losses.dtype) * (losses + z_loss * jnp.square(log_z) if z_loss else losses)
+    return compensated_sum(terms, (0,))
+
+
+def _fused_impl(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
+                excluded):
+    (losses, log_z, *predicted), _, _ = _fused_terms(
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
+        gradients=False)
+    return _fused_total(losses, log_z, weights, z_loss), (losses, predicted[0] if predict else None, log_z)
+
+
+def _fused_fwd(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
+               excluded):
+    (losses, log_z, *rest), d_table, d_bias = _fused_terms(
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
+        gradients=True)
+    predicted, d_states = (rest[0], rest[1]) if predict else (None, rest[0])
+    total = _fused_total(losses, log_z, weights, z_loss)
+    # Empty arrays carry the inputs' dtypes, which the gradients return in.
+    dtypes = (jnp.zeros((0,), hidden.dtype), jnp.zeros((0,), table.dtype))
+    return (total, (losses, predicted, log_z)), (d_states, d_table, d_bias, dtypes)
+
+
+def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, residuals, cotangents):
+    """The gradients the forward took, times the total's cotangent; the
+    per-token outputs carry none."""
+    d_states, d_table, d_bias, (states_dtype, table_dtype) = residuals
+    scale = cotangents[0]
+    return ((scale * d_states).astype(states_dtype.dtype), (scale * d_table).astype(table_dtype.dtype), None,
+            None, None if d_bias is None else scale * d_bias)
+
+
+_fused = jax.custom_vjp(_fused_impl, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
+_fused.defvjp(_fused_fwd, _fused_bwd)
+
+
+FUSED_LOGIT_BYTES = 2 << 30
+"""The fp32 logits one chunk of `fused_head_loss` holds, when no tile asks
+for fewer tokens: the most tokens, a power of two, whose logits fit. On an
+A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320, 12288 tokens,
+bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against 1024's 129.3 and
+56.3 and 4096's 126.3, and at the 8B's (4096 wide, 128256, 4096 tokens)
+the one chunk this allows took 58.1 ms on the A100 against 2048's 70.8
+(tools/benchmark_lm_head.py fused)."""
+
+
+def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -> int:
+    """`fused_head_loss`'s chunk: `FUSED_LOGIT_BYTES` of fp32 logits, at most
+    `tile`'s tokens and every token."""
+    fitting = 1 << max(FUSED_LOGIT_BYTES // (4 * vocab), 1).bit_length() - 1
+    return min(tokens, fitting, tokens if tile is None else tile[0])
+
+
+def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
+                    tile: tuple[int, int] | None = None, predict: bool = True, temperature: float = 1.0,
+                    excluded: int | None = None) -> tuple[jax.Array, Terms]:
+    """The weighted sum of `head.logits(hidden)`'s cross entropies at
+    `targets` and PaLM's z-loss, sum of w (ce + z_loss log Z^2), with each
+    token's loss, top-1 column (None unless `predict`) and log Z beside it.
+
+    Only the sum carries a gradient, and its gradient is taken in the forward
+    pass, Liger's fused linear cross entropy: a chunk of tokens
+    (`fused_tokens`, `tile`'s tokens at most) scores the whole vocabulary,
+    then pulls its softmax back through the head at once, three products a
+    chunk and no logits recomputed or held beyond the chunk. The backward
+    scales those gradients by the sum's cotangent. The sum is a loss's
+    numerator (`Ratio.total`), with no 1/sum(w) in it, so microbatches pool
+    by mass; `weights` (`[...]` like `targets`) are known in the forward and
+    carry no gradient. The products, the softmax and the rounding are
+    `chunked_cross_entropy`'s whole head's, the states through the head's
+    input quantizer; the softcap is the head's own, a constant. Under
+    `jax.checkpoint` the forward and its gradients run again with the rest
+    of the scope, so a step keeps the head outside its rematerialized
+    blocks, as `LMObjective`'s does. On a mesh every device sums its own
+    tokens against the head gathered whole, the sums added after, and the
+    head's gradient leaves reduce-scattered (`_sharded_head`). `excluded` is
+    a column the softmax gives no mass, as in `chunked_cross_entropy`.
+    """
+    if hidden.shape[:-1] != targets.shape or weights.shape != targets.shape:
+        raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
+    states = head.states(hidden)
+    compute = states.dtype if head.compute is None else head.compute
+    precision = BF16 if rounds_to_bf16(compute, head.precision) else head.precision
+    table = head.matrix if head.vocab_major else head.matrix.T
+    bias = None if head.bias is None else jnp.asarray(head.bias, at_least_fp32(states.dtype))
+    statics = (float(z_loss), head.softcap)
+
+    def summed(hidden, table, targets, excluded, cap, bias):
+        del excluded, cap  # Static here, closed over below.
+        labels, weights = targets
+        chunk = fused_tokens(labels.size, table.shape[0], tile)
+        total, (losses, predicted, log_z) = _fused(
+            hidden.reshape(-1, hidden.shape[-1]), table, labels.reshape(-1),
+            jax.lax.stop_gradient(weights.reshape(-1)), bias, *statics, chunk, precision, predict,
+            float(temperature), None if excluded_column is None else int(excluded_column))
+        shaped = None if predicted is None else predicted.reshape(labels.shape)
+        return total, (losses.reshape(labels.shape), shaped, log_z.reshape(labels.shape))
+
+    excluded_column = excluded
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return summed(states, table, (targets, weights), None, None, bias)
+    shares, terms = _sharded_head(mesh, states, table, (targets, weights), None, None, bias, summed, None,
+                                  predict=predict)
+    return jnp.sum(shares), terms
+
+
 def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
                        tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
-                       temperature: float = 1.0, excluded: int | None = None):
+                       temperature: float = 1.0, excluded: int | None = None) -> Terms:
     """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
 
     The head is the matrix `AffineHead.output_table` gives, its bias,
@@ -651,11 +820,25 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
+@overload
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits: Callable, *,
+                  predict: bool) -> Terms: ...
+
+
+@overload
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits: None, *,
+                  predict: bool) -> tuple[jax.Array, Terms]: ...
+
+
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits, *, predict: bool):
     """`head` on a mesh: each device scores its own tokens in a `shard_map`,
     against the head's own columns where they stay split (`_vocabulary_split`)
-    or the head gathered whole (`chunked_cross_entropy`)."""
-    spec = _token_spec(targets.shape)
+    or the head gathered whole (`chunked_cross_entropy`). A `head` with no
+    `column_logits` returns a sum over its tokens before their outputs
+    (`fused_head_loss`), each device's share of it out along the token axes,
+    and gathers the head whole. `targets` may be a tuple of arrays alike, split alike."""
+    sums = column_logits is None
+    spec = _token_spec(jax.tree.leaves(targets)[0].shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
         return head(hidden, table, targets, excluded, cap, bias)
@@ -672,7 +855,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     held = P(*(entry if entry else None for entry in kept))
     group, widths = kept
     size = math.prod(mesh.shape[axis] for axis in group)
-    split = bool(group) and (hidden.size // math.prod(
+    split = not sums and bool(group) and (hidden.size // math.prod(
         mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
         < table.size * table.dtype.itemsize)
 
@@ -685,6 +868,9 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
             table = jax.lax.all_gather(table, group, axis=0, tiled=True)
             if bias is not None:
                 bias = jax.lax.all_gather(bias, group, axis=0, tiled=True)
+        if sums:
+            total, outputs = head(hidden, table, targets, excluded, cap, bias)
+            return total.reshape(1), outputs
         return head(hidden, table, targets, excluded, cap, bias)
 
     # The map holds every axis manual, those that split no token too: in a map
@@ -702,9 +888,11 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     def naming(entry):
         return (*mesh_axes(entry), *alone) or None
 
-    return jax.shard_map(local, in_specs=(P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]),
-                                          spec, P(), P(), None if bias is None else P(naming(held[0]))),
-                         out_specs=(spec, spec if predict else None, spec),
+    outputs = (spec, spec if predict else None, spec)
+    inputs = (P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]), spec, P(), P(),
+              None if bias is None else P(naming(held[0])))
+    return jax.shard_map(local, in_specs=inputs,
+                         out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
                          axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
         hidden, table, targets, excluded, cap, bias)
 

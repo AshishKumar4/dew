@@ -18,8 +18,8 @@ from typing import ClassVar
 import grain.python as grain
 import numpy as np
 
-from dew.data.cache import Generation
 from dew.data.dataset import Batch, Records
+from dew.data.generation import Generation
 from dew.data.pipeline import Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed

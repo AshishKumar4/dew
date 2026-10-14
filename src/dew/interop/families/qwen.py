@@ -21,7 +21,9 @@ from dew.interop.decoder_parts import (
     QWEN35,
     DecoderFamily,
     DecoderFields,
+    Leaves,
     MixtureFields,
+    Renames,
     Ropes,
     base_config,
     dew_path,
@@ -32,6 +34,7 @@ from dew.interop.decoder_parts import (
     read_rope,
     record_int,
     refuse,
+    renamed_path,
     softmax_top_k,
     specified_layer_types,
 )
@@ -374,25 +377,19 @@ def _qwen35_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
 
 
 
+_QWEN_MOE_NAMES: Renames = (('mlp.shared_expert', 'mlp.shared_experts'),)
+_QWEN_MOE_LEAVES: Leaves = {
+    **{f'mlp.experts.{projection}': ('mlp', 'experts', projection, 'kernel') for projection in MOE_SHARED},
+    'mlp.shared_expert_gate.weight': ('mlp', 'shared_expert_gate', 'kernel'),
+}
+"""Qwen3-Next's and Qwen3.5-MoE's experts, each projection one tensor over
+every expert with no `.weight`, and the shared expert's gate."""
+
+
 def qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.startswith("mtp."):
         return _qwen_mtp_path(name, config, qwen35_moe_path)
-    parts = name.split(".")
-    if len(parts) >= 5 and parts[:2] == ["model", "layers"] and parts[2].isdigit():
-        tail = parts[3:]
-        layer = ("params", f"layers_{parts[2]}", "mlp")
-        if len(tail) == 3 and tail[:2] == ["mlp", "experts"] and tail[2] in MOE_SHARED:
-            return (*layer, "experts", tail[2], "kernel")
-        if tail == ["mlp", "shared_expert_gate", "weight"]:
-            return (*layer, "shared_expert_gate", "kernel")
-        if (
-            len(tail) == 4
-            and tail[:2] == ["mlp", "shared_expert"]
-            and tail[2] in MOE_SHARED
-            and tail[3] == "weight"
-        ):
-            return (*layer, "shared_experts", tail[2], "kernel")
-    return dew_path(name, config)
+    return renamed_path(_QWEN_MOE_NAMES, name, config, layer_leaves=_QWEN_MOE_LEAVES)
 
 
 QWEN3_NEXT = DecoderFamily(

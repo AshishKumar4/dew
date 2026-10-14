@@ -7,7 +7,6 @@ come from one draw. The AV reader is imported on use.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -15,17 +14,6 @@ import numpy as np
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
     from dew.data.steps.video import DecodeVideo, PickClip
-
-
-def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
-    """Every video file under `root`, in one deterministic order."""
-    suffixes = tuple(ext.lower() if ext.startswith('.') else f'.{ext}'.lower()
-                     for ext in extensions)
-    paths = []
-    for directory, _, files in os.walk(root):
-        paths += [os.path.join(directory, name) for name in files
-                  if os.path.splitext(name)[1].lower() in suffixes]
-    return sorted(paths)
 
 
 def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
