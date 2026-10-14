@@ -48,7 +48,6 @@ from dew.data.pipeline import (
     RandomMap,
     Rebatch,
     Repeat,
-    ShardByHost,
     Shuffle,
     Slice,
     Stage,
@@ -110,12 +109,19 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     A first-fit pack of tokens alone directly on a source that reads its
     documents by index and states their lengths reads that source's planned windows
     (`PackedSource.planned`), by the plan a published generation stores, so
-    the windows are indexed and the order is global in every read. A source
-    read only as a stream, such as one filtered by a predicate, is packed as
-    its rows arrive."""
+    the windows are indexed and the order is global in every read; a chunk
+    step that cuts documents as the plan does (`chunks_for`) may come between,
+    and the plan then cuts them, which it otherwise refuses. A source read
+    only as a stream, such as one filtered by a predicate, is packed as its
+    rows arrive."""
     from dew.data.generation import Generation
     from dew.data.holdout import rebased
-    from dew.data.packing import PackedSource, plan_name
+    from dew.data.packing import PackedSource, chunks_for, plan_name
+
+    def cut(stages: Sequence[Stage]) -> int:
+        """1 where a chunk step cuts documents as the pack after it plans them (`chunks_for`), else 0."""
+        return int(len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack)
+                   and chunks_for(stages[0].step, stages[1]))
 
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
@@ -125,11 +131,14 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             generation = stage.cache.source()
             source, stages = rebased(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            if (source is generation and stages and isinstance(stages[0], Pack)
-                    and plan_name(stages[0], "accepted") in plans):
-                source, stages = PackedSource.published(source, stage.cache, stages[0]), stages[1:]
+            at = cut(stages)
+            packing = stages[at] if len(stages) > at else None
+            if source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans:
+                source = PackedSource.published(source, stage.cache, packing, chunked=bool(at))
+                stages = stages[at + 1 :]
             break
-    pack = stages[0] if stages else None
+    at = cut(stages)
+    pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
         and pack.policy == "first-fit"
@@ -138,7 +147,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.supports("indexed")
         and source.lengths() is not None
     ):
-        source, stages = PackedSource.planned(source, pack), stages[1:]
+        source, stages = PackedSource.planned(source, pack, chunked=bool(at)), stages[at + 1 :]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
@@ -348,11 +357,14 @@ def _cache_at(stages: Sequence[Stage]) -> int:
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
-    its deterministic steps made, before the first random step; any other
+    its deterministic steps made, before the first random step or batch; any other
     read orders the source's rows right after the cache that keys them, and
     a cache's rows reach an indexed read as a stream."""
     if read == "memory":
-        return next((index for index, stage in enumerate(stages) if _random(stage)), len(stages)), True
+        # Records are ordered before their batch, as before the first random step.
+        boundary = (index for index, stage in enumerate(stages)
+                    if _random(stage) or isinstance(stage, (BatchStage, TokenBudget)))
+        return next(boundary, len(stages)), True
     cache = _at(stages, Artifact)
     return (0, read == "indexed") if cache is None else (cache + 1, False)
 
@@ -452,6 +464,13 @@ def _analyzed(
     one canonical pass, so its split is whole."""
     source = pipeline.source
     nested = source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+    if isinstance(source, Mixture):
+        # A mixture reads its members' records and makes one batch of its own, so a member's batch,
+        # and every stage after it, would never run.
+        batched = next((child for child in nested if child.batched), None)
+        if batched is not None:
+            raise ValueError(f"mixture member {_name(batched)} is batched; a mixture batches once, after "
+                             f"mix: move the member's batch and the stages after it onto the mixture")
     children = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
@@ -592,7 +611,7 @@ def _checked(
                 _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
-        if isinstance(stage, (Slice, ShardByHost)) and not indexed and not promotion:
+        if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
         streams = isinstance(stage, (Interleave, Rebatch, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
@@ -607,10 +626,10 @@ def _checked(
             workers = True
         if isinstance(stage, MapBatch):
             if not batched:
-                raise ValueError(f"map_batch in {name} must follow batch")
+                raise ValueError(f"the host batch step in {name} must follow batch")
             host = True
         elif host and not isinstance(stage, (Workers, Prefetch)):
-            raise ValueError(f"{type(stage).__name__} in {name} follows the host map_batch stage")
+            raise ValueError(f"{type(stage).__name__} in {name} follows a host batch step")
         prefix.append(stage)
     return per_share
 

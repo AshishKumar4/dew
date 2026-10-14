@@ -406,7 +406,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     objective = config.masked_objective(original.model, original.model_config, None)
     batch = next(iter(loader(config.data, batch=8, read="memory",
         loading=Loading(workers=0)).val(DataPartition())))
-    padding = np.asarray(batch["text_segment_ids"]) == 0
+    padding = np.asarray(batch["text_coordinates"].segments) == 0
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)

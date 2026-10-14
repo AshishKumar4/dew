@@ -76,6 +76,7 @@ from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
 
     from dew.lora import Adapter, LoRA
     from dew.training.distributed import Layout, MeshSpec
@@ -287,6 +288,11 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
+    """The source tensors no forward reads, kept as stored for `save` to write back.
+
+    A pipeline keeps a text encoder's vision tower here, each tensor named
+    under its component as its layouts are.
+    """
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
     """The encoder `export` writes through, installed by the route that built the model, or None
     for `weight_layouts`."""
@@ -395,7 +401,7 @@ class Pretrained:
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
-             mesh: MeshSpec | None = None, layout: Layout | None = None,
+             mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
@@ -466,7 +472,7 @@ class Pretrained:
               attention_impl: str = "auto", max_seq_len: int | None = None,
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
               dduf_file: str | None = None,
-              mesh: MeshSpec | None = None, layout: Layout | None = None, fallback: str | None = None,
+              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None,
               weights: bool = True) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
@@ -826,7 +832,7 @@ class PretrainedFallback(Pretrained):
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
-                          mesh: MeshSpec | None = None, layout: Layout | None = None,
+                          mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
@@ -1075,11 +1081,12 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str
+def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str, *, media: bool
              ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray]]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
-    integer formats' grid."""
+    integer formats' grid. `media` is whether the loader reads the source as
+    a media wrapper (`_media_wrapper`)."""
     quantization = source_quantization(config)
     if quantization is None:
         return tensors, (), None, {}
@@ -1089,7 +1096,8 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     aliases: tuple[tuple[str, str], ...] = ()
     if param_dtype != "float32":
         aliases = decoders.validate_source_aliases(
-            quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
+            quantization.tensor_names(tensors), partial(quantization.read, tensors, set(quantized_tensors)),
+            config, media=media)
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
     return tensors, quantized_tensors, scale_dtype, grid
@@ -1267,10 +1275,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    tensors, quantized_tensors, scale_dtype, grid = _decoded(
-        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype)
-    export_adapter = None
     media = _media_wrapper(config)
+    tensors, quantized_tensors, scale_dtype, grid = _decoded(
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype, media=media)
+    export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 

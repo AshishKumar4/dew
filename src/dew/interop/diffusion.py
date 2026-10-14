@@ -934,9 +934,11 @@ def save_source(source, values, destination: Path) -> None:
         )
         (folder / file).write_text(json.dumps(component_config, indent=2))
     grouped: dict[str, dict[str, np.ndarray]] = {}
-    for layout in source.weight_layouts:
-        component, _, name = layout.name.partition("/")
-        grouped.setdefault(component, {})[name] = layout.export(values)
+    exported = {**source.retained_tensors,
+                **{layout.name: layout.export(values) for layout in source.weight_layouts}}
+    for source_name, tensor in exported.items():
+        component, _, name = source_name.partition("/")
+        grouped.setdefault(component, {})[name] = tensor
     for component, tensors in grouped.items():
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         write_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
