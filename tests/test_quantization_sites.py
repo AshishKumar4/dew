@@ -123,6 +123,33 @@ def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
     assert_quantized(logits, reference, "pipeline")
 
 
+def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
+    """`dew.pipeline` serves the query, key and value packed under their one
+    input scale. A reload takes the loaded model's own tree, each member's
+    scale at its own scope, and packs it as placement did, so the server
+    holds the weights it held before. Members scaled apart cannot share the
+    packed product's one scale, and their reload is refused."""
+    from dew.inference.serving import Server
+
+    directory, loaded, _ = case
+    server = Server.from_task(dew.pipeline(str(directory), dtype=jnp.float32), slots=8, capacity=64)
+    served = jax.tree.map(np.asarray, server.variables)
+    server.reload(loaded.variables)
+    for again, before in zip(jax.tree.leaves(server.variables), jax.tree.leaves(served), strict=True):
+        np.testing.assert_array_equal(np.asarray(again), before)
+
+    group = projection_groups(loaded.model, loaded.variables)[0]
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    node = variables[QUANTIZATION]
+    for part in group.path:
+        node = node[part]
+    member = node[group.members[1]]
+    leaf = next(iter(member))
+    node[group.members[1]] = {**member, leaf: np.float32(2) * member[leaf]}
+    with pytest.raises(ValueError, match="quantize their one input apart"):
+        server.reload(variables)
+
+
 def test_every_entry_method_quantizes_the_sites_it_reaches(case):
     """The quantizers run under the model's `apply`, so an entry method a
     wrapper never named, as DiffusionGemma's `encode` was, quantizes too:
