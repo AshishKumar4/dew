@@ -54,7 +54,6 @@ from dew.nn.protocols import (
     CountedPredictions,
     CountedPredictionTraining,
     DecoderTraining,
-    Logits,
     TokenModel,
 )
 from dew.nn.sharding import LOGITS, constrain
@@ -81,13 +80,14 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import (
     chunked_tile,
+    final_read,
     fused_head_loss,
     head_cross_entropy,
     head_table,
-    logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
     reads_states,
+    refuse_without_logits,
     support_log_probs,
 )
 from dew.records import JSON
@@ -145,10 +145,7 @@ def _check_reads(model: nn.Module) -> None:
     """
     if isinstance(model, TokenModel) and not model.causal:
         raise ValueError("LMObjective requires a causal model for next-token likelihoods")
-    if not reads_states(model) and not isinstance(model, Logits):
-        raise TypeError(
-            f"LMObjective scores a model's logits, and a {type(model).__name__} gives none: no head over "
-            f"its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+    refuse_without_logits(model, "LMObjective")
 
 
 def _streamed_depths(model: nn.Module) -> bool:
@@ -947,10 +944,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             total, (losses, predicted, log_z) = fused_head_loss(
                 hidden, table, targets, weights, z_loss=float(z_loss or 0.0), predict=predict)
         else:
-            losses, predicted, log_z = (
-                head_cross_entropy(self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
-                                   predict=predict) if reads_states(self.model)
-                else logits_cross_entropy(hidden, targets, predict=predict))
+            losses, predicted, log_z = head_cross_entropy(
+                self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -988,7 +983,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         from dew.data.pipeline import ObjectiveData
         from dew.data.steps.text import CountTargets, FixedTokens
 
-        geometry = FixedTokens(self.seq_len, extra=1, pad_id=0 if self.pad_id is None else self.pad_id)
+        geometry = FixedTokens(self.seq_len, extra=1)
         if self.loss_role is None and self.pad_id is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(
@@ -1033,19 +1028,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
                        layers: Sequence[int] = ()):
-        """Run the model over `inputs` and return its final states, or the
-        logits of a model that gives them only from its tokens (`reads_states`).
+        """Run the model over `inputs` and return what a loss scores (`chunked.final_read`).
 
         Beside them come whatever the open `collections` gathered, empty
         when none was opened, and under `intermediates` the outputs of
         every layer when `layers` asks for any.
         """
         opened = [*collections, INTERMEDIATES] if layers else collections
-        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method="hidden_states" if reads_states(self.model) else "logits",
-                                  mutable=opened or False,
-                                  capture_intermediates=layer_outputs if layers else False,
-                                  **packing)
+        hidden = final_read(self.model, params, inputs, train=train, rngs=rngs, mutable=opened or False,
+                            capture_intermediates=layer_outputs if layers else False, **packing)
         if not opened:
             return hidden, {}
         return hidden
@@ -1086,11 +1077,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = (
-                head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
-                                   tile=self.head_tile, predict=False, temperature=temperature)
-                if reads_states(self.model)
-                else logits_cross_entropy(scores.hidden, targets, predict=False, temperature=temperature))
+            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
+                                              tile=self.head_tile, predict=False, temperature=temperature)
             log_probs = -losses
         if support is not None:
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
@@ -1101,8 +1089,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 filtered, present = support_log_probs(scores.hidden, head, targets, ids, owners,
                                                       temperature=temperature)
             else:
-                logits = (model_logits(self.model, params, scores.hidden) if reads_states(self.model)
-                          else scores.hidden)
+                logits = model_logits(self.model, params, scores.hidden)
                 filtered, present = logits_support_log_probs(logits, targets, ids, owners,
                                                              temperature=temperature)
             log_probs = jnp.where(present, filtered, log_probs)
@@ -1215,8 +1202,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
         assert isinstance(statistics, Ratio)
-        logits = constrain(model_logits(self.model, thaw(params), scores.hidden)
-                           if reads_states(self.model) else scores.hidden, LOGITS)
+        logits = constrain(model_logits(self.model, thaw(params), scores.hidden), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),

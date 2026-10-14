@@ -106,6 +106,7 @@ from dew.inference.tasks import (
     prepared_inputs,
     shape_bucket,
 )
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
@@ -391,7 +392,10 @@ class Server:
     prefills. A request whose prompt and budget do not fit the capacity is
     refused at `submit`, with the error `TextGeneration` raises for a request
     over the model's context. Over a mesh, the slots and the admission split
-    evenly over the groups of rows, and so do the pages of a paged pool.
+    evenly over the groups of rows, and so do the pages of a paged pool. The
+    server holds the weights at their decoding storage
+    (`dew.interop.weights.decoding_storage`), to which `reload` casts the
+    weights it is handed.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
@@ -406,6 +410,7 @@ class Server:
                                chunked=rows.chunk is not None, mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
+        variables = decoding_storage(model, variables)
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:

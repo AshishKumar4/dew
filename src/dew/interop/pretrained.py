@@ -129,7 +129,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
              for part, value in packing.split(text_name, tensor, config).items()]
     if any(part is None for part in parts):
         raise ValueError(f"packed tensor {name!r} has no parameter path")
-    return packing.layout(name, [part for part in parts if part is not None])
+    return packing.layout(name, [part for part in parts if part is not None], config)
 
 
 def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_parts.DecoderFamily,

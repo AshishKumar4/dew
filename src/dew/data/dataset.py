@@ -27,7 +27,7 @@ import threading
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -915,102 +915,6 @@ def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
     return tuple(counts)
 
 
-@dataclasses.dataclass(frozen=True)
-class LengthGroups:
-    """Global batches of records of like length, for a stream whose batches are
-    cut to their longest record.
-
-    The order is read `window` global batches at a time: each window's
-    records are sorted by `length`, cut into batches again, and those batches
-    are put back in a random order of the window's own (`_Grouped`). Every
-    record is still read once a pass and a position is still one record
-    count. A batch's corpus shares now hold over its window rather than over
-    the batch. `length` reads a record as the order holds it, before any
-    operation runs, and only ranks: an estimate is enough.
-    """
-
-    length: Callable[[Batch], int]
-    window: int = 64
-
-
-class _Grouped(pygrain.MapDataset[Batch]):
-    """`parent` with each window of `rows * window` records sorted by length
-    and cut into batches of `rows`, the batches shuffled within the window
-    from `seed`. A window's order is computed once, by the first reading thread
-    to need it while the others wait, and the last few windows' orders are kept."""
-
-    _MUTATES_ELEMENT_SPEC = False
-
-    def __init__(
-        self,
-        parent: pygrain.MapDataset[Batch],
-        groups: LengthGroups,
-        rows: int,
-        seed: int,
-        length_at: Callable[[int], int] | None = None,
-    ):
-        super().__init__(parent)
-        self._groups, self._rows, self._seed = groups, rows, seed
-        self._length_at = length_at
-        self._span = rows * groups.window
-        self._orders: dict[int, np.ndarray] = {}
-        self._lock = threading.Lock()
-
-    def __getstate__(self) -> dict:
-        state = dict(self.__dict__)
-        del state["_lock"]
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        self._lock = threading.Lock()
-
-    def __len__(self) -> int:
-        return len(self._parent)
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
-    @overload
-    def __getitem__(self, index: int) -> Batch | None: ...
-
-    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
-        if isinstance(index, slice):
-            return self.slice(index)
-        start = index - index % self._span
-        return self._parent[start + int(self._order(start)[index - start])]
-
-    def _order(self, start: int) -> np.ndarray:
-        order = self._orders.get(start)
-        if order is None:
-            with self._lock:
-                order = self._orders.get(start)
-                if order is None:
-                    order = self._ordered(start)
-                    # A new dict, so a thread reading the old one never sees it change.
-                    self._orders = {**dict(list(self._orders.items())[-3:]), start: order}
-        return order
-
-    def _ordered(self, start: int) -> np.ndarray:
-        size = min(self._span, len(self._parent) - start)
-        if self._length_at is not None:
-            lengths = [self._length_at(start + offset) for offset in range(size)]
-        else:
-            records = [self._parent[start + offset] for offset in range(size)]
-            lengths = [0 if record is None else self._groups.length(record) for record in records]
-        return _window_order(lengths, self._rows, np.random.default_rng([self._seed, start]))
-
-
-def _window_order(lengths: Sequence[int], rows: int, rng: np.random.Generator) -> np.ndarray:
-    """The order of a window's records by `lengths`, cut into batches of
-    `rows`, the whole batches in an order drawn from `rng`. A finite pass's
-    last window can end in a part batch, which stays last: put among the
-    whole ones, it would move every batch boundary after it."""
-    ranked = np.argsort(lengths, kind="stable")
-    whole = len(ranked) // rows * rows
-    batches = ranked[:whole].reshape(-1, rows)
-    return np.concatenate([batches[rng.permutation(len(batches))].reshape(-1), ranked[whole:]])
-
-
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
@@ -1515,7 +1419,6 @@ __all__ = [
     "Forwarding",
     "GlobalStream",
     "Identified",
-    "LengthGroups",
     "Loader",
     "Loading",
     "PhasedStream",
