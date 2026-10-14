@@ -122,17 +122,34 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
+def _two_sum(left, right):
+    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
+    total = left + right
+    part = total - left
+    return total, (left - (total - part)) + (right - part)
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
-    `hi` is the rounded sum and `lo` carries what its rounding dropped
-    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
+    `hi` is the sum rounded and `lo` what the rounding dropped (the his'
+    TwoSum, the los added to its remainder, then the pair's own TwoSum), so a
+    running sum keeps fp32's precision squared and its `hi` is the running
+    value rounded once, where a pair left unrenormalised keeps the plain
+    running sum in `hi`, every addition's rounding in it.
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total = left_hi + right_hi
-    part = total - left_hi
-    dropped = (left_hi - (total - part)) + (right_hi - part)
-    return total, dropped + left_lo + right_lo
+    total, dropped = _two_sum(left_hi, right_hi)
+    return _two_sum(total, dropped + left_lo + right_lo)
+
+
+def compensated_difference(later, earlier):
+    """`later - earlier` of two double-float values, rounded once: the halves'
+    differences summed, so the difference of two near values (a range of a
+    running sum) keeps its own precision, where the his' difference alone
+    carries their whole magnitude's rounding: a one-token range of a decay's
+    running sum near -78 off by 4e-6. Broadcasts as the halves do."""
+    return (later[0] - earlier[0]) + (later[1] - earlier[1])
 
 
 def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:

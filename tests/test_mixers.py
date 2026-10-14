@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -110,17 +110,36 @@ def test_models_build_takes_kind_mixer_records():
     assert jnp.array_equal(model.apply(params, ids), expected.apply(params, ids))
 
 
-DOCUMENTS = (5, 7)
-"""Two packed documents' lengths: the first shorter than a conv's history would carry, both uneven."""
+DOCUMENTS = (5, 70, 7)
+"""Three packed documents' lengths, all uneven: the first shorter than a conv's history would carry,
+the second across the chunked rules' 64-token chunk boundary, the third starting mid-chunk after it."""
 
 PADDING = 3
 """Segment-0 slots after the documents, the packer's tail."""
 
 
+def documents_alone(model, tokens):
+    """The logits of each document of `tokens` `[1, sum(DOCUMENTS)]` run alone, concatenated, as a
+    function of the variables."""
+    starts = (0, *itertools.accumulate(DOCUMENTS))
+
+    def alone(variables):
+        return jnp.concatenate([model.apply(variables, tokens[:, begin:end])
+                                for begin, end in itertools.pairwise(starts)], axis=1)
+
+    return alone
+
+
+def pulled(forward, variables, cotangent):
+    """`forward`'s logits and the variables' gradient under `cotangent`."""
+    logits, pull = jax.vjp(forward, variables)
+    return logits, pull(cotangent.astype(logits.dtype))[0]
+
+
 def packed_and_alone(model, variables, tokens, cotangent):
     """Logits and parameter gradients of the documents' `tokens` `[1, sum(DOCUMENTS)]` run packed
     (segment ids and positions restarting per document, then PADDING segment-0 slots whose logits
-    the loss ignores) and of each document run alone, the latter concatenated."""
+    the loss ignores) and of each document run alone, the latter concatenated (`documents_alone`)."""
     total = sum(DOCUMENTS)
     documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
     segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
@@ -132,21 +151,11 @@ def packed_and_alone(model, variables, tokens, cotangent):
         return model.apply(variables, row, coordinates=coordinates(
             segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1))[:, :total]
 
-    def alone(variables):
-        starts = (0, *itertools.accumulate(DOCUMENTS))
-        return jnp.concatenate([model.apply(variables, tokens[:, begin:end])
-                                for begin, end in itertools.pairwise(starts)], axis=1)
-
     def run(forward):
-        @jax.jit
-        def pulled(variables, cotangent):
-            logits, pull = jax.vjp(forward, variables)
-            return logits, pull(cotangent.astype(logits.dtype))[0]
-
-        return pulled(variables, cotangent)
+        return jax.jit(functools.partial(pulled, forward))(variables, cotangent)
 
     assert tokens.shape == (1, total)
-    return run(packed), run(alone)
+    return run(packed), run(documents_alone(model, tokens))
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
@@ -164,18 +173,22 @@ REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
-    gives each document's logits and the parameters' gradients its documents give run one at a time,
-    within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
-    a document boundary, nor between the documents and the segment-0 padding after them. The
-    float64 truth is the documents run alone in float64, the fp32 runs at IEEE products, as the
-    rule's references take theirs."""
+    """Every mixer in the registry: a row packing three documents (segment ids, positions restarting),
+    one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
+    its documents give run one at a time, within the float64 gate, so no layer carries a conv history,
+    a recurrent state or attention across a document boundary, nor between the documents and the
+    segment-0 padding after them. The float64 truth is the documents run alone in float64, the fp32
+    runs at IEEE products, as the rule's references take theirs; each leaf's floor is its own float64
+    terms' (`float64_terms`), as a gradient summed over a document's tokens rounds with the partial
+    sums it adds: Kimi delta attention's second layer's A_log, its terms 2.7 times its size, rounds
+    to 6.6e-06 packed under its floor of 7.3e-06, where the documents alone round to 5.6e-07 at their
+    own chunk phase and 6.6e-06 at the packed one."""
     if jax.default_backend() == "gpu":
         pytest.skip("a GPU's XLA picks GEMM algorithms by shape, so a packed row and its documents "
                     "alone sum in different orders and one draw of each measures luck; isolation on a "
                     "GPU is test_no_token_reaches_another_document's, bitwise")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
@@ -187,23 +200,25 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
-        _, (truth, truth_grads) = packed_and_alone(model.clone(dtype=jnp.float64), wide, tokens,
-                                                   jnp.asarray(cotangent, jnp.float64))
+        alone64 = documents_alone(model.clone(dtype=jnp.float64), tokens)
+        (truth, truth_grads), (terms, terms_grads) = float64_terms(
+            functools.partial(pulled, alone64), wide, jnp.asarray(cotangent, jnp.float64))
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS))
+                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS),
+                           terms={"logits": terms, "grads": terms_grads})
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_no_token_reaches_another_document(kind):
-    """Every mixer in the registry, on every backend: in a packed row (two documents, then segment-0
-    padding), changing the first document's tokens and the padding's leaves the second document's
+    """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
+    segment-0 padding), changing the first document's tokens and the padding's leaves the second's
     logits, and the gradients of a loss on them alone, bitwise as they were. The same program on the
     same shapes, so any difference is information crossing a document boundary."""
     if kind in REFUSED:
         pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
-    first, second = DOCUMENTS
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
+    first, second = DOCUMENTS[:2]
     total = first + second + PADDING
     segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
     positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)

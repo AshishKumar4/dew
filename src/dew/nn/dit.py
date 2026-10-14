@@ -143,7 +143,9 @@ class PatchEmbedding(nn.Module):
                  precision=self.precision)(x)
         if self.bottleneck is not None:
             x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
-        return jnp.reshape(x, (batch, -1, self.embedding_dim))
+        # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
+        # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
+        return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
 
 
 @logical_axes({("ada_proj",): ("embed", "modulation")})

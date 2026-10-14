@@ -12,10 +12,11 @@ from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
 from typing import overload
 
+import grain.experimental as gx
 import grain.python as pygrain
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import Record, Rejected
 from dew.records import integer, integers, record
 
 _log = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class CorpusCounts:
     accepted: int = 0
     truncated: int = 0
     chunks: int = 0
+    chunk_records: int = 0
     rejected: Counter[str] = dataclasses.field(default_factory=Counter)
 
     def metrics(self) -> dict[str, float]:
@@ -36,7 +38,7 @@ class CorpusCounts:
             f"data/attempted/{self.name}": float(self.attempted),
             f"data/accepted/{self.name}": float(self.accepted),
             f"data/truncated/{self.name}": self.truncated / total,
-            f"data/chunks_per_record/{self.name}": self.chunks / total,
+            f"data/chunks_per_record/{self.name}": self.chunks / max(1, self.chunk_records),
             **{
                 f"data/rejected/{self.name}/{reason}": float(count) for reason, count in self.rejected.items()
             },
@@ -48,6 +50,7 @@ class CorpusCounts:
             "accepted": self.accepted,
             "truncated": self.truncated,
             "chunks": self.chunks,
+            "chunk_records": self.chunk_records,
             "rejected": dict(self.rejected),
         }
 
@@ -56,9 +59,15 @@ class CorpusCounts:
         self.accepted = integer(state["accepted"], "accepted")
         self.truncated = integer(state["truncated"], "truncated")
         self.chunks = integer(state["chunks"], "chunks")
+        self.chunk_records = integer(state["chunk_records"], "chunk_records")
         self.rejected = Counter(
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
+
+    def expanded(self, outputs: Sequence[Record]) -> None:
+        """Count one chunked document and its fan-out before later stages can reject chunks."""
+        self.chunk_records += 1
+        self.chunks += sum(value is not None and not isinstance(value, Rejected) for value in outputs)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,7 +106,6 @@ class _KeepAccepted:
             self.counts.accepted += 1
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
-                self.counts.chunks += int(element.get("_dew_chunks", 0))
             self._probe()
             self.consecutive, self.started = 0, None
             return True
@@ -137,14 +145,51 @@ class _KeepAccepted:
             )
 
 
-class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
+class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
+    """Checkpoint a corpus counter with its parent, including replay during parent restoration."""
+
+    def __init__(self, parent: pygrain.DatasetIterator, counts: CorpusCounts):
+        super().__init__(parent)
+        self._read, self._counts = parent, counts
+
+    def __next__(self) -> Element:
+        return next(self._read)
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._read.get_state(), "corpus": self._counts.name,
+                "counts": self._counts.state()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._read.set_state(record(state["parent"], "counted parent"))
+        self._counts.restore(record(state["counts"], "corpus counts"))
+
+    def close(self) -> None:
+        self._read.close()
+
+
+class Chunked(pygrain.IterDataset[Record]):
+    """A chunk expansion counted at its fan-out, with counters in the iterator position."""
+
+    def __init__(self, parent: pygrain.IterDataset[Record], name: str,
+                 expand: Callable[[CorpusCounts], gx.FlatMapTransform]):
+        super().__init__(parent)
+        self._records, self._name, self._expand = parent, name, expand
+
+    def __iter__(self) -> pygrain.DatasetIterator[Record]:
+        counts = CorpusCounts(self._name)
+        return _CountedIterator(iter(gx.FlatMapIterDataset(self._records, self._expand(counts))), counts)
+
+
+class _AcceptedIterator(_CountedIterator[Batch]):
+    _read: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch]
+
     def __init__(
         self,
         parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
         predicate: _KeepAccepted,
     ):
-        super().__init__(parent)
-        self._read, self._predicate = parent, predicate
+        super().__init__(parent, predicate.counts)
+        self._predicate = predicate
 
     def __next__(self) -> Batch:
         value = next(self._read)
@@ -154,22 +199,16 @@ class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
 
     def get_state(self) -> Mapping[str, object]:
         return {
-            "parent": self._read.get_state(),
-            "corpus": self._predicate.counts.name,
-            "counts": self._predicate.counts.state(),
+            **super().get_state(),
             "consecutive": self._predicate.consecutive,
             "warned": self._predicate.warned,
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(record(state["parent"], "accepted parent"))
-        self._predicate.counts.restore(record(state["counts"], "corpus counts"))
+        super().set_state(state)
         self._predicate.consecutive = integer(state["consecutive"], "consecutive")
         self._predicate.started = None
         self._predicate.warned = bool(state["warned"])
-
-    def close(self) -> None:
-        self._read.close()
 
 
 class Accepted(pygrain.IterDataset[Batch]):
@@ -452,6 +491,7 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                 combined.attempted = max(combined.attempted, parsed.attempted)
                 combined.truncated = max(combined.truncated, parsed.truncated)
                 combined.chunks = max(combined.chunks, parsed.chunks)
+                combined.chunk_records = max(combined.chunk_records, parsed.chunk_records)
                 combined.rejected.update(parsed.rejected)
             for child in branch.values():
                 visit(child)

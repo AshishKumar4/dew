@@ -247,6 +247,10 @@ class Windows:
     stride: int | None = None
     fields: tuple[str, ...] = ("text",)
 
+    def __post_init__(self) -> None:
+        if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
+            raise ValueError("causal windows need fields and positive lengths and strides")
+
 
 @dataclasses.dataclass(frozen=True)
 class TokenSplit:

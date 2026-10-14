@@ -59,7 +59,7 @@ def test_parquet_images_and_captions_reach_real_worker_batches(tmp_path, workers
 
 def test_hugging_face_image_structs_decode_their_embedded_bytes(tmp_path):
     source = image_table(tmp_path / "hub-images.parquet", 4, struct=True)
-    data = loader(ImageData(source=source, image_size=SCALE, augment=None), batch=4,
+    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=None), batch=4,
                 read="memory", loading=READ)
     stream = data.train(DataPartition())
     try:
@@ -131,8 +131,8 @@ def test_validation_never_applies_the_training_crop_or_colour_jitter(tmp_path):
 
 def test_an_unconditional_batch_discards_host_caption_strings(tmp_path):
     source = image_table(tmp_path / "images.parquet", 4)
-    data = loader(ImageData(source=source, image_size=SCALE, augment=None), batch=4, read="memory",
-                  loading=READ)
+    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=None), batch=4,
+                  read="memory", loading=READ)
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
