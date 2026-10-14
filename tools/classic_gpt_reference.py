@@ -71,7 +71,7 @@ def greedy(loaded, ids, steps):
     return generated
 
 
-def check_checkpoint(checkpoint, output, revision=None, safetensors_directory=None):
+def check_checkpoint(checkpoint, output, revision=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
@@ -79,13 +79,6 @@ def check_checkpoint(checkpoint, output, revision=None, safetensors_directory=No
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
                                                     attn_implementation='eager', revision=revision).eval().to(device)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
-    source = checkpoint
-    if safetensors_directory is not None:
-        # OPT-125m publishes pickle weights alone. Transformers converts
-        # the same tensors once; Dew's loader still reads safe tensor storage.
-        reference.save_pretrained(safetensors_directory)
-        tokenizer.save_pretrained(safetensors_directory)
-        source = safetensors_directory
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
     with torch.no_grad():
         expected = reference(torch.tensor(ids, device=device), use_cache=False).logits.cpu().numpy()
@@ -94,7 +87,7 @@ def check_checkpoint(checkpoint, output, revision=None, safetensors_directory=No
                                        pad_token_id=0).cpu().numpy()
     del reference
     torch.cuda.empty_cache()
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference', max_seq_len=64,
+    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
@@ -126,13 +119,12 @@ def main():
     parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
     parser.add_argument('--checkpoint')
     parser.add_argument('--revision')
-    parser.add_argument('--safetensors-directory')
     parser.add_argument('--output')
     args = parser.parse_args()
     if args.fixture:
         write_fixture(args.family)
     if args.checkpoint:
-        check_checkpoint(args.checkpoint, args.output, args.revision, args.safetensors_directory)
+        check_checkpoint(args.checkpoint, args.output, args.revision)
 
 
 if __name__ == '__main__':
