@@ -652,6 +652,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
         sized = dict(zip(tests, pool.map(needs, tests), strict=True))
     shares = {name: share for name, (share, _) in sized.items()}
     guessed = {name for name, (_, guess) in sized.items() if guess}
+    retried: set[str] = set()
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
     waiting = sorted(tests, key=lambda name: -shares[name])
@@ -664,8 +665,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
-                                    environ)] = fits
+                # A retry runs: the red run's record may not have reached the Worker over a green one.
+                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline,
+                                    cache and fits not in retried, 60.0, common, environ)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -674,6 +676,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
                 red = any(verdict["exitCode"] for verdict in json.loads(verdicts[name].read_text())["rows"])
                 if name in guessed and red:
                     guessed.remove(name)
+                    retried.add(name)
                     shares[name] = budget
                     waiting.insert(0, name)
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]

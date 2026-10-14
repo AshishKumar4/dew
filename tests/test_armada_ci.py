@@ -268,6 +268,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [share for share, *_ in ran("test_spawner")] == ["0.125"]
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 1 for name in names), "the second lane reused the green rows"
+    assert len(ran("test_needy")) == 2, "and the retry's green row"
     assert [share for share, *_ in ran("test_spawner")] == ["0.125", "0.5"], "a spawner runs alone"
 
 
