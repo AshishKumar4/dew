@@ -61,3 +61,47 @@ def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_p
     assert len(commands) == 2
     assert gate.measure(ROOT, args, ROOT / "tools", is_head=False) == {}
     assert len(commands) == 2
+
+
+def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_path, monkeypatch):
+    """Each probe runs the tool its rows name and reads every one of its rows
+    from that tool's output, so a head whose tools all ran has a measurement
+    for every row of the battery."""
+    from types import SimpleNamespace
+
+    def after(command, flag):
+        return command[command.index(flag) + 1]
+
+    outputs = {
+        "benchmark_step.py": lambda command: [{"ms_per_step": 5.0}],
+        "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
+        "benchmark_lm_serving.py": lambda command: {"sweep": [
+            {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
+            for slots in after(command, "--slots").split(",")]},
+        "benchmark_attention.py": lambda command: [
+            {"implementation": implementation, "forward_backward_ms": 5.0}
+            for implementation in command[command.index("--implementations") + 1:
+                                          command.index("--sequence-lengths")]],
+        "benchmark_image_pipeline.py": lambda command: {
+            "pipeline": {"device_crop_flip_jitter": {"images_per_second": 5.0}}},
+        "qwen35_pair.py": lambda command: {"comparison": {
+            "dew_tokens_per_s": 720.0, "dew_over_torch": 1.0, "tolerance": 0.01,
+            "performance_claim_passed": True}},
+    }
+
+    def child(command, **kwargs):
+        if command[1] == "-c":
+            printed = ("NVIDIA A100-SXM4-80GB" if "device_kind" in command[2]
+                       else json.dumps({"save_ms": 5.0, "restore_ms": 6.0}))
+            return subprocess.CompletedProcess(command, 0, printed + "\n", "")
+        flag = "--json-out" if "--json-out" in command else "--out"
+        Path(after(command, flag)).write_text(json.dumps(outputs[Path(command[1]).name](command)))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    args = SimpleNamespace(only=[], claim=False, model="unused", flowers="unused", torch_python="torch",
+                           out=tmp_path / "gate.json")
+    sample = gate.measure(ROOT, args, ROOT / "tools", is_head=True)
+    for row in gate.BATTERY:
+        value = sample[row.name]
+        assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
