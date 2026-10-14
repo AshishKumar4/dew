@@ -1,6 +1,5 @@
 """SLOP013: what importing a module may not do to the process, and what it may."""
 
-import ast
 import importlib.util
 import sys
 import textwrap
@@ -38,8 +37,9 @@ CASES = {
 
 
 @pytest.mark.parametrize("case", list(CASES))
-def test_import_time_writes_are_reported_and_deferred_ones_are_not(lint, case):
+def test_import_time_writes_are_reported_and_deferred_ones_are_not(lint, case, tmp_path):
     body, reported = CASES[case]
-    source = textwrap.dedent("import os\nimport jax\n\n" + body)
-    module = lint.Module(Path("src/dew/effects.py"), "src/dew/effects.py", source, ast.parse(source))
+    (tmp_path / "src" / "dew").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "effects.py").write_text(textwrap.dedent("import os\nimport jax\n\n" + body))
+    [module] = lint.collect(["src/dew"], tmp_path, "dew")
     assert any(True for _ in lint.imports(module)) is reported

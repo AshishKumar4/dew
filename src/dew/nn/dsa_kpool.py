@@ -379,6 +379,13 @@ class KPoolSparseAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, mask=mask)
+        # A valid query that selects no pool, one of the first tokens before
+        # a pool completes where no tail is always selected, reads every key
+        # alike in the reference, whose masked logits are all equal there;
+        # attention itself reads nothing for a row that sees no key.
+        unselected = jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
+        uniform = jnp.mean(value.astype(jnp.float32), axis=1, keepdims=True).astype(attention.dtype)
+        attention = jnp.where(unselected, uniform, attention)
         return checkpoint_name(self.o_proj(checkpoint_name(attention, 'context').reshape(
             batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
 

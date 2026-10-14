@@ -20,7 +20,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
+from interop_support import (
+    assert_autoencoder_vjp,
+    assert_layout_tensors,
+    extract_fixture,
+    fixture_arrays,
+    scaled_gap,
+)
 
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
@@ -48,14 +54,6 @@ def loaded(source):
 
 def channels_last(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
-
-
-def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]:
-    """Each native parameter gradient, exported to its source tensor's layout,
-    against the source's gradient of that tensor."""
-    return {layout.name: scaled_gap(layout.export({"autoencoder": gradients}),
-                                    reference[f"{walk}.grad.{layout.name.removeprefix('vae/')}"])
-            for layout in layouts}
 
 
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, loaded):
@@ -113,38 +111,20 @@ def test_the_decode_matches_the_source(loaded, reference):
 
 def test_encoder_gradients_match_the_source(loaded, reference):
     autoencoder, params, layouts, _ = loaded
-    model = autoencoder.model
-    probe_mean = channels_last(reference["probe_mean"])
-    probe_std = channels_last(reference["probe_std"])
-
-    def objective(params, image):
-        mean, std = posterior(model, params, image)
-        return jnp.sum(mean * probe_mean) + jnp.sum(std * probe_std)
-
-    grad_params, grad_image = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["image"]))
-    image_gap = scaled_gap(grad_image, channels_last(reference["encode.grad_image"]))
-    gaps = parameter_gaps(layouts, grad_params, reference, "encode")
-    worst = max(gaps, key=gaps.get)
-    print(f"encode: image gradient gap {image_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert image_gap < GRADIENT
-    assert gaps[worst] < GRADIENT, worst
+    assert_autoencoder_vjp(
+        "encode", lambda params, image: posterior(autoencoder.model, params, image), params,
+        channels_last(reference["image"]),
+        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
+        channels_last(reference["encode.grad_image"]), GRADIENT)
 
 
 def test_decoder_gradients_match_the_source(loaded, reference):
     autoencoder, params, layouts, _ = loaded
     model = autoencoder.model
-    probe = channels_last(reference["probe"])
-
-    def objective(params, latent):
-        return jnp.sum(model.apply({"params": params}, latent, method=model.decode) * probe)
-
-    grad_params, grad_latent = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["latent"]))
-    latent_gap = scaled_gap(grad_latent, channels_last(reference["decode.grad_latent"]))
-    gaps = parameter_gaps(layouts, grad_params, reference, "decode")
-    worst = max(gaps, key=gaps.get)
-    print(f"decode: latent gradient gap {latent_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert latent_gap < GRADIENT
-    assert gaps[worst] < GRADIENT, worst
+    assert_autoencoder_vjp(
+        "decode", lambda params, latent: model.apply({"params": params}, latent, method=model.decode), params,
+        channels_last(reference["latent"]), [channels_last(reference["probe"])], layouts, reference,
+        channels_last(reference["decode.grad_latent"]), GRADIENT)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):

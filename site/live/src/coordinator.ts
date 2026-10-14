@@ -122,19 +122,21 @@ export class Coordinator extends DurableObject<Env> {
 	}
 
 	/**
-	 * Record that a session's container is running. False when the session is already
-	 * over, for example swept as unused while its container was still booting: nothing
-	 * counts that container any more, so the Kernel must destroy it. `image` is the image
-	 * the container started from; the first report is the start.
+	 * Record that a session's container is running, and return when the session ends: its
+	 * first start, which a reconnect keeps, and the wall clock after it, in milliseconds
+	 * since the epoch. Null when the session is already over, for example swept as unused
+	 * while its container was still booting, or past its end: nothing counts that container
+	 * any more, so the Kernel must destroy it. `image` is the image the container started from.
 	 */
-	async started(id: string, now: number, image: string): Promise<boolean> {
-		const cursor = this.ctx.storage.sql.exec(
-			'UPDATE sessions SET started = COALESCE(started, ?), image = ? WHERE id = ? AND ended IS NULL',
-			now,
-			image,
-			id,
-		);
-		return cursor.rowsWritten === 1;
+	async started(id: string, now: number, image: string): Promise<number | null> {
+		const sql = this.ctx.storage.sql;
+		sql.exec('UPDATE sessions SET started = COALESCE(started, ?), image = ? WHERE id = ? AND ended IS NULL', now, image, id);
+		const row = sql.exec<{ started: number }>('SELECT started FROM sessions WHERE id = ? AND ended IS NULL', id).toArray()[0];
+		if (!row) return null;
+		const end = row.started + this.limits.wallSeconds * 1000;
+		if (now < end) return end;
+		sql.exec('UPDATE sessions SET ended = ? WHERE id = ?', end, id);
+		return null;
 	}
 
 	/** Whether a session may still connect: created, and not yet over. */
