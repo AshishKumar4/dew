@@ -169,7 +169,7 @@ class TextData:
         return train, held, ()
 
     def _token_pipelines(self, stored) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.steps.windows import Documents, WindowSource
+        from dew.data.steps.windows import WindowSource
 
         held = self.validation
         if isinstance(held, Split):
@@ -185,14 +185,11 @@ class TextData:
         def windows(source, stride):
             if self.pack is None:
                 return Pipeline(WindowSource(source, source.tokens, self.seq_len, stride))
-            documents = Pipeline(source)
-            if source.document_ends() is None:
-                if source.tokens.eos_id is None:
-                    raise ValueError(
-                        f"packed text needs producer document boundaries or EOS: {source.describe()}"
-                    )
-                documents = documents.flat_map(Documents(source.tokens.eos_id))
-            return documents.pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            if not source.documented:
+                raise ValueError(
+                    f"packed text needs producer document boundaries or EOS: {source.describe()}"
+                )
+            return Pipeline(source).pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
         return (
             windows(sources[0], self.seq_len if self.stride is None else self.stride),
@@ -493,7 +490,6 @@ def loader(
     *,
     batch: int | None = None,
     tokens: int | None = None,
-    lengths: tuple[int, ...] = (),
     read: Read | None = "indexed",
     provision: bool = False,
     cache: Cache | Generation | str | None = None,
@@ -536,10 +532,10 @@ def loader(
     train, held = _promoted(train), None if held is None else _promoted(held)
 
     def compiled(at: Read) -> tuple[Pipeline, ...]:
-        ordered = _batched(_ordered(train, at, seed), batch, train=True, tokens=tokens, lengths=lengths)
+        ordered = _batched(_ordered(train, at, seed), batch, train=True, tokens=tokens)
         if held is None:
             return (ordered,)
-        return ordered, _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
+        return ordered, _batched(held, batch, train=False, tokens=tokens)
 
     read = read or _preferred_read(compiled, provision=provision)
     branches = compiled(read)
@@ -570,7 +566,6 @@ def _batched(
     *,
     train: bool,
     tokens: int | None = None,
-    lengths: tuple[int, ...] = (),
 ) -> Pipeline:
     from dew.data.pipeline import BatchStage, MapBatch
 
@@ -582,7 +577,7 @@ def _batched(
 
     at = _until(pipeline.stages, MapBatch)
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(
-        batch, tokens=tokens, lengths=lengths, drop_remainder=train
+        batch, tokens=tokens, drop_remainder=train
     )
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
