@@ -1247,3 +1247,5 @@ zipp==4.1.1
     # via
     #   etils
     #   importlib-metadata
+zstandard==0.25.0
+    # via dewml (pyproject.toml)

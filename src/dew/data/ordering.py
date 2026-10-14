@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+import threading
 from collections.abc import Callable
 from typing import overload
 
@@ -20,28 +20,37 @@ class BlockShuffle(grain.MapDataset[Batch]):
         self._rows, self._sizes, self._block, self._seed = parent, sizes, block, seed
         self._starts = np.cumsum((0, *sizes[:-1]))
         self._total = sum(sizes)
-        self._epochs: OrderedDict[int, tuple[tuple[int, ...], np.ndarray]] = OrderedDict()
+        self._epochs: dict[int, tuple[tuple[int, ...], np.ndarray]] = {}
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._rows)
 
     def _epoch(self, epoch: int) -> tuple[tuple[int, ...], np.ndarray]:
-        if epoch in self._epochs:
-            self._epochs.move_to_end(epoch)
-            return self._epochs[epoch]
-        order = tuple(
-            int(index) for index in np.random.default_rng([self._seed, epoch]).permutation(len(self._sizes))
-        )
-        ends = np.cumsum(
-            [
-                sum(self._sizes[index] for index in order[start : start + self._block])
-                for start in range(0, len(order), self._block)
-            ]
-        )
-        self._epochs[epoch] = (order, ends)
-        while len(self._epochs) > 2:
-            self._epochs.popitem(last=False)
-        return order, ends
+        cached = self._epochs.get(epoch)
+        if cached is None:
+            with self._lock:
+                cached = self._epochs.get(epoch)
+                if cached is None:
+                    order = tuple(int(index) for index in np.random.default_rng(
+                        [self._seed, epoch]).permutation(len(self._sizes)))
+                    ends = np.cumsum([
+                        sum(self._sizes[index] for index in order[start : start + self._block])
+                        for start in range(0, len(order), self._block)
+                    ])
+                    cached = order, ends
+                    # Published dictionaries never change under concurrent readers.
+                    self._epochs = {**dict(list(self._epochs.items())[-1:]), epoch: cached}
+        return cached
 
     def index(self, index: int) -> int:
         epoch, position = divmod(index, self._total)

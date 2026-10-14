@@ -90,6 +90,37 @@ def test_token_budget_validation_keeps_partial_rows_with_a_mask():
         reader.close()
 
 
+@pytest.mark.parametrize("drop_remainder", [False, True])
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_finite_row_batch_marks_its_remainder_or_drops_it(drop_remainder, shares):
+    """A finite pass scores each kept record once, with a fixed shape even in its last batch."""
+    records = Memory(tuple({"id": np.int32(index), "text": np.arange(index * 8, (index + 1) * 8,
+                       dtype=np.int32)} for index in range(6)))
+    pipeline = Pipeline(records).repeat(1).batch(4, drop_remainder=drop_remainder)
+    data = compile(pipeline, read="memory", loading=READ)
+    size = 4 // shares
+    delivered = []
+    for share in range(shares):
+        stream = data.train(DataPartition(share, shares))
+        try:
+            batches = list(stream)
+        finally:
+            stream.close()
+        expected_ids = [list(range(share, 4, shares))]
+        expected_masks = [[True] * size]
+        if not drop_remainder:
+            expected_ids.append(list(range(4 + share, 6, shares)) * 2)
+            expected_masks.append([True] * (size // 2) + [False] * (size // 2))
+        assert [batch["id"].tolist() for batch in batches] == expected_ids
+        masks = [np.asarray(batch.get(VALID_ROWS, np.ones(size, bool))) for batch in batches]
+        assert [mask.tolist() for mask in masks] == expected_masks
+        for batch, mask in zip(batches, masks, strict=True):
+            assert batch["id"].shape == (size,) and batch["text"].shape == (size, 8)
+            np.testing.assert_array_equal(batch["text"], batch["id"][:, None] * 8 + np.arange(8))
+            delivered.extend(batch["id"][mask].tolist())
+    assert sorted(delivered) == list(range(4 if drop_remainder else 6))
+
+
 def test_variable_axis_is_an_input_contract_not_a_trainer_exception():
     declared = InputSpec(Field("tokens", (16,), variable_axes=(0,)))
     declared.check({"tokens": np.zeros((4, 8), np.int32)})

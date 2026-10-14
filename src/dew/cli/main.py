@@ -58,7 +58,8 @@ class DataExport:
     recipe: Positional[str]
     destination: Positional[str]
     fields: str = "{}"
-    format: Literal["parquet", "array_record"] = "parquet"
+    format: Literal["parquet", "array_record"] | None = None
+    """Parquet for records, ArrayRecord for token stores unless explicitly named."""
     rows_per_shard: int = 100_000
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] = "streamed"
@@ -72,6 +73,9 @@ class DataExport:
         from dew.records import record
         from dew.registry import datasets
 
+        format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
+        if self.tokenizer is not None and format != "array_record":
+            raise ValueError("token exports must use --format array_record")
         recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
         train, held, _ = recipe.pipelines()
         pipeline = train if self.branch == "train" else held
@@ -88,7 +92,7 @@ class DataExport:
                         "vocab_size": vocabulary.vocab_size, "dtype": "int32",
                         "eos_id": vocabulary.eos_id if self.eos else None}
         manifest = export(iterate(pipeline, read=self.read, provision=self.provision),
-                          self.destination, format=self.format, rows_per_shard=self.rows_per_shard,
+                          self.destination, format=format, rows_per_shard=self.rows_per_shard,
                           metadata=metadata, length_field="text" if self.tokenizer is not None else None)
         emit(json.dumps(manifest, sort_keys=True))
         return 0
