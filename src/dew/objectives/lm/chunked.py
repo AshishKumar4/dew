@@ -232,16 +232,13 @@ class _ChunkTerms(NamedTuple):
     mass: jax.Array
 
 
-def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
+def _chunk_terms(hidden, head_chunk, targets, start: int,
                  softcap: float | None, precision: jax.lax.PrecisionLike,
                  predict: bool, temperature: float, excluded, bias=None) -> _ChunkTerms:
-    """One tile's `_ChunkTerms`."""
+    """One tile's `_ChunkTerms`, its columns from `start` on."""
     logits = _without(capped_logits(biased_logits(_tile_logits(hidden, head_chunk, precision), bias),
                               softcap, temperature), start, excluded)
-
-    inside = (targets >= start) & (targets < stop)
-    column = jnp.clip(targets - start, 0, stop - start - 1)
-    picked = jnp.where(inside, jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0], 0.0)
+    picked = _target_logits(logits, targets - start)
     _, top, normalizer = _row_terms(logits, predict)
     if top is None:
         return _ChunkTerms(picked, None, None, *normalizer)
@@ -285,7 +282,7 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
         def columns(first, carry, count):
             terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
-                picked_targets, first, first + count, softcap, precision, predict, temperature, excluded,
+                picked_targets, first, softcap, precision, predict, temperature, excluded,
                 None if bias is None else jax.lax.dynamic_slice_in_dim(bias, first, count))
             peak = jnp.maximum(carry[1], terms.peak)
             merged = (carry[0] + terms.picked, peak,
@@ -670,10 +667,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk
         logits, pullback = jax.vjp(lambda raw: capped_logits(raw, cap, temperature),
                                    biased_logits(_tile_logits(states, matrix, precision), bias))
         log_z, top, (peaks, masses) = _row_terms(_without(logits, 0, excluded), predict)
-        inside = (targets >= 0) & (targets < table.shape[0])
-        picked = jnp.where(inside, jnp.take_along_axis(
-            logits, jnp.clip(targets, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
-        values = [log_z - picked, log_z]
+        values = [log_z - _target_logits(logits, targets), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
@@ -847,9 +841,9 @@ def head_cross_entropy(model, variables, read, targets, chunks: int, *,
 
 
 def _target_logits(logits, targets):
-    """Each row of `logits`' entry at its target, as in `_chunk_terms`: 0
-    for a target outside the vocabulary, which picks no column, such as a
-    padding id past it whose weight is 0."""
+    """Each row of `logits`' entry at its target, 0 for a target outside its
+    columns, which picks none: a padding id past the vocabulary, whose weight
+    is 0, or another tile's or shard's column."""
     vocab = logits.shape[-1]
     inside = (targets >= 0) & (targets < vocab)
     return jnp.where(inside, jnp.take_along_axis(
