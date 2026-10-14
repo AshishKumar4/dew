@@ -273,13 +273,15 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     """Once a step of a batch's signature compiles, the prefetcher places
     only the leaves its executable kept: a field the step never reads stays a
     host array of its own, and the step runs on the batch as placed. A batch
-    of a signature no step has compiled for is placed whole."""
+    of a signature no step has compiled for is placed whole. A field held as
+    None, as an optional part of `Coordinates` is, is no leaf to place."""
     mesh = MeshSpec().build()
     rows = jax.device_count()
-    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
+    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
     step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
     compiled = step.lower(jnp.zeros(()), shard_batch(mesh, batch), jnp.int32(0)).compile()
-    reads = {batch_signature(batch): step_reads(compiled)}
+    signature = batch_signature(batch)
+    reads = {signature: step_reads(compiled, signature)}
     wider = {**batch, "x": np.ones((rows, 4), np.float32)}
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
         placed, whole = next(stream), next(stream)

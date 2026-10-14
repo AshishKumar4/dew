@@ -2,6 +2,7 @@
 
 import itertools
 
+import jax
 import numpy as np
 
 from dew.data.cache import Cache
@@ -28,9 +29,8 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
     left, right = warm.train(DataPartition()), cold.train(DataPartition())
     try:
         for ours, old in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):
-            assert ours.keys() == old.keys()
-            for field in ours:
-                np.testing.assert_array_equal(ours[field], old[field])
+            assert jax.tree.structure(ours) == jax.tree.structure(old)
+            jax.tree.map(np.testing.assert_array_equal, ours, old)
         saved = left.get_state()
         expected = next(left)
     finally:
@@ -42,6 +42,6 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
         reader.set_state(saved)
         shares.append(next(reader))
         reader.close()
-    for field in expected:
-        joined = np.stack([shares[0][field], shares[1][field]], axis=1).reshape(expected[field].shape)
-        np.testing.assert_array_equal(joined, expected[field])
+    # The shares' rows interleave into the whole batch's, leaf by leaf (a window's coordinates too).
+    jax.tree.map(lambda first, second, whole: np.testing.assert_array_equal(
+        np.stack([first, second], axis=1).reshape(whole.shape), whole), shares[0], shares[1], expected)
