@@ -200,8 +200,9 @@ class LoRA:
                  modules: Sequence[str] | None = None,
                  layouts: Mapping[str, WeightLayout] | None = None) -> InputQuantization:
         """Measure which projections of the base this adapter freezes run
-        faster in FP8 on this GPU at `tokens` rows a step, and return the
-        record `apply` takes as its `fp8_base` (`measured_fp8_sites`).
+        faster in FP8 at `tokens` rows a step, on process 0's GPU for the
+        whole pool, and return the record `apply` takes as its `fp8_base`
+        (`measured_fp8_sites`).
 
         `modules` names the projections as `modules` does (this adapter's own
         when None) and `layouts` resolves them as `apply` does. The

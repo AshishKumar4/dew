@@ -145,10 +145,10 @@ class Resize(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
-        if self.method is None and isinstance(self.size, int):
+        if self.method is None:
             return {**element, self.field: resize_image(image, self.size)}
         height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
-        return {**element, self.field: _resized(image, height, width, self.method or "area")}
+        return {**element, self.field: _resized(image, height, width, self.method)}
 
 
 @dataclasses.dataclass(frozen=True)

@@ -38,7 +38,7 @@ from ..dit import (
     factorized_walk,
     scan_ordered_pos_embed,
 )
-from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
+from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, rows_like
 from .dit import gather_tokens
@@ -152,10 +152,7 @@ class JepaEncoder(_JepaStackOptions):
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
         """Image patch lengths; a video needs its frame/patch geometry separately."""
-        if len(sample_shape) != 3 or any(side % self.patch_size for side in sample_shape[:2]):
-            raise MissingFlopsCount("JepaEncoder needs a divisible [height, width, channels] sample shape")
-        height, width, _ = sample_shape
-        return np.full((rows,), (height // self.patch_size) * (width // self.patch_size), np.int64)
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
 
     @nn.nowrap
     def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:

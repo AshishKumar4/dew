@@ -156,3 +156,43 @@ def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(save
     assert source.inputs.sample.shape[:2] == (64, 48)
     reloaded = Condition.from_json(condition.to_json(), params=condition.encoder.params)
     assert reloaded.encoder.time_id_values == condition.encoder.time_id_values
+
+
+def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines, tmp_path):
+    """The safety head keeps its scoring state, the concept embeddings and
+    thresholds, in FP32 whatever the weights are stored in, so a load at
+    `param_dtype="bfloat16"` blocks and allows what the checkpoint's own
+    thresholds decide. The fixture's checker, all ones, allows the reference
+    image, as the reference recorded. A second checker sets one concept to the
+    reference's own embedding of that image at threshold 0.9985, between the
+    bf16 values 0.99609375 and 1.0: the published rule rounds its score,
+    cosine 1 less 0.9985, to 0.002 and blocks the image, where a threshold
+    narrowed to 1.0 scores 0 and allows it. The image's own direction moves
+    the cosine only at second order in the bf16 tower's error, far inside the
+    0.001 left before the score rounds to zero."""
+    import shutil
+
+    import jax.numpy as jnp
+    import numpy as np
+    from safetensors.numpy import load_file, save_file
+
+    from dew.interop import Pretrained
+
+    source = saved_pipelines / "safety"
+    reference = np.load(source / "reference.npz")
+    concept = tmp_path / "safety"
+    shutil.copytree(source, concept)
+    checker = concept / "safety_checker" / "model.safetensors"
+    tensors = load_file(str(checker))
+    embeds, thresholds = tensors["concept_embeds"].copy(), tensors["concept_embeds_weights"].copy()
+    embeds[0], thresholds[0] = reference["checker_embeddings"][0], 0.9985
+    save_file({**tensors, "concept_embeds": embeds, "concept_embeds_weights": thresholds}, str(checker),
+              metadata={"format": "pt"})
+    images = jnp.asarray(reference["images"] * 2 - 1)
+    for name, directory, expected in (("fixture", source, reference["checker_flags"]),
+                                      ("concept", concept, [True])):
+        for storage in ("float32", "bfloat16"):
+            loaded = Pretrained.load(str(directory), dtype="float32", param_dtype=storage,
+                                     attention_impl="xla")
+            blocked = np.all(np.asarray(loaded.finish(loaded.variables, images)) == -1, axis=(1, 2, 3))
+            np.testing.assert_array_equal(blocked, expected, err_msg=f"the {name} checker at {storage}")

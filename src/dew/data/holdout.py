@@ -177,13 +177,17 @@ def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
 
 
 def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None = None,
-            records: int | None = None, split: str | None = None, **named: float) -> tuple[Pipeline, ...]:
+            records: int | None = None, split: str | tuple[str, ...] | None = None,
+            **named: float) -> tuple[Pipeline, ...]:
     """`Dataset.holdout`."""
     if sum(form is not None for form in (fraction, records, split)) + bool(named) != 1:
         raise ValueError("holdout takes one of a fraction, records=, split= or named fractions")
     if split is not None:
-        held = _rebased(dataset, lambda source: _named_split(source, split))
-        return _rebased(dataset, lambda source: source), held
+        names = (split,) if isinstance(split, str) else split
+        if not names or len(set(names)) != len(names):
+            raise ValueError(f"holdout split= names one or more distinct splits, not {split!r}")
+        held = (_rebased(dataset, functools.partial(_named_split, name=name)) for name in names)
+        return _rebased(dataset, lambda source: source), *held
     if records is not None:
         if records < 1:
             raise ValueError(f"holdout records= is at least 1, not {records}")

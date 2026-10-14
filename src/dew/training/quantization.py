@@ -650,7 +650,7 @@ def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
 
 def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) -> InputQuantization:
     """The record of the frozen `sites` whose products run faster in FP8 on
-    this process's GPU, measured at `tokens` rows a step.
+    the pool's GPUs, measured at `tokens` rows a step.
 
     Each distinct `[in, out]` kernel shape among `sites` (scopes in the
     stored tree, `/`-joined) is timed both ways, forward and input
@@ -661,42 +661,74 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
     the sites and the generation, so a run reproduces the choice; a GPU
     without FP8 tensor cores is refused by name.
+
+    Process 0 measures and every process takes its record, as kernel picks
+    are settled (`dew.nn.kernels.tuning`): the sites decide which kernels a
+    rank's train state holds packed, so ranks timing their own would build
+    different states. A process beside other work on its GPU measures
+    unfairly (`dew.cache.measures_picks`) and is refused, where a recorded
+    `InputQuantization` reproduces the choice instead. Every rank looks the
+    sites up in its own tree first, and the pool agrees on what they found,
+    so a rank whose tree lacks one is refused with its peers rather than
+    leaving them at the measurement's agreement.
     """
+    from dew import cache, coordination
+    from dew.nn.kernels.generation import device_generation, gpu_target
+
+    def planned() -> dict:
+        return {"tokens": tokens,
+                "shapes": {site: list(np.shape(_site_kernel(variables["params"], site))) for site in sites}}
+
+    plan = coordination.agreed_same("frozen FP8 sites to measure", planned)
+    shapes = {site: tuple(shape) for site, shape in plan["shapes"].items()}
+
+    def decided() -> dict | None:
+        if jax.process_index() != 0:
+            return None
+        generation = device_generation()
+        if gpu_target(generation).fp8_peak is None:
+            raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
+        if not cache.measures_picks():
+            raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
+                             "one shares its GPU (AUTOTUNE_CACHE_MODE_READ, as gpu-run -n 0.5 sets): "
+                             "measure on a whole GPU, or pass the InputQuantization a run recorded")
+        faster = {shape: _fp8_faster(shape, tokens) for shape in sorted(set(shapes.values()))}
+        return {"sites": [site for site in sites if faster[shapes[site]]], "generation": generation}
+
+    record = coordination.broadcast_from_process_zero(
+        coordination.agreed("measuring frozen FP8 sites", decided))
+    return InputQuantization(frozen_fp8=tuple(record["sites"]), measured_on=record["generation"])
+
+
+def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
+    """Whether a frozen `[in, out]` kernel's forward and input gradient at
+    `tokens` rows run faster as FP8 products than as bf16 ones on this GPU."""
     import statistics
 
-    from dew.nn.kernels.generation import device_generation, gpu_target
     from dew.nn.kernels.tuning import samples
 
-    generation = device_generation()
-    if gpu_target(generation).fp8_peak is None:
-        raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
-    shapes = {site: tuple(np.shape(_site_kernel(variables["params"], site))) for site in sites}
-    faster: dict[tuple[int, ...], bool] = {}
-    for shape in sorted(set(shapes.values())):
-        inputs, outputs = shape
-        keys = jax.random.split(jax.random.key(0), 3)
-        x = jax.random.normal(keys[0], (tokens, inputs), jnp.bfloat16)
-        cotangent = jax.random.normal(keys[1], (tokens, outputs), jnp.bfloat16)
-        kernel = jax.random.normal(keys[2], shape, jnp.float32) * 0.02
-        leaves = jax.device_put(frozen_fp8_leaves(kernel))
+    inputs, outputs = shape
+    keys = jax.random.split(jax.random.key(0), 3)
+    x = jax.random.normal(keys[0], (tokens, inputs), jnp.bfloat16)
+    cotangent = jax.random.normal(keys[1], (tokens, outputs), jnp.bfloat16)
+    kernel = jax.random.normal(keys[2], shape, jnp.float32) * 0.02
+    leaves = jax.device_put(frozen_fp8_leaves(kernel))
 
-        def bf16(x, kernel, cotangent):
-            def product(left, contracted):
-                return jax.lax.dot_general(left, kernel, (((1,), (contracted,)), ((), ())),
-                                           preferred_element_type=jnp.float32).astype(x.dtype)
-            return product(x, 0), product(cotangent, 1)
+    def bf16(x, kernel, cotangent):
+        def product(left, contracted):
+            return jax.lax.dot_general(left, kernel, (((1,), (contracted,)), ((), ())),
+                                       preferred_element_type=jnp.float32).astype(x.dtype)
+        return product(x, 0), product(cotangent, 1)
 
-        def fp8(x, cotangent, leaves):
-            forward, forward_scale, dgrad, dgrad_scale = (leaves[leaf] for leaf in FROZEN_FP8)
-            return (_fp8_rows(x, forward, forward_scale).astype(x.dtype),
-                    _fp8_rows(cotangent, dgrad, dgrad_scale).astype(x.dtype))
+    def fp8(x, cotangent, leaves):
+        forward, forward_scale, dgrad, dgrad_scale = (leaves[leaf] for leaf in FROZEN_FP8)
+        return (_fp8_rows(x, forward, forward_scale).astype(x.dtype),
+                _fp8_rows(cotangent, dgrad, dgrad_scale).astype(x.dtype))
 
-        timings = [statistics.median(samples(jax.jit(fn), *args, repeats=30))
-                   for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
-                                    (fp8, (x, cotangent, leaves)))]
-        faster[shape] = timings[1] < timings[0]
-    return InputQuantization(frozen_fp8=tuple(site for site in sites if faster[shapes[site]]),
-                             measured_on=generation)
+    timings = [statistics.median(samples(jax.jit(fn), *args, repeats=30))
+               for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
+                                (fp8, (x, cotangent, leaves)))]
+    return timings[1] < timings[0]
 
 
 def _trailing_contraction(module: nn.Module, ndim: int) -> bool:
