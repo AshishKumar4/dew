@@ -654,7 +654,8 @@ def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
     scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
     codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
-    return codes.reshape(padded.shape)[:height, :width], scale_inv
+    # A contiguous copy: the slice off the padding is a view a writer taking the buffer misreads.
+    return xp.ascontiguousarray(codes.reshape(padded.shape)[:height, :width]), scale_inv
 
 
 def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
