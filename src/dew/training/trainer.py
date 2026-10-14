@@ -798,8 +798,8 @@ class Trainer(Generic[Loss, Effects]):
         Each shape fits on its own. A run bucketed by length meets a long
         bucket that climbs, and when that rung stayed, every later, shorter
         bucket compiled at it too, though it fitted with less recomputation
-        (c50's real mix: six shapes at 'minimal' that fitted with none, 15%
-        slower a token). So each new shape starts where the first compile
+        (in one real mix, six shapes ran at 'minimal' that fitted with none,
+        15% slower a token). So each new shape starts where the first compile
         found the objective, its configured remat and head or the rung its
         checkpoint trained on, and climbs only as far as it must. A shape the
         checkpoint names climbs to that shape's own rung, so a resumed run
