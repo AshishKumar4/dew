@@ -732,10 +732,11 @@ def _base_kernel(variables: Variables, path: Path, *, decoded: bool = True):
     """The kernel of the module at `path` (under `params`): its own, or a
     frozen FP8 site's from its packed codes (`frozen_fp8_kernel`), whose
     shape alone is read where `decoded` is False."""
-    node = _node(variables, path)
-    if "kernel" in node:
-        return node["kernel"]
-    leaves = _node(variables[QUANTIZATION], path[1:])
+    leaves = variables.get(QUANTIZATION, {})
+    for name in path[1:]:
+        leaves = leaves.get(name, {})
+    if FROZEN_FP8[0] not in leaves:
+        return _node(variables, path)["kernel"]
     if not decoded:
         return jax.ShapeDtypeStruct(np.shape(leaves[FROZEN_FP8[0]])[::-1], jnp.float32)
     return jnp.asarray(frozen_fp8_kernel(leaves))
