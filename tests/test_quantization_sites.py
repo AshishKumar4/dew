@@ -132,7 +132,7 @@ def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     from dew.inference.serving import Server
 
     directory, loaded, _ = case
-    server = Server.from_task(dew.pipeline(str(directory), dtype=jnp.float32), slots=1, capacity=64)
+    server = Server.from_task(dew.pipeline(str(directory), dtype=jnp.float32), slots=2, capacity=64)
     served = jax.tree.map(np.asarray, server.variables)
     server.reload(loaded.variables)
     for again, before in zip(jax.tree.leaves(server.variables), jax.tree.leaves(served), strict=True):
