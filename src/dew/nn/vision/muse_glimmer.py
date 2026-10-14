@@ -14,7 +14,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -125,7 +125,6 @@ _TENSORS = {
     "ln_pre.weight": ("pre_norm", "scale"), "ln_pre.bias": ("pre_norm", "bias"),
     "ln_post.weight": ("post_norm", "scale"), "ln_post.bias": ("post_norm", "bias"),
 }
-_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
 _BLOCK_MAPS = {("attn", "q_proj"): ("self_attn", "q_proj"), ("attn", "k_proj"): ("self_attn", "k_proj"),
                ("attn", "v_proj"): ("self_attn", "v_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "fc1"): ("mlp", "up_proj"), ("mlp", "fc2"): ("mlp", "down_proj")}
@@ -134,14 +133,7 @@ _BLOCK_MAPS = {("attn", "q_proj"): ("self_attn", "q_proj"), ("attn", "k_proj"): 
 def muse_glimmer_vision_path(hf_name: str) -> tuple[str, ...]:
     """One Muse Glimmer trunk tensor name, its `vision_tower.` prefix off, into its path in the trunk
     tree; anything else raises ValueError."""
-    path = _TENSORS.get(hf_name)
-    parts = hf_name.split(".")
-    if path is None and len(parts) > 3 and parts[0] == "layers" and parts[1].isdigit():
-        block, leaf = f"blocks_{parts[1]}", parts[-1]
-        if len(parts) == 4 and parts[2] in _BLOCK_NORMS and leaf in ("weight", "bias"):
-            path = (block, _BLOCK_NORMS[parts[2]], "scale" if leaf == "weight" else "bias")
-        elif len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS and leaf in ("weight", "bias"):
-            path = (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
+    path = _TENSORS.get(hf_name) or block_tensor_path(hf_name.split("."), _BLOCK_MAPS, prefix="layers")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

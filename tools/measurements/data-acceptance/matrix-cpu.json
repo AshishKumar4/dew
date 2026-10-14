@@ -1,0 +1,1770 @@
+{
+  "schema": 1,
+  "commit": "5e4698ff52b5349c81c0d0cfb81efa89b29a8707",
+  "inputs": {
+    "image": {
+      "path": "matrix-work/image/images.array_record",
+      "bytes": 983040,
+      "sha256": "6f7e125353b7677951f22da3ef9df1a6d702a0ac111e77e4ffd57320f8eed6a7",
+      "rows": 4096,
+      "source": "matrix-work/image"
+    },
+    "text": {
+      "path": "matrix-work/text/train.bin",
+      "bytes": 2044542,
+      "sha256": "7f6c7f1e9e5bd27c6b620e9d25f2a7990468df341b29ea74195272054b0bbf3a",
+      "rows": 18000,
+      "tokens": 1022271,
+      "source": "matrix-work/text"
+    }
+  },
+  "rows": [
+    {
+      "engine": "dew",
+      "workload": "image",
+      "config": {
+        "engine": "dew",
+        "workload": "image",
+        "source": "/home/ci/work/dew/dew/matrix-work/image",
+        "output": "/home/ci/work/dew/dew/matrix-work/0-image-dew.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "records": 4096,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "1a26188a2f3fa37086fecfc8441fdb78bcf0e4ebf2f6fdff9584090d1b50ce55",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.5414696779999986,
+      "loader": {
+        "first_batch_seconds": 6.066276278000004,
+        "batches": 128,
+        "batches_per_second": 67.56601045350276,
+        "records_per_second": 2162.112334512088,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 9.00693999999902,
+        "latency_p95_ms": 57.941286000001924
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 6.607745956000002,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 1.5626783749991269,
+        "step_ms": 8.335670375000603,
+        "dispatch_ms": 1.7868992500003067,
+        "records_per_second": 3232.8624509215106,
+        "tokens_per_second": 0.0,
+        "padding_fraction": null,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['image']",
+                [
+                  32,
+                  128,
+                  128,
+                  3
+                ],
+                "uint8"
+              ]
+            ],
+            "seconds": 0.47366581200000013,
+            "flops": 1152.0
+          }
+        ],
+        "losses": [
+          0.3950676918029785,
+          0.39427509903907776,
+          0.393722265958786,
+          0.3936479091644287,
+          0.39369285106658936,
+          0.39242446422576904,
+          0.3924696445465088,
+          0.39263391494750977,
+          0.39208269119262695,
+          0.39212748408317566,
+          0.3916958272457123,
+          0.39185941219329834,
+          0.3913090229034424,
+          0.3909967839717865,
+          0.39104118943214417,
+          0.3901351988315582
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": null,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "stats.py",
+          "line": 320,
+          "function": "wrapper",
+          "self_seconds": 0.00031227,
+          "cumulative_seconds": 5.410847397,
+          "calls": 52
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.000353744,
+          "cumulative_seconds": 5.410270335000001,
+          "calls": 362
+        },
+        {
+          "file": "dataset.py",
+          "line": 831,
+          "function": "__next__",
+          "self_seconds": 0.000106081,
+          "cumulative_seconds": 5.4102267170000005,
+          "calls": 20
+        },
+        {
+          "file": "dataset.py",
+          "line": 1061,
+          "function": "__next__",
+          "self_seconds": 0.00011198800000000001,
+          "cumulative_seconds": 5.408742956,
+          "calls": 17
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.000183172,
+          "cumulative_seconds": 5.403724560000001,
+          "calls": 36
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00021568200000000003,
+          "cumulative_seconds": 5.403351517,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.000502643,
+          "cumulative_seconds": 5.374991399000001,
+          "calls": 16
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.000373812,
+          "cumulative_seconds": 5.37373229,
+          "calls": 26
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.0031168750000000003,
+          "cumulative_seconds": 5.3732868090000006,
+          "calls": 42
+        },
+        {
+          "file": "connection.py",
+          "line": 439,
+          "function": "_poll",
+          "self_seconds": 0.007603960000000001,
+          "cumulative_seconds": 5.37088123,
+          "calls": 42
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.005955915,
+          "cumulative_seconds": 4.867173323,
+          "calls": 260
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.009628571,
+          "cumulative_seconds": 0.276060113,
+          "calls": 243
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.007985825,
+          "cumulative_seconds": 0.154956334,
+          "calls": 4350
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.012736818,
+          "cumulative_seconds": 0.14361859700000001,
+          "calls": 242
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.008461083000000001,
+          "cumulative_seconds": 0.11267286800000001,
+          "calls": 2175
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.004212454,
+          "cumulative_seconds": 0.100068793,
+          "calls": 2175
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.001124222,
+          "cumulative_seconds": 0.08369061900000001,
+          "calls": 1209
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.005425774,
+          "cumulative_seconds": 0.0814922,
+          "calls": 1209
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.0025252340000000003,
+          "cumulative_seconds": 0.079655532,
+          "calls": 6767
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.077026358,
+          "cumulative_seconds": 0.077130668,
+          "calls": 6769
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 652382208,
+      "worker_rss_peak_bytes": 1150861312,
+      "cold": false
+    },
+    {
+      "engine": "grain",
+      "workload": "image",
+      "config": {
+        "engine": "grain",
+        "workload": "image",
+        "source": "/home/ci/work/dew/dew/matrix-work/image",
+        "output": "/home/ci/work/dew/dew/matrix-work/1-image-grain.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "native Grain transforms"
+      },
+      "cold_open_seconds": 0.03532821800000363,
+      "loader": {
+        "first_batch_seconds": 5.524901951000004,
+        "batches": 128,
+        "batches_per_second": 75.56095899581932,
+        "records_per_second": 2417.9506878662182,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 1.703050000003259,
+        "latency_p95_ms": 67.49497599999188
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.5602301690000075,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 1.3797211874990722,
+        "step_ms": 5.64811900000084,
+        "dispatch_ms": 0.5730699374986159,
+        "records_per_second": 4553.319248339894,
+        "tokens_per_second": 0.0,
+        "padding_fraction": null,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['image']",
+                [
+                  32,
+                  128,
+                  128,
+                  3
+                ],
+                "uint8"
+              ]
+            ],
+            "seconds": 0.4269004350000074,
+            "flops": 1152.0
+          }
+        ],
+        "losses": [
+          0.3950676918029785,
+          0.39427509903907776,
+          0.393722265958786,
+          0.3936479091644287,
+          0.39369285106658936,
+          0.39242446422576904,
+          0.3924696445465088,
+          0.39263391494750977,
+          0.39208269119262695,
+          0.39212748408317566,
+          0.3916958272457123,
+          0.39185941219329834,
+          0.3913090229034424,
+          0.3909967839717865,
+          0.39104118943214417,
+          0.3901351988315582
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": null,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.00026915,
+          "cumulative_seconds": 10.161769123000001,
+          "calls": 311
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.000161043,
+          "cumulative_seconds": 10.151416146,
+          "calls": 36
+        },
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.00241704,
+          "cumulative_seconds": 9.77394421,
+          "calls": 233
+        },
+        {
+          "file": "stats.py",
+          "line": 320,
+          "function": "wrapper",
+          "self_seconds": 0.0005155040000000001,
+          "cumulative_seconds": 5.113681975,
+          "calls": 54
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.000226208,
+          "cumulative_seconds": 5.1053126440000005,
+          "calls": 36
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.007957230000000001,
+          "cumulative_seconds": 0.24329449200000003,
+          "calls": 228
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.005847312,
+          "cumulative_seconds": 0.13192873600000002,
+          "calls": 4111
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.010377654,
+          "cumulative_seconds": 0.129615817,
+          "calls": 228
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.007195725,
+          "cumulative_seconds": 0.095282288,
+          "calls": 2055
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.003548425,
+          "cumulative_seconds": 0.08723319800000001,
+          "calls": 2056
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.002243826,
+          "cumulative_seconds": 0.070465146,
+          "calls": 6396
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.0005784750000000001,
+          "cumulative_seconds": 0.070037008,
+          "calls": 18
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.00038064500000000004,
+          "cumulative_seconds": 0.067190356,
+          "calls": 27
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.06706954000000001,
+          "cumulative_seconds": 0.06707658000000001,
+          "calls": 6398
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.000761837,
+          "cumulative_seconds": 0.06611091100000001,
+          "calls": 1142
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.005497337000000001,
+          "cumulative_seconds": 0.06534907400000001,
+          "calls": 1142
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.0016356690000000002,
+          "cumulative_seconds": 0.065269326,
+          "calls": 39
+        },
+        {
+          "file": "__init__.py",
+          "line": 363,
+          "function": "_get_ident",
+          "self_seconds": 0.001348005,
+          "cumulative_seconds": 0.055961834,
+          "calls": 1142
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.055656968,
+          "cumulative_seconds": 0.05578352600000001,
+          "calls": 4565
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1672,
+          "function": "_parse_stat_file",
+          "self_seconds": 0.005572184,
+          "cumulative_seconds": 0.045065675,
+          "calls": 1142
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 658018304,
+      "worker_rss_peak_bytes": 1153331200,
+      "cold": false
+    },
+    {
+      "engine": "dew",
+      "workload": "text",
+      "config": {
+        "engine": "dew",
+        "workload": "text",
+        "source": "/home/ci/work/dew/dew/matrix-work/text",
+        "output": "/home/ci/work/dew/dew/matrix-work/2-text-dew.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "records": 8851,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "afde8e535c7b0233a9ab992a5d01b4ee0796b5cf5e3c0e1eb2907f9c5634d350",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.46016036200001054,
+      "loader": {
+        "first_batch_seconds": 4.995270043000005,
+        "batches": 128,
+        "batches_per_second": 274.43418200202507,
+        "records_per_second": 8781.893824064802,
+        "tokens_per_second": 997521.0832023295,
+        "latency_p50_ms": 0.8911999999980935,
+        "latency_p95_ms": 10.798248999989823
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.4554304050000155,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 0.807063124999452,
+        "step_ms": 25.707834624999926,
+        "dispatch_ms": 3.882611062501873,
+        "records_per_second": 1206.8686932802052,
+        "tokens_per_second": 135207.008294048,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 2.1085515740000034,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034355640411377,
+          6.016714572906494,
+          6.019128799438477,
+          5.9994215965271,
+          5.9799580574035645,
+          5.996591567993164,
+          5.978468894958496,
+          5.953999042510986,
+          5.964770793914795,
+          5.945408344268799,
+          5.963889122009277,
+          5.950737476348877,
+          5.9288434982299805,
+          5.899747371673584,
+          5.89005184173584,
+          5.922088146209717
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": null,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.0005044380000000001,
+          "cumulative_seconds": 10.321020997000002,
+          "calls": 365
+        },
+        {
+          "file": "dataset.py",
+          "line": 1061,
+          "function": "__next__",
+          "self_seconds": 8.0251e-05,
+          "cumulative_seconds": 10.304204428,
+          "calls": 18
+        },
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.0034767820000000003,
+          "cumulative_seconds": 9.912325571,
+          "calls": 238
+        },
+        {
+          "file": "stats.py",
+          "line": 320,
+          "function": "wrapper",
+          "self_seconds": 0.000605666,
+          "cumulative_seconds": 5.20663997,
+          "calls": 55
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.000162558,
+          "cumulative_seconds": 5.177903781,
+          "calls": 36
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00033168,
+          "cumulative_seconds": 5.176686311,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 0.00013311,
+          "cumulative_seconds": 4.677835501000001,
+          "calls": 20
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.010559057,
+          "cumulative_seconds": 0.326997769,
+          "calls": 233
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.019117115,
+          "cumulative_seconds": 0.17712798700000001,
+          "calls": 233
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.008261858,
+          "cumulative_seconds": 0.17648812600000002,
+          "calls": 4201
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.009682864000000001,
+          "cumulative_seconds": 0.125405503,
+          "calls": 2100
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.005587971000000001,
+          "cumulative_seconds": 0.11848816000000001,
+          "calls": 2101
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.0032909650000000003,
+          "cumulative_seconds": 0.09926715900000001,
+          "calls": 6535
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.09514823400000001,
+          "cumulative_seconds": 0.095044474,
+          "calls": 6537
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.005751518000000001,
+          "cumulative_seconds": 0.094296293,
+          "calls": 1167
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.007502598,
+          "cumulative_seconds": 0.08854432500000001,
+          "calls": 1167
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.000498529,
+          "cumulative_seconds": 0.08828780400000001,
+          "calls": 19
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.000240193,
+          "cumulative_seconds": 0.07761348500000001,
+          "calls": 19
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.0017047910000000002,
+          "cumulative_seconds": 0.076671664,
+          "calls": 35
+        },
+        {
+          "file": "__init__.py",
+          "line": 363,
+          "function": "_get_ident",
+          "self_seconds": 0.0019442900000000002,
+          "cumulative_seconds": 0.075180284,
+          "calls": 1167
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 811687936,
+      "worker_rss_peak_bytes": 982437888,
+      "cold": false
+    },
+    {
+      "engine": "grain",
+      "workload": "text",
+      "config": {
+        "engine": "grain",
+        "workload": "text",
+        "source": "/home/ci/work/dew/dew/matrix-work/text",
+        "output": "/home/ci/work/dew/dew/matrix-work/3-text-grain.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "planned first-fit windows read from token store"
+      },
+      "cold_open_seconds": 0.057937635999991244,
+      "loader": {
+        "first_batch_seconds": 5.248684706999995,
+        "batches": 128,
+        "batches_per_second": 281.4174848328648,
+        "records_per_second": 9005.359514651673,
+        "tokens_per_second": 1022904.1887372578,
+        "latency_p50_ms": 1.3608299999816609,
+        "latency_p95_ms": 11.130259999987402
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.306622342999987,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 0.7353898125010971,
+        "step_ms": 28.500004062498974,
+        "dispatch_ms": 4.873593562500389,
+        "records_per_second": 1094.5636695308563,
+        "tokens_per_second": 122625.33610212876,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 1.9136772559999997,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034355640411377,
+          6.016714572906494,
+          6.019128799438477,
+          5.9994215965271,
+          5.9799580574035645,
+          5.996591567993164,
+          5.978468894958496,
+          5.953999042510986,
+          5.964770793914795,
+          5.945408344268799,
+          5.963889122009277,
+          5.950737476348877,
+          5.9288434982299805,
+          5.899747371673584,
+          5.89005184173584,
+          5.922088146209717
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": null,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.002487174,
+          "cumulative_seconds": 9.697438975,
+          "calls": 233
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.00041534000000000005,
+          "cumulative_seconds": 5.107691027,
+          "calls": 341
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.009493167,
+          "cumulative_seconds": 5.106479975,
+          "calls": 245
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 4.576268628,
+          "cumulative_seconds": 5.106320195,
+          "calls": 1115
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.000131433,
+          "cumulative_seconds": 5.092674999000001,
+          "calls": 38
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00034234900000000004,
+          "cumulative_seconds": 5.088830720000001,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 0.00011600300000000001,
+          "cumulative_seconds": 4.649994045000001,
+          "calls": 19
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.009801800000000001,
+          "cumulative_seconds": 0.30732017100000003,
+          "calls": 228
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.007685994000000001,
+          "cumulative_seconds": 0.20334664200000002,
+          "calls": 4111
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.013820697000000002,
+          "cumulative_seconds": 0.16401636900000002,
+          "calls": 228
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.009775033,
+          "cumulative_seconds": 0.142605012,
+          "calls": 2055
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.0043216290000000004,
+          "cumulative_seconds": 0.124848521,
+          "calls": 2056
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.0026722770000000002,
+          "cumulative_seconds": 0.10650702000000001,
+          "calls": 6389
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.088336444,
+          "cumulative_seconds": 0.08833012400000001,
+          "calls": 6391
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.001056566,
+          "cumulative_seconds": 0.083782701,
+          "calls": 1142
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.006722279,
+          "cumulative_seconds": 0.08166572500000001,
+          "calls": 1142
+        },
+        {
+          "file": "__init__.py",
+          "line": 1129,
+          "function": "memory_info",
+          "self_seconds": 0.000991158,
+          "cumulative_seconds": 0.076560164,
+          "calls": 913
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1865,
+          "function": "memory_info",
+          "self_seconds": 0.028017981,
+          "cumulative_seconds": 0.072058362,
+          "calls": 913
+        },
+        {
+          "file": "__init__.py",
+          "line": 363,
+          "function": "_get_ident",
+          "self_seconds": 0.002039703,
+          "cumulative_seconds": 0.07001370800000001,
+          "calls": 1142
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.06505496200000001,
+          "cumulative_seconds": 0.065157852,
+          "calls": 4560
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 772222976,
+      "worker_rss_peak_bytes": 983343104,
+      "cold": false
+    },
+    {
+      "engine": "grain_prepacked",
+      "workload": "text",
+      "config": {
+        "engine": "grain_prepacked",
+        "workload": "text",
+        "source": "/home/ci/work/dew/dew/matrix-work/text",
+        "output": "/home/ci/work/dew/dew/matrix-work/4-text-grain_prepacked.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "prepacked in-memory native-Grain first-fit list"
+      },
+      "cold_open_seconds": 2.719576988,
+      "loader": {
+        "first_batch_seconds": 5.339039710999998,
+        "batches": 128,
+        "batches_per_second": 580.4964784113066,
+        "records_per_second": 18575.88730916181,
+        "tokens_per_second": 2110004.9261928727,
+        "latency_p50_ms": 0.6017799999824547,
+        "latency_p95_ms": 2.6544400000148016
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 8.058616698999998,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 1.78524987499884,
+        "step_ms": 40.43737012500159,
+        "dispatch_ms": 5.688659125000939,
+        "records_per_second": 757.8875967431597,
+        "tokens_per_second": 84907.09482263212,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 2.1788112410000053,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034355640411377,
+          6.016714572906494,
+          6.019128799438477,
+          5.9994215965271,
+          5.9799580574035645,
+          5.996591567993164,
+          5.978468894958496,
+          5.953999042510986,
+          5.964770793914795,
+          5.945408344268799,
+          5.963889122009277,
+          5.950737476348877,
+          5.9288434982299805,
+          5.899747371673584,
+          5.89005184173584,
+          5.922088146209717
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": null,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.000456488,
+          "cumulative_seconds": 5.9854763150000005,
+          "calls": 345
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.009400692,
+          "cumulative_seconds": 5.981465034,
+          "calls": 256
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 4.648835265000001,
+          "cumulative_seconds": 5.981388424,
+          "calls": 1139
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.00012028000000000001,
+          "cumulative_seconds": 5.980857954,
+          "calls": 38
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.00034685,
+          "cumulative_seconds": 5.975315714000001,
+          "calls": 18
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.000224558,
+          "cumulative_seconds": 5.969465114,
+          "calls": 36
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.000263012,
+          "cumulative_seconds": 5.965955404000001,
+          "calls": 19
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.003270358,
+          "cumulative_seconds": 5.964432374,
+          "calls": 29
+        },
+        {
+          "file": "connection.py",
+          "line": 439,
+          "function": "_poll",
+          "self_seconds": 0.0009610840000000001,
+          "cumulative_seconds": 5.957700256000001,
+          "calls": 29
+        },
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.005365692,
+          "cumulative_seconds": 5.466115867,
+          "calls": 240
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 8.4567e-05,
+          "cumulative_seconds": 4.727483887,
+          "calls": 19
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.009198254000000001,
+          "cumulative_seconds": 1.046867127,
+          "calls": 234
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.017996953,
+          "cumulative_seconds": 0.7708287260000001,
+          "calls": 4214
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.008199185000000001,
+          "cumulative_seconds": 0.687798698,
+          "calls": 2107
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.012042538,
+          "cumulative_seconds": 0.6240506490000001,
+          "calls": 2107
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.0010903660000000002,
+          "cumulative_seconds": 0.560533795,
+          "calls": 1171
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.006689609,
+          "cumulative_seconds": 0.555479269,
+          "calls": 1171
+        },
+        {
+          "file": "__init__.py",
+          "line": 363,
+          "function": "_get_ident",
+          "self_seconds": 0.0018368350000000002,
+          "cumulative_seconds": 0.54460534,
+          "calls": 1171
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1672,
+          "function": "_parse_stat_file",
+          "self_seconds": 0.006668566000000001,
+          "cumulative_seconds": 0.528718682,
+          "calls": 1171
+        },
+        {
+          "file": "_common.py",
+          "line": 728,
+          "function": "bcat",
+          "self_seconds": 0.012765952,
+          "cumulative_seconds": 0.5161976460000001,
+          "calls": 1171
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 871297024,
+      "worker_rss_peak_bytes": 1075032064,
+      "cold": false
+    },
+    {
+      "engine": "dew",
+      "workload": "image",
+      "config": {
+        "engine": "dew",
+        "workload": "image",
+        "source": "/home/ci/work/dew/dew/matrix-work/5-image-dew-cold.inputs",
+        "output": "/home/ci/work/dew/dew/matrix-work/5-image-dew-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "records": 4096,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "94fd9410f3f12cb1cfaff7b3dd84ef6be5457a4798a1b8c1414f51487ebd94d5",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.42373230399999784,
+      "loader": {
+        "first_batch_seconds": 5.222041618999981,
+        "batches": 4,
+        "batches_per_second": 0.7523178814244539,
+        "records_per_second": 24.074172205582524,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 90.64368500000342,
+        "latency_p95_ms": 5221.967879000004
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.645773922999979,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 505073664,
+      "worker_rss_peak_bytes": 1150517248,
+      "cold": true
+    },
+    {
+      "engine": "grain",
+      "workload": "image",
+      "config": {
+        "engine": "grain",
+        "workload": "image",
+        "source": "/home/ci/work/dew/dew/matrix-work/6-image-grain-cold.inputs",
+        "output": "/home/ci/work/dew/dew/matrix-work/6-image-grain-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "native Grain transforms"
+      },
+      "cold_open_seconds": 0.04078332699998555,
+      "loader": {
+        "first_batch_seconds": 5.479445483999996,
+        "batches": 4,
+        "batches_per_second": 0.7186227052288061,
+        "records_per_second": 22.995926567321796,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 76.20339499999318,
+        "latency_p95_ms": 5478.969172999996
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.520228810999981,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 505548800,
+      "worker_rss_peak_bytes": 1142202368,
+      "cold": true
+    },
+    {
+      "engine": "dew",
+      "workload": "text",
+      "config": {
+        "engine": "dew",
+        "workload": "text",
+        "source": "/home/ci/work/dew/dew/matrix-work/7-text-dew-cold.inputs",
+        "output": "/home/ci/work/dew/dew/matrix-work/7-text-dew-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "records": 8851,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "d4baba8ec2d2b54102143897db8f3f38987e541cf55c54085a761a1cc15c98b2",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.47669080200000735,
+      "loader": {
+        "first_batch_seconds": 4.936019135999999,
+        "batches": 4,
+        "batches_per_second": 0.7950238961425592,
+        "records_per_second": 25.440764676561894,
+        "tokens_per_second": 2834.6577016962947,
+        "latency_p50_ms": 90.89379399998165,
+        "latency_p95_ms": 4935.967836000003
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.412709938000006,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 492425216,
+      "worker_rss_peak_bytes": 982204416,
+      "cold": true
+    },
+    {
+      "engine": "grain",
+      "workload": "text",
+      "config": {
+        "engine": "grain",
+        "workload": "text",
+        "source": "/home/ci/work/dew/dew/matrix-work/8-text-grain-cold.inputs",
+        "output": "/home/ci/work/dew/dew/matrix-work/8-text-grain-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "planned first-fit windows read from token store"
+      },
+      "cold_open_seconds": 0.05356574699999328,
+      "loader": {
+        "first_batch_seconds": 5.303252444000009,
+        "batches": 4,
+        "batches_per_second": 0.750197177324903,
+        "records_per_second": 24.006309674396896,
+        "tokens_per_second": 2674.8280357519416,
+        "latency_p50_ms": 18.262027999981,
+        "latency_p95_ms": 5301.034044000005
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "cpu",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.18.54-cloudflare-microvm-2026.9.16-x86_64-with-glibc2.41",
+        "cpu": "",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.356818191000002,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 489156608,
+      "worker_rss_peak_bytes": 980635648,
+      "cold": true
+    }
+  ],
+  "comparisons": [
+    {
+      "workload": "image",
+      "metric": "records_per_second",
+      "dew_over_grain": 0.8941920715596143,
+      "rss_over_grain": 0.9955248923622417,
+      "first_batch_from_open_seconds": 6.607745956000002,
+      "cold_first_batch_from_open_seconds": 5.645773922999979,
+      "device_idle_fraction": 0.1578726325438038,
+      "checks": {
+        "within_5_percent_of_grain": false,
+        "rss_within_grain_plus_10_percent": true,
+        "warm_first_batch_under_10_seconds": true,
+        "device_idle_under_5_percent": false,
+        "cold_first_batch_under_30_seconds": true
+      }
+    },
+    {
+      "workload": "text",
+      "metric": "tokens_per_second",
+      "dew_over_grain": 0.9751852560441042,
+      "rss_over_grain": 1.0219642794647752,
+      "first_batch_from_open_seconds": 5.4554304050000155,
+      "cold_first_batch_from_open_seconds": 5.412709938000006,
+      "device_idle_fraction": 0.030438100595710234,
+      "checks": {
+        "within_5_percent_of_grain": true,
+        "rss_within_grain_plus_10_percent": true,
+        "warm_first_batch_under_10_seconds": true,
+        "device_idle_under_5_percent": true,
+        "cold_first_batch_under_30_seconds": true
+      }
+    }
+  ],
+  "config": {
+    "output": "/armada/task/artifacts/matrix-cpu.json",
+    "work": "matrix-work",
+    "seed": 17,
+    "steps": 128,
+    "warmup": 8,
+    "train_steps": 16,
+    "stage_batches": 16,
+    "workers": 2,
+    "batch": 32,
+    "tokens": 16384,
+    "seq_len": 128,
+    "image_size": 128,
+    "engines": [
+      "dew",
+      "grain"
+    ],
+    "workloads": [
+      "image",
+      "text"
+    ],
+    "cold": true
+  }
+}
