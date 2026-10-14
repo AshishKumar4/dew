@@ -1,6 +1,8 @@
 """Loader batches and RNG against frozen references, with real workers.
 
-Images pin the public-stage recipe; the other loaders pin 66beb5305.
+Images pin the public-stage recipe. Packed batches pin host Coordinates,
+with the token, segment and position values from 66beb5305 unchanged.
+The other loaders pin 66beb5305.
 """
 
 import gzip

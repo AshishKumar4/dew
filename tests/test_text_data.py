@@ -82,7 +82,8 @@ def _stream_dir(tmp_path, body, dtype=np.uint16):
 def _read(batches, count=None):
     """The rows of `batches`, the first `count` batches of an endless stream, which it closes."""
     try:
-        return [{key: value[row] for key, value in batch.items() if key != VALID_ROWS}
+        return [jax.tree.map(lambda value, row=row: value[row],
+                             {key: value for key, value in batch.items() if key != VALID_ROWS})
                 for batch in itertools.islice(batches, count) for row in range(len(batch["text"]))]
     finally:
         batches.close()
@@ -363,6 +364,12 @@ def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
 # Packed documents
 # ---------------------------------------------------------------------------------
 
+def _laid_rows(rows) -> list[tuple[tuple[int, ...], ...]]:
+    """Each row's tokens, and its documents and their positions as its coordinates lay them out."""
+    return [(tuple(row["text"].tolist()), tuple(row["text_coordinates"].segments.tolist()),
+             tuple(row["text_coordinates"].positions.tolist())) for row in rows]
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 @pytest.mark.parametrize("eos_id,ends,segments", [
     (0, [4, 7, 9], [1, 1, 1, 1, 2, 2, 2, 3, 3]),
@@ -382,7 +389,7 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(
                   batch=1, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, *[0] * 7]
-    assert window["text_segment_ids"].tolist() == [*segments, *[0] * 7]
+    assert window["text_coordinates"].segments.tolist() == [*segments, *[0] * 7]
 
 
 def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_order(tmp_path):
@@ -404,15 +411,11 @@ def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_ord
               for read in ("indexed", "memory")}
     assert all(data.plan.lowering == "global" for data in loaded.values())
     assert len({data.records for data in loaded.values()}) == 1
-    rows = {read: sorted(tuple(tuple(row[key].tolist()) for key in
-                              ("text", "text_segment_ids", "text_positions"))
-                         for row in _read(data.train(DataPartition()), data.steps_per_epoch))
+    rows = {read: sorted(_laid_rows(_read(data.train(DataPartition()), data.steps_per_epoch)))
             for read, data in loaded.items()}
     assert rows["indexed"] == rows["memory"]
     streamed = loader(recipe, batch=2, read="streamed", loading=loading)
-    assert rows["indexed"] == sorted(tuple(tuple(row[key].tolist()) for key in
-                                          ("text", "text_segment_ids", "text_positions"))
-                                    for row in _read(streamed.val(DataPartition())))
+    assert rows["indexed"] == sorted(_laid_rows(_read(streamed.val(DataPartition()))))
     assert not (directory / "train.documents.npy").exists()
 
 
@@ -476,7 +479,7 @@ def test_a_producer_document_index_allows_packing_without_an_eos_id(tmp_path):
                   loading=Loading(workers=0, threads=1, read_buffer=1))
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, 0, 0, 0]
-    assert window["text_segment_ids"].tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
+    assert window["text_coordinates"].segments.tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
@@ -491,19 +494,27 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     assert data.records == 2 and data.batch == 2 and data.steps_per_epoch == 1
     batch = next(data.val(DataPartition()))
 
-    for key in ("text", "text_segment_ids", "text_positions"):
-        assert batch[key].shape == (2, seq_len + 1)
-        assert batch[key].dtype == np.int32
+    laid = batch["text_coordinates"]
+    assert set(batch) == {"text", "text_coordinates"}
+    assert laid.max_segments == seq_len + 1 and laid.right_padded
+    assert all(isinstance(value, np.ndarray) for value in jax.tree.leaves(laid))
+    for value in (batch["text"], laid.segments, laid.positions):
+        assert value.shape == (2, seq_len + 1)
+        assert value.dtype == np.int32
     np.testing.assert_array_equal(batch["text"], [
         [10, 11, 12, 0, 30, 31, 32, 33, 0],
         [20, 21, 22, 23, 24, 0, 0, 0, 0]])
-    np.testing.assert_array_equal(batch["text_segment_ids"], [
+    np.testing.assert_array_equal(laid.segments, [
         [1, 1, 1, 1, 2, 2, 2, 2, 2],
         [1, 1, 1, 1, 1, 1, 0, 0, 0]])
     # Positions restart at 0 inside every document; RoPE reads them.
-    np.testing.assert_array_equal(batch["text_positions"], [
+    np.testing.assert_array_equal(laid.positions, [
         [0, 1, 2, 3, 0, 1, 2, 3, 4],
         [0, 1, 2, 3, 4, 5, 0, 0, 0]])
+    np.testing.assert_array_equal(laid.starts, [
+        [False, False, False, False, True, False, False, False, False],
+        [False, False, False, False, False, False, True, False, False]])
+    assert laid.starts.dtype == np.bool_
 
 
 def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
@@ -515,11 +526,32 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
         read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     rows = [batch["text"][0] for batch in data.val(DataPartition())]
-    positions = [batch["text_positions"][0] for batch in data.val(DataPartition())]
+    positions = [batch["text_coordinates"].positions[0] for batch in data.val(DataPartition())]
     assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
     np.testing.assert_array_equal(np.concatenate(rows)[:10],
                                   [*list(range(10, 19)), 0])
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
+
+
+def test_a_store_packs_its_documents_whole_unless_a_chunk_step_cuts_them(tmp_path):
+    """A store's planned pack places each document whole and refuses one longer than a
+    window; a chunk step before the pack cuts it into window-long pieces, which the plan
+    of the store's document lengths cuts alike, each piece a window of its own here."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.text import chunk
+
+    _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document; windows of 4
+    stored = TokenFiles(str(tmp_path))
+    loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
+    with pytest.raises(ValueError):
+        compile(Pipeline(stored).pack(4, bins=1).repeat().batch(1), read="indexed", provision=True,
+                loading=loading)
+    data = compile(Pipeline(stored).flat_map(chunk(4)).pack(4, bins=1).repeat().batch(1), read="indexed",
+                   provision=True, loading=loading)
+    assert data.plan.lowering == "global"
+    rows = [row["text"].tolist() for row in _read(data.train(DataPartition()), 3)]
+    assert rows == [[10, 11, 12, 13], [14, 15, 16, 17], [18, 0, 0, 0]]
 
 
 def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
@@ -598,9 +630,9 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
 
     padding = seq_len + 1 - len(val_tokens)
     np.testing.assert_array_equal(row["text"][0], val_tokens + [0] * padding)
-    np.testing.assert_array_equal(row["text_segment_ids"][0],
+    np.testing.assert_array_equal(row["text_coordinates"].segments[0],
                                   [1] * len(val_tokens) + [0] * padding)
-    np.testing.assert_array_equal(row["text_positions"][0, :len(val_tokens)],
+    np.testing.assert_array_equal(row["text_coordinates"].positions[0, :len(val_tokens)],
                                   np.arange(len(val_tokens)))
 
 
@@ -728,7 +760,9 @@ def test_memory_windows_and_packing_never_reread_the_store(stores, monkeypatch, 
     recipe = TextData(source=stored, pack=pack, seq_len=7, packing_bins=2)
     train, _, _ = recipe.pipelines()
     if pack is not None:
-        assert train.source is stored and len(train.stages) == 1
+        from dew.data.pipeline import FlatMap, Pack
+
+        assert train.source is stored and [type(stage) for stage in train.stages] == [FlatMap, Pack]
     data = loader(recipe,
                   batch=2, read="memory",
                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
@@ -761,8 +795,8 @@ def _counted_cross_entropy(batch, seq_len):
     objective = LMObjective(model, seq_len)
     params = objective.init(jax.random.key(0))
     tokens = jnp.asarray(batch["text"], jnp.int32)
-    segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
-    positions = jnp.asarray(batch["text_positions"], jnp.int32)
+    segment_ids = jnp.asarray(batch["text_coordinates"].segments, jnp.int32)
+    positions = jnp.asarray(batch["text_coordinates"].positions, jnp.int32)
 
     ce, _ = objective.scalar_loss(params, batch, Step(step=jnp.zeros((), jnp.int32),
                                                 key=jax.random.key(1), ema=None))
@@ -911,14 +945,14 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
         data = loader(recipe, batch=1, read="memory",
             loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
         rows = _read(data.val(DataPartition()))
-        return [{key: value.tolist() for key, value in row.items()} for row in rows]
+        return [jax.tree.map(lambda value: value.tolist(), row) for row in rows]
 
     windows = {name: validation(name, seq_len=4) for name in fields}
     packed = {name: validation(name, seq_len=5, pack="first-fit", packing_bins=2) for name in fields}
     assert [row["text"] for row in windows["bin"]] == [
         CORPUS[start:start + 5].tolist() for start in range(0, len(CORPUS) - 4, 4)]
     lengths = [count for row in packed["bin"]
-               for segment, count in Counter(row["text_segment_ids"]).items() if segment]
+               for segment, count in Counter(row["text_coordinates"].segments).items() if segment]
     assert sorted(lengths) == [2, 3, 3, 4, 6], "the documents are the eos spans"
     for name in fields:
         assert windows[name] == windows["bin"], name
@@ -1004,3 +1038,32 @@ def test_a_same_size_write_between_token_samples_changes_the_readers_identity(tm
             after.set_state(position)
     finally:
         after.close()
+
+
+def test_a_token_mixture_validates_on_the_corpora_that_hold_a_validation_split(tmp_path):
+    """Three token stores mixed by weight, one without a validation split: training mixes all
+    three and validation the two that hold one, each with its own weight, where the held mixture
+    once took the three weights for its two corpora and refused."""
+    stream = np.arange(1, 65, dtype=np.uint16)
+    stores = {name: str(write_token_corpus(tmp_path / name, stream, None if name == "c" else stream[:32]))
+              for name in ("a", "b", "c")}
+    weights = {stores["a"]: 1.0, stores["b"]: 2.0, stores["c"]: 3.0}
+    train, held, _ = TextData(source=weights, seq_len=7).pipelines()
+    assert train.source.weights == (1.0, 2.0, 3.0)
+    assert held is not None and held.source.weights == (1.0, 2.0)
+
+
+def test_a_one_split_token_export_refuses_a_validation_split_it_does_not_hold(tmp_path):
+    """A committed token export holds one split, so a validation split it lacks is refused by
+    the store's own split selection, where the recipe once validated on the training tokens."""
+    from dew.cli.main import main
+    from dew.data.holdout import Split
+
+    documents = tmp_path / "documents.jsonl"
+    documents.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
+    exported = tmp_path / "tokens"
+    fields = json.dumps({"source": str(documents)})
+    assert main(["data", "export", "records", str(exported), "--fields", fields, "--tokenizer", "byte",
+                 "--eos", "--format", "array_record"]) == 0
+    with pytest.raises(ValueError):
+        TextData(source=str(exported), seq_len=4, validation=Split("val")).pipelines()

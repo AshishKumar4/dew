@@ -47,7 +47,6 @@ from .few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
 from .objective import LOSS_HEADS, DiffusionObjective
 
 if TYPE_CHECKING:
-    from flax import linen as nn
 
     from dew.diffusion.presets import Preset
 
@@ -332,26 +331,28 @@ class DiffusionRunConfig(RunConfig):
         if self.lora is not None and variables is not None:
             raise ValueError("a --lora run's saved variables hold its factors, which "
                              "TextToImage.from_run binds through the run's own adapter record")
-        objective = self._objective(variables, None)
+        objective = self._objective(variables)
         if self.lora is None or self.pretrained is not None:
             return objective
         # The objective's own init draws the denoiser beside its heads and
         # towers; the adapter freezes the denoiser's weights, and the heads
-        # stay under `params` to train, beside their own `constants`.
+        # stay under `params` to train, beside their own `constants`. The
+        # adapted denoiser takes the drawn one's place (`substitute`), and the
+        # towers, the autoencoder and any frozen teacher stay as built.
         key = jax.random.key(self.trainer.key)
         drawn = objective.init(key)
         adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
                                   key=jax.random.fold_in(key, 1))
         heads = {collection: {name: tree for name, tree in drawn[collection].items() if name in LOSS_HEADS}
                  for collection in ("params", "constants") if collection in drawn}
-        return self._objective(merge({**drawn, **adapter.variables}, heads), adapter.model)
+        objective.substitute((adapter.model, *(entry.module for entry in objective.program_key()[1:])))
+        objective.variables = merge({**drawn, **adapter.variables}, heads)
+        return objective
 
-    def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
-        """The configured objective over `variables`, with `adapted` in place
-        of the model a run from scratch builds."""
+    def _objective(self, variables: Variables | None) -> DiffusionObjective:
+        """The configured objective over `variables`."""
         if self.pretrained is None:
-            base, conditions, autoencoder = self._scratch(variables)
-            model = base if adapted is None else adapted
+            model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
@@ -382,7 +383,7 @@ class DiffusionRunConfig(RunConfig):
         the batches it trains on (`FlowGRPOObjective.rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
 
-        run = dataclasses.replace(self.pinned(), trainer=self.trainer.derived())
+        run = self.pinned()
         objective = run.build()
         dataset = loader(run.data, batch=run.trainer.batch_size, tokens=run.trainer.batch_tokens,
                        read=run.data_read, provision=run.provision,

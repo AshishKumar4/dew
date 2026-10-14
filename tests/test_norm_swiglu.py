@@ -175,7 +175,7 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     # Repeated tokens hold the row arithmetic fixed while the column sum
-    # grows to E1's size, isolating partial-sum error from bf16 midpoint flips.
+    # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
     (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
             coefficient=scale_coefficient(x, dtype, after_cast=True))
