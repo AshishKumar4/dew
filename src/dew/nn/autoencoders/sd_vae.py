@@ -9,6 +9,9 @@ from .vae import load_pretrained_vae
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
 
+    record_name = 'sd_vae'
+    record_module = AutoencoderKL
+
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
                  dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
                  model: AutoencoderKL | None = None):
@@ -38,14 +41,10 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         self.latent_shift = 0.0 if latent_shift is None else latent_shift
         self.latent_scale = 0.18215 if latent_scale is None else latent_scale
 
-    def to_json(self) -> dict:
-        import numpy as np
-
-        from dew.registry import dtype_name, record_fields
-        return {'name': 'sd_vae', 'fields': {
-            'model': record_fields(self.model, AutoencoderKL), 'dtype': dtype_name(self.dtype),
-            'latent_shift': np.asarray(self.latent_shift).tolist(),
-            'latent_scale': np.asarray(self.latent_scale).tolist()}}
+    def record_arguments(self) -> dict:
+        from dew.registry import dtype_name
+        return {'dtype': dtype_name(self.dtype), 'latent_shift': self.latent_shift,
+                'latent_scale': self.latent_scale}
 
     def moments(self, params, images):
         """Return `AutoencoderKL.moments` of the frames, which `encode_batch` draws its latent from."""
