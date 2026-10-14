@@ -1,8 +1,8 @@
 """Train a byte decoder on Tiny Shakespeare, evaluate, and generate two samples."""
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.config.data import HoldOut, TextData, loader
-from dew.data import ByteTokenizer, Hub, Loading
+from dew.config.data import TextData
+from dew.data import ByteTokenizer, Loading, load
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
@@ -22,11 +22,9 @@ steps = args.steps
 tokens = args.tokens
 # End command line
 
-recipe = (TextData(source=tokens, seq_len=256) if tokens is not None else
-          TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=256,
-               eos=True, token_holdout=HoldOut(fraction=0.01)))
-data = loader(recipe, batch=64, read="memory", provision=tokens is None,
-            validation_records=256, loading=Loading(workers=0))
+data = (load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=256)
+        if tokens is None else TextData(source=tokens, seq_len=256).load(
+            batch=64, read="memory", validation_records=256, loading=Loading(workers=0)))
 model = CausalTransformer(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
                           mlp_features=1024, max_seq_len=256, dropout_rate=0.2)
 optimizer = OptimConfig(schedule=Cosine(peak=1e-3, warmup_steps=10, end=1e-4),

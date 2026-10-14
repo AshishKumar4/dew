@@ -287,9 +287,9 @@ class TextToImage:
         The repository holds the run directory as `HfApi().upload_folder`
         writes it. `revision` is the Hub revision to download; the other
         arguments are `from_run`'s."""
-        from dew.interop.hub import pull_from_hub
+        from huggingface_hub import snapshot_download
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
+        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
                             ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype, trust=trust)
 

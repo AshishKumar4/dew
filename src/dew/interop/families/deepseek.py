@@ -33,7 +33,7 @@ from dew.interop.decoder_parts import (
     dew_path,
     layer_depth_path,
     prediction_path,
-    read_rope_theta,
+    read_rope,
     record_float,
     record_int,
     refuse,
@@ -116,40 +116,6 @@ _MINIMAX_M2_NAMES = (
     ('mlp.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
     ('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj'),
 )
-
-
-def deepseek_rope(hf_config: Mapping[str, object], used: set
-                   ) -> tuple[float, Ramp | None]:
-    """Return (rope_theta, yarn record) from either rope spelling.
-
-    Both released DeepSeek configs spell it with `rope_scaling` of
-    `type: yarn`; transformers prefers `rope_scaling` when both are
-    present (convert_rope_params_to_dict), so this does too. Plain rope
-    reuses the shared reader; anything but plain or YaRN changes the
-    frequencies and refuses with the entry named.
-    """
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
-    scaling = hf_config.get('rope_scaling')
-    parameters = hf_config.get('rope_parameters')
-    entry = (scaling if isinstance(scaling, Mapping)
-             else parameters if isinstance(parameters, Mapping) else None)
-    theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
-    max_pos = records.integer(hf_config.get('max_position_embeddings',
-                                DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings')
-    if entry is None:
-        return theta, None
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    field = ('rope_scaling' if scaling is entry else 'rope_parameters')
-    if rope_type in ('default', 'none'):
-        plain = read_rope_theta(dict(entry, rope_theta=entry.get(
-            'rope_theta', theta)), field)
-        return plain or theta, None
-    if rope_type != 'yarn':
-        refuse(f"rope scaling (rope_type {rope_type!r})",
-                "the mixer applies plain or YaRN rotary positions")
-    entry_theta = float(entry.get('rope_theta', theta))
-    return entry_theta, yarn_record(
-        dict(entry, rope_theta=entry_theta), field, entry_theta, max_pos)
 
 
 def deepseek_mixture(hf_config: Mapping[str, object], layers: int,
@@ -292,8 +258,10 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    rope_theta, yarn = deepseek_rope(hf_config, used)
-    config = base_config(hf_config, used, rope=Ropes(rope_theta))
+    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        ramps=('yarn',), per_kind=False)
+    config = base_config(hf_config, used, rope=Ropes(ropes.theta))
     layer_types = records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
@@ -369,7 +337,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'qk_rope_head_dim': rope,
             'v_head_dim': records.integer(v_dim, 'v_head_dim'),
             'rope_interleave': bool(interleave),
-            'yarn': yarn,
+            'yarn': ropes.scaling,
             'index_topk': None if index is None else index['index_topk'],
             'index_n_heads': None if index is None else index['index_n_heads'],
             'index_head_dim': (None if index is None

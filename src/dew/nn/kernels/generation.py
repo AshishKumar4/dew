@@ -237,15 +237,16 @@ _logged: set[tuple[str, str, str]] = set()
 def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
     """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
     generation, `fastest` or else the one `KERNELS` names, turned it down for `refusal`. The first such
-    call in a process for each kernel and refusal is logged as a warning naming both, so a change that
-    sends calls off the measured kernel shows in a run's log, not only in its step time. A generation
-    without a measurement, or a call that runs the measured kernel, logs nothing."""
+    call in a process for each kernel and refusal is logged at INFO naming both, so a change that sends
+    calls off the measured kernel shows in a run's log, not only in its step time; it is the dispatch's
+    own choice, which a user has nothing to act on. A generation without a measurement, or a call that
+    runs the measured kernel, logs nothing."""
     generation = device_generation()
     measured = fastest or gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
-        _log.warning("%s runs %r, not %r, the kernel measured fastest on %s: %s",
-                     choice, kernel, measured, generation, refusal)
+        _log.info("%s runs %r, not %r, the kernel measured fastest on %s: %s",
+                  choice, kernel, measured, generation, refusal)
     return kernel
 
 

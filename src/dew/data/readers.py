@@ -13,14 +13,13 @@ import numpy as np
 
 from dew.data.dataset import (
     Batch,
-    Checkpointable,
     Closeable,
     DataPartition,
     FilledBatch,
     Forwarding,
     GlobalReader,
-    Position,
     Reader,
+    _CheckpointableMapping,
     rows_of,
     take_batch,
 )
@@ -30,42 +29,21 @@ from dew.data.plan import Plan
 from dew.records import record
 
 
-class _Host(Forwarding):
-    def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
-        self._source: Iterator[Batch] | None = source
-        self._steps = steps
+@dataclasses.dataclass(frozen=True)
+class _HostSteps:
+    steps: tuple[HostStep, ...]
 
-    def _forwarded(self) -> Iterator[Batch] | None:
-        return self._source
-
-    def __iter__(self) -> Iterator[Batch]:
-        return self
-
-    def __next__(self) -> Batch:
+    def __call__(self, value: Batch) -> Batch:
         from dew.data.lowering import _outputs
 
-        if self._source is None:
-            raise StopIteration
-        value = next(self._source)
-        for step in self._steps:
+        for step in self.steps:
             value = record(_outputs(Map(step), None, value)[0], "host map result")
         return value
 
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            self._source = None
 
-    def get_state(self) -> Position:
-        if not isinstance(self._source, Checkpointable):
-            raise TypeError("map_batch parent does not expose a checkpoint position")
-        return self._source.get_state()
-
-    def set_state(self, state: Position) -> None:
-        if not isinstance(self._source, Checkpointable):
-            raise TypeError("map_batch parent does not expose a checkpoint position")
-        self._source.set_state(state)
+class _Host(_CheckpointableMapping):
+    def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
+        super().__init__(source, _HostSteps(steps))
 
     @property
     def records(self) -> int:
