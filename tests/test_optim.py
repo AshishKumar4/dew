@@ -24,11 +24,19 @@ from dew.training import MeshSpec
 from dew.training.optim import (
     OPTIMIZER_MAP,
     Cosine,
+    Exponential,
+    Linear,
+    OneCycle,
     Optimizer,
     ParamGroup,
+    Power,
+    PowerTail,
     muon_weight_dimension_numbers,
     scale_by_qk_clip,
+    scaled,
+    weight_decay_mask,
 )
+from dew.training.trainer import learning_rate
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
@@ -647,7 +655,8 @@ def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
         update, state = solver.update(grads, state, params)
         for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
             np.testing.assert_allclose(have, want, rtol=rtol, atol=atol)
-    assert {leaf.dtype for leaf in jax.tree.leaves((state[0].mu, state[0].nu))} == {jnp.dtype(jnp.bfloat16)}
+    moments = state.inner_state[0]
+    assert {leaf.dtype for leaf in jax.tree.leaves((moments.mu, moments.nu))} == {jnp.dtype(jnp.bfloat16)}
 
 
 def test_bf16_state_keeps_the_second_moments_small_increments():
@@ -661,13 +670,14 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     expected = reference.init(params)
     expected = expected._replace(nu={'w': jnp.ones(8192, jnp.float32)})
     state = solver.init(params)
-    state = (state[0]._replace(nu={'w': jnp.ones(8192, jnp.bfloat16)}), *state[1:])
+    moments = state.inner_state[0]._replace(nu={'w': jnp.ones(8192, jnp.bfloat16)})
+    state = state._replace(inner_state=(moments, *state.inner_state[1:]))
     reference_update, solver_update = jax.jit(reference.update), jax.jit(solver.update)
     for _ in range(1000):
         _, expected = reference_update(grads, expected, params)
         _, state = solver_update(grads, state, params)
     want = float(expected.nu['w'][0])
-    have = float(jnp.mean(state[0].nu['w'].astype(jnp.float32)))
+    have = float(jnp.mean(state.inner_state[0].nu['w'].astype(jnp.float32)))
     assert want < 0.4
     assert have == pytest.approx(want, rel=1e-2)
 
@@ -676,23 +686,76 @@ def test_every_optimizer_the_config_names_is_built():
     assert set(OPTIMIZER_MAP) == set(typing.get_args(Optimizer))
 
 
-def test_lamb_is_optax_lamb_on_the_configs_schedule_options_and_clip():
-    """`optimizer='lamb'` runs optax.lamb itself (`OPTIMIZER_MAP`), so what
-    Dew adds is the wiring: the config's schedule, betas and
-    `optimizer_opts` reach it, behind the global-norm clip. Three steps on
-    changing gradients are bitwise the transform built from optax
-    directly."""
+@pytest.mark.parametrize("optimizer", ["adam", "adamw", "lamb", "muon", "muonclip"])
+@pytest.mark.parametrize("form", ["constant", "schedule", "groups"])
+def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
+    """Two runs at different rates of one schedule's shape, a group's
+    multiplier and its own schedule included, lower the same update: the
+    rate is an operand in the optimizer's state, not a constant in its
+    program. The updates still differ, by the rates."""
     params = decoder_params()["params"]
-    cosine = Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)
-    betas, opts = {"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}
-    solver = OptimConfig(optimizer="lamb", **betas, optimizer_opts=opts, schedule=cosine,
-                         clip_grads=0.5).build(10)
-    reference = optax.chain(optax.clip_by_global_norm(0.5), optax.lamb(cosine.schedule(10), **betas, **opts))
+    grads = fixed_gradients(params)
+
+    def config(rate):
+        schedule = (None if form == "constant"
+                    else Cosine(peak=rate, warmup_steps=2, end=rate / 10, init=rate / 4))
+        groups = () if form != "groups" else (
+            ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
+                       schedule=Linear(peak=rate * 2, warmup_steps=1, end=rate / 8)),
+            ParamGroup("rest", ("*",)))
+        return OptimConfig(optimizer=optimizer, learning_rate=rate, schedule=schedule, param_groups=groups)
+
+    programs, updates = [], []
+    for rate in (1e-3, 4e-3):
+        solver = config(rate).build(10)
+        state = solver.init(params)
+        programs.append(jax.jit(solver.update).lower(grads, state, params).as_text())
+        updates.append(solver.update(grads, state, params)[0])
+    assert programs[0] == programs[1]
+    assert any(not np.array_equal(left, right) for left, right in
+               zip(jax.tree.leaves(updates[0]), jax.tree.leaves(updates[1]), strict=True))
+
+
+@pytest.mark.parametrize(("optimizer", "schedule"), [
+    ("lamb", Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)),
+    ("adam", Linear(peak=3e-3, warmup_steps=2, decay_start=3, end=1e-4)),
+    ("adamw", Exponential(init=1e-2, end=1e-3, offset=1e-4)),
+    ("muon", Power(peak=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end=1e-3))),
+    ("muonclip", OneCycle(peak=1e-2)),
+    ("adamw", None),
+], ids=["lamb-cosine", "adam-linear", "adamw-exponential", "muon-power", "muonclip-one_cycle",
+        "adamw-constant"])
+def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimizer, schedule):
+    """`OptimConfig` runs the optax optimizer it names (`OPTIMIZER_MAP`)
+    behind the global-norm clip, its betas and `optimizer_opts` reaching
+    it, at a rate its state holds: the schedule's first rate as a scale, and
+    the schedule of the rates' ratios to it (`scaled_solver`). Six steps on
+    changing gradients, through the warmups, decays and tails, are optax's
+    own optimizer at that rate bit for bit, and the rate each step reports
+    is the float64 schedule's to float32 rounding: two ulps of it, or of the
+    peak where its terms cancel, as tests/test_optim_schedules.py holds the
+    schedules themselves."""
+    params = decoder_params()["params"]
+    adam = optimizer in ("adam", "adamw", "lamb")
+    betas, opts = ({"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}) if adam else ({}, {})
+    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts, learning_rate=3e-3,
+                         schedule=schedule, clip_grads=0.5)
+    solver = config.build(10)
+    scale, shape = scaled(config.rate)
+    ratio = (lambda count: 1.0) if shape is None else shape.schedule(10)
+    given = {**betas, **opts, **({"mask": weight_decay_mask} if adam else {})}
+    reference = optax.chain(optax.clip_by_global_norm(0.5), OPTIMIZER_MAP[optimizer](
+        lambda count: jnp.float32(scale) * ratio(count), **given))
     state, expected_state = solver.init(params), reference.init(params)
-    for step in range(3):
+    for step in range(6):
         grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
         updates, state = solver.update(grads, state, params)
         expected, expected_state = reference.update(grads, expected_state, params)
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
+        with jax.enable_x64(new_val=True):
+            # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
+            exact = scale if schedule is None else float(
+                schedule.schedule(10)(jnp.asarray(step, jnp.float64)))
+        assert abs(float(learning_rate(state)) - exact) <= 2.4e-7 * (abs(exact) + scale)
         params = optax.apply_updates(params, updates)

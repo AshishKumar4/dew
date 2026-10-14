@@ -152,17 +152,17 @@ A raw-text memory run can reserve a token-axis fraction with `token_holdout=Hold
 
 ## Token-budget batches
 
-Pipeline.batch(tokens=24576, lengths=(256, 512, 768, 1024, 1536, 3072)) chooses rows from a token budget rather than a row count. Its record-producing step must declare TokenGeometry; the compiler does not guess from field names. Empty lengths derives at most six divisors covering that geometry. A partition refuses lengths whose row batch cannot split across its mesh.
+`Pipeline.batch(tokens=24576)` takes as many rows as a token budget holds rather than a row count. Every row holds the same number of tokens, which a record step states by declaring `TokenGeometry` (`FixedTokens` for token windows, `PackedRows` for packed decision windows); the compiler does not guess from field names, and a budget that is not whole rows is refused.
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-DecisionRunConfig.bucket_lengths chooses the recipe's allowed lengths. The decision objective scores real token counts, not padding. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 
-`Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout, grouping and host batch steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
+`Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout and packing steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
 
-Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `group`, `batch`, `workers`, `prefetch` and `map_batch` to choose that order. A global shuffle requires an indexed pipeline, and a host batch step requires batching first.
+Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers`, `prefetch` and `map_batch` to choose that order. A global shuffle requires an indexed pipeline, and a host batch step requires batching first.
 
 ## Cache and storage publication
 
@@ -256,7 +256,7 @@ include each timing interval, the image-byte SHA-256 and the example outputs.
 
 ## Position and multiple processes
 
-The checkpoint stores the compiled plan with the iterator position: source snapshots, step identities, ordering, derived packing and grouping facts, cache generations and topology constraints. A resume rebuilds that plan and refuses changed data, tokenizer, order or transforms. A change only to the code that ran the steps (Dew's revision, the installed packages, the interpreter, the platform or the bytes of a step's module or of the factory that configured it) is a warning on a global resume and a refusal on a per-share one. A step states a change to what it computes in its configuration or its declared `identity`.
+The checkpoint stores the compiled plan with the iterator position: source snapshots, step identities, ordering, derived order and packing facts, cache generations and topology constraints. A resume rebuilds that plan and refuses changed data, tokenizer, order or transforms. A change only to the code that ran the steps (Dew's revision, the installed packages, the interpreter, the platform or the bytes of a step's module or of the factory that configured it) is a warning on a global resume and a refusal on a per-share one. A step states a change to what it computes in its configuration or its declared `identity`.
 
 | Lowering | Position | Resume topology |
 |---|---|---|
