@@ -193,7 +193,8 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     # measured count lands on the closed form exactly (956,301,312 vs
     # 956,301,312, largest observed difference 0 FLOPs in 956 million). The
     # step is partitioned over the eight devices, so the count is per device.
-    assert trainer.flops_per_step * jax.device_count() == pytest.approx(analytic, rel=0.05)
+    assert trainer.step_flops is not None
+    assert trainer.step_flops.hardware * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
 @pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
@@ -249,7 +250,8 @@ def test_fit_reports_throughput_to_the_tracker():
 
 class TickGatedTracker(RecordingTracker):
     """Marks each step's tick, so an input can start a batch's delay only
-    when the loop has finished the step before and is about to ask for it."""
+    when the loop is about to ask for it: the loop reads a step's log once
+    the next step is dispatched, just before it asks for the batch after."""
 
     def __init__(self, steps):
         super().__init__()
@@ -266,10 +268,11 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
     of a shape the loop has not met compiles inside its tick, which reports the
     compile as train/compile_s; the ticks that compiled nothing report none.
 
-    Each batch's 100 ms delay starts at the tick of the step before it, when
-    the loop is about to ask for it, so the loop waits nearly all of it however
-    long its own work between reads takes. A delay that ran beside the loop's
-    work would leave a wait of 100 ms less that work, which a loaded runner
+    Each batch's 100 ms delay starts at the tick of the step two before the
+    one it feeds, read as the step before is dispatched, when the loop is
+    about to ask for it, so the loop waits nearly all of it however long its
+    own work between reads takes. A delay that ran beside the loop's work
+    would leave a wait of 100 ms less that work, which a loaded runner
     stretched past 58 ms."""
     steps = 10
     tracker = TickGatedTracker(steps)
@@ -277,8 +280,8 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
     def slow():
         rng = np.random.default_rng(0)
         for index, rows in enumerate(itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH))):
-            if 0 < index <= steps:
-                tracker.ticked[index].wait()
+            if 1 < index <= steps:
+                tracker.ticked[index - 1].wait()
             time.sleep(0.1)
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
