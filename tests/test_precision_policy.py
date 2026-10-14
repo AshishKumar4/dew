@@ -411,3 +411,17 @@ def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     if jax.default_backend() == "gpu":
         text = jax.jit(jax.value_and_grad(loss(bf16_logits))).lower(x).compile().as_text()
         assert "reduce-precision" not in text and "bf16[16,512]" in text
+
+
+@pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
+def test_the_gpu_divides_fp32_to_the_nearest_float():
+    """`import dew` has XLA:GPU divide fp32 to the nearest float
+    (`dew.telemetry.devices.divide_exactly`): over 2^20 quotients of operands
+    from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a
+    CPU's and the references' are. XLA's own `div.full` left 28% of them off
+    by up to 2 ulps on an H100."""
+    rng = np.random.default_rng(0)
+    numerator, denominator = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))
+    quotient = np.asarray(jax.jit(jnp.divide)(numerator, denominator))
+    nearest = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(quotient, nearest)
