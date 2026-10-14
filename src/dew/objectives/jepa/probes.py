@@ -12,7 +12,6 @@ job.
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import jax
@@ -25,22 +24,6 @@ from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_t
 
 type ProbeParams = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""
-
-
-def _probe_params(tree: optax.Params) -> ProbeParams:
-    """Read the probe's two arrays out of the tree optax gives back.
-
-    optax declares every parameter tree as an arbitrary pytree, so the arrays
-    that go into the optimizer have to be recognised again on the way out.
-    """
-    if not isinstance(tree, Mapping):
-        raise TypeError(f"probe parameters are a mapping, not {type(tree).__name__}")
-    params: ProbeParams = {}
-    for name, leaf in tree.items():
-        if not isinstance(name, str) or not isinstance(leaf, jax.Array):
-            raise TypeError("probe parameters are arrays held under string names")
-        params[name] = leaf
-    return params
 
 
 def _split(embeddings, labels):
@@ -76,7 +59,7 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
         p, opt_state = carry
         grads = jax.grad(objective)(p)
         updates, opt_state = optimizer.update(grads, opt_state, p)
-        return (_probe_params(optax.apply_updates(p, updates)), opt_state), None
+        return (optax.apply_updates(p, updates), opt_state), None
 
     (params, _), _ = jax.lax.scan(step, (params, optimizer.init(params)), None, length=steps)
     predicted = jnp.argmax(test_x @ params["w"] + params["b"], axis=-1)

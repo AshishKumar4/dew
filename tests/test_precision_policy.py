@@ -1,16 +1,13 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
-import collections
 import json
 from importlib import import_module
 from pathlib import Path
 
 import jax
-import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax._src import source_info_util
 from reference_error import assert_fp32_reduction_bound
 from test_architectures import CASES as ARCHITECTURE_CASES
 
@@ -303,46 +300,6 @@ def forward(architecture, dtype, rng):
         return model.apply(variables, *args, **kwargs)
 
     return run, (variables, args, kwargs)
-
-
-def indexing_only(jaxpr) -> set:
-    """The variables of `jaxpr` whose every use ends in integers: floats
-    that compute an index and nothing else. `jax.image.resize` computes its
-    nearest source indices in float32 whatever the image's dtype (on
-    purpose, jax b/206898375), exact below 2**24 and rounding none of the
-    model's values."""
-    uses = collections.defaultdict(list)
-    for eqn in jaxpr.eqns:
-        for var in eqn.invars:
-            if isinstance(var, jax.extend.core.Var):
-                uses[var].append(eqn)
-    returned = {var for var in jaxpr.outvars if isinstance(var, jax.extend.core.Var)}
-    only: set = set()
-    for eqn in reversed(jaxpr.eqns):
-        for var in eqn.outvars:
-            if var not in returned and uses[var] and all(
-                    jnp.issubdtype(out.aval.dtype, jnp.integer) or out in only
-                    for use in uses[var] for out in use.outvars):
-                only.add(var)
-    return only
-
-
-def made_in(jaxpr, dtype) -> list[str]:
-    """Where `jaxpr`, and every jaxpr it holds, makes a value of `dtype` the
-    model computes with (`indexing_only` values are not counted): Dew's
-    source line nearest each, in the order they are made."""
-    indexing = indexing_only(jaxpr)
-    found = []
-    for eqn in jaxpr.eqns:
-        if any(getattr(getattr(var, "aval", None), "dtype", None) == dtype and var not in indexing
-               for var in eqn.outvars):
-            frames = [] if eqn.source_info.traceback is None else list(
-                source_info_util.user_frames(eqn.source_info.traceback))
-            ours = [frame for frame in frames if "/src/dew/" in frame.file_name] or frames
-            found.append(f"{ours[0].file_name.split('/src/')[-1]}:{ours[0].start_line}" if ours else "?")
-        for inner in jax.extend.core.jaxprs_in_params(eqn.params):
-            found += made_in(inner, dtype)
-    return found
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
