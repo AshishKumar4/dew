@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
-from rl_support import TinyHead, clipped_surrogate, token_mean
+from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
@@ -128,11 +128,13 @@ def test_the_loss_reads_the_rolled_out_batch():
     assert {"pg", "actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower", "kl"} <= set(aux.metrics)
 
 
-def test_evaluation_scores_prompt_perplexity():
+@pytest.mark.parametrize("policy", [TinyHead, TinyLogits])
+def test_evaluation_scores_prompt_perplexity(policy):
     """Validation never samples: each prompt's shifted cross entropy, the
     real suffix weighted off `prompt_length`, pads counting nothing, compiled
-    once for the objective's modules."""
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB), 4, beta=0.0)
+    once for the objective's modules; a policy that gives its logits only
+    from its tokens is scored as the training loss scores it."""
+    objective = GRPOObjective(policy(vocab_size=VOCAB), 4, beta=0.0)
     params = objective.init(jax.random.key(0))
     prompts = np.array([[0, 0, 1, 2, 3], [4, 5, 6, 7, 1]], np.int32)
     batch = {PROMPT_KEY: jnp.asarray(prompts),

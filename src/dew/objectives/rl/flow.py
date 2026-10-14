@@ -33,6 +33,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import metrics
+from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
@@ -235,10 +236,12 @@ class FlowGRPOObjective(DiffusionObjective):
             keep = selected & (transition.variance != 0)
             current = jnp.where(keep, transition.log_prob(action), 0) / dimensions
             previous = jnp.where(keep, old_log_prob, 0) / dimensions
+            # Flow-GRPO's clip is PPO's without the dual cap, one term a sample.
+            surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
+                                                   epsilon_low=self.clip_range, epsilon_high=self.clip_range,
+                                                   dual_clip=None)
+            pg = jnp.where(keep, surrogate[:, 0], 0).sum()
             ratio = jnp.exp(current - previous)
-            unclipped = -advantage * ratio
-            clipped = -advantage * jnp.clip(ratio, 1 - self.clip_range, 1 + self.clip_range)
-            pg = jnp.where(keep, jnp.maximum(unclipped, clipped), 0).sum()
             kl = jnp.asarray(0.0)
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
