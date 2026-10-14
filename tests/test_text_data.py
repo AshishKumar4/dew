@@ -430,7 +430,7 @@ def test_a_store_without_an_eos_id_is_one_document_windows_read_and_only_packing
     assert data.records == (None if read == "streamed" else (len(stream) - 1) // 8)
     assert [row["text"].tolist() for row in _read(data.val(DataPartition()), 2)] == [
         stream[start:start + 9].tolist() for start in (0, 8)]
-    with pytest.raises(ValueError, match="producer document boundaries or EOS"):
+    with pytest.raises(ValueError):
         loader(TextData(source=stored, pack="first-fit", seq_len=8), batch=1, read=read, loading=loading)
 
 

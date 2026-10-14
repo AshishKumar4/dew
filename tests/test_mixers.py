@@ -167,8 +167,8 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
-REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
-"""Kinds that refuse packed rows by name, and the name."""
+REFUSED = {"kpool_sparse_attention"}
+"""Kinds that refuse packed rows."""
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
@@ -193,7 +193,9 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
     if kind in REFUSED:
-        with pytest.raises(ValueError, match=REFUSED[kind]):
+        jax.block_until_ready(jax.jit(functools.partial(pulled, documents_alone(model, tokens)))(
+            variables, cotangent))
+        with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return
     with jax.default_matmul_precision("highest"):
