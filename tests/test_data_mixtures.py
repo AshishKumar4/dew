@@ -1009,7 +1009,7 @@ def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_ea
     from dew.data.steps.text import CountTargets, Tokenize
 
     def published(name: str, documents: int) -> Pipeline:
-        texts = Memory([{"text": "x" * (index + 3)} for index in range(documents)], identity=name)
+        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
         generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
                              Cache(str(tmp_path / name)), read="indexed", loading=READ)
         return Pipeline(generation.source(), name=name)
