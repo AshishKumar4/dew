@@ -33,6 +33,7 @@ const LABELS = {
 	'06-jepa-representation-learning': 'Representations with I-JEPA',
 	'07-scaling-on-many-devices': 'Scale across devices',
 	'08-load-a-pretrained-decoder': 'Continue a pretrained decoder',
+	'11-llms-in-an-agent-harness': 'LLMs in an agent harness',
 };
 
 function fence(code) {
