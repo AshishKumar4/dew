@@ -29,8 +29,7 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, json_value, record
 from dew.registry import import_path
-from dew.rl import gae
-from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
+from dew.rl.advantage import MEAN_EPS, WHITEN_EPS, gae_advantages
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
@@ -298,10 +297,9 @@ class PPORollout:
         token_rewards = np.zeros_like(baselines)
         scored = last >= 0
         token_rewards[scored, last[scored]] = rewards[scored]
-        _, returns = gae(jnp.asarray(token_rewards), jnp.asarray(baselines), jnp.asarray(keep, jnp.float32),
-                         self.gamma, self.lam)
-        returns = np.asarray(returns)
-        raw = returns - baselines
+        raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
+                                        jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
+        returns = raw + baselines
         moments = [float(np.sum(keep)), float(np.sum(raw * keep)), float(np.sum(raw * raw * keep))]
         count, total, squares = np.sum(np.asarray(from_every_process(moments), np.float64), axis=0)
         mean = total / (count + MEAN_EPS)

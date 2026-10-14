@@ -1556,11 +1556,12 @@ def write_diffusion_window_tiny() -> None:
         np.save(directory / "logits_f64.npy", logits().double().numpy())
 
 
-def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False) -> None:
+def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,
+               device: str = "cpu") -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
-    model = model.float()
+    model = model.float().to(device)
     model.save_pretrained(directory, safe_serialization=True)
 
     ids = probe_ids(model.config.vocab_size)
@@ -1585,6 +1586,30 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
                  logits=reference, logits_f64=truth)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_device_tiny(name: str, model: PreTrainedModel, device: str, command: str) -> None:
+    """`write_tiny` on `device` with TF32 off, the first row's six-token
+    greedy continuation of its first four ids, and meta.json naming the run
+    and `command`: the classic decoder fixtures tools/classic_gpt_reference.py
+    and tools/gpt_neox_reference.py write on CUDA."""
+    import transformers
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    write_tiny(name, model, device=device)
+    directory = FIXTURES / name
+    ids = np.load(directory / "input_ids.npy")
+    with torch.no_grad():
+        generated = model.generate(torch.tensor(ids[:1, :4], device=device), do_sample=False,
+                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0)
+    np.save(directory / "generated.npy", generated.cpu().numpy())
+    (directory / "meta.json").write_text(json.dumps({
+        "transformers": transformers.__version__, "torch": torch.__version__,
+        "dtype": "float32", "attention": "eager", "seed": 1234,
+        "device": torch.cuda.get_device_name() if device == "cuda" else device,
+        "command": command,
+    }, indent=2) + "\n")
 
 
 def write_tensor_table(directory: Path) -> None:

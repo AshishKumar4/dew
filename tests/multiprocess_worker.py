@@ -467,6 +467,31 @@ class Recording:
         self._source.close()
 
 
+def mode_reads(args) -> dict:
+    """A field no step reads stays on the host in a pool too: the mask the step
+    publishes under its placed batch's signature is the one placement finds,
+    though each process places a share of the rows."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.training import MeshSpec
+    from dew.training.distributed import batch_signature, shard_batch, step_reads
+
+    mesh = MeshSpec().build()
+    rows = len(mesh.local_devices)
+    batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
+    first = shard_batch(mesh, batch)
+    step = jax.jit(lambda state, batch: state + jnp.sum(batch["x"]))
+    compiled = step.lower(jnp.zeros(()), first).compile()
+    signature = batch_signature(first)
+    placed = shard_batch(mesh, batch, {signature: step_reads(compiled, signature)})
+    return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
+            "unused_on_host": isinstance(placed["unused"], np.ndarray),
+            "unused_shape": list(np.shape(placed["unused"])),
+            "x_placed": isinstance(placed["x"], jax.Array),
+            "sum": float(compiled(jnp.zeros(()), placed))}
+
+
 def mode_packed_fit(args) -> dict:
     """`--steps` steps of a real fit over the packed training stream, with
     the windows this process read.
@@ -752,6 +777,33 @@ def mode_pool_refusals(args) -> dict:
     return outcomes
 
 
+def mode_fp8_sites(args) -> dict:
+    """How the pool ends `measured_fp8_sites` on CPUs, which have no FP8
+    tensor cores, and when process 1's tree lacks a site the others hold:
+    each outcome is the error's type and text, and every process then
+    passes one more agreement, which a rank left behind would block."""
+    import jax
+
+    from dew import coordination
+    from dew.training.quantization import measured_fp8_sites
+
+    full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
+                       "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}
+    lacking = {"params": {"wide": full["params"]["wide"]}}
+
+    def outcome(variables) -> str:
+        try:
+            measured_fp8_sites(variables, ("wide", "narrow"), 8)
+        except (ValueError, coordination.PeerFailure) as error:
+            return f"{type(error).__name__}: {error}"
+        return "measured"
+
+    unsupported = outcome(full)
+    missing = outcome(lacking if jax.process_index() == 1 else full)
+    after = coordination.agreed("after the refusals", lambda: True)
+    return {"unsupported": unsupported, "missing": missing, "after": after}
+
+
 def mode_profile_failure(args) -> dict:
     """A scheduled profile window whose directory is a file on rank 0 only.
 
@@ -950,7 +1002,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp, stage=stage, microbatches=microbatches),
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage), microbatches=microbatches,
                    layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
 
 
@@ -2330,7 +2382,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "whole_validation": mode_whole_validation,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
-         "packed_fit": mode_packed_fit,
+         "packed_fit": mode_packed_fit, "reads": mode_reads,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
          "decoding_components": mode_decoding_components,
@@ -2342,7 +2394,8 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
-         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
+         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
+         "fp8_sites": mode_fp8_sites}
 
 
 def parse_args(argv=None):
