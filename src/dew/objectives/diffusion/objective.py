@@ -463,7 +463,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
-        self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
+        self._grid = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
 
     @property
     def _sample(self):
@@ -855,8 +855,7 @@ class DiffusionObjective(Objective[Ratio]):
     def evaluate(self, params, batch, step: Step):
         """Generate one sample for every real row, without decoding for display."""
         samples, _ = self._draw(params, batch, step)
-        assert self.artifact is not None
-        return self.artifact(samples)
+        return self._grid(samples)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Draw a separate small batch for display.
@@ -875,8 +874,7 @@ class DiffusionObjective(Objective[Ratio]):
             captions = condition.encoder.captions(tokens[keyword])
             if captions:
                 break
-        assert self.artifact is not None
-        return self.artifact(samples, captions)
+        return self._grid(samples, captions)
 
 
 class FlowDistillationObjective(DiffusionObjective):
