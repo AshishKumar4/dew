@@ -755,16 +755,17 @@ def test_a_killed_program_leaves_no_loading_worker_running():
         "from dew.data.compile import compile\n"
         "from dew.data.dataset import DataPartition\n"
         "from dew.data.pipeline import Pipeline\n"
-        "rows = Memory(tuple({'x': np.full(4, int(sys.argv[1]), np.int64)} for _ in range(64)))\n"
+        "rows = Memory(tuple({'x': np.full(4096, int(sys.argv[1]), np.int64)} for _ in range(64)))\n"
         "loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)\n"
         "stream = compile(Pipeline(rows).repeat().batch(2), read='memory', loading=loading)"
         ".train(DataPartition())\n"
         "next(stream)\n"
         "print(' '.join(str(child.pid) for child in multiprocessing.active_children()), flush=True)\n"
         "time.sleep(600)\n")
-    # Every batch is two records of four copies of this run's own token, so its segments are found by it.
+    # Every batch is two records of 4096 copies of this run's own token, 64 KiB, large enough to cross
+    # in shared memory (`dew.data.dataset.SHARED_BYTES`), so its segments begin with the token.
     token = secrets.randbits(63)
-    mark = np.full((2, 4), token, np.int64).tobytes()
+    mark = np.full(8, token, np.int64).tobytes()
     root = Path(__file__).resolve().parents[1]
     parent = subprocess.Popen(
         [sys.executable, "-c", program, str(token)], cwd=root, stdout=subprocess.PIPE, text=True,

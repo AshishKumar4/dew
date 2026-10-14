@@ -284,6 +284,6 @@ The checkpoint stores the compiled plan with the iterator position: source snaps
 
 Volatile fetches cannot claim exact resume until their bytes are persisted. They use the first-reader rule when readers replicate a share.
 
-`Dataset.batch` is global. `DataPartition(index, count)` names a disjoint share; `DataPartition.of(mesh)` derives it from placement. Canonical validation takes accepted rows before the share cut. Record-level random transforms stay keyed to the global order; model noise keyed by batch row can change when process placement changes.
+`Dataset.batch` is global. `DataPartition(index, count)` names a disjoint share; `DataPartition.of(mesh)` derives it from placement. Canonical validation takes accepted rows before the share cut. A record-level random transform's draw is keyed by the record's place in the run's order: the same in every read mode for one order, and by its place in its share in a read cut per share (one that drops records, or a streamed one). Model noise keyed by batch row can change when process placement changes.
 
 [Checkpoints](../guides/checkpoints.md) and [distributed training](distributed.md) cover the trainer's restore and placement contracts.
