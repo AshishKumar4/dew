@@ -46,12 +46,10 @@ def dilated_form(form):
     def substituted(call, args, kwargs, context):
         module = context.module
         if (context.method_name != '__call__' or not isinstance(module, conv.Conv)
-                or module.conv_general_dilated is not conv._conv_general_dilated
-                or module.is_initializing()):
+                or module.conv_general_dilated is not conv._conv_general_dilated):
             return call(*args, **kwargs)
-        # The same layer, over the same parameters, with the form as its convolution's argument.
-        return module.clone(parent=None, name=None, conv_general_dilated=convolve).apply(
-            {'params': module.variables['params']}, *args, **kwargs)
+        # The same layer in its own scope, the form its convolution's argument.
+        return module.clone(parent=module.scope, conv_general_dilated=convolve)(*args, **kwargs)
 
     with nn.intercept_methods(substituted):
         yield

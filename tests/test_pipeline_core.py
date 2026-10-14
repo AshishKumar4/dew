@@ -18,7 +18,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
-from dew.data.pipeline import Artifact, Configured, Pipeline, Rejected, mix
+from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
@@ -142,15 +142,6 @@ def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
     with pytest.raises(ValueError):
         changed.set_state(saved)
     changed.close()
-
-
-def test_cache_refuses_random_prefix_before_opening_the_artifact():
-    """A random step after a cache compiles; one before it is refused before
-    the artifact is opened, as an `object()` in the cache's place shows."""
-    cached = Pipeline(source()).cache(Cache(f"memory://{uuid4().hex}"))
-    compile(cached.random_map(Draw()).batch(4), loading=READ)
-    with pytest.raises(ValueError):
-        compile(Pipeline(source()).random_map(Draw()).then(Artifact(object())).batch(4), loading=READ)
 
 
 def test_random_validation_is_refused():

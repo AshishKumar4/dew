@@ -47,7 +47,7 @@ import io
 import re
 import sys
 import tokenize
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,7 +100,10 @@ SEAMS = ("subprocess", "socket", "urllib", "request", "http", "download", "hub",
 NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "tuple", "str",
              "int", "float", "bool", "bytes"}
 # The hooks Python documents as set by assignment.
-INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "threading.excepthook"}
+INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "sys.displayhook", "sys.breakpointhook",
+                     "threading.excepthook"}
+# The calls that hand a test a function's source text.
+SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
                  "register_event_listener", "filterwarnings", "simplefilter")
@@ -788,33 +791,40 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
-def _imported(tree: ast.Module) -> dict[str, str]:
-    """The local names this file binds by import, each with the module it came from."""
-    bound: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            bound |= {(alias.asname or alias.name).split(".")[0]: alias.name for alias in node.names}
-        elif isinstance(node, ast.ImportFrom):
-            bound |= {alias.asname or alias.name: node.module or "" for alias in node.names}
-    return bound
+def _resolved(node: ast.expr, bound: Mapping[str, str]) -> str:
+    """The dotted path `node` spells, its first name read as the import `bound`
+    gives it (`_imports`), or "" where no import binds that name."""
+    head, _, rest = _named(node).partition(".")
+    target = bound.get(head, "")
+    return f"{target}.{rest}" if target and rest else target
 
 
-def _root(node: ast.expr) -> str:
-    """The name an attribute chain starts from, or ""."""
-    while isinstance(node, ast.Attribute):
-        node = node.value
-    return node.id if isinstance(node, ast.Name) else ""
+def _scoped(scope: ast.AST, local: frozenset[str] = frozenset()) -> Iterator[tuple[ast.AST, frozenset[str]]]:
+    """Every node under `scope`, with the names an enclosing function binds
+    itself (its parameters and its assignments), which no import stands for there."""
+    for node in ast.iter_child_nodes(scope):
+        inner = local
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            arguments = node.args
+            parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
+                          arguments.kwarg)
+            assigned = {child.id for child in _own(node)
+                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+            inner = local | assigned | {parameter.arg for parameter in parameters if parameter is not None}
+        yield node, inner
+        yield from _scoped(node, inner)
 
 
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour."""
-    for node in ast.walk(module.tree):
-        if isinstance(node, ast.Call):
-            name = _named(node.func)
-            if name.endswith("raises") and any(keyword.arg == "match" for keyword in node.keywords):
+    bound = _imports(module.tree, _module_name(module), module.path.name == "__init__.py")
+    for node, local in _scoped(module.tree):
+        if isinstance(node, ast.Call) and _root(node.func) not in local:
+            called = _resolved(node.func, bound)
+            if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "matches an error's wording; assert the refusal, not its text")
-            elif name.rsplit(".", 1)[-1] in {"getsource", "getsourcelines", "getsourcefile"}:
+            elif called in SOURCE_READERS:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "reads source text; test what the code does")
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -824,23 +834,26 @@ def wording(module: Module) -> Iterator[Finding]:
 
 
 def patches(module: Module) -> Iterator[Finding]:
-    """SLOP012: a module replaced by assignment, outside the suite."""
-    imported = _imported(module.tree)
-    for node in ast.walk(module.tree):
-        if isinstance(node, ast.Assign):
-            replaced = [target for target in node.targets if isinstance(target, ast.Attribute)]
-        elif isinstance(node, ast.Call) and _named(node.func) == "setattr" and node.args:
-            replaced = [node.args[0]]
+    """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
+    bound = _imports(module.tree, _module_name(module), module.path.name == "__init__.py")
+    for node, local in _scoped(module.tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
+            owner, attribute = node.value, node.attr
+        elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
+              and len(node.args) > 1):
+            owner, named = node.args[:2]
+            spelled = isinstance(named, ast.Constant) and isinstance(named.value, str)
+            attribute = named.value if spelled else "*"
         else:
             continue
-        for target in replaced:
-            origin = imported.get(_root(target), "")
-            # The library rebinds nothing it imported but the interpreter's own hooks; a
-            # script, nothing of our package.
-            if origin and _named(target) not in INTERPRETER_HOOKS and (
-                    module.is_source or origin.split(".")[0] == module.package):
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP012",
-                              f"rebinds {_named(target)} for every caller; pass the behaviour in")
+        origin = "" if _root(owner) in local else _resolved(owner, bound)
+        target = f"{origin}.{attribute}"
+        # The library rebinds nothing it imported but the interpreter's own hooks; a
+        # script, nothing of our package.
+        if origin and target not in INTERPRETER_HOOKS and (
+                module.is_source or origin.split(".")[0] == module.package):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP012",
+                          f"rebinds {target} for every caller; pass the behaviour in")
 
 
 def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
