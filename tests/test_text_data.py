@@ -24,7 +24,7 @@ from token_support import write_token_corpus
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
 from dew.data.dataset import DataPartition
-from dew.data.sources.files import TokenFiles
+from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones import causal_transformer as backbone
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
