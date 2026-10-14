@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_vjp import recorded_vjp
 
 DIFFUSERS = "0.34.0"
 COMMON = {"in_channels": 3, "latent_channels": 8, "attention_head_dim": 8,
@@ -85,22 +86,14 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root, safe_serialization=True)
     named = list(model.named_parameters())
 
-    def gradients(loss, inputs):
-        every = inputs + [value for _, value in named]
-        found = torch.autograd.grad(loss, every, allow_unused=True)
-        return [torch.zeros_like(value) if gradient is None else gradient
-                for gradient, value in zip(found, every, strict=True)]
-
     image = (torch.rand((BATCH, config["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
              ).requires_grad_()
     latent = model.encode(image).latent
-    probe_latent = torch.randn(latent.shape, generator=generator)
-    encoded = gradients((latent * probe_latent).sum(), [image])
+    encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, named, generator)
 
     code = torch.randn(latent.shape, generator=generator).requires_grad_()
     pixels = model.decode(code).sample
-    probe = torch.randn(pixels.shape, generator=generator)
-    decoded = gradients((pixels * probe).sum(), [code])
+    decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, named, generator)
 
     small = torch.rand((BATCH, config["in_channels"], *SMALL), generator=generator) * 2 - 1
     with torch.no_grad():
@@ -110,15 +103,10 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
 
     arrays = {
         "image": image.detach().numpy(), "latent": latent.detach().numpy(),
-        "probe_latent": probe_latent.numpy(), "encode.grad_image": encoded[0].numpy(),
-        "code": code.detach().numpy(), "pixels": pixels.detach().numpy(), "probe": probe.numpy(),
-        "decode.grad_code": decoded[0].numpy(),
+        "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
         "small": small.numpy(), "small_latent": small_latent.numpy(),
-        "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(),
+        "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(), **encoded, **decoded,
     }
-    for (name, _), from_encode, from_decode in zip(named, encoded[1:], decoded[1:], strict=True):
-        arrays[f"encode.grad.{name}"] = from_encode.numpy()
-        arrays[f"decode.grad.{name}"] = from_decode.numpy()
     print(f"{root.name}: parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
           f"latent {tuple(latent.shape)}; |latent| <= {np.abs(arrays['latent']).max():.3g}; "
           f"|pixels| <= {np.abs(arrays['pixels']).max():.3g}")
