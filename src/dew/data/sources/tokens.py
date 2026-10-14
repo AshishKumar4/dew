@@ -69,17 +69,41 @@ class TokenBytes:
 
 
 @dataclass(frozen=True)
+class _TokenShard:
+    """One logical shard's columns, a view of a flat or per-shard mmap index."""
+
+    columns: np.ndarray | None
+    row_start: int
+
+    @property
+    def values(self) -> np.ndarray:
+        if self.columns is None:
+            raise FileNotFoundError(
+                "ArrayRecord token spans need the producer's length index; "
+                "set provision=True or choose read='memory'"
+            )
+        return self.columns
+
+    @property
+    def ends(self) -> np.ndarray:
+        return self.values[:, 1]
+
+
+@dataclass(frozen=True)
 class TokenRecords:
-    """ArrayRecord token documents with a producer's authoritative length index."""
+    """Lazy token spans with one decoder over flat or per-shard producer indexes.
+
+    Index columns remain mmap views. Only the per-shard totals are combined;
+    ArrayRecords owns the bounded set of open physical shards.
+    """
 
     paths: tuple[str, ...]
-    lengths: np.ndarray | None
+    indexes: tuple[ArrayIndex, ...] = ()
     dtype: str = "int32"
     field: str | None = None
     eos_id: int | None = None
     storage_options: Mapping[str, object] | None = None
     record_codec: bool = False
-    cumulative: np.ndarray | None = None
     shard_rows: tuple[int, ...] | None = None
 
     @cached_property
@@ -89,24 +113,28 @@ class TokenRecords:
         return ArrayRecords(self.paths, self.storage_options, counts=self.shard_rows)
 
     @cached_property
-    def ends(self) -> np.ndarray:
-        if self.cumulative is not None:
-            return self.cumulative
-        if self.lengths is None:
-            raise FileNotFoundError(
-                "ArrayRecord token spans need the producer's length index; "
-                "set provision=True or choose read='memory'"
-            )
-        return np.cumsum(self.lengths, dtype=np.int64)
+    def shards(self) -> tuple[_TokenShard, ...]:
+        if not self.paths:
+            return ()
+        starts = np.cumsum([0, *(len(index.values) for index in self.indexes[:-1])])
+        return tuple(
+            _TokenShard(index.values, int(start))
+            for index, start in zip(self.indexes, starts, strict=True)
+        ) if self.indexes else (_TokenShard(None, 0),)
 
-    def materialize_lengths(self) -> np.ndarray:
-        if self.lengths is None:
-            self.__dict__["lengths"] = np.asarray(
-                [len(self.piece(index)) for index in range(len(self.records))], dtype=np.int64
-            )
-        return self.__dict__["lengths"]
+    @property
+    def indexed(self) -> bool:
+        return all(shard.columns is not None for shard in self.shards)
 
-    def piece(self, index: int) -> np.ndarray:
+    def materialize_lengths(self) -> None:
+        """Measure an unindexed raw store once, retaining its flat columns for memory reads."""
+        if not self.indexed:
+            lengths = np.asarray(
+                [len(self._document(index)) for index in range(len(self.records))], dtype=np.int64
+            )
+            self.__dict__["shards"] = (_TokenShard(np.column_stack((lengths, np.cumsum(lengths))), 0),)
+
+    def _document(self, index: int) -> np.ndarray:
         from .codec import decode, unpack_dict_of_byte_arrays
 
         payload = self.records[index]
@@ -116,62 +144,15 @@ class TokenRecords:
             value = decode(payload)
             if self.field is None or not isinstance(value, Mapping) or self.field not in value:
                 raise ValueError(f"token document lacks field {self.field!r}")
-            values = np.asarray(value[self.field], dtype=self.dtype)
-        elif self.field is not None:
+            return np.asarray(value[self.field], dtype=self.dtype)
+        if self.field is not None:
             payload = unpack_dict_of_byte_arrays(payload)[self.field]
-            values = np.frombuffer(payload, dtype=self.dtype)
-        else:
-            values = np.frombuffer(payload, dtype=self.dtype)
-        if self.lengths is not None and len(values) != int(self.lengths[index]):
-            raise ValueError(f"token document {index} differs from the producer's length index")
-        return values
-
-    def __len__(self) -> int:
-        return int(self.ends[-1]) if len(self.ends) else 0
-
-    def __getitem__(self, span: slice) -> np.ndarray:
-        start, stop, step = span.indices(len(self))
-        if step != 1:
-            raise ValueError("token stores are read in contiguous spans")
-        pieces = []
-        for index in range(int(np.searchsorted(self.ends, start, side="right")), len(self.ends)):
-            begin = 0 if index == 0 else int(self.ends[index - 1])
-            if begin >= stop:
-                break
-            pieces.append(self.piece(index)[max(start - begin, 0) : stop - begin])
-        return np.concatenate(pieces) if pieces else np.empty(0, self.dtype)
-
-
-@dataclass(frozen=True)
-class TokenShards:
-    """Produced token spans over per-shard memory-mapped length and end columns."""
-
-    paths: tuple[str, ...]
-    indexes: tuple[ArrayIndex, ...]
-    dtype: str = "int32"
-    field: str = "text"
-    eos_id: int | None = None
-    storage_options: Mapping[str, object] | None = None
+        return np.frombuffer(payload, dtype=self.dtype)
 
     @cached_property
     def shard_ends(self) -> np.ndarray:
-        totals = [int(index.values[-1, 1]) if len(index.values) else 0 for index in self.indexes]
+        totals = [int(shard.ends[-1]) if len(shard.ends) else 0 for shard in self.shards]
         return np.cumsum(totals, dtype=np.int64)
-
-    @cached_property
-    def row_ends(self) -> np.ndarray:
-        return np.cumsum([len(index.values) for index in self.indexes], dtype=np.int64)
-
-    @cached_property
-    def records(self):
-        from .records import ArrayRecords
-
-        return ArrayRecords(
-            self.paths,
-            self.storage_options,
-            record_codec=True,
-            counts=[len(index.values) for index in self.indexes],
-        )
 
     def __len__(self) -> int:
         return int(self.shard_ends[-1]) if len(self.shard_ends) else 0
@@ -181,28 +162,29 @@ class TokenShards:
         if step != 1:
             raise ValueError("token stores are read in contiguous spans")
         pieces = []
-        for shard in range(int(np.searchsorted(self.shard_ends, start, side="right")), len(self.paths)):
-            beginning = int(self.shard_ends[shard - 1]) if shard else 0
+        for index in range(int(np.searchsorted(self.shard_ends, start, side="right")), len(self.shards)):
+            beginning = int(self.shard_ends[index - 1]) if index else 0
             if beginning >= stop:
                 break
-            row_base = int(self.row_ends[shard - 1]) if shard else 0
-            columns = self.indexes[shard].values
-            ends = columns[:, 1]
+            shard = self.shards[index]
+            ends = shard.ends
             for row in range(int(np.searchsorted(ends, max(start - beginning, 0), side="right")), len(ends)):
                 row_start = beginning + (int(ends[row - 1]) if row else 0)
                 if row_start >= stop:
                     break
-                record = self.records[row_base + row]
-                if not isinstance(record, Mapping):
-                    raise ValueError("exported token document is not a named record")
-                tokens = np.asarray(record[self.field], dtype=self.dtype)
-                if len(tokens) != int(columns[row, 0]):
-                    raise ValueError("exported token document differs from its producer length")
+                tokens = self._document(shard.row_start + row)
+                if len(tokens) != int(shard.values[row, 0]):
+                    raise ValueError("token document differs from the producer's length index")
                 pieces.append(tokens[max(start - row_start, 0) : stop - row_start])
         return np.concatenate(pieces) if pieces else np.empty(0, dtype=self.dtype)
 
+    def __getstate__(self) -> Mapping[str, object]:
+        """Workers reopen producer indexes instead of pickling their mapped columns."""
+        return {name: value for name, value in self.__dict__.items()
+                if name != "shards" or not self.indexes}
 
-def _document_ends(tokens: TokenBytes | TokenRecords | TokenShards) -> np.ndarray:
+
+def _document_ends(tokens: TokenBytes | TokenRecords) -> np.ndarray:
     """Each document ends just past its EOS, or at the stream's end for an unterminated tail."""
     block = 1 << 24
     found = [
@@ -273,7 +255,7 @@ class TokenFiles(Dataset):
         return json.loads(fs.cat_file(path)) if fs.exists(path) else {}
 
     @cached_property
-    def tokens(self) -> TokenBytes | TokenRecords | TokenShards:
+    def tokens(self) -> TokenBytes | TokenRecords:
         eos = self.meta.get("eos_id")
         if eos is not None and not isinstance(eos, int):
             raise ValueError("token metadata eos_id must be an integer or null")
@@ -298,13 +280,15 @@ class TokenFiles(Dataset):
                     raise ValueError("token export index needs length and cumulative end columns")
                 indexes.append(index)
                 paths.append(root.child(entry["path"]).url)
-            return TokenShards(
+            return TokenRecords(
                 tuple(paths),
                 tuple(indexes),
                 str(self.meta.get("dtype", "int32")),
                 "text",
                 eos,
                 self.storage_options,
+                record_codec=True,
+                shard_rows=tuple(len(index.values) for index in indexes),
             )
         if self.array_paths:
             binary = Store(self.url, self.storage_options).child(f"{self.split}.bin")
@@ -312,7 +296,7 @@ class TokenFiles(Dataset):
             if fs.exists(path):
                 raise ValueError(f"{self.url} holds {self.split} in both binary and ArrayRecord stores")
             fs, path = self.length_index.resolve()
-            lengths = cumulative = None
+            flat: tuple[ArrayIndex, ...] = ()
             rows = None
             if fs.exists(path):
                 index = self.mapped_index.values
@@ -320,16 +304,15 @@ class TokenFiles(Dataset):
                     raise ValueError(
                         "token length index needs length and cumulative end columns; provision it again"
                     )
-                lengths, cumulative = index[:, 0], index[:, 1]
+                flat = (self.mapped_index,)
                 rows = tuple(json.loads(self.row_manifest.read())["rows"])
             return TokenRecords(
                 self.array_paths,
-                lengths,
+                flat,
                 str(self.meta.get("dtype", "uint16")),
                 self.field,
                 eos,
                 self.storage_options,
-                cumulative=cumulative,
                 shard_rows=rows,
             )
         return TokenBytes(
@@ -342,7 +325,7 @@ class TokenFiles(Dataset):
     def metadata(self) -> Mapping[str, object]:
         facts = dict(self.meta)
         tokens = self.tokens
-        if not isinstance(tokens, TokenRecords) or tokens.lengths is not None:
+        if not isinstance(tokens, TokenRecords) or tokens.indexed:
             facts.update(tokens=len(tokens), **{f"{self.split}_tokens": len(tokens)})
         elif f"{self.split}_tokens" in facts:
             facts["tokens"] = facts[f"{self.split}_tokens"]
@@ -357,7 +340,7 @@ class TokenFiles(Dataset):
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
-        if isinstance(self.tokens, (TokenRecords, TokenShards)):
+        if isinstance(self.tokens, TokenRecords):
             fs, path = self.length_index.resolve()
             return {
                 "store": "tokens",
@@ -369,7 +352,7 @@ class TokenFiles(Dataset):
                     self.tokens.paths, format="array_record", storage_options=self.storage_options
                 ).fingerprint(),
                 "index": _version(fs, path) if fs.exists(path) else None,
-                "shard_rows": self.tokens.shard_rows if isinstance(self.tokens, TokenRecords) else None,
+                "shard_rows": None if self.tokens.record_codec else self.tokens.shard_rows,
                 "producer": Files(self.url, storage_options=self.storage_options).committed,
             }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
@@ -387,7 +370,7 @@ class TokenFiles(Dataset):
         if read == "memory":
             return True
         tokens = self.tokens
-        return not isinstance(tokens, TokenRecords) or tokens.lengths is not None
+        return not isinstance(tokens, TokenRecords) or tokens.indexed
 
     def can_provision(self, read: Read) -> bool:
         return True
@@ -397,12 +380,12 @@ class TokenFiles(Dataset):
         lengths, and, for a store with an EOS id, where each document ends
         (`document_ends`)."""
         tokens = self.tokens
-        if isinstance(tokens, TokenRecords):
+        if isinstance(tokens, TokenRecords) and not tokens.record_codec:
             from .records import ArrayRecords
 
-            lengths = tokens.materialize_lengths()
+            tokens.materialize_lengths()
             encoded = io.BytesIO()
-            np.save(encoded, np.column_stack((lengths, np.cumsum(lengths))), allow_pickle=False)
+            np.save(encoded, tokens.shards[0].values, allow_pickle=False)
             self.length_index.write(encoded.getvalue())
             counts = []
             for path in tokens.paths:
@@ -474,7 +457,7 @@ class TokenFiles(Dataset):
 class _TokenDocuments:
     """A token store's documents by index, each the span its index names."""
 
-    tokens: TokenBytes | TokenRecords | TokenShards
+    tokens: TokenBytes | TokenRecords
     ends: np.ndarray
 
     def __len__(self) -> int:
