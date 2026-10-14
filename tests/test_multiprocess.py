@@ -540,11 +540,17 @@ def packed_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    # The token store states its documents' lengths, so a plan over the whole store packs it: the
-    # order's source names that packing, and no Pack stage is left to run per share.
-    order = json.loads(saved["order"])
-    assert "packing=Pack(" in json.dumps(order["source"]), "the order has to name the store's packing"
-    assert not any(stage.startswith("Pack(") for stage in order["stages"])
+    # The token store states its documents' lengths, so the run reads it through a plan over the
+    # whole store (`PackedSource`), and no Pack stage is left to run per share.
+    from dew.config.data import TextData
+    from dew.data.analysis import _promoted
+    from dew.data.packing import PackedSource
+    from dew.data.pipeline import Pack
+
+    train, _, _ = TextData(source=str(corpus), pack="first-fit", seq_len=PACKED_SEQ_LEN).pipelines()
+    read = _promoted(train)
+    assert isinstance(read.source, PackedSource) and isinstance(read.source.plan.pack, Pack)
+    assert not any(isinstance(stage, Pack) for stage in read.stages)
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 
