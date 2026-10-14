@@ -671,7 +671,7 @@ def keep_captions(captions):
 
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 
-FLIP_JITTER = images.Augment(flip=True, jitter=True)
+FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 # ---------------------------------------------------------------------------------
@@ -688,9 +688,7 @@ class Augmenting:
 
     length: int = 16
     image_size: int = 128
-    augment: images.Augment | None = FLIP_JITTER
-    augmentation_backend: str = "host"
-    crop_scale: tuple[float, float] = (1.0, 1.0)
+    augment: Augment | None = FLIP_JITTER
     augmentation_size: int | None = None
     val_batches: int | None = 4
     val_split: str | None = None
@@ -709,11 +707,9 @@ class Augmenting:
         mode = self.augment if training else None
         classes = tuple(["rose", "tulip", "lotus", "orchid", "marigold"] *
                         ((1000 + max((self.length, *self.splits.values()))) // 5 + 1))
-        augment = None if mode is None else Augment(mode.flip, mode.jitter, self.crop_scale,
-                                                  self.augmentation_backend)
         return ImageData(source=Memory(rows), image_size=self.image_size,
                          staging_size=self.augmentation_size, caption_templates=CAPTION_TEMPLATES,
-                         classes=classes, augment=augment).pipelines()[0]
+                         classes=classes, augment=mode).pipelines()[0]
 
     def pipelines(self):
         source = self.source()

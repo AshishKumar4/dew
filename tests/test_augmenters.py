@@ -51,7 +51,7 @@ def _synthetic_image(seed=0):
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 """More than one, so a test can see which the record's rng drew."""
 
-FLIP_JITTER = images.Augment(flip=True, jitter=True)
+FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 def _element_for(kind, seed=0):
@@ -67,8 +67,7 @@ def _spec(kind, augment=FLIP_JITTER):
     return ImageData(source=Memory([_element_for(kind)] * DRAWS), image_size=SCALE,
                      caption_templates=CAPTION_TEMPLATES if kind == "tfds" else (),
                      classes=LABELS if kind == "tfds" else (),
-                     augment=None if augment is None else Augment(augment.flip, augment.jitter,
-                                                                  backend="host"))
+                     augment=augment)
 
 
 def _read(spec, *, seed=0, batch=8):
@@ -114,14 +113,12 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "import numpy as np",
             "from dew.config.data import ImageData",
             "from dew.data import images",
-            "from dew.data.images import Augment, augment_image",
             "",
             "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
-            "for augment in (None, Augment(flip=True, jitter=False), Augment(flip=True, jitter=True)):",
-            "    ImageData(source=(), labels=labels)",
-            "    images.random_resized_crop(16), images.flip(), images.color_jitter()",
-            "    out = augment_image(augment, image, np.random.default_rng(0))",
+            "ImageData(source=(), labels=labels)",
+            "for stage in (images.flip(), images.color_jitter()):",
+            "    out = stage.random_map({'image': image}, np.random.default_rng(0))['image']",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
             "print('ok')",
         ]
@@ -211,7 +208,7 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind):
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
     outcomes = set()
-    for row in _read(_spec(kind, images.Augment(flip=True, jitter=False))):
+    for row in _read(_spec(kind, Augment(flip=True, jitter=False, backend="host"))):
         out = row["image"]
         assert out.dtype == np.uint8
         assert out.shape == base.shape
