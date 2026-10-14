@@ -390,8 +390,10 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     if stage.policy == "concat":
         return gx.ConcatThenSplitIterDataset(documents, length_struct=sizes)
     packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
+    # Fields cut alike with the first share its segments and positions, as the indexed planner's
+    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
-                  max_sequences_per_bin=stage.segments)
+                  max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
 
 
 def _reordered(stage: Shuffle | Repeat | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
