@@ -54,14 +54,12 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
-from reference_source import CACHE, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "llama_cpp"
 TOKENIZER = FIXTURE / "tokenizer"
 COMMIT = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 ARCHIVE_SHA256 = "a6861d549427f814dc591c439e08206f67ffaba0248344d421589abf18199e67"
-SOURCE = CACHE / "ggml-org" / "llama.cpp" / COMMIT
 FIELDS = {"vocab_size": 384, "emb_features": 64, "num_layers": 2, "num_heads": 4, "num_kv_heads": 2,
           "mlp_features": 128, "max_seq_len": 64, "qk_norm": False, "tie_embeddings": False}
 SEED = 61
@@ -208,15 +206,18 @@ def digests(directory: Path) -> dict[str, str]:
 def fetch() -> Path:
     """The pinned source, its archive fetched once, checked against its
     SHA-256 and unpacked."""
-    if (SOURCE / "convert_hf_to_gguf.py").is_file():
-        return SOURCE
+    from tools.reference_source import CACHE, verified
+
+    unpacked = CACHE / "ggml-org" / "llama.cpp" / COMMIT
+    if (unpacked / "convert_hf_to_gguf.py").is_file():
+        return unpacked
     archive = verified(f"https://github.com/ggml-org/llama.cpp/archive/{COMMIT}.tar.gz",
-                       SOURCE.parent / f"{COMMIT}.tar.gz", ARCHIVE_SHA256)
+                       unpacked.parent / f"{COMMIT}.tar.gz", ARCHIVE_SHA256)
     with tarfile.open(archive) as source:
         for member in source.getmembers():
             member.name = member.name.split("/", 1)[1] if "/" in member.name else ""
-        source.extractall(SOURCE, members=[m for m in source.getmembers() if m.name], filter="data")
-    return SOURCE
+        source.extractall(unpacked, members=[m for m in source.getmembers() if m.name], filter="data")
+    return unpacked
 
 
 def build(source: Path) -> Path:
