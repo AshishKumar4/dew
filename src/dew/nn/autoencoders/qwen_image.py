@@ -339,6 +339,9 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
+    record_name = 'qwen_image'
+    record_module = QwenImageVAE
+
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
         super().__init__(model, params)
@@ -350,13 +353,9 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
                 f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
-    @property
-    def downscale_factor(self) -> int:
-        return self.model.downscale_factor
 
-    @property
-    def latent_channels(self) -> int:
-        return self.model.latent_channels
+    def record_arguments(self) -> dict:
+        return {'latents_mean': self.latents_mean, 'latents_std': self.latents_std}
 
     # The base class's shift and scale stay 0 and 1, so its encode and decode
     # only flatten video around the batch calls here.
