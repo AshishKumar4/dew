@@ -45,6 +45,7 @@ from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels.generation import assumed
 from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -61,14 +62,7 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import (
-    FORWARD_FLOPS,
-    TOKENS,
-    TRAINING_FLOPS,
-    _TokenCount,
-    prepare_counts,
-    step_counts,
-)
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -236,7 +230,7 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
     np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
-    assert counted[FORWARD_FLOPS].sum() == objective.model_flops(None, batch)
+    assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
         prepare_counts(objective, counted, count_model=True)
@@ -346,7 +340,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
         assert _TokenCount.host(measured[TOKENS]) == 7
-        assert float(measured[FORWARD_FLOPS]) == objective.model_flops(None, batch)
+        assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
 
@@ -359,8 +353,7 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     def counted(steps):
         for forward, tokens in steps:
             interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                           jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
-                                                      TRAINING_FLOPS: jnp.asarray(3 * forward),
+                           jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
                                                       TOKENS: jnp.asarray(_TokenCount.words(tokens))})
 
     counted(((100, 4), (200, 3)))
@@ -383,8 +376,12 @@ def forward_products(function, *operands, state_mac: bool = False):
     hide a missing Dense. Noncausal, unpadded fixtures make attention's
     logical product equal its executed product; chunked recurrence model
     FLOPs instead follow their documented algorithm-independent formula.
+    The forward is traced on its reference path, as on a CPU, on every
+    device: a GPU's kernels are custom calls, whose products no jaxpr shows.
     """
-    return float(jaxpr_products(jax.make_jaxpr(function)(*operands), state_mac=state_mac))
+    with assumed("cpu"):
+        traced = jax.make_jaxpr(function)(*operands)
+    return float(jaxpr_products(traced, state_mac=state_mac))
 
 
 def jaxpr_products(graph, *, state_mac=False):
