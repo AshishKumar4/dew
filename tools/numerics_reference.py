@@ -25,7 +25,12 @@ What lands, beside each fixture's own files:
   deepseek-v3-tiny and mamba2-tiny: `f64` and `bf16`, the reference forward
   on the committed `input_ids.npy` with weights and activations in float64
   and in bfloat16 (stored as float32, which holds every bfloat16 exactly).
-  The float64 run is the truth both precisions are measured from.
+  The float64 run is the truth both precisions are measured from, with every
+  float32 pin of the model widened (`diffusers_wan_reference.float64`):
+  its norms', rotary tables' and attention softmax's casts, which otherwise
+  round the truth at float32 where Gemma-family models pin them (the
+  diffusion-gemma truth moved 1.7e-7 to 2.4e-7 RMS, about half the fp32
+  run's own distance, when widened).
 - numerics.npz in diffusion-gemma-workflow: the same pair for the three
   denoiser forwards in its reference.npz (`bare`, `conditioned`,
   `image_logits`), and in diffusion-gemma-denoise-tiny for `ref_bare` and
@@ -55,6 +60,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
+from diffusers_wan_reference import float64
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
@@ -105,7 +111,8 @@ def logits(model, ids: np.ndarray) -> np.ndarray:
 def write_decoder(name: str) -> None:
     directory = FIXTURES / name
     ids = np.load(directory / "input_ids.npy")
-    f64 = logits(decoder(name, torch.float64), ids)
+    with float64():
+        f64 = logits(decoder(name, torch.float64), ids)
     same(name, logits(decoder(name, torch.float32), ids).astype(np.float32),
          np.load(directory / "logits.npy"), f64)
     bf16 = logits(decoder(name, torch.bfloat16), ids).astype(np.float32)
@@ -150,7 +157,8 @@ def write_workflow() -> None:
     directory = FIXTURES / "diffusion-gemma-workflow"
     with np.load(directory / "reference.npz") as stored:
         reference = {key: stored[key] for key in stored.files}
-    f64 = workflow_outputs(workflow(torch.float64), reference, torch.float64)
+    with float64():
+        f64 = workflow_outputs(workflow(torch.float64), reference, torch.float64)
     fp32 = workflow_outputs(workflow(torch.float32), reference, torch.float32)
     for key, value in fp32.items():
         same(f"workflow {key}", value.astype(np.float32), reference[key], f64[key])
@@ -205,7 +213,8 @@ def denoiser_outputs(model, dtype: torch.dtype) -> dict[str, np.ndarray]:
 
 def write_denoiser() -> None:
     directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    f64 = denoiser_outputs(denoiser(torch.float64), torch.float64)
+    with float64():
+        f64 = denoiser_outputs(denoiser(torch.float64), torch.float64)
     for key, value in denoiser_outputs(denoiser(torch.float32), torch.float32).items():
         same(f"denoiser {key}", value.astype(np.float32), np.load(directory / f"{key}.npy"), f64[key])
     bf16 = denoiser_outputs(denoiser(torch.bfloat16), torch.bfloat16)
@@ -255,7 +264,6 @@ def filtered(scores: torch.Tensor) -> torch.Tensor:
 def write_generation(name: str) -> None:
     directory = FIXTURES / name
     model = decoder(name, torch.float32)
-    exact = decoder(name, torch.float64)
     model.generation_config.eos_token_id = None
     ids, mask = prompts(model.config.vocab_size)
     width = ids.shape[1]
@@ -269,11 +277,15 @@ def write_generation(name: str) -> None:
         sampled = model.generate(**common, do_sample=True, temperature=TEMPERATURE, top_k=TOP_K,
                                  top_p=TOP_P)
     arrays: dict[str, np.ndarray] = {"prompt": ids, "mask": mask}
+    with float64():
+        exact = decoder(name, torch.float64)
+        f64s = {path: teacher_forced(exact, result.sequences.numpy(), mask, width)
+                for path, result in (("greedy", greedy), ("sampled", sampled))}
     for path, result in (("greedy", greedy), ("sampled", sampled)):
         sequences = result.sequences.numpy()
         assert sequences.shape == (ids.shape[0], width + NEW_TOKENS)
         step_logits = torch.stack(result.logits, 1)
-        f64 = teacher_forced(exact, sequences, mask, width)
+        f64 = f64s[path]
         arrays[f"{path}_tokens"] = sequences[:, width:]
         arrays[f"{path}_logits"] = step_logits.to(torch.float32).numpy()
         arrays[f"{path}_f64"] = f64
@@ -319,8 +331,10 @@ def write_attention() -> None:
         out, _ = eager_attention_forward(module, q.to(dtype), k.to(dtype), v.to(dtype), None,
                                          scaling=width ** -0.5)
         return out
+    with float64():
+        exact = attend(torch.float64)
     np.savez(FIXTURES.parent / "attention_bf16.npz", q=bits(q), k=bits(k), v=bits(v),
-             bf16=bits(attend(torch.bfloat16)), f64=attend(torch.float64).to(torch.float32).numpy())
+             bf16=bits(attend(torch.bfloat16)), f64=exact.to(torch.float32).numpy())
 
 
 def main() -> None:
