@@ -924,7 +924,8 @@ _SANDWICH_NORMS = {
     'pre_feedforward_layernorm': 'post_attention_layernorm',
     'post_feedforward_layernorm': 'mlp_output_norm',
 }
-_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
+# An attention gate_proj is Muse Glimmer's output gate (`CausalSelfAttention.gate_projection`).
+_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'gate_proj', 'o_proj'),
                 'mlp': ('gate_proj', 'up_proj', 'down_proj', 'gate')}
 _HEAD_NORMS = ('q_norm', 'k_norm')
 # The MLA projections and norms live under self_attn beside the standard

@@ -13,6 +13,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew.interop.mamba2 import config_from_hf
@@ -81,9 +82,10 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     common 13 tokens.
 
     Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
-    equal; tolerance 1e-3, about twice that. Dew computing and storing
-    bfloat16 sits 4.8 from the fp32 reference, where the reference's own
-    bfloat16 forward sits 9.1; tolerance 10, about twice Dew's.
+    equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
+    the conv's bf16 output, as the reference's own bfloat16 forward does, and
+    is held to that forward's RMS distance from the fp32 logits
+    (`assert_as_exact_as_the_reference`).
     """
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
@@ -105,4 +107,7 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
     assert largest(logits, reference) < 1e-3
     assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    assert largest(bf16.model.apply(bf16.variables, ids), reference) < 10
+    with torch.no_grad():
+        theirs = port.to(torch.bfloat16)(torch.from_numpy(ids.astype(np.int64))).logits.float().numpy()
+    mine = np.asarray(bf16.model.apply(bf16.variables, ids), np.float32)
+    assert_as_exact_as_the_reference(mine, theirs, reference, "bf16 logits against the fp32 port's")
