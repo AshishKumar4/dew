@@ -23,10 +23,11 @@ from flax.typing import Dtype
 from dew import records
 from dew.data.text import HFTokenizer
 from dew.decision.head import JointSchemaHead
-from dew.decision.laya import unpacked_attention
+from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs, Specials
 from dew.decision.model import DecisionModel
 from dew.interop import sources
+from dew.interop.decoder_parts import split_packed
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import read_file
 from dew.interop.weights import translate_parameters
@@ -91,7 +92,7 @@ class StoredJointHead:
             raise ValueError("the stored head drops out at a rate Dew's head does not train with")
         head = JointSchemaHead.rebuilt(records.integer(config["hidden_size"], "hidden_size"), config,
                                        dtype=dtype, attention_impl=attention_impl)
-        tensors = unpacked_attention(read_file(root / HEAD_WEIGHTS)[0])
+        tensors = split_packed(read_file(root / HEAD_WEIGHTS)[0], IN_PROJ)
         flat = translate_parameters(tensors, _path, param_dtype)
         return cls(head, _shaped(head, flat))
 

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
+from dew.decision.calibration import tied_prefixes
 from dew.eval.common import metric_device
 from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
 
@@ -121,9 +122,6 @@ class AURC:
 
     def finalize(self, accumulated: tuple[np.ndarray, np.ndarray]) -> float:
         tops, correct = accumulated
-        order = np.argsort(-tops, kind="mergesort")
-        tops, correct = tops[order], correct[order]
-        last = np.flatnonzero(np.concatenate((tops[1:] != tops[:-1], [True])))
-        accepted = last + 1.0
-        risk = 1.0 - np.cumsum(correct)[last] / accepted
-        return float(np.sum(risk * np.diff(np.concatenate(([0.0], accepted)))) / len(tops))
+        _, accepted, right = tied_prefixes(tops, correct)
+        risk = 1.0 - right / accepted
+        return float(np.sum(risk * np.diff(np.concatenate(([0], accepted)))) / len(tops))
