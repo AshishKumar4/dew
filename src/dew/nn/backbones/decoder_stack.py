@@ -19,21 +19,12 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.objectives.base import merge
+
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
-
-
-def _merged(bank: Mapping, rows: Mapping) -> dict:
-    """`bank` with every leaf `rows` holds added beside its own."""
-    merged = dict(bank)
-    for key, value in rows.items():
-        held = merged.get(key)
-        merged[key] = (_merged(held, value) if isinstance(held, Mapping) and isinstance(value, Mapping)
-                       else value)
-    return merged
-
 
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
@@ -456,7 +447,7 @@ class StackView:
                     # A bank already stored under the run's name holds the
                     # leaves its rows lack (`banked_collections`); the rows
                     # stack into it.
-                    tree[name] = _merged(tree[name], runs[0]) if name in tree else runs[0]
+                    tree[name] = merge(tree[name], runs[0]) if name in tree else runs[0]
                 else:
                     stages[name] = jax.tree.map(_on_stage_axis, _stack_leaves(*runs))
             if stages:

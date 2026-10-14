@@ -264,7 +264,16 @@ class Files(Dataset):
                 or metadata.get("generation")
             )
             if local(fs):
-                version = content_version(fs, path, integer(metadata["size"], "size"))
+                # A copy on this host's disk is named by what it holds, which its producer's
+                # declaration, where it states one, must describe.
+                size = integer(fs.info(path)["size"], "size")
+                version = content_version(fs, path, size)
+                stated = self.declared.get(url, {})
+                if stated.get("bytes", size) != size or stated.get("sha256", version) != version:
+                    raise ValueError(
+                        f"{url} declares {stated.get('bytes')} bytes (sha256 {stated.get('sha256')}), but "
+                        f"the file holds {size} (sha256 {version}): the store's metadata is stale")
+                metadata = {**metadata, "size": size}
             elif version is None:
                 version = fs.ukey(path)
             files.append(
@@ -744,12 +753,16 @@ class _Lines(grain.IterDataset):
 
 
 class _LineIterator(grain.DatasetIterator):
+    # Whether `file` is open: an iterator whose opening failed has nothing to close.
+    _opened = False
+
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
         self.fs, self.path = Store(shard.uri, source.storage_options).resolve()
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
+        self._opened = True
         self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
         if self.csv is not None:
             _ = self.csv.fieldnames
@@ -790,4 +803,5 @@ class _LineIterator(grain.DatasetIterator):
         _seek_lines(self.file, offset)
 
     def close(self) -> None:
-        self.file.close()
+        if self._opened:
+            self.file.close()

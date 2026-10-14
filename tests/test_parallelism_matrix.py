@@ -7,15 +7,17 @@ under reassociating its sums (its rows reordered and pooled, and the step's
 distance from fp64), and holds the layout's FLOPs to an even split. A cell
 works, or is refused by design with its reason, as a stage axis over a model
 that runs no pipeline is; any other status is a defect. The models are the
-tool's zoo, sized so every layout divides them. Each row lists the layouts
-that split its model in a way no other row covers: a pair's second axis, a
-packed or masked column under a sequence split, a bidirectional exchange, a
-vision tower beside a pipelined decoder, a tensor or sequence axis over
-experts, and a data axis Explicit (`MeshSpec.explicit`), alone and beside
-fsdp, wherever an operation is placed from its rows rather than its
-operands: the embedding's gather and scatter-add, GRPO's shifted scores,
-MDLM's mask draw, Mamba-1's and Mamba-2's states and conv histories,
-unpatchify, JEPA's repeat and covariance, and a vision tower's placed slots.
+tool's zoo, sized so every layout divides them. Each row lists the layouts that
+split its model in a way no other row covers: a pair's second axis, a packed or
+masked column under a sequence split, a bidirectional exchange, a vision tower
+beside a pipelined decoder, a tensor or sequence axis over experts, a norm's
+statistics over groups of a split width, an attention gate of its own
+projection over split heads, and a data axis Explicit
+(`MeshSpec.explicit`), alone and beside fsdp, wherever an operation is placed
+from its rows rather than its operands: the embedding's gather and scatter-add,
+GRPO's shifted scores, MDLM's mask draw, Mamba-1's and Mamba-2's states and
+conv histories, unpatchify, JEPA's repeat and covariance, and a vision tower's
+placed slots.
 
 The tool draws every parameter an initializer leaves all zeros, so a
 DiT's zeroed output and modulations do not hide the layers above them
@@ -36,6 +38,8 @@ CELLS: dict[str, tuple[str, ...]] = {
     "dense_dpo": ("fsdp4", "sequence4"),
     "dense_grpo": ("tensor4", "sequence4", "data4_explicit"),
     "dense_mdlm": ("sequence4", "fsdp2_tensor2", "fsdp2_explicit"),
+    "grouped": ("fsdp2_tensor2",),
+    "gated": ("tensor4",),
     "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
