@@ -33,6 +33,7 @@ const LABELS = {
 	'06-jepa-representation-learning': 'Representations with I-JEPA',
 	'07-scaling-on-many-devices': 'Scale across devices',
 	'08-load-a-pretrained-decoder': 'Continue a pretrained decoder',
+	'09-sft-for-llms': 'SFT for LLMs',
 };
 
 function fence(code) {
