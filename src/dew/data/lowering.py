@@ -665,6 +665,26 @@ class _Build:
         stream = self.batched(pipeline, partition, offset, fill=fill)
         return iter(self.after_batch(stream, pipeline, partition, batching))
 
+    def tuned(self, pipeline: Pipeline) -> _Build:
+        """This build with automatic loading resolved on the whole order
+        (`Loading.resolved`), and at most one worker per batch of a pass that
+        ends where its rows are indexed. Grain sizes workers by memory alone,
+        and a validation pass read with training's workers, so a pass of five
+        batches had one per core, 26 on an H100 host. Each worker past the
+        last batch reads nothing, yet starts a process that imports the
+        program and keeps about six pipes open until the reader is collected."""
+        loading = self.loading
+        bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
+        if loading.workers == "auto":
+            loading = loading.resolved(bare.batched(pipeline, DataPartition()))
+        if loading.worker_count and (not self.training or not self.lowering.endless):
+            rows = bare.records(pipeline, DataPartition())
+            if isinstance(rows, pygrain.MapDataset):
+                size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+                batches = -(-len(rows) // size)
+                loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
+        return dataclasses.replace(self, loading=loading)
+
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> pygrain.IterDataset:
