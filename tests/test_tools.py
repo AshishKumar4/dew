@@ -581,9 +581,13 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
             "def test_imported_here():\n"
             "    from pytest import raises as source\n"
             "    with source(ValueError, match='empty'):\n"
-            "        graph.edges({})\n"),
+            "        graph.edges({})\n"
+            "class TestReading:\n"
+            "    from inspect import getsource as read\n"
+            "    def test_default(self, text=read(graph)):\n"
+            "        assert text\n"),
     })
-    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22)]
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
@@ -616,7 +620,11 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
             "    Edges().json.dumps = repr\n"
             "def after_comprehension():\n"
             "    [conv for conv in (Edges(),)]\n"
-            "    conv.convolve = repr\n"),
+            "    conv.convolve = repr\n"
+            "def rebuilt():\n"
+            "    import json\n"
+            "    json = Edges()\n"
+            "    json.count = 0\n"),
         "tools/bench.py": (
             "import json\n"
             "from sparx import graph\n"
