@@ -35,8 +35,9 @@ green row records the checkout's Python files its tests executed
 itself and what every file shares (`shared`: the environment's locks, the
 CI tools, every non-Python file under tests/ and src/, and the names of every
 Python file there, so a file a scanner would find changes every key). A task
-recomputes each of its files' keys from the record made on its own CPU class
-(float32 results differ by microarchitecture) and reports the recorded green row
+recomputes each of its files' keys from the record made on its own class
+(`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
+and reports the recorded green row
 instead of running a file whose key matches, which ran green on exactly these
 inputs there. A file that started another process is never reused, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
@@ -46,7 +47,9 @@ token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU, for the H100 tier to run.
+another path on a GPU. A GPU node runs them as tasks of a CUDA lane, whose
+rows are recorded and reused on the GPU's class as a CPU task's are on the
+CPU's, so a batch reruns only those whose inputs it changed.
 """
 
 import argparse
@@ -102,8 +105,9 @@ across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
 SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
           "tools/armada/executed.py", str(DURATIONS))
-"""The files every test file's key covers whole, beside tests/ and src/ and the environment's own
-inputs, which .armada.json names (`environment_files`)."""
+"""The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
+builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
+names (`environment_files`)."""
 
 
 def environment_files() -> list[str]:
@@ -124,8 +128,8 @@ grading with a changed record format never overwrites or breaks main's records."
 
 
 def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every non-Python
-    file under tests/ and src/, and the names of every Python file there."""
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
+    non-Python file under tests/ and src/, and the names of every Python file there."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
@@ -134,7 +138,7 @@ def shared(python: str) -> str:
             digest.update(str(path).encode())
             if path.suffix != ".py":
                 digest.update(hashlib.sha256(path.read_bytes()).digest())
-    for name in (*SHARED, *environment_files()):
+    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
 
@@ -164,16 +168,28 @@ def cpu_class() -> str:
     return "-".join(fields.get(key, "unknown") for key in ("vendor_id", "cpu family", "model"))
 
 
+def device_class() -> str:
+    """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as
+    tests/lane_environment.py reads it) the host's GPU model as its driver names it, before the CPU's
+    class, whose float32 the lane's CPU devices compute (`cpu_class`); else the CPU's class alone."""
+    if "cuda" not in os.environ.get("JAX_PLATFORMS", "").split(","):
+        return cpu_class()
+    models = sorted({line.partition(":")[2].strip()
+                     for path in Path("/proc/driver/nvidia/gpus").glob("*/information")
+                     for line in path.read_text().splitlines() if line.startswith("Model:")})
+    return "-".join(["+".join(models).replace(" ", "-") or "unknown-gpu", cpu_class()])
+
+
 def worker() -> str:
     """The URL of the Worker that holds the records."""
     return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
 
 
-def cache_url(python: str, row_name: str, cpu: str) -> str:
-    """Where the record of `row_name` on CPU class `cpu` lives: the Worker's key alphabet has no colon
-    or hash."""
+def cache_url(python: str, row_name: str, held: str) -> str:
+    """Where the record of `row_name` on class `held` (`device_class`) lives: the Worker's key alphabet
+    has no colon or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{worker()}/{CACHE_PREFIX}/{python}/{cpu}/{name}/"
+    return (f"{worker()}/{CACHE_PREFIX}/{python}/{held}/{name}/"
             + ("-of-".join(split.split("/")) if split else "whole"))
 
 
@@ -196,12 +212,12 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
-    """The green row of test file `name` (in `split`'s group) recorded on this host's CPU class, if it
-    ran green there on exactly these inputs; else None."""
+    """The green row of test file `name` (in `split`'s group) recorded on this host's class
+    (`device_class`), if it ran green there on exactly these inputs; else None."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), cpu_class()), token)
+    record = cache_request(cache_url(python, row(python, name, split), device_class()), token)
     if record is None:
         return None
     recorded = json.loads(record)
@@ -411,7 +427,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
-        print(f"{len(rows)} files ran green on these inputs on {cpu_class()}; their rows are reused")
+        print(f"{len(rows)} files ran green on these inputs on {device_class()}; their rows are reused")
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -495,7 +511,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
     executed = json.loads(executed_report.read_text())
-    cpu = cpu_class()
+    held = device_class()
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         if row_["exitCode"] == 0 and name in executed:
@@ -503,7 +519,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
             key = None if depends is None else cache_key(common, name, depends)
             body = json.dumps({"key": key, "depends": depends, "row": row_,
                                "reads": executed[name]["reads"]}).encode()
-            cache_request(cache_url(python, row_["name"], cpu), token, body)
+            cache_request(cache_url(python, row_["name"], held), token, body)
 
 
 def listed(prefix: str, token: str) -> list[str]:
@@ -524,7 +540,7 @@ def listed(prefix: str, token: str) -> list[str]:
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
-    on every CPU class, a split file's under each count of groups it was planned as. A file is out
+    on every class, a split file's under each count of groups it was planned as. A file is out
     only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
     changed since it ran is in as "changed", and one without a record, or with one the Worker did not
     return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
@@ -535,7 +551,7 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
-        name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <cpu class>/<test file>/<group>
+        name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <class>/<test file>/<group>
         record = cache_request(f"{worker()}/{prefix}{key}", token)
         if record is None:
             return name, ["unrecorded"]

@@ -127,7 +127,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process has no key, so it is in, and no task reuses
-    its row."""
+    its row. Under pytest-xdist, the workers' reports join."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -165,10 +165,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file.
+    # The session fixture's files in a task of their own, where it reads for every file, on two
+    # pytest-xdist workers, as the GPU tier runs: each worker's report joins the task's.
     fixtures = ["tests/test_one.py", "tests/test_two.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests in ([name for name in ran if name not in fixtures], fixtures):
+    for tests, options in (([name for name in ran if name not in fixtures], ""), (fixtures, "-n 2")):
+        monkeypatch.setenv("PYTEST_ADDOPTS", options)
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
