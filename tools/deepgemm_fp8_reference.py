@@ -23,35 +23,27 @@ from the checkout with any torch that has float8_e4m3fn on the CPU:
     python tools/deepgemm_fp8_reference.py
 """
 
-import hashlib
 import importlib.util
 import json
-import urllib.request
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
+from reference_source import CACHE as UPSTREAM, verified
 
 REPO = "deepseek-ai/DeepGEMM"
 COMMIT = "057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7"
 SOURCE = "deep_gemm/utils/math.py"
 SHA256 = "9cdecd0c0a0a8b3c64af87107464c91510876110eb80bdb485ff1f74eda8ea0e"
-CACHE = Path.home() / ".cache" / "dew" / "upstream" / "DeepGEMM" / COMMIT
+CACHE = UPSTREAM / "DeepGEMM" / COMMIT
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "deepgemm_fp8.npz"
 RANDOM = (((256, 384), 128), ((130, 259), 128), ((5, 7), 128), ((48, 32), 16), ((7, 3), 2))
 
 
 def upstream():
     """DeepGEMM's math.py at `COMMIT`, fetched once and checked."""
-    path = CACHE / SOURCE
-    if not path.is_file():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{SOURCE}"
-        path.write_bytes(urllib.request.urlopen(url).read())
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != SHA256:
-        raise RuntimeError(f"{path} has SHA-256 {digest}, not the pinned {SHA256}")
+    path = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{SOURCE}", CACHE / SOURCE, SHA256)
     spec = importlib.util.spec_from_file_location("deepgemm_math", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

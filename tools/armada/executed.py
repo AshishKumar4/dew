@@ -35,9 +35,10 @@ and uname and file (the `platform` module's answers). Any other start, a shell's
 included, may run the checkout's code."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
-"""Audit events of a process start. A multiprocessing child is counted where it starts (`start_child`):
-Python 3.12 audits no spawn or forkserver start, and a forkserver's later children start in its own
-process."""
+"""Audit events of a process start; a multiprocessing child's is `CHILD_START`'s."""
+CHILD_START = BaseProcess.start.__code__
+"""Where every multiprocessing context starts a child, a Python process: Python 3.12 audits no spawn
+or forkserver start, and a forkserver's later children start in its own process."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()
@@ -58,6 +59,12 @@ decided: dict[types.CodeType, bool] = {}
 
 
 def started(code, offset):
+    if code is CHILD_START:
+        # Never disabled: a thread's start that disabled it as the next test file began would leave
+        # that file's starts unseen. Process starts are few.
+        if running:
+            spawned.add(running[-1])
+        return None
     name = code.co_filename
     if not checkout(name):
         return sys.monitoring.DISABLE
@@ -133,13 +140,6 @@ def native(names: list) -> bool:
                                and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
 
 
-def start_child(self: BaseProcess) -> None:
-    """`BaseProcess.start`, counting the child every multiprocessing context starts: a Python process."""
-    if running:
-        spawned.add(running[-1])
-    multiprocessing_start(self)
-
-
 # Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
 # import Dew; repository modules imported even earlier join what every file shares.
 shared.update(name[len(root):] for module in list(sys.modules.values())
@@ -148,8 +148,6 @@ sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
 sys.addaudithook(audited)
-multiprocessing_start = BaseProcess.start
-BaseProcess.start = start_child
 
 
 @pytest.hookimpl(hookwrapper=True)
