@@ -265,7 +265,7 @@ def test_a_failed_cleanup_never_hides_why_a_start_ended(bridge, monkeypatch):
 
 def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypatch):
     """The Worker names the session's end on each connection. A page that reconnects shortly before it
-    is closed then, not a full allowance later, and one that connects after it is refused."""
+    is closed then, not a full allowance later, and told why; one that connects after it is refused."""
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed
 
@@ -280,11 +280,12 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
             await first.close()
             await asyncio.sleep(1.0)
             again = await page(port, session, ends_in=4.0 - (time.monotonic() - began))
-            with pytest.raises(ConnectionClosed):
+            with pytest.raises(ConnectionClosed) as ended:
                 while True:
                     await asyncio.wait_for(again.recv(), 60)
-            # Closed at the session's end, not an allowance after the reconnect.
+            # Closed at the session's end, not an allowance after the reconnect, and told why.
             assert 4.0 <= time.monotonic() - began < 30
+            assert (ended.value.rcvd.code, ended.value.rcvd.reason) == (1000, "it reached its time limit")
             await settled(kernels)
             assert kernels.live == set()
             late = await connect(f"ws://127.0.0.1:{port}/contexts/{session}/ws", additional_headers={
@@ -339,6 +340,37 @@ print(json.dumps(batches))
     *said, batches = done.stdout.strip().splitlines()
     assert json.loads(batches) == [8, 8, 8]
     assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3
+
+
+def test_a_session_idle_past_its_allowance_ends_and_says_so(bridge, monkeypatch):
+    """With no cell running and no request for the idle allowance, the bridge closes the page's socket
+    with its reason, and the session's kernels."""
+    from websockets.exceptions import ConnectionClosed
+
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+    monkeypatch.setenv("DEW_LIVE_IDLE_SECONDS", "120")
+
+    async def scenario():
+        kernels = Kernels()
+        gateway, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            # Its contexts were last used three minutes ago.
+            for cells in gateway.contexts.values():
+                for context in cells.values():
+                    context.last_used -= 180
+            with pytest.raises(ConnectionClosed) as ended:
+                while True:
+                    await asyncio.wait_for(socket.recv(), 30)
+            closed = ended.value.rcvd
+            assert (closed.code, closed.reason) == (1000, "it had no request for 2 minutes")
+            await settled(kernels)
+            assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
 
 
 def test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it(bridge, monkeypatch):

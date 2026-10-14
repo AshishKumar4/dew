@@ -8,23 +8,42 @@ upstream definition fails the generator instead of leaving a stale one in
 scope. `defined_in` (`definitions` for a URL) runs them in the generator's
 scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
-takes single lines out of a published function.
+takes single lines out of a published function. `verified` keeps a
+reference file on disk, fetched once and checked against its pinned SHA-256
+on every use.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import urllib.request
 from collections.abc import Iterable
+from pathlib import Path
 
 TIMEOUT = 120
 """Seconds a fetch may take."""
+CACHE = Path.home() / ".cache" / "dew" / "upstream"
+"""Where `verified` keeps fetched reference files, each under its own source's path."""
 
 
 def fetched(url: str) -> str:
     """The text of the file at `url`."""
     with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
         return response.read().decode()
+
+
+def verified(url: str, local: Path, digest: str) -> Path:
+    """`local`, the file at `url` fetched there if it is not yet, refused
+    unless its SHA-256 is `digest`."""
+    if not local.is_file():
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+            local.write_bytes(response.read())
+    found = hashlib.sha256(local.read_bytes()).hexdigest()
+    if found != digest:
+        raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
+    return local
 
 
 def _defined(node: ast.stmt) -> set[str]:
