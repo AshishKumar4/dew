@@ -20,6 +20,7 @@ import json
 import os
 import re
 import signal
+import sys
 import time
 import urllib.request
 import uuid
@@ -40,7 +41,9 @@ MAX_OUTPUT = 2_000_000
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
 DEADLINE_HEADER = "X-Dew-Deadline"
-"""The session's end, in milliseconds since the epoch, which the Worker sets on every connection."""
+"""The session's end, in milliseconds since the epoch, which the Worker sets on every connection. The
+bridge reads it against its own wall clock: the host's and the Worker's clocks, both NTP-synced, may
+differ by the end's accuracy, a few seconds at most, which moves the end by as much and no more."""
 # Memory the model process and the bridge keep free. Below it a new context is refused and the
 # largest guest is killed at once: waiting for the kernel's OOM killer lets the host thrash first.
 RESERVE = 1536 << 20
@@ -157,12 +160,23 @@ def largest_guest(proc=Path("/proc")):
 
 
 class Page:
-    """One page's connection: its socket and contexts, each cell's running task and request, the
-    contexts of its running training cells, and the training cells its Stop ended."""
+    """One page's connection: its socket and contexts, each cell's running task and request, every
+    task it started and has not ended (a restart's predecessor included), the contexts of its
+    running training cells, the cells its Stop ended and the cells restarting."""
 
     def __init__(self, socket, session, cells):
         self.socket, self.session, self.cells = socket, session, cells
         self.running, self.requests, self.training, self.stops = {}, {}, {}, set()
+        self.tasks, self.restarting = set(), set()
+
+    def admit(self, message, cell):
+        """Why the bridge refuses `message` on `cell` now, or None: a page runs or queues at most
+        MAX_CELLS cells, and a restart, which ends a running cell, at most as many beside them."""
+        if message["op"] == "restart" and cell in self.restarting:
+            return "this cell is restarting already"
+        if len(self.tasks) >= (MAX_CELLS if message["op"] == "execute" else 2 * MAX_CELLS):
+            return f"this page runs or queues {MAX_CELLS} cells already; stop one, or wait for one to finish"
+        return None
 
     def busy(self):
         return any(not task.done() for task in self.running.values())
@@ -189,6 +203,8 @@ class Gateway:
         self.waiting = []
         self.started = time.monotonic()
         self.idle = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
+        # Cleanups running to their end after what they clean up for was cancelled (`settle`).
+        self.cleanups = set()
 
     async def api(self, path, data=None, method=None):
         def call():
@@ -216,8 +232,7 @@ class Gateway:
             try:
                 created = await asyncio.shield(creating)
             except asyncio.CancelledError:
-                with suppress(Exception):
-                    await self.api(f"/api/kernels/{(await creating)['id']}", method="DELETE")
+                await self.settle(self.discard(None, creating))
                 raise
             kernel = {**created, "preload": PRELOAD[kernel]}
             channels = None
@@ -237,14 +252,31 @@ class Gateway:
                 return context
             except BaseException:
                 # Cancellation too (a disconnect, a Restart): nothing else knows this kernel yet.
-                await asyncio.shield(self.discard(channels, kernel["id"]))
+                await self.settle(self.discard(channels, creating))
                 raise
 
-    async def discard(self, channels, identifier):
-        """Close a kernel no context holds: its channels, if open, and the kernel."""
-        if channels:
-            await channels.close()
-        await self.api(f"/api/kernels/{identifier}", method="DELETE")
+    async def discard(self, channels, creating):
+        """Close a kernel no context holds, once `creating` has made it: its channels, if open, and
+        the kernel, which is deleted though its channels fail to close."""
+        try:
+            if channels:
+                await channels.close()
+        finally:
+            await self.api(f"/api/kernels/{(await creating)['id']}", method="DELETE")
+
+    async def settle(self, cleanup):
+        """Run `cleanup` to its end, though the caller is cancelled again meanwhile; its failure is
+        logged, never raised: what ended the caller is why it ended."""
+        task = asyncio.ensure_future(cleanup)
+        self.cleanups.add(task)
+
+        def ended(task):
+            self.cleanups.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                print(f"a kernel's cleanup failed: {task.exception()!r}", file=sys.stderr, flush=True)
+        task.add_done_callback(ended)
+        with suppress(Exception, asyncio.CancelledError):
+            await asyncio.shield(task)
 
     async def create(self, session):
         if session not in self.contexts:
@@ -346,7 +378,7 @@ class Gateway:
 
     async def websocket(self, socket):
         session = socket.request.path.split("/")[2]
-        # The session's end, on this host's monotonic clock.
+        # The session's end (DEADLINE_HEADER), on this host's monotonic clock.
         deadline = time.monotonic() + int(socket.request.headers[DEADLINE_HEADER]) / 1000 - time.time()
         if deadline <= time.monotonic():
             await socket.close(1008, "this session is over")
@@ -391,21 +423,22 @@ class Gateway:
                         raise ValueError("invalid or oversized cell")
                     for ended in [name for name, task in page.running.items() if task.done()]:
                         del page.running[ended], page.requests[ended]
-                    if message["op"] == "execute" and len(page.running) >= MAX_CELLS:
-                        await page.fail(message["id"], ValueError(
-                            f"this page runs or queues {MAX_CELLS} cells already; stop one, or wait for one "
-                            "to finish"))
+                    if refusal := page.admit(message, cell):
+                        await page.fail(message["id"], ValueError(refusal))
                         continue
                     step = self.run if message["op"] == "execute" else self.restart
                     before = page.running.get(cell), page.requests.get(cell)
-                    page.running[cell] = asyncio.create_task(step(page, message, cell, before))
-                    page.requests[cell] = message["id"]
+                    task = asyncio.create_task(step(page, message, cell, before))
+                    page.tasks.add(task)
+                    task.add_done_callback(page.tasks.discard)
+                    page.running[cell], page.requests[cell] = task, message["id"]
                 else:
                     raise ValueError("unsupported kernel operation")
         finally:
-            for task in page.running.values():
+            tasks = list(page.tasks)
+            for task in tasks:
                 task.cancel()
-            for task in page.running.values():
+            for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
             self.connected.discard(session)
@@ -450,10 +483,12 @@ class Gateway:
             await page.fail(message["id"], error)
         finally:
             page.training.pop(cell, None)
+            page.stops.discard(cell)
 
     async def restart(self, page, message, cell, before):
         """End what runs in `cell`, give it a fresh context, and answer done: the notebook's Restart."""
         previous, ended = before
+        page.restarting.add(cell)
         try:
             if previous is not None and not previous.done():
                 page.stops.add(cell)
@@ -471,6 +506,8 @@ class Gateway:
                                                "count": None}))
         except Exception as error:
             await page.fail(message["id"], error)
+        finally:
+            page.restarting.discard(cell)
 
     async def guard(self):
         """Kill the largest guest while the host's available memory is under RESERVE; the bridge

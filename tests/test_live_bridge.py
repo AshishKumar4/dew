@@ -28,17 +28,25 @@ def bridge():
 
 
 class Kernels:
-    """The Kernel Gateway's REST and channel protocol over a set of kernels. Creating one takes
-    `creating` seconds and running its preload `preloading`; a cell whose code is `sleep N` runs N
-    seconds, or until the kernel is interrupted. `live` holds the kernels created and not deleted, and
-    `created` counts every one."""
+    """The Kernel Gateway's REST and channel protocol over a set of kernels. A phase in `held`
+    ("create", or "preload", a context loading its client) sets its `entered` event and waits for
+    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted.
+    The next `failing` deletes fail. `live` holds the kernels created and not deleted, and `created`
+    counts every one."""
 
-    def __init__(self, creating=0.0, preloading=0.0):
-        self.creating, self.preloading = creating, preloading
+    def __init__(self):
+        self.held, self.failing = set(), 0
+        self.entered = {phase: asyncio.Event() for phase in ("create", "preload")}
+        self.release = {phase: asyncio.Event() for phase in ("create", "preload")}
         self.live, self.interrupts, self.created = set(), {}, 0
 
+    async def phase(self, name):
+        if name in self.held:
+            self.entered[name].set()
+            await self.release[name].wait()
+
     async def create(self, request):
-        await asyncio.sleep(self.creating)
+        await self.phase("create")
         identifier = str(uuid.uuid4())
         self.live.add(identifier)
         self.created += 1
@@ -46,6 +54,9 @@ class Kernels:
         return web.json_response({"id": identifier, "name": (await request.json())["name"]})
 
     async def delete(self, request):
+        if self.failing:
+            self.failing -= 1
+            return web.Response(status=500)
         self.live.discard(request.match_info["kernel"])
         return web.Response(status=204)
 
@@ -67,7 +78,7 @@ class Kernels:
 
             status = "ok"
             if code.startswith(("import model_client", "import live_training")):
-                await asyncio.sleep(self.preloading)
+                await self.phase("preload")
             elif code.startswith("sleep "):
                 self.interrupts[kernel].clear()
                 try:
@@ -174,7 +185,7 @@ def test_a_page_runs_or_queues_at_most_its_cells_of_either_kind(bridge, monkeypa
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("phase", ["creating", "preloading"])
+@pytest.mark.parametrize("phase", ["create", "preload"])
 @pytest.mark.parametrize("ending", ["disconnect", "restart"])
 def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, phase, ending):
     """A disconnect or a Restart that cancels a cell's context while the gateway creates its kernel,
@@ -190,25 +201,57 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
             # The page's first cell takes the context made ready as it connected; its second starts one.
             await socket.send(json.dumps({"op": "execute", "id": "first", "cell": "a", "code": "print(1)"}))
             await answer(socket, "first")
-            kernels.creating, kernels.preloading = 1.0, 1.0
+            kernels.held.add(phase)
             await socket.send(json.dumps({"op": "execute", "id": "fresh", "cell": "b", "code": "print(2)"}))
-            await asyncio.sleep(0.5 if phase == "creating" else 1.5)
+            await asyncio.wait_for(kernels.entered[phase].wait(), 30)
             if ending == "restart":
                 await socket.send(json.dumps({"op": "restart", "id": "again", "cell": "b"}))
                 assert (await answer(socket, "fresh"))[-1]["status"] == "aborted"
                 assert (await answer(socket, "again"))[-1]["status"] == "ok"
             await socket.close()
-            await asyncio.sleep(1.5)
+            kernels.held.clear()
+            kernels.release[phase].set()
             await settled(kernels)
             assert kernels.live == set()
-            assert kernels.created >= 2, "the second cell's kernel was being made"
-            kernels.creating, kernels.preloading = 0.0, 0.0
+            assert kernels.created == 2, "the second cell's kernel was the one being made"
             socket = await page(port, session)
             await socket.send(json.dumps({"op": "execute", "id": "next", "cell": "b", "code": "print(3)"}))
             assert [message["type"] for message in await answer(socket, "next")] == ["stream", "done"]
             await socket.close()
             await settled(kernels)
             assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_cleanup_never_hides_why_a_start_ended(bridge, monkeypatch):
+    """A disconnect while a context loads its client, whose kernel's delete then fails, still
+    closes the page's session: its other contexts are deleted, and the session is free again."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+
+    async def scenario():
+        kernels = Kernels()
+        gateway, server, runner, port = await serving(bridge, kernels)
+        try:
+            session = str(uuid.uuid4())
+            socket = await page(port, session)
+            await socket.send(json.dumps({"op": "execute", "id": "first", "cell": "a", "code": "print(1)"}))
+            await answer(socket, "first")
+            kernels.held.add("preload")
+            await socket.send(json.dumps({"op": "execute", "id": "fresh", "cell": "b", "code": "print(2)"}))
+            await asyncio.wait_for(kernels.entered["preload"].wait(), 30)
+            kernels.failing = 1
+            await socket.close()
+            kernels.release["preload"].set()
+            for _ in range(100):
+                if session not in gateway.connected and session not in gateway.contexts:
+                    break
+                await asyncio.sleep(0.1)
+            assert session not in gateway.connected and session not in gateway.contexts
+            assert len(kernels.live) == 1, "only the kernel whose delete failed is left"
         finally:
             server.close()
             await runner.cleanup()
@@ -235,8 +278,9 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
             again = await page(port, session, ends_in=4.0 - (time.monotonic() - began))
             with pytest.raises(ConnectionClosed):
                 while True:
-                    await asyncio.wait_for(again.recv(), 10)
-            assert 3.5 < time.monotonic() - began < 6.0
+                    await asyncio.wait_for(again.recv(), 60)
+            # Closed at the session's end, not an allowance after the reconnect.
+            assert 4.0 <= time.monotonic() - began < 30
             await settled(kernels)
             assert kernels.live == set()
             late = await connect(f"ws://127.0.0.1:{port}/contexts/{session}/ws", additional_headers={
@@ -291,3 +335,61 @@ print(json.dumps(batches))
     *said, batches = done.stdout.strip().splitlines()
     assert json.loads(batches) == [8, 8, 8]
     assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3
+
+
+def test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it(bridge, monkeypatch):
+    """A Restart starts a task as a cell does, which counts among the page's cells; a cell restarts
+    once at a time; and a page that closes ends every task it started, its kernels deleted. Stopped
+    cells leave nothing behind once they end."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+    pages = []
+
+    class Recorded(bridge.Page):
+        def __init__(self, *args):
+            super().__init__(*args)
+            pages.append(self)
+    monkeypatch.setattr(bridge, "Page", Recorded)
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            for index in range(bridge.MAX_CELLS):
+                await socket.send(json.dumps({"op": "execute", "id": f"run-{index}", "cell": f"c{index}",
+                                              "code": "sleep 30"}))
+            await asyncio.sleep(1)
+            await socket.send(json.dumps({"op": "interrupt", "cell": "c0"}))
+            # Each running cell restarted; their fresh contexts wait on the gateway.
+            kernels.held.add("create")
+            for index in range(bridge.MAX_CELLS):
+                await socket.send(json.dumps({"op": "restart", "id": f"restart-{index}",
+                                              "cell": f"c{index}"}))
+            await asyncio.wait_for(kernels.entered["create"].wait(), 30)
+            # The stopped cell ended in its error; the others, the restart aborted.
+            ended = [(await answer(socket, f"run-{index}"))[-1]["status"]
+                     for index in range(bridge.MAX_CELLS)]
+            assert ended == ["error", *["aborted"] * (bridge.MAX_CELLS - 1)]
+            # A restart of a restarting cell is refused, and the restarts count as the page's cells.
+            await socket.send(json.dumps({"op": "restart", "id": "again", "cell": "c1"}))
+            assert "restarting already" in (await answer(socket, "again"))[0]["evalue"]
+            await socket.send(json.dumps({"op": "execute", "id": "more", "cell": "new", "code": "print(1)"}))
+            assert "cells already" in (await answer(socket, "more"))[0]["evalue"]
+            [held] = pages
+            assert len(held.tasks) == bridge.MAX_CELLS
+            assert held.restarting == {f"c{index}" for index in range(bridge.MAX_CELLS)}
+            await socket.close()
+            kernels.held.clear()
+            kernels.release["create"].set()
+            for _ in range(100):
+                if not held.tasks:
+                    break
+                await asyncio.sleep(0.1)
+            assert (held.tasks, held.stops, held.restarting) == (set(), set(), set())
+            await settled(kernels)
+            assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
