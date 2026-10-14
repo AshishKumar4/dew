@@ -47,22 +47,22 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
 OUT = ROOT / "tests" / "fixtures" / "joint_checkpoint" / "tiny"
-SOURCE = json.loads((OUT / "source.json").read_text())
-"""The release the fixtures reproduce: its repo, revision and model class."""
 HEAD = {"hidden_size": 32, "width": 24, "routing_layers": 2, "layers": 2, "heads": 2, "feedforward": 40}
 
 
 def upstream_module():
-    """joint_schema_model.py as the release publishes it."""
+    """joint_schema_model.py as the release the fixtures reproduce publishes it
+    (source.json: its repo and revision), and its model class (`model`)."""
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(SOURCE["repo"], "joint_schema_model.py", revision=SOURCE["revision"])
+    source = json.loads((OUT / "source.json").read_text())
+    path = hf_hub_download(source["repo"], "joint_schema_model.py", revision=source["revision"])
     spec = importlib.util.spec_from_file_location("joint_schema_model", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # its dataclasses look their module up
     spec.loader.exec_module(module)
-    return module
+    return module, getattr(module, source["model"])
 
 
 def as_upstream(request: dict) -> dict:
@@ -80,7 +80,7 @@ def main() -> None:
 
     from dew.interop.verify import scatter_weights
 
-    upstream = upstream_module()
+    upstream, model_class = upstream_module()
     tokenizer = AutoTokenizer.from_pretrained(BACKBONE)
     backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
                                                                attn_implementation="eager").eval()
@@ -91,7 +91,7 @@ def main() -> None:
         head.prior_logit_scale.fill_(0.7)
         head.joint_logit_scale.fill_(1.3)
         head.residual_gate.fill_(-0.4)
-    model = getattr(upstream, SOURCE["model"])(backbone, head).eval()
+    model = model_class(backbone, head).eval()
     exact = copy.deepcopy(model).double()
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "joint_head_config.json").write_text(json.dumps(HEAD, indent=1) + "\n")
@@ -137,13 +137,13 @@ def images() -> None:
     from safetensors.torch import load_file
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-    upstream = upstream_module()
+    upstream, model_class = upstream_module()
     processor = AutoProcessor.from_pretrained(BACKBONE)
     backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
                                                                attn_implementation="eager").eval()
     head = upstream.JointSchemaHead(**json.loads((OUT / "joint_head_config.json").read_text())).eval()
     head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
-    model = getattr(upstream, SOURCE["model"])(backbone, head).eval()
+    model = model_class(backbone, head).eval()
     exact = copy.deepcopy(model).double()
     request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
