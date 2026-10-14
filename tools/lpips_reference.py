@@ -27,13 +27,12 @@ come from is replaced: `models.vgg16(weights=IMAGENET1K_V1)` and
 from __future__ import annotations
 
 import hashlib
-import urllib.request
 from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import definitions
+from reference_source import definitions, verified
 from torchvision import models
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
@@ -111,12 +110,7 @@ def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict
 
 def published_file(name: str) -> Path:
     url, digest = PUBLISHED[name]
-    path = CACHE / name
-    if not path.is_file():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(url, path)
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
-    return path
+    return verified(url, CACHE / name, digest)
 
 
 def images(rng, count: int) -> tuple[np.ndarray, np.ndarray]:
