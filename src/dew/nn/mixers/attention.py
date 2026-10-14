@@ -506,7 +506,8 @@ class CausalSelfAttention(nn.Module):
         # The tokens' places and documents: the caller's or a packed batch's, else none given
         # (`Coordinates`).
         tokens = coordinates_of(attention_metadata, B, S)
-        positions, segment_ids = tokens.positions, tokens.segments
+        # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
+        positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
@@ -560,7 +561,9 @@ class CausalSelfAttention(nn.Module):
             if self.attention_scale is not None:
                 query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
             if self.temperature_tuning is not None:
-                scale = temperature_scale(positions, *self.temperature_tuning,
+                # The tokens' logical places, never their cache slots (`Coordinates.positions`).
+                scale = temperature_scale(positions if logical_positions is None else logical_positions,
+                                          *self.temperature_tuning,
                                           dtype=at_least_fp32(query.dtype))
                 query = query * (scale[..., None, None] if scale.ndim == 2
                                  else scale[None, :, None, None]).astype(query.dtype)
@@ -604,10 +607,8 @@ class CausalSelfAttention(nn.Module):
                 key_positions = jnp.arange(masking.key.shape[1])
             elif attention_metadata is not None and attention_metadata.key_positions is not None:
                 key_positions = attention_metadata.key_positions
-            elif attention_metadata is not None and attention_metadata.valid is not None:
-                valid = attention_metadata.valid
-                key_positions = (jnp.cumsum(valid, axis=-1) - 1) * valid
             else:
+                # Each key's logical place, its query's (`Coordinates.positions`).
                 key_positions = positions
             bias = alibi_bias(key_positions, self.num_heads, dtype=query.dtype)
         if attention_metadata is not None and attention_metadata.position_bias is not None:
