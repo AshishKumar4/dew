@@ -574,12 +574,16 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
             "def test_file():\n"
             "    assert open('src/sparx/graph.py').read()\n"
             "def test_refusal(table):\n"
-            "    def getsource():\n"
+            "    def source():\n"
             "        return ''\n"
             "    with pytest.raises(ValueError), table.raises(ValueError, match='empty'):\n"
-            "        graph.edges({getsource(): 1})\n"),
+            "        graph.edges({source(): 1, table().inspect.getsource(graph): 2})\n"
+            "def test_imported_here():\n"
+            "    from pytest import raises as source\n"
+            "    with source(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"),
     })
-    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14)]
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
@@ -587,8 +591,9 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     by any assignment or `setattr`, and a library that does so to anything it
     imported, a sibling module by a relative import included, change them for
     every caller. A script's rebinding of another library, an interpreter
-    hook however it is spelled, and an attribute of an object a function
-    holds as its own name are not reported."""
+    hook however it is spelled, and an attribute of an object a scope holds
+    as its own name or reaches from a call are not reported; each scope
+    reads its own imports, and a comprehension's names stay in it."""
     found = _linted(tmp_path, {
         "src/sparx/conv.py": "",
         "src/sparx/graph.py": (
@@ -607,7 +612,11 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
             "def fill(json):\n"
             "    conv = Edges()\n"
             "    conv.count = 0\n"
-            "    json.dumps = repr\n"),
+            "    json.dumps = repr\n"
+            "    Edges().json.dumps = repr\n"
+            "def after_comprehension():\n"
+            "    [conv for conv in (Edges(),)]\n"
+            "    conv.convolve = repr\n"),
         "tools/bench.py": (
             "import json\n"
             "from sparx import graph\n"
@@ -621,10 +630,20 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
             "sys.excepthook = print\n"
             "json.dumps = repr\n"
             "def fill(graph):\n"
-            "    graph.count = 0\n"),
+            "    graph.count = 0\n"
+            "def first_party():\n"
+            "    from sparx import graph as engine\n"
+            "    engine.run = repr\n"
+            "def third_party():\n"
+            "    import json as engine\n"
+            "    engine.run = repr\n"
+            "def defined():\n"
+            "    class graph:\n"
+            "        pass\n"
+            "    graph.run = repr\n"),
     })
-    assert found == [("src/sparx/graph.py", 8, "SLOP012"), ("src/sparx/graph.py", 9, "SLOP012"),
-                     *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10)]]
+    assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20)],
+                     *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
 
 
 # ---------------------------------------------------------------------------
