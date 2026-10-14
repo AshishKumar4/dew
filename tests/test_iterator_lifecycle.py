@@ -306,6 +306,47 @@ def test_full_queue_close_preserves_consumed_position_and_releases_source():
     assert ref() is None
 
 
+def test_a_stop_request_racing_the_workers_close_reaches_the_source_it_read():
+    """close asks a stoppable source to stop while the worker, the source just drained, closes it
+    and lets it go: the request reaches the source close read, and close returns without error.
+    The source holds the race open: when close checks it for request_stop, the source lets its
+    worker drain and finish, and waits a moment for it."""
+    events, drain = [], threading.Event()
+    stream = None
+
+    class Draining:
+        @property
+        def __class__(self):
+            # The main thread's checks after the stop was asked for: let the worker finish meanwhile.
+            if threading.current_thread() is threading.main_thread() and stream._stop.is_set():
+                drain.set()
+                for _ in range(100):
+                    if stream._iterator is None:
+                        break
+                    threading.Event().wait(0.01)
+            return Draining
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            drain.wait(10)
+            raise StopIteration
+
+        def request_stop(self):
+            events.append("stop")
+
+        def close(self):
+            events.append("close")
+
+    stream = DevicePrefetchIterator(Draining(), MeshSpec().build(), depth=1)
+    consumer = threading.Thread(target=lambda: next(stream, None))
+    consumer.start()
+    stream.close()
+    consumer.join(10)
+    assert sorted(events) == ["close", "stop"]
+
+
 @pytest.mark.parametrize("failure", [None, ValueError("source failed")])
 def test_terminal_outcome_finalizes_with_a_full_data_queue(failure):
     source = Source(end=3, failure=failure)
