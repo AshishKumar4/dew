@@ -313,6 +313,7 @@ class Decide:
             if not self.layout.fits(row):
                 raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
                                  f"the maximum context length, max_len={self.layout.max_len}")
+        self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
@@ -358,7 +359,7 @@ class Decide:
         length = _bucket(inputs.tokens.shape[1])
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
-            valid=_widened(inputs.valid, length),
+            segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = _bucket(len(rows), smallest=1)
@@ -463,8 +464,9 @@ class Decide:
 
     def _scored_reader(self, reader: Reader) -> list[Scored]:
         scored = []
+        segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch)
+            inputs = laid_out(batch, segments)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -586,18 +588,21 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
-    """The `DecisionInputs` of a batch the decision dataset laid out (`Encoding`)."""
+def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+    """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
+    holding at most `max_segments` rows."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
-    return DecisionInputs(tokens=array("tokens"), valid=array("valid"), kinds=array("kinds"),
+    def given(name: str) -> jax.Array | None:
+        return array(name) if name in batch else None
+
+    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), kinds=array("kinds"),
                           questions=array("questions"), spans=array("spans"),
                           option_spans=array("option_spans"), options=array("options"),
-                          positions=array("positions") if "positions" in batch else None,
-                          slots=array("slots") if "slots" in batch else None,
-                          option_slots=array("option_slots") if "option_slots" in batch else None,
-                          slotted=array("slotted") if "slotted" in batch else None)
+                          positions=array("positions"), slots=given("slots"),
+                          option_slots=given("option_slots"), slotted=given("slotted"),
+                          max_segments=max_segments)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:

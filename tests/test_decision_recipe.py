@@ -207,30 +207,43 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
             sum(value[metric] for value in scored["sources"].values()) / 2)
 
 
-def test_the_clef_recipe_defaults_build_token_budget_batches():
+def _joint(**layout) -> DecisionObjective:
+    """The joint schema head over the tiny Qwen decoder, its rows laid out by `JointLayout(**layout)`."""
+    from dew.decision.head import JointSchemaHead
+    from dew.decision.model import DecisionModel
+    from dew.interop import Pretrained
+
+    source = Pretrained.load(str(QWEN), dtype="float32", max_seq_len=layout["max_len"])
+    width, _ = DecisionModel.head_size(source.model)
+    return DecisionObjective(source, layout=JointLayout(**layout), shuffle_options=False,
+                             head=JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2,
+                                                  feedforward=32))
+
+
+def test_the_decision_recipe_defaults_pack_token_budget_batches_of_one_shape():
+    """The decision recipe's 16,384-token micro-batches are four windows of its
+    4,096-token rows, whatever lengths the rows have."""
     import itertools
 
     run = _module("clef").run_config()
     trainer = run.trainer.derived()
     assert trainer.batch_size is None
     assert trainer.batch_tokens == trainer.update_tokens == 16_384
-    assert trainer.accumulation == 1 and run.bucket_lengths == ()
+    assert trainer.accumulation == 1
     choice = Choice("Which?", ["first", "second"])
     examples = [Example("x" * size, {"team": choice}, {"team": 0})
                 for size in (160, 768, 1_536, 3_072)] * 64
-    objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
-                                  shuffle_options=False)
+    objective = _joint(max_len=run.max_len)
     data = loader(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
-                  lengths=run.bucket_lengths, objective=objective.data(), read="memory",
-                  loading=Loading(workers=0))
+                objective=objective.data(), read="memory", loading=Loading(workers=0))
     assert data.batch_tokens == 16_384
     stream = data.train(DataPartition())
     try:
         batches = list(itertools.islice(stream, 8))
     finally:
         stream.close()
-    assert len({batch["tokens"].shape[1] for batch in batches}) <= 6
-    assert all(batch["tokens"].shape[0] * batch["tokens"].shape[1] == 16_384 for batch in batches)
+    assert {batch["tokens"].shape for batch in batches} == {(4, run.max_len)}
+    assert all(batch["segments"].max() > 1 for batch in batches)
 
 
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
@@ -286,8 +299,8 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
 
 
-def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_its_state(tmp_path):
-    """The Clef recipe under LoRA on length-bucketed batches, stopped at step 2
+def test_a_packed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_its_state(tmp_path):
+    """A decision run under LoRA on packed windows, stopped at step 2
     and resumed to 4, ends bitwise where an unbroken run does: parameters,
     optimizer state, counters and keys, on the same records. Resumed under
     another attention kernel, a change that keeps the state's shape, it reads
@@ -304,7 +317,7 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
         flags[flags.index("--trainer.steps") + 1] = str(steps)
         flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                   "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
-                  "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]
+                  "--max-len", "1024", "--no-calibrate", *changed]
         return DecisionRunConfig.cli(flags, default=clef.run_config()).run()
 
     def leaves(state) -> list:
