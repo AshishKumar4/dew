@@ -348,11 +348,14 @@ def _cache_at(stages: Sequence[Stage]) -> int:
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
-    its deterministic steps made, before the first random step; any other
+    its deterministic steps made, before the first random step or batch; any other
     read orders the source's rows right after the cache that keys them, and
     a cache's rows reach an indexed read as a stream."""
     if read == "memory":
-        return next((index for index, stage in enumerate(stages) if _random(stage)), len(stages)), True
+        # Records are ordered before their batch, as before the first random step.
+        boundary = (index for index, stage in enumerate(stages)
+                    if _random(stage) or isinstance(stage, (BatchStage, TokenBudget)))
+        return next(boundary, len(stages)), True
     cache = _at(stages, Artifact)
     return (0, read == "indexed") if cache is None else (cache + 1, False)
 

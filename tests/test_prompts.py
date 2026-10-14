@@ -169,3 +169,21 @@ def test_the_train_stream_encodes_inside_workers():
     batch = next(data.train(DataPartition()))
 
     np.testing.assert_array_equal(batch[PROMPT_KEY][0], [0, 0, 0, 1, 2, 3, 4, 5])
+
+
+def test_prompts_validate_on_a_hub_split_of_their_own(tmp_path, monkeypatch):
+    """Prompts from a Hub dataset validate on its own validation split, which the source names,
+    where the reward facts wrapped around the source once hid its splits and refused."""
+    from hub_support import native_hub
+
+    from dew.data.holdout import Split
+    from dew.data.sources import Hub
+
+    native_hub(monkeypatch, tmp_path, "acme/prompts",
+               {"train": {"prompt": ["a", "b", "c", "d"]}, "validation": {"prompt": ["x", "y"]}})
+    recipe = PromptData(source=Hub("acme/prompts"), tokenizer=TOKENIZER, max_prompt_len=WINDOW,
+                        validation=Split("validation"))
+    train, held, _ = recipe.pipelines()
+    rows = {name: list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+            for name, pipeline in (("train", train), ("held", held))}
+    assert len(rows["train"]) == 4 and len(rows["held"]) == 2
