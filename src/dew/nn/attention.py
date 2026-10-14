@@ -1291,13 +1291,13 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     shards = sequence_shards()
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
-    live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
-                        key_value_seq_lengths)
     if dropout_rate and not deterministic:
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
             causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
             key_value_seq_lengths, dropout_rate, dropout_rng, shards)
+        live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
+                            key_value_seq_lengths)
         return checkpoint_name(_read_nothing(out, live), 'attention_output')
     if shards > 1 and segment_ids is not None:
         # The exchanges split an explicit mask along the sequence and have no
@@ -1322,7 +1322,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
                      max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
-    return checkpoint_name(_read_nothing(out, live), 'attention_output')
+    return checkpoint_name(out, 'attention_output')
 
 
 def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
@@ -1570,7 +1570,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     differentiable in forward mode under `forward_mode_attention`.
 
     'auto' resolves here, once, against this call's shapes and backend, and
-    `_attention_kernel` runs the call on the kernel it resolved to.
+    `_attention_kernel` runs the call on the kernel it resolved to. A query
+    row that sees no key comes back zero whichever kernel ran
+    (`visible_rows`), inside a sequence exchange too.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -1590,8 +1592,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths)
+    live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
-        return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
+        return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
     def fused(query, key, value, bias, sinks):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
@@ -1599,7 +1602,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     def reference(query, key, value, bias, sinks):
         return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
 
-    return forward_differentiable(fused, reference, query, key, value, bias, sinks)
+    return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
 def forward_differentiable(value, tangent, *arrays):
