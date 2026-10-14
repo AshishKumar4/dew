@@ -251,14 +251,6 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-def _pulled(repo_id: str, revision: str | None) -> str:
-    """Download a run directory published to the Hub and return its local path."""
-    import os
-
-    from dew.interop.hub import pull_from_hub
-    return os.fspath(pull_from_hub(repo_id, revision=revision))
-
-
 class SavedRun(NamedTuple):
     """One checkpoint of a run, pinned: its inference declaration, not the
     training configuration, and the exact step it is, which a loader reads
@@ -512,7 +504,10 @@ class TextGeneration:
         `HfApi().upload_folder`. `revision` pins a Hub revision, and the
         other arguments work as in `from_run`.
         """
-        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
+        from huggingface_hub import snapshot_download
+
+        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
+                            ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
@@ -614,7 +609,10 @@ class BlockGeneration:
         `HfApi().upload_folder`. `revision` pins a Hub revision, and the
         other arguments work as in `from_run`.
         """
-        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
+        from huggingface_hub import snapshot_download
+
+        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
+                            ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
@@ -723,7 +721,10 @@ class MaskedGeneration:
         `HfApi().upload_folder`. `revision` pins a Hub revision, and the
         other arguments work as in `from_run`.
         """
-        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
+        from huggingface_hub import snapshot_download
+
+        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
+                            ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 

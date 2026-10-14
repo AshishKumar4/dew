@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import grain.python as grain
 import jax
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected
 from dew.records import record
 
 
@@ -26,36 +25,6 @@ class Fields(grain.MapTransform):
         kept = {name: element[name] for name in names if name not in self.remove}
         return {**{name: value for name, value in kept.items() if name not in renamed},
                 **{new: kept[old] for old, new in self.rename}}
-
-
-@dataclasses.dataclass(frozen=True)
-class Placed(grain.MapTransform):
-    """A training or validation batch without the fields an accelerator cannot
-    hold: strings, bytes and Python objects, such as an image's catalog URL
-    and content hash. The host steps before it read them; what remains is
-    what the prefetcher places."""
-
-    def map(self, element: Batch) -> Batch:
-        return {name: (self.map(value) if isinstance(value, Mapping) else value)
-                for name, value in element.items() if _placeable(value)}
-
-
-def _placeable[Field](value: np.ndarray | str | bytes | Mapping[str, Field] | Field) -> bool:
-    if isinstance(value, np.ndarray):
-        return value.dtype.kind not in "OSUV"
-    if isinstance(value, (list, tuple)):
-        return all(_placeable(entry) for entry in value)
-    return not isinstance(value, (str, bytes))
-
-
-@dataclasses.dataclass(frozen=True)
-class Keep(grain.MapTransform):
-    predicate: Callable[[Batch], bool]
-    reason: str = "filtered"
-    rejects = True
-
-    def map(self, element: Batch) -> Batch | Rejected:
-        return element if self.predicate(element) else Rejected(self.reason)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,11 +50,3 @@ class Formatting(grain.MapTransform):
                     array = array.astype(dtype)
                 held[name] = array
         return held
-
-
-@dataclasses.dataclass(frozen=True)
-class Preprocessing(grain.RandomMapTransform):
-    step: Callable[[Batch, np.random.Generator], Batch]
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return self.step(element, rng)
