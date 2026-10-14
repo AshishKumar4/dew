@@ -387,7 +387,7 @@ class Dataset:
         return Pipeline(self)
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
-                split: str | None = None, **named: float) -> tuple[Dataset, ...]:
+                split: str | tuple[str, ...] | None = None, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -399,7 +399,9 @@ class Dataset:
         that identifies a document (an id or a url), so its versions and
         chunks land together; without one, a record's identity is its whole
         content. `records=n` holds out the first n records, and
-        `split="validation"` the store's own split.
+        `split="validation"` the store's own split, or
+        `split=("validation", "test")` each of them, in order, after the
+        records the store reads by default.
         """
         from dew.data.holdout import holdout
 
@@ -455,19 +457,27 @@ class Dataset:
         every read and resume."""
         for step in steps:
             if _declares_rejects(step):
-                raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
+                raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
         return self.then(*(RandomMap(step, identity) for step in steps))
 
-    def filter_map(self, *steps: RecordStep | pygrain.RandomMapTransform,
-                   identity: str | None = None) -> Pipeline:
+    def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.decode` do. A `grain.RandomMapTransform` draws from the
-        record's generator, as `video.pick_clip` draws a window."""
-        return self.then(*(RandomMap(step, identity, rejects=True) if isinstance(step,
-                                                                                 pygrain.RandomMapTransform)
-                           else Map(step, identity, rejects=True) for step in steps))
+        `images.decode` do."""
+        for step in steps:
+            if isinstance(step, pygrain.RandomMapTransform):
+                raise TypeError(f"{_named_step(step)} draws from a generator; "
+                                "apply it with random_filter_map")
+        return self.then(*(Map(step, identity, rejects=True) for step in steps))
+
+    def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
+        """One record to none or one, each step drawing from the record's
+        generator (`fn(record, rng)` or a `grain.RandomMapTransform`) and
+        returning its record's replacement or `Rejected(reason)`, which drops
+        it, counted by reason, as `video.pick_clip` drops a clip shorter than
+        its window. The draws are the same on every read and resume."""
+        return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
