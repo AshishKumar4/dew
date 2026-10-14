@@ -357,14 +357,6 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     def record_arguments(self) -> dict:
         return {'latents_mean': self.latents_mean, 'latents_std': self.latents_std}
 
-    @property
-    def downscale_factor(self) -> int:
-        return self.model.downscale_factor
-
-    @property
-    def latent_channels(self) -> int:
-        return self.model.latent_channels
-
     # The base class's shift and scale stay 0 and 1, so its encode and decode
     # only flatten video around the batch calls here.
     def encode(self, params, x, key=None):
