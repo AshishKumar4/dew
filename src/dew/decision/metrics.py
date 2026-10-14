@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
+from dew.decision.calibration import tied_prefixes
 from dew.eval.common import metric_device
 from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
 
@@ -82,7 +83,12 @@ class ECE:
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> np.ndarray:
         """Return, per bin, the row count, the summed top probability and the number correct."""
-        tops, correct = _tops(artifact)
+        return self.binned(*_tops(artifact))
+
+    def binned(self, tops: np.ndarray, correct: np.ndarray) -> np.ndarray:
+        """Per bin, the row count, the summed top probability `tops` and the
+        number `correct`, for answers however they were drawn: `finalize`
+        reads these, from a run's validation pass or a served benchmark's."""
         edges = np.linspace(0.0, 1.0, self.bins + 1)
         index = np.clip(np.searchsorted(edges, tops, side="left") - 1, 0, self.bins - 1)
         return np.stack([np.bincount(index, minlength=self.bins).astype(np.float64),
@@ -121,9 +127,6 @@ class AURC:
 
     def finalize(self, accumulated: tuple[np.ndarray, np.ndarray]) -> float:
         tops, correct = accumulated
-        order = np.argsort(-tops, kind="mergesort")
-        tops, correct = tops[order], correct[order]
-        last = np.flatnonzero(np.concatenate((tops[1:] != tops[:-1], [True])))
-        accepted = last + 1.0
-        risk = 1.0 - np.cumsum(correct)[last] / accepted
-        return float(np.sum(risk * np.diff(np.concatenate(([0.0], accepted)))) / len(tops))
+        _, accepted, right = tied_prefixes(tops, correct)
+        risk = 1.0 - right / accepted
+        return float(np.sum(risk * np.diff(np.concatenate(([0], accepted)))) / len(tops))

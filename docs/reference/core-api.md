@@ -18,7 +18,6 @@ Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean
 | `ema` | Optional `EMASpec`; the base objective uses `None`. |
 | `optimizer(tx, *, accumulation)` | Return the optimizer `Trainer` steps `params` with, from the one it was handed; the base method returns `tx`. Per-network optimizers use `optax.multi_transform` and `optax.conditionally_mask`. |
 | `averages(update)` | Return whether the update after `update` committed ones moves the EMA; the base method averages every update. |
-| `artifact` | Optional description of the objective's evaluation artifact type. |
 
 `Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 

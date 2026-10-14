@@ -36,14 +36,12 @@ for gptqmodel's pack extension. Run from the checkout:
 """
 
 import copy
-import hashlib
 import importlib.util
 import json
 import os
 import re
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import gptqmodel
@@ -54,6 +52,7 @@ from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_gptq_v2_to_v1_format_module
 from safetensors.numpy import load_file
+from reference_source import CACHE as UPSTREAM, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
@@ -65,7 +64,7 @@ AWQ_FILES = {
     "awq/utils/packing_utils.py": "65eab3eabe3f55e300ffbab5feac59c49322d985f42dcda4e2288859fb9a4abe",
     "awq/modules/linear/gemm.py": "a3ff4f116e01cfaa905440af4606c61089c788bf0dad7442314e0ad074843cf2",
 }
-CACHE = Path.home() / ".cache" / "dew" / "upstream" / "AutoAWQ" / AWQ_COMMIT
+CACHE = UPSTREAM / "AutoAWQ" / AWQ_COMMIT
 PROJECTION = re.compile(r"(q|k|v|o|gate|up|down)_proj\.weight$")
 
 
@@ -77,14 +76,8 @@ def autoawq():
         sys.modules[package] = module
     loaded = {}
     for path, digest in AWQ_FILES.items():
-        local = CACHE / path
-        if not local.is_file():
-            local.parent.mkdir(parents=True, exist_ok=True)
-            url = f"https://raw.githubusercontent.com/{AWQ_REPO}/{AWQ_COMMIT}/{path}"
-            local.write_bytes(urllib.request.urlopen(url).read())
-        found = hashlib.sha256(local.read_bytes()).hexdigest()
-        if found != digest:
-            raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
+        local = verified(f"https://raw.githubusercontent.com/{AWQ_REPO}/{AWQ_COMMIT}/{path}",
+                         CACHE / path, digest)
         name = path.removesuffix(".py").replace("/", ".")
         spec = importlib.util.spec_from_file_location(name, local)
         module = importlib.util.module_from_spec(spec)
