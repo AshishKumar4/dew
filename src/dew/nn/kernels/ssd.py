@@ -17,9 +17,10 @@ chunk innermost with the state in the shared output window.
 
 The backward is the hand-written reverse recurrence, `dS_n = exp(acs_C-1)
 dS_n+1 + dy^T (C exp(acs))`, since autodiff would keep every chunk's
-intermediates. The XLA path is the oracle and the fallback for GPU, CPU and
-refused geometries; tests/test_ssd_kernel.py holds the kernel to `chunk_ssd`
-and its `jax.grad`.
+intermediates. The XLA path is the oracle and the scan for CPU and refused
+geometries; a GPU whose target row names it runs mamba_ssm's own kernels
+(`dew.nn.kernels.mamba_ssd`), else the XLA path. tests/test_ssd_kernel.py
+holds the kernel to `chunk_ssd` and its `jax.grad`.
 """
 
 from __future__ import annotations
@@ -73,9 +74,10 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     The kernel needs a tpu backend, a float32 scan (a wider scan takes the
     XLA path in its own dtype), a chunk long enough to pay for a program,
     three power-of-two widths so that Mosaic's tiling wastes no lanes, and a
-    tile inside the per-program budget. A Triton port ran 6x to 12x slower
-    than XLA on an RTX 4080 and overflowed shared memory at chunks of 128 and
-    256 (docs/performance.md), so a GPU takes the XLA path.
+    tile inside the per-program budget. This kernel's one-program form ran 6x
+    to 12x slower than XLA as Triton on an RTX 4080 and overflowed shared
+    memory at chunks of 128 and 256 (docs/performance.md); a GPU runs
+    mamba_ssm's decomposition into fourteen kernels (`dew.nn.kernels.mamba_ssd`).
     """
     if backend != 'tpu' or jnp.dtype(dtype) != jnp.float32:
         return False
