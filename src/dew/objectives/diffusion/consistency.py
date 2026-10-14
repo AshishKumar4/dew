@@ -36,7 +36,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.protocols import TimeScaled
-from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables
+from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables, part
 from dew.sampling.guidance import guide
 
 from .few_step import SMOOTH_TIME_SCALE
@@ -325,10 +325,6 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             return output
         return velocity
 
-    def _fake(self, params) -> Variables:
-        return {collection: tree[FAKE_SCORE] for collection, tree in params.items()
-                if isinstance(tree, dict) and FAKE_SCORE in tree}
-
     def _teacher(self, params, given, blank, x, t) -> tuple[jax.Array, jax.Array]:
         teacher = jax.lax.stop_gradient(params[TEACHER])
         clean, F = trig_prediction(self._network(self.teacher, teacher, given), x, t)
@@ -416,7 +412,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             t = self._times(draws.critic_time, self.critic_times)
             noise = draws.critic_noise
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
-            fake, _ = trig_prediction(self._network(self.fake_score, self._fake(params), given), x, t)
+            fake, _ = trig_prediction(self._network(self.fake_score, part(params, FAKE_SCORE), given), x, t)
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
@@ -427,7 +423,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         t = self._times(draws.critic_time, self.critic_times)
         noise = draws.critic_noise
         x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
-        frozen = jax.lax.stop_gradient(self._fake(params))
+        frozen = jax.lax.stop_gradient(part(params, FAKE_SCORE))
         fake, _ = trig_prediction(self._network(self.fake_score, frozen, given), x, t)
         teacher, _ = self._teacher(params, given, blank, x, t)
         return distribution_matching_loss(generated, jax.lax.stop_gradient(fake), teacher, self.dmd_weight)
