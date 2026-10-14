@@ -11,8 +11,6 @@ export interface Limits {
 	warmSeconds: number;
 	/** A session with no request for this long, while no cell runs, ends. */
 	idleSeconds: number;
-	/** CPU time the kernel process may use. */
-	cpuSeconds: number;
 	/** At most `ipStarts` sessions per visitor IP in any `ipWindowSeconds`, and `TABS` at once (coordinator.ts). */
 	ipWindowSeconds: number;
 	ipStarts: number;
@@ -30,7 +28,6 @@ export function limitsOf(env: Env): Limits {
 		wallSeconds: read('WALL_SECONDS'),
 		warmSeconds: read('WARM_SECONDS'),
 		idleSeconds: read('IDLE_SECONDS'),
-		cpuSeconds: read('CPU_SECONDS'),
 		ipWindowSeconds: read('IP_WINDOW_SECONDS'),
 		ipStarts: read('IP_STARTS'),
 	};

@@ -121,7 +121,7 @@ class PPOObjective(Objective[Ratio, Variables]):
         self.actor = GRPOObjective(model, seq_len, **policy_options)
         self.critic, self.seq_len = critic, seq_len
         self.value_coefficient, self.value_clip = value_coefficient, value_clip
-        self.inputs, self.artifact = self.actor.inputs, self.actor.artifact
+        self.inputs = self.actor.inputs
         reference = self.actor.ema
         self.ema = None if reference is None else EMASpec(reference.decay,
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))

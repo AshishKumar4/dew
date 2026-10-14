@@ -121,7 +121,6 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                 "pairs in features, and none were named")
         self.feature_loss: FeatureLoss = feature_loss
         self.inputs = student.inputs
-        self.artifact = student.artifact
         averaged = student.ema
         # The EMA follows what moves; the teacher never does.
         self.ema = None if averaged is None else EMASpec(
