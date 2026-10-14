@@ -149,9 +149,11 @@ class LayerSpec:
     engram: int | None = None
     """The layer's place among the engram layers, whose bucket ids it reads
     before its attention; None for a layer without a lookup."""
-    prediction_slot: int | None = None
-    """The layer's place among the DSpark drafter's target layers, whose
-    input streams' mean it records; None for the rest."""
+    prediction_target: int | None = None
+    """The layer's own index when it is one of the DSpark drafter's target
+    layers, whose input streams' mean it records under its own name
+    (`CausalTransformer.draft_context` reads `layers_{index}`), so it runs
+    unrolled, as a `provider` does; None for the rest."""
     attention_norm: bool = True
     """Whether the block norms its attention input; ModernBERT's first block does not."""
 
