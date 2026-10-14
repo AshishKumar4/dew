@@ -547,11 +547,11 @@ def _reference_gradients(trip: RoundTrip, *, wide: bool = False):
     return upstream, converted, prediction_prefixes
 
 
-def gradient_parity(trip: RoundTrip) -> dict[str, tuple[float, float]]:
+def gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """The two implementations' gradients of the mean next-token cross
     entropy over the source checkpoint, per source tensor, each one's
-    distance from the reference's gradient in float64 as
-    `max |gradient - truth| / max(1, |truth|)`: (ours, theirs).
+    deviation from the reference's gradient in float64, entry by entry
+    relative to max(1, |truth|): (ours, theirs).
 
     Each bound layout writes dew's gradient tree back into the source's
     own tensor layout the way the export writes the weights, so the same
@@ -634,14 +634,14 @@ def gradient_parity(trip: RoundTrip) -> dict[str, tuple[float, float]]:
     return errors
 
 
-def _from_truth(ours, theirs, truth) -> tuple[float, float]:
-    """`ours` and `theirs` each as `max |gradient - truth| / max(1, |truth|)`."""
+def _from_truth(ours, theirs, truth) -> tuple[np.ndarray, np.ndarray]:
+    """`ours` and `theirs` each as `(gradient - truth) / max(1, |truth|)`, flat."""
     scale = np.maximum(1.0, np.abs(truth))
-    return (float(np.max(np.abs(np.asarray(ours, np.float64) - truth) / scale)),
-            float(np.max(np.abs(np.asarray(theirs, np.float64) - truth) / scale)))
+    return (np.ravel((np.asarray(ours, np.float64) - truth) / scale),
+            np.ravel((np.asarray(theirs, np.float64) - truth) / scale))
 
 
-def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[float, float]]:
+def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """Actual LMObjective gradients, including V4's raw-stream prediction loss,
     each one's distance from the reference's in float64 (`gradient_parity`).
 
@@ -679,7 +679,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[float, float
             model, _ = reference_model(case, FIXTURES / case.fixture, torch.float64 if wide else None)
             model.eval()
             model.set_attn_implementation('eager')
-            depth = load_mtp_reference(FIXTURES / case.fixture, model.config)
+            depth = load_mtp_reference(FIXTURES / case.fixture, model.config, model.dtype)
             tokens = torch.from_numpy(trip.ids.astype(np.int64))
             streams: list[torch.Tensor] = []
 

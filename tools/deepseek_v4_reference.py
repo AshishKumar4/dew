@@ -426,8 +426,9 @@ class DeepseekV4MTP(torch.nn.Module):
         return model.lm_head(self.reference_model.model.norm(self.reference_model.model.hc_head(out)))
 
 
-def load_mtp_reference(directory: Path, config: DeepseekV4Config) -> DeepseekV4MTP:
-    """The fixture's released mtp.0.* tensors as a runnable depth.
+def load_mtp_reference(directory: Path, config: DeepseekV4Config, dtype=None) -> DeepseekV4MTP:
+    """The fixture's released mtp.0.* tensors as a runnable depth, in `dtype`
+    (float32 where None).
 
     The release ships the depth under its own flat names and transformers
     builds none, so the block is loaded through the standard
@@ -489,7 +490,8 @@ def load_mtp_reference(directory: Path, config: DeepseekV4Config) -> DeepseekV4M
         Path(temporary, "config.json").write_text(json.dumps(fields))
         safetensors.torch.save_file(renamed, str(Path(temporary, "model.safetensors")))
         loaded = DeepseekV4ForCausalLM.from_pretrained(
-            temporary, dtype=torch.float32, local_files_only=True, output_loading_info=True)
+            temporary, dtype=torch.float32 if dtype is None else dtype, local_files_only=True,
+            output_loading_info=True)
     if not isinstance(loaded, tuple):
         raise SystemExit("output_loading_info returns the model and its report")
     model, report = loaded
@@ -507,7 +509,7 @@ def load_mtp_reference(directory: Path, config: DeepseekV4Config) -> DeepseekV4M
     model.lm_head.requires_grad_(False)
     depth = DeepseekV4MTP(model.config, model)
     for name in ("e_proj", "h_proj", "enorm", "hnorm"):
-        getattr(depth, name).weight = torch.nn.Parameter(direct[f"{name}.weight"])
+        getattr(depth, name).weight = torch.nn.Parameter(direct[f"{name}.weight"].to(model.dtype))
     return depth
 
 
