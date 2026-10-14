@@ -67,6 +67,30 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
 
 
+@dataclasses.dataclass(frozen=True)
+class SplitMemory(Memory):
+    """Records in memory with named splits of their own beside them, as a Hub repository holds."""
+
+    splits: tuple[tuple[str, tuple], ...] = ()
+
+    def with_split(self, name: str) -> Memory:
+        return Memory(dict(self.splits)[name], identity=f"{self.identity}:{name}")
+
+
+def test_holdout_returns_each_of_the_named_splits_a_store_holds_after_its_own():
+    """`holdout(split=("validation", "test"))` returns the store's default records, then each
+    named split in order, with the steps replayed on each."""
+    store = SplitMemory(rows("train", 3), identity="splits", splits=(
+        ("validation", tuple(rows("validation", 2))), ("test", tuple(rows("test", 1)))))
+    parts = store.map(lambda row: {**row, "seen": True}).holdout(split=("validation", "test"))
+    assert [[(row["origin"], int(row["i"])) for row in iterate(part, read="memory") if row["seen"]]
+            for part in parts] == [[("train", 0), ("train", 1), ("train", 2)],
+                                   [("validation", 0), ("validation", 1)], [("test", 0)]]
+    assert len(store.holdout(split="test")) == 2
+    with pytest.raises(ValueError):
+        store.holdout(split=("test", "test"))
+
+
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 @pytest.mark.parametrize("key", [None, "identity"])
 @pytest.mark.parametrize("nested", ["mapping", "arrays", "object_array"])
@@ -567,6 +591,18 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
         assert [generation[index]["i"] for index in range(len(generation))] == list(range(12))
 
 
+@pytest.mark.parametrize("form", ["NFKC", "NFC"])
+def test_text_normalize_reads_composed_and_compatibility_characters_alike(form):
+    """text.normalize puts a record's text into one Unicode form, so a decomposed accent reads as
+    its composed letter and, under NFKC, a ligature and a full-width digit as their plain ones;
+    the record's other fields pass through."""
+    records = [{"text": "cafe\u0301 \ufb01ne \uff11", "id": 7}, {"text": b"plain", "id": 8}]
+    normalized = list(Memory(records).map(text.normalize(form)).iterate())
+    assert [row["text"] for row in normalized] == [
+        "caf\u00e9 fine 1" if form == "NFKC" else "caf\u00e9 \ufb01ne \uff11", "plain"]
+    assert [int(row["id"]) for row in normalized] == [7, 8]
+
+
 def test_chunks_cut_long_documents_keeping_every_target():
     pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.chunk(4, overlap=1)).iterate())
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
@@ -685,6 +721,59 @@ def test_finite_diagnostics_draw_after_rejection_and_shuffle_as_training_does(re
         for name in ("i", "draw", "value"):
             np.testing.assert_array_equal(row[name], batch[name][0])
         assert row["value"] == row["i"] + row["draw"]
+
+
+def keep_heads(row, rng) -> dict | Rejected:
+    """The row with its draw, or `Rejected("tails")` when the draw lands below a half."""
+    draw = rng.random()
+    return {**row, "draw": np.float64(draw)} if draw >= 0.5 else Rejected("tails")
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_random_step_that_drops_records_draws_alike_on_every_read_and_counts_its_drops(read):
+    """A plain `fn(record, rng)` that may reject goes through random_filter_map: each read keeps
+    the records training keeps, with training's draws, and counts the rest under the step's
+    reason, where a random step that drops once had a verb only as a Grain transform."""
+    chain = Memory(rows("a", 24)).named("coins").random_filter_map(keep_heads)
+    chain = dataclasses.replace(chain, mode=read, loading=READ)
+    kept = [(int(row["i"]), float(row["draw"])) for row in chain.iterate()]
+    reader = compile(chain.repeat(1).batch(1, drop_remainder=False), loading=READ).train(DataPartition())
+    try:
+        trained = [(int(batch["i"][0]), float(batch["draw"][0])) for batch in reader]
+    finally:
+        reader.close()
+    assert kept == trained
+    assert 0 < len(kept) < 24 and all(draw >= 0.5 for _, draw in kept)
+    assert chain.stats(records=24)["data/rejected/coins/tails"] == 24 - len(kept)
+
+
+class Coin(grain.RandomMapTransform):
+    """Keeps a record, with its draw, on heads."""
+
+    def random_map(self, element, rng) -> dict | Rejected:
+        return keep_heads(element, rng)
+
+
+def test_an_objective_s_random_step_that_drops_records_runs_in_its_training_branch():
+    """An objective's training step that draws and may reject runs as random_filter_map does,
+    where it once reached filter_map, which now refuses a step that draws."""
+    records = Memory(rows("a", 24)).repeat(1).batch(1, drop_remainder=False)
+    data = compile(records, read="memory", loading=READ, objective=ObjectiveData(train=(Coin(),)))
+    reader = data.train(DataPartition())
+    try:
+        draws = [float(batch["draw"][0]) for batch in reader]
+    finally:
+        reader.close()
+    assert 0 < len(draws) < 24 and all(draw >= 0.5 for draw in draws)
+
+
+def test_filter_map_refuses_a_step_that_draws():
+    """A Grain RandomMapTransform draws from a generator, so filter_map, whose steps read the
+    record alone, refuses it rather than call it without one."""
+    from dew.data import video
+
+    with pytest.raises(TypeError):
+        Memory(rows("a", 2)).filter_map(video.pick_clip(1.0))
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

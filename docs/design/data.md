@@ -17,7 +17,7 @@ trainer.fit(train.shuffle(seed=0).batch(64), validation=val.batch(64), epochs=1)
 ```mermaid
 flowchart LR
   S["Source<br/>Files · Hub · TFDS · Memory<br/>from_hf · from_torch · from_grain · from_iter"]
-  R["Per-record functions<br/>map · random_map · filter<br/>filter_map · flat_map"]
+  R["Per-record functions<br/>map · random_map · filter<br/>filter_map · random_filter_map · flat_map"]
   X["Cross-record verbs<br/>pack · shuffle · mix · concat<br/>interleave · schedule · holdout · cache"]
   B["batch(n)<br/>the global training batch"]
   T["Trainer<br/>host share from the mesh<br/>device prefetch"]
@@ -44,6 +44,7 @@ Three types, six function shapes.
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
 | `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
+| `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
 | `DatasetFn` | `(Dataset, *settings) -> Dataset` | `pipe(fn, *settings)` | any |
 
@@ -56,7 +57,9 @@ flowchart TD
   Rn -- no --> M["map"]
   Rn -- yes --> RM["random_map"]
   D -- "yes, a yes/no test" --> FI["filter"]
-  D -- "yes, while transforming" --> FM["filter_map"]
+  D -- "yes, while transforming" --> Rt{"Random?"}
+  Rt -- no --> FM["filter_map"]
+  Rt -- yes --> RFM["random_filter_map"]
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
@@ -82,13 +85,13 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
-| Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
+| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, ...)` forwards Grain's packer options; `text.chunk(length, overlap=)` cuts long documents first |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.chunk(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
-| Combine | `mix(datasets, weights=, by="records" \| "tokens", stop=)`, `concat(datasets)`, `interleave(datasets, cycle_length=)`, `schedule([(dataset, tokens), ...])` |
+| Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
 | Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
@@ -246,7 +249,7 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 ```python
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
-           .random_map(video.pick_clip(seconds=2.0))       # writes one start/stop descriptor
+           .random_filter_map(video.pick_clip(seconds=2.0))  # writes one start/stop descriptor
            .filter_map(video.decode(frames=32, fps=16, size=256))            # reads the descriptor
            .filter_map(audio.decode(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
@@ -287,7 +290,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text` int32 `[B, seq_len + 1]`; `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
-| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B]` |
+| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
@@ -403,11 +406,12 @@ The chain lowers one stage per Grain operator. On top of that, Dew fuses adjacen
 
 | Area | Status |
 |---|---|
-| `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`flat_map`, `mix([..], weights=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built on `feat/data-fetch` (verb names being aligned to this page) |
+| `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`random_filter_map`/`flat_map`, `mix([..], weights=, by=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built |
 | `images.fetch`/`decode`, albumentations and torchvision adapters, `images.augmentation_key`/`device_augment` | Built |
-| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Being built (replaces `video.decode_clip` and `video.audio`) |
-| `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Being built |
+| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Built |
+| `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Built |
 | `fit(data, validation=, steps=/epochs=/tokens=)` | Built |
-| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `mix(by=, stop=)` keyed members, `schedule` in tokens, `snapshot`, `text.chunk`, `stats` | Planned |
+| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `snapshot`, `text.chunk`, `text.normalize`, `stats` | Built |
+| `mix` members keyed by name, `schedule` in tokens | Planned |
 | Elastic resume, `text.decontaminate`, `text.dedup_minhash`, language and quality filters, fusion, measured defaults, GPU decode | Planned |
 | Native `jax.Mesh` with any axes | Planned (training) |
