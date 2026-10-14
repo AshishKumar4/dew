@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, through
+from delta_rule_support import CHUNKED, recurrence, through
 from kernel_compile import compile_kernels, failures
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
 from sharded import boundary_copies
@@ -30,10 +30,6 @@ from dew.nn.kernels import fla_gdn, fla_kda, tuning
 from dew.nn.linear import fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
-
-CHUNKED = 64
-"""The terms a chunk sums in another order than the portable math: the port's fp32 floor over the
-math's distance (`assert_leaves_as_exact`'s `reductions`)."""
 
 ON_A_GPU = pytest.mark.skipif(
     jax.default_backend() == "gpu",

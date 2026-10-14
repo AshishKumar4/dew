@@ -1,24 +1,24 @@
 {
 	"about": "The screen pretrained.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "35ec422e140be2a4d1e1de3e57b92635fff4d28768161cee36749fb479364743",
+	"script_sha256": "511edc9fc09097763365fe85c15feec254a52cd913cb487d519de6fe47854e0a",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
-		"jax": "0.11.2.post3",
+		"jax": "0.11.2.post4",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "e3ef9db5370cf236b0175e092b94d2a4caccfc29",
-		"date": "2026-10-12"
+		"dew": "10d1092cf7e2855be1b80162809534006f19f928",
+		"date": "2026-10-14"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 243.8,
+		"seconds": 137.9,
 		"columns": 96,
 		"screen": [
 			[
 				{
-					"text": " Paris. The capital of Italy is Rome. The capital of"
+					"text": " Paris. The capital of France is also the capital of the"
 				}
 			],
 			[
@@ -133,7 +133,7 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  0:01:17 "
+					"text": "  100%  0:00:47 "
 				},
 				{
 					"text": "\u2502",
@@ -191,7 +191,7 @@
 					"dim": true
 				},
 				{
-					"text": "1 steps in 0:01:20             "
+					"text": "1 steps in 0:00:49             "
 				},
 				{
 					"text": "\u2502",
@@ -211,7 +211,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 80.05 s                  "
+					"text": "after 48.97 s                  "
 				},
 				{
 					"text": "\u2502",
@@ -251,7 +251,7 @@
 					"dim": true
 				},
 				{
-					"text": "5.295                         ",
+					"text": "3.826                         ",
 					"bold": true
 				},
 				{

@@ -81,11 +81,15 @@ FOREIGN = "dew.nn.kernels.another_branch.Kernel"
 
 
 def with_foreign(text: str) -> str:
-    """A store's JSON with one more launch, of a kernel this checkout lacks."""
+    """A store's JSON with two more launches this checkout cannot read: one of a kernel it lacks, and
+    one of a kernel it has whose stored arguments lack an operand (another checkout's signature of
+    it, as before a launch gained an operand). The first is last."""
     stored = json.loads(text)
     entry = json.loads(json.dumps(stored["data"][0]))
     entry[0]["op"]["__type"] = FOREIGN
-    return json.dumps({**stored, "data": [*stored["data"], entry]})
+    unbound = json.loads(json.dumps(stored["data"][0]))
+    del unbound[0]["arguments"][next(iter(unbound[0]["arguments"]))]
+    return json.dumps({**stored, "data": [*stored["data"], unbound, entry]})
 
 
 READ = """
@@ -209,16 +213,16 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
                                    metadata={})
     seed = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
         (found[0], tuning.AutotuningData({found[0].heuristics_config: timing})),))
-    foreign = json.loads(with_foreign(seed.dumps()))["data"][-1]
-    fresh(STORED, json.dumps({**json.loads(seed.dumps()), "data": [foreign]}), cache_dir=tmp_path / "cache",
+    foreign = json.loads(with_foreign(seed.dumps()))["data"][-2:]
+    fresh(STORED, json.dumps({**json.loads(seed.dumps()), "data": foreign}), cache_dir=tmp_path / "cache",
           flags=inherited)
     path, measured, settled = fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
     assert settled is True
     with open(path) as file:
         written = json.load(file)
-    assert foreign in written["data"]
+    assert all(entry in written["data"] for entry in foreign)
     stored = tokamax.AutotuningResult.loads(json.dumps(
-        {**written, "data": [entry for entry in written["data"] if entry != foreign]}))
+        {**written, "data": [entry for entry in written["data"] if entry not in foreign]}))
     kinds = {type(ba.op) for ba, _ in stored.data}
     assert {norm_swiglu.RmsForward, norm_swiglu.RmsBackward} <= kinds
     for ba, timings in stored.data:
