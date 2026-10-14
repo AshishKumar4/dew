@@ -661,6 +661,81 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
         source.with_split("val")
 
 
+@pytest.fixture(params=["raw", "packed", "export"])
+def token_span_store(tmp_path, request):
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    documents = [[], [], [1, 2, 0], [], [3, 0], [4, 5, 6, 0]]
+    metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                "vocab_size": 256, "eos_id": 0}
+    if request.param == "export":
+        export([{"text": np.asarray(document, np.int32)} for document in documents], str(tmp_path),
+               format="array_record", rows_per_shard=2, length_field="text", metadata=metadata)
+    else:
+        (tmp_path / "meta.json").write_text(json.dumps(metadata))
+        for shard, start in enumerate(range(0, len(documents), 2)):
+            writer = ArrayRecordWriter(str(tmp_path / f"train-{shard}.array_record"), "group_size:1")
+            for document in documents[start:start + 2]:
+                raw = np.asarray(document, np.int32).tobytes()
+                writer.write(pack_dict_of_byte_arrays({"ids": raw}) if request.param == "packed" else raw)
+            writer.close()
+    return tmp_path, "ids" if request.param == "packed" else None
+
+
+def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_span_store):
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.tokens import TokenFiles
+
+    root, field = token_span_store
+    stored = TokenFiles(str(root), field=field).provision()
+    tokens = stored.tokens
+    expected = np.asarray([1, 2, 0, 3, 0, 4, 5, 6, 0], np.int32)
+    assert len(tokens) == len(expected)
+    for span in (slice(None), slice(1, 8), slice(-5, -1), slice(3, 5), slice(5, 5), slice(8, 2)):
+        np.testing.assert_array_equal(tokens[span], expected[span])
+    with pytest.raises(ValueError):
+        tokens[::2]
+    assert stored.documented
+    assert stored.document_ends().tolist() == [3, 5, 9]
+    for read in ("memory", "indexed", "streamed"):
+        rows = iterate(Pipeline(stored), read=read, loading=Loading(workers=0, threads=1, read_buffer=0))
+        assert [row["text"].tolist() for row in rows] == [[1, 2, 0], [3, 0], [4, 5, 6, 0]]
+    for shard, index in zip(tokens.shards, tokens.indexes, strict=True):
+        assert shard.columns is index.values
+        assert isinstance(shard.columns, np.memmap)
+    reopened = pickle.loads(pickle.dumps(tokens))
+    np.testing.assert_array_equal(reopened[1:8], expected[1:8])
+    assert all(isinstance(shard.columns, np.memmap) for shard in reopened.shards)
+
+
+def test_each_token_document_is_checked_against_its_producer_length(token_span_store):
+    from dew.data.sources.tokens import TokenFiles
+
+    root, field = token_span_store
+    TokenFiles(str(root), field=field).provision()
+    manifest_path = root / "_dew_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes()) if manifest_path.exists() else None
+    path = (root / manifest["files"][1]["lengths"]["path"] if manifest is not None
+            else root / "train.lengths.npy")
+    columns = np.load(path, allow_pickle=False)
+    row = 0 if manifest is not None else 2
+    columns[row, 0] += 1
+    columns[row:, 1] += 1
+    encoded = io.BytesIO()
+    np.save(encoded, columns, allow_pickle=False)
+    path.write_bytes(encoded.getvalue())
+    if manifest is not None:
+        manifest["files"][1]["lengths"].update(
+            bytes=len(encoded.getvalue()), sha256=hashlib.sha256(encoded.getvalue()).hexdigest())
+        manifest_path.write_text(json.dumps(manifest))
+    stored = TokenFiles(str(root), field=field)
+    with pytest.raises(ValueError):
+        stored.tokens[:3]
+
+
 @pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
 def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path, format_args):
     from dew.cli.main import main

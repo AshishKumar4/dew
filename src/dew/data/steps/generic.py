@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import grain.python as grain
 import jax
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected
 from dew.records import record
 
 
@@ -49,16 +48,6 @@ def _placeable[Field](value: np.ndarray | str | bytes | Mapping[str, Field] | Fi
 
 
 @dataclasses.dataclass(frozen=True)
-class Keep(grain.MapTransform):
-    predicate: Callable[[Batch], bool]
-    reason: str = "filtered"
-    rejects = True
-
-    def map(self, element: Batch) -> Batch | Rejected:
-        return element if self.predicate(element) else Rejected(self.reason)
-
-
-@dataclasses.dataclass(frozen=True)
 class Formatting(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         fields = record(element, "dataset row")
@@ -81,11 +70,3 @@ class Formatting(grain.MapTransform):
                     array = array.astype(dtype)
                 held[name] = array
         return held
-
-
-@dataclasses.dataclass(frozen=True)
-class Preprocessing(grain.RandomMapTransform):
-    step: Callable[[Batch, np.random.Generator], Batch]
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return self.step(element, rng)
