@@ -268,8 +268,9 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
     `causal_conv1d`'s.
 
     `right_padded` says each row's `valid` slots are its first
-    (`AttentionMetadata.right_padded`). Its real tokens then follow the held
-    ones with no gap, so the row convolves as it stands and its padding is
+    (`AttentionMetadata.right_padded`), as they all are where `valid` is
+    None. Its real tokens then follow the held ones with no gap, so the row
+    convolves as it stands, its packed documents apart, and its padding is
     zeroed after: the masked conv's values, without its two gathers over
     every slot and their scattered gradients.
 
@@ -282,28 +283,25 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
     if held is not None:
         x = jax.lax.optimization_barrier(x)
     width = kernel.shape[-1] - 1
-    conv = functools.partial(_behind, kernel=kernel, held=held, bias=bias, parts=parts, dtype=dtype)
-    if valid is not None and right_padded and segments is None:
-        empty = jnp.zeros((x.shape[0], width, x.shape[2]), x.dtype)
-        stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
-        valid = jnp.asarray(valid, bool)
-        # The K-1 rows that end at the row's last real token.
-        ends = jnp.sum(valid, axis=1, dtype=jnp.int32)
-        rows = (ends[:, None] + jnp.arange(width)[None, :])[:, :, None]
-        return conv(x, valid=valid), jnp.take_along_axis(stream, rows, axis=1)
-    if valid is None and segments is not None:
-        # Every slot real: each packed document convolves alone where it stands, the held history counting
-        # as the first's, without the masked conv's gathers over every slot; the history left keeps only
-        # the last document's tokens, as `_masked_conv1d`'s does.
-        state = rows_like(jnp.zeros((x.shape[0], width, x.shape[2]), x.dtype), x) if held is None else held
-        kept = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')[:, -width:]
-        history = jnp.where((kept == segments[:, -1:])[:, :, None],
-                            jnp.concatenate([state, x], axis=1)[:, -width:], 0)
-        return conv(x, segments=segments), history
-    if valid is not None:
+    if valid is not None and not right_padded:
         return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype)
-    history = x if held is None else jnp.concatenate([held, x], axis=1)
-    return conv(x), history[:, -width:]
+    batch, length, channels = x.shape
+    empty = jnp.zeros((batch, width, channels), x.dtype)
+    stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
+    valid = None if valid is None else jnp.asarray(valid, bool)
+    # The K-1 stream rows that end at the row's last real token.
+    ends = (jnp.full((batch,), length, jnp.int32) if valid is None
+            else jnp.sum(valid, axis=1, dtype=jnp.int32))
+    rows = ends[:, None] + jnp.arange(width)[None, :]
+    history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
+    if segments is not None:
+        # The next call continues the last real token's document, so the history keeps only its tokens,
+        # the held ones counting as the first document's, as `_masked_conv1d`'s does.
+        owners = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')
+        last = jnp.take_along_axis(owners, ends[:, None] + width - 1, axis=1)
+        history = jnp.where((jnp.take_along_axis(owners, rows, axis=1) == last)[:, :, None], history, 0)
+    return _behind(x, kernel=kernel, held=held, bias=bias, valid=valid, segments=segments, parts=parts,
+                   dtype=dtype), history
 
 
 def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dtype=None):

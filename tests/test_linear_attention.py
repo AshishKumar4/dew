@@ -518,15 +518,20 @@ RIGHT_PADDED = {
 
 @pytest.mark.parametrize("case", list(RIGHT_PADDED))
 @pytest.mark.parametrize("history", [False, True])
-def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
+@pytest.mark.parametrize("packed", [False, True])
+def test_a_right_padded_row_convolves_as_the_masked_conv(case, history, packed):
     """Declared right-padded, a row convolves as it stands, with no gather:
     the masked conv's outputs, padding zeroed, the history it carries and
-    the gradients into the input, the taps and the incoming history."""
+    the gradients into the input, the taps and the incoming history, with
+    its real tokens one document or packed as two, the second from the
+    third token on, the padding a document of its own."""
     x, kernel, state, valid, cotangent = masked_operands(RIGHT_PADDED[case], 4, history=history, seed=3)
+    segments = (jnp.where(valid, 1 + (jnp.arange(valid.shape[1]) >= 2), 0).astype(jnp.int32) if packed
+                else None)
 
     def scored(*, right_padded):
         def inner(x, kernel, state):
-            out, carried = held_conv1d(x, kernel, valid, state, right_padded=right_padded)
+            out, carried = held_conv1d(x, kernel, valid, state, segments=segments, right_padded=right_padded)
             return jnp.sum(out * cotangent) + jnp.sum(carried ** 2), (out, carried)
         return jax.value_and_grad(inner, argnums=(0, 1, 2), has_aux=True)
 
