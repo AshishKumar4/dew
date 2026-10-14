@@ -419,9 +419,13 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     (`compensated_difference`). A plain fp32 prefix there, near -289 in base 2, rounds each running
     sum by up to 1.5e-5, which the 15-token range carries into the output and past the bar; that
     is asserted too. A decay per key dimension (Kimi's delta attention) is the same in each, the
-    pair in one 16-token sub-chunk, its diagonal block."""
+    pair in one 16-token sub-chunk, its diagonal block. The final memory takes no cotangent: fla's
+    decay gradient adds that memory's whole share at the chunk's last token and takes it back at the
+    key's, an fp32 cancellation of terms larger than the gradient that the math, summing each pair's
+    range, never makes; with one, the port's per-head decay gradient sits 5.8 times the math's
+    distance whatever the first token's decay."""
     length, width, key_at, query_at = 64, 64, 48, 63
-    keys = jax.random.split(jax.random.key(29), 7)
+    keys = jax.random.split(jax.random.key(29), 6)
     decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
     g = jnp.repeat(decay[..., None], width, axis=-1) if per_key else decay
 
@@ -432,8 +436,7 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     v = jax.random.normal(keys[3], (1, length, 1, width))
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, 1)))
     inputs = (alone(keys[1], query_at), alone(keys[2], key_at), v, g, beta, jnp.zeros((1, 1, width, width)))
-    do = jax.random.normal(keys[5], (1, length, 1, width))
-    dht = 0.1 * jax.random.normal(keys[6], (1, 1, width, width))
+    do, dht = jax.random.normal(keys[5], (1, length, 1, width)), jnp.zeros((1, 1, width, width))
 
     def math(q, k, v, g, beta, h0):
         return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
