@@ -8,32 +8,51 @@ looks slow this says whether the loader is the reason.
 The dataset is a registered recipe and its fields are the command line, so the
 knobs here are the knobs a run has:
 
-    python tools/benchmark_data.py --steps 100 data:oxford-flowers --data.image-size 128
-    python tools/benchmark_data.py data:local-videos --data.source /mnt/data/voxceleb2/train --data.frames 16
+    python tools/benchmark_data.py --steps 100 data:images --data.image-size 128
+    python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
+
+The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
+a fresh interpreter over the same produced files.
 """
 
+import contextlib
+import cProfile
+import functools
+import hashlib
+import importlib.metadata
+import itertools
+import json
 import os
+import platform
+import queue
+import shutil
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
-# Reading data needs no accelerator, and claiming one costs seconds of startup
+# Reading data needs no accelerator, and claiming one costs seconds of startup.
+# An explicit JAX_PLATFORMS=cuda selects the same-session A100 measurement.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import itertools  # noqa: E402
-import sys  # noqa: E402
-import time  # noqa: E402
-from dataclasses import dataclass, field  # noqa: E402
-from typing import TYPE_CHECKING, Iterable, List  # noqa: E402
-
-import tyro  # noqa: E402
-from absl import flags  # noqa: E402
+import tyro
+from absl import flags
 
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-from dew.config.data import ImageData, RunData, loader  # noqa: E402
 from dew.data import Loading  # noqa: E402
+from dew.data.dataset import Forwarding  # noqa: E402
 from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
+    from dew.config.data import RunData
+
     # tyro reads the runtime annotation, a Union of the registered specs, and
     # a type checker cannot read a variable in a type expression.
     AnySpec = RunData
@@ -41,9 +60,15 @@ else:
     AnySpec = datasets.union
 
 
+def flowers():
+    from dew.config.data import ImageData
+
+    return ImageData(source="tfds://oxford_flowers102:2.1.1")
+
+
 @dataclass(frozen=True)
 class Benchmark:
-    data: AnySpec = field(default_factory=lambda: ImageData(source="tfds://oxford_flowers102:2.1.1"))
+    data: AnySpec = field(default_factory=flowers)
     """Which dataset, with its own fields as flags."""
     batch: int = 32
     """Global batch size."""
@@ -51,11 +76,11 @@ class Benchmark:
     """Steps to time."""
     warmup: int = 5
     """Steps to run before timing starts."""
-    read: str = "indexed"
+    read: Literal["memory", "indexed", "streamed"] = "indexed"
     loading: Loading = field(default_factory=Loading)
 
 
-def measure(batches: Iterable, steps: int, warmup: int) -> List[float]:
+def measure(batches: Iterable, steps: int, warmup: int) -> list[float]:
     """Wall time per batch after warmup, in seconds."""
     latencies = []
     # islice pulls exactly the batches that are timed: the loop never reads
@@ -70,12 +95,12 @@ def measure(batches: Iterable, steps: int, warmup: int) -> List[float]:
     return latencies
 
 
-def percentile(values: List[float], q: float) -> float:
+def percentile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
-def report(latencies: List[float], batch_size: int) -> None:
+def report(latencies: list[float], batch_size: int) -> None:
     if not latencies:
         raise SystemExit("the loader ran out of batches before the first measured step")
     print(f"steps measured:   {len(latencies)}")
@@ -85,6 +110,8 @@ def report(latencies: List[float], batch_size: int) -> None:
 
 
 def main(config: Benchmark) -> None:
+    from dew.config.data import loader
+
     dataset = loader(config.data, batch=config.batch, read=config.read, loading=config.loading)
     print(f"{datasets.alias_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
@@ -107,5 +134,606 @@ def main(config: Benchmark) -> None:
             primary.add_note(f"Data iterator cleanup failed: {error!r}")
 
 
+
+
+@dataclass(frozen=True)
+class Matrix:
+    output: Path = Path("data-matrix.json")
+    work: Path = Path("data-matrix")
+    seed: int = 17
+    steps: int = 128
+    warmup: int = 8
+    train_steps: int = 16
+    stage_batches: int = 16
+    workers: int = 2
+    batch: int = 32
+    tokens: int = 16384
+    seq_len: int = 128
+    image_size: int = 128
+    engines: tuple[Literal["dew", "dew_memory", "grain", "grain_prepacked"], ...] = ("dew", "grain")
+    workloads: tuple[Literal["image", "text"], ...] = ("image", "text")
+    cold: bool = True
+    """Also open each arm cold: a fresh copy of its inputs, never provisioned, out of the page cache."""
+
+
+@dataclass(frozen=True)
+class Worker:
+    engine: Literal["dew", "dew_memory", "grain", "grain_prepacked"]
+    workload: Literal["image", "text"]
+    source: Path
+    output: Path
+    steps: int = 128
+    warmup: int = 8
+    train_steps: int = 16
+    stage_batches: int = 16
+    workers: int = 2
+    batch: int = 32
+    tokens: int = 16384
+    seq_len: int = 128
+    image_size: int = 128
+    seed: int = 17
+    cold: bool = False
+
+
+def file_fact(path: Path) -> dict:
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
+
+
+def write_images(paths: list[Path], count: int) -> None:
+    """`count` encoded 192x256 images, dealt round-robin into the ArrayRecord files `paths`."""
+    import cv2
+    import numpy as np
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    writers = [ArrayRecordWriter(str(path), "group_size:1") for path in paths]
+    try:
+        pixels = np.arange(192 * 256 * 3).reshape(192, 256, 3)
+        for index in range(count):
+            value = ((pixels + index * 7) % 256).astype(np.uint8)
+            _, png = cv2.imencode(".png", value[..., ::-1])
+            writers[index % len(writers)].write(pack_dict_of_byte_arrays({"jpg": png.tobytes(), "txt": b""}))
+    finally:
+        for writer in writers:
+            writer.close()
+
+
+def synthetic_inputs(config: Matrix) -> dict:
+    import numpy as np
+
+
+    image = config.work / "image"
+    text = config.work / "text"
+    image.mkdir(parents=True, exist_ok=True)
+    text.mkdir(parents=True, exist_ok=True)
+    path = image / "images.array_record"
+    write_images([path], 4096)
+    # No labels in the encoded layout: the image step uses a genuine per-image
+    # squared prediction loss, so all loaders read exactly these same bytes.
+    lengths = np.random.default_rng(config.seed).integers(17, 98, 18000)
+    documents = [np.concatenate(((np.arange(size - 1) + index) % 200 + 4, [255]))
+                 for index, size in enumerate(lengths)]
+    ids = np.concatenate(documents).astype(np.uint16)
+    ids.tofile(text / "train.bin")
+    held = np.full(129, 42, np.uint16)
+    held[-1] = 255
+    held.tofile(text / "val.bin")
+    (text / "meta.json").write_text(json.dumps({"tokenizer": "byte", "dtype": "uint16",
+        "vocab_size": 256, "eos_id": 255, "train_tokens": len(ids), "val_tokens": len(held)}) + "\n")
+    from dew.data import Files
+
+    Files(str(image), format="array_record").provision()
+    return {
+        "image": {**file_fact(path), "rows": 4096, "source": str(image)},
+        "text": {**file_fact(text / "train.bin"), "rows": len(documents),
+                 "tokens": len(ids), "source": str(text)},
+    }
+
+
+INPUTS = {"image": ("images.array_record",), "text": ("train.bin", "val.bin", "meta.json")}
+"""The files each workload's inputs are made of, without what a reader provisioned beside them."""
+
+
+def evicted_copy(source: Path, workload: str, into: Path) -> Path:
+    """`workload`'s input files under `source` copied to `into`, written through and dropped from the
+    page cache, so a reader opens a store it has never provisioned from bytes it reads from disk.
+    Clean pages leave the cache on POSIX_FADV_DONTNEED without root, where dropping every cache
+    needs it."""
+    shutil.rmtree(into, ignore_errors=True)
+    into.mkdir(parents=True)
+    for name in INPUTS[workload]:
+        shutil.copyfile(source / name, into / name)
+        with (into / name).open("rb+") as copied:
+            os.fsync(copied.fileno())
+            os.posix_fadvise(copied.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    return into
+
+
+def objective_for(config: Worker):
+    import jax.numpy as jnp
+    from flax import linen as nn
+
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.supervised import Supervised
+
+    if config.workload == "image":
+        class ImageMean(nn.Module):
+            @nn.compact
+            def __call__(self, image):
+                values = jnp.mean(image.astype(jnp.float32) / 255, axis=(1, 2))
+                return nn.Dense(3)(values)
+
+        def loss(outputs, batch):
+            target = jnp.mean(batch["image"].astype(jnp.float32) / 255, axis=(1, 2))
+            return jnp.mean(jnp.square(outputs - target), axis=-1)
+
+        return Supervised(ImageMean(), loss, inputs=InputSpec(
+            Field("image", (config.image_size, config.image_size, 3))))
+    return LMObjective(CausalTransformer(vocab_size=256, emb_features=32, num_layers=1,
+        num_heads=2, mlp_features=64, max_seq_len=config.seq_len),
+        seq_len=config.seq_len)
+
+
+def dew_reader(config: Worker, objective, loading: Loading):
+    from dew.config.data import ImageData, TextData, loader
+    from dew.data import Files
+    from dew.data.dataset import DataPartition
+    from dew.data.sources import TokenFiles
+
+    if config.workload == "image":
+        # Every record trains, as the Grain arm reads them all.
+        recipe = ImageData(Files(str(config.source), format="array_record"), image_size=config.image_size,
+                           augment=None, validation=None)
+    else:
+        recipe = TextData(TokenFiles(str(config.source)), tokenizer="byte", seq_len=config.seq_len,
+                          pack="first-fit", packing_bins=32)
+    read = "memory" if config.engine == "dew_memory" else "indexed"
+    data = loader(recipe, batch=config.batch, read=read, provision=True, loading=loading, seed=config.seed,
+                  objective=objective.data())
+    assert data.plan is not None, "a compiled run states its plan"
+    plan = data.plan.record()
+    return lambda: iter(data.train(DataPartition())), {
+        "records": data.records, "read": read, "batch_policy": "fixed rows",
+        "plan_sha256": hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest(),
+        "lowering": plan["lowering"], "exact": plan["exact"],
+    }
+
+
+def grain_options(rows, config: Worker):
+    import grain.python as grain
+
+    if config.workers:
+        rows = rows.mp_prefetch(grain.MultiprocessingOptions(
+            num_workers=config.workers, per_worker_buffer_size=2))
+    return rows
+
+
+def grain_reader(config: Worker, objective, loading: Loading):
+    import grain.experimental as gx
+    import grain.python as grain
+
+    from dew.data import images
+    from dew.data.steps.image import EncodeCaptions
+
+    read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
+    if config.workload == "image":
+        source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
+        rows = grain.MapDataset.source(source).shuffle(seed=config.seed).repeat()
+        # The image recipe's own record steps (`ImageData.pipelines`), applied by Grain alone.
+        rows = rows.map(images.decode("image", at_least=config.image_size, rejects=False))
+        rows = rows.map(images.resize(config.image_size)).map(images.caption())
+        rows = rows.batch(config.batch, drop_remainder=True).map(EncodeCaptions())
+        stream = grain_options(rows.to_iter_dataset(read_options), config)
+    elif config.workload == "text" and config.engine == "grain_prepacked":
+        import numpy as np
+
+        source = np.memmap(config.source / "train.bin", mode="r", dtype=np.uint16)
+        ends = np.flatnonzero(source == 255) + 1
+        documents = [{"text": np.asarray(source[start:end], np.int32)}
+                     for start, end in zip(np.concatenate(([0], ends[:-1])), ends, strict=True)]
+        rows = grain.MapDataset.source(documents).to_iter_dataset(read_options)
+        packed = gx.FirstFitPackIterDataset(rows, length_struct={"text": config.seq_len + 1},
+                                           num_packing_bins=32, shuffle_bins=False)
+        # A produced packing order is repeated and shuffled by both Dew loaders.
+        stored = list(packed)
+        rows = grain.MapDataset.source(stored).shuffle(seed=config.seed).repeat()
+        stream = grain_options(rows.batch(config.batch, drop_remainder=True).to_iter_dataset(read_options),
+                               config)
+    else:
+        from dew.data.packing import PackedSource
+        from dew.data.pipeline import Pack
+        from dew.data.sources import TokenFiles
+
+        source = TokenFiles(str(config.source))
+        source.provision()
+        windows = PackedSource.planned(source, Pack(config.seq_len + 1, bins=32)).records("indexed")
+        rows = grain.MapDataset.source(windows).map(
+            lambda row: {name: value for name, value in row.items() if not name.startswith("_dew_")})
+        rows = rows.shuffle(seed=config.seed).repeat().batch(config.batch, drop_remainder=True)
+        stream = grain_options(rows.to_iter_dataset(read_options), config)
+    reference = ("prepacked in-memory native-Grain first-fit list" if config.engine == "grain_prepacked" else
+                 "planned first-fit windows read from token store" if config.workload == "text" else
+                 "native Grain transforms")
+    return lambda: iter(stream), {"read": "indexed", "batch_policy": "fixed rows", "reference": reference}
+
+
+def batch_counts(batch) -> dict:
+    import numpy as np
+
+    first = next(iter(batch.values()))
+    rows = len(first)
+    tokens = padded = 0
+    if "valid" in batch:
+        tokens, padded = int(np.sum(batch["valid"])), int(np.size(batch["valid"]))
+    elif "text" in batch:
+        padded = int(np.size(batch["text"][:, 1:]))
+        laid = batch.get("text_coordinates")
+        segments = batch.get("text_segment_ids") if laid is None else np.asarray(laid.segments)
+        tokens = padded if segments is None else int(np.sum(
+            (segments[:, 1:] == segments[:, :-1]) & (segments[:, 1:] > 0)))
+    return {"rows": rows, "tokens": tokens, "padded_tokens": padded}
+
+
+def signature(batch) -> tuple:
+    import jax
+
+    return tuple((jax.tree_util.keystr(path), tuple(value.shape), str(value.dtype))
+                 for path, value in jax.tree_util.tree_leaves_with_path(batch))
+
+
+class ResidentMemory:
+    """Sample parent and aggregate loader-worker RSS, including cold materialization."""
+    def __init__(self):
+        self.parent_peak = self.workers_peak = 0
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+
+    def sample(self):
+        import psutil
+
+        process = psutil.Process()
+        while not self.stop.is_set():
+            self.parent_peak = max(self.parent_peak, process.memory_info().rss)
+            rss = 0
+            for child in process.children(recursive=True):
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    rss += child.memory_info().rss
+            self.workers_peak = max(self.workers_peak, rss)
+            self.stop.wait(0.02)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop.set()
+        self.thread.join()
+
+
+def loader_measure(factory, config: Worker) -> dict:
+    first = None
+    latencies, counts = [], []
+    started = steady_started = time.perf_counter()
+    with contextlib.closing(factory()) as reader:
+        for index in range(config.warmup + config.steps):
+            before = time.perf_counter()
+            if index == config.warmup:
+                steady_started = before
+            batch = next(reader)
+            seconds = time.perf_counter() - before
+            if first is None:
+                first = time.perf_counter() - started
+            if index >= config.warmup:
+                latencies.append(seconds)
+                counts.append(batch_counts(batch))
+        # Counted batches are consumer work too: do not turn time spent counting
+        # into free prefetch time and overstate steady pipeline throughput.
+        seconds = time.perf_counter() - steady_started
+    return {"first_batch_seconds": first, "batches": len(latencies),
+            "batches_per_second": len(latencies) / seconds,
+            "records_per_second": sum(row["rows"] for row in counts) / seconds,
+            "tokens_per_second": sum(row["tokens"] for row in counts) / seconds,
+            "latency_p50_ms": percentile(latencies, 0.5) * 1000,
+            "latency_p95_ms": percentile(latencies, 0.95) * 1000}
+
+
+class Counted(Forwarding):
+    def __init__(self, parent, objective=None):
+        self._source = parent
+        self.objective = objective
+        self.counts = queue.Queue()
+
+    def __iter__(self):
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+    def __next__(self):
+        batch = next(self._source)
+        counts = batch_counts(batch)
+        counts["model_flops"] = (None if self.objective is None or counts["tokens"] == 0 else
+                                 self.objective.training_flops(None, batch))
+        self.counts.put(counts)
+        return batch
+
+
+def training_measure(factory, objective, config: Worker) -> dict:
+    import jax
+    import optax
+
+    from dew.telemetry.instrumentation import model_flops_utilization
+    from dew.training import Trainer
+    from dew.training.distributed import DevicePrefetchIterator
+
+    trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
+    state, _, _ = trainer.place()
+    jax.block_until_ready(state)
+    compiled, compiles, measured, flops = {}, [], [], {}
+    counted = Counted(factory(), objective)
+    index = 0
+    signals, completed_seconds, segment_started = [], 0.0, None
+    with DevicePrefetchIterator(counted, trainer.device_mesh) as reader:
+        while len(measured) < config.train_steps:
+            start = time.perf_counter()
+            batch = next(reader)
+            waited = time.perf_counter() - start
+            counts = counted.counts.get_nowait()
+            key = signature(batch)
+            cold_shape = key not in compiled
+            if cold_shape:
+                jax.block_until_ready(state)
+                if segment_started is not None:
+                    completed_seconds += time.perf_counter() - segment_started
+                    segment_started = None
+                before = time.perf_counter()
+                compiled[key] = trainer.compile(state, batch)
+                flops[key] = None if trainer.step_flops is None else trainer.step_flops.hardware
+                compiles.append({"signature": key, "seconds": time.perf_counter() - before,
+                                 "flops": flops[key]})
+            before = time.perf_counter()
+            # The step's commit telemetry (its sixth output) is not a signal this run reads.
+            state, loss, _, finite, accepted = compiled[key](state, batch)[:5]
+            dispatched = time.perf_counter() - before
+            signals.append((loss, finite, accepted))
+            if cold_shape or index < config.warmup:
+                jax.block_until_ready((state, loss, finite, accepted))
+            if index >= config.warmup and not cold_shape:
+                if segment_started is None:
+                    segment_started = start
+                measured.append({**counts, "wait_seconds": waited,
+                    "dispatch_seconds": dispatched, "signal_index": len(signals) - 1,
+                    "hlo_flops": flops[key]})
+            index += 1
+        jax.block_until_ready(state)
+        if segment_started is not None:
+            completed_seconds += time.perf_counter() - segment_started
+    resolved = jax.device_get(signals)
+    if any(not bool(finite) or not bool(accepted) for _, finite, accepted in resolved):
+        raise ValueError("the real small-model update was nonfinite or not accepted")
+    seconds = completed_seconds
+    padded = sum(row["padded_tokens"] for row in measured)
+    hlo_flops = None if any(row["hlo_flops"] is None for row in measured) else sum(
+        row["hlo_flops"] for row in measured)
+    model_flops = None if any(row["model_flops"] is None for row in measured) else sum(
+        row["model_flops"] for row in measured)
+    return {"steps": len(measured), "data_wait_ms": statistics.mean(
+                row["wait_seconds"] for row in measured) * 1000,
+            "step_ms": (seconds - sum(row["wait_seconds"] for row in measured)) * 1000 / len(measured),
+            "dispatch_ms": statistics.mean(row["dispatch_seconds"] for row in measured) * 1000,
+            "records_per_second": sum(row["rows"] for row in measured) / seconds,
+            "tokens_per_second": sum(row["tokens"] for row in measured) / seconds,
+            "padding_fraction": None if padded == 0 else 1 - sum(
+                row["tokens"] for row in measured) / padded,
+            "compile_count": len(compiles), "compiles": compiles,
+            "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
+            "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+            "model_mfu_bf16_peak": model_flops_utilization(model_flops, seconds),
+            "model_flops_scope": "objective.training_flops on real host lengths and layout; "
+                                 "custom image-mean model and frozen legacy API have no analytic count",
+            "hlo_utilization_bf16_peak": model_flops_utilization(hlo_flops, seconds),
+            "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
+                                 "not an analytic real-token MFU"}
+
+
+def stage_profile(factory, batches: int = 16) -> list[dict]:
+    profile = cProfile.Profile()
+    with contextlib.closing(factory()) as reader, profile:
+        for _ in range(batches):
+            next(reader)
+    profile.create_stats()
+    return [{"file": Path(key[0]).name, "line": key[1], "function": key[2],
+             "self_seconds": value[2], "cumulative_seconds": value[3], "calls": value[1]}
+            for key, value in sorted(profile.stats.items(), key=lambda pair: pair[1][3], reverse=True)[:20]]
+
+
+def matrix_worker(config: Worker) -> dict:
+    import jax
+
+    if config.cold:
+        config = replace(config, source=evicted_copy(config.source, config.workload,
+                                                     config.output.with_suffix(".inputs")))
+    objective = objective_for(config)
+    loading = Loading(workers=config.workers, worker_buffer=2)
+    with ResidentMemory() as rss:
+        started = time.perf_counter()
+        factory, policy = {"dew": dew_reader, "dew_memory": dew_reader, "grain": grain_reader,
+                           "grain_prepacked": grain_reader}[
+            config.engine](config, objective, loading)
+        opened = time.perf_counter() - started
+        result = {"engine": config.engine, "workload": config.workload, "config": asdict(config),
+            "policy": policy, "cold_open_seconds": opened, "loader": loader_measure(factory, config),
+            "loading": asdict(loading),
+            "device": jax.devices()[0].device_kind,
+            "cold_scope": ("fresh process and cache home over a fresh copy of the inputs, never provisioned, "
+                           "evicted from the page cache" if config.cold else
+                           "fresh process and loader objects; shared OS page cache after input preparation"),
+            "environment": {"python": platform.python_version(), "platform": platform.platform(),
+                "cpu": platform.processor(), "packages": {name: importlib.metadata.version(name)
+                    for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}}}
+        result["first_batch_from_open_seconds"] = opened + result["loader"]["first_batch_seconds"]
+        if config.train_steps:
+            result["training"] = training_measure(factory, objective, config)
+        result["stages"] = stage_profile(factory, config.stage_batches) if config.stage_batches else []
+        result["stage_scope"] = (f"separate untimed {config.stage_batches}-batch parent-thread cProfile; "
+                                 "excludes worker CPU" if config.stage_batches else "not recorded")
+    result["parent_rss_peak_bytes"] = rss.parent_peak
+    result["worker_rss_peak_bytes"] = rss.workers_peak
+    config.output.write_text(json.dumps(result, default=str, indent=2) + "\n")
+    return result
+
+
+def comparison(rows: list[dict]) -> list[dict]:
+    """The data acceptance checks for each workload, Dew's reader against plain Grain over the same
+    steps: steady throughput within 5%, resident memory, parent and workers, at most Grain's and
+    10%, a warm first batch within 10 s of opening and a cold one within 30 s, and the device
+    idle under 5% of a training step, waiting for data."""
+    verdicts = []
+    for workload in sorted({row["workload"] for row in rows}):
+        arms = {row["engine"]: row for row in rows if row["workload"] == workload and not row.get("cold")}
+        cold = {row["engine"]: row for row in rows if row["workload"] == workload and row.get("cold")}
+        if not {"dew", "grain"} <= arms.keys():
+            continue
+        failed = {name: row["error"] for name, row in arms.items() if "error" in row}
+        if failed:
+            verdicts.append({"workload": workload, "cause": failed})
+            continue
+        dew, grain = arms["dew"], arms["grain"]
+        metric = "records_per_second" if workload == "image" else "tokens_per_second"
+        resident = {name: arm["parent_rss_peak_bytes"] + arm["worker_rss_peak_bytes"]
+                    for name, arm in arms.items()}
+        verdict = {"workload": workload, "metric": metric,
+                   "dew_over_grain": dew["loader"][metric] / grain["loader"][metric],
+                   "rss_over_grain": resident["dew"] / resident["grain"],
+                   "first_batch_from_open_seconds": dew["first_batch_from_open_seconds"]}
+        if "first_batch_from_open_seconds" in cold.get("dew", {}):
+            verdict["cold_first_batch_from_open_seconds"] = cold["dew"]["first_batch_from_open_seconds"]
+        if "training" in dew:
+            training = dew["training"]
+            verdict["device_idle_fraction"] = training["data_wait_ms"] / (
+                training["data_wait_ms"] + training["step_ms"])
+        verdict["checks"] = {
+            "within_5_percent_of_grain": verdict["dew_over_grain"] >= 0.95,
+            "rss_within_grain_plus_10_percent": verdict["rss_over_grain"] <= 1.10,
+            "warm_first_batch_under_10_seconds": verdict["first_batch_from_open_seconds"] < 10,
+            **({"device_idle_under_5_percent": verdict["device_idle_fraction"] < 0.05}
+               if "device_idle_fraction" in verdict else {}),
+            **({"cold_first_batch_under_30_seconds": verdict["cold_first_batch_from_open_seconds"] < 30}
+               if "cold_first_batch_from_open_seconds" in verdict else {})}
+        verdicts.append(verdict)
+    return verdicts
+
+
+def run_matrix(config: Matrix) -> None:
+    config.work.mkdir(parents=True, exist_ok=True)
+    root = Path(__file__).resolve().parents[1]
+    prepared = config.work / "inputs.json"
+    inputs = json.loads(prepared.read_text()) if prepared.is_file() else synthetic_inputs(config)
+    rows = []
+    common = {name: getattr(config, name) for name in ("steps", "warmup", "train_steps", "stage_batches",
+                                                    "workers", "batch", "tokens", "seq_len",
+                                                    "image_size", "seed")}
+    cases: list[tuple[Literal["image", "text"], Literal["dew", "dew_memory", "grain", "grain_prepacked"],
+                      bool]] = [(workload, engine, False) for workload in config.workloads
+                                for engine in config.engines]
+    if "text" in config.workloads and "grain" in config.engines and "grain_prepacked" not in config.engines:
+        cases.append(("text", "grain_prepacked", False))
+    if config.cold:
+        cases.extend((workload, engine, True) for workload in config.workloads for engine in config.engines)
+    for number, (workload, engine, cold) in enumerate(cases):
+        output = config.work / f"{number}-{workload}-{engine}{'-cold' if cold else ''}.json"
+        source = Path(inputs[workload]["source"])
+        # A cold arm times its open and first batches only.
+        first = {"steps": 4, "warmup": 0, "train_steps": 0, "stage_batches": 0}
+        timed = {**common, **(first if cold else {})}
+        worker = Worker(engine, workload, source.resolve(), output.resolve(), cold=cold, **timed)
+        args = [sys.executable, str(Path(__file__).resolve()), "worker"]
+        for name, value in asdict(worker).items():
+            flag = "--" + name.replace("_", "-")
+            if isinstance(value, bool):
+                # tyro reads a bool as a flag and its --no- form.
+                args.append(flag if value else "--no-" + flag[2:])
+            elif value is not None:
+                args.extend([flag, str(value)])
+        environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+        if cold:
+            # A cache home of its own, so nothing an earlier arm provisioned or compiled is found.
+            environment["XDG_CACHE_HOME"] = str(output.with_suffix(".cache").resolve())
+        with output.with_suffix(".log").open("w") as log:
+            done = subprocess.run(args, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT)
+        row = ({"engine": engine, "workload": workload, "exit_code": done.returncode,
+                "error": output.with_suffix(".log").read_text()[-4000:]}
+               if done.returncode else json.loads(output.read_text()))
+        rows.append({**row, "cold": cold})
+        result = {"schema": 1, "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+            "inputs": inputs, "rows": rows,
+            "comparisons": comparison(rows), "config": asdict(config)}
+        config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+        arm = f"{workload}/{engine}{' cold' if cold else ''}"
+        print(f"{arm}: " + (f"exit {done.returncode}" if done.returncode else
+            f"{row['loader']['records_per_second']:.1f} rows/s, "
+            f"{row['loader']['tokens_per_second']:.1f} tokens/s, "
+            f"first batch {row['first_batch_from_open_seconds']:.2f} s"), flush=True)
+    if any("error" in row for row in rows):
+        raise RuntimeError(f"matrix contains failed arms; see {config.output}")
+
+
+
+@dataclass(frozen=True)
+class Scaling:
+    """Streamed reads of one image corpus in `shards` files, interleaving `cycles` shards at a time."""
+
+    output: Path = Path("data-scaling.json")
+    work: Path = Path("data-matrix")
+    shards: int = 16
+    records: int = 4096
+    cycles: tuple[int, ...] = (1, 2, 4, 8)
+    steps: int = 64
+    warmup: int = 4
+    batch: int = 32
+    image_size: int = 128
+
+
+def run_scaling(config: Scaling) -> None:
+    """Throughput of a streamed image read as it interleaves more shards: decoding and resizing run
+    inside each shard's stream, so a wider cycle decodes more shards at once."""
+    from dew.data import Files, images
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    directory = config.work / "shards"
+    if not directory.is_dir():
+        directory.mkdir(parents=True)
+        write_images([directory / f"images-{index:02d}.array_record" for index in range(config.shards)],
+                     config.records)
+    rows = []
+    for cycle in config.cycles:
+        chain = (Files(str(directory), format="array_record").read("streamed")
+                 .map(images.decode("image", at_least=config.image_size, rejects=False))
+                 .map(images.resize(config.image_size)).interleave(cycle).repeat().batch(config.batch))
+        data = compile(chain, loading=Loading(workers=0))
+        worker = Worker("dew", "image", directory, config.output, steps=config.steps, warmup=config.warmup,
+                        batch=config.batch, image_size=config.image_size)
+        measured = loader_measure(functools.partial(data.train, DataPartition()), worker)
+        rows.append({"cycle": cycle, **measured})
+        print(f"cycle {cycle}: {measured['records_per_second']:.1f} rows/s", flush=True)
+    base = rows[0]["records_per_second"]
+    config.output.write_text(json.dumps({"schema": 1, "config": asdict(config), "rows": rows, "speedup": {
+        str(row["cycle"]): row["records_per_second"] / base for row in rows}}, indent=2, default=str) + "\n")
+
+
 if __name__ == "__main__":
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark]))
+    if sys.argv[1:2] == ["matrix"]:
+        run_matrix(tyro.cli(Matrix, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["worker"]:
+        matrix_worker(tyro.cli(Worker, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["scaling"]:
+        run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
+    else:
+        main(tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark]))
