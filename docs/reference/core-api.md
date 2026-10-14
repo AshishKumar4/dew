@@ -130,29 +130,34 @@ Import `TrainState` from `dew.training`.
 
 `state.averaged` overlays EMA leaves onto `state.variables` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
-## Dataset, Pipeline and Loading
+## Dataset, Loader and Loading
 
-Import the data values and recipes from `dew.data`.
+Import stores, chains, `load` and `Loading` from `dew.data`, `compile` from `dew.data.compile`, and run specs and `loader` from `dew.config.data`. `Loader` and `DataPartition` are in `dew.data.dataset`.
 
 ```text
-load(recipe_or_alias, *, batch, read="indexed", provision=False, cache=None,
+load(name_or_dataset, *, batch, tokenizer=None, seq_len=None, read=None,
+     provision=True, seed=0, loading=None) -> Loader
+loader(spec_or_alias, *, batch, read="indexed", provision=False, cache=None,
      objective=None, validation_records=None, seed=0, loading=Loading(workers="auto"), host=())
-compile(train, *, validation=None, host=(), objective=None, read="indexed",
-        provision=False, loading=Loading(), seed=0)
-Dataset(train, val, records, batch, ramp=None)
+spec.load(**options)  # loader(spec, **options)
+compile(train, *, validation=None, host=(), objective=None, read=None,
+        provision=False, loading=None, seed=0) -> Loader
+Loader(train, val, records, batch, ramp=None)
 DataPartition(index=0, count=1, readers=1, reader=0)
 Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
 ```
 
-A recipe is a frozen value implementing `Recipe.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. The aliases are `records`, `text`, `chat`, `prompts`, `preferences`, `images`, `video` and `decisions`. Source URLs belong in `source`; `load` refuses a bare URI.
+`load("hf/<repo>")` and `load("tfds/<builder>")` read a dataset by name: packed language-model rows where `tokenizer=` or `seq_len=` asks for them, batched records otherwise. Text holds out 1% of document identities before tokenization; records hold out the first 256. `hf/<repo>@<revision>` pins a Hub revision and `tfds/<builder>:<version>` a TFDS version. A `Dataset` is also accepted. Other source locations use `Hub()`, `TFDS()` or `Files()`.
 
-`load(..., batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Dataset exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
+A run spec is a frozen value implementing `RunData.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. Every data spec has `.load(**options)`, which calls `loader` with that spec. Each spec has an alias in `dew.registry.datasets`, such as `records`, `text`, `chat`, `images` or `video`. Source URLs belong in `source`; `loader` refuses a bare URI. `TextData` defaults to EOS and a 1% token-axis holdout when no validation is named, keeping a token store's own validation split. `ImageData` defaults to a 256-record holdout.
+
+`spec.load(batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
 
 `Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take`, `cache` and `map_batch`. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
 Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 
-`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or explicit provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation. Missing artifacts are named errors unless `provision=True` permits their creation.
+`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `dew.data.load` provisions what the read needs, logging each artifact it prepares; with `provision=False`, a missing artifact is a named error.
 
 `Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps and host batch steps for each branch. `ObjectiveData.pack` optionally packs those records into fixed windows, and `ObjectiveData.packed` runs record steps on each window before batching. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
@@ -164,7 +169,7 @@ Sources implement `Source`: `Memory` holds records or columns, `Files` opens a f
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`Loading` changes concurrency without changing record order or draws. Explicit `Loading(workers=0)` reads in the training process. `load` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
+`Loading` changes concurrency without changing record order or draws. `dew.data.load` defaults to `Loading(workers=0)`, which reads in the training process; spec `.load()` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 

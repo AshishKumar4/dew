@@ -1026,6 +1026,10 @@ class DevicePrefetchIterator:
         self._stop = threading.Event()
         self._done = threading.Event()
         self._start_lock = threading.Lock()
+        # Held while a stop request reaches the source and while the worker lets the source go:
+        # a request reaches the source it read (during its close too, which may wait on it), and
+        # the worker releases the source only after that request returns.
+        self._handover = threading.Lock()
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
@@ -1053,8 +1057,7 @@ class DevicePrefetchIterator:
                         # Thread creation failed before any source operation.
                         self._stop.set()
                         try:
-                            if isinstance(self._iterator, Stoppable):
-                                self._iterator.request_stop()
+                            self._stop_source()
                         except BaseException as failure:
                             error.add_note(f"Source cancellation failed: {failure!r}")
                         self._prefetch()
@@ -1066,8 +1069,15 @@ class DevicePrefetchIterator:
         """Ask the worker to stop between batches, and a stoppable source to stop its own work."""
         first = not self._stop.is_set()
         self._stop.set()
-        if first and isinstance(self._iterator, Stoppable):
-            self._iterator.request_stop()
+        if first:
+            self._stop_source()
+
+    def _stop_source(self) -> None:
+        """Ask the source to stop its own work, unless the worker has already let it go."""
+        with self._handover:
+            source = self._iterator
+            if isinstance(source, Stoppable):
+                source.request_stop()
 
     def _prefetch(self):
         """Read, place and enqueue batches until the source drains or a stop.
@@ -1130,7 +1140,9 @@ class DevicePrefetchIterator:
             except BaseException as error:
                 self._cleanup_error = error
             finally:
-                self._iterator = self._mesh = self._prepare = None
+                with self._handover:
+                    self._iterator = None
+                self._mesh = self._prepare = None
                 # No bound close method or checkpointable alias may retain a
                 # Grain pipeline after the worker exits.
                 iterator = source = mesh = close = None
@@ -1157,7 +1169,8 @@ class DevicePrefetchIterator:
         if threading.current_thread() is self._thread:
             raise RuntimeError("a prefetch worker cannot close itself")
         if timeout is None:
-            seconds = self._iterator.stop_seconds if isinstance(self._iterator, Budgeted) else None
+            source = self._iterator
+            seconds = source.stop_seconds if isinstance(source, Budgeted) else None
             timeout = 5.0 if seconds is None else float(seconds)
         error = None
         try:

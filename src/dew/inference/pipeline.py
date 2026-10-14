@@ -81,11 +81,12 @@ def pipeline(
     if not root.is_dir():
         # A Hub source is read at the commit its metadata resolved; one holding
         # a run (`HfApi().upload_folder`) is pulled whole and loads as the run.
+        from huggingface_hub import snapshot_download
+
         from dew.interop import sources
-        from dew.interop.hub import pull_from_hub
         metadata = sources.snapshot(source, revision, weights=False)
         if (metadata / RUN_FILE).is_file():
-            root, revision = epath.Path(pull_from_hub(source, metadata.name)), None
+            root, revision = epath.Path(snapshot_download(repo_id=source, revision=metadata.name)), None
         else:
             revision = metadata.name
     if root.is_dir() and not (root / RUN_FILE).is_file() and any(path.name.isdecimal()
