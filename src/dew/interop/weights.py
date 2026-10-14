@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from jax.core import Tracer
 
 from dew import records
 from dew.registry import dtype_name, resolve_dtype
@@ -66,7 +67,10 @@ def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
     stored wider than `model`'s compute dtype cast to it, but for those
     `checkpoint_dtype` keeps in fp32, as a checkpoint loaded at that storage
     holds them, and as HF's `torch_dtype` and vLLM's `dtype` store a model.
-    Other collections, and a model that declares no compute dtype, keep theirs."""
+    Other collections, and a model that declares no compute dtype, keep theirs.
+    Under a trace each cast is held behind a barrier, so XLA cannot fold a
+    later widening (a norm's fp32 read of its scale) back onto the wider
+    value (`xla_allow_excess_precision`): the program reads what is stored."""
     compute = getattr(model, "dtype", None)
     if compute is None:
         return variables
@@ -77,7 +81,8 @@ def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
         if (names[0] != "params" or not jnp.issubdtype(dtype, jnp.floating)
                 or dtype.itemsize <= jnp.dtype(compute).itemsize):
             return leaf
-        return leaf.astype(checkpoint_dtype(dtype, dtype_name(compute), path=names))
+        cast = leaf.astype(checkpoint_dtype(dtype, dtype_name(compute), path=names))
+        return jax.lax.optimization_barrier(cast) if isinstance(cast, Tracer) else cast
 
     return jax.tree_util.tree_map_with_path(stored, variables)
 
