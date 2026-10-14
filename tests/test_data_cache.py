@@ -75,7 +75,9 @@ def _cached_passes(step, directory, records=8, read="indexed"):
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_volatile_cache_reruns_prefix_on_later_passes(tmp_path, records, read):
     step = CountedStep(volatile=True)
-    assert _cached_passes(step, tmp_path, records, read) == [(0, 1), (1, 1), (0, 2), (1, 2)]
+    # A reader may run a later pass's step ahead of delivering an earlier one: each row's two
+    # outcomes are its two calls, in whichever order they ran.
+    assert sorted(_cached_passes(step, tmp_path, records, read)) == [(0, 1), (0, 2), (1, 1), (1, 2)]
     assert step.calls[0] == step.calls[1] == 2
     assert not list(tmp_path.iterdir())
 
@@ -84,7 +86,7 @@ def test_volatile_cache_reruns_prefix_on_later_passes(tmp_path, records, read):
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_volatile_cache_retries_rejected_rows_on_later_passes(tmp_path, permanent, read):
     step = CountedStep(volatile=True, reject_first=True, permanent=permanent)
-    assert _cached_passes(step, tmp_path, read=read) == [(1, 1), (2, 1), (0, 2), (1, 2)]
+    assert sorted(_cached_passes(step, tmp_path, read=read)) == [(0, 2), (1, 1), (1, 2), (2, 1)]
     assert step.calls[0] == step.calls[1] == 2
     assert not list(tmp_path.iterdir())
 
@@ -237,7 +239,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
-        from dew.data.cache import Generation
+        from dew.data.generation import Generation
 
         assert any(isinstance(attempt, Generation) for attempt in attempts)
         generation = cache.generation(key)
