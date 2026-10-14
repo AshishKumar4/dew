@@ -304,48 +304,56 @@ def _config(fastest: AutotuningData | None) -> Hashable:
     return None if fastest is None else fastest.fastest_config
 
 
-def _kernel_launches(picks: tokamax.AutotuningResult):
-    """`picks`' launches of Dew's kernels, each with its fastest config's timing."""
-    for ba, timings in picks.data:
-        if isinstance(ba.op, KernelOp) and timings.prune_errors():
-            yield ba, timings.prune()
+Keyed = dict[tuple[tokamax.Op, Hashable], tuple[tokamax.BoundArguments, AutotuningData]]
+"""Launches by their op and cache key, each with its timings (`_keyed`)."""
 
 
-def _read(path: str) -> tuple[tokamax.AutotuningResult | None, list]:
-    """The launches stored at `path` that this checkout's kernels read, and
-    the stored entries they do not, as JSON: another checkout's launches (a
-    kernel another branch adds, or another branch's config fields), which a
-    write keeps as they are. Each launch is read alone, so one launch this
-    checkout cannot read leaves the others readable. A file that is not JSON
-    holds nothing."""
+def _keyed(timed) -> Keyed:
+    """Each of the `(launch, timings)` pairs `timed` by its op and cache key, which binds the
+    launch's arguments to this checkout's signature of its kernel (ValueError where they do not)."""
+    return {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in timed}
+
+
+def _kernel_launches(launches: Keyed):
+    """`launches`' launches of Dew's kernels, each `(op, key, fastest config's timing)`."""
+    for (op, key), (_, timings) in launches.items():
+        if isinstance(op, KernelOp) and timings.prune_errors():
+            yield op, key, timings.prune()
+
+
+def _read(path: str) -> tuple[Keyed, list]:
+    """The launches stored at `path` that this checkout's kernels read
+    (`_keyed`), and the stored entries they do not, as JSON: another
+    checkout's launches (a kernel another branch adds, another branch's
+    config fields, or another signature of a kernel, as before a launch
+    gained an operand), which a write keeps as they are. Each launch is read
+    alone, so one launch this checkout cannot read leaves the others
+    readable. A missing file, or one that is not JSON, holds nothing."""
     if not os.path.exists(path):
-        return None, []
+        return {}, []
     try:
         with open(path) as file:
             stored = json.load(file)
-        entries, kind = list(stored["data"]), stored["device_kind"]
+        entries = list(stored["data"])
     except (ValueError, KeyError, TypeError) as error:
         _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
-        return None, []
-    read, foreign = [], []
+        return {}, []
+    read: Keyed = {}
+    foreign = []
     for entry in entries:
         try:
-            read.extend(tokamax.AutotuningResult.loads(json.dumps(
-                {**stored, "data": [entry]})).data)
+            read.update(_keyed(tokamax.AutotuningResult.loads(json.dumps({**stored, "data": [entry]})).data))
         except ValueError:
             foreign.append(entry)
-    return tokamax.AutotuningResult(kind, tuple(read)), foreign
+    return read, foreign
 
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op."""
     stored, _ = _read(cache.kernel_picks_path(kind))
-    if stored is None:
-        return {}
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
-    for ba, fastest in _kernel_launches(stored):
-        bare = ba.op.replace(config=None, vjp=None)
-        picks.setdefault((bare, kind), _Picks())[ba.autotuning_cache_key] = fastest
+    for op, key, fastest in _kernel_launches(stored):
+        picks.setdefault((op.replace(config=None, vjp=None), kind), _Picks())[key] = fastest
     return picks
 
 
@@ -359,8 +367,7 @@ def _store(picks: tokamax.AutotuningResult) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         stored, foreign = _read(path)
-        launches = () if stored is None else stored.data
-        merged = {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in (*launches, *picks.data)}
+        merged = {**stored, **_keyed(picks.data)}
         written = json.loads(tokamax.AutotuningResult(picks.device_kind, tuple(merged.values()))
                              .dumps(prune_errors=True))
         write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
@@ -440,8 +447,9 @@ def _settle(found: list[tuple[KernelOp, tokamax.BoundArguments]], *, measure: bo
         return tokamax.AutotuningResult(kind, tuple(decisions)).dumps()
 
     text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
-    settled = {(ba.op, ba.autotuning_cache_key): fastest
-               for ba, fastest in _kernel_launches(tokamax.AutotuningResult.loads(text))}
+    decided_launches = _keyed(tokamax.AutotuningResult.loads(text).data)
+    settled: dict[tuple[tokamax.Op, Hashable], AutotuningData] = {
+        (op, key): fastest for op, key, fastest in _kernel_launches(decided_launches)}
     changed = False
     for op, ba in found:
         picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
