@@ -426,7 +426,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             planes = device_events(directory)[0]
             timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
                         **communication(directory, config.profile_steps, planes=planes)}
-        flops = trainer.flops_per_step
+        flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
         peak = step_bytes(trainer.executable)

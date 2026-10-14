@@ -13,8 +13,6 @@ evaluation running against the sharded EMA copy, and a checkpoint on disk
 afterwards.
 """
 
-import dataclasses
-import itertools
 import json
 import math
 from dataclasses import dataclass, replace
@@ -24,9 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn, traverse_util
+from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
@@ -44,7 +42,6 @@ from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.model_flops import model_batch
-from dew.training.transaction import ema_update, with_ema
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -413,129 +410,49 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
     return trainer, state, losses
 
 
+def wide(case: Case, batch):
+    """A batch as the float64 runs read it: its samples float64, so their
+    conversion and the diffusion noising do not share the float32 runs' roundings."""
+    return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
+
+
+def widened_state(state):
+    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                        else jnp.copy(leaf), state)
+
+
 def truth(case: Case, tmp_path, initial):
     """The case's two steps on one device in float64, from `initial`
-    widened: the same rows, keys and draws, every float wider. The
-    samples arrive as float64, so their conversion and the diffusion
-    noising do not share the float32 runs' roundings."""
+    widened: the same rows, keys and draws, every float wider."""
     trainer, encoder = make_trainer(case, tmp_path / "truth", 1, RecordingTracker(), 1)
     source = batches(case, encoder)
 
-    def wide(batch):
-        return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
-
-    data = Loader(train=lambda partition: map(wide, source()),
-                  val=lambda partition: (wide(batch) for batch in [next(source())]),
+    data = Loader(train=lambda partition: (wide(case, batch) for batch in source()),
+                  val=lambda partition: (wide(case, batch) for batch in [next(source())]),
                   batch=BATCH, records=None)
-    wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                         else jnp.copy(leaf), initial)
-    return trainer.fit(data, steps=2, state=wider)
+    return trainer.fit(data, steps=2, state=widened_state(initial))
 
 
-KEY_PROJECTIONS = ("to_k", "k_proj")
-"""The names attention gives the projection of its keys."""
+def update_terms(case: Case, tmp_path, initial):
+    """The terms of each leaf the case's two steps write (`float64_terms`), in float64 from
+    `initial`: the trainer's own step body, its transaction (the loss's gradient at each step's
+    parameters, the momentum update, the EMA), over the rows `truth` trains on. A parameter's
+    terms are its updates' sums and the momentum's the gradients', never the parameter it started
+    from, whose own size floors it."""
+    trainer, encoder = make_trainer(case, tmp_path / "terms", 1, devices=1)
+    source = batches(case, encoder)()
+    rows = [model_batch(wide(case, next(source))) for _ in range(2)]
+    state = widened_state(initial)
+    with trainer._traced_on(trainer.device_mesh):
+        body = trainer._step_body(trainer._loss_shape(state, rows[0]), {}, 1)
 
+        def two_steps(state):
+            for batch in rows:
+                advanced, *_ = body(state, batch, 0)
+                state = replace(advanced, step=state.step + 1)
+            return state
 
-def key_bias_terms(case: Case, trainer, encoder, state, index: int):
-    """Each attention key projection's bias gradient at step `index`, as its
-    terms summed absolutely, in float64, keyed by the bias's path, with the
-    loss's gradient for the parameters beside them. A key bias moves every
-    key of its head by one vector, which the softmax over those keys
-    ignores, so its gradient, the key projection's cotangents summed over
-    rows and positions, is zero but for their rounding: the cotangents are
-    read by adding a zero to the projection's output, at the step's own
-    state, batch, key and averaged weights, as the Trainer differentiates
-    the loss."""
-    batch = list(itertools.islice(batches(case, encoder)(), index + 1))[-1]
-    if not case.is_lm:
-        batch = {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
-    batch = model_batch(jax.tree.map(jnp.asarray, batch))
-    step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                with_ema(state.variables, state.ema))
-    shapes: dict[tuple, jax.ShapeDtypeStruct] = {}
-
-    def loss(params, offsets, record=None):
-        calls: dict[tuple[str, ...], int] = {}
-
-        def project(next_fun, args, kwargs, context):
-            value = next_fun(*args, **kwargs)
-            path = context.module.scope.path
-            if (context.method_name != "__call__" or path[-1:] not in [(name,) for name in KEY_PROJECTIONS]
-                    or "bias" not in context.module.variables.get("params", {})):
-                return value
-            call = (path, calls.setdefault(path, 0))
-            calls[path] += 1
-            if record is not None:
-                record[call] = jax.ShapeDtypeStruct(value.shape, value.dtype)
-            return value + offsets.get(call, 0)
-
-        with nn.intercept_methods(project):
-            statistics, _ = trainer.objective._loss({**state.variables, "params": params}, batch, step)
-        return trainer.objective.reduce_loss(statistics)[0]
-
-    jax.eval_shape(lambda params: loss(params, {}, shapes), state.variables["params"])
-    offsets = {call: jnp.zeros(shape.shape, shape.dtype) for call, shape in shapes.items()}
-    gradient, cotangents = jax.jit(jax.grad(loss, argnums=(0, 1)))(state.variables["params"], offsets)
-    # A module applied on its own (a JEPA encoder or predictor) names paths from its own root, so each
-    # call's bias is the one parameter whose path ends in the call's and whose shape is its features'.
-    params = traverse_util.flatten_dict(state.variables["params"])
-    terms: dict[tuple[str, ...], np.ndarray] = {}
-    for (path, _), cotangent in cotangents.items():
-        [bias] = [name for name, value in params.items() if name[-len(path) - 1:] == (*path, "bias")
-                  and value.shape == cotangent.shape[cotangent.ndim - value.ndim:]]
-        width = params[bias].ndim
-        summed = np.sum(np.abs(np.asarray(cotangent)), axis=tuple(range(cotangent.ndim - width)))
-        terms[bias] = terms.get(bias, 0) + summed
-    return terms, gradient
-
-
-def key_bias_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
-    """Each attention key bias's terms over the two SGD steps, by state tree:
-    the momentum holds momentum g1 + g2, the bias, which starts at zero,
-    moves to -lr ((1 + momentum) g1 + g2), and the EMA averages those
-    parameters with the objective's decays, so each is a sum of the two
-    steps' gradients' terms (`key_bias_terms`), measured at the state each
-    step reads: the first step's SGD update and average give the second's.
-    SwiftHeron's general rule for small and cancelling leaves (ledger 469)
-    replaces this declaration."""
-    trainer, encoder = make_trainer(case, tmp_path / "key-terms", 1, devices=1)
-    params = traverse_util.flatten_dict(initial.variables["params"])
-    if not any(path[-2:] in [(name, "bias") for name in KEY_PROJECTIONS] for path in params):
-        return {}
-    average = trainer.objective.ema
-    decays = [float(average.decay(jnp.asarray(index))) if average is not None
-              and bool(trainer.objective.averages(jnp.asarray(index))) else 1.0 for index in (0, 1)]
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                            else jnp.copy(leaf), initial)
-        first, gradient = key_bias_terms(case, trainer, encoder, wide, 0)
-        variables = {**wide.variables, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
-                                                              wide.variables["params"], gradient)}
-        ema = None if wide.ema is None else ema_update(wide.ema, variables, decays[0])
-        moved = dataclasses.replace(wide, variables=variables, ema=ema, step=wide.step + 1,
-                                    microstep=wide.microstep + 1)
-        second, _ = key_bias_terms(case, trainer, encoder, moved, 1)
-    zero = [path for path in first if not np.any(np.asarray(params[path]))]
-    biases = {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path]) for path in zero}
-    scales = {"variables": biases,
-              "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
-    if wide.ema is not None:
-        scales["ema"] = {path: decays[1] * (1 - decays[0]) * LEARNING_RATE * first[path]
-                         + (1 - decays[1]) * biases[path] for path in zero}
-    return scales
-
-
-def declared(scales: dict[str, dict[tuple[str, ...], np.ndarray]], exact) -> dict[str, dict[str, float]]:
-    """`assert_leaves_as_exact`'s invariants: each state tree's leaves whose
-    paths end in a declared parameter's, with the RMS of its terms."""
-    out: dict[str, dict[str, float]] = {}
-    for name, by_path in scales.items():
-        for key, _ in jax.tree_util.tree_leaves_with_path(getattr(exact, name)):
-            text = jax.tree_util.keystr(key)
-            for path, scale in by_path.items():
-                if text.endswith("".join(f"['{part}']" for part in path)):
-                    out.setdefault(name, {})[text] = float(np.sqrt(np.mean(np.square(scale))))
-    return out
+        return float64_terms(two_steps, state)[1]
 
 
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
@@ -576,7 +493,7 @@ def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...]
 
 
 def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
-    """`assert_leaves_as_exact`'s invariants for each gated delta net's decay
+    """The declared terms (`raised`) of each gated delta net's decay
     parameters over a language model's two SGD steps, by state tree. The
     momentum holds momentum g1 + g2, and a parameter that starts at zero
     moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
@@ -609,6 +526,20 @@ def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str,
     return {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
                           for path in first if starts_at_zero(path)},
             "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
+
+
+def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
+    """`terms` with each leaf whose path ends in a declared parameter's at least
+    its declared terms (`decay_invariants`), leaf by leaf."""
+    def raise_tree(name, tree):
+        def leaf(key, value):
+            text = jax.tree_util.keystr(key)
+            for path, scale in scales.get(name, {}).items():
+                if text.endswith("".join(f"['{part}']" for part in path)):
+                    value = np.maximum(value, scale)
+            return value
+        return jax.tree_util.tree_map_with_path(leaf, tree)
+    return replace(terms, **{name: raise_tree(name, getattr(terms, name)) for name in scales})
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)
@@ -653,15 +584,15 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
-    scales = decay_invariants(case, tmp_path, initial)
-    for name, by_path in key_bias_invariants(case, tmp_path, initial).items():
-        scales.setdefault(name, {}).update(by_path)
-    invariants = declared(scales, exact)
+    with jax.enable_x64(new_val=True):
+        terms = jax.device_get(update_terms(case, tmp_path, copied()))
+    # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
+    # rule's cumulative sums of the decay, which the step's own terms do not see.
+    terms = raised(terms, decay_invariants(case, tmp_path, initial))
     for layout in (replicated, state):
         for name in ("variables", "opt_state", "ema"):
             assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                   getattr(exact, name), reductions=reductions,
-                                   invariants=invariants.get(name))
+                                   getattr(exact, name), reductions=reductions, terms=getattr(terms, name))
 
 
 # --------------------------------------------------------------------------

@@ -184,15 +184,17 @@ class ImageRows(TypedDict):
 
 GROUPED_NORMS = dict.fromkeys(("input_layernorm", "post_attention_layernorm", "norm"), {"groups": 4})
 """K2 Horizon's norms, each over four groups of the width."""
+OWN_GATE = {"output_gate": True, "layer_types": ("attention",) * 4,
+            "kinds": {"attention": {"mixer": {"class": "attention", "fields": {"gate_projection": "own"}}}}}
+"""Muse Glimmer's attention gate, a projection of its own over the layer's input."""
 
 
 def zoo() -> dict[str, Any]:
-    """Small models of every family a layout splits differently: a dense
-    decoder (and under `GROUPED_NORMS`), MoE decoders with 8 and with
-    Qwen3-30B-A3B's 128 experts, a Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
-    above divides. The DiT's rows hold 256 patches, as a DiT's smallest
-    release does (DiT-B/2 at 256 px): a sequence or tensor split repeats each
-    row's conditioning on every shard by design, which the FLOPs bound would
+    """Small models of every family a layout splits differently: a dense decoder (also under
+    `GROUPED_NORMS` and `OWN_GATE`), MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
+    Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout above divides. The DiT's
+    rows hold 256 patches, as a DiT's smallest release does (DiT-B/2 at 256 px): a sequence or tensor
+    split repeats each row's conditioning on every shard by design, which the FLOPs bound would
     count against a row of only a few patches. The last two MoE models and DiffusionGemma keep their
     released configs' routing and layer kinds. The layers a sequence axis
     splits differently come too: latent attention (MLA), a window (12 rows:
@@ -267,6 +269,7 @@ def zoo() -> dict[str, Any]:
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "grouped": Case("causal_transformer", {**dense, "norms": GROUPED_NORMS}, **lm),
+        "gated": Case("causal_transformer", {**dense, **OWN_GATE}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
@@ -470,7 +473,7 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     state, _, _ = trainer.place()
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
-    compiled = {"flops_per_device": trainer.flops_per_step,
+    compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
     return state, data, step, compiled
 

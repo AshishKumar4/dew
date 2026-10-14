@@ -41,6 +41,8 @@ DECODERS = {
     "ouro": ("Ouro (looped)", "Dense decoders"),
     "qwen3_5_text": ("Qwen 3.5, text", "Dense decoders"),
     "k2_horizon": ("K2 Horizon", "Dense decoders"),
+    "muse_glimmer_text": ("Muse Glimmer, text", "Dense decoders"),
+    "mimo_v2": ("MiMo-V2", "Mixture of experts"),
     "bloom": ("BLOOM", "Dense decoders"),
     "gemma": ("Gemma", "Dense decoders"),
     "gemma2": ("Gemma 2", "Dense decoders"),
