@@ -95,7 +95,6 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.generic import Placed
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -467,10 +466,9 @@ def _compiled(
     validation_counts: Mapping[str, CorpusCounts],
     batch_tokens: int | None,
 ) -> Loader:
-    read, seed, loading, batch, global_order = (
+    read, seed, batch, global_order = (
         build.read,
         build.seed,
-        build.loading,
         build.batch,
         build.global_order,
     )
@@ -495,10 +493,7 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(train, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
+    build = build.tuned(train)
     train_host, device = _batch_steps(train)
     train_host = train_host + host
     statistics = _Statistics(counts)
@@ -519,7 +514,7 @@ def _compiled(
             pipeline=validation,
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
-            ),
+            ).tuned(validation),
             host=_held_steps(validation) + host,
         )
     )
@@ -789,8 +784,9 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
-    # The objective's batch goes to the accelerator: its string and object fields stay here.
-    return branch.then(*(MapBatch(step) for step in steps), MapBatch(Placed()))
+    # A string or object field stays in the batch for the host code and metrics that read it; the
+    # prefetcher places the rest (`dew.training.distributed.device_fields`).
+    return branch.then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
@@ -844,9 +840,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
-    if loading.workers == "auto":
-        build = dataclasses.replace(build, loading=loading.resolved(build.batched(pipeline, DataPartition())))
-    return _Host(build.batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
+    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
@@ -943,11 +937,7 @@ def validation(
         pipeline = _materialize(pipeline, {}, training=False)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
-    if loading.workers == "auto":
-        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
-        loading = loading.resolved(tuning.batched(pipeline, DataPartition()))
-        build = dataclasses.replace(build, loading=loading)
-    return functools.partial(_validation_reader, pipeline=pipeline, build=build,
+    return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=_held_steps(pipeline) + host)
 
 

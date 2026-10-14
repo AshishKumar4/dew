@@ -60,6 +60,7 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import asks_default_precision
 
@@ -228,6 +229,94 @@ INPUT_SCALES: dict[InputKind, str] = {"fp8": "fp8_input_scale", "nvfp4": "nvfp4_
 multiplier (amax/448) or the NVFP4 global scale, one float32 scalar a site."""
 
 
+FROZEN_FP8 = ("fp8_forward", "fp8_forward_scale", "fp8_dgrad", "fp8_dgrad_scale")
+"""A frozen FP8 site's leaves in `QUANTIZATION`: its `[in, out]` kernel's E4M3
+codes for the forward product, `[out, in]`, and for the input gradient,
+`[in, out]`, each beside one float32 scale a row (`frozen_fp8_leaves`)."""
+
+
+def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
+    """A frozen `[in, out]` kernel packed once for both products it takes part
+    in, each direction's rows scaled on their own by the one FP8 block cast
+    (`dew.interop.codecs.quantize_fp8_blocks` over `(1, width)` blocks): the
+    forward's `[out, in]` rows contract the input, the input gradient's
+    `[in, out]` rows the output's cotangent. A forward row's scale is a
+    contracting-axis scale of the other direction, so the two are quantized
+    apart. The two E4M3 copies replace the kernel in the train state
+    (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
+    kernel's, so the gain over a bf16 base is the products' rate."""
+    from dew.interop.codecs import quantize_fp8_blocks
+
+    kernel = np.asarray(kernel, np.float32)
+    if kernel.ndim != 2:
+        raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
+    forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
+    dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
+    return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
+
+
+def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> np.ndarray:
+    """The `[in, out]` kernel a frozen FP8 site's `leaves` hold, in float32:
+    the forward codes decoded under their row scales (`frozen_fp8_leaves`),
+    for a merge or an export, which read the kernel the products ran on."""
+    from dew.interop.codecs import dequantize_fp8_blocks
+
+    forward = np.asarray(leaves[FROZEN_FP8[0]])
+    return dequantize_fp8_blocks(forward, np.asarray(leaves[FROZEN_FP8[1]]), (1, forward.shape[1])).T
+
+
+def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
+    """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
+    rows cast by the FP8 block cast, the codes widened in the dot and both
+    rows' scales applied after it, the form XLA's GPU compiler rewrites to an
+    FP8 GEMM (cuBLASLt)."""
+    from dew.interop.codecs import fp8_block_cast
+
+    codes, scales = fp8_block_cast(values, (1, values.shape[1]))
+    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
+                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    return product * scales * row_scales.T
+
+
+@jax.custom_vjp
+def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
+                       dgrad_scale: jax.Array) -> jax.Array:
+    """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
+    `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
+    gradient for the kernel, which is frozen."""
+    return _fp8_rows(x, forward, forward_scale)
+
+
+def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
+    # The input's dtype rides as an empty array, a residual JAX can hold.
+    return _fp8_rows(x, forward, forward_scale), (jnp.zeros((0,), x.dtype), dgrad, dgrad_scale)
+
+
+def _frozen_fp8_backward(residuals, cotangent):
+    like, dgrad, dgrad_scale = residuals
+    return _fp8_rows(cotangent, dgrad, dgrad_scale).astype(like.dtype), None, None, None, None
+
+
+frozen_fp8_product.defvjp(_frozen_fp8_forward, _frozen_fp8_backward)
+
+
+def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
+    """The bound Dense `module`'s output from its frozen FP8 leaves, its
+    kernel unread: the product (`frozen_fp8_product`) over the input's
+    trailing axis, its bias added in float32, in the dtype the Dense
+    computes in. A module asking for more than the default matmul
+    precision is refused, which an FP8 product cannot honour."""
+    if not asks_default_precision(module.precision):
+        raise ValueError(f"{'/'.join(module.path)} asks for {module.precision} matmul precision, which "
+                         "its frozen FP8 product cannot honour")
+    leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
+    product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
+    if module.use_bias:
+        product = product + module.get_variable("params", "bias").astype(jnp.float32)
+    dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
+    return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class InputQuantizer:
@@ -284,8 +373,8 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
     safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
-    multiplier = _nvfp4_divide(jnp.float32(1), safe) * jnp.float32(448)
-    scale = _nvfp4_divide(jnp.float32(1), multiplier)
+    multiplier = correctly_rounded_divide(jnp.float32(1), safe) * jnp.float32(448)
+    scale = correctly_rounded_divide(jnp.float32(1), multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
     broadcast_shape = (1,) * values.ndim
@@ -294,49 +383,6 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))
     rounded = qarray.dequantize(quantized)
     return straight_through(x, rounded)
-
-
-def _nvfp4_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
-    """CT's correctly rounded fp32 quotient, including on XLA's approximate GPU divider.
-
-    A Dekker TwoProduct gives the exact residual of the approximate
-    quotient, split into two fp32 values. One residual correction puts the
-    quotient within one ulp; comparing its exact residual with each
-    neighbour's half-spacing times the divisor chooses nearest-even.
-    That threshold product is exact because the half-spacing is a power
-    of two. The quantizer's observed scales and quotients keep these
-    intermediates normal; dense and midpoint checks hold the result to
-    NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
-    """
-    def product_error(a, b, product):
-        ah = jax.lax.bitcast_convert_type(
-            jax.lax.bitcast_convert_type(a, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
-        bh = jax.lax.bitcast_convert_type(
-            jax.lax.bitcast_convert_type(b, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
-        al, bl = a - ah, b - bh
-        remainder = product - ah * bh
-        remainder = remainder - al * bh
-        remainder = remainder - ah * bl
-        return al * bl - remainder
-
-    quotient = numerator / denominator
-    product = quotient * denominator
-    error = product_error(quotient, denominator, product)
-    residual = (numerator - product) - error
-    quotient = quotient + residual / denominator
-    product = quotient * denominator
-    error = product_error(quotient, denominator, product)
-    difference = numerator - product
-    high = difference - error
-    recovered = high - difference
-    low = (difference - (high - recovered)) - (error + recovered)
-    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
-    upper = (above - quotient) * 0.5 * denominator
-    lower = (quotient - below) * 0.5 * denominator
-    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
-    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
-    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
-    return jnp.where(up, above, jnp.where(down, below, quotient))
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -373,16 +419,16 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     divisor = jnp.full(largest.shape, 6, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
     scale = jnp.asarray(
-        rounded_operand(_nvfp4_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
+        rounded_operand(correctly_rounded_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
     overall = jnp.full(scale.shape, spec.scale, jnp.float32)
     scale = scale * overall
     if spec.e4m3_scale:
         scale = jnp.clip(scale, 0, 448).astype(jnp.float8_e4m3fn).astype(jnp.float32)
     eps = jnp.finfo(jnp.float8_e4m3fn if spec.e4m3_scale else jnp.float32).eps
     scale = jnp.where(scale == 0, jnp.asarray(eps, jnp.float32), scale)
-    scale = _nvfp4_divide(scale, overall)
+    scale = correctly_rounded_divide(scale, overall)
     expanded = jnp.broadcast_to(scale[..., None], groups.shape).reshape(x.shape)
-    quotients = _nvfp4_divide(values.astype(jnp.float32), expanded)
+    quotients = correctly_rounded_divide(values.astype(jnp.float32), expanded)
     quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(expanded), None)
     quantized = quantized.replace(scale=expanded)
     rounded = qarray.dequantize(quantized)
@@ -415,12 +461,12 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) 
     # a tiny positive stand-in keeps that result while avoiding 0/0 NaNs.
     global_scale = jnp.where(spec.scale > 0, spec.scale, 1e-12).astype(jnp.float32)
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
-    normalized = largest * _nvfp4_divide(jnp.ones_like(largest), denominator)
+    normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
     saturated = jnp.minimum(normalized, 448)
     scales = saturated.astype(jnp.float8_e4m3fn).astype(jnp.float32) * global_scale
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
-    quotients = values * _nvfp4_divide(jnp.ones_like(values), spread)
+    quotients = values * correctly_rounded_divide(jnp.ones_like(values), spread)
     quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(spread), None)
     rounded = qarray.dequantize(quantized.replace(scale=spread))
     return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
@@ -428,17 +474,19 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) 
 
 @dataclasses.dataclass(frozen=True)
 class InputQuantization:
-    """A checkpoint's input quantization on its Linear layers, which a model
-    loaded from a ModelOpt or compressed-tensors FP8 or NVFP4 checkpoint
-    computes under (`dew.interop.Pretrained`), and a run of it records.
+    """The quantization at a model's Linear sites: a checkpoint's input
+    quantization, which a model loaded from a ModelOpt or compressed-tensors
+    FP8 or NVFP4 checkpoint computes under (`dew.interop.Pretrained`), and a
+    LoRA run's frozen FP8 base (`dew.lora.LoRA.fp8_base`); a run records it.
 
-    Each quantized Linear holds its scale in its own `QUANTIZATION`
-    variables (`INPUT_SCALES`), so a scanned, staged or packed view of the
-    layers keeps it, and a site without one computes as it is. This record
-    holds what the files declare: NVFP4's local-scale rounding and
-    arithmetic, and which sites are quantized in which format. It is not a `Quantization`: nothing trains
-    quantized, and the weights already hold the values the source reader
-    decoded.
+    Each quantized Linear holds its scale, or its frozen FP8 kernel
+    (`FROZEN_FP8`), in its own `QUANTIZATION` variables, so a scanned,
+    staged or packed view of the layers keeps it, and a site without one
+    computes as it is. This record holds what the files declare (NVFP4's
+    local-scale rounding and arithmetic, and which sites take their input
+    in which format) and which frozen sites multiply in FP8, as measured on
+    `measured_on`. It is not a `Quantization`: nothing trains quantized, and
+    the weights already hold the values the source reader decoded.
     """
 
     e4m3_scale: bool = True
@@ -450,10 +498,22 @@ class InputQuantization:
     and its format: what `init` declares, so a model rebuilt from this record
     initializes the scales a checkpoint restores. The values live in the
     variables alone."""
+    frozen_fp8: tuple[str, ...] = ()
+    """The frozen Dense sites whose products run in FP8 (`frozen_fp8_dense`),
+    by their scope in the stored variables tree, `/`-joined: those whose FP8
+    forward and input gradient measured faster than bf16's on `measured_on`
+    (`measured_fp8_sites`). LoRA packs their kernels from the base it
+    freezes, the one place a kernel is known never to train."""
+    measured_on: str | None = None
+    """The GPU generation `frozen_fp8` was measured on (`sm90`); a site runs
+    its FP8 product on that generation alone."""
 
     def __post_init__(self) -> None:
         if self.format == "modelopt" and not self.e4m3_scale:
             raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
+        object.__setattr__(self, "frozen_fp8", tuple(self.frozen_fp8))
+        if self.frozen_fp8 and self.measured_on is None:
+            raise ValueError("frozen FP8 sites name the GPU generation they were measured on (measured_on)")
 
     def layer_sites(self, layer: str) -> tuple[tuple[str, InputKind], ...]:
         """The quantized sites under the stored scope `layer` (`layers_3`),
@@ -481,15 +541,48 @@ class InputQuantization:
         scale = module.get_variable(QUANTIZATION, INPUT_SCALES[held[0]])
         return InputQuantizer(scale, held[0], self.e4m3_scale, self.format)
 
+    def joined(self, model: nn.Module) -> nn.Module:
+        """`model` computing under this record's frozen FP8 sites, and under
+        the input quantization it already computes under, if any: one
+        wrapper, so one interceptor, serves both."""
+        from dew.registry import wrapper_layers
+
+        _, layers = wrapper_layers(type(model))
+        held = layers[0]._dew_wrapper() if layers else None
+        if not isinstance(held, InputQuantization):
+            return self.apply(model)
+        unwrapped = layers[0]._dew_wrapped(**{field.name: getattr(model, field.name)
+                                              for field in dataclasses.fields(model)
+                                              if field.init and field.name not in ("parent", "name")})
+        joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
+        return joined.apply(unwrapped)
+
+    def packed(self, frozen: Variables) -> Variables:
+        """The `QUANTIZATION` leaves of `frozen_fp8`, packed from the kernels
+        the `frozen` tree holds at their scopes (`frozen_fp8_leaves`)."""
+        return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
+                               for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
+
+    def refuse_other_fp8_generation(self, module: nn.Module) -> None:
+        """Refuse a frozen FP8 product on a GPU other than the one its sites
+        were measured on, by name: where FP8 pays differs by generation."""
+        from dew.nn.kernels.generation import device_generation
+
+        if device_generation() != self.measured_on:
+            raise ValueError(f"{'/'.join(module.path)} multiplies its frozen kernel in FP8 as measured on "
+                             f"{self.measured_on}, and this is {device_generation()}; measure this GPU's "
+                             "sites (LoRA.fp8_base)")
+
     def apply(self, model: nn.Module) -> nn.Module:
         """Return `model` quantizing each Linear's input to its declared format
-        and back with its scales, before the layer's dot.
+        and back with its scales, before the layer's dot, and computing each
+        Linear that holds a frozen FP8 kernel from it (`frozen_fp8_dense`).
 
-        The quantizer runs at the call of every module that holds a scale,
-        under an interceptor `apply` installs, so every entry method of the
-        model runs it. The dot itself is unchanged, so its dtype,
-        accumulation precision, output sharding and the bias placement stay
-        as the model defines them.
+        Both run at the call of every module that holds a scale or a frozen
+        kernel, under an interceptor `apply` installs, so every entry method
+        of the model runs them, inside an adapter's branch. An input's dot
+        is otherwise unchanged, so its dtype, accumulation precision, output
+        sharding and the bias placement stay as the model defines them.
         """
         base, record = type(model), self
         if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
@@ -497,17 +590,24 @@ class InputQuantization:
 
         def quantize_inputs(next_fun, args, kwargs, context):
             module = context.module
-            quantizer = record.quantizer(module) if context.method_name == "__call__" else None
-            if quantizer is None:
+            calls = context.method_name == "__call__"
+            quantizer = record.quantizer(module) if calls else None
+            frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
+            if quantizer is None and not frozen:
                 return next_fun(*args, **kwargs)
             # A Linear's input arrives first or by its parameter's name.
             inputs = args[0] if args else kwargs["inputs"]
             if not _trailing_contraction(module, inputs.ndim):
-                raise ValueError(f"{'/'.join(module.path)} holds an input scale, which a Linear "
-                                 "contracting its input's trailing axis alone reads")
+                raise ValueError(f"{'/'.join(module.path)} holds an input scale or a frozen FP8 kernel, "
+                                 "which a Linear contracting its input's trailing axis alone reads")
+            if quantizer is not None:
+                inputs = quantizer.qdq(inputs)
+            if frozen:
+                record.refuse_other_fp8_generation(module)
+                return frozen_fp8_dense(module, inputs)
             if args:
-                return next_fun(quantizer.qdq(inputs), *args[1:], **kwargs)
-            return next_fun(**{**kwargs, "inputs": quantizer.qdq(inputs)})
+                return next_fun(inputs, *args[1:], **kwargs)
+            return next_fun(**{**kwargs, "inputs": inputs})
 
         class InputQuantized(base):
             _dew_input_quantization: ClassVar[bool] = True
@@ -534,6 +634,69 @@ class InputQuantization:
         return InputQuantized(**{field.name: getattr(model, field.name)
                                  for field in dataclasses.fields(model)
                                  if field.init and field.name not in ("parent", "name")})
+
+
+def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
+    """The kernel `tree` holds at the `/`-joined scope `site`, refused by name where it holds none."""
+    node: object = tree
+    for name in (*site.split("/"), "kernel"):
+        if not isinstance(node, Mapping) or name not in node:
+            raise ValueError(f"frozen FP8 site {site} is not a Dense of this model's frozen tree")
+        node = node[name]
+    if not isinstance(node, jax.Array | np.ndarray):
+        raise ValueError(f"frozen FP8 site {site} holds no kernel array")
+    return node
+
+
+def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) -> InputQuantization:
+    """The record of the frozen `sites` whose products run faster in FP8 on
+    this process's GPU, measured at `tokens` rows a step.
+
+    Each distinct `[in, out]` kernel shape among `sites` (scopes in the
+    stored tree, `/`-joined) is timed both ways, forward and input
+    gradient, by `dew.nn.kernels.tuning.samples` on a GPU the process holds
+    alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
+    products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
+    inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
+    by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
+    the sites and the generation, so a run reproduces the choice; a GPU
+    without FP8 tensor cores is refused by name.
+    """
+    import statistics
+
+    from dew.nn.kernels.generation import device_generation, gpu_target
+    from dew.nn.kernels.tuning import samples
+
+    generation = device_generation()
+    if gpu_target(generation).fp8_peak is None:
+        raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
+    shapes = {site: tuple(np.shape(_site_kernel(variables["params"], site))) for site in sites}
+    faster: dict[tuple[int, ...], bool] = {}
+    for shape in sorted(set(shapes.values())):
+        inputs, outputs = shape
+        keys = jax.random.split(jax.random.key(0), 3)
+        x = jax.random.normal(keys[0], (tokens, inputs), jnp.bfloat16)
+        cotangent = jax.random.normal(keys[1], (tokens, outputs), jnp.bfloat16)
+        kernel = jax.random.normal(keys[2], shape, jnp.float32) * 0.02
+        leaves = jax.device_put(frozen_fp8_leaves(kernel))
+
+        def bf16(x, kernel, cotangent):
+            def product(left, contracted):
+                return jax.lax.dot_general(left, kernel, (((1,), (contracted,)), ((), ())),
+                                           preferred_element_type=jnp.float32).astype(x.dtype)
+            return product(x, 0), product(cotangent, 1)
+
+        def fp8(x, cotangent, leaves):
+            forward, forward_scale, dgrad, dgrad_scale = (leaves[leaf] for leaf in FROZEN_FP8)
+            return (_fp8_rows(x, forward, forward_scale).astype(x.dtype),
+                    _fp8_rows(cotangent, dgrad, dgrad_scale).astype(x.dtype))
+
+        timings = [statistics.median(samples(jax.jit(fn), *args, repeats=30))
+                   for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
+                                    (fp8, (x, cotangent, leaves)))]
+        faster[shape] = timings[1] < timings[0]
+    return InputQuantization(frozen_fp8=tuple(site for site in sites if faster[shapes[site]]),
+                             measured_on=generation)
 
 
 def _trailing_contraction(module: nn.Module, ndim: int) -> bool:

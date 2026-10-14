@@ -79,7 +79,8 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
     with `fields`, sampling in two Euler steps."""
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)),
-        data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"), image_size=4, augment=None),
+        data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"), image_size=4,
+                       augment=None, validation=None),
         preset=Flow() if preset is None else preset, val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
@@ -128,7 +129,7 @@ def preference_pairs():
 def jepa():
     """The JEPA recipe's sample field over its image dataset, the grid it patches."""
     config = JepaRunConfig(data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"),
-                                     image_size=16, augment=None), probe_classes=2)
+                                     image_size=16, augment=None, validation=None), probe_classes=2)
     sample = config.sample()
     encoder = JepaEncoder(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=2)
     grid = (sample.shape[-2] // encoder.patch_size,) * 2

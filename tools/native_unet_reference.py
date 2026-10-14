@@ -4,6 +4,12 @@ Run only in the isolated reference environment:
   python tools/native_unet_reference.py OUTPUT_DIRECTORY
 These small models exercise down/up sampling, mixed skip widths, linear
 projections, transformer depth, cross-only attention and nine-channel inputs.
+
+  python tools/native_unet_reference.py --float64 ARCHIVE_DIRECTORY
+writes tests/fixtures/native_unet_float64.npz: each case's prediction and
+input VJP from the archive's own Diffusers weights and inputs, run in float64
+(`jax_enable_x64`, the model's dtype and every parameter widened), the truth
+the float64 rule holds Dew and the float32 reference to.
 """
 import argparse
 import json
@@ -65,6 +71,38 @@ def build(root):
         jax.clear_caches()
 
 
+def widen(root):
+    """Each case's float64 prediction and input VJP, from the archive at `root`."""
+    if diffusers.__version__ != "0.34.0":
+        raise RuntimeError("Use Diffusers 0.34.0 for the reference")
+    jax.config.update("jax_enable_x64", True)
+    arrays = {}
+    for case in ("sd1", "sd2", "sdxl-inpaint", "refiner"):
+        directory = Path(root) / case
+        reference = np.load(directory / "reference.npz")
+        model, params = FlaxUNet2DConditionModel.from_pretrained(directory / "unet", dtype=jnp.float64)
+        params = jax.tree.map(lambda value: jnp.asarray(value, jnp.float64), params)
+        wide = {name: jnp.asarray(reference[name], jnp.float64) for name in reference.files}
+        added = ({"text_embeds": wide["pooled"], "time_ids": wide["time_ids"]} if "pooled" in reference.files
+                 else None)
+
+        def predict(value, wide=wide, added=added, model=model, params=params):
+            return model.apply({"params": params}, value, wide["time"], encoder_hidden_states=wide["context"],
+                               added_cond_kwargs=added).sample
+
+        noise = wide["input"].transpose(0, 3, 1, 2)
+        prediction = jax.jit(predict)(noise)
+        probe = wide["probe"].transpose(0, 3, 1, 2)
+        tangent = jax.jit(jax.grad(lambda value: jnp.sum(predict(value) * probe)))(noise)
+        if prediction.dtype != jnp.float64 or tangent.dtype != jnp.float64:
+            raise TypeError(f"{case} ran in {prediction.dtype}, not float64")
+        arrays[f"{case}/output"] = np.asarray(prediction).transpose(0, 2, 3, 1)
+        arrays[f"{case}/vjp"] = np.asarray(tangent).transpose(0, 2, 3, 1)
+    destination = Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz"
+    np.savez_compressed(destination, precision=np.asarray("ieee"), **arrays)
+    print("wrote", destination)
+
+
 def bundle(root, destination):
     """Archive source-compatible checkpoint files and numerical oracle arrays."""
     import tarfile
@@ -78,4 +116,6 @@ def bundle(root, destination):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
-    build(parser.parse_args().directory)
+    parser.add_argument("--float64", action="store_true", help="the archive's float64 truth, not new oracles")
+    arguments = parser.parse_args()
+    (widen if arguments.float64 else build)(arguments.directory)

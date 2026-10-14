@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from dew import cache as cache
 from dew.logging import configure as _configure_logging
 from dew.telemetry.devices import (
+    divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
     refuse_cpu_only_jax as _refuse_cpu_only_jax,
     unpartition_gpu_pool as _unpartition_gpu_pool,
@@ -40,6 +41,7 @@ from dew.telemetry.devices import (
 _configure_logging()
 _refuse_cpu_only_jax()
 _keep_roundings()
+_divide_exactly()
 _unpartition_gpu_pool()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
