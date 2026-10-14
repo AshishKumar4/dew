@@ -11,8 +11,8 @@ each option's text, then the state,
 and the model scores each option at its marker. The option texts share a
 token budget, `head_max_len`, and the state takes what is left of `max_len`.
 `StateFirstLayout` puts the state first and each marker after its option,
-for a causal backbone. `JointLayout` is Clef's, one row for every question
-of a request, each option a span of its own.
+for a causal backbone. `JointLayout` lays every question of a request in
+one row, each option a span of its own.
 """
 
 import dataclasses
@@ -355,26 +355,27 @@ class StateFirstLayout(QuestionLayout):
         return tokens, span, markers, spans, len(kept)
 
 
-CLEF_SYSTEM = ("Read the complete state and schema. Decide every field jointly. Each answer "
-               "must be exactly one of that field's allowed options.")
-CLEF_NOUL = {"true": "The proposition is true or the answer is yes.",
-             "false": "The proposition is false or the answer is no."}
+JOINT_SYSTEM = ("Read the complete state and schema. Decide every field jointly. Each answer "
+                "must be exactly one of that field's allowed options.")
+"""The joint layout's system prompt."""
+JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
+              "false": "The proposition is false or the answer is no."}
+"""A noul option's description where its question gives none."""
 
 
 @dataclass(frozen=True)
 class JointLayout(Layout):
-    """Clef's layout: every question of a request in one row, each option a span of its own.
+    """Every question of a request in one row, each option a span of its own.
 
-    The row is a chat prompt (joint_schema_model.py `encode_record` at
-    Cloudflare/clef 2f3de3dd): Clef's system prompt, the state, then a schema of
-    numbered fields, each with its id, type, instructions and allowed options,
+    The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), the state,
+    then a schema of numbered fields, each with its id, type, instructions and allowed options,
     and the opening of the assistant's turn. A request's images come before the
     state, each laid out as `image` and expanded by the backbone's processor.
     Each option is rendered as compact
     JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
     head pools the tokens of each option and of each question's instructions.
     A choice's options come in the order of their keys, and a noul's as true,
-    then false, with Clef's descriptions where the question gives none. The
+    then false, with `JOINT_NOUL`'s descriptions where the question gives none. The
     state is cut to `max_state_tokens`, and to what the schema leaves of
     `max_len`; the schema itself is never cut, so a schema longer than
     `max_len` leaves no state and a row that does not fit (`fits`).
@@ -416,7 +417,7 @@ class JointLayout(Layout):
                 schema.extend(tokens("\n"))
             schema.extend(tokens("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        opening = tokens(f"<|im_start|>system\n{CLEF_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+        opening = tokens(f"<|im_start|>system\n{JOINT_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
         prefix = opening + list(media)
         suffix = tokens("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
         state_ids = tokens(_compact(state))
@@ -439,13 +440,13 @@ class JointLayout(Layout):
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:
         """Return each option's key and description, in the question's order."""
         if isinstance(question, Noul):
-            criteria = {**CLEF_NOUL, **question.criteria}
+            criteria = {**JOINT_NOUL, **question.criteria}
             return tuple((key, criteria[key]) for key in question.options)
         return tuple(zip(question.options, question.descriptions, strict=True))
 
     @staticmethod
     def order(question: Question) -> list[int]:
-        """Return the question's options in Clef's order: a choice's by key, a noul's true first."""
+        """Return the question's options in the joint order: a choice's by key, a noul's true first."""
         keys = question.options
         if isinstance(question, Choice):
             return sorted(range(len(keys)), key=lambda index: keys[index])
@@ -455,7 +456,8 @@ class JointLayout(Layout):
 
 
 def _compact(value: JSON) -> str:
-    """A value as Clef renders it: text as it is, anything else as compact JSON with sorted keys."""
+    """A value as the joint layout renders it: text as it is, anything else as compact JSON with
+    sorted keys."""
     match value:
         case str():
             return value
