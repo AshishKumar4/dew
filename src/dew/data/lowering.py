@@ -39,7 +39,16 @@ from dew.data.analysis import (
     _until,
 )
 from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, record_batch, stacked
-from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
+from dew.data.mixing import (
+    Accepted,
+    Chunked,
+    CorpusCounts,
+    PrimedMix,
+    SearchBudget,
+    TokenDeficit,
+    primed_maps,
+    token_weights,
+)
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -76,6 +85,7 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
+from dew.data.steps.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, record
 
@@ -102,13 +112,15 @@ class _Materialized(Protocol):
 
 
 def _outputs(
-    stage: Stage, position: int | None, value: Record, rng: np.random.Generator | None = None
+    stage: Stage, position: int | None, value: Record, rng: np.random.Generator | None = None,
+    *, counts: CorpusCounts | None = None,
 ) -> tuple[Record, ...]:
     """What a record stage makes of one row, the single definition the cache
     fill, memory materialization and Grain lowering all apply: its outputs,
     with a `Rejected` marker in place of each row it drops. A marker passes
     through and a missing row is rejected. `position` is the row's source
-    position, as `Pipeline.map_with_index` defines it.
+    position, as `Pipeline.map_with_index` defines it. When `counts` is given,
+    a chunk expansion counts its document and fan-out as it runs.
     """
     if isinstance(value, Rejected):
         return (value,)
@@ -123,7 +135,10 @@ def _outputs(
     if isinstance(stage, FlatMap):
         element = record(value, "flat_map input")
         outputs = stage.step.flat_map(element) if isinstance(stage.step, Expansion) else stage.step(element)
-        return tuple(outputs) or (Rejected("empty_expansion"),)
+        outputs = tuple(outputs)
+        if counts is not None and isinstance(stage.step, Chunks):
+            counts.expanded(outputs)
+        return outputs or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -199,11 +214,12 @@ def _positioned(manifest: ShardManifest) -> ShardManifest:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Rows:
+class _Rows(gx.FlatMapTransform):
     """Grain's form of a record stage: `_outputs` over each element, keeping
     the source position an element carries out of the step's sight."""
 
     stage: Map | RandomMap | MapWithIndex | Filter | FlatMap
+    counts: CorpusCounts | None = None
 
     def __call__(self, element: Record, rng: np.random.Generator | None = None) -> Record:
         return self.flat_map(element, rng)[0]
@@ -211,9 +227,14 @@ class _Rows:
     def flat_map(self, element: Record, rng: np.random.Generator | None = None) -> tuple[Record, ...]:
         position = _position(element)
         if position is None:
-            return _outputs(self.stage, None, element, rng)
-        outputs = _outputs(self.stage, position, _unplaced(element), rng)
+            return _outputs(self.stage, None, element, rng, counts=self.counts)
+        outputs = _outputs(self.stage, position, _unplaced(element), rng, counts=self.counts)
         return tuple(_placed(output, position) for output in outputs)
+
+
+def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str) -> pygrain.IterDataset:
+    return (Chunked(rows, name, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
+            else gx.FlatMapIterDataset(rows, _Rows(stage)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -271,13 +292,14 @@ class _ShardSteps:
     reader: Callable[[Shard], pygrain.IterDataset]
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
+    name: str
 
     def __call__(self, shard: Shard) -> pygrain.IterDataset:
         rows = self.reader(shard)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
         for stage in self.stages:
-            lowered = _Rows(stage)
-            rows = gx.FlatMapIterDataset(rows, lowered) if isinstance(stage, FlatMap) else rows.map(lowered)
+            rows = (_expanded(rows, stage, self.name) if isinstance(stage, FlatMap)
+                    else rows.map(_Rows(stage)))
         return rows
 
 
@@ -478,7 +500,9 @@ class _Build:
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
-        shards = dataclasses.replace(shards, reader=_ShardSteps(shards.reader, local, cache is not None))
+        shards = dataclasses.replace(
+            shards, reader=_ShardSteps(shards.reader, local, cache is not None, _name(pipeline))
+        )
         rows = self.streamed(shards, pipeline, partition)
         if cache is not None or any(_drops(stage) for stage in local):
             rows = Accepted(rows, _name(pipeline), budget=self.budget)
@@ -626,7 +650,7 @@ class _Build:
     ) -> Rows:
         lowered = _Rows(stage)
         if isinstance(stage, FlatMap):
-            rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), lowered)
+            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline))
         else:
             rows = rows.random_map(lowered) if isinstance(stage, RandomMap) else rows.map(lowered)
         if isinstance(stage, (Filter, FlatMap)) or stage.rejects:
@@ -640,6 +664,26 @@ class _Build:
         batching = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         stream = self.batched(pipeline, partition, offset, fill=fill)
         return iter(self.after_batch(stream, pipeline, partition, batching))
+
+    def tuned(self, pipeline: Pipeline) -> _Build:
+        """This build with automatic loading resolved on the whole order
+        (`Loading.resolved`), and at most one worker per batch of a pass that
+        ends where its rows are indexed. Grain sizes workers by memory alone,
+        and a validation pass read with training's workers, so a pass of five
+        batches had one per core, 26 on an H100 host. Each worker past the
+        last batch reads nothing, yet starts a process that imports the
+        program and keeps about six pipes open until the reader is collected."""
+        loading = self.loading
+        bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
+        if loading.workers == "auto":
+            loading = loading.resolved(bare.batched(pipeline, DataPartition()))
+        if loading.worker_count and (not self.training or not self.lowering.endless):
+            rows = bare.records(pipeline, DataPartition())
+            if isinstance(rows, pygrain.MapDataset):
+                size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+                batches = -(-len(rows) // size)
+                loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
+        return dataclasses.replace(self, loading=loading)
 
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True

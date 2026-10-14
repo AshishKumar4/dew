@@ -239,6 +239,14 @@ def _without(*fields):
     return lambda config: {key: value for key, value in config.items() if key not in fields}
 
 
+_YARN_SOURCES = (
+    ("deepseek-v2-tiny", 10000.0),
+    ("deepseek-v3-tiny", 10000.0),
+    ("deepseek-v32-tiny", 10000.0),
+    ("gpt-oss-tiny", 150000.0),
+)
+
+
 @pytest.mark.parametrize("name, edit", [
     # Gemma3TextConfig: GELU, global base 1e6 and local 1e4 by default.
     ("gemma3-tiny", _without("rope_parameters", "hidden_activation", "attn_logit_softcapping")),
@@ -263,6 +271,23 @@ def _without(*fields):
                             "full_attention": {"rope_type": "default", "rope_theta": 500000.0}},
         "rope_scaling": {key: value for key, value in config["rope_parameters"]["full_attention"].items()
                          if key != "rope_theta"}}),
+    # DeepSeek and GPT OSS read a legacy YaRN entry at the stated flat base.
+    *[(name, lambda config: {
+        **_without("rope_parameters")(config),
+        "rope_theta": config["rope_parameters"]["rope_theta"],
+        "rope_scaling": {**_without("rope_theta", "rope_type", "type")(config["rope_parameters"]),
+                         "type": "yarn"}})
+      for name, _ in _YARN_SOURCES],
+    # An unstated base takes the family's own default, not another family's.
+    *[(name, lambda config: {**config,
+                            "rope_parameters": _without("rope_theta")(config["rope_parameters"])})
+      for name, _ in _YARN_SOURCES],
+    ("gpt-oss-tiny", lambda config: {
+        **config, "rope_parameters": _without("factor")(config["rope_parameters"])}),
+    ("llada-tiny", _without("n_kv_heads", "head_dim", "rope_theta")),
+    ("llada-tiny", lambda config: {
+        **_without("n_layers", "activation_type")(config),
+        "num_layers": config["n_layers"], "hidden_activation": config["activation_type"]}),
 ])
 def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, tmp_path):
     """A source that leaves its config class's defaults unstated, or spells
@@ -272,20 +297,39 @@ def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, 
     assert np.max(np.abs(ours - theirs)) < 1e-4
 
 
-def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path):
+@pytest.mark.parametrize("name, theta", [
+    ("llama31-tiny", 10000.0),
+    *_YARN_SOURCES,
+])
+def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, name, theta):
     """The mixin replaces rope_parameters with a stated rope_scaling whole,
-    so an explicit plain rope_scaling over a llama3 record is plain rope at
-    the default base, as that spelling stated alone is."""
+    so an explicit plain rope_scaling over a ramp is plain rope at the
+    family's default base, as that spelling stated alone is. A family
+    whose mixer reads only one plain or YaRN entry refuses other ramps
+    and per-kind records through the same loader."""
     plain = {"rope_type": "default"}
-    conflicting = _respelled("llama31-tiny", tmp_path / "conflicting",
+    conflicting = _respelled(name, tmp_path / "conflicting",
                              lambda config: {**config, "rope_scaling": plain})
-    alone = _respelled("llama31-tiny", tmp_path / "alone",
-                       lambda config: {**config, "rope_parameters": {**plain, "rope_theta": 10000.0}})
-    ids = np.load(FIXTURES / "llama31-tiny" / "input_ids.npy")
+    alone = _respelled(name, tmp_path / "alone",
+                       lambda config: {**config, "rope_parameters": {**plain, "rope_theta": theta}})
+    ids = np.load(FIXTURES / name / "input_ids.npy")
     logits = [np.asarray(model.apply(variables, ids))
               for model, variables in (fp32_decoder(conflicting), fp32_decoder(alone))]
     np.testing.assert_array_equal(*logits)
-    assert np.max(np.abs(logits[0] - np.load(FIXTURES / "llama31-tiny" / "logits.npy"))) > 1e-3
+    reference = np.load(FIXTURES / name / "logits.npy")
+    assert not np.array_equal(logits[0], reference)
+    if name == "llama31-tiny":
+        assert np.max(np.abs(logits[0] - reference)) > 1e-3
+    else:
+        for index, entry in enumerate((
+            {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
+             "high_freq_factor": 4.0, "original_max_position_embeddings": 16},
+            {"full_attention": plain, "sliding_attention": plain},
+        )):
+            unsupported = _respelled(name, tmp_path / f"unsupported-{index}",
+                                      lambda config, entry=entry: {**config, "rope_scaling": entry})
+            with pytest.raises(ValueError):
+                fp32_decoder(unsupported)
 
 
 @pytest.mark.parametrize("head_dim, theta, ramp", [

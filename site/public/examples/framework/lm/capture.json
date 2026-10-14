@@ -1,19 +1,19 @@
 {
 	"about": "The screen lm.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "e9b8668804e140df7e5fd3d2d734289c1cf3db8cae9e06f27f7b33a365aa605a",
+	"script_sha256": "f9b6ce426799fac56990a452831d170e6f0ba0202d7d75b508ca41326857628c",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
-		"jax": "0.11.2.post3",
+		"jax": "0.11.2.post4",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "e3ef9db5370cf236b0175e092b94d2a4caccfc29",
-		"date": "2026-10-12"
+		"dew": "4fbee88e0478f5d9810abaabce36791ac0f6af9e",
+		"date": "2026-10-14"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 24.0,
+		"seconds": 25.4,
 		"columns": 96,
 		"screen": [
 			[
@@ -206,7 +206,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 2.52 s                   "
+					"text": "after 2.80 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -226,7 +226,7 @@
 					"dim": true
 				},
 				{
-					"text": "87.6 step/s                    "
+					"text": "157.0 step/s                   "
 				},
 				{
 					"text": "\u2502",
@@ -246,7 +246,7 @@
 					"dim": true
 				},
 				{
-					"text": "0.9% of the wall time in steps "
+					"text": "0.5% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -266,7 +266,7 @@
 					"dim": true
 				},
 				{
-					"text": "5.818                         ",
+					"text": "5.929                         ",
 					"bold": true
 				},
 				{

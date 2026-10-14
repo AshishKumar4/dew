@@ -233,16 +233,37 @@ def _documents(batch: int, padded: int):
     return pl.BlockSpec((None, padded), lambda i, bc, h: (bc % batch, 0))
 
 
-def _chunk_cumsum_kernel(dt_ref, a_ref, step_ref, da_ref, *, length: int, chunk: int, bh: int):
+def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int):
     """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
-    cumulated over the chunk, both fp32 in mamba_ssm's heads-first layout."""
+    cumulated over the chunk, both fp32 in mamba_ssm's heads-first layout.
+
+    With documents, each document in the chunk cumulates its own steps alone, the others' zeroed,
+    where mamba_ssm's sum runs on from the chunk's first step: every decay a kernel reads is a
+    difference of two of these sums within one document, which an earlier document's steps would
+    otherwise enter and leave in rounding, so that a token's output moved with another document's
+    values (tests/test_mixers.py, `test_no_token_reaches_another_document`). A chunk inside one
+    document takes one sum, as without them."""
+    *seq, step_ref, da_ref = refs
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
-    steps = pl.ds(c * chunk, chunk)
+    start = c * chunk
+    steps = pl.ds(start, chunk)
     dt = _read(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
     step_ref[:, steps] = dt
-    da_ref[:, steps] = jnp.cumsum(dt * a_ref[heads].astype(jnp.float32)[:, None], axis=1)
+    decay = dt * a_ref[heads].astype(jnp.float32)[:, None]
+    if not seq:
+        da_ref[:, steps] = jnp.cumsum(decay, axis=1)
+        return
+    documents = seq[0][steps][None, :]
+
+    def document(d, summed):
+        mine = documents == d
+        return summed + jnp.where(mine, jnp.cumsum(jnp.where(mine, decay, 0.0), axis=1), 0.0)
+
+    # The documents count up along a row, from the chunk's first step's to its last's.
+    da_ref[:, steps] = jax.lax.fori_loop(seq[0][start], seq[0][start + chunk - 1] + 1, document,
+                                         jnp.zeros(decay.shape, jnp.float32))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,8 +273,8 @@ class ChunkCumsum(_Launch):
     NAME = "chunk_cumsum"
     SPANS = (("dt", 2), None, None)
 
-    def _fwd(self, dt: jax.Array, A: jax.Array, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         batch, length, heads = dt.shape
         padded = -(-length // chunk) * chunk
         bh = config.bm
@@ -262,12 +283,13 @@ class ChunkCumsum(_Launch):
             functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0)),
-                      pl.BlockSpec((heads,), lambda b, c, h: (0,))],
+                      pl.BlockSpec((heads,), lambda b, c, h: (0,)),
+                      *([] if seq is None else [pl.BlockSpec((None, padded), lambda b, c, h: (b, 0))])],
             out_specs=[out, out],
             out_shape=[jax.ShapeDtypeStruct((batch, heads, padded), jnp.float32)] * 2,
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_cumsum_fwd",
-        )(dt, A)
+        )(dt, A, *([] if seq is None else [seq]))
         return (step, da), None
 
 
@@ -1181,8 +1203,8 @@ def _scan_fwd(x, dt, A, b, c, d, h0, seq, chunk: int, interpret: bool):
     inputs alone, as mamba_ssm does."""
     groups = b.shape[2]
     launch = {"chunk": chunk, "interpret": interpret}
-    dtp, da = _CHUNK_CUMSUM(dt, A, **launch)
     seqp = _documents_padded(seq, chunk)
+    dtp, da = _CHUNK_CUMSUM(dt, A, seqp, **launch)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
     states, final = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp,
                                    dtype=jnp.dtype(c.dtype).name, **launch)
@@ -1202,8 +1224,8 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
     groups = b.shape[2]
     shape = h0.shape
     launch = {"chunk": chunk, "interpret": interpret}
-    dtp, da = _CHUNK_CUMSUM(dt, A, **launch)
     seqp = _documents_padded(seq, chunk)
+    dtp, da = _CHUNK_CUMSUM(dt, A, seqp, **launch)
     cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[-1], **launch)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
     states, _ = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp, dtype="float32",

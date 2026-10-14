@@ -2,12 +2,14 @@
 
 A push lands between steps and later submissions report its version; the
 served tree keeps the server's precision; a refused request raises at
-submission and leaves the rest running.
+submission and leaves the rest running; a submission does not wait for a
+step.
 """
 
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import jax
@@ -74,20 +76,53 @@ def test_native_rollouts_preserve_a_split_jax_key():
     assert actual.tokens == tuple(int(token) for token in expected.tokens[0, 3:3 + count])
 
 
-def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving():
+@pytest.fixture
+def native_server():
     target = objective()
     params = target.init(jax.random.key(0))
     server = NativeRolloutServer(
         Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING), slots=2, capacity=64)
     )
+    yield server
+    server.close()
+
+
+def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(native_server):
+    running = native_server.submit([1, 2, 3], 40, key=1)
+    with pytest.raises(ValueError):
+        native_server.submit(list(range(1, 11)) * 6, 10, key=2)
+    assert len(running.result(timeout=120).tokens) >= 1
+    assert native_server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)
+
+
+def test_a_submission_does_not_wait_for_the_step_under_way(native_server):
+    """Draws submitted while another thread holds the step lock return at
+    once, and are served once the step ends."""
+    # A rollout source submits a batch's draws one after another; each waiting
+    # for a step made one-turn RLVR eight times slower (ledger 518).
+    stepping, done = threading.Event(), threading.Event()
+
+    def step_under_way():
+        with native_server._lock:
+            stepping.set()
+            done.wait()
+
+    holder = threading.Thread(target=step_under_way)
+    futures = []
+    submitter = threading.Thread(target=lambda: futures.extend(
+        native_server.submit([1, 2, 3], BUDGET, key=seed) for seed in range(4)))
     try:
-        running = server.submit([1, 2, 3], 40, key=1)
-        with pytest.raises(ValueError):
-            server.submit(list(range(1, 11)) * 6, 10, key=2)
-        assert len(running.result(timeout=120).tokens) >= 1
-        assert server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)
+        holder.start()
+        stepping.wait()
+        submitter.start()
+        submitter.join(timeout=60)
+        returned = not submitter.is_alive() and len(futures) == 4
     finally:
-        server.close()
+        done.set()
+        holder.join()
+        submitter.join()
+    assert returned
+    assert all(future.result(timeout=120).prompt == (1, 2, 3) for future in futures)
 
 
 def test_a_program_that_ends_with_draws_in_flight_exits_cleanly():

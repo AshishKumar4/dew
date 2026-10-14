@@ -537,7 +537,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     bound.update(built)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
-    # Each outermost dotted name once: `dew.interop.hub.pull_from_hub`, not also `dew.interop.hub`.
+    # Only the outermost dotted name counts, so a method and its class are not counted twice.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     seen = set()
     for node in ast.walk(tree):
