@@ -357,13 +357,14 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
     `tied_head_names` is the family's own spelling of the head and the
     embedding, which is not `lm_head.weight` everywhere: DeepSeek V4 stores
     its head as `head.weight`, so the depths that share it are checked
-    against that tensor.
+    against that tensor. A tied source that stores its one copy under the
+    head's name alone has no second copy to check; the head fills the
+    embedding (`translate_weights`).
     """
     head_name, embedding_name = tied_head_names
     aliases: list[tuple[str, str]] = []
-    if config["tie_embeddings"] and head_name in names:
-        if (embedding_name not in names
-                or not np.array_equal(read(head_name), read(embedding_name))):
+    if config["tie_embeddings"] and head_name in names and embedding_name in names:
+        if not np.array_equal(read(head_name), read(embedding_name)):
             raise ValueError(f"tie_word_embeddings is set but {head_name} is not the "
                              "embedding it claims to copy")
         aliases.append((head_name, embedding_name))
@@ -599,15 +600,20 @@ def translate_weights(
     # A tied head and a depth's embedding and head are checked copies of
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
+    head_name, embedding_name = _tied_names(family, config, hf_tensors)
     copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
-                                                 _tied_names(family, config, hf_tensors))}
+                                                 (head_name, embedding_name))}
+    # A tied source may keep its one copy under the head's name alone, as
+    # SFconvertbot's safetensors conversion of OPT-125m does; that tensor
+    # then fills the embedding, as a layout binds a tied head (`Pretrained`).
+    alone = config["tie_embeddings"] and embedding_name not in hf_tensors
 
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
     for name, tensor in family.prepare_weights(hf_tensors, config).items():
-        path = family.weight_path(name, config)
+        path = family.weight_path(embedding_name if alone and name == head_name else name, config)
         if path is None or name in copies:
             continue
         stored = np.asarray(tensor)
