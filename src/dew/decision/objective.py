@@ -344,8 +344,10 @@ class PackedRows(pygrain.MapTransform):
     """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
     row's spans moved to where it starts in the window, and with
     `option_slots` the window's real options compacted to that many slots
-    (`compacted`). The window's length is the pack's (`packing`)."""
+    (`compacted`). Every window is `max_length` tokens, which a token budget
+    divides into rows."""
 
+    max_length: int
     option_slots: int | None = None
 
     def map(self, element: Batch) -> Batch:
@@ -606,7 +608,7 @@ class DecisionObjective(Objective[Ratio]):
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             pack=packing(self.layout, self.bounds),
-            packed=(PackedRows(compact),),
+            packed=(PackedRows(self.layout.max_len, compact),),
         )
 
     def inference_record(self):
