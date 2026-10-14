@@ -17,6 +17,7 @@ kvfrans/shortcut-models' `get_targets`, in JAX, which
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -136,6 +137,19 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
                         f"as simple_dit(interval=True)")
 
 
+def _model_velocity(model: nn.Module, schedule, key: jax.Array, variables, conditions, *,
+                    train: bool) -> Velocity:
+    """`model` at `variables` as a `Velocity`: `(x, t, r)` to its output at `t`'s model time given the
+    `conditions` and the interval's model-time duration to `r`, with `key`'s dropout where `train`."""
+    def over(x, t, r) -> jax.Array:
+        output = model.apply(variables, x, schedule.model_time(t), **conditions,
+                             duration=schedule.model_time(t) - schedule.model_time(r),
+                             train=train, rngs=model_rngs(key, training=train))
+        assert isinstance(output, jax.Array)
+        return output
+    return over
+
+
 class MeanFlowObjective(DiffusionObjective):
     """Trains MeanFlow on an interval process (`presets.MeanFlow`).
 
@@ -190,16 +204,8 @@ class MeanFlowObjective(DiffusionObjective):
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
-        variables = self.model_variables(variables)
-
-        def velocity(conditions, *, train: bool) -> Velocity:
-            def average(z, t, r) -> jax.Array:
-                output = self.model.apply(variables, z, schedule.model_time(t), **conditions,
-                                          duration=schedule.model_time(t) - schedule.model_time(r),
-                                          train=train, rngs=model_rngs(dropout_key, training=train))
-                assert isinstance(output, jax.Array)
-                return output
-            return average
+        velocity = functools.partial(_model_velocity, self.model, schedule, dropout_key,
+                                     self.model_variables(variables))
 
         if self.omega != 1.0 or self.kappa != 0.0:
             start, stop = self.guidance_interval
@@ -288,21 +294,7 @@ class ShortcutObjective(DiffusionObjective):
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
 
-        def velocity(variables, conditions, *, train: bool) -> Velocity:
-            def over(x, sigma, following) -> jax.Array:
-                output = self.model.apply(
-                    variables,
-                    x,
-                    schedule.model_time(sigma),
-                    **conditions,
-                    duration=schedule.model_time(sigma) - schedule.model_time(following),
-                    train=train,
-                    rngs=model_rngs(dropout_key, training=train),
-                )
-                assert isinstance(output, jax.Array)
-                return output
-            return over
-
+        velocity = functools.partial(_model_velocity, self.model, schedule, dropout_key)
         teacher = self.model_variables(jax.lax.stop_gradient(variables if step.ema is None else step.ema))
         leading = jax.tree.map(lambda value: value[:rows], given)
         bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
