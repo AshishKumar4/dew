@@ -425,8 +425,9 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
                  scaling_factor: float = 1.0):
         super().__init__(model, params)
         # The checkpoint's statistics as given, in the source's layout, for the record.
-        self.statistics = {name: None if value is None else np.asarray(value, np.float32)
-                           for name, value in (('latents_mean', latents_mean), ('latents_std', latents_std))}
+        self.statistics: dict[str, object] = {
+            name: None if value is None else np.asarray(value, np.float32)
+            for name, value in (('latents_mean', latents_mean), ('latents_std', latents_std))}
         self.statistics['scaling_factor'] = scaling_factor
         self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
         self.latent_scale = scaling_factor / (
