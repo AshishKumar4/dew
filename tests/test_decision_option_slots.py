@@ -106,8 +106,8 @@ def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
 
 
 def ragged() -> list[Example]:
-    """Rows of the Qwen3.5-0.8B decision mixture's shapes: one question of a hundred options
-    (LEDGAR), seventeen of three (ContractNLI) and one of twenty-four (CLINC150)."""
+    """Ragged rows: one question of a hundred options, seventeen of three and one of
+    twenty-four."""
     clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
     hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
