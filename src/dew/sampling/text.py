@@ -93,7 +93,9 @@ class Bounded(Protocol):
 @runtime_checkable
 class Decoding(Protocol):
     """A decoder that continues its rows token by token: `init_cache` opens the
-    cache its decode calls (`decode=True`) write, a position a call."""
+    cache its decode calls (`decode=True`) write, a position a call. A caller
+    that appends with those calls itself, past `generate`'s and the server's
+    host checks, reads `dew.nn.kv_cache.overflowed` after them."""
 
     def init_cache(self, batch_size: int) -> None: ...
 

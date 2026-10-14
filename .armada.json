@@ -17,7 +17,7 @@
             "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
-                "--out={out}"],
+                "--out={out}", "--cache={cache}"],
     "timeout": 1800,
     "speculative": true,
     "secrets": ["DEW_XLA_CACHE_TOKEN"]
