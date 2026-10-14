@@ -45,7 +45,7 @@ SAMPLERS = {
 
 @dataclass
 class Config:
-    model: str = "dewml/hybrid-dit-176m@0043f4455889f1625fc6a7472241ebfaed751358"
+    model: str = "dewml/hybrid-dit-176m@13393896010260671b58cda12a7a2eab3d270e87"
     """A Hugging Face Hub repository, `repo@revision` to pin a commit or tag, or a local Dew run
     directory."""
     out: Path = Path("runs/sample-text-to-image")
