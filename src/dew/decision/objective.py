@@ -543,6 +543,10 @@ class DecisionObjective(Objective[Ratio]):
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
+        return self._charged(logits, inputs, batch)
+
+    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> tuple[Ratio, Aux]:
+        """The loss and its accuracy report over the questions' option logits."""
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
@@ -559,8 +563,15 @@ class DecisionObjective(Objective[Ratio]):
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments)
-        weights = self.evaluation_variables(params, step)
-        logits = self._logits(weights, inputs)
+        return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
+
+    def _validation_scores(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Decisions]:
+        inputs = laid_out(batch, self.bounds.segments)
+        logits = self.model.logits(params, inputs)
+        return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
+
+    def _decisions(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> Decisions:
+        """The questions' option probabilities, each at its type's temperature, with what scores them."""
         if self.temperatures is not None:
             # Each question's temperature by its type and its count of real
             # options, as `Temperatures.of` gives it; a padding question has none.

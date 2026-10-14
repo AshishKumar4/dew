@@ -5,13 +5,16 @@ import pickle
 import jax
 import numpy as np
 import optax
+import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from steady_state import steady_state
 
 from dew import Evaluation, Trainer
 from dew.artifacts import TextSamples
 from dew.data.dataset import Loader
+from dew.diffusion.discrete import MDLM
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import MeshSpec
@@ -81,3 +84,50 @@ def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
                           metrics=(Perplexity(),), loss=True, mesh=mesh)
     assert second.coordinated_batches == first.coordinated_batches == 3
     assert second.scores["val/perplexity"] != first.scores["val/perplexity"]
+
+
+class CountedLM(LMObjective):
+    scorings = 0
+
+    def token_scores(self, *args, **kwargs):
+        self.scorings += 1
+        return super().token_scores(*args, **kwargs)
+
+
+class CountedMasked(MaskedDiffusionObjective):
+    scorings = 0
+
+    def _token_losses(self, *args, **kwargs):
+        self.scorings += 1
+        return super()._token_losses(*args, **kwargs)
+
+
+def counted_lm():
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
+    return CountedLM(model, seq_len=4), 5
+
+
+def counted_masked():
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=4, causal=False, dtype="float32", attention_impl="xla")
+    return CountedMasked(model, MDLM(mask_id=7)(), seq_len=4, ema_decay=None), 4
+
+
+@pytest.mark.parametrize("build", [counted_lm, counted_masked], ids=["lm", "masked"])
+def test_a_pass_asking_for_the_loss_and_a_metric_scores_each_batch_once(build):
+    """The validation loss and the perplexity come from one scoring of each
+    batch, and are what a pass asking for either alone reports."""
+    objective, width = build()
+    params = objective.init(jax.random.key(0))
+    rows = np.random.default_rng(0).integers(1, 7, (2, 8, width), dtype=np.int32)
+
+    def split(partition):
+        return iter([{"text": rows[index]} for index in range(2)])
+
+    both = Evaluation.run(objective, params, split, key=1, metrics=(Perplexity(),), loss=True)
+    assert objective.scorings == 1
+    loss = Evaluation.run(objective, params, split, key=1, loss=True)
+    perplexity = Evaluation.run(objective, params, split, key=1, metrics=(Perplexity(),))
+    np.testing.assert_allclose(both.scores["val/loss"], loss.scores["val/loss"], rtol=1e-6)
+    np.testing.assert_allclose(both.scores["val/perplexity"], perplexity.scores["val/perplexity"], rtol=1e-6)
