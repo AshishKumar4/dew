@@ -83,7 +83,12 @@ class ECE:
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> np.ndarray:
         """Return, per bin, the row count, the summed top probability and the number correct."""
-        tops, correct = _tops(artifact)
+        return self.binned(*_tops(artifact))
+
+    def binned(self, tops: np.ndarray, correct: np.ndarray) -> np.ndarray:
+        """Per bin, the row count, the summed top probability `tops` and the
+        number `correct`, for answers however they were drawn: `finalize`
+        reads these, from a run's validation pass or a served benchmark's."""
         edges = np.linspace(0.0, 1.0, self.bins + 1)
         index = np.clip(np.searchsorted(edges, tops, side="left") - 1, 0, self.bins - 1)
         return np.stack([np.bincount(index, minlength=self.bins).astype(np.float64),
