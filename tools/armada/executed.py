@@ -16,7 +16,9 @@ execute, what session-scoped fixtures read is every file's, and what runs under 
 which runs once, as it is imported, is its own test file's too, and every file's before collection."""
 
 import dis
+import functools
 import json
+import multiprocessing.process
 import os
 import re
 import shlex
@@ -33,8 +35,9 @@ TOOL = 3
 SPAWNS = {"subprocess.Popen": 1, "_posixsubprocess.fork_exec": 1, "os.posix_spawn": 1, "os.spawn": 2,
           "os.exec": 1, "os.fork": None, "os.forkpty": None}
 """Audit events of a process start, and where in their arguments the child's command line is: a fork
-has none, its child being this process's copy. Python 3.12 raises none for multiprocessing's spawn
-and forkserver children, which 3.13's `_posixsubprocess.fork_exec` names."""
+has none, its child being this process's copy. A multiprocessing child is counted where it starts
+(`started_child`): Python 3.12 audits no spawn or forkserver start, and a forkserver's later children
+start in its own process."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()
@@ -110,6 +113,16 @@ def audited(event, args):
         spawned.add(running[-1])
 
 
+def started_child(start):
+    """`BaseProcess.start`, counting the child every multiprocessing context starts: a Python process."""
+    @functools.wraps(start)
+    def run(process):
+        if running:
+            spawned.add(running[-1])
+        return start(process)
+    return run
+
+
 def runs_python(command) -> bool:
     """Whether a child of `command`, a command line or a shell's string, runs Python: a word of it
     names an interpreter, a module path or a program whose first line does, through any wrapper."""
@@ -149,6 +162,7 @@ sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
 sys.addaudithook(audited)
+multiprocessing.process.BaseProcess.start = started_child(multiprocessing.process.BaseProcess.start)
 
 
 @pytest.hookimpl(hookwrapper=True)
