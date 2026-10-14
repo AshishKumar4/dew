@@ -140,7 +140,6 @@
         "tensor": 1,
         "sequence": 1,
         "stage": 1,
-        "microbatches": null,
         "replicas": 1,
         "explicit": []
       },

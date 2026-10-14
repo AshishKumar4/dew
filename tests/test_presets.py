@@ -4,6 +4,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+import jax
 import numpy as np
 import optax
 import pytest
@@ -100,10 +101,9 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
     documents = [{"text": "dew trains jax models " * (1 + index % 4)} for index in range(64)]
     train, held = Memory(documents).holdout(records=8)
     batch = next(train.pipe(presets.lm, "byte", seq_len=32, batch=8).iterate())
-    assert {name: batch[name].shape for name in ("text", "text_segment_ids",
-                                                 "text_positions")} == dict.fromkeys(
-        ("text", "text_segment_ids", "text_positions"), (8, 33))
-    assert batch["text_segment_ids"].max() > 1
+    laid = batch["text_coordinates"]
+    assert batch["text"].shape == laid.segments.shape == laid.positions.shape == (8, 33)
+    assert laid.segments.max() > 1
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
                               max_seq_len=64)
     logged = trained(LMObjective(model, seq_len=32), train.shuffle(0).repeat().pipe(
@@ -165,7 +165,7 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
         for _ in range(64):
             batch = next(reader)
             for index, marker in enumerate(batch[field][:, 0]):
-                row = {name: values[index] for name, values in batch.items()}
+                row = jax.tree.map(lambda values, index=index: values[index], batch)
                 delivered[int(marker)] += targets(row)
         saved = reader.get_state()
         remaining = [next(reader)[field].tolist() for _ in range(3)]

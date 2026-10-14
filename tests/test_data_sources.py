@@ -280,6 +280,30 @@ def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
         moved.close()
 
 
+@pytest.mark.parametrize(("url", "format", "read_as"), [
+    ("hf://datasets/owner/data", None, "Hub"),
+    ("hf://datasets/owner/data@pinned", None, "Hub"),
+    ("hf://datasets/owner/data/train.jsonl", None, "Files"),
+    ("hf://datasets/owner/data@pinned/train.csv", None, "Files"),
+    ("hf://datasets/owner/data/train.txt", None, "Files"),
+    ("hf://datasets/owner/data/train.array_record", None, "Files"),
+    ("hf://datasets/owner/data/train.parquet", None, "Files"),
+    ("hf://datasets/owner/data/records", "jsonl", "Files"),
+])
+def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, format, read_as):
+    """An hf:// URL of a repository reads the repository; one naming a file Files reads by its
+    suffix, or any URL given a format, reads that file, whatever its record format."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Files, Hub, source
+
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    resolved = source(url, format=format)
+    assert type(resolved) is {"Hub": Hub, "Files": Files}[read_as]
+    if read_as == "Files":
+        assert resolved.url == url and resolved.format == format
+
+
 @pytest.mark.parametrize("format", ["jsonl", "parquet"])
 def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     from types import SimpleNamespace
@@ -567,6 +591,26 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
         Files(root, format="jsonl").records("memory")
 
 
+def test_a_source_exports_the_records_its_pipeline_exports():
+    """A map-style Torch source has records but no physical shards; exported directly, it writes
+    the records its pipeline does, where a direct export once needed a shard manifest."""
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from dew.data import from_torch
+
+    stored = from_torch(TensorDataset(torch.arange(10).reshape(5, 2)), fields=("id",), identity="five@1")
+
+    def exported(values) -> list:
+        root = f"memory://export-{uuid4().hex}"
+        export(values, root, rows_per_shard=2)
+        files = Files(root, format="parquet")
+        return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
+                for row in files.manifest().reader(shard)]
+
+    assert exported(stored) == exported(stored.chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
+
+
 def test_spark_directory_requires_success_marker(tmp_path):
     table = pa.table({"value": [1, 2]})
     ds.write_dataset(table, str(tmp_path), format="parquet")
@@ -760,6 +804,40 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     records = stored.records("indexed")
     actual = np.concatenate([records[index]["text"] for index in range(len(records))])
     assert actual.tolist() == expected.tolist()
+
+
+def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
+    """A committed token export that only its storage options reach, an S3 endpoint of its own,
+    reads its manifest, metadata and tokens through them, as its shards and index do."""
+    import fsspec
+    from moto.server import ThreadedMotoServer
+
+    from dew.cli.main import main
+    from dew.data.sources import TokenFiles
+    from dew.data.text import ByteTokenizer
+
+    input = tmp_path / "documents.jsonl"
+    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
+    destination = tmp_path / "tokens"
+    fields = json.dumps({"source": str(input)})
+    assert main(["data", "export", "records", str(destination), "--fields", fields, "--tokenizer", "byte",
+                 "--eos", "--format", "array_record"]) == 0
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
+        bucket = "tokens-" + uuid4().hex
+        remote = fsspec.filesystem("s3", **options)
+        remote.mkdir(bucket)
+        remote.put(str(destination), f"{bucket}/export", recursive=True)
+        stored = TokenFiles(f"s3://{bucket}/export", storage_options=options)
+        vocabulary = ByteTokenizer()
+        assert stored.meta["eos_id"] == vocabulary.eos_id
+        assert stored.tokens[:].tolist() == [*vocabulary.encode("first"), vocabulary.eos_id,
+                                             *vocabulary.encode("next"), vocabulary.eos_id]
+    finally:
+        server.stop()
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
@@ -1190,6 +1268,39 @@ def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, fo
     assert first_rows == second_rows == [f"row {index}" + ("\n" if format == "text" else "")
                                         for index in range(4)]
     assert first_identity == second_identity
+
+
+@pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
+def test_a_copied_corpus_resumes_a_position_saved_at_another_mount(tmp_path, format):
+    """A position saved reading one copy of a corpus resumes on a copy mounted elsewhere: an
+    order is the same wherever its sources are mounted, as the pool's identity already
+    holds, and the copy reads on from the saved record."""
+    from dew.data.compile import compile
+
+    first = tmp_path / "host0" / "corpus"
+    first.mkdir(parents=True)
+    suffix = "txt" if format == "text" else format
+    rows = [f"row {index}" for index in range(4)]
+    (first / f"part-0.{suffix}").write_text(("text\n" if format == "csv" else "") + "\n".join(
+        json.dumps({"text": row}) if format == "jsonl" else row for row in rows) + "\n")
+    Files(str(first), format=format).provision()
+    second = tmp_path / "elsewhere" / "mounted"
+    shutil.copytree(first, second)
+
+    def reader(directory):
+        return compile(Files(str(directory), format=format).repeat().batch(1),
+                       read="indexed", loading=Loading(workers=0)).train(DataPartition())
+
+    saving, resumed = reader(first), reader(second)
+    try:
+        next(saving)
+        saved = saving.get_state()
+        expected = next(saving)["text"].tolist()
+        resumed.set_state(saved)
+        assert next(resumed)["text"].tolist() == expected
+    finally:
+        saving.close()
+        resumed.close()
 
 
 def test_a_pool_is_shown_which_part_of_its_plan_differs():

@@ -53,7 +53,6 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
-    BATCH_AXES,
     SEQUENCE_AXIS,
     STAGE_AXIS,
     TENSOR_AXIS,
@@ -61,6 +60,7 @@ from dew.nn.sharding import (
     Link,
     LogicalAxes,
     Schedule,
+    batch_axes,
     boxed,
     boxed_axes,
     measured_links,
@@ -113,12 +113,16 @@ from dew.training.distributed import (
     check_batch,
     check_stream,
     device_fields,
+    device_mesh,
+    explicit_axes,
     link_bandwidth,
     microbatch,
     microbatch_shapes,
     placed_bytes,
     prefetched_bytes,
+    ruled,
     shard_batch,
+    stage_microbatches,
     step_reads,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
@@ -145,7 +149,7 @@ from dew.training.model_flops import (
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
-from dew.training.optim import RATE_SCALE, RATE_SHAPE, with_rate_scales
+from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -207,28 +211,6 @@ class ProfileWindow:
     directory: str
     steps: int
     warmup: int = 2
-
-
-def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
-    """Return the learning rate stored in `opt_state`, if the optimizer stores one.
-
-    An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.training.optim.scaled_solver`), whose
-    product is the rate; an Optax optimizer can inject `learning_rate`
-    itself (`optax.inject_hyperparams`). The result is None when the
-    optimizer closes over the rate, or when parameter groups hold several
-    rates.
-    """
-    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
-    rates = []
-    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
-        if not isinstance(node, injected):
-            continue
-        if RATE_SCALE in node.hyperparams:
-            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
-        elif "learning_rate" in node.hyperparams:
-            rates.append(node.hyperparams["learning_rate"])
-    return rates[0] if len(rates) == 1 else None
 
 
 # How the display shows the metrics the trainer itself logs; an objective,
@@ -396,7 +378,7 @@ class _FitRun:
 
 
 def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
-                rollout: Rollout | None, mesh: MeshSpec) -> str | None:
+                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
     """Why every step reads its batch whole, or None where a plan may split it,
     refusing the arguments no Trainer takes together."""
     if accumulation < 1:
@@ -406,7 +388,7 @@ def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn
     whole = ("a custom step owns its execution" if step is not None else
              "the layout keeps the variables on the host" if "variables" in layout.host else
              "a rollout writes a batch of its own" if rollout is not None else
-             "an Explicit mesh axis types the step's rows" if mesh.explicit else None)
+             "an Explicit mesh axis types the step's rows" if explicit_axes(mesh) else None)
     if split is not None and (split < 1 or (whole is not None and split > 1)):
         raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
                          f"only 1 where {whole}; got {split}")
@@ -431,8 +413,9 @@ class Trainer(Generic[Loss, Effects]):
         optimizer: optax.GradientTransformation | OptimConfig,
         *,
         key: int | jax.Array,
-        mesh: MeshSpec = _DEFAULT_MESH,
+        mesh: MeshSpec | Mesh = _DEFAULT_MESH,
         layout: Layout = _DEFAULT_LAYOUT,
+        microbatches: int | None = None,
         accumulation: int = 1,
         split: int | None = None,
         dynamic_scale: bool = False,
@@ -457,7 +440,10 @@ class Trainer(Generic[Loss, Effects]):
         it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
         scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives. `lower_for`, a CUDA generation, lowers
+        replay. `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native
+        `jax.sharding.Mesh` of any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
+        `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
+        multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
@@ -473,6 +459,7 @@ class Trainer(Generic[Loss, Effects]):
         self.key = request_key(key)
         self.mesh = mesh
         self.layout = layout
+        self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
         self.dynamic_scale = dynamic_scale
@@ -593,8 +580,13 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
-        """Build the mesh `MeshSpec` describes over this process pool's devices, on first use."""
-        return self.mesh.build()
+        """The device mesh (`device_mesh`), built on first use."""
+        return device_mesh(self.mesh)
+
+    @property
+    def microbatches(self) -> int:
+        """The microbatches a pipelined step feeds through the stage axis (`stage_microbatches`)."""
+        return stage_microbatches(self.device_mesh, self._microbatches)
 
     @property
     def host_master(self) -> bool:
@@ -623,6 +615,7 @@ class Trainer(Generic[Loss, Effects]):
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
 
+    @ruled
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.
 
@@ -690,6 +683,7 @@ class Trainer(Generic[Loss, Effects]):
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
             for field in self.layout.host})
 
+    @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored.
 
@@ -798,8 +792,8 @@ class Trainer(Generic[Loss, Effects]):
         Each shape fits on its own. A run bucketed by length meets a long
         bucket that climbs, and when that rung stayed, every later, shorter
         bucket compiled at it too, though it fitted with less recomputation
-        (c50's real mix: six shapes at 'minimal' that fitted with none, 15%
-        slower a token). So each new shape starts where the first compile
+        (in one real mix, six shapes ran at 'minimal' that fitted with none,
+        15% slower a token). So each new shape starts where the first compile
         found the objective, its configured remat and head or the rung its
         checkpoint trained on, and climbs only as far as it must. A shape the
         checkpoint names climbs to that shape's own rung, so a resumed run
@@ -1051,7 +1045,7 @@ class Trainer(Generic[Loss, Effects]):
         platform = devices[0].platform
         links = {}
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
-            if mesh.shape[axis] == 1:
+            if mesh.shape.get(axis, 1) == 1:
                 continue
             if (mesh, axis) not in self._bandwidths:
                 self._bandwidths[mesh, axis] = (
@@ -1068,7 +1062,7 @@ class Trainer(Generic[Loss, Effects]):
         parameters, and the links of the axes the step measured, none by
         default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with (on, pipeline_microbatches(self.mesh.microbatches) as schedule,
+        with (on, pipeline_microbatches(self.microbatches) as schedule,
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
@@ -1085,6 +1079,7 @@ class Trainer(Generic[Loss, Effects]):
             return advanced, loss, aux, None
         return run
 
+    @ruled
     def compile(self, state: TrainState, batch: Batch,
                 timed: Callable[[list[CompiledStep]], list[float]] | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
@@ -1171,8 +1166,8 @@ class Trainer(Generic[Loss, Effects]):
         (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
-        candidates = splits(self._rows, batch, mesh, self.mesh, self._split)
-        shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+        candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
+        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
         def lower(split: int) -> Candidate:
             return self._candidate(state, batch, schedule, placement, replicated, split,
@@ -1289,7 +1284,7 @@ class Trainer(Generic[Loss, Effects]):
         self._at_base_rung(batch)
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
-            split = splits(self._rows, batch, mesh, self.mesh, self._split)[0]
+            split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
             micro = microbatch_shapes(batch, split)
             shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
             shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -1326,7 +1321,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _refuse_unpipelined(self, schedule: Schedule) -> None:
         """Refuse a stage axis under a model whose traced step ran no pipeline."""
-        stages = self.device_mesh.shape[STAGE_AXIS]
+        stages = self.device_mesh.shape.get(STAGE_AXIS, 1)
         if stages > 1 and not schedule.pipelined:
             raise LayoutRefused(
                 f"the stage axis of {stages} holds a pipeline's stages of a decoder's layer "
@@ -1349,8 +1344,8 @@ class Trainer(Generic[Loss, Effects]):
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
-            batch = transfer(batch, batch_shardings(cpu, batch))
             with self._traced_on(cpu):
+                batch = transfer(batch, batch_shardings(cpu, batch))
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
@@ -1367,6 +1362,7 @@ class Trainer(Generic[Loss, Effects]):
     # The loop
     # ------------------------------------------------------------------
 
+    @ruled
     def fit(
         self,
         dataset: Dataset | Loader,
@@ -1549,7 +1545,8 @@ class Trainer(Generic[Loss, Effects]):
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
-                    run.reads[batch_signature(device)] = step_reads(self.executable)
+                    signature = batch_signature(device)
+                    run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -1679,7 +1676,7 @@ class Trainer(Generic[Loss, Effects]):
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
-            check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
+            check_stream(run.source, mesh, self.microbatches, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             if isinstance(run.source, RampedStream):
@@ -2016,8 +2013,8 @@ class Trainer(Generic[Loss, Effects]):
                 raise ValueError(f"{name}'s metrics need eval_every or EvalSuite.every to schedule its pass")
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 self._check_validation_is_read(name, suite, preview=preview)
-        if self.mesh.stage > 1 and self.rollout is None:
-            check_batch(dataset.batch, self.device_mesh, self.mesh)
+        if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
+            check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
     def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
@@ -2380,7 +2377,7 @@ class Trainer(Generic[Loss, Effects]):
         # mesh itself, and previews decode outside it. The objective's
         # schedules read steps, as training does (`Transaction`): a window of
         # window_size microbatches is `accumulation` steps.
-        with (pipeline_microbatches(self.mesh.microbatches),
+        with (pipeline_microbatches(self.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = Evaluation.run(
                 self.objective, params, reader, metrics=metrics, key=key,
