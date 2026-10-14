@@ -1,13 +1,16 @@
 """Recipe encodings against the frozen pre-migration loader behavior."""
 
+import dataclasses
 import itertools
 import re
 
 import numpy as np
 
 from dew.config.data import ChatData, PromptData, TextData, loader
-from dew.data import ByteTokenizer, Loading
+from dew.data import ByteTokenizer, Loading, Memory
 from dew.data.dataset import DataPartition
+from dew.data.pipeline import Pipeline
+from dew.data.steps.text import FixedTokens
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.decision.data import Decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -124,3 +127,43 @@ def test_a_cached_token_holdout_caches_the_documents_before_the_split(tmp_path):
                 for batch in loaded.val(DataPartition())]
 
     assert held(Cache(f"memory://{uuid4().hex}")) == held(None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _SelfBatched:
+    """A recipe whose training pipeline makes its own batch: `rows` rows, or `tokens` tokens of
+    fixed 8-target windows."""
+
+    rows: int | None = None
+    tokens: int | None = None
+
+    def pipelines(self):
+        documents = Memory(tuple({"text": np.arange(index, index + 9, dtype=np.int32)} for index in range(8)),
+                           identity="self-batched")
+        records = Pipeline(documents).map(FixedTokens(8, extra=1))
+        return records.batch(self.rows, tokens=self.tokens), None, ()
+
+
+def _epoch(data, batches: int) -> list[int]:
+    reader = data.train(DataPartition())
+    try:
+        return sorted(int(row[0]) for batch in itertools.islice(reader, batches) for row in batch["text"])
+    finally:
+        reader.close()
+
+
+def test_a_recipe_batched_by_rows_orders_its_records_before_the_batch_in_every_read():
+    """A memory read orders a recipe's records before its batch, as an indexed read does, so a
+    recipe that batches its own rows reads every record once an epoch in both, where the memory
+    read once ordered after the batch and refused its own global shuffle."""
+    for read in ("memory", "indexed"):
+        data = loader(_SelfBatched(rows=2), batch=2, read=read, seed=3, loading=READ)
+        assert _epoch(data, 4) == list(range(8))
+
+
+def test_a_recipe_batched_by_tokens_keeps_the_token_batch_the_load_asks_for():
+    """A recipe's own token batch, the budget a load asks for, is kept, as a row batch is, where a
+    second budget was once appended after it and refused."""
+    data = loader(_SelfBatched(tokens=16), batch=None, tokens=16, read="indexed", seed=3, loading=READ)
+    assert data.batch_tokens == 16
+    assert _epoch(data, 4) == list(range(8))

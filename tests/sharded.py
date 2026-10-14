@@ -28,11 +28,8 @@ import numpy as np
 from jax.sharding import NamedSharding
 from reference_error import assert_leaves_as_exact
 
-from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
-
-PARAMETER_AXES = (FSDP_AXIS, TENSOR_AXIS, EXPERT_AXIS)
-"""The mesh axes a `Layout` splits parameters over."""
+from dew.training.distributed import parameter_axes
 
 
 def split_axes(tree) -> set[str]:
@@ -46,7 +43,7 @@ def split_axes(tree) -> set[str]:
 
 def assert_sharded(tree, mesh: jax.sharding.Mesh) -> None:
     """Every parameter axis of `mesh` larger than one splits some leaf of `tree`."""
-    wanted = {axis for axis in PARAMETER_AXES if mesh.shape.get(axis, 1) > 1}
+    wanted = {axis for axis in parameter_axes(mesh.axis_names) if mesh.shape[axis] > 1}
     missing = wanted - split_axes(tree)
     assert not missing, f"no parameter is split over {sorted(missing)}, so this mesh runs as data parallelism"
 

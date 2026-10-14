@@ -100,7 +100,7 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     with pytest.raises(ValueError, match="only 1 where an Explicit mesh axis types the step's rows"):
         Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), split=2, mesh=spec)
     trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), mesh=spec)
-    assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), MeshSpec(), trainer._split) == [1]
+    assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
 
 
 def lm(split=None, accumulation=1):
@@ -211,11 +211,11 @@ def test_a_split_must_cut_every_batch_the_run_reads_into_whole_rows():
     rows is refused."""
     rows = (24, 16, 12, 8, 6, 4)
     one, two = MeshSpec().build(jax.devices()[:1]), MeshSpec().build(jax.devices()[:2])
-    assert splits(rows, BATCH, one, MeshSpec(), None) == [1, 2]
-    assert splits(rows, BATCH, two, MeshSpec(), None) == [1]
+    assert splits(rows, BATCH, one, 1, None) == [1, 2]
+    assert splits(rows, BATCH, two, 1, None) == [1]
     with pytest.raises(LayoutRefused, match=r"of \[4, 6, 8, 12, 16, 24\] rows over 1 row shards of .*, cut "
                        r"into whole rows on every device only in \[1, 2\]"):
-        splits(rows, BATCH, one, MeshSpec(), 4)
+        splits(rows, BATCH, one, 1, 4)
 
 
 def raw(leaf):
