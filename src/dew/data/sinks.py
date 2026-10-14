@@ -174,9 +174,11 @@ def export(
             length_field=length_field,
         )
     if isinstance(values, Source):
-        manifest = values.manifest()
-        rows = (row for shard in manifest.shards for row in manifest.reader(shard))
-    elif isinstance(values, Iterable):
+        from dew.data.pipeline import Pipeline
+
+        # A source exports as a pipeline of it does, by a read it supports, physical shards or none.
+        values = Pipeline(values)
+    if isinstance(values, Iterable):
         rows = iter(values)
     else:
         from dew.data.analysis import _preferred_read

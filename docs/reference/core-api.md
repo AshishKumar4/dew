@@ -47,16 +47,17 @@ InputSpec(sample, conditions={}, mask=None)
 Import these from `dew.training`:
 
 ```text
-MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
-Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
+MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, explicit=())
+Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=(), data_axes=())
 MeshSpec(...).build(devices=None)
 ```
 
-`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(microbatches=...)` sets a pipelined step's microbatches, a positive multiple of a stage axis above 1; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
 
 `Layout` has these fields:
 
-- `rules` is an ordered sequence of logical-axis rules, or a mapping of overrides that update the default table. When dimensions compete for one mesh axis, rule order decides which one gets it, and a dimension the axis size does not divide cannot use that axis. The valid parameter mesh axes are `fsdp`, `expert` and `tensor`.
+- `rules` is an ordered sequence of logical-axis rules, or a mapping of overrides that update the default table. When dimensions compete for one mesh axis, rule order decides which one gets it, and a dimension the axis size does not divide cannot use that axis. A rule may name any axis of the mesh, a native mesh's own names included; a parameter splits over any axis but `data`, `sequence` and `stage`, and a rule naming an axis the mesh lacks is refused unless it is one of Dew's six, which a mesh without them treats as size 1.
+- `data_axes` names the axes a batch's rows split over, ahead of the rules' own `activation_batch` entries; the run's data shares, its batch placement and its row counts read them. Empty leaves the rules as they are.
 - `min_shard` is the size, in elements and not bytes, below which a parameter stays replicated, because sharding it would cost more in collectives than it saves in memory.
 - `tolerance` is the fraction of shardable parameter elements a layout may leave replicated before `check` refuses it.
 - `host` names train-state fields out of `params`, `opt_state` and `ema`. A named `opt_state` or `ema` stays in pinned host memory between steps, and the step fetches it to the device. Naming `params` instead puts the whole `TrainState` on the CPU, including optimizer state, EMA and accumulation. The optimizer transaction then runs on a CPU companion of the mesh, and on every process the runtime CPU device count must match the accelerator count before JAX initializes.
@@ -70,12 +71,12 @@ Import `Trainer` from `dew` or `dew.training`.
 
 ```text
 Trainer(objective, optimizer, *, key,
-        mesh=MeshSpec(), layout=Layout(), accumulation=1,
+        mesh=MeshSpec(), layout=Layout(), microbatches=None, accumulation=1,
         dynamic_scale=False, checkpoints=None, tracker=None,
         step=None, rollout=None, profile=None)
 ```
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh`, a `MeshSpec` or a native `jax.sharding.Mesh`, and `layout` describe placement; `microbatches` is how many a pipelined step feeds through the mesh's stage axis, one a stage when unset. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
@@ -152,7 +153,7 @@ A run spec is a frozen value implementing `RunData.pipelines()`: it returns the 
 
 `spec.load(batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
 
-`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take`, `cache` and `map_batch`. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
+`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
 Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 

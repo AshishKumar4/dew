@@ -24,7 +24,7 @@ from dew.data.dataset import rows_of
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.base import Batch, Objective
 from dew.records import JSON
-from dew.training.distributed import MeshSpec, Placement, batch_divisor
+from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import Held, place_leaf
 from dew.training.memory import (
     compiled_if_it_fits,
@@ -40,7 +40,7 @@ from dew.training.state import TrainState
 _log = logging.getLogger(__name__)
 
 
-def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, spec: MeshSpec,
+def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, microbatches: int,
            fixed: int | None) -> list[int]:
     """The splits a plan may read `batch` in on `mesh`, ascending: `fixed`
     where the run fixes one, else 1, the batch whole, and every count that
@@ -49,7 +49,7 @@ def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, 
     every device holding whole rows of each; a batch of step-wide fields
     alone is read whole. A fixed split that leaves some device without whole
     rows is refused."""
-    rows, divisor = rows or (rows_of(batch),), batch_divisor(mesh, spec)
+    rows, divisor = rows or (rows_of(batch),), batch_divisor(mesh, microbatches)
     whole = [split for split in range(1, min(rows) // divisor + 1)
              if all(count % (split * divisor) == 0 for count in rows)]
     if fixed is None:

@@ -714,7 +714,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     rows = np.random.default_rng(0).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
     batch = {"text": rows}
 
-    def run(spec):
+    def run(spec, microbatches=None):
         objective = LMObjective(qmodel, SEQ_LEN)
         mesh = spec.build()
         placed = jax.device_put(
@@ -727,13 +727,13 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
             return objective.scalar_loss({**variables, "params": params},
                                   placed_batch, info)
 
-        with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
             (value, _), grads = jax.jit(
                 jax.value_and_grad(loss, has_aux=True))(placed["params"])
         return float(value), jax.tree.map(np.asarray, grads)
 
     loss, _grads = run(MeshSpec(fsdp=8))
-    piped, piped_grads = run(MeshSpec(fsdp=4, stage=2, microbatches=2))
+    piped, piped_grads = run(MeshSpec(fsdp=4, stage=2), 2)
     assert np.isfinite(loss) and np.isfinite(piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
     assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
