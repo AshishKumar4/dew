@@ -383,16 +383,17 @@ def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp
     (the name of the snapshot directory), with checkpoints selected by step."""
     import huggingface_hub
 
-    import dew.interop.hub as hub
     from dew.sampling import Sampling
 
     snapshot = tmp_path / "3f2a9c"
     make_lm_run(snapshot)
     resolved, pulled = [], []
-    monkeypatch.setattr(huggingface_hub, "snapshot_download",
-                        lambda repo_id, revision, allow_patterns: resolved.append(revision) or snapshot)
-    monkeypatch.setattr(hub, "snapshot_download",
-                        lambda repo_id, revision: pulled.append(revision) or snapshot)
+
+    def downloaded(repo_id, revision, allow_patterns=None):
+        (pulled if allow_patterns is None else resolved).append(revision)
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", downloaded)
     task = dew.pipeline("user/byte-lm", revision="main", step=2)
     assert isinstance(task, TextGeneration)
     assert (resolved, pulled) == (["main"], ["3f2a9c"])

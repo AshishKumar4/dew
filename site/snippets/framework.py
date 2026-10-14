@@ -12,7 +12,6 @@ small offline fixtures.
 import argparse
 import json
 import os
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -333,10 +332,8 @@ def offline(out):
     from huggingface_hub import HfApi
     from PIL import Image
 
-    import dew.interop.hub as hub
     from dew.data import ByteTokenizer
     from dew.decision import Decide
-    from dew.diffusion.presets import Flow
     from dew.inference import RunProcessor
     from dew.interop import PretrainedDecoder
 
@@ -381,17 +378,9 @@ def offline(out):
     def byte_text(self, **options):
         return replace(generation(self, **options), processor=RunProcessor(ByteTokenizer()))
 
-    def run(repo_id, revision=None):
-        sys.path.insert(0, str(ROOT / "tests"))
-        from test_inference import make_run
-        if not (out / "run").exists():
-            make_run(out / "run", preset=Flow())
-        return out / "run"
-
     PretrainedDecoder.load, PretrainedDecoder.text_generation = classmethod(tiny), byte_text
     laya, tiny_laya = Decide.from_pretrained.__func__, ROOT / "tests/fixtures/laya/tiny"
     Decide.from_pretrained = classmethod(lambda cls, name, **options: laya(cls, tiny_laya, **options))
-    hub.pull_from_hub = run
 
 
 def main():

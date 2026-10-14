@@ -143,7 +143,7 @@ def test_the_published_rae_matches_the_source(name):
     assert all(gaps[key] < bounds[key] for key in gaps), (gaps, bounds)
 
 
-def test_the_plain_dinov2_matches_transformers(source):
+def test_the_plain_dinov2_matches_transformers(source, tmp_path):
     """transformers' `Dinov2Model` (no registers, the final norm kept):
     patch tokens of a normalized 112-pixel batch, the 37x37 table resized to
     the grid without antialiasing, and the gradient of a probe against the
@@ -155,9 +155,16 @@ def test_the_plain_dinov2_matches_transformers(source):
         for name in component_tensors(source / "dinov2_plain", "")
         if name != "embeddings.mask_token"
     }
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (metadata / "config.json").write_bytes((source / "dinov2_plain" / "config.json").read_bytes())
+    rebound, supplied, supplied_layouts = load_dinov2(metadata, params=params)
+    assert supplied is params and supplied_layouts == ()
     module = module.clone(input_size=112)
     pixels = channels_last(reference["pixels"])
     tokens = module.apply({"params": params}, pixels)
+    np.testing.assert_array_equal(
+        rebound.clone(input_size=112).apply({"params": supplied}, pixels), tokens)
     assert tokens.shape == (1, 8, 8, 64)
     probe = reference["probe"].reshape(1, 8, 8, 64)
     grad = jax.grad(lambda pixels: jnp.sum(module.apply({"params": params}, pixels) * probe))(pixels)
