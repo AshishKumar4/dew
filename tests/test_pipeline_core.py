@@ -1,10 +1,10 @@
 """The pipeline's observable order, branch scope and exact positions."""
 
-import contextlib
 import dataclasses
 import importlib
 import itertools
 import json
+import multiprocessing
 import os
 from uuid import uuid4
 
@@ -196,35 +196,27 @@ def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(
     assert chosen == [4]
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts this process's pipes in /proc")
-def test_a_validation_pass_reads_with_at_most_one_worker_per_batch():
-    """A held pass of two batches leaves as many pipes open under four
-    training workers as under two: each worker past its last batch would
-    start a process that keeps its pipes until the reader is collected."""
+def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
+    """A held pass of two batches starts two worker processes though training
+    reads with four: a third and a fourth would read nothing, yet each would
+    import the program and keep its pipes until the reader is collected."""
+    started = []
+    start = multiprocessing.context.SpawnProcess.start
 
-    def pipes() -> int:
-        count = 0
-        for name in os.listdir("/proc/self/fd"):
-            with contextlib.suppress(OSError):
-                count += os.readlink(f"/proc/self/fd/{name}").startswith("pipe:")
-        return count
+    def counted(process):
+        started.append(process)
+        start(process)
 
-    def held(workers: int) -> int:
-        """The pipes a whole pass holds while its reader lives."""
-        prefix = Pipeline(source(8))
-        data = compile(prefix.repeat().batch(4), validation=prefix.batch(4),
-                       loading=Loading(workers=workers, threads=1, read_buffer=1, worker_buffer=1))
-        before = pipes()
-        reader = data.val(DataPartition())
-        try:
-            assert [row["id"].tolist() for row in reader] == [[0, 1, 2, 3], [4, 5, 6, 7]]
-            return pipes() - before
-        finally:
-            reader.close()
-
-    # The first pass also opens the pipes a process opens once, so the second may hold fewer.
-    two = held(2)
-    assert held(4) <= two
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", counted)
+    prefix = Pipeline(source(8))
+    data = compile(prefix.repeat().batch(4), validation=prefix.batch(4),
+                   loading=Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1))
+    reader = data.val(DataPartition())
+    try:
+        assert [row["id"].tolist() for row in reader] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    finally:
+        reader.close()
+    assert len(started) == 2
 
 
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
