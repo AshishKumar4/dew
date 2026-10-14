@@ -43,7 +43,7 @@ from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import MeshSpec
 from dew.training.distributed import shard_batch
-from dew.training.model_flops import FORWARD_FLOPS, prepare_counts, step_counts
+from dew.training.model_flops import TRAINING_FLOPS, prepare_counts, step_counts
 
 IMAGE = np.array([2, 5], np.int64)
 TEXT = np.array([3, 4], np.int64)
@@ -141,13 +141,13 @@ def test_sharded_objective_counts_sum_to_one_qwen_batch_not_one_per_row():
         InputSpec(Field("images", (2, 3, 4)), conditions={"conditioning": Condition(encoder)}),
         autoencoder=None, ema_decay=None, unconditional_prob=0)
     batch = {"images": np.zeros((2, 2, 3, 4), np.float32), "text": encoder.tokenize(["a", "abcd"])}
-    whole = objective.model_flops(None, batch)
+    whole = objective.training_flops(None, batch)
     counted = prepare_counts(objective, batch, count_model=True)
-    assert counted[FORWARD_FLOPS].sum() == whole
+    assert counted[TRAINING_FLOPS].sum() == whole
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     placed = shard_batch(mesh, counted)
-    assert float(jax.jit(step_counts)(placed)[FORWARD_FLOPS]) == whole
-    per_shard = sum(np.asarray(shard.data).sum() for shard in placed[FORWARD_FLOPS].addressable_shards)
+    assert float(jax.jit(step_counts)(placed)[TRAINING_FLOPS]) == whole
+    per_shard = sum(np.asarray(shard.data).sum() for shard in placed[TRAINING_FLOPS].addressable_shards)
     assert per_shard == whole
 
 

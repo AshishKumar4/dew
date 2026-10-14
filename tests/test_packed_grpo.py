@@ -266,22 +266,29 @@ def test_mismatch_metrics_describe_every_trainable_token_whatever_a_mask_rejects
 
 
 def test_the_loss_never_holds_the_logits_of_the_whole_batch():
-    """GRPO scores through the chunked head: a large vocabulary adds tiles to
-    the loss and gradient's temporaries, never a [rows, width, vocab] tensor."""
+    """GRPO scores through the chunked head: doubling the vocabulary adds more
+    tiles to the loss and gradient's loop, never a [rows, width, vocab] tensor
+    to their temporaries. What the temporaries hold whatever the vocabulary
+    (on a GPU, cuBLAS's workspace, and a second tile under deterministic ops)
+    is not logits."""
     vocab, rows, width = 65536, 8, 64
-    model = CausalTransformer(vocab_size=vocab, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=width, dtype="float32", attention_impl="xla")
-    objective = GRPOObjective(model, width - 1)
-    params = jax.eval_shape(objective.init, jax.random.key(0))
-    batch = {name: jax.ShapeDtypeStruct((rows, width), dtype) for name, dtype in (
-        (IDS_KEY, jnp.int32), (SEGMENT_IDS_KEY, jnp.int32), (POSITIONS_KEY, jnp.int32),
-        (RESPONSE_MASK_KEY, jnp.float32), (BEHAVIOR_LOG_PROBS_KEY, jnp.float32),
-        (OLD_LOG_PROBS_KEY, jnp.float32), (ADVANTAGES_KEY, jnp.float32))}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables, batch):
-        return objective.loss(variables, batch, step)[0].mean()[0]
+    def temporaries(vocab: int) -> int:
+        model = CausalTransformer(vocab_size=vocab, emb_features=16, num_layers=1, num_heads=2,
+                                  mlp_features=32, max_seq_len=width, dtype="float32", attention_impl="xla")
+        objective = GRPOObjective(model, width - 1)
+        params = jax.eval_shape(objective.init, jax.random.key(0))
+        batch = {name: jax.ShapeDtypeStruct((rows, width), dtype) for name, dtype in (
+            (IDS_KEY, jnp.int32), (SEGMENT_IDS_KEY, jnp.int32), (POSITIONS_KEY, jnp.int32),
+            (RESPONSE_MASK_KEY, jnp.float32), (BEHAVIOR_LOG_PROBS_KEY, jnp.float32),
+            (OLD_LOG_PROBS_KEY, jnp.float32), (ADVANTAGES_KEY, jnp.float32))}
+        step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
 
-    compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
-    logits = rows * width * vocab * 4
-    assert compiled.memory_analysis().temp_size_in_bytes < logits / 2
+        def loss(variables, batch):
+            return objective.loss(variables, batch, step)[0].mean()[0]
+
+        compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    added_logits = rows * width * vocab * 4
+    assert temporaries(2 * vocab) - temporaries(vocab) < added_logits / 2

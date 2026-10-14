@@ -11,7 +11,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected, TokenField
+from dew.data.pipeline import Rejected
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
 
 
@@ -162,24 +162,15 @@ class CountTargets(grain.MapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class FixedTokens(grain.MapTransform):
+    """Rows of exactly `max_length + extra` tokens of `field`, the
+    `max_length` a token budget divides into rows (`TokenGeometry`)."""
+
     max_length: int
     extra: int = 0
     field: str = "text"
-    pad_id: int = 0
-    length_field: str = "_dew_length"
-
-    @property
-    def token_fields(self) -> tuple[TokenField, ...]:
-        return (
-            TokenField(self.field, self.extra, pad=self.pad_id),
-            *(
-                TokenField(name, self.extra)
-                for name in (f"{self.field}_segment_ids", f"{self.field}_positions", f"{self.field}_roles")
-            ),
-        )
 
     def map(self, element: Batch) -> Batch:
         size = len(element[self.field])
         if size != self.max_length + self.extra:
             raise ValueError(f"fixed tokens need {self.max_length + self.extra} values, got {size}")
-        return {**element, self.length_field: np.int32(self.max_length)}
+        return element

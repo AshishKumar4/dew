@@ -43,8 +43,8 @@ def _banded(x, before=None):
 
 
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
-                    positions=None, segment_ids=None, valid=None, dtype=None, precision=None,
-                    force_fp32_for_softmax=True, implementation='auto', sinks=None,
+                    positions=None, segment_ids=None, max_segments=None, valid=None, dtype=None,
+                    precision=None, force_fp32_for_softmax=True, implementation='auto', sinks=None,
                     softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
     memory linear in the sequence.
@@ -54,7 +54,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     chunked local attention: a query reads the keys at or before it in its
     chunk, `position // c` (Llama 4's `attention_chunk_size`). Exactly one is
     set. `positions` `[S]` or `[B, S]` places the chunks (None is the row
-    index), `segment_ids` keeps packed documents apart (0 is padding) and
+    index), `segment_ids` keeps packed documents apart (0 is padding), at
+    most `max_segments` a row (`Coordinates.max_segments`), and
     `valid` `[B, S]` drops the keys it marks False.
 
     No `[S, S]` array is built above two spans. A window flash, cudnn (no
@@ -82,7 +83,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=True, sliding_window=window)
+        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
     # its additive bias where cudnn runs (docs/performance.md: 16384 packed
     # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
@@ -99,9 +100,11 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         # (flash_attention.py:113-128, 1707-1715), so it would raise there.
         on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
         windowed = resolved == 'flash' or (resolved in ('cudnn', 'tpu') and sinks is None)
-        if on_splash or (segment_ids is None and (windowed or length <= 2 * span)):
+        # Flash takes packed documents as its varlen sequences where their cap is declared.
+        packs = segment_ids is None or (resolved == 'flash' and max_segments is not None)
+        if on_splash or (packs and (windowed or length <= 2 * span)):
             return whole(implementation=implementation, causal=True, sliding_window=window,
-                         segment_ids=segment_ids)
+                         segment_ids=segment_ids, max_segments=max_segments)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's
