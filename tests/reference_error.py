@@ -22,6 +22,16 @@ the reference makes; a computation that differs rather than rounds (a
 dropped term, a wrong scale, a format coarser than the reference's, a mask
 one step off) moves the RMS error by more than that and fails.
 
+Why not once, the reference's own distance plus a floor for summing in
+another order. Measured over the suite (2026-10-14: 862 float64
+comparisons in 85 files), Dew's distance over the reference's sits at a
+median of 1.00, p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
+part by their own rounding draws, so a ratio above one is as likely as
+below. At once, 95 comparisons in 20 files failed with no defect behind
+them, and holding them needed a reduction-length floor of half the
+reference's own error at each, a weaker bound than twice the reference.
+At twice, one comparison failed, a deliberate one (a sinkless MiMo tower).
+
 What the rule cannot see is a difference below that factor: an attention
 softmax taken in bf16 instead of fp32 lands at 1.2 to 1.4 times the
 reference's error, since the bf16 logits both runs share carry most of it.
