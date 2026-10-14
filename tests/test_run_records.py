@@ -139,7 +139,9 @@ def test_the_published_runs_weights_are_the_ones_its_models_read():
 @pytest.mark.network
 def test_the_published_run_holds_the_committed_layout_and_samples_an_image():
     """The revision layout.json records holds exactly the committed layout,
-    and loads and samples an image on the CPU, its text tower included."""
+    and loads and samples an image, its text tower included, on the lane's
+    backend: the CPU unless the run sets JAX_PLATFORMS, as the live sampler
+    runs it."""
     import jax
     import numpy as np
 
