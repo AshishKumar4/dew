@@ -160,13 +160,8 @@ def gradient(objective, variables, batch):
 
 
 def decided(objective, variables, batch, segments: int):
-    """The batch's logits and the gradient of its summed loss, as one compiled program."""
-
-    def both(variables, batch):
-        logits = objective.model.logits(variables, laid_out(batch, segments))
-        return logits, gradient(objective, variables, batch)
-
-    return jax.jit(both)(variables, batch)
+    """The batch's logits and the gradient of its summed loss."""
+    return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
 @pytest.mark.parametrize("arm", sorted(ARMS))
