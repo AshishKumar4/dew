@@ -3,6 +3,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import threading
 import urllib.parse
 
@@ -45,10 +46,13 @@ def pytest_terminal_summary(terminalreporter):
 
 
 def pytest_collection_finish(session):
-    """A run whose every selected test is a GPU's (`-m gpu`) refuses to start on
-    another backend: the lane defaults JAX_PLATFORMS to cpu (`lane_environment`),
-    where each would only skip and the run would look green."""
-    if (session.items and jax.default_backend() != "gpu"
+    """A run that selects GPU tests by mark (`-m gpu`, `-m "gpu or kernel"`) and
+    gets only those refuses to start on another backend: the lane defaults
+    JAX_PLATFORMS to cpu (`lane_environment`), where each would only skip and
+    the run would look green. A run that names a file whose tests are all a
+    GPU's, as the CPU suite runs every file, skips them as any CPU run does."""
+    selects_gpu = re.search(r"(?<!not )\bgpu\b", session.config.getoption("markexpr") or "")
+    if (selects_gpu and session.items and jax.default_backend() != "gpu"
             and all(item.get_closest_marker("gpu") for item in session.items)):
         raise pytest.UsageError(f"every selected test runs on a CUDA GPU, and this run's backend is "
                                 f"{jax.default_backend()}: set JAX_PLATFORMS=cuda")
