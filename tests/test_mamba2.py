@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import AttentionMetadata, ModelInputs, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs, coordinates
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 
@@ -188,15 +188,15 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     hidden = jnp.asarray(reference["layer.hidden"])
     parallel = module.apply(variables, hidden)
 
-    cache = module.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    cache = module.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
     prefill = 5
-    out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill],
-                                decode=True, mutable=["cache"])
+    out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill], MixerCall(decode=True),
+                                mutable=["cache"])
     steps = [out]
     for position in range(prefill, hidden.shape[1]):
         out, mutated = module.apply({**variables, **mutated}, hidden[:, position:position + 1],
-                                    decode=True, mutable=["cache"])
+                                    MixerCall(decode=True), mutable=["cache"])
         steps.append(out)
 
     assert largest(jnp.concatenate(steps, axis=1), parallel) < BOUND
@@ -213,7 +213,7 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     compact = hidden[1][valid[1]][None]
 
     metadata = AttentionMetadata(coordinates=coordinates(valid=valid))
-    padded = jnp.asarray(module.apply(variables, hidden, attention_metadata=metadata))
+    padded = jnp.asarray(module.apply(variables, hidden, MixerCall(metadata)))
     plain = jnp.asarray(module.apply(variables, hidden[:1]))
     closed = jnp.asarray(module.apply(variables, compact))
 
@@ -237,7 +237,7 @@ def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
     segments = jnp.asarray(np.repeat(np.arange(1, 4), np.diff(cuts))[None], jnp.int32)
 
     packed = module.apply(variables, hidden,
-                          attention_metadata=AttentionMetadata(coordinates=coordinates(segments=segments)))
+                          MixerCall(AttentionMetadata(coordinates=coordinates(segments=segments))))
     alone = jnp.concatenate([module.apply(variables, hidden[:, start:end])
                              for start, end in itertools.pairwise(cuts)], axis=1)
 

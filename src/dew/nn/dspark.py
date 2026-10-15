@@ -34,6 +34,7 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import RMSNorm
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, HyperConnections, HyperHead, collapse_by, expand_streams, first_stream
+from .inputs import MixerCall
 from .precision import at_least_fp32
 from .protocols import ProjectionGroup
 from .sharding import logical_axes
@@ -132,7 +133,7 @@ class DSparkStage(nn.Module):
         (the release's prefill, v41:1044-1052, :1123-1125)."""
         context = store[DRAFT_CONTEXT]
         empty = jnp.zeros((context.shape[0], 0, context.shape[-1]), context.dtype)
-        self.layer.self_attn(empty, decode=True, kv_store=store)
+        self.layer.self_attn(empty, MixerCall(decode=True, kv_store=store))
 
     def head(self, carry):
         """The collapsed pre-norm state and the normed one the head scores:

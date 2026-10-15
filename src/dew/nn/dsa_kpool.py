@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +45,7 @@ from .attention import (
     max_attention_logits,
     scaled_dot_product_attention,
 )
-from .inputs import AttentionMetadata, PredictionPhase, coordinates_of, valid_order
+from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, latent_refusals, open_mla_cache
 from .precision import at_least_fp32
@@ -224,6 +225,10 @@ class KPoolSparseAttention(nn.Module):
     xla.
     """
 
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): its pools read each document's own
+    consecutive keys, with no mask or bias to narrow them."""
+
     emb_features: int
     num_heads: int
     max_seq_len: int
@@ -279,11 +284,9 @@ class KPoolSparseAttention(nn.Module):
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None,
-                 prediction_phase: PredictionPhase = "ordinary"):
+    def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
         # No rope: the slot positions order the keys and nothing rotates.
-        del kv_store
+        decode, attention_metadata = call.decode, call.metadata
         batch, length, _ = x.shape
         if coordinates_of(attention_metadata, batch, length).segments is not None:
             raise ValueError(
