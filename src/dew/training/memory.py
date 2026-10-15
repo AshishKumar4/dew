@@ -388,6 +388,21 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     return True
 
 
+def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list | None:
+    """Move each module the objective trains to its half rung, where it has
+    one (`Recomputing.recompute_half`), and return the modules it held, which
+    `objective.substitute` restores; None where no module has one."""
+    entries = objective.program_key()
+    half = [entry.module.recompute_half() if entry.trained and isinstance(entry.module, Recomputing)
+            else None for entry in entries]
+    if all(module is None for module in half):
+        return None
+    held = [entry.module for entry in entries]
+    objective.substitute([entry.module if module is None else module
+                          for module, entry in zip(half, entries, strict=True)])
+    return held
+
+
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
     """Move each module the objective trains one rung up its own remat ladder
     where it goes on (`Recomputing.recompute_more`), and return whether any
