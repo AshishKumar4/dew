@@ -125,6 +125,8 @@ def build(args: argparse.Namespace) -> Run:
     windows, order = data["windows"], data["order"]
     seq = windows.shape[1] - 1
     segments = None if args.documents is None else documents(windows.shape, args.documents)
+    # A packed batch's documents a row, the same each step, so one compile serves every step.
+    most = None if segments is None else int(segments.max())
     # The schedule decays over every epoch; --steps only stops the run early.
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
@@ -144,7 +146,7 @@ def build(args: argparse.Namespace) -> Run:
         if segments is None:
             return {TEXT_KEY: windows[indices]}
         return {TEXT_KEY: windows[indices], "text_coordinates": coordinates(
-            segments=segments[indices], max_segments=int(segments.max()), xp=np)}
+            segments=segments[indices], max_segments=most, xp=np)}
 
     work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
