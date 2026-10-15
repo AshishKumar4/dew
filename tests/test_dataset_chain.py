@@ -13,7 +13,7 @@ import pytest
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
-from dew.data.dataset import DataPartition
+from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Rejected
 from dew.data.plan import Manifest, StepIdentity
 
@@ -41,6 +41,52 @@ def test_a_mix_reads_memory_grain_and_files_members_at_their_shares(tmp_path):
         stream.close()
     shares = {origin: float(np.mean(origins == origin)) for origin in ("memory", "grain", "files")}
     assert shares == pytest.approx({"memory": 0.5, "grain": 0.25, "files": 0.25}, abs=0.05)
+
+
+@pytest.fixture
+def grain_rows():
+    return grain.MapDataset.source(rows("filtered", 16))
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("partition", [DataPartition(), DataPartition(1, 2)])
+def test_filtered_grain_roots_refuse_global_record_count_batches(grain_rows, mixed, partition):
+    filtered = grain_rows.filter(lambda row: row["i"] % 3 != 0)
+    member = from_grain(filtered.shuffle(1), "filtered@1").repeat()
+    chain = mix([member, member]) if mixed else member
+    data = compile(chain.batch(4), read="indexed", loading=READ)
+    assert data.plan is not None and data.plan.lowering == "global"
+    reader = data.train(partition)
+    assert isinstance(reader, GlobalStream)
+    try:
+        with pytest.raises(ValueError):
+            list(itertools.islice(reader, 8))
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_filtered_memory_roots_compact_before_global_counts_and_share_cuts(grain_rows, mixed):
+    filtered = grain_rows.filter(lambda row: row["i"] % 3 != 0)
+    member = Memory(filtered, identity="filtered@1").repeat()
+    chain = mix([member, member]) if mixed else member
+    data = compile(chain.batch(4), read="indexed", loading=READ)
+    whole, resumed = data.train(DataPartition()), data.train(DataPartition())
+    assert isinstance(whole, GlobalStream) and isinstance(resumed, GlobalStream)
+    shares = [data.train(DataPartition(index, 2)) for index in range(2)]
+    try:
+        first = next(whole)["i"]
+        saved = whole.get_state()
+        expected = next(whole)["i"]
+        resumed.set_state(saved)
+        np.testing.assert_array_equal(next(resumed)["i"], expected)
+        interleaved = np.stack([next(reader)["i"] for reader in shares], axis=-1).reshape(-1)
+        np.testing.assert_array_equal(interleaved, first)
+        assert np.all(first % 3 != 0) and np.all(expected % 3 != 0)
+    finally:
+        for reader in (whole, resumed, *shares):
+            assert isinstance(reader, GlobalStream)
+            reader.close()
 
 
 def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_read():
