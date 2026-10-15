@@ -40,6 +40,7 @@ def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = N
 def choices(obj: LMObjective, params, tokens, routes=None, key="indices"):
     """Every sparse layer's sown choice, by layer index."""
     sown = obj.token_scores(params, tokens, routing=True, routes=routes).routing
+    assert sown is not None
     return {int(name.split('_')[1]): np.asarray(sown[name]['mlp']['gate'][key][0]) for name in sown}
 
 
@@ -190,14 +191,16 @@ def test_replay_under_a_pipeline_scores_as_on_one_stage():
     np.testing.assert_allclose(scored(MeshSpec(fsdp=2, stage=2), 2), flat, atol=1e-5)
 
 
-def test_pack_takes_each_ids_routing_from_the_latest_call_that_forwarded_it():
+def test_pack_extends_recorded_routing_when_the_shared_prefix_agrees():
     """Call 2 merges onto call 1; its record re-covers the whole chain except
     its own last sampled id, which no call forwarded. The engine's uint8 ids
     stay uint8 through the call and the batch."""
     first = Call((1, 2), (3,), (-0.1,), "tool_calls", 0,
                  routed_experts=np.full((2, LAYERS, TOP_K), 1, np.uint8))
-    second = Call((1, 2, 3, 4), (5, 6), (-0.2, -0.3), "stop", 0,
-                  routed_experts=np.arange(5 * LAYERS * TOP_K, dtype=np.uint8).reshape(5, LAYERS, TOP_K))
+    assert first.routed_experts is not None
+    routes = np.arange(5 * LAYERS * TOP_K, dtype=np.uint8).reshape(5, LAYERS, TOP_K)
+    routes[:2] = first.routed_experts
+    second = Call((1, 2, 3, 4), (5, 6), (-0.2, -0.3), "stop", 0, routed_experts=routes)
     unrecorded = Call((9,), (8,), (-0.4,), "stop", 0)
     rollouts = [Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.0),
                 Session("t", "g", 1, 0, (unrecorded,), Status.COMPLETED, 0.0)]
@@ -209,6 +212,37 @@ def test_pack_takes_each_ids_routing_from_the_latest_call_that_forwarded_it():
     assert batch["input_ids"][0, 6:].tolist() == [9, 8]
     assert batch[ROUTED_KEY][0].tolist() == [True] * 5 + [False] * 3
     assert ROUTED_EXPERTS_KEY not in pack(rollouts[1:], 8)
+
+
+@pytest.mark.parametrize("conflict", [0, 2])
+def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
+    from dew.objectives.rl.grpo import GRPOObjective
+
+    obj = objective(scan=True)
+    grpo = GRPOObjective(obj.model, SEQ_LEN)
+    params = obj.init(jax.random.key(0))
+    first_routes = np.broadcast_to(np.arange(TOP_K, dtype=np.uint8), (4, LAYERS, TOP_K)).copy()
+    later_routes = np.broadcast_to(first_routes[0], (7, LAYERS, TOP_K)).copy()
+    later_routes[conflict] += TOP_K
+    first = Call((1, 2, 3), (4, 5), (-.1, -.2), "tool_calls", 0, routed_experts=first_routes)
+    second = Call((1, 2, 3, 4, 5, 6), (7, 8), (-.3, -.4), "stop", 1, routed_experts=later_routes)
+    batch = pack([Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.)], SEQ_LEN + 1)
+    sampled = batch["response_mask"] != 0
+    order = np.argsort(batch["call_index"][sampled], kind="stable")
+    scored = np.asarray(grpo.packed_log_probs(params, batch))[sampled][order]
+    expected = []
+    for call in (first, second):
+        assert call.routed_experts is not None
+        ids = np.zeros((1, SEQ_LEN + 1), np.int32)
+        size = len(call.prompt_ids) + len(call.sampled_ids)
+        ids[0, :size] = call.prompt_ids + call.sampled_ids
+        routes = np.pad(call.routed_experts, ((0, SEQ_LEN + 2 - size), (0, 0), (0, 0)))[None]
+        direct = np.asarray(replayed_log_probs(obj, params, ids, (routes, None)))
+        expected.extend(direct[0, len(call.prompt_ids) - 1:size - 1].tolist())
+    np.testing.assert_allclose(scored, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(batch["behavior_log_probs"][sampled][order],
+                                  np.array([-.1, -.2, -.3, -.4], np.float32))
+    assert len(np.unique(batch["text_segment_ids"][sampled])) == 2
 
 
 def test_packed_grpo_replays_the_routing_its_batch_carries():

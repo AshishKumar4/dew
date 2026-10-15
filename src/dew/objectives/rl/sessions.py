@@ -294,6 +294,12 @@ class _Chain:
     supports: list[tuple[int, ...] | None] = field(default_factory=list)
     """Per token, the ids its sampler kept, or None."""
 
+    def continues(self, call: Call) -> bool:
+        """Whether the token prefix and its recorded routing agree with `call`."""
+        return (merges(self.tokens, call)
+                and (self.routing is None or call.routed_experts is None
+                     or np.array_equal(self.routing, call.routed_experts[:len(self.routing)])))
+
     def extend(self, call: Call, index: int, start: int) -> None:
         """Append `call`'s prompt from `start`, then its sampled ids."""
         tail = len(call.prompt_ids) - start
@@ -340,7 +346,7 @@ def chains(session: Session, index: int, width: int) -> list[_Chain]:
                 f"session {session.task}/{session.group}/{session.sample} call {number} holds "
                 f"{size} ids, wider than the {width}-id row")
         current = built[-1] if built else None
-        if current is not None and merges(current.tokens, call):
+        if current is not None and current.continues(call):
             current.extend(call, number, len(current.tokens))
         else:
             chain = _Chain(index)
