@@ -1,22 +1,14 @@
 """SLOP013: what importing a module may not do to the process, and what it may."""
 
-import importlib.util
-import sys
 import textwrap
-from pathlib import Path
 
 import pytest
-
-TOOL = Path(__file__).resolve().parents[1] / "tools" / "lint_slop.py"
+from tool_support import load
 
 
 @pytest.fixture(scope="module")
 def lint():
-    spec = importlib.util.spec_from_file_location("lint_slop_imports", TOOL)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load("lint_slop")
 
 
 WRITE = 'jax.config.update("jax_enable_x64", True)'
