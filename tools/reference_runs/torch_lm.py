@@ -50,14 +50,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from common import WorkloadWork, run_arguments
-from torch_runs import Ranks, Split, finish, record, split, train
+from common import WorkloadWork
+from torch_runs import Ranks, Split, finish, record, split, torch_arguments, train
 
 
 def arguments(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(parents=[run_arguments()])
-    parser.add_argument("--micro-batch", type=int, default=None,
-                        help="rows per forward on one rank; unset is the rank's whole share")
+    parser = argparse.ArgumentParser(parents=[torch_arguments()])
     parser.add_argument("--precision", choices=("autocast", "autocast-bf16-residual", "fp32", "fsdp-bf16"),
                         required=True)
     parser.add_argument("--parallel", choices=("single", "ddp", "fsdp2"), default="single")
