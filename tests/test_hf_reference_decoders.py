@@ -46,5 +46,6 @@ def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_refere
         actual, expected = np.asarray(logits)[valid], fixture(rows)[valid]
         assert_as_exact_as_the_reference(actual, expected, fixture(f'{rows}_f64')[valid], f'{name} {rows}')
         np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    continued = generate(loaded.model, loaded.variables, ids[:, :4], 6, sampling=Sampling(temperature=0))
+    continued = generate(loaded.model, loaded.variables, ids[:, :4], 6, key=0,
+                         sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(continued.tokens), fixture('generated'))

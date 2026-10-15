@@ -19,7 +19,8 @@ def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, sampling=Sampling(temperature=0))
+    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
+                         sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
     sequential = loaded.model.clone(parallel_residual=False)
     wrong = np.asarray(sequential.apply(loaded.variables, jnp.asarray(ids)))

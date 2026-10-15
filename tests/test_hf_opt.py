@@ -20,7 +20,8 @@ def test_opt_same_weight_logits_and_cached_greedy_generation():
     expected = np.load(DIRECTORY / 'logits.npy')
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, sampling=Sampling(temperature=0))
+    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
+                         sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
     wrong = loaded.model.clone(position_embedding_offset=0)
     assert float(np.max(np.abs(np.asarray(wrong.apply(loaded.variables, ids)) - expected))) > 1e-2

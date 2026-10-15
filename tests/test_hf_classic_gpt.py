@@ -31,7 +31,7 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     actual = np.asarray(model.apply(loaded.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    generated = generate(model, loaded.variables, ids[:1, :4], 6, sampling=Sampling(temperature=0))
+    generated = generate(model, loaded.variables, ids[:1, :4], 6, key=0, sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(directory / 'generated.npy'))
 
 
