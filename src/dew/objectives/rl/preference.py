@@ -86,6 +86,12 @@ class DPOObjective(LMObjective):
         It also reports `rewards/chosen`, `rewards/rejected` and `accuracy`,
         the fraction of pairs whose chosen reward is higher.
         """
+        statistics, aux, _ = self._preference(variables, batch, step)
+        return statistics, aux
+
+    def _preference(self, variables, batch, step, *, predict: bool | None = None):
+        """The preference loss and its reports, with the policy's scores of
+        the pairs behind them, chosen halves first (`token_scores`' `predict`)."""
         if step.ema is None:
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
@@ -94,7 +100,7 @@ class DPOObjective(LMObjective):
         # The policy and its reference score both halves in one forward each, through the same
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
-        policy = self.token_scores(variables, pairs, qk_stats=self.qk_stats)
+        policy = self.token_scores(variables, pairs, qk_stats=self.qk_stats, predict=predict)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
         ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
@@ -105,7 +111,7 @@ class DPOObjective(LMObjective):
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
-        }, qk_stats=policy.qk)
+        }, qk_stats=policy.qk), policy
 
     def evaluate(self, params, batch, step):
         """Return per-token scores of the chosen responses under the policy, for their perplexity,
@@ -116,9 +122,20 @@ class DPOObjective(LMObjective):
     def _evaluation_scores(self, params, batch, key) -> TokenScores:
         """The chosen responses' per-token cross entropies, with the shifted
         completion mask as weights."""
-        chosen_ids, _, chosen_mask, _ = self._halves(batch)
+        chosen_ids, _, _, _ = self._halves(batch)
         scores = self.token_scores(params, chosen_ids, predict=True)
-        losses = scores.losses
         assert scores.correct is not None
-        weights = chosen_mask.astype(losses.dtype)
-        return TokenScores(losses=losses, weights=weights, correct=scores.correct)
+        return self._chosen(scores.losses, scores.correct, batch)
+
+    def _validation_scores(self, params, batch, step):
+        """The preference loss and the chosen responses' scores, from the
+        policy's one scoring of the pairs."""
+        statistics, _, policy = self._preference(params, batch, step, predict=True)
+        assert policy.correct is not None
+        rows = policy.losses.shape[0] // 2
+        return statistics, self._chosen(policy.losses[:rows], policy.correct[:rows], batch)
+
+    def _chosen(self, losses, correct, batch) -> TokenScores:
+        """The chosen halves' scores, with the shifted completion mask as weights."""
+        _, _, chosen_mask, _ = self._halves(batch)
+        return TokenScores(losses=losses, weights=chosen_mask.astype(losses.dtype), correct=correct)
