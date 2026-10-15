@@ -72,7 +72,8 @@ def decisions(tops, correct):
     labels = np.stack([np.where(correct, 0, 1), np.ones(len(tops), int)], axis=1)
     scored = np.stack([np.ones(len(tops), bool), np.zeros(len(tops), bool)], axis=1)
     return Decisions(probabilities=probabilities, options=np.ones((len(tops), 2, 2), bool),
-                     labels=labels, ordinal=np.zeros((len(tops), 2), bool), scored=scored)
+                     labels=labels, targets=np.eye(2)[labels], ordinal=np.zeros((len(tops), 2), bool),
+                     scored=scored)
 
 
 def test_ece_and_accuracy_merge_across_batches_as_one_pass():
@@ -127,6 +128,25 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
     assert float(loss) == pytest.approx(float(expected), rel=1e-5)
 
 
+
+
+@pytest.mark.parametrize("rule", [LogLoss(), Brier()], ids=lambda rule: rule.name)
+def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
+    """Held-out rows whose gold is a distribution are scored against that
+    distribution: a scoring rule's held-out metric equals the objective's own
+    validation loss under the same rule, not a charge against the most likely
+    option."""
+    from dew.training.evaluation import Evaluation
+
+    soft = [Example(f"charged twice {index}", {"team": INTENT}, targets={"team": (0.6, 0.3, 0.1)})
+            for index in range(8)]
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  loss=rule, shuffle_options=False)
+    data = loader(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
+                  objective=objective.data())
+    result = Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(rule,),
+                            loss=True)
+    assert result.scores[f"val/{rule.name}"] == pytest.approx(result.scores["val/loss"], rel=1e-5)
 
 
 HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index),

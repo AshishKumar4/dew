@@ -20,12 +20,13 @@ from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_t
 @dataclass(frozen=True)
 class Answered:
     """The questions of a `Decisions` with a known answer, one row each: their
-    probabilities `[M, K]`, real options `[M, K]`, right options `[M]` and
-    whether `[M]` they ask a score."""
+    probabilities `[M, K]`, real options `[M, K]`, right options `[M]`, gold
+    distributions `[M, K]` and whether `[M]` they ask a score."""
 
     probabilities: np.ndarray
     options: np.ndarray
     labels: np.ndarray
+    targets: np.ndarray
     ordinal: np.ndarray
 
     @classmethod
@@ -36,6 +37,7 @@ class Answered:
         scored = np.asarray(decisions.scored, bool)
         return cls(np.asarray(decisions.probabilities, np.float64)[scored],
                    np.asarray(decisions.options, bool)[scored], np.asarray(decisions.labels)[scored],
+                   np.asarray(decisions.targets, np.float64)[scored],
                    np.asarray(decisions.ordinal, bool)[scored])
 
 

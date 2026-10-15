@@ -130,11 +130,17 @@ class ParseExample:
 
 @dataclass(frozen=True)
 class ParseTable:
+    """A flat table's row as a one-question `Example`. A label names its
+    option by key, or by index where it is an int; where the options are the
+    label column's own values (`by_value`), every label names its option by
+    value, an int one included."""
+
     options: tuple[str, ...]
     text: str = "text"
     label: str = "label"
     question: str = "label"
     instructions: str = "Classify the input into the correct category."
+    by_value: bool = False
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
         if "state" in row and "questions" in row:
@@ -147,7 +153,7 @@ class ParseTable:
             "example": Example(
                 json_value(row[self.text], self.text),
                 {self.question: question},
-                {self.question: _label(label)},
+                {self.question: str(label) if self.by_value else _label(label)},
             )
         }
 
@@ -162,6 +168,7 @@ class _DecisionSource:
     def consumed(self, read: Read) -> "_DecisionSource":
         consumed = dataclasses.replace(self, source=_consumed(self.source, read))
         consumed._classes[:] = self._classes
+        consumed._valued[:] = self._valued
         consumed._facts.update(self._facts)
         return consumed
 
@@ -190,11 +197,18 @@ class _DecisionSource:
                             str(record(records[index], "decision row")[self.table.label])
                             for index in range(len(records))
                     })
+                    self._valued[:] = [True]
             self._memory_slots(records)
         return records
 
     @functools.cached_property
     def _classes(self) -> list[str]:
+        return []
+
+    @functools.cached_property
+    def _valued(self) -> list[bool]:
+        """`[True]` where the options are the label column's own values, read
+        whole, so each label names its option by value."""
         return []
 
     @functools.cached_property
@@ -229,7 +243,9 @@ class _DecisionSource:
                 )
             )
             if names:
-                return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names}
+                valued = not self.table.options and bool(self._valued)
+                return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names,
+                        **({"decision_options_by_value": True} if valued else {})}
         return {**stated, "slots": self._facts} if self._facts else stated
 
     def lengths(self) -> np.ndarray | None:
@@ -446,4 +462,5 @@ class _ParseConfigured:
             if "slots" in metadata:
                 return ParseExample()
             raise ValueError("decision flat table needs options, ClassLabel metadata or read='memory'")
-        return dataclasses.replace(self.table, options=records.strings(names, "decision_options"))
+        return dataclasses.replace(self.table, options=records.strings(names, "decision_options"),
+                                   by_value=metadata.get("decision_options_by_value") is True)

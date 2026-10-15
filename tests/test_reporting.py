@@ -28,7 +28,8 @@ def decisions() -> Decisions:
     asks one with no known answer, and its second question has no options."""
     probabilities = np.array([[[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], [[0.3, 0.3, 0.4], [1 / 3] * 3]], np.float32)
     options = np.array([[[True] * 3, [True] * 3], [[True] * 3, [False] * 3]])
-    return Decisions(probabilities=probabilities, options=options, labels=np.array([[2, 0], [1, 0]]),
+    labels = np.array([[2, 0], [1, 0]])
+    return Decisions(probabilities=probabilities, options=options, labels=labels, targets=np.eye(3)[labels],
                      ordinal=np.zeros((2, 2), bool), scored=np.array([[True, True], [False, True]]))
 
 
