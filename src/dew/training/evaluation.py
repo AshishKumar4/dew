@@ -302,8 +302,6 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
-        loss_variables = (context.ema if context.ema is not None and not objective._ema_is_reference
-                          else variables)
         while True:
             held, available = _next_batch(iterator, scored)
             if not available:
@@ -321,7 +319,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                     statistics, produced = agreed(
                         f"scoring batch {scored}",
                         lambda batch=batch, scored=scored: _dispatched(
-                            objective, variables, loss_variables, batch, context, scored,
+                            objective, variables, batch, context, scored,
                             loss=loss, evaluate=bool(metrics), score_key=score_key))
                     loss_sums.add(statistics)
                     if metrics:
@@ -414,16 +412,13 @@ def _real_batch(batch: Batch, keep: np.ndarray) -> Batch:
                         {name: leaf for name, leaf in batch.items() if name != VALID_ROWS})
 
 
-def _dispatched(objective: Objective[Loss, Effects], variables: Variables, loss_variables: Variables,
-                batch: Batch, context: Step, index: int, *, loss: bool, evaluate: bool,
-                score_key: jax.Array):
+def _dispatched(objective: Objective[Loss, Effects], variables: Variables, batch: Batch, context: Step,
+                index: int, *, loss: bool, evaluate: bool, score_key: jax.Array):
     """One batch's device work, dispatched under one key: the validation-loss
     statistics where `loss`, and what the objective produces where `evaluate`."""
     keyed = replace(context, key=_folded(score_key, index))
     # The objective's programs take what a device holds; the metrics read the rest (`_merged`).
-    device = device_fields(batch)
-    statistics = objective._validation_loss(loss_variables, device, keyed) if loss else None
-    return statistics, objective.evaluate(variables, device, keyed) if evaluate else None
+    return objective._validation_report(variables, device_fields(batch), keyed, loss=loss, evaluate=evaluate)
 
 
 def _as_placed(leaf) -> np.ndarray:
