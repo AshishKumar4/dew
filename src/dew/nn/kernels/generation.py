@@ -104,7 +104,7 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
-               'attention_packed': 'flash', 'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off',
+               'attention_packed': 'flash', 'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off', 'narrow_copies': 'off',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100')),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
