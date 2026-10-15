@@ -16,13 +16,13 @@ tests reshape between that and NHWC with numpy's own reshape.
 """
 
 import json
-import sys
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tool_support
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
@@ -138,16 +138,8 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     float64 (`flux2_published.npz`): the pipeline's folded, normalized latent
     and a corner of its decode, each to within twice the source's own
     float32 distance from that result, or 1e-5."""
-    import importlib.util
-
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
-    spec = importlib.util.spec_from_file_location(
-        "diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py"
-    )
-    tool = importlib.util.module_from_spec(spec)
-    # Its dataclasses resolve their module through sys.modules.
-    sys.modules[spec.name] = tool
-    spec.loader.exec_module(tool)
+    tool = tool_support.load("diffusers_flux2_reference")
     reference = np.load(ROOT / "tests/fixtures/flux2_published.npz")
     repo, revision = tool.PUBLISHED_VAE
     autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
