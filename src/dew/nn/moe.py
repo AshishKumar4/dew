@@ -98,7 +98,7 @@ def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],
 
 @struct.dataclass
 class RouterMoments:
-    """Additive routed-position statistics for global load-times-score loss."""
+    """Additive routed-position statistics for load-times-score loss."""
     scores: jax.Array
     counts: jax.Array
     positions: jax.Array
@@ -106,23 +106,38 @@ class RouterMoments:
 
 
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
-    """DeepSeek V2 auxiliary loss after all routed positions have pooled."""
+    """DeepSeek V2 auxiliary loss for each pool of routed positions."""
     scores = stats.scores.astype(jnp.promote_types(stats.scores.dtype, jnp.float32))
     positions = jax.lax.stop_gradient(stats.positions.astype(scores.dtype))
     counts = jax.lax.stop_gradient(stats.counts.astype(scores.dtype))
     denominator = jnp.where(positions > 0, positions, 1) ** 2 * stats.top_k
-    return alpha * scores.size * jnp.vdot(counts, scores) / denominator
+    return alpha * scores.shape[-1] * jnp.sum(counts * scores, axis=-1) / denominator
 
 
-def sequence_router_losses(scores: jax.Array, indices: jax.Array,
-                           alpha: float) -> jax.Array:
-    """Compute one DeepSeek V2 load-times-score loss per intact sequence
-    (arXiv 2405.04434, section 2.1.4)."""
-    _, length, experts = scores.shape
+def sequence_router_moments(scores: jax.Array, indices: jax.Array, valid: jax.Array,
+                            documents: jax.Array | None = None, *,
+                            max_segments: int | None = None) -> RouterMoments:
+    """Each document's router moments over its real queries."""
+    rows, length, experts = scores.shape
     scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
-    chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
-    load = jnp.sum(chosen, axis=(1, 2)) / (length * indices.shape[-1] / experts)
-    return jnp.sum(load * jnp.mean(scores, axis=1), axis=1) * alpha
+    segments = (1 if documents is None else length) if max_segments is None else max_segments
+    documents = jnp.ones((rows, length), jnp.int32) if documents is None else documents
+    owners = jnp.where(valid & (documents != 0), documents - 1, segments)
+
+    def moments(row_scores, row_indices, row_valid, row_owners):
+        summed = jax.ops.segment_sum(jnp.where(row_valid[:, None], row_scores, 0), row_owners, segments)
+        counts = jnp.zeros((segments, experts), scores.dtype).at[row_owners[:, None], row_indices].add(
+            row_valid[:, None].astype(scores.dtype), mode="drop")
+        positions = jax.ops.segment_sum(row_valid.astype(scores.dtype), row_owners, segments)
+        return RouterMoments(summed, counts, positions, indices.shape[-1])
+
+    return jax.vmap(moments)(scores, indices, valid, owners)
+
+
+def sequence_router_losses(scores: jax.Array, indices: jax.Array, alpha: float) -> jax.Array:
+    """One DeepSeek V2 balance loss per intact sequence (arXiv 2405.04434, section 2.1.4)."""
+    stats = sequence_router_moments(scores, indices, jnp.ones(scores.shape[:2], bool))
+    return global_router_loss(stats, alpha)[:, 0]
 
 
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
