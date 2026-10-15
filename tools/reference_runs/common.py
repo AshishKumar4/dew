@@ -408,23 +408,23 @@ def host() -> dict:
 
 
 def documents(shape: tuple[int, int], lengths: str, seed: int = 0) -> np.ndarray:
-    """Packed rows' segment ids, `shape` `[windows, seq + 1]`, numbered from 1
-    in each row: documents whose lengths a PCG64 generator seeded with `seed`
+    """Packed rows' segment ids, `shape` `[windows, seq + 1]`, numbered from 1:
+    one row of documents whose lengths a PCG64 generator seeded with `seed`
     draws uniformly from `lengths`' LOW:HIGH, both ends included, the last
-    cut at the row's end. Each side of a run reads the same layout from the
-    same string."""
+    cut at the row's end, and every window packed the same. So every step
+    trains the same work, and Dew's count of one batch is each step's. Each
+    side of a run reads the same layout from the same string."""
     low, high = (int(part) for part in lengths.split(":"))
     if not 1 <= low <= high:
         raise ValueError(f"documents are LOW:HIGH lengths, 1 <= LOW <= HIGH, got {lengths}")
     rng = np.random.Generator(np.random.PCG64(seed))
-    segments = np.empty(shape, np.int32)
-    for row in segments:
-        filled, segment = 0, 1
-        while filled < row.size:
-            length = int(rng.integers(low, high, endpoint=True))
-            row[filled:filled + length] = segment
-            filled, segment = filled + length, segment + 1
-    return segments
+    row = np.empty(shape[1], np.int32)
+    filled, segment = 0, 1
+    while filled < row.size:
+        length = int(rng.integers(low, high, endpoint=True))
+        row[filled:filled + length] = segment
+        filled, segment = filled + length, segment + 1
+    return np.broadcast_to(row, shape)
 
 
 def window_rows(order: np.ndarray, step: int, batch: int) -> np.ndarray:

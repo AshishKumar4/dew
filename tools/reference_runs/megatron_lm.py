@@ -14,9 +14,10 @@ curve to compare: the row measures Megatron-Core on the same work, not Dew's
 numerics. The step is what Megatron-LM's `pretrain_gpt.py` runs, with its
 fusions on: TE's fused norm-linear layers and attention backend choice, the
 fused SwiGLU, rope and vocabulary cross entropy, and weight gradients
-accumulated in the fused GEMM. Weight decay takes Megatron's default
-grouping, which leaves the norms and biases undecayed; nothing in the step's
-time depends on it.
+accumulated in the fused GEMM. The loss is the mean over the step's counted
+targets (`calculate_per_token_loss`), as Dew's is. Weight decay takes
+Megatron's default grouping, which leaves the norms and biases undecayed;
+nothing in the step's time depends on it.
 
 `--documents LOW:HIGH` packs each row with documents of `common.documents`
 lengths: Dew's side reads the same segment ids as `text_coordinates`, and
@@ -45,21 +46,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from common import (
-    TorchTracedWindow,
-    WorkloadWork,
-    documents,
-    host,
-    peak_flops,
-    run_arguments,
-    sha256,
-    steps_for,
-    throughput,
-    warmup_cosine,
-    window_rows,
-    write_record,
-)
-from torch_lm import Ranks, attach_profile, trace_directory
+from common import WorkloadWork, documents, run_arguments
+from torch_runs import Ranks, Split, finish, record, split, train
 
 
 def arguments(argv=None) -> argparse.Namespace:
@@ -130,6 +118,9 @@ def model_parts(hf: dict, args: argparse.Namespace):
         bias_activation_fusion=True, bias_dropout_fusion=True, masked_softmax_fusion=True,
         persist_layer_norm=True, apply_rope_fusion=True, gradient_accumulation_fusion=True,
         cross_entropy_loss_fusion=True, cross_entropy_fusion_impl=args.cross_entropy,
+        # The step's loss is the mean over every counted target of every
+        # micro-batch and data rank, Dew's token mean.
+        calculate_per_token_loss=True,
         attention_backend=AttnBackend.auto,
         recompute_granularity=None if args.recompute == "none" else args.recompute,
         recompute_method="uniform" if args.recompute == "full" else None,
@@ -167,21 +158,15 @@ def model_parts(hf: dict, args: argparse.Namespace):
 
 @dataclasses.dataclass
 class Run:
-    """The wrapped model, its optimizer and schedule, and the windows a step reads."""
+    """The wrapped model, its optimizer and schedule, the windows a step
+    reads and, packed, their documents."""
 
     model: torch.nn.Module
     optimizer: object
     forward_backward: object
     config: object
-    windows: np.ndarray
-    order: np.ndarray
+    split: Split
     segments: np.ndarray | None
-    seq: int
-    total: int
-    schedule_steps: int
-    share: int
-    micro: int
-    accumulation: int
 
 
 def build(args: argparse.Namespace, place: Ranks) -> Run:
@@ -197,22 +182,10 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     from megatron.core.pipeline_parallel import get_forward_backward_func
     from megatron.core.transformer.module import Float16Module
 
-    data = np.load(args.data)
-    windows, order = data["windows"], data["order"]
-    seq = windows.shape[1] - 1
-    schedule_steps = steps_for(order, args.batch)
-    total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
-    data_ranks = parallel_state.get_data_parallel_world_size()
-    if args.batch % data_ranks:
-        raise ValueError(f"{args.batch} rows do not split over {data_ranks} data ranks")
-    share = args.batch // data_ranks
-    micro = args.micro_batch or share
-    if share % micro:
-        raise ValueError(f"a rank's {share} rows do not split into micro-batches of {micro}")
-    segments = None if args.documents is None else documents(windows.shape, args.documents)
-
+    windows = split(args, parallel_state.get_data_parallel_world_size())
+    segments = None if args.documents is None else documents(windows.windows.shape, args.documents)
     config, spec, shape = model_parts(text_config(args.model), args)
-    model = GPTModel(config, spec, max_sequence_length=seq, **shape).cuda()
+    model = GPTModel(config, spec, max_sequence_length=windows.seq, **shape).cuda()
     model = Float16Module(config, model)
     if args.fsdp:
         model = FullyShardedDataParallel(config, DistributedDataParallelConfig(
@@ -231,8 +204,7 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     config.finalize_model_grads_func = finalize_model_grads
     config.grad_scale_func = optimizer.scale_loss
     config.no_sync_func = model.no_sync
-    return Run(model, optimizer, get_forward_backward_func(), config, windows, order, segments, seq, total,
-               schedule_steps, share, micro, share // micro)
+    return Run(model, optimizer, get_forward_backward_func(), config, windows, segments)
 
 
 def micro_batch(run: Run, rows: np.ndarray, device: torch.device) -> dict:
@@ -241,17 +213,18 @@ def micro_batch(run: Run, rows: np.ndarray, device: torch.device) -> dict:
     counted from each document's start."""
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    ids = run.windows[rows].astype(np.int64)
+    seq = run.split.seq
+    ids = run.split.windows[rows].astype(np.int64)
     tokens, labels = ids[:, :-1], ids[:, 1:]
     if run.segments is None:
-        positions = np.broadcast_to(np.arange(run.seq), tokens.shape)
+        positions = np.broadcast_to(np.arange(seq), tokens.shape)
         mask, packed = np.ones(tokens.shape, np.float32), None
     else:
         segments = run.segments[rows]
         inputs = segments[:, :-1].reshape(-1)
         # A row's end closes its last document as a new segment id does.
         starts = np.flatnonzero(np.concatenate([[True], (inputs[1:] != inputs[:-1])
-                                                | (np.arange(1, inputs.size) % run.seq == 0)]))
+                                                | (np.arange(1, inputs.size) % seq == 0)]))
         lengths = np.diff(np.append(starts, inputs.size))
         positions = (np.arange(inputs.size) - np.repeat(starts, lengths)).reshape(1, -1)
         mask = (segments[:, :-1] == segments[:, 1:]).astype(np.float32).reshape(1, -1)
@@ -284,91 +257,24 @@ def token_mean(mask: torch.Tensor, losses: torch.Tensor):
     return total, count, {"lm loss": torch.stack([total.detach(), count.detach().float()])}
 
 
-def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int) -> tuple[float, float]:
-    """One optimizer step on this data rank's rows of step `step`: the token
-    mean of the loss and the pre-clip gradient norm."""
+def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int) -> tuple:
+    """One optimizer step on this data rank's rows of step `step`: the summed
+    loss and its counted targets, the pre-clip gradient norm, no auxiliary
+    loss."""
     from megatron.core import parallel_state
 
-    rank = parallel_state.get_data_parallel_rank()
-    rows = window_rows(run.order, step, args.batch)[rank * run.share:(rank + 1) * run.share]
-    batches = [micro_batch(run, rows[index * run.micro:(index + 1) * run.micro], place.device)
-               for index in range(run.accumulation)]
+    layout = run.split
+    rows = layout.rows(step, args.batch, parallel_state.get_data_parallel_rank())
+    batches = [micro_batch(run, rows[index * layout.micro:(index + 1) * layout.micro], place.device)
+               for index in range(layout.accumulation)]
     run.model.zero_grad_buffer()
     run.optimizer.zero_grad()
     reported = run.forward_backward(
         forward_step_func=forward_step, data_iterator=iter(batches), model=[run.model],
-        num_microbatches=run.accumulation, seq_length=run.seq, micro_batch_size=run.micro,
+        num_microbatches=layout.accumulation, seq_length=layout.seq, micro_batch_size=layout.micro,
         forward_only=False)
     _, norm, _ = run.optimizer.step()
-    summed = torch.stack([entry["lm loss"] for entry in reported]).sum(dim=0)
-    return summed, norm
-
-
-def train(args: argparse.Namespace, place: Ranks, run: Run):
-    """Every step in the recorded order, timed from `timing_warmup` to the profiled tail."""
-    losses, norms, rates = [], [], []
-    window = TorchTracedWindow(place.device, run.total, args.timing_warmup, args.profile_steps)
-    torch.cuda.reset_peak_memory_stats(place.device)
-    torch.cuda.synchronize(place.device)
-    for step in range(run.total):
-        window.before(step)
-        lr = warmup_cosine(step, init=args.lr_init, peak=args.lr_peak, warmup=args.warmup,
-                           decay_steps=run.schedule_steps, end=args.lr_end)
-        for group in run.optimizer.param_groups:
-            group["lr"] = lr
-        loss, norm = train_step(args, place, run, step)
-        losses.append(loss)
-        norms.append(norm)
-        rates.append(lr)
-    window.close(trace_directory(args) / f"rank{place.rank}.json")
-    return losses, norms, rates, window
-
-
-def record(args: argparse.Namespace, place: Ranks, run: Run, losses, norms, rates, window,
-           work: WorkloadWork) -> dict | None:
-    """Rank 0's record: the token-mean losses, the timed throughput, every rank's memory peak and MFU
-    from Dew's count of the same step."""
-    summed = torch.stack(losses)
-    dist.all_reduce(summed)
-    peak = torch.tensor([torch.cuda.max_memory_allocated(place.device),
-                         torch.cuda.max_memory_reserved(place.device)],
-                        device=place.device, dtype=torch.float64)
-    peaks = [torch.zeros_like(peak) for _ in range(place.world)]
-    dist.all_gather(peaks, peak)
-    if place.rank != 0:
-        return None
-    tokens_per_step = args.batch * run.seq
-    if work.tokens_per_step != tokens_per_step:
-        raise ValueError(f"{args.work} counts {work.tokens_per_step} tokens a step, this run trains "
-                         f"{tokens_per_step}")
-    peak_rate = peak_flops(torch.cuda.get_device_name(place.device))
-    return {
-        "framework": "megatron-core",
-        "world": place.world,
-        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps,
-                   "seq": run.seq, "accumulation": run.accumulation, "micro_batch": run.micro,
-                   "data_sha256": sha256(args.data), "model_type": text_config(args.model)["model_type"],
-                   "transformer_config": {name: str(value) for name, value in vars(run.config).items()
-                                          if not name.startswith("_") and not callable(value)},
-                   "optimizer": "megatron.core DistributedOptimizer (Adam, decoupled weight decay)",
-                   "schedule": "optax warmup_cosine_decay_schedule (common.warmup_cosine)"},
-        "versions": {name: version(name) for name in ("megatron-core", "transformer_engine", "torch",
-                                                      "flash-linear-attention")}
-                    | {"cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version(),
-                       "container": os.environ.get("NVIDIA_PYTORCH_VERSION")},
-        "device": torch.cuda.get_device_name(place.device),
-        "host": host(),
-        "loss": (summed[:, 0] / summed[:, 1]).cpu().tolist(),
-        "grad_norm": [float(norm) for norm in norms],
-        "lr": rates,
-        "throughput": throughput(window.seconds, window.timed_steps, tokens_per_step, window.step_seconds),
-        "flops_per_token": work.training_flops_per_step / work.tokens_per_step,
-        "work": dataclasses.asdict(work),
-        "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
-            / window.seconds / (peak_rate * place.world),
-        "memory": {"peak_allocated_bytes": [int(p[0]) for p in peaks],
-                   "peak_reserved_bytes": [int(p[1]) for p in peaks]},
-    }
+    return torch.stack([entry["lm loss"] for entry in reported]).sum(dim=0), norm, None
 
 
 def main() -> None:
@@ -376,16 +282,23 @@ def main() -> None:
     work = WorkloadWork.read(args.work)
     place = ranks(args)
     run = build(args, place)
-    losses, norms, rates, window = train(args, place, run)
-    result = record(args, place, run, losses, norms, rates, window, work)
-    if result is not None:
-        if window.profiler is not None:
-            attach_profile(args, place, result)
-        write_record(args.out, result)
-        print(json.dumps({"first_loss": result["loss"][0], "last_loss": result["loss"][-1],
-                          "tokens_per_s": result["throughput"]["tokens_per_s"],
-                          "step_ms": result["throughput"]["step_ms_mean"], "mfu": result["mfu"],
-                          "peak_gib": max(result["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+    curves = train(args, place, run.split, run.optimizer, lambda step: train_step(args, place, run, step))
+    # Each step's loss summed with its counted targets over the ranks: the
+    # token mean, whatever the ranks repeat under tensor parallelism.
+    summed = torch.stack(curves.losses)
+    dist.all_reduce(summed)
+    hf = text_config(args.model)
+    result = record(
+        args, place, run.split, curves, work, summed[:, 0] / summed[:, 1], framework="megatron-core",
+        fields={},
+        config={"model_type": hf["model_type"],
+                "transformer_config": {name: str(value) for name, value in vars(run.config).items()
+                                       if not name.startswith("_") and not callable(value)},
+                "optimizer": "megatron.core DistributedOptimizer (Adam, decoupled weight decay)"},
+        versions={name: version(name) for name in ("megatron-core", "transformer_engine",
+                                                   "flash-linear-attention")}
+                 | {"container": os.environ.get("NVIDIA_PYTORCH_VERSION")})
+    finish(args, place, result, curves.traced)
     dist.destroy_process_group()
 
 
