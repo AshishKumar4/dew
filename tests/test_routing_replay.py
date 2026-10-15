@@ -232,10 +232,12 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     expected = []
     for call in (first, second):
         assert call.routed_experts is not None
-        ids = jnp.asarray([call.prompt_ids + call.sampled_ids])
-        routes = np.pad(call.routed_experts, ((0, 1), (0, 0), (0, 0)))[None]
+        ids = np.zeros((1, SEQ_LEN + 1), np.int32)
+        size = len(call.prompt_ids) + len(call.sampled_ids)
+        ids[0, :size] = call.prompt_ids + call.sampled_ids
+        routes = np.pad(call.routed_experts, ((0, SEQ_LEN + 2 - size), (0, 0), (0, 0)))[None]
         direct = np.asarray(replayed_log_probs(obj, params, ids, (routes, None)))
-        expected.extend(direct[0, len(call.prompt_ids) - 1:].tolist())
+        expected.extend(direct[0, len(call.prompt_ids) - 1:size - 1].tolist())
     np.testing.assert_allclose(scored, expected, rtol=1e-5, atol=1e-6)
     np.testing.assert_array_equal(batch["behavior_log_probs"][sampled], np.array([-.1, -.2, -.3, -.4],
                                                                               np.float32))

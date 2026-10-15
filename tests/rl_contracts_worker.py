@@ -18,7 +18,7 @@ from dew.training import MeshSpec, Trainer
 def native(args):
     harness, verified = Harness(), []
     trainer, rollout = build(harness, verifier=lambda episode: verified.append(episode) or 0.)
-    trainer.mesh = MeshSpec(sequence=args.processes)
+    trainer.mesh = MeshSpec(tensor=args.processes)
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)
     refused = False
@@ -53,7 +53,7 @@ def ppo(args):
     captured = CapturedEpisodes(**{field.name: getattr(rollout.episodes, field.name)
                                   for field in fields(rollout.episodes)})
     trainer = Trainer(trainer.objective, trainer.optimizer, key=trainer.key,
-                      mesh=MeshSpec(sequence=args.processes))
+                      mesh=MeshSpec(tensor=args.processes))
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)
     rollout = PPORollout(rollout.objective, captured, gamma=rollout.gamma, lam=rollout.lam)
