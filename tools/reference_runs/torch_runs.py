@@ -20,6 +20,7 @@ from common import (
     host,
     kernel_summary,
     peak_flops,
+    run_arguments,
     sha256,
     steps_for,
     throughput,
@@ -28,6 +29,14 @@ from common import (
     window_rows,
     write_record,
 )
+
+
+def torch_arguments() -> argparse.ArgumentParser:
+    """A torch runner's arguments: a reference run's, and the rows a forward takes."""
+    parser = argparse.ArgumentParser(parents=[run_arguments()], add_help=False)
+    parser.add_argument("--micro-batch", type=int, default=None,
+                        help="rows per forward on one data rank; unset is the rank's whole share")
+    return parser
 
 
 @dataclasses.dataclass

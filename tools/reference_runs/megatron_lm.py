@@ -46,14 +46,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from common import WorkloadWork, documents, run_arguments
-from torch_runs import Ranks, Split, finish, record, split, train
+from common import WorkloadWork, documents
+from torch_runs import Ranks, Split, finish, record, split, torch_arguments, train
 
 
 def arguments(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(parents=[run_arguments()])
-    parser.add_argument("--micro-batch", type=int, default=None,
-                        help="rows per forward on one data rank; unset is the rank's whole share")
+    parser = argparse.ArgumentParser(parents=[torch_arguments()])
     parser.add_argument("--tp", type=int, default=1, help="tensor-parallel size")
     parser.add_argument("--fsdp", action="store_true",
                         help="Megatron-FSDP over the data ranks: parameters, gradients and optimizer state "
