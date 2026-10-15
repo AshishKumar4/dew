@@ -67,8 +67,8 @@ def _trained(monkeypatch, optimizer, *, copies, steps=3, mesh=None, padded=0, ac
     parameter split where it divides, `accumulation` steps an update of `split`
     microbatches each, over `rows` rows. A `mixture` routes its MLPs over
     four experts under a balance loss. A `ragged` run's even steps end
-    their first half of rows in padding, so no two neighbouring
-    microbatches count as many tokens."""
+    every other row in padding, so no two neighbouring microbatches count
+    as many tokens, whether a window reads steps or a step's parts."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -86,13 +86,38 @@ def _trained(monkeypatch, optimizer, *, copies, steps=3, mesh=None, padded=0, ac
     state = trainer.initial_state()
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
     step = trainer.compile(state, batch)
-    shorter = {TEXT_KEY: batch[TEXT_KEY].at[:rows // 2, -3:].set(0)}
+    shorter = {TEXT_KEY: batch[TEXT_KEY].at[::2, -3:].set(0)}
     trained = [shorter if ragged and index % 2 == 0 else batch for index in range(steps)]
     losses = []
     for current in trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
         state, loss, *_ = step(state, current)
         losses.append(np.asarray(loss))
     return state, losses
+
+
+def _assert_plain_update(narrow, losses, plain, plain_losses):
+    """`narrow`, trained through copies, holds bitwise the parameters, last
+    gradient (`_keeping_gradients`) and losses of `plain`, trained without;
+    each copy is split as its parameter is, so a gather moves bf16, and is
+    the cast of the parameters the last update wrote. Returns the copies'
+    paths under `params`."""
+    assert plain.compute is None
+    for a, b in zip(jax.tree.leaves((narrow.variables, narrow.opt_state)),
+                    jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for a, b in zip(losses, plain_losses, strict=True):
+        np.testing.assert_array_equal(a, b)
+    masters = {tuple(key.key for key in path): leaf.sharding
+               for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.variables)[0]}
+    paths = {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]:
+        keys = tuple(key.key for key in path)
+        assert leaf.sharding.is_equivalent_to(masters[keys], leaf.ndim), keys
+        paths[keys[1:]] = leaf.dtype
+    for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
+                    strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    return paths
 
 
 @pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
@@ -103,40 +128,29 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     plain SGD, whose update reads the gradient once, every parameter and the
     last gradient after three steps are bitwise what the in-forward cast
     gives: the copies change no gradient, and the tied table's two uses
-    still sum in fp32.
-    So too where the batch is split over data-parallel devices, whose
-    gradients are summed across them, and where every parameter is split
-    over fsdp devices too (the lane's eight: data 8, data 4 x fsdp 2, fsdp 8).
-    Each copy is split as its parameter is, so a gather moves bf16."""
+    still sum in fp32. So too where the batch is split over data-parallel
+    devices, whose gradients are summed across them, and where every
+    parameter is split over fsdp devices too (the lane's eight: data 8,
+    data 4 x fsdp 2, fsdp 8)."""
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
     narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
     plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, mesh=mesh)
-    paths = {tuple(key.key for key in path)[1:]: leaf.dtype
-             for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
-    names = {"/".join(path) for path in paths}
+    names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
-    assert plain.compute is None
-    for a, b in zip(jax.tree.leaves((narrow.variables, narrow.opt_state)),
-                    jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-    for a, b in zip(losses, plain_losses, strict=True):
-        np.testing.assert_array_equal(a, b)
-    masters = {tuple(key.key for key in path): leaf.sharding
-               for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.variables)[0]}
-    for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]:
-        assert leaf.sharding.is_equivalent_to(masters[tuple(key.key for key in path)], leaf.ndim), path
-    # The copies are the cast of the parameters the last update wrote.
-    for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
-                    strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
-@pytest.mark.parametrize("mixture", [False, True], ids=["pooled", "replayed"])
-@pytest.mark.parametrize(("accumulation", "split"), [(2, 1), (1, 2)], ids=["accumulated", "split"])
+@pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
+    (2, 1, False, 1), (1, 2, True, 1),
+    pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
+    pytest.param(1, 2, False, 2, marks=pytest.mark.mesh(devices=2)),
+    pytest.param(2, 1, False, 8, marks=pytest.mark.mesh(devices=8)),
+    pytest.param(1, 2, True, 8, marks=pytest.mark.mesh(devices=8)),
+], ids=["accumulated-pooled", "split-replayed", "accumulated-replayed-fsdp2", "split-pooled-fsdp2",
+        "accumulated-pooled-fsdp8", "split-replayed-fsdp8"])
 def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
-        monkeypatch, accumulation, split, mixture):
+        monkeypatch, accumulation, split, mixture, fsdp):
     """A step that pools several microbatches, by accumulation or a batch
     read in parts, reads the copies through its window and rewrites them as
     it commits. Each microbatch's gradient is widened as it is pooled, so
@@ -144,25 +158,18 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     fp32 as without copies, and a loss whose balance terms pool apart (a
     mixture's) replays the window's microbatches through the copies too:
     under SGD every parameter and the last pooled gradient after two
-    windows are bitwise the plain run's, and the copies are the cast of
-    what the last commit wrote."""
+    windows are bitwise the plain run's, with the parameters and their
+    copies split over fsdp devices too (pairwise over the window's kind,
+    its pooling and the mesh)."""
+    from dew.training import MeshSpec
+
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
-           "rows": split * max(8, jax.device_count()), "ragged": True}
+           "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
     narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, **run)
     plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, **run)
-    assert plain.compute is None and int(narrow.updates) == int(plain.updates) == 2
-    paths = {tuple(key.key for key in path)[1:]: leaf.dtype
-             for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
-    assert paths
-    for a, b in zip(jax.tree.leaves((narrow.variables, narrow.opt_state)),
-                    jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-    for a, b in zip(losses, plain_losses, strict=True):
-        np.testing.assert_array_equal(a, b)
-    for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
-                    strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert int(narrow.updates) == int(plain.updates) == 2
+    assert _assert_plain_update(narrow, losses, plain, plain_losses)
 
 
 def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept(monkeypatch):
