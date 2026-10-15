@@ -1152,6 +1152,37 @@ def test_a_memory_read_counts_valid_targets_where_it_packs():
     assert compile(laid, read="memory", loading=READ).records == 2
 
 
+def test_each_pass_declares_the_most_documents_its_own_windows_hold():
+    """Training windows of one document each and validation windows of four, packed with their
+    roles: each pass declares the most its own windows hold (`Coordinates.max_segments`), not the
+    other's nor its window's length."""
+    long = Memory(tuple({"text": np.arange(8, dtype=np.int32)} for _ in range(4)))
+    short = Memory(tuple({"text": np.arange(2, dtype=np.int32), "text_roles": np.ones(2, np.int32)}
+                         for _ in range(8)))
+    data = compile(Pipeline(long).pack(9).batch(2), read="memory", loading=READ,
+                   validation=Pipeline(short).pack(9, fields=("text", "text_roles")).batch(2))
+    for reader, most in ((data.train, 1), (data.val, 4)):
+        assert reader is not None
+        opened = reader(DataPartition())
+        try:
+            laid = next(opened)["text_coordinates"]
+        finally:
+            opened.close()
+        assert int(laid.segments.max()) == laid.max_segments == most
+
+
+def test_a_window_holding_more_documents_than_its_read_declares_is_refused():
+    """A sequence kernel sized by the declared documents would run the rest into the next row's."""
+    from dew.data.steps.generic import Coordinated
+
+    window = {"text": np.zeros((1, 6), np.int32),
+              "text_segment_ids": np.asarray([[1, 1, 2, 3, 0, 0]], np.int32),
+              "text_positions": np.asarray([[0, 1, 0, 0, 0, 0]], np.int32)}
+    assert Coordinated(("text",), 3).map(window)["text_coordinates"].max_segments == 3
+    with pytest.raises(ValueError):
+        Coordinated(("text",), 2).map(window)
+
+
 def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
     """A loading worker stacks a batch's large numeric column straight into shared memory, which
     the reader maps without a copy, and keeps its captions and small columns as plain arrays,
