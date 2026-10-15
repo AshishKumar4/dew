@@ -103,13 +103,17 @@ def model_parts(hf: dict, args: argparse.Namespace):
     from megatron.core.transformer.enums import AttnBackend
 
     rope = hf.get("rope_parameters") or {"rope_theta": hf.get("rope_theta", 10000.0)}
+    if hf.get("attention_bias") or hf.get("mlp_bias"):
+        # Megatron-Core biases q/k/v alone or every linear layer; an HF decoder's
+        # biased attention also biases its output projection.
+        raise SystemExit(f"{args.model} has biased linear layers; this mapping builds bias-free decoders")
     common = dict(
         num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
         ffn_hidden_size=hf["intermediate_size"], num_attention_heads=hf["num_attention_heads"],
         num_query_groups=hf["num_key_value_heads"],
         kv_channels=hf.get("head_dim") or hf["hidden_size"] // hf["num_attention_heads"],
         normalization="RMSNorm", layernorm_epsilon=hf["rms_norm_eps"], gated_linear_unit=True,
-        activation_func=F.silu, add_bias_linear=False, add_qkv_bias=hf.get("attention_bias", False),
+        activation_func=F.silu, add_bias_linear=False,
         hidden_dropout=0.0, attention_dropout=0.0, init_method_std=hf.get("initializer_range", 0.02),
         bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
         tensor_model_parallel_size=args.tp, sequence_parallel=args.sequence_parallel,
