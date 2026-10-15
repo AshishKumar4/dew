@@ -233,28 +233,28 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None. The last run's
-    record decides where it was made on these shared inputs, as its record under them may not have
-    been written; else the record under these inputs, then the last run's, which may be another
-    commit's whose file's inputs are these."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the
+    last run on these shared inputs decides, green or red (`record` writes it before the last run's);
+    with none, the last run's, which may be another commit's whose file's inputs are these."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     url = functools.partial(cache_url, python, row(python, name, split), device_class())
-    last = json.loads(record) if (record := cache_request(url(), token)) is not None else None
-    if last is not None and last.get("inputs") == common[:16]:
-        return last["row"] if fresh(last, name, common) else None
-    exact = json.loads(record) if (record := cache_request(url(common), token)) is not None else None
-    for recorded in (exact, last):
-        if recorded is not None and fresh(recorded, name, common):
-            return recorded["row"]
-    return None
+    record = cache_request(url(common), token)
+    if record is None:
+        record = cache_request(url(), token)
+    recorded = None if record is None else json.loads(record)
+    return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
     """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
     or one of a file that started another Python process, whose code no event saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
+
+
+RECORD_TRIES = 4
+"""How many times a record's write is tried, two, four and eight seconds apart."""
 
 
 def recorded_tests() -> dict[str, list[float]]:
@@ -557,10 +557,23 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
-                           "inputs": common[:16], "depends": ran["depends"], "row": row_,
-                           "reads": ran["reads"], "peak": ran["peak"]})
-        for inputs in (None, common):
-            cache_request(cache_url(python, row_["name"], held, inputs), token, body.encode())
+                           "depends": ran["depends"], "row": row_, "reads": ran["reads"],
+                           "peak": ran["peak"]}).encode()
+        # The record under these inputs first, and the last run's only once it is written: the last
+        # run's record is then never newer than these inputs' (`reused`).
+        if written(cache_url(python, row_["name"], held, common), token, body):
+            written(cache_url(python, row_["name"], held), token, body)
+
+
+def written(url: str, token: str, body: bytes) -> bool:
+    """Whether `body` was PUT at `url`, tried `RECORD_TRIES` times: a record not written leaves the
+    one before it, such as an older green row a red run should have replaced."""
+    for attempt in range(RECORD_TRIES):
+        if attempt:
+            time.sleep(2 ** attempt)
+        if cache_request(url, token, body) is not None:
+            return True
+    return False
 
 
 def listed(prefix: str, token: str) -> list[str]:
