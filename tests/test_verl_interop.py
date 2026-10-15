@@ -94,7 +94,7 @@ def test_packed_native_rows_match_verls_tensor_mapping():
 def test_rollouts_round_trip_through_verl_rows_losslessly():
     """Dew's own metadata restores what verl's fields lack: identity,
     status, finish reasons, versions and the sampling support, across a
-    rollout whose history broke the strict chain (two rows)."""
+    rollout whose token history or routing broke the strict chain (three rows)."""
     routed = np.arange(4 * 2 * 2).reshape(4, 2, 2) % 5
     calls = (
         Call(
@@ -106,10 +106,11 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
     rollout = Session("task", "g", 1, 2, calls, Status.COMPLETED, 0.5, {"tests": 0.5}, "log://1")
     failed = Session("task", "g", 2, 0, (Call((1,), (2,), (-3.0,), "abort", 4),), Status.INFRA_ERROR, None)
     rows = json.loads(json.dumps(to_verl([rollout, failed])))
-    assert len(rows) == 3
+    assert len(rows) == 4
     assert (
-        rows[0]["extra_fields"]["min_global_steps"] == 3 and rows[0]["extra_fields"]["max_global_steps"] == 4
+        rows[0]["extra_fields"]["min_global_steps"] == 3 and rows[0]["extra_fields"]["max_global_steps"] == 3
     )
+    assert rows[1]["extra_fields"]["min_global_steps"] == rows[1]["extra_fields"]["max_global_steps"] == 4
     restored = [trajectory.session for trajectory in from_verl(rows)]
     assert restored == [rollout, failed]
     for key, value in pack([rollout], 16, support_capacity=4).items():
