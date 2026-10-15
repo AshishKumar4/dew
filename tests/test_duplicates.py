@@ -38,10 +38,10 @@ def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(t
     (owned / "second.py").write_text("from first import first\n\n\ndef second(values, limit):\n"
                                      "    return first(values, limit)\n")
     assert gate(owned) == 0
-    six = tmp_path / "six"
-    six.mkdir()
-    (six / "first.py").write_text(f"def first(values, limit):\n{BLOCK}")
+    sharing_six = tmp_path / "sharing_six"
+    sharing_six.mkdir()
+    (sharing_six / "first.py").write_text(f"def first(values, limit):\n{BLOCK}")
     # The last line differs, so the two share six: not past the bar.
     differing = BLOCK.replace("return total", "return -total")
-    (six / "second.py").write_text(f"def second(values, limit):\n{differing}")
-    assert gate(six) == 0
+    (sharing_six / "second.py").write_text(f"def second(values, limit):\n{differing}")
+    assert gate(sharing_six) == 0
