@@ -77,7 +77,11 @@ class _Wrapping(Protocol):
 
 @runtime_checkable
 class _RestrictedReads(Protocol):
+    """A holdout or slice that takes fewer reads than its store, and says why
+    and what reads instead (`refusal`)."""
+
     reads: tuple[Read, ...]
+    refusal: str
 
 
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
@@ -641,9 +645,23 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
             preparer = _provisioner(source, read)
             if preparer is not None:
                 preparer.provision()
-    refused = [source.describe() for source in missing if not source.supports(read)]
+    refused: dict[str, list[str]] = {}
+    for source in missing:
+        if not source.supports(read):
+            refused.setdefault(_refusal(source, read, provision=provision), []).append(source.describe())
     if refused:
-        raise ValueError(
-            f"read={read!r} is unavailable for {', '.join(refused)}; "
-            "provision the named artifact with dew data provision or provision=True"
-        )
+        raise ValueError(f"read={read!r} is unavailable: "
+                         + "; ".join(f"{', '.join(names)}: {why}" for why, names in refused.items()))
+
+
+def _refusal(source: Source, read: Read, *, provision: bool) -> str:
+    """Why `source` cannot take `read`: a holdout or slice over its store that
+    reads no such way, which says what does, else its store, which a run
+    that did not provision may prepare."""
+    while isinstance(source, _Wrapping):
+        if isinstance(source, _RestrictedReads) and read not in source.reads:
+            return source.refusal
+        source = source.source
+    if provision:
+        return "its store takes no such read, and provisioning prepared none"
+    return "provision the named artifact with dew data provision or provision=True"
