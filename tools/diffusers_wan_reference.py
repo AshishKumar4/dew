@@ -45,6 +45,9 @@ import numpy as np
 import torch
 import transformers.utils as transformers_utils
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from torch_precision import default_dtype, wide  # noqa: E402
+
 # Diffusers 0.34.0's pipeline modules import two names Transformers dropped
 # after 4.x; the pipeline walk needs `WanPipeline` itself, so the names are
 # restored, as tools/diffusers_sd3_reference.py restores them.
@@ -82,23 +85,6 @@ CASES: dict[str, Case] = {
                      "cross_attn_norm": False, "num_layers": 3, "eps": 1e-3, "out_channels": 6},
                     size=(4, 4, 6), length=5, times=(999.0,)),
 }
-
-
-def wide(dtype):
-    """`dtype`, float32 read as float64: what a widened reference casts to where it pins float32."""
-    return torch.float64 if dtype == torch.float32 else dtype
-
-
-@contextlib.contextmanager
-def default_dtype(dtype):
-    """torch's default floating dtype `dtype` within the block, the previous one restored after it,
-    the one precision context the references build and run their oracles under."""
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)
 
 
 class Float64Library:
