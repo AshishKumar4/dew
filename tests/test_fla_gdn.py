@@ -457,7 +457,12 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     decay gradient adds that memory's whole share at the chunk's last token and takes it back at the
     key's, an fp32 cancellation of terms larger than the gradient that the math, summing each pair's
     range, never makes; with one, the port's per-head decay gradient sits 5.8 times the math's
-    distance whatever the first token's decay."""
+    distance whatever the first token's decay. Kimi's port implements fla's factorised decay
+    gradient, each token's `q dq - k dk` summed back over its chunk, so its decay gradient is held to
+    that formula's terms (`float64_terms`), each token's root sum of squares of the products summed
+    back to it, in float64: where keys of zero make a token's gradient zero, the terms it adds and
+    takes back are not. The gated delta rule's port sums each token's own pairs (`_summed_back`) and
+    is held to its gradient alone."""
     length, width, key_at, query_at = 64, 64, 48, 63
     keys = jax.random.split(jax.random.key(29), 6)
     decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
@@ -485,7 +490,13 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     missed = (plain[query_at] - plain[key_at]) - (exact[query_at] - exact[key_at])
     with pytest.raises(AssertionError):
         assert_leaves_as_exact(truth[0] * np.exp2(missed), want[0], truth[0], reductions=CHUNKED)
-    assert_leaves_as_exact(got, want, truth, reductions=CHUNKED)
+    terms = truth
+    if per_key:
+        products = np.square(operands[0] * truth[2]) + np.square(operands[1] * truth[3])
+        chunks = products.reshape(1, length // 64, 64, 1, width)
+        summed_back = np.sqrt(np.flip(np.cumsum(np.flip(chunks, 2), 2), 2)).reshape(products.shape)
+        terms = (*truth[:5], summed_back, *truth[6:])
+    assert_leaves_as_exact(got, want, truth, reductions=CHUNKED, terms=terms)
 
 
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
