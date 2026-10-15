@@ -579,11 +579,14 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     it placed (`PackedSource`) and a memory read's as many as it packed; a
     pack that runs as rows arrive holds its windows to its cap
     (`Pack.segments`), or to its window's length where it has none: a window
-    holds no more documents than tokens."""
+    holds no more documents than tokens. A corpus that shows no packing
+    while another packs into the same batches holds windows packed where
+    none of this can see, so then each declares its window's length."""
     from dew.data.packing import PackedSource
 
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
+    unseen = False
 
     def declare(pack: Pack, most: int | None) -> None:
         ids = pack.fields[0]
@@ -591,20 +594,32 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
         bounds[ids] = max(bounds.get(ids, 0), bound)
 
-    for pipeline in pipelines:
-        for stage in _steps(pipeline):
+    def walk(pipeline: Pipeline, *, packed: bool) -> None:
+        nonlocal unseen
+        for stage in pipeline.stages:
             if isinstance(stage, Pack):
                 declare(stage, stage.segments)
-        for _, source in _leaves(pipeline):
-            packed = _packed_documents(source)
-            for stage in _written(source, ()):
-                if isinstance(stage, Pack):
-                    declare(stage, stage.segments if packed is None else packed)
-            while isinstance(source, (_Facts, _Ran)):
-                source = source.source if isinstance(source, _Facts) else source.original
-            if isinstance(source, PackedSource):
-                declare(source.plan.pack, source.plan.most_documents)
-    return tuple(Coordinated(fields[ids], bound) for ids, bound in bounds.items())
+                packed = True
+        source = pipeline.source
+        if isinstance(source, (Mixture, Phases)):
+            for child in source.pipelines:
+                walk(child, packed=packed)
+            return
+        documents = _packed_documents(source)
+        for stage in _written(source, ()):
+            if isinstance(stage, Pack):
+                declare(stage, stage.segments if documents is None else documents)
+                packed = True
+        while isinstance(source, (_Facts, _Ran)):
+            source = source.source if isinstance(source, _Facts) else source.original
+        if isinstance(source, PackedSource):
+            declare(source.plan.pack, source.plan.most_documents)
+            packed = True
+        unseen = unseen or not packed
+
+    for pipeline in pipelines:
+        walk(pipeline, packed=False)
+    return tuple(Coordinated(fields[ids], None if unseen else bound) for ids, bound in bounds.items())
 
 
 def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
