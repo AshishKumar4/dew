@@ -148,3 +148,12 @@ def run_pool(mode: str | Path, directory: Path, processes: int, *, timeout: floa
                                       coordinator=coordinator, **flags))
         return [report_of(process, out, timeout=timeout, pool=pool.running)
                 for process, out in zip(pool.running, outs, strict=True)]
+
+
+def assert_exits_cleanly(program: str) -> None:
+    """`program` runs to its end in a fresh CPU interpreter over this checkout's source and exits 0;
+    its output is the failure's message. A worker left running at exit aborts it in finalization."""
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, capture_output=True, text=True,
+                          timeout=300, env={**os.environ, "JAX_PLATFORMS": "cpu",
+                                            "PYTHONPATH": str(REPO_ROOT / "src")})
+    assert done.returncode == 0, done.stdout + done.stderr
