@@ -5,8 +5,10 @@ GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -64,11 +66,11 @@ def launches(function, *args) -> dict[str, tuple[tuple[int, ...], int]]:
             for eqn in equations(graph) if eqn.primitive.name == "pallas_call"}
 
 
-def fresh(script: str, *arguments: str, cache_dir, flags: str) -> list:
-    """`script`'s last printed JSON, run by a fresh interpreter on this checkout
-    and these tests, compiling into `cache_dir` under XLA `flags`."""
+def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src") -> list:
+    """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
+    checkout's) and these tests, compiling into `cache_dir` under XLA `flags`."""
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
-                   "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}
+                   "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests")))}
     run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stderr[-3000:]
@@ -275,20 +277,6 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False]
 
 
-WIDENED = """
-import inspect
-from dew.nn.kernels import norm_swiglu
-# This checkout's norm launch as a checkout whose kernel takes one operand more names it.
-fwd = norm_swiglu.RmsForward._fwd
-parameters = list(inspect.signature(fwd).parameters.values())
-at = next(i for i, p in enumerate(parameters) if p.kind is inspect.Parameter.KEYWORD_ONLY)
-parameters.insert(at, inspect.Parameter("shift", inspect.Parameter.KEYWORD_ONLY, default=None))
-def widened(self, *args, shift=None, **kwargs):
-    return fwd(self, *args, **kwargs)
-widened.__signature__ = inspect.Signature(parameters)
-norm_swiglu.RmsForward._fwd = widened
-"""
-
 STORES = """
 import json, sys
 import jax
@@ -312,15 +300,27 @@ print(json.dumps([path, picks, len(foreign)]))
 """
 
 
+def widened_checkout(root: Path) -> Path:
+    """A copy of this checkout's package whose norm launch takes one operand more (`shift`), as
+    another branch's would."""
+    shutil.copytree(REPO_ROOT / "src" / "dew", root / "dew")
+    path = root / "dew" / "nn" / "kernels" / "norm_swiglu.py"
+    text = path.read_text()
+    signature = ("    def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, "
+                 "gate: jax.Array | None, *,\n")
+    assert text.count(signature) == 1
+    path.write_text(text.replace(signature, signature + "             shift: None = None,\n"))
+    return root
+
+
 def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(tmp_path):
-    """Two checkouts share a store: one whose norm launch takes an operand more (`shift`) and this
-    one. Each stores its own pick of the launch through the store's writer. This checkout reads only
-    its own, and its write leaves the other's entry as it was, which that checkout still reads back as
-    its pick, where a launch binding stored arguments by name and dropping the one its kernel lacks
-    took that pick as this checkout's and rewrote it without the operand."""
+    """Two checkouts share a store: another branch's, whose norm launch takes an operand more, and
+    this one. Each stores its pick of the launch through the store's writer and reads back only its
+    own, and each write leaves the other's entry as it was."""
     flags = keeping_picks()
     cache_dir = tmp_path / "cache"
-    path, theirs, _ = fresh(WIDENED + STORES, "[4, 2]", cache_dir=cache_dir, flags=flags)
+    other = widened_checkout(tmp_path / "other")
+    path, theirs, _ = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
     [(names, pick)] = theirs.items()
     assert "shift" in json.loads(names) and pick == [4, 2]
     with open(path) as file:
@@ -330,5 +330,6 @@ def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(t
     assert "shift" not in json.loads(names) and pick == [2, 8] and foreign == 1
     with open(path) as file:
         assert entry in json.load(file)["data"]
-    _, theirs, foreign = fresh(WIDENED + STORES, "[4, 2]", cache_dir=cache_dir, flags=flags)
-    assert theirs == {names: [4, 2] for names in theirs} and len(theirs) == 1 and foreign == 1
+    _, theirs, foreign = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
+    [(names, pick)] = theirs.items()
+    assert "shift" in json.loads(names) and pick == [4, 2] and foreign == 1
