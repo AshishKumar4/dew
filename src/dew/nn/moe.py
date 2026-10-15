@@ -479,8 +479,38 @@ GatedActivation = str | Situ
 """A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
 
 
-def gated_product(activation: GatedActivation, *, implementation: str = 'auto', axes=None,
-                  packed: bool = False) -> Callable[[jax.Array, jax.Array], jax.Array]:
+def _gate_function(activation: str, implementation: str) -> Callable[[jax.Array], jax.Array]:
+    """The gate's activation `activation` names, refusing an unknown name or implementation."""
+    if implementation not in norm_swiglu.IMPLEMENTATIONS:
+        raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
+                         f"got {implementation!r}")
+    gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
+    if activation not in gates:
+        raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
+    return gates[activation]
+
+
+def _rounded(activate: Callable[[jax.Array], jax.Array]) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """`gated_product`'s rounded arithmetic over `activate`."""
+    def rounded(gate: jax.Array, up: jax.Array) -> jax.Array:
+        dtype = jnp.result_type(gate, up)
+        gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
+        up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
+        activated = rounded_to(activate(gate_fp32), gate.dtype)
+        return rounded_to(activated * up_fp32, dtype).astype(dtype)
+
+    return rounded
+
+
+# Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
+# a scanned stack otherwise stores five fp32 copies of the MLP width per
+# token (TPU v6e, scanned 12-layer 512-wide decoder: 10.51 ms against 9.06
+# and 1.33x the memory).
+_recomputed = functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
+
+
+def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
+                  axes=None) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
     where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
     gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
@@ -490,39 +520,43 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto', 
     round nowhere. A `Situ` computes its own product. SwiGLU's
     `implementation` defaults to the generation's measured kernel; explicit
     'pallas' interprets on CPU. GeGLU and SiTU remain XLA products. `axes`,
-    the operands' logical axes, place the kernel on a mesh; `packed` says the
-    operands are halves of one projection's output, which XLA's product reads
-    in place."""
-    if implementation not in norm_swiglu.IMPLEMENTATIONS:
-        raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
-                         f"got {implementation!r}")
+    the operands' logical axes, place the kernel on a mesh."""
     if isinstance(activation, Situ):
         return activation
-    gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
-    if activation not in gates:
-        raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
-    activate = gates[activation]
-
-    # Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
-    # a scanned stack otherwise stores five fp32 copies of the MLP width per
-    # token (TPU v6e, scanned 12-layer 512-wide decoder: 10.51 ms against 9.06
-    # and 1.33x the memory).
-    @functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
-    def rounded_product(gate: jax.Array, up: jax.Array) -> jax.Array:
-        dtype = jnp.result_type(gate, up)
-        gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
-        up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
-        activated = rounded_to(activate(gate_fp32), gate.dtype)
-        return rounded_to(activated * up_fp32, dtype).astype(dtype)
+    activate = _gate_function(activation, implementation)
+    rounded_product = _recomputed(_rounded(activate))
 
     def product(gate: jax.Array, up: jax.Array) -> jax.Array:
         chosen = 'xla' if activation != 'swiglu' else norm_swiglu.swiglu_kernel(
-            implementation, gate, up, axes=axes, packed=packed)
+            implementation, gate, up, axes=axes)
         if chosen == 'pallas':
             return norm_swiglu.swiglu(gate, up, axes=axes)
         if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
             return activate(gate) * up
         return rounded_product(gate, up)
+
+    return product
+
+
+def packed_gated_product(activation: str, *, implementation: str = 'auto',
+                         axes=None) -> Callable[[jax.Array], jax.Array]:
+    """`gated_product` of one packed projection's `[..., 2, H]` output, gate
+    then up, read where the projection wrote them: SwiGLU's kernel reads and
+    writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
+    recomputes from the packed output itself, so neither copies a half out.
+    `axes` are the product's logical axes, `[..., H]`'s."""
+    activate = _gate_function(activation, implementation)
+    rounded = _rounded(activate)
+    rounded_product = _recomputed(lambda gate_up: rounded(gate_up[..., 0, :], gate_up[..., 1, :]))
+
+    def product(gate_up: jax.Array) -> jax.Array:
+        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.packed_swiglu_kernel(
+            implementation, gate_up, axes=axes)
+        if chosen == 'pallas':
+            return norm_swiglu.packed_swiglu(gate_up, axes=axes)
+        if jnp.finfo(gate_up.dtype).bits >= 32:
+            return activate(gate_up[..., 0, :]) * gate_up[..., 1, :]
+        return rounded_product(gate_up)
 
     return product
 

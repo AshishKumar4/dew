@@ -30,7 +30,7 @@ from tuned import each_config
 from dew.nn import attention
 from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
-from dew.nn.moe import gated_product
+from dew.nn.moe import gated_product, packed_gated_product
 
 pytestmark = pytest.mark.kernel
 
@@ -354,6 +354,27 @@ def test_swiglu_forward_and_both_gradients(dtype, shape):
     compare((xla, pallas, xla), operands, seed, ("y", "gate", "up"))
 
 
+@pytest.mark.parametrize("implementation", ["pallas", "xla"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
+def test_a_packed_projections_swiglu_is_the_apart_one_read_in_place(implementation, dtype, shape):
+    """One packed projection's `[..., 2, H]` output, gate then up: the
+    kernel's packed launch and XLA's product read the halves where they lie
+    and give the apart product's output and both gradients bit for bit, the
+    gradient in the packed layout, so the apart product's float64 gate
+    holds for them."""
+    gate_up = jax.random.normal(jax.random.key(34), (*shape[:-1], 2, shape[-1])).astype(dtype)
+    seed = jax.random.normal(jax.random.key(35), shape).astype(dtype)
+    packed = functools.partial(evaluated, packed_gated_product("swiglu", implementation=implementation))
+    if implementation == "pallas":
+        assert "swiglu_backward" in str(jax.make_jaxpr(packed)((gate_up,), seed))
+    output, dpacked = jax.jit(packed)((gate_up,), seed)
+    apart = jax.jit(functools.partial(evaluated, gated_product("swiglu", implementation=implementation)))(
+        (gate_up[..., 0, :], gate_up[..., 1, :]), seed)
+    for mine, theirs in zip((output, dpacked[..., 0, :], dpacked[..., 1, :]), apart, strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+
+
 @pytest.mark.parametrize("offset,after_cast,with_scale", [(False, True, True), (True, False, True),
                                                          (False, True, False)])
 def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
@@ -414,8 +435,9 @@ def test_other_gates_keep_their_arithmetic(name):
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("split", ["fsdp", "tensor"])
 def test_seam_and_product_run_per_shard_as_on_one_device(split):
-    """Named logical axes place both kernels on a mesh: rows split, the norm's
-    features whole, and the weight's gradient summed over the shards."""
+    """Named logical axes place the kernels on a mesh: rows split, the norm's
+    features whole, the weight's gradient summed over the shards, and a
+    packed SwiGLU's pair of halves whole."""
     from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
     from dew.training import MeshSpec
 
@@ -429,7 +451,9 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
             implementation="pallas", axes=axes),
             (x, branch, scale), (ds, dy))
         product = evaluated(gated_product("swiglu", implementation="pallas", axes=hidden), (gate, up), dout)
-        return seam, product
+        packed = evaluated(packed_gated_product("swiglu", implementation="pallas", axes=hidden),
+                           (jnp.stack([gate, up], -2),), dout)
+        return seam, product, packed
 
     alone = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
     with jax.set_mesh(MeshSpec(**{split: 2}).build(jax.devices()[:2])):
