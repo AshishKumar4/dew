@@ -77,8 +77,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
-PYTHONS = tuple(sorted((classifier.removeprefix("Programming Language :: Python :: ") for classifier in _CLASSIFIERS
-                        if re.fullmatch(r"Programming Language :: Python :: \d+\.\d+", classifier)),
+_PREFIX = "Programming Language :: Python :: "
+PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLASSIFIERS
+                        if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
                        key=lambda version: tuple(int(part) for part in version.split("."))))
 """The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
 test, the newest the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints them
