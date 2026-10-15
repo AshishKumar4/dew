@@ -77,6 +77,12 @@ def arguments() -> argparse.Namespace:
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
+    parser.add_argument("--param-dtype", choices=("float32", "bfloat16"), default="float32",
+                        help="the parameters in memory; bfloat16 bounds what casting them each use costs")
+    parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
+                        help="Adam's moments in memory (OptimConfig.state_dtype)")
+    parser.add_argument("--remat", default=None,
+                        help="the decoder's starting remat policy, a name in REMAT_POLICIES")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
@@ -113,6 +119,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.config import OptimConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
@@ -125,9 +132,13 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
-    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype=args.param_dtype,
                                  attention_impl=args.attention)
     model = pretrained.model
+    if args.remat is not None:
+        text = model.language_model if isinstance(model, MultimodalTransformer) else model
+        text = text.clone(remat=args.remat)
+        model = model.clone(language_model=text) if isinstance(model, MultimodalTransformer) else text
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
@@ -142,7 +153,7 @@ def build(args: argparse.Namespace) -> Run:
     # and biases too.
     solver = OptimConfig(
         optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        state_dtype=args.state_dtype, schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
