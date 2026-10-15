@@ -206,15 +206,15 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
     held = []
 
-    def trained(copies):
+    def trained(*, copies):
         state, _, trainer = _trained(monkeypatch, optax.adam(1e-3), copies=copies, steps=1)
         devices = [device for device in trainer.device_mesh.devices.flat
                    if device.process_index == jax.process_index()]
         held.append(step_headroom(trainer.executable, devices) - trainer.plan["probes"][0]["headroom"])
         return state
 
-    narrow = trained(True)
-    trained(False)
+    narrow = trained(copies=True)
+    trained(copies=False)
     copies = placed_bytes(jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
     assert copies > 0 and held[0] - held[1] == copies
