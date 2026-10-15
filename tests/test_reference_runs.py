@@ -116,6 +116,41 @@ def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_pat
     assert identity["fields"]["emb_features"] == fields.value.emb_features
 
 
+def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
+    """`common.documents` packs every window with the same documents, numbered
+    from 1, each LOW to HIGH tokens long but the last, which the row's end
+    cuts; so Dew's count of one batch of packed windows is every step's, and
+    it counts attention within each document only."""
+    import json
+
+    from dew.interop import translate_config
+    from dew.nn.inputs import coordinates
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    common = load("reference_runs/common")
+    segments = common.documents((6, 33), "3:7")
+    assert (segments == segments[0]).all()
+    ids, lengths = np.unique(segments[0], return_counts=True)
+    assert ids.tolist() == list(range(1, len(ids) + 1))
+    assert all(3 <= length <= 7 for length in lengths[:-1]) and 1 <= lengths[-1] <= 7
+    with pytest.raises(ValueError):
+        common.documents((1, 4), "5:3")
+
+    fields = translate_config(json.loads((FIXTURES / "hf" / "llama-tiny" / "config.json").read_text()))
+    fields.update(dtype="float32", attention_impl="xla")
+    objective = LMObjective(fields.value, seq_len=32, ema_decay=None)
+    windows = np.random.default_rng(0).integers(0, 256, (6, 33), dtype=np.int32)
+
+    def counted(rows, packed=True):
+        batch = {TEXT_KEY: windows[rows]}
+        if packed:
+            batch["text_coordinates"] = coordinates(segments=segments[rows], max_segments=int(segments.max()),
+                                                    xp=np)
+        return objective.training_flops(None, batch)
+
+    assert counted([0, 1]) == counted([4, 5]) < counted([0, 1], packed=False)
+
+
 def test_dit_work_includes_the_native_conditioning_geometry(monkeypatch):
     from dew.nn.backbones.dit import SimpleDiT
 
