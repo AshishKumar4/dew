@@ -1,0 +1,24 @@
+name: Proven commit
+description: Find a successful workflow run at this exact commit, excluding pull requests.
+inputs:
+  workflow:
+    description: Workflow file name
+    required: true
+outputs:
+  run:
+    description: Successful run ID, or empty when this commit is unproven
+    value: ${{ steps.find.outputs.run }}
+runs:
+  using: composite
+  steps:
+    - id: find
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WORKFLOW: ${{ inputs.workflow }}
+      run: |
+        # A pull request's run tested a merge, not this commit.
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" \
+          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+        echo "run=$run" >> "$GITHUB_OUTPUT"
+        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi

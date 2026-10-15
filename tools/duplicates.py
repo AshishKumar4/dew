@@ -4,7 +4,9 @@ tools/check.sh runs it over src/dew, tools and tests with no suppression and no 
 lands as one owner its callers share, or not at all. tests/test_duplicates.py proves it refuses a
 copied block.
 
-    uv run --no-project --with pylint==4.1.3 python tools/duplicates.py src/dew tools tests
+    python tools/duplicates.py src/dew tools tests
+
+It runs the test environment's pylint, which pyproject.toml's test extra pins.
 """
 
 import sys

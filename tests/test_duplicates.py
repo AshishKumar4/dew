@@ -1,15 +1,9 @@
 """tools/duplicates.py, the duplicate-code gate tools/check.sh runs, refuses a block two files copy and
-passes the same files once the block has one owner. CI runs it beside the gate, in the gate's own
-environment: `uv run --no-project --with pylint==4.1.3 --with pytest python -m pytest -q --noconftest
-tests/test_duplicates.py`."""
+passes the same files once the block has one owner, with the test environment's pylint."""
 
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
-
-pytest.importorskip("pylint")
 
 GATE = Path(__file__).resolve().parents[1] / "tools" / "duplicates.py"
 
