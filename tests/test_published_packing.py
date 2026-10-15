@@ -34,9 +34,16 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
     assert any(name.endswith("accepted") for name in warm.plan.derived)
     left, right = warm.train(DataPartition()), cold.train(DataPartition())
     try:
-        for ours, old in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):
+        read = list(itertools.islice(left, 4))
+        for ours, old in zip(read, itertools.islice(right, 4), strict=True):
             assert jax.tree.structure(ours) == jax.tree.structure(old)
             jax.tree.map(np.testing.assert_array_equal, ours, old)
+        # Sixteen windows hold the plan's every one: each batch declares the most documents one
+        # holds, which the memory read declares alike, not the window's length.
+        assert warm.records <= 16
+        assert len({batch["text_coordinates"].max_segments for batch in read}) == 1
+        most = max(int(batch["text_coordinates"].segments.max()) for batch in read)
+        assert read[0]["text_coordinates"].max_segments == most < 9
         saved = left.get_state()
         expected = next(left)
     finally:

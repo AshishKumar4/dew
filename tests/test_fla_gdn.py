@@ -66,18 +66,19 @@ def output_operands(batch, length, key_heads, value_heads, width, columns, dtype
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("shape, config", [
-    ((2, 128, 2, 2, 64, 64), (64, 64)),
-    ((1, 128, 2, 4, 128, 128), (128, 128)),
-    ((1, 64, 1, 2, 128, 128), (32, 32)),
+@pytest.mark.parametrize("shape, tiles", [
+    ((2, 128, 2, 2, 64, 64), fla_gdn.Tiles(64, 64, 4, 3)),
+    ((1, 128, 2, 4, 128, 128), fla_gdn.Tiles(128, 128, 8, 3)),
+    ((1, 64, 1, 2, 128, 128), fla_gdn.Tiles(32, 32, 2, 3)),
 ])
-def test_the_output_kernel_computes_flas_expression(dtype, shape, config):
+def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     """fla's chunk_fwd_o per chunk and head, grouped value heads included, at each of fla's block
-    configs: within one rounding of its dtype of the same expression in XLA."""
+    configs, the launch configured with it: within one rounding of its dtype of the same expression in
+    XLA."""
     operands = output_operands(*shape, dtype)
-    bk, bv = config
     scale = shape[4] ** -0.5
-    got = fla_gdn.chunk_fwd_o(*operands, scale=scale, bk=bk, bv=bv, interpret=INTERPRETED)
+    launch = fla_gdn.ChunkFwdO(config=tiles)
+    got = launch(*operands, *fla_gdn.sequences(*shape[:2]), scale=scale, chunk=64, interpret=INTERPRETED)
     want = support.reference_o(*operands, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)

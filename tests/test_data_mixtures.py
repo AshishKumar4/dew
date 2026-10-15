@@ -470,6 +470,20 @@ def test_phases_switch_the_mixture_at_a_step(tmp_path):
     assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
 
 
+def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp_path):
+    """Packed phases step one program: a phase whose windows hold one document each and one whose
+    windows hold four both declare four (`Coordinates.max_segments`), not their own most nor the
+    window's length."""
+    whole = document_dir(tmp_path / "whole", [[index + 1] * 7 for index in range(8)])
+    short = document_dir(tmp_path / "short", [[index + 101] for index in range(32)])
+    spec = TextData(source="", pack="first-fit", phases=(DataPhase(whole, 2), DataPhase(short)), seq_len=8,
+                    packing_bins=2)
+    stream = loader(spec, batch=4, read="memory", loading=READ).train(DataPartition())
+    batches = list(itertools.islice(stream, 4))
+    assert [int(batch["text_coordinates"].segments.max()) for batch in batches] == [1, 1, 4, 4]
+    assert {batch["text_coordinates"].max_segments for batch in batches} == {4}
+
+
 def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     """Resuming onto a changed mixture is refused, but resuming onto a phase
     list whose first phase is the run's mixture, with a boundary it has not

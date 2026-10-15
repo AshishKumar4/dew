@@ -48,10 +48,11 @@ from dew.nn.kernels.fla_gdn import (
     _halves,
     _headed,
     _Launch,
-    _launch,
+    _picks,
     _read,
     _row,
     _rows,
+    _spaces,
     _tiles,
     _tril_inverse,
     _weighted_values,
@@ -62,52 +63,6 @@ from dew.nn.precision import compensated_difference
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
-
-
-def _space(kernel: str, wide: bool) -> frozenset[Tiles]:
-    """`kernel`'s 16-bit tiles to measure, fla's own autotune lists for it (chunk_intra.py:33-39,
-    wy_fast.py:247-256, gla/chunk.py:335-344, chunk_bwd.py:331), narrower value blocks where a GPU's
-    block holds 99 KB."""
-    return {
-        # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
-        "intra_diagonal": frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8)
-                                    for warps in (1, 2, 4, 8)),
-        "intra_solve": _tiles([(32, 0), (64, 0)], (1, 2, 4), (1,)),
-        "recompute_w_u": _tiles([(64, 64)], (2, 4), (2, 3, 4)),
-        "chunk_fwd_o": _tiles([(32, 64), (64, 64)] + ([(32, 128), (64, 128)] if wide else []), (2, 4, 8),
-                              (2, 3, 4) if wide else (2,)),
-        "bwd_dav": _tiles([(0, 64)], (2, 4, 8), (2, 3, 4) if wide else (2,)),
-        "bwd_wy_dqkg": _tiles([(32, 32), (32, 64)] if wide else [(32, 32)], (2, 4), (1,)),
-        "bwd_intra": _tiles([(32, 0), (64, 0)], (2, 4, 8), (1,)),
-    }[kernel]
-
-
-_A100 = {
-    "intra_diagonal": Tiles(0, 0, 4, 1, 4),
-    # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: the solve 0.98 -> 0.80 ms,
-    # the backward intra kernel 2.49 -> 1.98 ms, the output 0.25 -> 0.23 ms.
-    "intra_solve": Tiles(32, 0, 1, 1),
-    "recompute_w_u": Tiles(64, 64, 4, 2),
-    "chunk_fwd_o": Tiles(64, 128, 4, 2),
-    "bwd_dav": Tiles(0, 64, 4, 2),
-    "bwd_wy_dqkg": Tiles(32, 64, 4, 1),
-    "bwd_intra": Tiles(64, 0, 4, 1),
-}
-_SMALL = {**_A100, "intra_solve": Tiles(32, 0, 2, 1), "chunk_fwd_o": Tiles(64, 64, 4, 2),
-          "bwd_wy_dqkg": Tiles(32, 32, 4, 1), "bwd_intra": Tiles(32, 0, 4, 1)}
-HEURISTICS = {True: _A100, False: _SMALL}
-"""Each launch's tiles without a measurement, by whether the GPU's block holds an A100's shared
-memory: an A100's measured choices, fla's narrower ones for 99 KB devices, for every dtype."""
-
-
-class _KdaLaunch(_Launch):
-    """One of KDA's own launches (`fla_gdn._Launch`), over its own tiles (`_space`, `HEURISTICS`)."""
-
-    def heuristic(self, dtype: str, wide: bool) -> Tiles:
-        return HEURISTICS[wide][self.NAME]
-
-    def space(self, wide: bool) -> frozenset[Tiles]:
-        return _space(self.NAME, wide)
 
 
 def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqk_ref, akk_ref, *,
@@ -146,11 +101,14 @@ def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqk
 
 
 @dataclasses.dataclass(frozen=True)
-class IntraDiagonal(_KdaLaunch):
+class IntraDiagonal(_Launch):
     """`intra_diagonal`'s launch (tuning.KernelOp): its value heads a program, warps and stages."""
 
     NAME = "intra_diagonal"
     KEYS, VALUES = "k", None
+    # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
+    SPACES = _spaces(frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8) for warps in (1, 2, 4, 8)))
+    PICKS = _picks(Tiles(0, 0, 4, 1, 4))
 
     def _tiles(self, ba, tiles: Tiles) -> Tiles:
         """A block of value heads that divides them, one where value heads share a key head, as fla's
@@ -191,14 +149,12 @@ _INTRA_DIAGONAL = IntraDiagonal()
 
 
 def intra_diagonal(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                   bh: int | None = None, warps: int | None = None, stages: int | None = None,
                    interpret: bool = False):
     """`(Aqk, Akk)` `[B, T, HV, 16]`, each token's row of its sub-chunk's diagonal block, `Aqk` in `k`'s
     dtype and `Akk` fp32: fla's `chunk_kda_fwd_intra_token_parallel` (chunk_intra_token_parallel.py:121-
     180), a program per place of each chunk (`spans`, the rows' own where None) and `BH` value heads."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_INTRA_DIAGONAL, {"bh": bh, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _INTRA_DIAGONAL(q, k, g, g_lo, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_ref, akkd_ref, aqk_ref,
@@ -295,11 +251,14 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
 
 
 @dataclasses.dataclass(frozen=True)
-class IntraSolve(_KdaLaunch):
+class IntraSolve(_Launch):
     """`intra_solve`'s launch (tuning.KernelOp)."""
 
     NAME = "intra_solve"
     KEYS, VALUES = "k", None
+    SPACES = _spaces(_tiles([(32, 0), (64, 0)], (1, 2, 4), (1,)))
+    # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.98 -> 0.80 ms.
+    PICKS = _picks(Tiles(32, 0, 1, 1), small=Tiles(32, 0, 2, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, g_lo: jax.Array, beta: jax.Array,
              aqkd: jax.Array, akkd: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *,
@@ -332,7 +291,6 @@ _INTRA_SOLVE = IntraSolve()
 
 
 def intra_solve(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                bk: int | None = None, warps: int | None = None, stages: int | None = None,
                 interpret: bool = False):
     """`(Aqk, Akk)` `[B, T, HV, BT]` in `k`'s dtype: each chunk's `scale (q exp2(g)) (k exp2(-g))^T`,
     causal, and the inverse `(I + tril(beta (k exp2(g)) (k exp2(-g))^T, -1))^-1`: fla's
@@ -343,8 +301,8 @@ def intra_solve(q, k, g, g_lo, beta, *, scale: float, chunk: int = 64, spans: Se
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     aqkd, akkd = intra_diagonal(q, k, g, g_lo, beta, scale=scale, chunk=chunk, spans=spans,
                                 interpret=interpret)
-    return _launch(_INTRA_SOLVE, {"bk": bk, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, aqkd, akkd, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _INTRA_SOLVE(q, k, g, g_lo, beta, aqkd, akkd, *spans, chunk=chunk, scale=scale,
+                        interpret=interpret)
 
 
 def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, lo_ref, *refs, chunk: int, aligned: bool,
@@ -384,11 +342,13 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, lo_ref, *refs, 
 
 
 @dataclasses.dataclass(frozen=True)
-class RecomputeWU(_KdaLaunch):
+class RecomputeWU(_Launch):
     """`recompute_w_u`'s launch (tuning.KernelOp)."""
 
     NAME = "recompute_w_u"
     KEYS, VALUES = "k", "v"
+    SPACES = _spaces(_tiles([(64, 64)], (2, 4), (2, 3, 4)))
+    PICKS = _picks(Tiles(64, 64, 4, 2))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
              g_lo: jax.Array, q: jax.Array | None, chunk_spans: jax.Array, sequence_spans: jax.Array, *,
@@ -428,15 +388,13 @@ _RECOMPUTE_W_U = RecomputeWU()
 
 
 def recompute_w_u(k, v, beta, a, g, g_lo, q=None, *, chunk: int = 64, spans: Sequences | None = None,
-                  bk: int | None = None, bv: int | None = None, warps: int | None = None,
-                  stages: int | None = None, interpret: bool = False):
+                  interpret: bool = False):
     """`(w, u, kg, qg)`: fla's `recompute_w_u_fwd` for KDA (wy_fast.py:264-311). `w`, `kg` and `qg`
     `[B, T, HV, K]` in `k`'s dtype, `u` in `v`'s; `qg` only for given queries `q` `[B, T, H, K]`, else
     None. `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta` `[B, T, HV]`, `a` the inverse per chunk `[B,
     T, HV, BT]`, `g` and `g_lo` the base-2 cumulated decay's halves `[B, T, HV, K]` fp32."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_RECOMPUTE_W_U, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   k, v, beta, a, g, g_lo, q, *spans, chunk=chunk, interpret=interpret)
+    return _RECOMPUTE_W_U(k, v, beta, a, g, g_lo, q, *spans, chunk=chunk, interpret=interpret)
 
 
 def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool, scale: float,
@@ -466,11 +424,15 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkFwdO(_KdaLaunch):
+class ChunkFwdO(_Launch):
     """KDA's `chunk_fwd_o`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = "q", "v"
+    SPACES = _spaces(_tiles([(32, 64), (64, 64), (32, 128), (64, 128)], (2, 4, 8), (2, 3, 4)),
+                     _tiles([(32, 64), (64, 64)], (2, 4, 8), (2,)))
+    # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.25 -> 0.23 ms.
+    PICKS = _picks(Tiles(64, 128, 4, 2), small=Tiles(64, 64, 4, 2))
 
     def _fwd(self, q: jax.Array, v: jax.Array, g: jax.Array, a: jax.Array, h: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
@@ -503,14 +465,12 @@ _CHUNK_FWD_O = ChunkFwdO()
 
 
 def chunk_fwd_o(q, v, g, a, h, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                bk: int | None = None, bv: int | None = None, warps: int | None = None,
-                stages: int | None = None, interpret: bool = False):
+                interpret: bool = False):
     """The output `[B, T, HV, V]` in `v`'s dtype: fla's `chunk_gla_fwd_o_gk` (gla/chunk.py:962-997). `q`
     `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `g` the base-2 cumulated decay `[B, T, HV,
     K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memory each chunk enters (`fla_gdn.chunk_fwd_h`'s)."""
     spans = sequences(*q.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_CHUNK_FWD_O, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _CHUNK_FWD_O(q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, aligned: bool, scale: float,
@@ -538,11 +498,13 @@ def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, 
 
 
 @dataclasses.dataclass(frozen=True)
-class BwdDav(_KdaLaunch):
+class BwdDav(_Launch):
     """`bwd_dav`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_dav"
     KEYS, VALUES = None, "v"
+    SPACES = _spaces(_tiles([(0, 64)], (2, 4, 8), (2, 3, 4)), _tiles([(0, 64)], (2, 4, 8), (2,)))
+    PICKS = _picks(Tiles(0, 64, 4, 2))
 
     def _fwd(self, v: jax.Array, do: jax.Array, a: jax.Array, chunk_spans: jax.Array,
              sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool, config: Tiles,
@@ -572,14 +534,13 @@ class BwdDav(_KdaLaunch):
 _BWD_DAV = BwdDav()
 
 
-def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None = None, bv: int | None = None,
-            warps: int | None = None, stages: int | None = None, interpret: bool = False):
+def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+            interpret: bool = False):
     """`(dAqk, dv)`: fla's `chunk_kda_bwd_dAv` (chunk_bwd.py:314-365), `dAqk` `[B, T, HV, BT]` fp32 and
     `dv` `[B, T, HV, V]` in `do`'s dtype. `v` the corrected values, `do` the output's gradient, `a`
     `Aqk`."""
     spans = sequences(*v.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_DAV, {"bv": bv, "warps": warps, "stages": stages},
-                   v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _BWD_DAV(v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
 def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, lo_ref, beta_ref, a_ref, h_ref, do_ref,
@@ -667,11 +628,13 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, lo_ref, beta_
 
 
 @dataclasses.dataclass(frozen=True)
-class BwdWyDqkg(_KdaLaunch):
+class BwdWyDqkg(_Launch):
     """`bwd_wy_dqkg`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_wy_dqkg"
     KEYS, VALUES = "k", "v"
+    SPACES = _spaces(_tiles([(32, 32), (32, 64)], (2, 4), (1,)), _tiles([(32, 32)], (2, 4), (1,)))
+    PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, corrected: jax.Array, g: jax.Array,
              g_lo: jax.Array, beta: jax.Array, a: jax.Array, h: jax.Array, do: jax.Array, dh: jax.Array,
@@ -715,15 +678,13 @@ _BWD_WY_DQKG = BwdWyDqkg()
 
 
 def bwd_wy_dqkg(q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *, scale: float, chunk: int = 64,
-                spans: Sequences | None = None, bk: int | None = None, bv: int | None = None,
-                warps: int | None = None, stages: int | None = None, interpret: bool = False):
+                spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, dv, db, dg, dAkk)`: fla's `chunk_kda_bwd_wy_dqkg_fused` (chunk_bwd.py:367-431), `dq`,
     `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T, HV]` and `dAkk` `[B, T, HV, BT]` fp32, `dv` in `v`'s dtype.
     `h` and `dh` the memory each chunk enters and its gradient (`fla_gdn.chunk_fwd_h`'s and
     `chunk_bwd_dhu`'s), `dv` the corrected values' full gradient, `a` `Akk`'s inverse."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_WY_DQKG, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
-                   q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
+    return _BWD_WY_DQKG(q, k, v, corrected, g, g_lo, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
                    interpret=interpret)
 
 
@@ -833,11 +794,14 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, daqk_ref
 
 
 @dataclasses.dataclass(frozen=True)
-class BwdIntra(_KdaLaunch):
+class BwdIntra(_Launch):
     """`bwd_intra`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_intra"
     KEYS, VALUES = "k", None
+    SPACES = _spaces(_tiles([(32, 0), (64, 0)], (2, 4, 8), (1,)))
+    # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 2.49 -> 1.98 ms.
+    PICKS = _picks(Tiles(64, 0, 4, 1), small=Tiles(32, 0, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, g_lo: jax.Array, beta: jax.Array,
              daqk: jax.Array, dakk: jax.Array, dq: jax.Array, dk: jax.Array, db: jax.Array, dg: jax.Array,
@@ -877,16 +841,14 @@ _BWD_INTRA = BwdIntra()
 
 
 def bwd_intra(q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *, chunk: int = 64,
-              spans: Sequences | None = None,
-              bk: int | None = None, warps: int | None = None, stages: int | None = None,
-              interpret: bool = False):
+              spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, db, dg)` fp32, `bwd_wy_dqkg`'s plus the intra-chunk terms of `dAqk` and `dAkk`: fla's
     `chunk_kda_bwd_intra` (chunk_intra.py:897-960), its grid over key blocks, sub-chunks and heads,
     beta's gradient summed over the key blocks after. `dq`, `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T,
     HV]`."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _launch(_BWD_INTRA, {"bk": bk, "warps": warps, "stages": stages},
-                   q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *spans, chunk=chunk, interpret=interpret)
+    return _BWD_INTRA(q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *spans, chunk=chunk,
+                      interpret=interpret)
 
 
 def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
