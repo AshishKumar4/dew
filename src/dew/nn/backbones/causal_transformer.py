@@ -15,11 +15,11 @@ attention_output_norm and mlp_output_norm, and the pre-norms keep their names.
 dew.interop.hf_decoders does that rename. A model family is supported only after
 its translator and a same-weight parity test against the reference have landed.
 
-The block holds its token mixer in a slot. Any module with the
-(x, decode=..., attention_metadata=...) -> x signature of CausalSelfAttention,
-reading its tokens' places and documents off the metadata's `Coordinates`, can
-be self_attn without changes to the block, and that is where a linear-attention
-mixer goes.
+The block holds its token mixer in a slot. Any module called (x, call) -> x
+with one `dew.nn.inputs.MixerCall`, as CausalSelfAttention is, reading its
+tokens' places and documents off the call metadata's `Coordinates` and
+declaring the masks it reads (`reads`), can be self_attn without changes to the
+block, and that is where a linear-attention mixer goes.
 """
 
 import dataclasses
@@ -1765,12 +1765,9 @@ class CausalTransformer(nn.Module):
         takes, the token ids a hash router selects by, the engram layers'
         bucket ids, and the media mask, which only a model with engram or a
         router with a media bias reads."""
+        # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
-        if pairwise_mask is not None:
-            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
-            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
-                raise ValueError("explicit pairwise masks require ordinary attention mixers")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
         if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded

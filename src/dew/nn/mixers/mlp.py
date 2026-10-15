@@ -5,11 +5,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from flax import linen as nn
 
 from dew.nn.flops import counted_flops
+from dew.nn.inputs import PLAIN_CALL, TOKENWISE, MixerCall
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
 
 class _MLP(nn.Module):
     """Share the feed-forward's scope so the mixer boundary adds no parameter nesting."""
+
+    reads: ClassVar[frozenset[str]] = TOKENWISE
+    """Tokenwise: no position, document, cache or mask changes what an MLP computes."""
 
     feedforward: GatedMLP | SparseMLP
 
@@ -38,10 +42,7 @@ class _MLP(nn.Module):
         layer's replayed ones (`RoutesExperts`)."""
         return isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts
 
-    def __call__(self, x, decode: bool = False, kv_store=None, attention_metadata=None,
-                 routes: Routes | None = None):
-        # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
-        del decode, kv_store, attention_metadata
+    def __call__(self, x, call: MixerCall = PLAIN_CALL, routes: Routes | None = None):
         if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
             return self.feedforward(x, routes=routes)
         return self.feedforward(x)
