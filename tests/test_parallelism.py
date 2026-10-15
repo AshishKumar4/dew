@@ -59,7 +59,7 @@ class DeterministicObjective(Objective):
                                num_heads=2, mlp_ratio=1)
         self.ema = EMASpec(decay=decay)
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
     def loss(self, variables, batch, step):
@@ -171,7 +171,7 @@ class Readouts(nn.Module):
 class BoxedReadout(Objective):
     ema = None
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return Readouts().init(key, jnp.ones((1, 16)))
 
     def loss(self, variables, batch, step):

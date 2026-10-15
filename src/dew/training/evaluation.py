@@ -37,7 +37,7 @@ from dew.objectives.base import (
     Variables,
 )
 
-from .distributed import MeshSpec, device_fields, host_fields, shard_batch, with_host
+from .distributed import MeshSpec, shard_batch, split_fields, with_host
 
 
 @dataclass(frozen=True)
@@ -418,7 +418,8 @@ def _dispatched(objective: Objective[Loss, Effects], variables: Variables, batch
     statistics where `loss`, and what the objective produces where `evaluate`."""
     keyed = replace(context, key=_folded(score_key, index))
     # The objective's programs take what a device holds; the metrics read the rest (`_merged`).
-    return objective._validation_report(variables, device_fields(batch), keyed, loss=loss, evaluate=evaluate)
+    device, _ = split_fields(batch)
+    return objective._validation_report(variables, device, keyed, loss=loss, evaluate=evaluate)
 
 
 def _as_placed(leaf) -> np.ndarray:
@@ -441,9 +442,11 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequenc
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
-        home = with_host(jax.tree.map(_as_placed, device_fields(held)), host_fields(held))
+        device, host = split_fields(held)
+        home = with_host(jax.tree.map(_as_placed, device), host)
     else:
-        produced, home = collective_host((produced, device_fields(batch)), phase=f"scoring batch {index}")
+        device, _ = split_fields(batch)
+        produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
 
     def merge() -> None:
         if not root:

@@ -103,6 +103,7 @@ from dew.inference.tasks import (
     cache_ceiling,
     cache_sized,
     decoded_rows,
+    generation_budget,
     prepared_inputs,
     shape_bucket,
 )
@@ -401,7 +402,7 @@ class Server:
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
-                 default_budget: int | None, decode_steps: int) -> None:
+                 default_budget: int | None, max_length: int | None, decode_steps: int) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -431,6 +432,7 @@ class Server:
         self.capacity = capacity
         self.admission = admission
         self.default_budget = default_budget
+        self.max_length = max_length
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -598,6 +600,7 @@ class Server:
                 else admission
             ),
             default_budget=task.max_new_tokens,
+            max_length=task.max_length,
             decode_steps=decode_steps,
         )
 
@@ -664,7 +667,8 @@ class Server:
         `prompt` is one text prompt, `ModelInputs` row or token row, without
         media or positions. It is validated as `TextGeneration` validates it,
         against the server's capacity in place of the model's context.
-        Without `max_new_tokens`, the task's default budget applies. A
+        Without `max_new_tokens`, the task's default budget applies, its
+        `max_new_tokens` or what its `max_length` leaves past the prompt. A
         request with a zero budget resolves at once, with the prompt alone.
         Another thread may submit while one steps. The request is validated
         here and queued at once; a step seats it when a slot is free.
@@ -701,9 +705,8 @@ class Server:
             fields = {}
         if ids.shape[0] != 1:
             raise ValueError("submit takes one prompt; call the server with a batch")
-        budget = self.default_budget if max_new_tokens is None else max_new_tokens
-        if budget is None:
-            raise ValueError("max_new_tokens is required; the source declares no default budget")
+        # Sized before the padding goes, by the rows' width, as the task sizes the same rows.
+        budget = generation_budget(max_new_tokens, self.default_budget, self.max_length, ids.shape[1])
         valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
         if positions is not None and (positions.shape != valid.shape or not np.array_equal(
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):

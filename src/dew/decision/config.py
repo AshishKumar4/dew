@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import HoldOut, loader
+from dew.config.data import HoldOut
 from dew.data.storage import Store
 from dew.data.text import HFTokenizer
 from dew.decision.data import Decisions
@@ -182,11 +182,7 @@ class DecisionRunConfig(RunConfig):
                            record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
                 summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
                 summary["made"] = made
-        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
-                       read=self.data_read,
-                       provision=self.provision, seed=self.data_seed, loading=self.loading,
-                       validation_records=self.validation_records,
-                       objective=objective.data())
+        dataset = self.loader(objective.data())
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
         unfit["held out"] = sum(counter.rejected.get("unfit",
