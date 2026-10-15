@@ -69,6 +69,8 @@ def recorded_norm() -> optax.GradientTransformation:
 
 
 def arguments() -> argparse.Namespace:
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+
     parser = argparse.ArgumentParser(parents=[run_arguments()])
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--mesh", choices=("data", "fsdp", "expert"), default="data",
@@ -82,8 +84,8 @@ def arguments() -> argparse.Namespace:
                         help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
-    parser.add_argument("--remat", default=None,
-                        help="the decoder's starting remat policy (REMAT_POLICIES); unset, the model's")
+    parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
+                        help="the decoder's starting remat policy; unset, the model's")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
@@ -141,11 +143,11 @@ def build(args: argparse.Namespace) -> Run:
     pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention)
     model = pretrained.model
-    if args.remat is not None:
+    if args.remat is not None and isinstance(model, MultimodalTransformer):
         # A multimodal checkpoint's decoder is its language model.
-        text = model.language_model if isinstance(model, MultimodalTransformer) else model
-        text = text.clone(remat=args.remat)
-        model = model.clone(language_model=text) if isinstance(model, MultimodalTransformer) else text
+        model = model.clone(language_model=model.language_model.clone(remat=args.remat))
+    elif args.remat is not None:
+        model = model.clone(remat=args.remat)
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
