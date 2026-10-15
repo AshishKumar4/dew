@@ -65,8 +65,6 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
 
 
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
-    from unittest.mock import patch
-
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -86,9 +84,7 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
 
     with torch.no_grad():
         expected = rows(reference)
-    tensor = torch.tensor
-    with float64(), patch.object(torch, 'tensor', lambda *args, dtype=None, **kwargs: tensor(
-            *args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)), torch.no_grad():
+    with float64(), torch.no_grad():
         truth_model = AutoModelForCausalLM.from_config(
             reference.config, dtype=torch.float64, attn_implementation='eager').eval()
         truth_model.load_state_dict(reference.state_dict())
