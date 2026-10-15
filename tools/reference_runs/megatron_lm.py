@@ -117,7 +117,7 @@ def model_parts(hf: dict, args: argparse.Namespace):
         tensor_model_parallel_size=args.tp, sequence_parallel=args.sequence_parallel,
         bias_activation_fusion=True, bias_dropout_fusion=True, masked_softmax_fusion=True,
         persist_layer_norm=True, apply_rope_fusion=True, gradient_accumulation_fusion=True,
-        cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te",
+        cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="native",
         attention_backend=AttnBackend.auto,
         recompute_granularity=None if args.recompute == "none" else args.recompute,
         recompute_method="uniform" if args.recompute == "full" else None,
@@ -139,7 +139,8 @@ def model_parts(hf: dict, args: argparse.Namespace):
             linear_key_head_dim=hf["linear_key_head_dim"], linear_value_head_dim=hf["linear_value_head_dim"],
             linear_num_key_heads=hf["linear_num_key_heads"],
             linear_num_value_heads=hf["linear_num_value_heads"])
-        spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+        # One pipeline stage holds every layer.
+        spec = get_transformer_block_with_experimental_attention_variant_spec(config, pp_rank=0)
         rotary_percent = rope.get("partial_rotary_factor", 1.0)
     else:
         raise SystemExit(f"{model_type} has no Megatron-Core mapping here; llama and qwen3_5 do")
