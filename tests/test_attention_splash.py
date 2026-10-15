@@ -148,10 +148,12 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     group and the keys `keep` `[B or 1, 1, q, k]` keeps, a sink joining each
     head's denominator. A logit's gradient P (dP - delta) cancels: on a query
     that keeps one key P is 1 and delta is dP, so it is zero in float64,
-    while a flash kernel forms delta as rowsum(out * dout) and dP as dout . v,
-    two roundings of one value of their size. Its terms are therefore
-    P (|dP| + |delta|), and such a row is held to their rounding, not to its
-    own zero."""
+    while a flash kernel forms delta as rowsum(out * dout) from its bf16
+    output. Each of those products carries the output's rounding, so delta's
+    error is of their size, sum |out dout|, however far their sum cancels: a
+    query that keeps one key beside a sink, whose output is a rounded share of
+    the value, shows it. Its terms are therefore P (|dP| + sum |out dout|),
+    and such a row is held to that rounding, not to its own zero."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
@@ -159,8 +161,9 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         sunk = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
         weights, raw = _float64_weights(q, k, keep, sunk, softcap)
         products = jnp.einsum('bqhd,bkhd->bhqk', dout, v[:, :, group])
-        delta = jnp.sum(weights * products, axis=-1, keepdims=True)
-        logit_terms = weights * (jnp.abs(products) + jnp.abs(delta)) / np.sqrt(width)
+        out = jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
+        delta = jnp.einsum('bqhd,bqhd->bhq', jnp.abs(out), jnp.abs(dout))[..., None]
+        logit_terms = weights * (jnp.abs(products) + delta) / np.sqrt(width)
         if softcap is not None:
             logit_terms = logit_terms * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
 
