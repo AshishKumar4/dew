@@ -6,6 +6,7 @@ packed documents treated as one attention square, and a vocabulary head
 incorrectly charged to a decision model.
 """
 
+import dataclasses
 import json
 import threading
 from pathlib import Path
@@ -47,6 +48,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels.generation import assumed
 from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba import Mamba, selective_scan
@@ -98,11 +100,14 @@ def test_windowed_and_chunked_attention_do_not_count_unread_pairs():
 
 
 def test_causal_mixer_counts_queries_shared_keys_and_output_gate():
-    mixer = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=1, head_dim=4, max_seq_len=16)
+    mixer = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=1, head_dim=4,
+                                             max_seq_len=16))
     attention = 16 * (4 + 25)
     assert mixer.model_flops(LENGTHS) == 2 * 8 * (8 + 4 + 4 + 8) * 7 + attention
-    assert mixer.clone(kv_shared=True).model_flops(LENGTHS) == 2 * 8 * (8 + 8) * 7 + attention
-    assert mixer.clone(output_gate=True).model_flops(LENGTHS) == mixer.model_flops(LENGTHS) + 2 * 8 * 8 * 7
+    shared = mixer.clone(ctx=dataclasses.replace(mixer.ctx, kv_shared=True))
+    assert shared.model_flops(LENGTHS) == 2 * 8 * (8 + 8) * 7 + attention
+    gated = mixer.clone(ctx=dataclasses.replace(mixer.ctx, output_gate=True))
+    assert gated.model_flops(LENGTHS) == mixer.model_flops(LENGTHS) + 2 * 8 * 8 * 7
 
 
 @pytest.mark.parametrize("width,heads", [(1024, 16), (4096, 32)])
@@ -501,7 +506,7 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
         operands = (jnp.ones((2, 4, 8)),)
         count = model.model_flops(lengths)
     elif family == "attention":
-        model = CausalSelfAttention(8, 2, 1, 4, 16, causal=False, attention_impl="reference")
+        model = CausalSelfAttention(MixerContext(8, 2, 1, 4, 16, causal=False, attention_impl="reference"))
         operands = (jnp.ones((2, 4, 8)),)
         count = model.model_flops(lengths)
     elif family == "dit":
