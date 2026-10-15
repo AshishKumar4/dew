@@ -84,6 +84,23 @@ CASES: dict[str, Case] = {
 }
 
 
+def wide(dtype):
+    """`dtype`, float32 read as float64: what a widened reference casts to where it pins float32."""
+    return torch.float64 if dtype == torch.float32 else dtype
+
+
+@contextlib.contextmanager
+def default_dtype(dtype):
+    """torch's default floating dtype `dtype` within the block, the previous one restored after it,
+    the one precision context the references build and run their oracles under."""
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 class Float64Library:
     """A library (numpy, torch) with its float32 read as float64, for a
     scheduler module whose tables round through an explicit float32."""
@@ -107,16 +124,11 @@ def float64_scheduler(module: ModuleType):
     """
     from unittest.mock import patch
 
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        with contextlib.ExitStack() as scope:
-            for name, library in (("torch", torch), ("np", np)):
-                if hasattr(module, name):
-                    scope.enter_context(patch.object(module, name, Float64Library(library)))
-            yield
-    finally:
-        torch.set_default_dtype(previous)
+    with default_dtype(torch.float64), contextlib.ExitStack() as scope:
+        for name, library in (("torch", torch), ("np", np)):
+            if hasattr(module, name):
+                scope.enter_context(patch.object(module, name, Float64Library(library)))
+        yield
 
 
 @contextlib.contextmanager
@@ -139,9 +151,6 @@ def widened():
     _device_constructors()
     float_, to, type_, arange = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange
 
-    def wide(dtype):
-        return torch.float64 if dtype == torch.float32 else dtype
-
     def widened_to(self, *args, **kwargs):
         if "dtype" in kwargs:
             kwargs["dtype"] = wide(kwargs["dtype"])
@@ -152,14 +161,11 @@ def widened():
     torch.Tensor.type = lambda self, dtype=None, *args, **kwargs: type_(
         self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
-    default = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
     try:
-        with patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
+        with default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
             yield
     finally:
         torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange = float_, to, type_, arange
-        torch.set_default_dtype(default)
 
 
 @contextlib.contextmanager

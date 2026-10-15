@@ -422,24 +422,42 @@ def render_object(entry: Entry, linker: Linker, context: str) -> str:
 
 
 def usage_imports() -> Iterator[tuple[str, str, str]]:
-    """(file, module, name) for every `from dew... import name` users are shown."""
-    pattern = re.compile(rf"from\s+({P.package}(?:\.\w+)*)\s+import\s+(\([^)]*\)|[^\n#]+)")
+    """(file, module, name) for every `from dew... import name` users are shown,
+    read as `unresolved_uses` reads them: the units a file shows
+    (`usage_code`), and in Markdown every fenced block and inline code span."""
     for relative, path in usage_files():
-        if path.suffix == ".ipynb":
-            text = "\n".join(code for code, _ in usage_code(relative, path))
-        elif path.suffix == ".md":
+        if path.suffix == ".md":
             # Only code a reader can run: fenced blocks and inline code spans.
             raw = path.read_text()
             fenced = re.findall(r"^(`{3,}|~{3,})[^\n]*\n(.*?)^\1", raw, re.S | re.M)
             inline = re.findall(r"`([^`\n]+)`", re.sub(r"^(`{3,}|~{3,}).*?^\1", "", raw, flags=re.S | re.M))
-            text = "\n".join([block for _, block in fenced] + inline)
+            units = [block for _, block in fenced] + inline
         else:
-            text = path.read_text()
-        for match in pattern.finditer(text):
-            names = re.sub(r"\s+as\s+\w+", "", match.group(2).strip("() \n"))
-            for name in re.split(r"[,\s]+", names):
-                if re.fullmatch(r"[A-Za-z_]\w*", name):
-                    yield relative, match.group(1), name
+            units = [code for code, _ in usage_code(relative, path)]
+        for unit in units:
+            for statement in import_statements(unit):
+                for alias in statement.names:
+                    yield relative, statement.module, alias.name
+
+
+def import_statements(code: str) -> Iterator[ast.ImportFrom]:
+    """Each `from dew... import ...` in `code`, whole statements where it
+    parses and each import line alone where it does not, as a unit cut from
+    prose or holding placeholders may not."""
+    try:
+        trees = [ast.parse(code)]
+    except SyntaxError:
+        trees = []
+        for line in code.splitlines():
+            try:
+                trees.append(ast.parse(line.strip()))
+            except SyntaxError:
+                continue
+    for tree in trees:
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.ImportFrom) and node.module
+                    and (node.module == P.package or node.module.startswith(P.package + "."))):
+                yield node
 
 
 def usage_files() -> Iterator[tuple[str, Path]]:

@@ -1,10 +1,12 @@
-"""Rounded timestep frequencies and replayed draws for Diffusers fixtures."""
+"""Rounded timestep frequencies, replayed draws and tiny text encoders for Diffusers fixtures."""
 
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 from collections.abc import Iterator
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
@@ -88,3 +90,25 @@ def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[list[int
         return
     with patch.object(module, "randn_tensor", draw):
         yield taken
+
+
+def tiny_qwen3_encoder(source: Path, tok, *, hidden_size: int, layers: int, seed: int):
+    """The published Qwen3 text encoder's config under `source`, narrowed to `hidden_size` wide and
+    `layers` deep with two query heads over one key head, every field it does not name the
+    release's own, its weights drawn at `seed + 5` and perturbed at `seed + 6`."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    config = json.loads((source / "text_encoder" / "config.json").read_text())
+    config.pop("torch_dtype", None)
+    config.pop("dtype", None)
+    config.update(hidden_size=hidden_size, intermediate_size=32, num_hidden_layers=layers,
+                  layer_types=["full_attention"] * layers, max_window_layers=layers, num_attention_heads=2,
+                  num_key_value_heads=1, head_dim=8, vocab_size=len(tok), max_position_embeddings=1024,
+                  bos_token_id=None, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+    torch.manual_seed(seed + 5)
+    model = Qwen3ForCausalLM(Qwen3Config(**config)).eval()
+    generator = torch.Generator().manual_seed(seed + 6)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    return model
