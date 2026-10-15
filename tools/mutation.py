@@ -52,7 +52,8 @@ CI_SHARDS = 8
 
 
 def plan(target: str | None, weekday: int) -> dict:
-    """Keep CI's nightly rotation and shard matrix with the target registry."""
+    """CI's mutation run: `target`, else the nightly targets' turn on `weekday`, over CI_SHARDS
+    shards, as the workflow's matrix reads it."""
     nightly = tuple(name for name, spec in TARGETS.items() if spec.nightly)
     return {"module": target or nightly[weekday % len(nightly)], "shards": CI_SHARDS,
             "matrix": {"shard": list(range(CI_SHARDS))}}
