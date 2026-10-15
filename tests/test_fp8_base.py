@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
@@ -182,29 +183,15 @@ def fit(adapter, steps, directory=None):
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables)
     batches = np.random.default_rng(2).integers(0, VOCAB, (8, BATCH, SEQ + 1)).astype(np.int32)
 
-    class Stream:
-        def __init__(self):
-            self.index = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.index += 1
-            return {"text": batches[(self.index - 1) % len(batches)]}
-
-        def get_state(self):
-            return str(self.index).encode()
-
-        def set_state(self, state):
-            self.index = int(state)
-
     mesh = MeshSpec()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     trainer.device_mesh = mesh.build(jax.devices()[:1])
-    return trainer.fit(Loader(lambda partition: Stream(), None, None, BATCH), steps=steps,
+    def windows(position):
+        return {"text": batches[position % len(batches)]}
+
+    return trainer.fit(Loader(lambda partition: Replaying(windows), None, None, BATCH), steps=steps,
                        checkpoint_every=None if directory is None else 2)
 
 

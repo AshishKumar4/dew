@@ -11,17 +11,14 @@ measured from (tests/reference_error.py). No model weights are downloaded
 at test time.
 """
 
-import json
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax.traverse_util import flatten_dict
-from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, assert_update_as_exact, kimi_source
+from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
 from reference_error import assert_as_exact_as_the_reference, ieee_fixture
-from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
 from dew.interop.codecs import decode_e2m1, quantize_packed_mxfp4
@@ -70,13 +67,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     The export writes every source name back: towers byte-exact, A_log
     zero-padded to its stored length, trained experts as MXFP4 pairs,
     everything else as trained; reloading reproduces that."""
-    loaded, _, _ = source
-    variables = assert_update_as_exact(source, TINY)
-    loaded.save(tmp_path, variables=variables)
-    written, shipped = (
-        load_file(str(tmp_path / "model.safetensors")),
-        load_file(str(TINY / "model.safetensors")),
-    )
+    trained, restored, written, shipped = exported(source, TINY, tmp_path)
     assert set(written) == set(shipped)
     for name in shipped:
         if name.startswith(("vision_tower.", "mm_projector.")):
@@ -86,12 +77,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     assert (
         written["language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"].dtype == np.uint8
     )
-    assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
-        (TINY / "config.json").read_text()
-    )
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    trained = flatten_dict(variables, sep=".")
-    for name, after in flatten_dict(dict(restored.variables), sep=".").items():
+    for name, after in restored.items():
         before = np.asarray(trained[name])
         if ".experts." in name:
             # Stacked [E, in, out]; compressed-tensors groups each [out, in] weight along its input.
