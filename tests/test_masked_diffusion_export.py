@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import assert_restores
 from model_support import flat_tree
 
 from dew.data import Memory
@@ -76,14 +77,7 @@ def trip(request, trips):
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
     """`Pretrained.load` reads the export back into the same model with the
     trained values bit for bit, so it computes the same logits."""
-    assert trip.reloaded.model == trip.source.model, "the export rebuilds a different model"
-
-    held, again = flat_tree(trip.trained), flat_tree(trip.reloaded.variables)
-    assert held.keys() == again.keys()
-    for name, leaf in again.items():
-        assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
-    np.testing.assert_array_equal(
-        tool.logits(trip.reloaded, trip.reloaded.variables, trip.ids), trip.ours)
+    assert_restores(trip.source.model, trip.trained, trip.reloaded, trip.ids)
 
 
 def test_transformers_reads_the_trained_export(trip):

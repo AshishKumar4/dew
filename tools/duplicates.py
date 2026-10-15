@@ -1,5 +1,5 @@
 """The duplicate-code gate: pylint's similarity check over the given roots, failing on any block of
-eight or more lines two files share once imports, signatures, docstrings and comments are set aside.
+more than six lines two files share once imports, signatures, docstrings and comments are set aside.
 tools/check.sh runs it over src/dew, tools and tests with no suppression and no baseline, so a copy
 lands as one owner its callers share, or not at all. tests/test_duplicates.py proves it refuses a
 copied block.
@@ -13,7 +13,7 @@ import sys
 
 from pylint.lint import Run
 
-ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=8", "--ignore-imports=y",
+ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=6", "--ignore-imports=y",
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
 """The one statement of the check, which the gate and its test both run."""
 

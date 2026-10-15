@@ -1,4 +1,5 @@
-"""Step-by-step sampler trajectories used by numerical reference tests."""
+"""What the diffusion suites share: a sampler's step-by-step walk, a published source's one train step
+and its batch, and a student stepped once and saved as a run."""
 
 import jax
 import jax.numpy as jnp
@@ -65,3 +66,21 @@ def trained_step(objective, batch, checkpoints=None):
         for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
             np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     return initial, state
+
+
+def saved_after_one_step(config, batch, directory, rate: float):
+    """`config`'s task stepped once by Adam at `rate` over `batch` and saved as a run in `directory`,
+    with the record its inference reads. Returns the task and its stepped state."""
+    import optax
+
+    from dew.training import Checkpoints, Trainer
+
+    task = config.build()
+    trainer = Trainer(task, optax.adam(rate), key=jax.random.PRNGKey(3))
+    state = trainer.initial_state()
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(directory))
+    checkpoints.save(1, state, None, artifact=task.inference_record())
+    checkpoints.wait()
+    config.save(str(directory))
+    return task, state

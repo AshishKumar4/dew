@@ -19,7 +19,15 @@ from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer,
 from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
+from .common import (
+    _PROJECTOR_PATHS,
+    ProjectorBase,
+    TowerBase,
+    TowerGeometry,
+    _image_size,
+    _vision_section,
+    head_width,
+)
 
 
 class SiglipVisionTransformer(nn.Module):
@@ -37,10 +45,7 @@ class SiglipVisionTransformer(nn.Module):
 
     def setup(self):
         cfg = self.config
-        if cfg.hidden_size % cfg.num_heads:
-            raise ValueError(
-                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
-                f"({cfg.num_heads})")
+        head_width(cfg.hidden_size, cfg.num_heads)
         patches = (cfg.image_size // cfg.patch_size) ** 2
         # torch Conv2d carries a bias unless told otherwise; the CLIP tower's
         # convolution is the bias-free exception, not the rule.

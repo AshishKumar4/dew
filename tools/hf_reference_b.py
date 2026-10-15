@@ -148,7 +148,14 @@ from deepseek_v4_reference import (  # noqa: E402
     write_deepseek_v4_mtp_reference,
 )
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
-from hf_reference import DEEPSEEK_YARN, FIXTURES, write_released_config, write_tiny  # noqa: E402
+from hf_reference import (  # noqa: E402
+    DEEPSEEK_YARN,
+    FIXTURES,
+    write_config,
+    write_provenance,
+    write_released_config,
+    write_tiny,
+)
 from dew.interop.safetensors_io import write_file
 from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
 from moe_reference import expert_tensors  # noqa: E402
@@ -252,7 +259,6 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
     per-expert conversion under Kimi's model_type. It fails the fixture if
     the released spelling reaches other logits than the saved config did.
     """
-    from huggingface_hub import model_info
     from transformers.conversion_mapping import (
         get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
     )
@@ -263,13 +269,8 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
         saved.pop(field, None)
     config = {"architectures": ["DeepseekV3ForCausalLM"], **saved, **KIMI_K2_TINY,
               "model_type": "kimi_k2", "transformers_version": transformers.__version__}
-    (directory / "config.json").write_text(
-        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({
-        "released": {"repo": repo, "revision": model_info(repo).sha},
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-    }, indent=1) + "\n")
+    write_config(directory, config)
+    write_provenance(directory, repo)
 
     conversion = get_checkpoint_conversion_mapping("deepseek_v3")
     if conversion is None:
@@ -400,7 +401,6 @@ def write_kimi_k25(name: str, repo: str, model: Kimi_K25ForConditionalGeneration
     other logits than the saved one, or if an id the fixture runs on is a
     media mark.
     """
-    from huggingface_hub import model_info
 
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
@@ -434,13 +434,8 @@ def write_kimi_k25(name: str, repo: str, model: Kimi_K25ForConditionalGeneration
     config = {"architectures": ["Kimi_K25ForConditionalGeneration"], **saved,
               "text_config": dict(sorted({**spelling, **kimi_k25_text()}.items())),
               "transformers_version": transformers.__version__}
-    (directory / "config.json").write_text(
-        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({
-        "released": {"repo": repo, "revision": model_info(repo).sha},
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-    }, indent=1) + "\n")
+    write_config(directory, config)
+    write_provenance(directory, repo)
 
     loaded = Kimi_K25ForConditionalGeneration.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
@@ -598,7 +593,6 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
     `full_attention_interval` beside the derived layer_types, the way the
     release spells its pattern.
     """
-    from huggingface_hub import model_info
 
     directory = FIXTURES / name
     depth = QwenMTP(model.config).eval()
@@ -622,14 +616,9 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
     config = json.loads((directory / "config.json").read_text())
     config.update(num_nextn_predict_layers=QWEN3_NEXT_TINY["num_nextn_predict_layers"],
                   full_attention_interval=QWEN3_NEXT_TINY["full_attention_interval"])
-    (directory / "config.json").write_text(json.dumps(dict(sorted(config.items())), indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({
-        "released": {"repo": repo, "revision": model_info(repo).sha},
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-        "vllm": {"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
-                 "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"},
-    }, indent=1) + "\n")
+    write_config(directory, config)
+    write_provenance(directory, repo, vllm={"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+                                           "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"})
     print(f"{directory}: mtp.* depth with {len(tensors)} tensors, mtp logits {tuple(logits.shape)}")
 # zai-org/GLM-5.3 at toy width. The release's proportions on a hidden width
 # of 32: intermediate_size twice the width (64), moe_intermediate_size and
@@ -911,7 +900,6 @@ def write_glm5_next_mtp(name: str, model: Glm5NextTextForCausalLM, depth: Glm5Ne
 def write_glm5_next_config(name: str, repo: str) -> None:
     """Overlay the released nested linear-attention spelling and prove the
     trunk plus saved head reloads bitwise; only the MTP depth remains unused."""
-    from huggingface_hub import model_info
 
     directory = FIXTURES / name
     saved = json.loads((directory / "config.json").read_text())
@@ -921,13 +909,8 @@ def write_glm5_next_config(name: str, repo: str) -> None:
     config = {**saved, **GLM5_NEXT_RELEASED, "architectures": ["Glm5NextTextModel"],
               "model_type": "glm5_next_text",
               "transformers_version": transformers.__version__}
-    (directory / "config.json").write_text(
-        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({
-        "released": {"repo": repo, "revision": model_info(repo).sha},
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-    }, indent=1) + "\n")
+    write_config(directory, config)
+    write_provenance(directory, repo)
 
     loaded = Glm5NextTextModel.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True,

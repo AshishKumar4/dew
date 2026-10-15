@@ -137,6 +137,30 @@ BLOOM_CONFIG = ('bloom-560m', 'bigscience/bloom-560m', 'ac2ae5fab2ce3f9f40dc79b5
 BLOOMZ_CONFIG = ('bloomz-560m', 'bigscience/bloomz-560m', 'a2845d7e13dd12efae154a9f1c63fcc2e0cc4b05')
 
 
+TRANSFORMERS_REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
+"""The transformers commit (v5.16.1) the fixtures are recorded against."""
+
+
+def write_config(directory: Path, config: dict) -> None:
+    """`config` as `directory`'s config.json, its keys sorted."""
+    (directory / "config.json").write_text(json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+
+
+def write_provenance(directory: Path, repo: str | None = None, **more) -> None:
+    """`directory`'s source.json: the release `repo` names at its current
+    revision where one is named, the transformers it was recorded with and
+    `more`."""
+    import transformers
+    from huggingface_hub import model_info
+
+    released = {} if repo is None else {"released": {"repo": repo, "revision": model_info(repo).sha}}
+    (directory / "source.json").write_text(json.dumps({
+        **released,
+        "transformers": {"version": transformers.__version__, "revision": TRANSFORMERS_REVISION},
+        **more,
+    }, indent=1) + "\n")
+
+
 def tiny_bloom() -> BloomForCausalLM:
     """Three heads exercise the non-power-of-two ALiBi slopes and fused qkv."""
     torch.manual_seed(0)
@@ -589,7 +613,6 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     expert; the latent case leaves top-k weights unnormalized.
     """
     from diffusers_wan_reference import float64
-    import transformers
 
     torch.manual_seed(0)
     name = "nemotron-h-moe-latent-tiny" if latent else "nemotron-h-moe-tiny" if moe else "nemotron-h-tiny"
@@ -616,11 +639,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     with float64(), torch.no_grad():
         truth = model.double()(input_ids=ids, use_cache=False).logits.double().numpy()
     np.save(directory / "logits_f64.npy", truth)
-    (directory / "source.json").write_text(json.dumps({
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-        "seed": 2024,
-    }, indent=1) + "\n")
+    write_provenance(directory, seed=2024)
     (directory / "model.safetensors").chmod(0o644)
 
 
@@ -1087,7 +1106,6 @@ def gemma4_vision_tiny_system(seed: int = 1234, *, head_dim: int = 8, device: st
     a 4x4 grid pooled to four soft tokens. The standardization buffers ride
     the state dict, so they are scattered with the weights.
     """
-    from types import SimpleNamespace
 
     vconf = gemma4_vision_tiny_config(head_dim)
     torch.manual_seed(seed)
@@ -1315,7 +1333,7 @@ def write_qwen35_mm_tiny() -> None:
     inputs, which scores with plain sequential positions on both sides.
     """
     from qwen_linear_reference import CONFIG as QWEN35_MM_TEXT
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import save_file
 
     system = qwen35_vision_tiny_system(seed=4321)
     torch.manual_seed(4321)

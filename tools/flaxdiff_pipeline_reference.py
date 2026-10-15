@@ -272,9 +272,9 @@ def main() -> None:
     arrays.update({f"params/{'/'.join(path)}": leaf for path, leaf in
                    ((tuple(str(key.key) for key in path), np.asarray(leaf))
                     for path, leaf in jax.tree_util.tree_flatten_with_path(weights)[0])})
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    from tools.reference_source import saved_fixture
+
+    saved_fixture(FIXTURE, arrays, meta)
     for name, images in (("FlaxDiff as run", arrays["as_run.images"]),
                          ("FlaxDiff, float32 towers", arrays["fp32_towers.images"]), ("Dew as run", ours)):
         gap = float(np.sqrt(np.mean((np.clip(images, -1, 1) - arrays["fp64.images"]) ** 2)))

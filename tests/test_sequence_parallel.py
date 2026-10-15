@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import two_documents
 
 from dew.nn.attention import (
     NormalAttention,
@@ -32,7 +33,7 @@ from dew.nn.attention import (
     gathered_keys_attention,
     scaled_dot_product_attention,
 )
-from dew.nn.inputs import MixerCall, coordinates
+from dew.nn.inputs import MixerCall
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 
@@ -56,19 +57,7 @@ def dense_batch():
 def packed_batch():
     """Two documents a row, the second starting at a different column on
     every row, and the tail of the last row padding (segment 0)."""
-    batch = dense_batch()
-    rng = np.random.default_rng(1)
-    segments = np.ones((BATCH, SEQ_LEN + 1), np.int32)
-    positions = np.zeros((BATCH, SEQ_LEN + 1), np.int32)
-    for row in range(BATCH):
-        boundary = int(rng.integers(3, SEQ_LEN - 2))
-        segments[row, boundary:] = 2
-        positions[row, :boundary] = np.arange(boundary)
-        positions[row, boundary:] = np.arange(SEQ_LEN + 1 - boundary)
-    segments[-1, -3:] = 0
-    batch["text_coordinates"] = coordinates(
-        segments=segments, positions=positions, max_segments=SEQ_LEN + 1, right_padded=True, xp=np)
-    return batch
+    return {**dense_batch(), "text_coordinates": two_documents(np.random.default_rng(1), BATCH, SEQ_LEN + 1)}
 
 
 # --------------------------------------------------------------------------

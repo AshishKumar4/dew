@@ -19,26 +19,30 @@ VOCAB = 11
 
 @dataclass(frozen=True, eq=False)
 class StubText(ConditionEncoder[str]):
-    """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
-    ids by character behind a start token, encode looks them up. Small, and
-    shaped like CLIP's output, so the models' text keyword takes it; a run's
-    text condition names it by its import path, `STUB_TEXT`."""
+    """A text encoder with a table of `vocab` vectors `features` wide: tokenize
+    maps a prompt to `tokens` ids by character behind a start token, encode
+    looks them up. Small, and shaped like CLIP's output, so the models' text
+    keyword takes it; a run's text condition names it by its import path,
+    `STUB_TEXT`."""
 
     checkpoint: str
     params: Variables
+    tokens: int = TOKENS
+    vocab: int = VOCAB
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
+    def from_pretrained(cls, checkpoint: str, *, params=None, tokens: int = TOKENS, features: int = FEATURES,
+                        vocab: int = VOCAB, **fields):
         if params is None:
             params = {"table": jnp.asarray(
-                np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))}
-        return cls(checkpoint=checkpoint, params=params)
+                np.random.RandomState(0).normal(size=(vocab, features)).astype(np.float32))}
+        return cls(checkpoint=checkpoint, params=params, tokens=tokens, vocab=vocab)
 
     def tokenize(self, data):
-        ids = np.zeros((len(data), TOKENS), np.int32)
-        mask = np.zeros((len(data), TOKENS), np.int32)
+        ids = np.zeros((len(data), self.tokens), np.int32)
+        mask = np.zeros((len(data), self.tokens), np.int32)
         for row, text in enumerate(data):
-            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
+            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1
         return {"input_ids": ids, "attention_mask": mask}
@@ -52,7 +56,8 @@ class StubText(ConditionEncoder[str]):
                      for row in np.asarray(tokens["input_ids"]))
 
     def to_json(self):
-        return {"checkpoint": self.checkpoint}
+        return {"checkpoint": self.checkpoint, "tokens": self.tokens,
+                "features": int(self.params["table"].shape[1]), "vocab": self.vocab}
 
 
 STUB_TEXT = f"{__name__}:StubText"

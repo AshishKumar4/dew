@@ -1,5 +1,6 @@
 """CPU worker sessions, pool reports and process-group cleanup."""
 
+import argparse
 import contextlib
 import json
 import os
@@ -32,6 +33,26 @@ def prepare_worker(args, *, multi_host: bool | None = False) -> None:
     from dew.training.runtime import prepare_process
 
     prepare_process(multi_host=True if args.coordinator else multi_host)
+
+
+def worker_parser(modes: Mapping[str, Callable], doc: str | None) -> argparse.ArgumentParser:
+    """A worker's command line: the `modes` it runs, the file its JSON result goes to, and its place in
+    the pool (`prepare_worker`). A worker adds its modes' own options."""
+    parser = argparse.ArgumentParser(description=doc)
+    parser.add_argument("mode", choices=sorted(modes))
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--coordinator", help="host:port of the jax.distributed service")
+    parser.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--process-id", type=int, default=0)
+    parser.add_argument("--fsdp-size", type=int, default=1)
+    return parser
+
+
+def serve_mode(modes: Mapping[str, Callable], args) -> None:
+    """In a worker: join the pool and write the mode's result as JSON to `args.out`."""
+    prepare_worker(args)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(modes[args.mode](args)))
 
 
 def free_port() -> int:
