@@ -385,8 +385,15 @@ class DecisionObjective(Objective[Ratio]):
     training stream and the validation pass pack rows first-fit into windows
     of the layout's `max_len` tokens (`packing`), as many rows, questions and
     options as its `bounds` let a window hold, so a step pays for its tokens
-    rather than `max_len` per row, and every batch has one shape. The loss
-    is the mean over the batch's scored questions.
+    rather than `max_len` per row, and every batch has one shape. A window
+    holds at most `segments` rows, which the backbone's sequence kernel then
+    works on a window (`Coordinates.max_segments`) whether or not they come:
+    16 by default, a few more than a window of mixed tasks' rows was measured
+    to hold, where a window full of the shortest rows would declare tens. A
+    mix of rows shorter than `max_len / segments` tokens fills its windows
+    less under it and takes a larger one; None lets a window hold as many as
+    the layout's shortest row fits. The loss is the mean over the batch's
+    scored questions.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -431,7 +438,8 @@ class DecisionObjective(Objective[Ratio]):
                  specials: Specials | None = None, layout: Layout | None = None,
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
-                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None):
+                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
+                 segments: int | None = 16):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -457,6 +465,8 @@ class DecisionObjective(Objective[Ratio]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
+        if segments is not None and segments < 1:
+            raise ValueError(f"a window holds at least one row; got segments={segments}")
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
@@ -477,6 +487,7 @@ class DecisionObjective(Objective[Ratio]):
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
+        self.segments = segments
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -530,8 +541,12 @@ class DecisionObjective(Objective[Ratio]):
 
     @functools.cached_property
     def bounds(self) -> Bounds:
-        """The most rows, questions and options a window packs (`Layout.bounds`)."""
-        return self.layout.bounds(self.tokenizer, self.specials)
+        """The most rows, questions and options a window packs (`Layout.bounds`),
+        at most `segments` rows."""
+        bounds = self.layout.bounds(self.tokenizer, self.specials)
+        if self.segments is None:
+            return bounds
+        return dataclasses.replace(bounds, segments=min(self.segments, bounds.segments))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments)
