@@ -1,6 +1,5 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
-import importlib.util
 import json
 import os
 import re
@@ -10,15 +9,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
-    spec = importlib.util.spec_from_file_location("armada_ci", ROOT / "tools/armada/ci.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load("ci", "tools/armada")
     monkeypatch.chdir(tmp_path)
     # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
     for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_TEST_CACHE"):
