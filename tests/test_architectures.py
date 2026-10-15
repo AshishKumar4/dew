@@ -464,7 +464,8 @@ def shard_terms(case: Case, tmp_path, initial):
     device's partial is its row's: the step from the whole batch with that
     row alone valid (`VALID_ROWS`), the same draws, weighted by its share of
     the batch. The step is linear in its gradient (SGD with momentum and
-    the EMA), so the partials sum to the whole step, which is checked."""
+    the EMA), so the partials sum to the whole step where its rows add up,
+    and None where they do not."""
     trainer, encoder = make_trainer(case, tmp_path / "shards", 1, devices=1)
     batch = model_batch(wide(case, next(batches(case, encoder)())))
     state = widened_state(initial)
@@ -486,11 +487,12 @@ def shard_terms(case: Case, tmp_path, initial):
                  for row in range(BATCH)]
     summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
     terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
-    for got, want, size in zip(jax.tree.leaves(summed), jax.tree.leaves(whole), jax.tree.leaves(terms),
-                               strict=True):
-        # float64 rounds the two sums apart by a few of its units of what they add; a step whose rows
-        # do not add up (a batch-wide statistic) parts them by its own size.
-        assert np.all(np.abs(got - want) <= 1e-9 * size), float(np.max(np.abs(got - want) / size))
+    # float64 rounds the two sums apart by a few of its units of what they add. A step whose rows do
+    # not add up, through a batch-wide statistic (a router's load, a JEPA batch's masks), parts them by
+    # its own size: its devices' sums are no rows' partials, and it has no such terms (None).
+    if not all(np.all(np.abs(got - want) <= 1e-9 * size) for got, want, size in zip(
+            jax.tree.leaves(summed), jax.tree.leaves(whole), jax.tree.leaves(terms), strict=True)):
+        return None
     return SimpleNamespace(**terms)
 
 
@@ -621,10 +623,10 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         with jax.enable_x64(new_val=True):
             exact = jax.device_get(truth(case, tmp_path, copied(), steps))
             terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
-            if rows:
-                # A layout's step adds its devices' partials, whose terms can far exceed the
-                # whole batch's where the rows' gradients cancel across devices.
-                across = shard_terms(case, tmp_path, copied())
+            # A layout's step adds its devices' partials, whose terms can far exceed the
+            # whole batch's where the rows' gradients cancel across devices.
+            across = shard_terms(case, tmp_path, copied()) if rows else None
+            if across is not None:
                 terms = replace(terms, **{name: jax.tree.map(np.maximum, getattr(terms, name),
                                                              getattr(across, name))
                                           for name in ("variables", "opt_state", "ema")})
