@@ -15,10 +15,10 @@ on:
   push:
     # ci/** is where a branch goes for its own run before it lands.
     branches: [ "main", "ci/**" ]
-    paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+    paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
   pull_request:
     branches: [ "main" ]
-    paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+    paths: *paths
   workflow_dispatch:
     inputs:
       run_cells:
