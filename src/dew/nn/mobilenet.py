@@ -358,21 +358,10 @@ class MobileMultiScaleFusion(nn.Module):
         return _timm_rms_norm(self.dtype, "norm")(x)
 
 
-# The stem reads three image channels, which is no width worth naming, and the
-# adapter's own norm sits under the name this encoder gives it; its inverted
-# bottleneck is a `MobileResidual` and carries that class's declarations.
-@logical_axes({
-    ("conv_stem", "conv"): (None, None, None, "embed"),
-    ("conv_stem", "bn"): ("embed",),
-    ("msfa", "norm"): ("embed",),
-})
-class MobileNetV5Encoder(nn.Module):
-    """The mobilenetv5_300m_enc graph, with timm's construction controls.
-
-    Strict GPU fp32 reference comparisons use precision=HIGHEST. The bf16
-    path executes with its own rounding; it is not qualified at the fp32
-    reference tolerance.
-    """
+@dataclasses.dataclass(frozen=True)
+class MobileNetV5:
+    """The mobilenetv5_300m_enc encoder's construction controls, as timm's
+    model_args name them (`MobileNetV5Encoder`)."""
 
     channel_multiplier: float = 1.0
     stem_size: int = 64
@@ -385,47 +374,71 @@ class MobileNetV5Encoder(nn.Module):
     msfa_output_resolution: int = 16
     layer_scale_init_value: float | None = 1e-5
     drop_path_rate: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "msfa_indices", tuple(self.msfa_indices))
+
+
+# The stem reads three image channels, which is no width worth naming, and the
+# adapter's own norm sits under the name this encoder gives it; its inverted
+# bottleneck is a `MobileResidual` and carries that class's declarations.
+@logical_axes({
+    ("conv_stem", "conv"): (None, None, None, "embed"),
+    ("conv_stem", "bn"): ("embed",),
+    ("msfa", "norm"): ("embed",),
+})
+class MobileNetV5Encoder(nn.Module):
+    """The mobilenetv5_300m_enc graph, built as its `construction` says.
+
+    Strict GPU fp32 reference comparisons use precision=HIGHEST. The bf16
+    path executes with its own rounding; it is not qualified at the fp32
+    reference tolerance.
+    """
+
+    construction: MobileNetV5 = MobileNetV5()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
-        if self.channel_multiplier <= 0 or self.stem_size < 1 or self.in_chans < 1:
+        args = self.construction
+        if args.channel_multiplier <= 0 or args.stem_size < 1 or args.in_chans < 1:
             raise ValueError("channel_multiplier, stem_size and in_chans must be positive")
-        if self.group_size is not None and self.group_size < 0:
+        if args.group_size is not None and args.group_size < 0:
             raise ValueError("group_size is nonnegative; 0 selects an ungrouped convolution")
-        if not 0 <= self.drop_path_rate < 1:
+        if not 0 <= args.drop_path_rate < 1:
             raise ValueError("drop_path_rate must be in [0, 1)")
-        if self.msfa_output_resolution < 1:
+        if args.msfa_output_resolution < 1:
             raise ValueError("msfa_output_resolution must be positive")
-        indices = tuple(index + 5 if index < 0 else index for index in self.msfa_indices)
+        indices = tuple(index + 5 if index < 0 else index for index in args.msfa_indices)
         if not indices or len(indices) != len(set(indices)) or any(not 0 <= i < 5 for i in indices):
             raise ValueError("msfa_indices must select distinct features among stem and four stages")
         self.selected = frozenset(indices)
-        _padding(self.pad_type, 3)
+        _padding(args.pad_type, 3)
 
     @nn.compact
     def __call__(self, pixel_values, train: bool = False):
+        args = self.construction
         pixels = jnp.asarray(pixel_values)
-        if (pixels.ndim != 4 or pixels.shape[1] != self.in_chans
+        if (pixels.ndim != 4 or pixels.shape[1] != args.in_chans
                 or min(pixels.shape) < 1):
-            raise ValueError(f"pixel_values must be nonempty [B, {self.in_chans}, H, W], got {pixels.shape}")
+            raise ValueError(f"pixel_values must be nonempty [B, {args.in_chans}, H, W], got {pixels.shape}")
         if not jnp.issubdtype(pixels.dtype, jnp.floating):
             raise ValueError(f"pixel_values must be floating processor output, got {pixels.dtype}")
         x = jnp.moveaxis(pixels, 1, -1)
-        fixed = self.channel_multiplier < 1.0 if self.fix_stem is None else self.fix_stem
-        stem = self.stem_size if fixed else _divisible(self.stem_size * self.channel_multiplier)
-        x = MobileConvNormAct(stem, 3, stride=2, padding=self.pad_type,
-                              bias=self.stem_bias, dtype=self.dtype,
+        fixed = args.channel_multiplier < 1.0 if args.fix_stem is None else args.fix_stem
+        stem = args.stem_size if fixed else _divisible(args.stem_size * args.channel_multiplier)
+        x = MobileConvNormAct(stem, 3, stride=2, padding=args.pad_type,
+                              bias=args.stem_bias, dtype=self.dtype,
                               precision=self.precision, name="conv_stem")(x)
         features = [x] if 0 in self.selected else []
         for stage in range(4):
-            x = MobileStage(stage, self.channel_multiplier, self.pad_type,
-                            self.group_size, self.layer_scale_init_value,
-                            self.drop_path_rate, self.dtype, self.precision,
+            x = MobileStage(stage, args.channel_multiplier, args.pad_type,
+                            args.group_size, args.layer_scale_init_value,
+                            args.drop_path_rate, self.dtype, self.precision,
                             self.attention_impl, name=f"stages_{stage}")(x, train=train)
             if stage + 1 in self.selected:
                 features.append(x)
-        x = MobileMultiScaleFusion(self.msfa_output_resolution, dtype=self.dtype,
+        x = MobileMultiScaleFusion(args.msfa_output_resolution, dtype=self.dtype,
                                    precision=self.precision, name="msfa")(tuple(features))
         return x.reshape(x.shape[0], -1, x.shape[-1])

@@ -54,6 +54,21 @@ def assert_same_stored_tensors(written: dict, original: dict) -> None:
                                       value.reshape(-1).view(np.uint8), err_msg=name)
 
 
+def assert_reloads(loaded, saved: Path, ids: np.ndarray) -> None:
+    """The checkpoint `loaded` wrote to `saved` loads back to the model, tree and logits over `ids`
+    it was saved from."""
+    from dew.interop import Pretrained
+
+    restored = Pretrained.load(saved, dtype='float32', attention_impl='reference')
+    assert restored.model == loaded.model
+    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
+    for original, again in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(restored.variables),
+                               strict=True):
+        np.testing.assert_array_equal(np.asarray(again), np.asarray(original))
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
+                                  loaded.model.apply(loaded.variables, ids))
+
+
 def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:
     """Every source tensor has a layout that exports its dtype, shape and bytes."""
     assert {layout.name for layout in layouts} == {f"{prefix}{name}" for name in tensors}

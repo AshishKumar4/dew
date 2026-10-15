@@ -1,26 +1,13 @@
 """Real-data example caption geometry and byte MDLM training."""
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import numpy as np
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def example(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / "examples" / f"{name}.py")
-    loaded = importlib.util.module_from_spec(spec)
-    sys.modules[name] = loaded
-    spec.loader.exec_module(loaded)
-    return loaded
+from tool_support import load
 
 
 def test_caption_rows_keep_image_and_caption_targets_in_separate_spans():
     """The caption canvas is whole: the caption, then EOS to the canvas's end,
     every position attended and scored, as the sampler denoises it."""
-    script = example("sft_diffusion_gemma_images")
+    script = load("sft_diffusion_gemma_images", "examples")
     config = script.Config(image_size=16, prompt_tokens=24)
     pixels = np.arange(2 * 16 * 16 * 3, dtype=np.uint8).reshape(2, 16, 16, 3)
     batch = script.caption_batch({"image": pixels, "label": [0, 1]}, config, ["pink rose", "yellow tulip"])

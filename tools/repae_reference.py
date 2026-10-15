@@ -66,6 +66,7 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from lpips_weights import drawn_weights
+from recorded_draws import Tape, TorchDraws
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
 from torchvision import models
@@ -182,35 +183,6 @@ class Config(dict):
     __getattr__ = dict.__getitem__
 
 
-class Replayed:
-    """torch as the step reads it: `randn`, `rand` and `randn_like` return
-    Dew's draws in the step's order, each checked against the shape asked
-    for, and `tensor` builds in the run's precision."""
-
-    def __init__(self, dtype, draws: list[np.ndarray]):
-        self.dtype, self.draws = dtype, [torch.as_tensor(np.array(draw)) for draw in draws]
-
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-    def _next(self, shape):
-        draw = self.draws.pop(0)
-        assert tuple(draw.shape) == tuple(shape), (tuple(draw.shape), tuple(shape))
-        return draw.to(self.dtype)
-
-    def randn(self, *size, device=None):
-        return self._next(size[0] if len(size) == 1 and not isinstance(size[0], int) else size)
-
-    def rand(self, *size, device=None):
-        return self.randn(*size)
-
-    def randn_like(self, like):
-        return self._next(like.shape)
-
-    def tensor(self, data, device=None, dtype=None):
-        return torch.tensor(data, dtype=dtype or self.dtype)
-
-
 class Accelerator:
     """accelerate's `Accelerator` on one process: `backward` is the loss's,
     and `clip_grad_norm_` records each parameter's gradient as it reads
@@ -314,7 +286,9 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
         replayed: list[np.ndarray]) -> dict[str, np.ndarray]:
     """One published step at `dtype`: each network's gradients, the batch
     norm's running statistics after it and the step's losses."""
-    random = Replayed(dtype, replayed)
+    # torch as the step reads it: Dew's draws in the step's order, and `tensor` in the run's precision.
+    tape = Tape([torch.as_tensor(np.array(draw)) for draw in replayed])
+    random = TorchDraws(tape, dtype)
     sit = defined_in(source("models/sit.py"), {"mean_flat", "build_mlp", "LabelEmbedder", "SiT"},
                      {"torch": random, "nn": torch.nn, "np": np, "math": math})
     autoencoder = defined_in(
@@ -392,7 +366,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     statements = [*loop.body[start:loop.body.index(accumulate)], *accumulate.body]
     with precision(dtype):
         ran(statements, scope, "train_repae.py")
-    assert not random.draws, "the step drew fewer times than DiffusionObjective.loss"
+    assert not tape.replayed, "the step drew fewer times than DiffusionObjective.loss"
 
     tail = "_f64" if dtype == torch.float64 else ""
     result = {f"grad/vae.{name}{tail}": accelerator.gradients[value].numpy()

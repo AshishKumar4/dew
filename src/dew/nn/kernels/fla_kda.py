@@ -876,7 +876,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     and the memory recomputed, then `dAqk` and the values' local gradient, the reverse recurrence
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
-    each chunk."""
+    each chunk, each sequence's first token's from its memory (`fla_gdn.first_decay_grad`)."""
     q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
@@ -891,7 +891,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
-    dg = fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels)
+    dg = fla_gdn.first_decay_grad(fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels), h0, dh0, spans)
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
