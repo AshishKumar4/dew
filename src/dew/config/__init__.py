@@ -51,6 +51,7 @@ from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_led
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Loading
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
+from dew.data.pipeline import ObjectiveData
 from dew.data.sources.base import Read
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
@@ -1152,11 +1153,18 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
-                       read=self.data_read,
-                       provision=self.provision, seed=self.data_seed, loading=self.loading,
-                       validation_records=self.validation_records, objective=objective.data())
+        dataset = self.loader(objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))
+
+    def loader(self, objective: ObjectiveData | None, recipe: RunData | None = None) -> Loader:
+        """The run's `data`, or `recipe` in its place, compiled with the
+        `objective`'s steps under the run's data controls: the trainer's batch
+        rows or tokens, `data_read`, `provision`, `data_seed`, `loading` and
+        `validation_records`. Every kind of run's `prepare` loads through it."""
+        return loader(self.data if recipe is None else recipe, batch=self.trainer.batch_size,
+                      tokens=self.trainer.batch_tokens, read=self.data_read, provision=self.provision,
+                      seed=self.data_seed, loading=self.loading, validation_records=self.validation_records,
+                      objective=objective)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
