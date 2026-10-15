@@ -133,6 +133,42 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
     np.testing.assert_allclose(row_means, reference["canvas_loss"], atol=1e-5, rtol=0)
 
 
+def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
+    loaded, _, step, _ = source
+    obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (4, 1))
+    mask = jnp.asarray([[0, 0, 1, 1], [0, 0, 0, 1], [1, 1, 1, 1], [0, 0, 0, 0]], bool)
+    valid = jnp.ones_like(tokens, bool).at[2, 4:6].set(False)
+    batch = {"text": ModelInputs(tokens, {"attention_mask": valid}), "canvas_mask": mask}
+    scored = jax.jit(obj.evaluate)(variables, batch, step)
+    expected = mask & valid[:, 4:]
+    np.testing.assert_array_equal(scored.weights, expected)
+    (loss, _), gradient = jax.jit(jax.value_and_grad(obj.scalar_loss, has_aux=True))(
+        variables, batch, step)
+    row_losses = (scored.losses * expected).sum(-1) / jnp.maximum(expected.sum(-1), 1)
+    np.testing.assert_allclose(loss, row_losses.mean(), atol=1e-5, rtol=0)
+    assert float(loss) > 0
+    assert any(float(jnp.linalg.norm(leaf)) > 1e-6 for leaf in jax.tree.leaves(gradient))
+
+
+def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
+    loaded, _, step, _ = source
+    obj = BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=4,
+                                  canvas_size=2, variables=loaded.variables)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    mask = jnp.tile(jnp.asarray([0, 0, 1, 1, 0, 0, 0, 1], bool), (64, 1))
+    batch = {"text": jnp.tile(jnp.arange(1, 13, dtype=jnp.int32), (64, 1)), "canvas_mask": mask}
+    scored = jax.jit(obj.evaluate)(variables, batch, step)
+    weights = np.asarray(scored.weights).reshape(64, 4, 2)
+    selected = weights.any(axis=-1)
+    np.testing.assert_array_equal(selected.sum(axis=-1), 1)
+    assert not selected[:, [0, 2]].any()
+    np.testing.assert_array_equal(weights[:, 1, 0], selected[:, 1])
+    assert not weights[:, 3, 0].any()
+    assert np.all((selected.sum(axis=0)[[1, 3]] >= 16) & (selected.sum(axis=0)[[1, 3]] <= 48))
+
+
 def test_the_model_the_trainer_substitutes_is_the_one_the_losses_run(source):
     """The trainer rematerializes or quantizes a step by substituting the
     modules `program_key` names. The losses run the clone sized to the SFT
