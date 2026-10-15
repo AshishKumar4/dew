@@ -413,7 +413,7 @@ jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b560
 jax-cuda13-pjrt==0.11.2
     # via jax-cuda13-plugin
 jax-cuda13-plugin==0.11.2
-    # via dewml (pyproject.toml)
+    # via jax
 jaxlib==0.11.2
     # via
     #   jax
