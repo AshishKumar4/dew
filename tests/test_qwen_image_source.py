@@ -271,60 +271,27 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     carried as stored beside it, and both go back out byte for byte. The
     export reloads to the trained forward.
     """
-    import optax
+    from diffusion_support import image_batch, trained_step
     from flax.traverse_util import flatten_dict
 
     from dew.checkpoints import Checkpoints
     from dew.inputs.diffusion import QwenImageConditioner
     from dew.interop.diffusion import component_tensors
     from dew.interop.pretrained import Pretrained
-    from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.training import Trainer
 
-    height, width, channels = loaded.inputs.sample.shape
-    assert channels == 4
+    assert loaded.inputs.sample.shape[-1] == 4
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
-    rows = jax.device_count()
-    pixels = np.tile(np.arange(height * width * channels, dtype=np.uint8).reshape(
-        1, height, width, channels), (rows, 1, 1, 1))
     prompts = record["pipeline"]["prompts"]
-    batch = {"image": pixels,
-             **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
-    checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
-                      checkpoints=checkpoints)
-    initial = trainer.initial_state()
-    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
-
-    def value(params) -> float:
-        loss, _ = objective.loss(params, batch, fixed)
-        return float(loss.total / loss.mass)
-
-    before = value(initial.variables)
-    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
-    assert value(state.variables) < before
-    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
-                           initial.variables["params"]["proj_out"]["kernel"])
-    for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.variables[held]),
-                             jax.tree.leaves(initial.variables[held]), strict=True):
-            np.testing.assert_array_equal(got, want)
+    batch = image_batch(loaded, prompts)
+    _, state = trained_step(objective, batch, Checkpoints(str(tmp_path / "run")))
     assert set(flatten_dict(state.variables["encoders"]["conditioning"])) == {
         layout.paths[0][2:] for layout in loaded.weight_layouts if layout.name.startswith("text_encoder/")}
     visual = {f"text_encoder/{name}" for name in component_tensors(source / "pipeline", "text_encoder")
               if name.startswith("model.visual.")}
     assert visual and set(loaded.retained_tensors) == visual
-
-    checkpoints.save(1, state, None, {})
-    checkpoints.wait()
-    restored, _, _ = trainer.place()
-    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from affine_run import raw_leaf
-        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)

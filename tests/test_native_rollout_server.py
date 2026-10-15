@@ -6,16 +6,13 @@ submission and leaves the rest running; a submission does not wait for a
 step.
 """
 
-import os
-import subprocess
-import sys
 import threading
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from process_support import assert_exits_cleanly
 
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
@@ -143,13 +140,4 @@ def test_a_program_that_ends_with_draws_in_flight_exits_cleanly():
         "servers = [NativeRolloutServer(Server.from_task(task, slots=4, capacity=512)) for _ in range(4)]\n"
         "draws = [server.submit([1, 2, 3], 400, key=seed) for server in servers for seed in range(64)]\n"
         "draws[0].result()\n")
-    root = Path(__file__).resolve().parents[1]
-    done = subprocess.run(
-        [sys.executable, "-c", program],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
-    )
-    assert done.returncode == 0, done.stdout + done.stderr
+    assert_exits_cleanly(program)

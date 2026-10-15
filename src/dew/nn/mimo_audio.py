@@ -28,6 +28,7 @@ from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .inputs import AttentionMetadata, coordinates
+from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
 from .quantizers import residual_quantize
@@ -145,12 +146,14 @@ class AudioTokenizerEncoder(nn.Module):
         skip = None
         for index in range(cfg.encoder_layers):
             attention = functools.partial(
-                CausalSelfAttention, emb_features=cfg.d_model, num_heads=heads, num_kv_heads=heads,
-                head_dim=cfg.d_model // heads, max_seq_len=1, causal=cfg.encoder_causal, qk_norm=False,
-                attention_bias=True, rope_theta=cfg.rope_theta,
-                # The reference masks keys past `window` places back: |q - k| < window + 1 (`window_sides`).
-                sliding_window=cfg.encoder_attn_window_size[0] + 1 if cfg.windowed(index) else None,
-                bidirectional_window=not cfg.encoder_causal, dtype=self.dtype, precision=self.precision)
+                CausalSelfAttention, ctx=MixerContext(
+                    emb_features=cfg.d_model, num_heads=heads, num_kv_heads=heads,
+                    head_dim=cfg.d_model // heads, max_seq_len=1, causal=cfg.encoder_causal, qk_norm=False,
+                    attention_bias=True, rope_theta=cfg.rope_theta,
+                    # The reference masks keys past `window` places back: |q - k| < window + 1
+                    # (`window_sides`).
+                    sliding_window=cfg.encoder_attn_window_size[0] + 1 if cfg.windowed(index) else None,
+                    bidirectional_window=not cfg.encoder_causal, dtype=self.dtype, precision=self.precision))
             mlp = functools.partial(GatedMLP, hidden_features=cfg.encoder_ffn_dim, out_features=cfg.d_model,
                                     activation="gelu_exact", use_bias=True, dtype=self.dtype,
                                     precision=self.precision)
@@ -223,10 +226,11 @@ class MiMoAudioCodeEncoder(nn.Module):
         x = x.reshape(batch * groups, cfg.group_size, cfg.input_local_dim)
         heads = cfg.input_local_attn_heads
         attention = functools.partial(
-            CausalSelfAttention, emb_features=cfg.input_local_dim, num_heads=heads, num_kv_heads=heads,
-            head_dim=cfg.input_local_dim // heads, max_seq_len=cfg.group_size,
-            causal=not cfg.input_full_attention, qk_norm=False, attention_bias=True, o_proj_bias=False,
-            rope_theta=cfg.rope_theta, dtype=self.dtype, precision=self.precision)
+            CausalSelfAttention, ctx=MixerContext(
+                emb_features=cfg.input_local_dim, num_heads=heads, num_kv_heads=heads,
+                head_dim=cfg.input_local_dim // heads, max_seq_len=cfg.group_size,
+                causal=not cfg.input_full_attention, qk_norm=False, attention_bias=True, o_proj_bias=False,
+                rope_theta=cfg.rope_theta, dtype=self.dtype, precision=self.precision))
         mlp = functools.partial(GatedMLP, hidden_features=cfg.input_local_intermediate_size,
                                 out_features=cfg.input_local_dim, dtype=self.dtype, precision=self.precision)
         for index in range(cfg.input_local_layers):
