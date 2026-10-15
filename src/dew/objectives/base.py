@@ -939,6 +939,30 @@ class Objective(ABC, Generic[Loss, Effects]):
     weights, the batch and the pass's key, or None when the objective scores
     no tokens."""
 
+    _validation_scores: Callable[..., tuple[Loss, Artifacts]] | None = None
+    """One validation batch's loss statistics and the artifacts `evaluate`
+    returns for it, from one scoring of the batch: a pure function of the
+    evaluation weights, the batch and the pass's step in evaluation mode. None
+    when the objective scores the two apart. An objective that declares it
+    returns what `validation_loss` and `evaluate` return, so a subclass that
+    changes either declares its own."""
+
+    def _validation_report(self, variables: Variables, batch: Batch, step: Step, *, loss: bool,
+                           evaluate: bool) -> tuple[Loss | None, Artifacts | None]:
+        """One validation batch's loss statistics where `loss`, and what
+        `evaluate` returns where `evaluate`.
+
+        `variables` are the weights `evaluate` takes; the loss reads their
+        `evaluation_variables`. Where both are asked for and the objective
+        scores them together (`_validation_scores`), the batch is scored once.
+        """
+        weights = self.evaluation_variables(variables, step)
+        if loss and evaluate and self._validation_scores is not None:
+            report = self.program('report', self._validation_scores)
+            return report(weights, batch, replace(step, training=False))
+        statistics = self._validation_loss(weights, batch, step) if loss else None
+        return statistics, self.evaluate(variables, batch, step) if evaluate else None
+
     @property
     def _compiled_scores(self) -> Callable[..., TokenScores]:
         """`_evaluation_scores` compiled for the current modules. Run op by op, the
