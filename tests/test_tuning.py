@@ -3,6 +3,7 @@ program, keyed by bucketed shape, resolved from a pin, a stored pick or a
 heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
+import ast
 import json
 import os
 import shutil
@@ -305,11 +306,12 @@ def widened_checkout(root: Path) -> Path:
     another branch's would."""
     shutil.copytree(REPO_ROOT / "src" / "dew", root / "dew")
     path = root / "dew" / "nn" / "kernels" / "norm_swiglu.py"
-    text = path.read_text()
-    signature = ("    def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, "
-                 "gate: jax.Array | None, *,\n")
-    assert text.count(signature) == 1
-    path.write_text(text.replace(signature, signature + "             shift: None = None,\n"))
+    tree = ast.parse(path.read_text())
+    [kernel] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RmsForward"]
+    [fwd] = [node for node in kernel.body if isinstance(node, ast.FunctionDef) and node.name == "_fwd"]
+    fwd.args.kwonlyargs.insert(0, ast.arg("shift"))
+    fwd.args.kw_defaults.insert(0, ast.Constant(None))
+    path.write_text(ast.unparse(tree))
     return root
 
 
