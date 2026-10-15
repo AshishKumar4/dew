@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, distance
+from reference_error import assert_as_exact_as_the_reference, distance, float64_terms
 from tuned import each_config
 
 from dew.nn import attention
@@ -100,26 +100,30 @@ def compare(functions, operands, seed, labels, *, coefficient=None):
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
     differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
     assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
-    reference, truth = oracles(functions, operands, seed)
-    gated(labels, jax.jit(functools.partial(evaluated, pallas))(operands, seed), reference, truth, seed,
-          coefficient)
+    reference, (truth, terms) = oracles(functions, operands, seed)
+    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+    gated(labels, actual, reference, truth, terms, seed, coefficient)
 
 
 def oracles(functions, operands, seed):
-    """XLA's outputs and gradients, and float64 truth."""
+    """XLA's outputs and gradients, and float64 truth with its terms (`float64`)."""
     xla, _, exact = functions
-    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
+    return jax.jit(functools.partial(evaluated, xla))(operands, seed), float64(exact, operands, seed)
+
+
+def float64(function, operands, seed):
+    """`function`'s outputs and gradients under `seed`, evaluated in float64 on the CPU, and each one's
+    float64 terms (`float64_terms`), what its sums add, by which the gate sizes its rows."""
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
-        truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
-    return reference, truth
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), (operands, seed))
+        return float64_terms(functools.partial(evaluated, function), *wide)
 
 
-def gated(labels, actual, reference, truth, seed, coefficient):
+def gated(labels, actual, reference, truth, terms, seed, coefficient):
     """Every output and gradient within the float64 gate."""
     try:
-        for label, mine, theirs, want in zip(labels, actual, reference, truth, strict=True):
+        for label, mine, theirs, want, summed in zip(labels, actual, reference, truth, terms, strict=True):
             if mine is None:
                 assert theirs is None and want is None
                 continue
@@ -129,7 +133,7 @@ def gated(labels, actual, reference, truth, seed, coefficient):
                 assert_scale_accumulation(mine, theirs, coefficient, seed)
             elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
-            assert_as_exact_as_the_reference(mine, theirs, want, label)
+            assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
     except AssertionError as error:
         report = rounding_report(labels, actual, reference, truth)
         print(report, flush=True)
@@ -201,7 +205,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
                         "wide rows": lambda: norm_operands((7, 4096), dtype, jnp.float32),
                         "narrow rows": lambda: norm_operands((4099, 256), dtype, jnp.float32)}[operands]()
     functions = norm_functions(dtype, offset=True, after_cast=True)
-    reference, truth = oracles(functions, (x, scale), seed)
+    reference, (truth, terms) = oracles(functions, (x, scale), seed)
     configs = each_config(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
     assert len(configs) > 1
     for config in configs:
@@ -210,7 +214,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
             # The factors this config's forward rounded, which its weight gradient sums.
             coefficient = scale_coefficient(x, dtype, after_cast=True)
         try:
-            gated(("y", "x", "scale"), actual, reference, truth, seed, coefficient)
+            gated(("y", "x", "scale"), actual, reference, truth, terms, seed, coefficient)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -225,14 +229,14 @@ def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
     xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
-    reference, truth = oracles((xla, pallas, xla), operands, seed)
+    reference, (truth, terms) = oracles((xla, pallas, xla), operands, seed)
     configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
     assert len(configs) > 1
     for config in configs:
         with tuning.pinned({kernel: config}):
             actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
         try:
-            gated(("y", "gate", "up"), actual, reference, truth, seed, None)
+            gated(("y", "gate", "up"), actual, reference, truth, terms, seed, None)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -246,13 +250,11 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     xla, pallas, exact = norm_functions(jnp.bfloat16, offset=True, after_cast=True)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
-        truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
+    truth, terms = float64(exact, operands, seed)
     try:
-        for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
-            assert_as_exact_as_the_reference(mine, theirs, want, label)
+        for label, mine, theirs, want, summed in zip(("y", "x", "scale"), actual, reference, truth, terms,
+                                                     strict=True):
+            assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
             if label == "scale":
                 assert_scale_accumulation(mine, theirs, scale_coefficient(
                     operands[0], jnp.bfloat16, after_cast=True), seed)
@@ -296,25 +298,22 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
     assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, seed))
     reference = jax.jit(functools.partial(evaluated, stream_seam("xla", dtype, joined)))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, fused))(operands, seed)
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
-        truth = evaluated(stream_seam("xla", jnp.float64, joined), wide,
-                          jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), seed))
+    truth, terms = float64(stream_seam("xla", jnp.float64, joined), operands, seed)
     (stream, normed), *gradients = actual
     (reference_stream, reference_normed), *reference_gradients = reference
     np.testing.assert_array_equal(stream, reference_stream)
     labels = ("y", "x", "branch", "scale")
-    for label, mine, theirs, want in zip(labels, (normed, *gradients),
-                                         (reference_normed, *reference_gradients),
-                                         (truth[0][1], *truth[1:]), strict=True):
+    for label, mine, theirs, want, summed in zip(labels, (normed, *gradients),
+                                                 (reference_normed, *reference_gradients),
+                                                 (truth[0][1], *truth[1:]), (terms[0][1], *terms[1:]),
+                                                 strict=True):
         if label == "branch" and not joined:
             assert not np.any(np.asarray(mine)) and not np.any(np.asarray(theirs))
             continue
         assert mine.dtype == theirs.dtype, label
         if label == "scale":
             assert_scale_accumulation(mine, theirs, scale_coefficient(stream, dtype, after_cast=True), dy)
-        assert_as_exact_as_the_reference(mine, theirs, want, label)
+        assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
 
 
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
@@ -336,13 +335,11 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
     assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, dy))
     reference = jax.jit(functools.partial(evaluated, gated("xla", dtype)))(operands, dy)
     actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
-        truth = evaluated(gated("xla", jnp.float64), wide, jnp.asarray(np.asarray(dy, np.float64)))
-    for label, mine, theirs, want in zip(("y", "x", "gate", "scale"), actual, reference, truth, strict=True):
+    truth, terms = float64(gated("xla", jnp.float64), operands, dy)
+    for label, mine, theirs, want, summed in zip(("y", "x", "gate", "scale"), actual, reference, truth, terms,
+                                                 strict=True):
         assert mine.dtype == theirs.dtype, label
-        assert_as_exact_as_the_reference(mine, theirs, want, label)
+        assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
