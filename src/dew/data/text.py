@@ -115,7 +115,7 @@ def load_tokenizer(name: str, *, revision: str | None = None,
             from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
             stated = get_tokenizer_config(name, revision=revision, local_files_only=local_files_only)
-            renamed = RENAMED_TOKENIZERS.get(stated.get("tokenizer_class"))
+            renamed = RENAMED_TOKENIZERS.get(str(stated.get("tokenizer_class")))
             reader = AutoTokenizer if renamed is None else getattr(transformers, renamed)
             loaded = reader.from_pretrained(name, revision=revision, local_files_only=local_files_only)
             # from_pretrained's annotation names classes transformers binds
