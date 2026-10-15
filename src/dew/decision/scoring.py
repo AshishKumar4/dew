@@ -9,7 +9,9 @@ over a validation pass's `Decisions`. Rules can be added and scaled, as in
 `LogLoss() + 0.5 * Brier()`.
 
 The charge is against a target distribution t over the row's options,
-one-hot or smoothed, and is zero for a certain, correct forecast.
+one-hot or soft, smoothed in training, and is zero for a certain, correct
+forecast of a certain target. A held-out pass charges each question's gold
+distribution, as its training does.
 """
 
 import functools
@@ -54,8 +56,7 @@ class ScoringRule(ABC):
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         answered = Answered.of(artifact)
         logits = np.log(np.clip(answered.probabilities, 1e-300, None))
-        target = np.eye(answered.options.shape[-1])[answered.labels]
-        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(target),
+        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(answered.targets),
                                          jnp.asarray(answered.options), jnp.asarray(answered.ordinal)),
                              np.float64)
         return float(charged.sum()), float(charged.size)

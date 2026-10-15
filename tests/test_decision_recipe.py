@@ -76,6 +76,34 @@ def test_a_named_validation_split_reads_the_source_s_own_split():
         Decisions(source=Memory(train), validation=Split("validation"), question="team").pipelines()
 
 
+def test_a_tables_own_integer_labels_name_their_options_by_value():
+    """A flat table whose options are its label column's own values: every
+    label names the option of its value, the integers 2 and 10 included,
+    rather than the option at that position. The options sort as text."""
+    from dew.config.data import loader
+    from dew.data.dataset import DataPartition
+    from dew.data.text import ByteTokenizer
+    from dew.decision import Specials
+    from dew.decision.layout import StateFirstLayout
+    from dew.decision.objective import DecisionObjective
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    rows = [{"text": f"row {index}", "label": 10 if index < 3 else 2} for index in range(8)]
+    layout = StateFirstLayout(max_len=64, head_max_len=32, option_tokens=4)
+    objective = DecisionObjective(
+        CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                          max_seq_len=layout.max_len),
+        tokenizer=ByteTokenizer(), specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
+                                                     pad=255),
+        layout=layout, shuffle_options=False)
+    data = loader(Decisions(source=rows, validation=rows), batch=8, read="memory", objective=objective.data())
+    (batch,) = list(data.val(DataPartition()))
+    scored = batch["scored"].ravel()
+    labels = [int(label) for label, real in zip(batch["labels"].ravel(), scored, strict=True) if real]
+    # Options ("10", "2"): the three tens are option 0 and the five twos option 1.
+    assert sorted(labels) == [0, 0, 0, 1, 1, 1, 1, 1]
+
+
 def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
     """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
     weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
