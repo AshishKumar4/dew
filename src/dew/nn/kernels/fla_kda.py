@@ -871,12 +871,29 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans)
 
 
+def first_decay_grad(dg, h0, dh0, spans: Sequences):
+    """`dg` `[B, T, HV, K]`, the decay's gradient summed back over each chunk, with each sequence's
+    first token's taken from the memory its decay scales: `<h0, dh0>` over the values for a row's
+    first sequence, and exactly zero for any other, which starts from no memory. Summed back, that
+    token's gradient is every term of its chunk, which cancel to fp32's residue where the memory is
+    zero (2.7e-11 on a zero initial memory, as a float64 recurrence and the portable math hold
+    exactly). The gated delta rule's port sums each token's own terms instead
+    (`fla_gdn._summed_back`), which give it exactly."""
+    batch, length = dg.shape[:2]
+    first, count = spans.spans[:, 0], spans.spans[:, 1]
+    shared = jnp.sum(h0.astype(jnp.float32) * dh0, axis=-1)
+    value = jnp.where((first % length == 0)[:, None, None], shared[first // length], 0.0)
+    flat = dg.reshape(batch * length, *dg.shape[2:])
+    index = jnp.where(count > 0, first, batch * length)
+    return flat.at[index].set(value.astype(dg.dtype), mode='drop').reshape(dg.shape)
+
+
 def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     """fla's `chunk_kda_bwd` (fla/ops/kda/chunk_bwd.py:434-615): `w`, `u`, the gated queries and keys
     and the memory recomputed, then `dAqk` and the values' local gradient, the reverse recurrence
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
-    each chunk, each sequence's first token's from its memory (`fla_gdn.first_decay_grad`)."""
+    each chunk, each sequence's first token's from its memory (`first_decay_grad`)."""
     q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
@@ -891,7 +908,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
-    dg = fla_gdn.first_decay_grad(fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels), h0, dh0, spans)
+    dg = first_decay_grad(fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels), h0, dh0, spans)
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
