@@ -24,8 +24,10 @@ a batch read in parts, reads one set of copies through its window and
 rewrites them as it commits. Each microbatch's gradient is widened as it is
 pooled, so the window sums in fp32 as it does without copies.
 
-Where: `gpu_target().kernels['narrow_copies']`, the CUDA generations it was measured to
-pay on (docs/performance.md). A TPU fuses the cast into the matmul, so the
+Where: on every GPU, where XLA runs each such cast as a kernel of its own
+apart from the matmul; a generation's row names `KERNELS['narrow_copies']`
+'off' only where a measurement says the copies cost more than they save
+(docs/performance.md). A TPU fuses the cast into the matmul, so the
 copy there only adds writes. The gradients are the cast's on split meshes
 as partitioned for the CPU (tests/test_narrow.py); a multi-GPU run over
 NCCL has not been measured, so its first should compare a few steps
