@@ -226,7 +226,8 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
 
 
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None) -> None:
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
+                           rows: bool = True) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
@@ -240,8 +241,11 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
     bias's gradient does under the softmax's shift invariance, is held to
     its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's worst row is held
-    to the reference's too (`ROW_FACTOR`)."""
+    signs are independent keeps about its own. Each leaf's rows are held to
+    the reference's too (`rows_over`), unless `rows` is false: after a
+    second training step a row inherits the first step's rounding through
+    the parameters it reads, which its own terms do not see, so such a
+    comparison holds each tensor alone and its first step holds the rows."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -256,7 +260,8 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
         # Each row over its own terms where they are given, the order floor in those units.
         over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)]
+                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
+                             if rows else ())]
     assert not over, "\n".join(over)
 
 
