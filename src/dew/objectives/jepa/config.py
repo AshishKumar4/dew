@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import ImageData, VideoData, loader
+from dew.config.data import ImageData, VideoData
 from dew.inputs import Field
 from dew.registry import models
 
@@ -62,10 +62,7 @@ class JepaRunConfig(RunConfig):
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
-        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
-                       read=self.data_read,
-                       provision=self.provision, seed=self.data_seed, loading=self.loading,
-                       validation_records=self.validation_records)
+        dataset = self.loader(None)
         sample = self.sample()
         video = sample.key == "video"
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
