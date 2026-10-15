@@ -12,7 +12,7 @@ from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path, head_width
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -39,11 +39,9 @@ class Qwen35Vision(TowerBase):
     num_position_embeddings: int = 2304
 
     def layout(self) -> ViTLayout:
-        if self.hidden_size % self.num_heads:
-            raise ValueError(f"hidden_size ({self.hidden_size}) must split over num_heads ({self.num_heads})")
         return ViTLayout(
             depth=self.depth, hidden_size=self.hidden_size, num_heads=self.num_heads,
-            num_kv_heads=self.num_heads, head_dim=self.hidden_size // self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
             intermediate_size=self.intermediate_size, activation=TOWER_ACTIVATIONS[self.hidden_act],
             in_channels=self.in_channels, patch_size=self.patch_size,
             temporal_patch_size=self.temporal_patch_size, spatial_merge_size=self.spatial_merge_size,

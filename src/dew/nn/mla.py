@@ -16,7 +16,7 @@ frequencies (`dew.nn.rope`).
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -700,6 +700,23 @@ class MultiHeadLatentAttention(nn.Module):
         return checkpoint_name(self.o_proj(context), 'o_proj')
 
 
+def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
+    """What a latent attention does not run of its layer's context: the
+    attention policies it is asked (`MixerContext.policies`), the standard
+    attention's value norm, keys as values, window, chunk, score scale and
+    partial rotation, and a cache other than its latents."""
+    return {
+        **ctx.policies(),
+        "v_norm": ctx.v_norm,
+        "k_eq_v": ctx.k_eq_v,
+        "sliding_window": ctx.sliding_window,
+        "attention_chunk": ctx.attention_chunk,
+        "attention_scale": ctx.attention_scale,
+        "partial_rotary_factor": ctx.partial_rotary_factor,
+        "kv_cache": ctx.kv_cache != KVCache(),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
@@ -740,17 +757,10 @@ class MLAMixer(MixerBase):
         return self.index_topk is not None
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        ctx.refuse("mla", {
-            **ctx.policies(),
-            "v_norm": ctx.v_norm,
-            "k_eq_v": ctx.k_eq_v,
-            "sliding_window": ctx.sliding_window,
-            "attention_chunk": ctx.attention_chunk,
-            "attention_scale": ctx.attention_scale,
-            "partial_rotary_factor": ctx.partial_rotary_factor,
-            "kv_cache": ctx.kv_cache != KVCache(),
-        }, "the latent attention scales by its head dims and the yarn mscale, rotates its rope head "
-           "whole, attends the whole sequence with an fp32 softmax and norms its latents, not its values")
+        ctx.refuse("mla", latent_refusals(ctx),
+                   "the latent attention scales by its head dims and the yarn mscale, rotates its rope head "
+                   "whole, attends the whole sequence with an fp32 softmax and norms its latents, not its "
+                   "values")
         if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
