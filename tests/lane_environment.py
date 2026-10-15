@@ -11,14 +11,24 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
-REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0")
+REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0",
+                        "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
-ops order the reductions. Autotuning off is a precaution: XLA picks GEMM and
-convolution kernels at compile time by live timing, which can differ between
-compilations (openxla.org/xla/determinism). Two LADD runs on an RTX 4080
-diverged under deterministic ops alone, but 20 fresh DiT processes did not,
-so that cause is unconfirmed. The precaution costs a test lane nothing that
-matters; in training it cost 8% on a 176M DiT step (docs/guides/checkpoints.md)."""
+ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
+the configuration it was emitted with, so no process chooses one; and such
+a run keeps no stored picks (`dew.cache.keeps_picks`), which XLA and Dew's
+kernels would take instead. Deterministic ops take Triton out of the GEMM
+configurations (`GetEnabledBackends` in
+xla/service/gpu/autotuning/config_assigner_pass.cc) while XLA still fuses
+dots for Triton, and the mean-flow hybrid DiT's jvp dot over a
+concatenation then had no configuration ("No supported config found");
+with Triton GEMMs off every dot is a cuBLAS call from the start. With
+Triton GEMMs off and autotuning on, eight processes sharing the H100 failed
+five tests that pass alone (a cuDNN engine index refused, a reload's logits
+not bitwise), which reads as configurations chosen under contention; it was
+not proven. Autotuning off leaves an fp8 convolution's emitted
+configuration, which cuDNN refuses on an H100, so that test compiles in its
+own process without it (tests/test_quantization.py)."""
 
 
 def configure_lane(environ: MutableMapping[str, str]) -> None:
