@@ -374,8 +374,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         keep = jax.random.bernoulli(keep_key, jnp.broadcast_to(1 - time, response.shape), mode="high")
         noise = jax.random.randint(noise_key, response.shape, 0, self.model.vocab_size)
         noisy = jnp.where(keep, response, noise)
-        valid_canvases = canvas_mask[:, ::self.canvas_size].sum(axis=-1)
-        selected = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
+        eligible = canvas_mask.reshape(response.shape[0], self.num_canvases, self.canvas_size).any(axis=-1)
+        valid_canvases = eligible.sum(axis=-1)
+        rank = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
+        selected = jnp.argmax(jnp.cumsum(eligible, axis=-1) > rank[:, None], axis=-1)
         return noisy, selected, sc_key
 
     def _encoder_targets(self, batch: Batch, tokens: jax.Array, validity, full_valid: jax.Array,
