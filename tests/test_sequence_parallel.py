@@ -230,11 +230,12 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
     including the keys a later layer shares. Both must read the same table.
     """
     from dew.nn.inputs import AttentionMetadata, coordinates as token_coordinates
+    from dew.nn.mixer_base import MixerContext
     from dew.nn.mixers.attention import CausalSelfAttention
 
-    plain = CausalSelfAttention(emb_features=16, num_heads=2, num_kv_heads=1,
-                                head_dim=128, max_seq_len=4096, rope_theta=5e5,
-                                partial_rotary_type="default", kv_store_key="shared")
+    plain = CausalSelfAttention(MixerContext(emb_features=16, num_heads=2, num_kv_heads=1, head_dim=128,
+                                             max_seq_len=4096, rope_theta=5e5, partial_rotary_type="default",
+                                             kv_store_key="shared"))
     multimodal = plain.clone(mrope_section=(16, 24, 24))
     hidden = jax.random.normal(jax.random.key(1), (1, 3, 16))
     positions = jnp.asarray([[0, 1, 4093]], jnp.int32)
