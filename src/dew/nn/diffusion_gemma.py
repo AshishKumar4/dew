@@ -226,6 +226,11 @@ class DiffusionGemma(nn.Module):
         return None if text is None else self.clone(text=text)
 
     @nn.nowrap
+    def recompute_half(self) -> Self | None:
+        text = self.text.recompute_half()
+        return None if text is None else self.clone(text=text)
+
+    @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         return self.clone(text=self.text.restore_recompute(record))
 

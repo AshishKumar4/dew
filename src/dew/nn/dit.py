@@ -422,6 +422,10 @@ class RematLadder(nn.Module):
         return None if stronger is None else self.clone(remat=stronger)
 
     @nn.nowrap
+    def recompute_half(self) -> Self | None:
+        return None
+
+    @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         restored = restored_remat(self.remat, record)
         return self if restored is None else self.clone(remat=restored)
