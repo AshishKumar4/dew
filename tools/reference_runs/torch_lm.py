@@ -84,7 +84,10 @@ def arguments(argv=None) -> argparse.Namespace:
                         help="torch.compile each decoder layer, the final norm and head, and the loss")
     parser.add_argument("--router-aux", type=float, default=None,
                         help="MoE: weight of the per-layer Switch balance loss (moe_aux)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.documents is not None:
+        parser.error("torch_lm.py trains whole rows; packed documents run in dew_lm.py and megatron_lm.py")
+    return args
 
 
 def moe_aux(router_logits, active: int, distributed: bool) -> torch.Tensor:
