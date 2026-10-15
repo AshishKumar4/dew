@@ -171,11 +171,14 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
     size against the reference's worst, at least `floor` (an order floor in
     those units), and each of size zero, a sum that cancels exactly before
     anything its terms see (a query that keeps one key), against the
-    reference's distance on that same row or element, which is all the
-    evidence it has: where the reference is exactly the float64 zero, Dew
-    must be too. An element is held as a row is: a wrong element of a long
-    row, or of a value of rank one, moves its row's RMS by little and
-    itself by as much as it is wrong."""
+    reference's distance on that same row, which is all the evidence it
+    has: where the reference is exactly the float64 zero, Dew must be too.
+    An element is held as a row is: a wrong element of a long row, or of a
+    value of rank one, moves its row's RMS by little and itself by as much as
+    it is wrong. An element of size zero is held to the reference's worst
+    such element instead of its own: one rounding against another, with no
+    row's mean to settle them, part by any ratio, and where the reference
+    computes every such element exactly Dew must too."""
     over = []
     for name, elements in (("row", False), ("element", True)):
         sizes, mine = row_errors(dew, truth, terms, elements=elements)
@@ -187,7 +190,8 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
             if not within(worst, ROW_FACTOR * max(their_worst, floor)):
                 over.append(f"the worst {name} is {worst:.3e} from float64 over its size, the reference's "
                             f"{their_worst:.3e}, allowed {ROW_FACTOR * max(their_worst, floor):.3e}")
-        zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
+        unsized = theirs[~sized]
+        zero = ~sized & ~(mine <= ROW_FACTOR * (np.max(unsized) if elements and unsized.size else theirs))
         if zero.any():
             at = int(np.flatnonzero(zero)[0])
             over.append(f"{int(zero.sum())} {name}s of float64 zero are further from it than the reference's "
