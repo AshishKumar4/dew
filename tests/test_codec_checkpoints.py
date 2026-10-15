@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights
@@ -37,7 +37,8 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
         ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits")
+    _, terms = float64_forward(loaded.model, loaded.variables, ids)
+    assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits", terms=terms)
     np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(expected, -1))
     loaded.save(tmp_path)
     assert_same_stored_tensors(read_weights(tmp_path), read_weights(directory))
