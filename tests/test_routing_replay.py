@@ -228,7 +228,8 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     second = Call((1, 2, 3, 4, 5, 6), (7, 8), (-.3, -.4), "stop", 1, routed_experts=later_routes)
     batch = pack([Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.)], SEQ_LEN + 1)
     sampled = batch["response_mask"] != 0
-    scored = np.asarray(grpo.packed_log_probs(params, batch))[sampled]
+    order = np.argsort(batch["call_index"][sampled], kind="stable")
+    scored = np.asarray(grpo.packed_log_probs(params, batch))[sampled][order]
     expected = []
     for call in (first, second):
         assert call.routed_experts is not None
@@ -239,8 +240,8 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
         direct = np.asarray(replayed_log_probs(obj, params, ids, (routes, None)))
         expected.extend(direct[0, len(call.prompt_ids) - 1:size - 1].tolist())
     np.testing.assert_allclose(scored, expected, rtol=1e-5, atol=1e-6)
-    np.testing.assert_array_equal(batch["behavior_log_probs"][sampled], np.array([-.1, -.2, -.3, -.4],
-                                                                              np.float32))
+    np.testing.assert_array_equal(batch["behavior_log_probs"][sampled][order],
+                                  np.array([-.1, -.2, -.3, -.4], np.float32))
     assert len(np.unique(batch["text_segment_ids"][sampled])) == 2
 
 
