@@ -27,6 +27,16 @@ if TYPE_CHECKING:
 _load_lock = threading.Lock()
 _loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
 
+RENAMED_TOKENIZERS: Mapping[str, str] = {
+    # Dream-org/Dream-v0-Base-7B's tokenization_dream.py at 6572adb5 is transformers 4.46's
+    # tokenization_qwen2.py with the class renamed, line for line; under 5.16.1 the two encode the
+    # same ids, special tokens and the mask included.
+    "DreamTokenizer": "Qwen2Tokenizer",
+}
+"""Tokenizer classes a release ships as remote code that are a transformers
+class under another name: `load_tokenizer` loads such a release with that
+class, and runs none of the release's code."""
+
 
 _TOKENIZER_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]
 """The files a tokenizer's loader can read: its vocabulary, merges and templates."""
@@ -81,7 +91,9 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     """The HF tokenizer of a hub repo or local directory, loaded once per process.
 
     Every Dew path that needs an HF tokenizer loads it here, so one name at
-    one revision is one object however many readers share it.
+    one revision is one object however many readers share it. A release whose
+    tokenizer is a transformers class renamed in its own remote code loads as
+    that class (`RENAMED_TOKENIZERS`).
     """
     repo, separator, pinned = name.rpartition("@")
     if separator and not Path(name).exists():
@@ -98,10 +110,14 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     with _load_lock:
         held = _loaded.get(key)
         if held is None:
+            import transformers
             from transformers import AutoTokenizer, PreTrainedTokenizerBase
+            from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
-            loaded = AutoTokenizer.from_pretrained(
-                name, revision=revision, local_files_only=local_files_only)
+            stated = get_tokenizer_config(name, revision=revision, local_files_only=local_files_only)
+            renamed = RENAMED_TOKENIZERS.get(stated.get("tokenizer_class"))
+            reader = AutoTokenizer if renamed is None else getattr(transformers, renamed)
+            loaded = reader.from_pretrained(name, revision=revision, local_files_only=local_files_only)
             # from_pretrained's annotation names classes transformers binds
             # to None without their backend, so its result is untyped until here.
             if not isinstance(loaded, PreTrainedTokenizerBase):
