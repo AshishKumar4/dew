@@ -26,6 +26,8 @@ does the history it caches, `[B, K-1, D]`.
 value head.
 """
 
+import contextlib
+import contextvars
 import functools
 from collections.abc import Sequence
 from typing import ClassVar, overload
@@ -810,6 +812,23 @@ a document excludes its first token's decay, and the compensated halves (`chunk_
 its precision below the shifted prefix."""
 
 
+RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
+"""The residuals a decoder block's remat rung has the layers that compute them recompute, the block
+keeping every other (`dew.nn.backbones.decoder_block.RematPolicy.recompute`): a delta rule traced
+inside recomputes its memory in its backward where this names 'delta_memory' (`_blocked_rule`),
+and keeps it otherwise. A block sets it as it traces its layers (`recomputing`)."""
+
+
+@contextlib.contextmanager
+def recomputing(names: tuple[str, ...]):
+    """Trace the layers inside with `names` recomputed by the layers that compute them (`RECOMPUTED`)."""
+    token = RECOMPUTED.set(names)
+    try:
+        yield
+    finally:
+        RECOMPUTED.reset(token)
+
+
 def _blocked_rule(query, key, value, g, beta, state, starts):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
@@ -821,7 +840,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     every padded product is an exact zero. The outputs are cut back. A packed
     document's first token (`starts`) forgets the memory (`FORGET`). The
     decay's shape picks the port: per head fla's gated delta rule, per key
-    dimension its Kimi delta attention."""
+    dimension its Kimi delta attention. It keeps its memory for the backward
+    but where the block's remat rung recomputes it (`RECOMPUTED`)."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -850,7 +870,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     g = jnp.where(starts.reshape(B, S, *(1,) * (g.ndim - 2)), jax.lax.stop_gradient(g) + FORGET, g)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, None, scale, CHUNK_SIZE,
-                      not generation.triton_runs())
+                      not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get())
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]

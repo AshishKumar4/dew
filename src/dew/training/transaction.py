@@ -333,7 +333,7 @@ class Transaction:
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
-        return variables, batch, step_info
+        return forward_variables(variables, state.compute), batch, step_info
 
     @staticmethod
     def unscaled(gradient, factor):
@@ -419,6 +419,14 @@ class Transaction:
         def commit(current):
             return self.commit(current, gradient, effects, qk)
 
+        def recopied(current):
+            # A window of several microbatches reads one set of copies
+            # throughout and rewrites them only as it commits.
+            committed, native_finite, norm = commit(current)
+            if committed.compute is not None:
+                committed = dataclasses.replace(committed, compute=narrowed(committed.variables, self.copies))
+            return committed, native_finite, norm
+
         due = pending.due & pending.active & accepted
         if self.size == 1:
             committed, native_finite, norm = commit(numerical)
@@ -430,7 +438,7 @@ class Transaction:
             # The window goes round the commit, which never reads it: a
             # conditional copies what it passes through.
             numerical, native_finite, norm = _only_when(
-                due, commit, lambda x: (x, jnp.asarray(a=True), zero),
+                due, recopied, lambda x: (x, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
         finite = finite & native_finite
@@ -468,7 +476,7 @@ class Transaction:
             numerical = dataclasses.replace(
                 numerical, accumulation=dataclasses.replace(window, gradient=candidate.gradient))
         advanced = _chosen(accepted, numerical, state)
-        if advanced.compute is not None:
+        if self.size == 1 and advanced.compute is not None:
             # The copies are the cast of whichever parameters were chosen, so
             # they are cast after the choice. Choosing between the new and the
             # old copies reads the old ones, two bytes a parameter that the
@@ -507,11 +515,12 @@ class Transaction:
             realized = realize(forward_variables(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             gradient = realized.pullback(cotangent)
-            if state.compute is None:
+            if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
             # and a copied parameter's gradient stays bf16 until the update
-            # widens it as it reads it.
+            # widens it as it reads it. A window of several microbatches
+            # widens it as it pools it, so the window sums in fp32.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)
 
             def replay(_):

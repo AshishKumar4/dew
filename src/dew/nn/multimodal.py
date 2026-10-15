@@ -498,6 +498,11 @@ class MultimodalTransformer(nn.Module):
         return None if language_model is None else self.clone(language_model=language_model)
 
     @nn.nowrap
+    def recompute_half(self) -> Self | None:
+        language_model = self.language_model.recompute_half()
+        return None if language_model is None else self.clone(language_model=language_model)
+
+    @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         return self.clone(language_model=self.language_model.restore_recompute(record))
 
