@@ -74,7 +74,7 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
-from dew.registry import wrapper_layers, wrapping
+from dew.registry import wrapper_layers
 from dew.training.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -650,11 +650,11 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
             return _record(branch.targets, branch.rslora, branch.dropout, layouts)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch), wrapping():
+            with nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch), wrapping():
+            with nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 

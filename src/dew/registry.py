@@ -952,26 +952,6 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
     return fields
 
 
-WRAPPED: contextvars.ContextVar[bool] = contextvars.ContextVar("wrapped", default=False)
-"""Whether the model being applied or initialised computes under a wrapper
-(`WrapperClass`), which intercepts its layers' own calls: an adapter's
-branch, an input quantization or Qwix's. A layer that would compute several
-of those calls as one (`dew.nn.joined`) makes each call instead. Every
-wrapper class sets it around its `apply` and `init_with_output` (`wrapping`);
-it is a flag of the call, since a scanned stack's layers reach no parent the
-wrapper class could be read from."""
-
-
-@contextlib.contextmanager
-def wrapping() -> Iterator[None]:
-    """Within the block, `WRAPPED` holds: a wrapper class's model computes."""
-    token = WRAPPED.set(True)
-    try:
-        yield
-    finally:
-        WRAPPED.reset(token)
-
-
 @runtime_checkable
 class Wrapper(Protocol):
     """A record that wraps a module in a class of its own and makes that

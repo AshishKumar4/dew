@@ -17,9 +17,22 @@ import numpy as np
 from flax import linen as nn
 from flax.core import meta
 
-from ..registry import WRAPPED
+from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 from .sharding import LogicalAxes, constrain, logical_spec, mesh_axes
+
+
+def _intercepted() -> bool:
+    """Whether the running call is a wrapped model's (`dew.registry.WrapperClass`: an adapter, an
+    input quantization, Dew's Qwix training) or a Qwix-quantized one's, which intercept their
+    layers' own calls. It reads the outermost module whose method is running: Flax keeps them on
+    a stack, which its lifted transforms (`nn.scan`) leave whole where a scanned layer's parents
+    stop at the scan, and which no public call reads; Qwix reads it the same way
+    (qwix/_src/model.py, `_is_in_nn_module`)."""
+    from flax.linen.module import _context
+
+    root = type(next(module for module in _context.module_stack if module is not None))
+    return bool(wrapper_layers(root)[1]) or any("_unquantized_type" in vars(layer) for layer in root.__mro__)
 
 
 def _kernel(projection: nn.Module) -> jax.Array:
@@ -52,7 +65,7 @@ def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[Logical
         (len({(projection.use_bias, projection.dtype, projection.precision, projection.promote_dtype)
               for projection in projections}) == 1,
          "the projections differ in bias, dtype, precision or promotion"),
-        (not WRAPPED.get(),
+        (not _intercepted(),
          "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
          "projection's own call"),
         (all(projection.has_variable('params', 'kernel') for projection in projections),
