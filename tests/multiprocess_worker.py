@@ -75,7 +75,7 @@ def make_objective():
                                    mlp_ratio=1)
             self.ema = EMASpec(decay=optax.constant_schedule(0.999))
 
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
         def loss(self, variables, batch, step):
@@ -1058,7 +1058,7 @@ def _evaluation_parts(case: _EvaluationCase):
     from dew.objectives.base import Aux, Objective
 
     class Numerical(Objective):
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return {"params": {"offset": jnp.zeros(())}}
 
         def loss(self, variables, batch, step):
@@ -1214,7 +1214,7 @@ def mode_evaluation_replicas(args) -> dict:
     from dew.training import MeshSpec, Trainer
 
     class Rows(Objective):
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return {"params": {"offset": jnp.zeros(())}}
 
         def loss(self, variables, batch, step):
@@ -2226,7 +2226,7 @@ def mode_host_training(args) -> dict:
     from dew.training.host import companion_mesh
 
     class Coupled(Objective):
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return {"params": {"small": jnp.ones(8), "large": jnp.ones(16)}}
 
         def loss(self, variables, batch, step):
