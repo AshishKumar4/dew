@@ -151,16 +151,27 @@ class KernelOp(tokamax.Op):
             config = (pin if pin in keyed.autotuning_configs
                       else ba.heuristics_config if pick is None else pick.fastest_config)
         if cache.KERNEL_LAUNCHES.value:
-            return tokamax.Op.__call__(self.replace(config=config), *args, **kwargs)
+            # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
+            # each traced array for its devices (`keyed`).
+            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *args, **kwargs)
         return self._fwd(*args, config=config, **kwargs)[0]
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
-        """`ba` with its token-counted arguments at its key's shapes, where its
-        space, heuristic and measurement are read: every shape a key covers
-        shares one space, so a pick holds for each."""
-        return tokamax.BoundArguments(self.replace(config=None, vjp=None), {
-            name: _bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
-            if name in self.ROWS and value is not None else value for name, value in ba.arguments.items()})
+        """`ba` as its key reads it, where its space, heuristic and measurement
+        are read: its arrays as their shapes and dtypes, as tokamax keys them,
+        the token-counted ones at their key's shapes, so a pick holds for every
+        shape a key covers, and the op as its picks name it (`_identity`).
+        A launch's GPU model is then read from the context, never from a
+        traced array: asking one for its devices raises an error that walks
+        the whole trace to say where the array came from, which was 111 s of
+        the packed Qwen3.5-0.8B step's 330 s compile on an A100 (ledger 554)."""
+        def shaped(name: str, value):
+            if name in self.ROWS and value is not None:
+                return _bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
+            return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                                if isinstance(leaf, jax.Array) else leaf, value)
+        return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
+                                                        for name, value in ba.arguments.items()})
 
     def _nearest(self, ba: tokamax.BoundArguments) -> AutotuningData | None:
         """The pick measured for the stored key nearest `ba`'s: every argument
@@ -196,7 +207,7 @@ class KernelOp(tokamax.Op):
                 for key, picks in _stored_picks(kind).items():
                     _PICKS.setdefault(key, _Picks()).update(picks)
                 _LOADED.add(kind)
-            return _PICKS.setdefault((self.replace(config=None, vjp=None), kind), _Picks())
+            return _PICKS.setdefault((_identity(self), kind), _Picks())
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
@@ -210,10 +221,16 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+def _identity(op: tokamax.Op) -> tokamax.Op:
+    """`op` as its picks name it: without the config, the vjp and the device
+    check a call sets."""
+    return op.replace(config=None, vjp=None, bypass_device_check=False)
+
+
 def _kind(ba: tokamax.BoundArguments) -> str:
-    """The GPU model `ba`'s launch is chosen for, as tokamax reads it: its
-    arrays', else the context mesh's (`Trainer.lower_for`'s abstract GPU),
-    else the default device's."""
+    """The GPU model the keyed launch `ba` (`keyed`) is chosen for, as tokamax
+    reads it: the context mesh's (`Trainer.lower_for`'s abstract GPU), else
+    the default device's."""
     return infer_device_kind(ba) or get_default_device().device_kind
 
 
@@ -356,7 +373,7 @@ def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     stored, _ = _read(cache.kernel_picks_path(kind))
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
     for op, key, fastest in _kernel_launches(stored):
-        picks.setdefault((op.replace(config=None, vjp=None), kind), _Picks())[key] = fastest
+        picks.setdefault((_identity(op), kind), _Picks())[key] = fastest
     return picks
 
 
