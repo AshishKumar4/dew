@@ -34,6 +34,10 @@ reverse after "/" with the forward recomputed or after ";" alone, in us.
     gated norm              59 ; 149       52 ; 101       53 ; 105       51 ; 96
     SwiGLU                  113 ; 171      87 ; 147       88 ; 146       88 ; 147
 
+A packed projection's `[..., 2, H]` output takes SwiGLU's own launch
+(`packed_swiglu`), which reads both halves and writes their gradient where
+the projection put them, so a joined gate and up GEMM costs no copy.
+
 In that fine-tune's profiled step the norms took 19.0 ms on the A100 and 18.6
 ms on the H100 SXM under XLA and 15.4 and 13.7 fused; SwiGLU 12.7 and 16.0
 against 12.4 and 13.6. The gated norm's reverse is the one behind its bar
@@ -87,6 +91,12 @@ ROW_BLOCKS = 12
 partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
 ELEMENT_BLOCK = 1024
+PACKED_BLOCK = 4096
+"""The packed SwiGLU's heuristic columns a program. Over every config of its space at Qwen3.5-0.8B's
+24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the fastest
+forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the apart
+kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
+512 columns, the largest power of two dividing the width, lost 3 to 10%."""
 
 
 def _row_block(width: int) -> int:
@@ -285,23 +295,38 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
     ) or _norm_refusal(x, scale, dtype, axes, (gate,)))
 
 
-def swiglu_kernel(implementation: str, gate, up, *, axes=None, packed: bool = False) -> str:
+def _swiglu_refusal(operands, axes) -> str | None:
+    """Why the SwiGLU kernels cannot take `operands`, or None."""
+    return first_refusal(
+        (not any(isinstance(operand, JVPTracer) for operand in operands),
+         "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
+        (_placed(axes, operands, whole_last=False),
+         "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that checks "
+         "varying axes holds them, and a Pallas call states no varying type"),
+    )
+
+
+def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
-    arithmetic; broadcasting or mixed operand dtypes also stay there, and so
-    do a packed projection's halves, which XLA reads in place.
+    arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
     return _selected('swiglu', implementation, first_refusal(
-        (not packed, "the gate and up are halves of one packed projection, which the kernel would copy out"),
-        (not any(isinstance(operand, JVPTracer) for operand in (gate, up)),
-         "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
-        (_placed(axes, (gate, up), whole_last=False),
-         "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that checks "
-         "varying axes holds them, and a Pallas call states no varying type"),
-    ))
+    ) or _swiglu_refusal((gate, up), axes))
+
+
+def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
+    """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
+    the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
+    `axes` are the product's logical axes, `[..., H]`'s."""
+    return _selected('swiglu', implementation, first_refusal(
+        (gate_up.dtype in DTYPES, "SwiGLU needs float32 or bfloat16 operands"),
+        (gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
+         "a packed SwiGLU takes a nonempty [..., 2, H] gate and up"),
+    ) or _swiglu_refusal((gate_up,), None if axes is None else (*axes[:-1], None, axes[-1])))
 
 
 def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: bool):
@@ -653,13 +678,24 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, *, ax
                       (x, gate, _widened(scale)), (False, False, True))
 
 
+def _product(gate, up, dtype, interpret: bool):
+    """SwiGLU of fp32 halves: SiLU rounded to the operands' `dtype`, as the model rounds it, times up."""
+    return _round(gate * jax.nn.sigmoid(gate), dtype, interpret) * up
+
+
+def _gradients(gate, up, dy):
+    """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate."""
+    sigmoid = jax.nn.sigmoid(gate)
+    activated = gate * sigmoid
+    return dy * (activated * (1.0 - sigmoid) + sigmoid) * up, dy * activated
+
+
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
     index = pl.program_id(0) * block + jnp.arange(block)
     mask = index < gate_ref.shape[0]
     gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    activated = _round(gate * jax.nn.sigmoid(gate), gate_ref.dtype, interpret)
-    plgpu.store(y_ref.at[index], (activated * up).astype(y_ref.dtype), mask=mask)
+    plgpu.store(y_ref.at[index], _product(gate, up, gate_ref.dtype, interpret).astype(y_ref.dtype), mask=mask)
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
@@ -668,11 +704,35 @@ def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, in
     gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    sigmoid = jax.nn.sigmoid(gate)
-    activated = gate * sigmoid
-    dg = dy * (activated * (1.0 - sigmoid) + sigmoid) * up
+    dg, du = _gradients(gate, up, dy)
     plgpu.store(dg_ref.at[index], dg.astype(gate_ref.dtype), mask=mask)
-    plgpu.store(du_ref.at[index], (dy * activated).astype(up_ref.dtype), mask=mask)
+    plgpu.store(du_ref.at[index], du.astype(up_ref.dtype), mask=mask)
+
+
+def _halves(gate_up_ref, block: int):
+    """A packed program's row of `[rows, 2 * width]`, its block of columns, their mask, and the
+    gate's and up's columns: contiguous runs, which the loads vectorize."""
+    width = gate_up_ref.shape[1] // 2
+    columns = pl.program_id(1) * block + jnp.arange(block)
+    return pl.program_id(0), columns, columns < width, columns + width
+
+
+def _packed_forward(gate_up_ref, y_ref, *, block: int, interpret: bool):
+    row, columns, mask, up_columns = _halves(gate_up_ref, block)
+    gate = plgpu.load(gate_up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(gate_up_ref.at[row, up_columns], mask=mask, other=0).astype(jnp.float32)
+    y = _product(gate, up, gate_up_ref.dtype, interpret)
+    plgpu.store(y_ref.at[row, columns], y.astype(y_ref.dtype), mask=mask)
+
+
+def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool):
+    row, columns, mask, up_columns = _halves(gate_up_ref, block)
+    gate = plgpu.load(gate_up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(gate_up_ref.at[row, up_columns], mask=mask, other=0).astype(jnp.float32)
+    dy = plgpu.load(dy_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    dg, du = _gradients(gate, up, dy)
+    plgpu.store(d_ref.at[row, columns], dg.astype(d_ref.dtype), mask=mask)
+    plgpu.store(d_ref.at[row, up_columns], du.astype(d_ref.dtype), mask=mask)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -689,6 +749,15 @@ class _Elementwise(tuning.KernelOp):
         return {BlockConfig(block, warps) for block in (256, 512, 1024, 2048, 4096) for warps in (1, 2, 4, 8)}
 
 
+def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
+            interpret: bool):
+    return pl.pallas_call(
+        functools.partial(kernel, block=config.block, interpret=interpret), grid=grid, out_shape=outputs,
+        compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
+        interpret=interpret, name=name,
+    )(*operands), None
+
+
 @dataclasses.dataclass(frozen=True)
 class SwigluForward(_Elementwise):
     """SwiGLU's forward launch over flat `gate` and `up` (`_swiglu_forward`)."""
@@ -697,12 +766,9 @@ class SwigluForward(_Elementwise):
 
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        return pl.pallas_call(
-            functools.partial(_swiglu_forward, block=config.block, interpret=interpret),
-            grid=(pl.cdiv(gate.size, config.block),), out_shape=jax.ShapeDtypeStruct(gate.shape, gate.dtype),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="swiglu_forward",
-        )(gate, up), None
+        return _launch(_swiglu_forward, "swiglu_forward", (gate, up),
+                       jax.ShapeDtypeStruct(gate.shape, gate.dtype), (pl.cdiv(gate.size, config.block),),
+                       config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -713,18 +779,51 @@ class SwigluBackward(_Elementwise):
 
     def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        return pl.pallas_call(
-            functools.partial(_swiglu_backward, block=config.block, interpret=interpret),
-            grid=(pl.cdiv(gate.size, config.block),),
-            out_shape=(jax.ShapeDtypeStruct(gate.shape, gate.dtype),
-                       jax.ShapeDtypeStruct(up.shape, up.dtype)),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="swiglu_backward",
-        )(gate, up, dy), None
+        outputs = (jax.ShapeDtypeStruct(gate.shape, gate.dtype), jax.ShapeDtypeStruct(up.shape, up.dtype))
+        return _launch(_swiglu_backward, "swiglu_backward", (gate, up, dy), outputs,
+                       (pl.cdiv(gate.size, config.block),), config, interpret)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Packed(_Elementwise):
+    """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row: a program a
+    row's block of columns, unless measured the whole row up to `PACKED_BLOCK` columns."""
+
+    def _get_heuristics_config(self, ba) -> BlockConfig:
+        return BlockConfig(min(PACKED_BLOCK, pl.next_power_of_2(ba.arguments['gate_up'].shape[1] // 2)), 4)
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedSwigluForward(_Packed):
+    """SwiGLU's forward launch over a packed projection's output, read in place (`_packed_forward`)."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate_up',)
+
+    def _fwd(self, gate_up: jax.Array, *, interpret: bool, config: BlockConfig,
+             return_residuals: bool = False):
+        rows, width = gate_up.shape[0], gate_up.shape[1] // 2
+        return _launch(_packed_forward, "swiglu_forward", (gate_up,),
+                       jax.ShapeDtypeStruct((rows, width), gate_up.dtype),
+                       (rows, pl.cdiv(width, config.block)), config, interpret)
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedSwigluBackward(_Packed):
+    """The packed SwiGLU's reverse launch (`_packed_backward`): the gradient in its input's layout."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate_up', 'dy')
+
+    def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
+             return_residuals: bool = False):
+        return _launch(_packed_backward, "swiglu_backward", (gate_up, dy),
+                       jax.ShapeDtypeStruct(gate_up.shape, gate_up.dtype),
+                       (gate_up.shape[0], pl.cdiv(dy.shape[1], config.block)), config, interpret)
 
 
 _SWIGLU_FORWARD = SwigluForward()
 _SWIGLU_BACKWARD = SwigluBackward()
+_PACKED_FORWARD = PackedSwigluForward()
+_PACKED_BACKWARD = PackedSwigluBackward()
 
 
 def _swiglu(gate, up, interpret: bool):
@@ -745,8 +844,51 @@ _swiglu_vjp = jax.custom_vjp(_swiglu, nondiff_argnums=(2,))
 _swiglu_vjp.defvjp(_swiglu_fwd, _swiglu_bwd)
 
 
+def _rows(gate_up):
+    """A packed `[..., 2, H]` output as the launches' `[rows, 2 * H]`."""
+    return gate_up.reshape(-1, 2 * gate_up.shape[-1])
+
+
+def _packed(gate_up, interpret: bool):
+    y = _PACKED_FORWARD(_rows(gate_up), interpret=interpret)
+    return y.reshape(gate_up.shape[:-2] + gate_up.shape[-1:])
+
+
+def _packed_fwd(gate_up, interpret: bool):
+    return _packed(gate_up, interpret), gate_up
+
+
+def _packed_bwd(interpret: bool, gate_up, dy):
+    return _PACKED_BACKWARD(_rows(gate_up), dy.reshape(-1, dy.shape[-1]), interpret=interpret).reshape(
+        gate_up.shape),
+
+
+_packed_vjp = jax.custom_vjp(_packed, nondiff_argnums=(1,))
+_packed_vjp.defvjp(_packed_fwd, _packed_bwd)
+
+
 def swiglu(gate, up, *, axes=None):
     """The fused SiLU product and its VJP, interpreted or lowered and placed
     on a mesh as `stream_rms_norm` is."""
     interpret = not generation.triton_runs()
     return _per_shard(lambda gate, up: _swiglu_vjp(gate, up, interpret), axes, (gate, up), (False, False))
+
+
+def packed_swiglu(gate_up, *, axes=None):
+    """`swiglu` of one packed projection's `[..., 2, H]` output, gate then up, read in place, its
+    gradient written in the same layout. `axes` are the product's own logical axes, `[..., H]`'s;
+    the pair axis is never split."""
+    interpret = not generation.triton_runs()
+
+    def local(gate_up):
+        return _packed_vjp(gate_up, interpret)
+
+    if not _split():
+        return local(gate_up)
+    if axes is None:
+        raise ValueError("a mesh splits the packed SwiGLU's operands, and it places them by their logical "
+                         "axes, which the call does not name")
+    shape = gate_up.shape[:-2] + gate_up.shape[-1:]
+    spec = logical_spec(axes, shape)
+    entries = (*spec, *(None,) * (len(shape) - len(spec)))
+    return manual_map(local, (jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]),), spec)(gate_up)
