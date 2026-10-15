@@ -843,7 +843,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    g = jnp.where(starts.reshape(B, S, *(1,) * (g.ndim - 2)), g + FORGET, g)
+    # A document's first token's decay scales a forgotten memory, so its gradient is exactly zero.
+    g = jnp.where(starts.reshape(B, S, *(1,) * (g.ndim - 2)), jax.lax.stop_gradient(g) + FORGET, g)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, None, scale, CHUNK_SIZE,
                       not generation.triton_runs())
