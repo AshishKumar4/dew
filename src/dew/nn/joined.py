@@ -19,15 +19,21 @@ from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 
 
-def _root(module: nn.Module) -> nn.Module:
-    while isinstance(module.parent, nn.Module):
-        module = module.parent
-    return module
+def _intercepted() -> bool:
+    """Whether the running call is a wrapped model's (`dew.registry.WrapperClass`: an adapter, an
+    input quantization, Dew's Qwix training) or a Qwix-quantized one's, which intercept their
+    layers' own calls. It reads the outermost module whose method is running: Flax keeps them on
+    a stack, which its lifted transforms (`nn.scan`) leave whole where a scanned layer's parents
+    stop at the scan, and which no public call reads; Qwix reads it the same way
+    (qwix/_src/model.py, `_is_in_nn_module`)."""
+    from flax.linen.module import _context
+
+    root = type(next(module for module in _context.module_stack if module is not None))
+    return bool(wrapper_layers(root)[1]) or any("_unquantized_type" in vars(layer) for layer in root.__mro__)
 
 
 def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None."""
-    first = projections[0]
     return first_refusal(
         (all(type(projection) is nn.Dense for projection in projections),
          "a projection is not a plain nn.Dense, whose call the join reproduces"),
@@ -36,9 +42,11 @@ def join_refusal(projections: Sequence[nn.Module]) -> str | None:
         (len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
                projection.promote_dtype) for projection in projections}) == 1,
          "the projections differ in width, bias, dtype, precision or promotion"),
-        (not wrapper_layers(type(_root(first)))[1],
+        (not _intercepted(),
          "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
          "projection's own call"),
+        (all(projection.has_variable('params', 'kernel') for projection in projections),
+         "a projection holds no kernel of its own"),
     )
 
 
