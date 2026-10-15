@@ -253,12 +253,12 @@ def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_defau
         batch=1, read="streamed", loading=READ)
     assert data.val is not None
     scored = labels(data.val)
-    # The training stream repeats its shuffled pass; its first pass is the rest of the records.
-    trained = labels(data.train, 320 - len(scored))
-    assert scored and sorted(trained + scored) == list(range(320))
+    # The training stream repeats a pass it shuffles in a window, so three passes' rows hold every record.
+    trained = set(labels(data.train, 3 * 320))
+    assert scored and trained.isdisjoint(scored) and sorted(trained | set(scored)) == list(range(320))
     whole = ImageData(source, image_size=4, augment=None, validation=None).load(batch=1, read="streamed",
                                                                                loading=READ)
-    assert whole.val is None and sorted(labels(whole.train, 320)) == list(range(320))
+    assert whole.val is None and sorted(set(labels(whole.train, 3 * 320))) == list(range(320))
 
 
 def test_image_data_defaults_hold_out_256_records_and_resize_both_parts():
