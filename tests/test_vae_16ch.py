@@ -18,7 +18,6 @@ Tolerances and the differences actually observed, fp32 on CPU:
   resolution, and a smooth 64px image round trips at 29.1 dB.
 """
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +32,6 @@ TOLERANCE = 1e-5
 
 def reference():
     return np.load(TINY / "reference.npz")
-
-
-def synthetic_image():
-    recipe = json.loads((TINY / "inputs.json").read_text())["image"]
-    return np.random.RandomState(recipe["seed"]).randint(
-        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
 def largest_difference(actual, expected) -> float:

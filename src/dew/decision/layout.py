@@ -546,11 +546,12 @@ class DecisionInputs:
         return self.segments != 0
 
     def coordinates(self) -> Coordinates:
-        """The tokens' `Coordinates`: each row a document, real tokens first. A
-        window's padding after its rows is one more document, so the documents a
-        window holds are its rows' bound and one (a sequence kernel's capacity)."""
+        """The tokens' `Coordinates`: each row a document, real tokens first, at
+        most `max_segments` a window. The padding after them runs as one more
+        sequence, which a sequence kernel adds to the documents itself
+        (`dew.nn.attention.flash_attention`)."""
         return coordinates(segments=self.segments, positions=self.positions,
-                           max_segments=self.max_segments + 1, right_padded=True)
+                           max_segments=self.max_segments, right_padded=True)
 
     @property
     def question_segments(self) -> jnp.ndarray:
