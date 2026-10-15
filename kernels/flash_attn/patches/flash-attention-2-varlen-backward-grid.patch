@@ -1,0 +1,213 @@
+diff --git a/csrc/flash_attn/mha_bwd.cpp b/csrc/flash_attn/mha_bwd.cpp
+index 5c559ca..9daed96 100644
+--- a/csrc/flash_attn/mha_bwd.cpp
++++ b/csrc/flash_attn/mha_bwd.cpp
+@@ -186,8 +186,12 @@ ffi::Error mha_bwd_impl(cudaStream_t stream,
+     
+     if (loop) {
+         dq_accum_ptr = dq_accum->untyped_data();
+-        // Zero the dq_accum buffer - entire buffer needs to be zeroed for both deterministic and non-deterministic
+-        FFI_CUDA_CHECK(cudaMemsetAsync(dq_accum_ptr, 0, dq_accum->size_bytes(), stream));
++        // The preprocess kernel clears every block of dq_accum the backward accumulates into, unless
++        // the deterministic order's split buffers need the whole buffer zeroed, as flash-attention's
++        // own mha_bwd allocates it with torch::empty or torch::zeros.
++        if (deterministic) {
++            FFI_CUDA_CHECK(cudaMemsetAsync(dq_accum_ptr, 0, dq_accum->size_bytes(), stream));
++        }
+     }
+ 
+ 
+@@ -352,8 +356,13 @@ mha_varlen_bwd_impl(
+         // be at least 128 apart. It's ok for us to do atomicAdds up to 128 rows beyond what we're normally
+         // allowed to do. So we won't have to do any bound checking, and performance should stay the same.
+         dq_accum_ptr = dq_accum->untyped_data();
+-        // Zero the dq_accum buffer - entire buffer needs to be zeroed for both deterministic and non-deterministic
+-        FFI_CUDA_CHECK(cudaMemsetAsync(dq_accum_ptr, 0, dq_accum->size_bytes(), stream));
++        // The preprocess kernel clears every block of dq_accum the backward accumulates into, unless
++        // the deterministic order's split buffers need the whole buffer zeroed, as flash-attention's
++        // own mha_varlen_bwd allocates it with torch::empty or torch::zeros. The padded rows are
++        // num_batch * 128 of them, which zeroing grew with the number of sequences.
++        if (deterministic) {
++            FFI_CUDA_CHECK(cudaMemsetAsync(dq_accum_ptr, 0, dq_accum->size_bytes(), stream));
++        }
+         
+         // Set split stride for deterministic mode
+         if (deterministic) {
+@@ -402,6 +411,7 @@ mha_varlen_bwd_impl(
+                      deterministic));
+     params.unpadded_lse = false;
+     params.total_q = total_q;
++    params.total_k = total_k;
+     params.dq_accum_split_stride = dq_accum_split_stride;
+ 
+     auto launch = &run_mha_bwd;
+diff --git a/csrc/flash_attn/src/block_info.h b/csrc/flash_attn/src/block_info.h
+index 9c8baff..b89044a 100644
+--- a/csrc/flash_attn/src/block_info.h
++++ b/csrc/flash_attn/src/block_info.h
+@@ -9,6 +9,31 @@ namespace FLASH_NAMESPACE {
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++// The blocks of kBlock rows of a varlen batch of `total` rows in `num_batch` sequences, numbered
++// in its padded block space: sequence b's blocks start at cu_seqlens[b] / kBlock + b. Each sequence
++// leaves at most one gap after its last block, so the space spans this many blocks however long
++// the longest sequence is, where a grid of num_batch * ceil_div(max_seqlen, kBlock) gives every
++// (sequence, block) pair a CTA, most of which find their sequence already ended.
++inline int varlen_num_blocks(int total, int num_batch, int block) {
++    return (total + block - 1) / block + num_batch;
++}
++
++// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within the
++// sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the last
++// sequence starting at or before it.
++template <int kBlock>
++__forceinline__ __device__ cute::tuple<int, int> varlen_block_coord(const int block_idx, const int num_batch,
++                                                                    const int *cu_seqlens, const int *seqused) {
++    int bidb = 0, last = num_batch - 1;
++    while (bidb < last) {
++        const int middle = (bidb + last + 1) / 2;
++        if (cu_seqlens[middle] / kBlock + middle <= block_idx) { bidb = middle; } else { last = middle - 1; }
++    }
++    const int block = block_idx - (cu_seqlens[bidb] / kBlock + bidb);
++    const int seqlen = seqused ? seqused[bidb] : cu_seqlens[bidb + 1] - cu_seqlens[bidb];
++    return block < (seqlen + kBlock - 1) / kBlock ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
++}
++
+ template<bool Varlen=true>
+ struct BlockInfo {
+ 
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index 3e9e95c..3367cc2 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -63,6 +63,8 @@ struct Flash_fwd_params : public Qkv_params {
+ 
+     // The dimensions.
+     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
++    // The keys' packed rows, read by a varlen backward to size its grid (varlen_num_blocks).
++    int total_k = 0;
+ 
+     // The scaling factors for the kernel.
+     float scale_softmax;
+diff --git a/csrc/flash_attn/src/flash_bwd_kernel.h b/csrc/flash_attn/src/flash_bwd_kernel.h
+index 148e5b6..4c8f2c9 100644
+--- a/csrc/flash_attn/src/flash_bwd_kernel.h
++++ b/csrc/flash_attn/src/flash_bwd_kernel.h
+@@ -811,10 +811,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
+ template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
+ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
+ 
+-    // The block index for the batch.
+-    const int bidb = blockIdx.y;
+     // The block index for the head.
+     const int bidh = blockIdx.z;
++    // A varlen launch covers the batch's padded key block space (varlen_num_blocks), unless the
++    // deterministic order's per-CTA dQ_accum buffers need the (sequence, block) grid.
++    if (params.cu_seqlens_k != nullptr && params.is_seqlens_k_cumulative && !params.deterministic) {
++        auto const coord = varlen_block_coord<Kernel_traits::kBlockN>(blockIdx.x, params.b, params.cu_seqlens_k,
++                                                                      params.seqused_k);
++        if (get<0>(coord) >= 0) {
++            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, get<0>(coord), bidh, get<1>(coord));
++        }
++        return;
++    }
++    // The block index for the batch.
++    const int bidb = blockIdx.y;
+ 
+     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
+diff --git a/csrc/flash_attn/src/flash_bwd_launch_template.h b/csrc/flash_attn/src/flash_bwd_launch_template.h
+index ee4469e..db5a5c5 100644
+--- a/csrc/flash_attn/src/flash_bwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_bwd_launch_template.h
+@@ -71,15 +71,21 @@ __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
+ 
+ template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
+-    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+-    dim3 grid_m(num_m_block, params.b, params.h);
+-    const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
++    // A varlen launch covers the batch's padded block space (varlen_num_blocks), each CTA finding
++    // its sequence and block from cu_seqlens; the deterministic order keeps the (sequence, block) grid.
++    const bool varlen_q = params.cu_seqlens_q != nullptr;
++    const bool varlen_k = params.cu_seqlens_k != nullptr && params.is_seqlens_k_cumulative && !params.deterministic;
++    const int num_m_block = varlen_q ? varlen_num_blocks(params.total_q, params.b, Kernel_traits::kBlockM)
++                                     : (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
++    dim3 grid_m(num_m_block, varlen_q ? 1 : params.b, params.h);
++    const int num_n_block = varlen_k ? varlen_num_blocks(params.total_k, params.b, Kernel_traits::kBlockN)
++                                     : (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+     int gridDimx = num_n_block;
+     if (params.deterministic) {
+         int num_sm = get_num_sm(get_current_device());
+         gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
+     }
+-    dim3 grid_n(gridDimx, params.b, params.h);
++    dim3 grid_n(gridDimx, varlen_k ? 1 : params.b, params.h);
+ 
+     if (!params.deterministic) {
+         flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+diff --git a/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h b/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
+index e4875fe..df3f315 100644
+--- a/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
++++ b/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
+@@ -60,17 +60,24 @@ inline __device__ void compute_dot_do_o(const Params &params) {
+     using ElementAccum = typename Kernel_traits::ElementAccum;
+     using index_t = typename Kernel_traits::index_t;
+ 
+-    const int m_block = blockIdx.x;
++    constexpr int kBlockM = Kernel_traits::kBlockM;
++    constexpr int kHeadDim = Kernel_traits::kHeadDim;
++
++    int m_block = blockIdx.x;
+     // The block index for the batch.
+-    const int bidb = blockIdx.y;
++    int bidb = blockIdx.y;
++    // A varlen launch covers the batch's padded block space (varlen_num_blocks).
++    if (params.cu_seqlens_q != nullptr) {
++        auto const coord = varlen_block_coord<kBlockM>(blockIdx.x, params.b, params.cu_seqlens_q, nullptr);
++        bidb = get<0>(coord);
++        m_block = get<1>(coord);
++        if (bidb < 0) return;
++    }
+     // The block index for the head.
+     const int bidh = blockIdx.z;
+     // The thread index.
+     const int tidx = threadIdx.x;
+ 
+-    constexpr int kBlockM = Kernel_traits::kBlockM;
+-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+-
+     const BlockInfo binfo(params, bidb);
+     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+ 
+@@ -188,17 +195,24 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
+     // Shared memory.
+     extern __shared__ char smem_[];
+ 
+-    const int m_block = blockIdx.x;
++    constexpr int kBlockM = Kernel_traits::kBlockM;
++    constexpr int kHeadDim = Kernel_traits::kHeadDim;
++
++    int m_block = blockIdx.x;
+     // The block index for the batch.
+-    const int bidb = blockIdx.y;
++    int bidb = blockIdx.y;
++    // A varlen launch covers the batch's padded block space (varlen_num_blocks).
++    if (params.cu_seqlens_q != nullptr) {
++        auto const coord = varlen_block_coord<kBlockM>(blockIdx.x, params.b, params.cu_seqlens_q, nullptr);
++        bidb = get<0>(coord);
++        m_block = get<1>(coord);
++        if (bidb < 0) return;
++    }
+     // The block index for the head.
+     const int bidh = blockIdx.z;
+     // The thread index.
+     const int tidx = threadIdx.x;
+ 
+-    constexpr int kBlockM = Kernel_traits::kBlockM;
+-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+-
+     const BlockInfo binfo(params, bidb);
+     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+ 
