@@ -16,13 +16,12 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
-from dew.data.dataset import rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
-from dew.training import Trainer, planning, rungs
+from dew.training import Trainer, rungs
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -113,43 +112,53 @@ def lm(split=None, accumulation=1, **fields):
 
 
 def trained(trainer, steps=3):
-    """The state after `steps` steps of BATCH, and the step's temporaries."""
+    """The state after `steps` steps of BATCH."""
     state, _, _ = trainer.place()
     step = trainer.compile(state, BATCH)
     for _ in range(steps):
         state, *_ = step(state, BATCH)
-    return state, trainer.executable.memory_analysis().temp_size_in_bytes
+    return state
 
 
-def room(monkeypatch, bytes_free):
-    """Give every compile `bytes_free` for its temporaries, as XLA's memory analysis reads them."""
+LIMIT = 2 ** 40
+"""The bytes every device reports it holds: one size, which a step's rung record names, whatever is free."""
 
-    def fit(candidate, executable, mesh):
-        if executable is None:
-            return False, None
-        headroom = bytes_free - executable.memory_analysis().temp_size_in_bytes
-        return headroom >= 0, headroom
 
-    monkeypatch.setattr(planning, "device_fit", fit)
+def free(monkeypatch, room):
+    """Every device reports `room` bytes of its LIMIT free (`Device.memory_stats`), the one reading of
+    the devices the fit check takes; what a step needs is XLA's memory analysis of the step."""
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": LIMIT, "bytes_in_use": LIMIT - room})
+
+
+def needs(monkeypatch, trainer, run=None):
+    """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that
+    compile left of all of LIMIT free, taken from LIMIT. `run` compiles it; None compiles it for BATCH."""
+    free(monkeypatch, LIMIT)
+    if run is None:
+        trained(trainer, steps=0)
+    else:
+        run()
+    return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
-    """With room for the step's temporaries at two microbatches and not at
-    one, the plan reads the batch in microbatches under no recomputation,
-    and the run trains as the whole batch does: the update pools the same
-    rows, `step` counts steps and `microstep` microbatches."""
-    whole, temps = trained(lm(split=1))
-    _, halves = trained(lm(split=2))
-    assert halves < temps, (halves, temps)
-    room(monkeypatch, (temps + halves) // 2)
+    """With room for the step at two microbatches and not at one, the plan
+    reads the batch in microbatches under no recomputation, and the run
+    trains as the whole batch does: the update pools the same rows, `step`
+    counts steps and `microstep` microbatches."""
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    unsplit = trained(lm(split=1))
+    free(monkeypatch, (whole + halves) // 2)
     trainer = lm()
-    state, _ = trained(trainer)
+    state = trained(trainer)
     split = trainer.plan["split"]
     assert split > 1 and trainer.objective.model.remat is None
     first, *_ = trainer.plan["probes"]
     assert (first["split"], first["fits"]) == (1, False)
     assert (int(state.step), int(state.microstep), int(state.updates)) == (3, 3 * split, 3)
-    for planned_leaf, whole_leaf in zip(jax.tree.leaves(state.variables), jax.tree.leaves(whole.variables),
+    for planned_leaf, whole_leaf in zip(jax.tree.leaves(state.variables), jax.tree.leaves(unsplit.variables),
                                         strict=True):
         np.testing.assert_allclose(np.asarray(planned_leaf), np.asarray(whole_leaf), rtol=1e-4, atol=1e-5)
 
@@ -159,12 +168,11 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     traces, so a restart compiles the recorded candidate first, from the
     cache, and keeps it, with the FLOPs the first run counted for the same
     executable."""
-    _, temps = trained(lm(split=1), steps=0)
-    _, halves = trained(lm(split=2), steps=0)
-    room(monkeypatch, (temps + halves) // 2)
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    free(monkeypatch, (whole + halves) // 2)
     first = lm()
     trained(first, steps=0)
-    room(monkeypatch, 2 * temps)
+    free(monkeypatch, LIMIT)
     again = lm()
     counted = []
     monkeypatch.setattr(rungs, "step_flops", lambda executable: counted.append(executable))
@@ -202,7 +210,7 @@ def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
     state's window holds the split, so a trainer that continues the state
     reads its steps alike."""
     trainer = lm(split=4, accumulation=2)
-    state, _ = trained(trainer, steps=4)
+    state = trained(trainer, steps=4)
     assert [probe["split"] for probe in trainer.plan["probes"]] == [4]
     clocks = (int(state.step), int(state.microstep), int(state.updates), int(state.window_size))
     assert clocks == (4, 16, 2, 8)
@@ -269,23 +277,15 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
         windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
 
 
-def fitting(monkeypatch, trainer, fits, rows=ROWS):
-    """Make each compile of `trainer`'s plan fit by `fits(split, remat,
-    tiled)`, read off the candidate's microbatch of a `rows`-row batch and
-    its objective's rung."""
-    monkeypatch.setattr(planning, "device_fit", lambda candidate, executable, mesh: (fits(
-        rows // rows_of(candidate.micro), trainer.objective.model.remat,
-        trainer.objective.head_tile is not None), 0))
-
-
 @pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
 def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
         monkeypatch, seconds, split, remat):
-    """Where the batch fits only split at the least recomputation, and whole
-    one remat rung up with the head tiled, both are compiled and timed, and
-    the faster is the plan: the objective at its rung, both times recorded."""
+    """Where the devices hold a byte less than the batch whole needs at the
+    least recomputation, it fits split there, and whole one remat rung up with
+    the head tiled: both are compiled and timed, and the faster is the plan,
+    the objective at its rung, both times recorded."""
+    free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
     trainer = lm()
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 2 or (remat is not None and tiled))
     state, _, _ = trainer.place()
     timed = []
     step = trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), seconds)[1])
@@ -298,13 +298,13 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert np.isfinite(float(loss))
 
 
-@pytest.mark.parametrize("fits", [lambda split, remat, tiled: True, lambda split, remat, tiled: split >= 2])
-def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, fits):
-    """A batch that fits whole, or that fits whole at no rung above, has one
-    plan, and nothing is timed; the frontier's compile that did not fit is
-    in the plan's record."""
+@pytest.mark.parametrize("split", [1, 2])
+def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
+    """With room for the batch whole, or for two microbatches and not the
+    batch whole a rung up, there is one plan, and nothing is timed; the
+    frontier's compile that did not fit is in the plan's record."""
+    free(monkeypatch, needs(monkeypatch, lm(split=split)))
     trainer = lm()
-    fitting(monkeypatch, trainer, fits)
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert trainer.plan["timed"] is None
@@ -319,17 +319,19 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
 
 
+@pytest.mark.gpu("the GPU kernel's delta rule recomputes its memory alone; on the CPU the half rung "
+                 "needs what no recomputation does")
 def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
-    """Where no recomputation fits the batch only at eight microbatches and recomputing a delta rule's
-    memory alone fits it at four, the plan is four at that half rung: no plan splits the batch further
+    """With room for four microbatches when a delta rule recomputes its memory alone, which no
+    recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses."""
+    half = "all_but_delta_memory"
+    free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
     trainer = lm(**DELTA)
-    half = REMAT_POLICIES["all_but_delta_memory"]
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= (8 if remat is None else 4))
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, "all_but_delta_memory")
-    assert trainer.objective.model.remat == half
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
+    assert trainer.objective.model.remat == REMAT_POLICIES[half]
     assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
         (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, False),
         (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False),
@@ -340,9 +342,8 @@ def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkey
     """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
     fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
     rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
-    half = REMAT_POLICIES["all_but_delta_memory"]
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 4 and remat != half)
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
@@ -354,8 +355,8 @@ def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkey
 def test_a_decoder_without_a_half_rung_asks_the_splits_it_did(monkeypatch):
     """Without a delta rule no rung is a half rung: the search asks the batch whole, the largest split,
     and halves the range, each at no recomputation, and the frontier one rung up."""
+    free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 4)
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
@@ -381,10 +382,11 @@ def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
 def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     """Under `fit`, a frontier is timed on the run's own state, and the run
     trains on from a fresh copy of it: the timed steps count for nothing."""
+    corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
+    free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
+                                                                  checkpoint_every=None)) - 1)
     trainer = windowed(tmp_path / "timed", None)
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 2 or (remat is not None and tiled),
-            rows=8)
-    state = trainer.fit(windows(token_files(tmp_path)), steps=3, checkpoint_every=None)
+    state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
     assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
     assert int(state.step) == 3
 
