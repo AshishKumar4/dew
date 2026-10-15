@@ -122,8 +122,10 @@ def widened():
     """The reference in float64: every float32 pin of the Wan modules
     widened, which are their `.float()`, `.to(torch.float32)` and
     `.type(torch.float32)` casts (Nemotron-H's router pins the last), the
-    sinusoids' float32 `arange` and the UniPC scheduler's float32 sigma
-    table, and float64 the default dtype."""
+    sinusoids' float32 `arange`, a float32 `torch.tensor` or `torch.full`
+    (the tables a model builds from Python numbers, Phi-3's LongRoPE factors
+    among them), the UniPC scheduler's float32 sigma table, and float64 the
+    default dtype."""
     from unittest.mock import patch
 
     from diffusers.schedulers import scheduling_unipc_multistep
@@ -135,7 +137,8 @@ def widened():
     # meta-device init (transformers' from_pretrained) would make arange's
     # tensors on the CPU beside the meta ones; so it is built first.
     _device_constructors()
-    float_, to, type_, arange = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange
+    float_, to, type_ = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type
+    arange, tensor, full = torch.arange, torch.tensor, torch.full
 
     def widened_to(self, *args, **kwargs):
         if "dtype" in kwargs:
@@ -147,11 +150,14 @@ def widened():
     torch.Tensor.type = lambda self, dtype=None, *args, **kwargs: type_(
         self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
+    torch.tensor = lambda *args, dtype=None, **kwargs: tensor(*args, dtype=wide(dtype), **kwargs)
+    torch.full = lambda *args, dtype=None, **kwargs: full(*args, dtype=wide(dtype), **kwargs)
     try:
         with default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
             yield
     finally:
-        torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange = float_, to, type_, arange
+        torch.Tensor.float, torch.Tensor.to, torch.Tensor.type = float_, to, type_
+        torch.arange, torch.tensor, torch.full = arange, tensor, full
 
 
 @contextlib.contextmanager
