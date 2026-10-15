@@ -1,8 +1,8 @@
 #!/bin/sh
 # Every cheap gate CI runs on a checkout, all of them, reporting every failure before it exits: the
 # locks, flake8, ruff, slop lint, the complexity record (complexity.json), the generated API pages and
-# installer, the tested Python versions and pyright. PYTHON names the interpreter of the test suite's environment (tools/install_environment.sh);
-# default: python. A lane runs it before every LAND, and CI's lint job runs it as is.
+# installer, the tested Python versions and pyright. PYTHON names the interpreter of the test suite's
+# environment (tools/install_environment.sh); default: python. A lane runs it before every LAND, and CI's lint job runs it as is.
 # Usage, from the checkout: sh tools/check.sh
 set -u
 python=${PYTHON:-python}
