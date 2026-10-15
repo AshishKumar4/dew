@@ -67,6 +67,9 @@ def arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--micro-batch", type=int, default=None,
                         help="rows per forward on one data rank; unset is the rank's whole share")
     parser.add_argument("--tp", type=int, default=1, help="tensor-parallel size")
+    parser.add_argument("--fsdp", action="store_true",
+                        help="Megatron-FSDP over the data ranks: parameters, gradients and optimizer state "
+                             "sharded (optim_grads_params); otherwise DDP with the distributed optimizer")
     parser.add_argument("--sequence-parallel", action="store_true")
     parser.add_argument("--recompute", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--cross-entropy", choices=("native", "te"), default="native",
@@ -75,6 +78,8 @@ def arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--precision-aware-optimizer", action="store_true",
                         help="Transformer Engine's Adam updates the fp32 master weights and writes the bf16 "
                              "ones in one kernel")
+    parser.add_argument("--moments", choices=("float32", "bfloat16"), default="float32",
+                        help="Adam's moment dtype; bfloat16 takes the precision-aware optimizer")
     parser.add_argument("--seed", type=int, default=0, help="Megatron's model init")
     return parser.parse_args(argv)
 
@@ -176,7 +181,11 @@ class Run:
 
 def build(args: argparse.Namespace, place: Ranks) -> Run:
     from megatron.core import parallel_state
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+        FullyShardedDataParallel,
+    )
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
     from megatron.core.models.gpt import GPTModel
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -200,13 +209,20 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     config, spec, shape = model_parts(text_config(args.model), args)
     model = GPTModel(config, spec, max_sequence_length=seq, **shape).cuda()
     model = Float16Module(config, model)
-    ddp = DistributedDataParallelConfig(use_distributed_optimizer=True)
-    model = DistributedDataParallel(config, ddp, model)
+    if args.fsdp:
+        model = FullyShardedDataParallel(config, DistributedDataParallelConfig(
+            use_distributed_optimizer=True, use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads_params"), model)
+    else:
+        model = DistributedDataParallel(config, DistributedDataParallelConfig(use_distributed_optimizer=True),
+                                        model)
+    moments = getattr(torch, args.moments)
     optimizer = get_megatron_optimizer(OptimizerConfig(
         optimizer="adam", lr=args.lr_peak, min_lr=args.lr_end, weight_decay=args.weight_decay,
         adam_beta1=args.b1, adam_beta2=args.b2, adam_eps=args.eps, clip_grad=args.clip, bf16=True,
         params_dtype=torch.bfloat16, use_distributed_optimizer=True,
-        use_precision_aware_optimizer=args.precision_aware_optimizer), [model])
+        use_precision_aware_optimizer=args.precision_aware_optimizer or args.moments != "float32",
+        exp_avg_dtype=moments, exp_avg_sq_dtype=moments), [model])
     config.finalize_model_grads_func = finalize_model_grads
     config.grad_scale_func = optimizer.scale_loss
     config.no_sync_func = model.no_sync
