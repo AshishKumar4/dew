@@ -12,13 +12,11 @@ BLOCK = """\
     for index, value in enumerate(values):
         if value > limit:
             total += value * index
-        elif value < -limit:
-            total -= value
         else:
-            total += 1
+            total -= value
     return total
 """
-"""Nine lines of logic, past the gate's eight."""
+"""Seven lines of logic, one past the gate's six."""
 
 
 def gate(root: Path) -> int:
@@ -27,7 +25,7 @@ def gate(root: Path) -> int:
                           timeout=300).returncode
 
 
-def test_a_block_two_files_copy_fails_the_gate_and_one_owner_passes_it(tmp_path):
+def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(tmp_path):
     copied = tmp_path / "copied"
     copied.mkdir()
     for name in ("first", "second"):
@@ -40,3 +38,10 @@ def test_a_block_two_files_copy_fails_the_gate_and_one_owner_passes_it(tmp_path)
     (owned / "second.py").write_text("from first import first\n\n\ndef second(values, limit):\n"
                                      "    return first(values, limit)\n")
     assert gate(owned) == 0
+    six = tmp_path / "six"
+    six.mkdir()
+    (six / "first.py").write_text(f"def first(values, limit):\n{BLOCK}")
+    # The last line differs, so the two share six: not past the bar.
+    differing = BLOCK.replace("return total", "return -total")
+    (six / "second.py").write_text(f"def second(values, limit):\n{differing}")
+    assert gate(six) == 0
