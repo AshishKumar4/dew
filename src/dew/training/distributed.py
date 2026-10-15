@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Concatenate, Protocol
+from typing import Concatenate, Protocol, overload
 
 import jax
 import jax.numpy as jnp
@@ -768,12 +768,19 @@ def placeable(field) -> bool:
         for leaf in jax.tree.leaves(field))
 
 
-def split_fields(batch: Batch) -> tuple[Batch, dict]:
+@overload
+def split_fields(batch: Batch) -> tuple[Batch, dict]: ...
+@overload
+def split_fields(batch: np.ndarray | jax.Array) -> tuple[np.ndarray | jax.Array, dict]: ...
+def split_fields(batch: Batch | np.ndarray | jax.Array) -> tuple[Batch | np.ndarray | jax.Array, dict]:
     """`batch` split in one walk into the fields a device can hold
     (`placeable`), the batch a step and an objective's programs are called
     on, and those none can, which host code reads and a compiled step cannot
     take, each in the mappings that hold them (`with_host` joins them back).
-    A batch with no host field is its own device part."""
+    A batch with no host field, a bare array among them, is its own device
+    part."""
+    if not isinstance(batch, Mapping):
+        return batch, {}
     device: dict = {}
     host: dict = {}
     for name, value in batch.items():
