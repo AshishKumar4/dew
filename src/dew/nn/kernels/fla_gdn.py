@@ -1366,15 +1366,18 @@ def chunk_fwd_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64, spans: Se
     return _CHUNK_FWD_O(q, k, v, h, g, g_lo, *spans, scale=scale, chunk=chunk, interpret=interpret)
 
 
-def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
-    return _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret)[0]
+def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
+    return _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep)[0]
 
 
-def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
+def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
     """fla's `chunk_gated_delta_rule_fwd` (fla/ops/gated_delta_rule/chunk.py:33-123): the decay
     cumulated in base 2, its compensated halves, the inverse, `w` and `u`, the memory across chunks,
-    then the output. Saves what fla saves: the cumulated decay, both halves, and the inverse, named
-    'delta_decay' and 'delta_inverse' for a remat policy, and the initial memory."""
+    then the output. Saves the cumulated decay's halves and the inverse, as fla does, and where
+    `keep` its memory: `w`, the memory each chunk enters and the corrected values, which fla
+    recomputes in its backward from the initial memory, as the rule does without `keep` (a remat rung
+    recomputing 'delta_memory', `dew.nn.backbones.decoder_block.RematPolicy.recompute`). Each is
+    named for a block's remat policy, which keeps or recomputes it."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     g_hi, g_lo = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
@@ -1382,7 +1385,8 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
     h, corrected, final = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
     o = chunk_fwd_o(q, k, corrected, h, g_hi, g_lo, scale=scale, **kernels)
-    return (o, final), (q, k, v, g_hi, g_lo, beta, a, h0, spans)
+    memory = checkpoint_name((w, h, corrected), 'delta_memory') if keep else None
+    return (o, final), (q, k, v, g_hi, g_lo, beta, a, h0, memory, spans)
 
 
 def first_decay_grad(dg, h0, dh0, spans: Sequences):
@@ -1401,16 +1405,20 @@ def first_decay_grad(dg, h0, dh0, spans: Sequences):
     return flat.at[index].set(value.astype(dg.dtype), mode='drop').reshape(dg.shape)
 
 
-def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
-    """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250): `w`, `u` and the memory recomputed, then
-    the output's local value gradient, the reverse recurrence, the query, key, `w` and decay
-    gradients, the WY backward, and the decay's gradient summed back over each chunk, each sequence's
-    first token's from its memory (`first_decay_grad`)."""
-    q, k, v, g_hi, g_lo, beta, a, h0, spans = residual
+def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, cotangent):
+    """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250): `w`, `u` and the memory the forward kept,
+    or recomputed from the initial memory as fla does, then the output's local value gradient, the
+    reverse recurrence, the query, key, `w` and decay gradients, the WY backward, and the decay's
+    gradient summed back over each chunk, each sequence's first token's from its memory
+    (`first_decay_grad`)."""
+    q, k, v, g_hi, g_lo, beta, a, h0, memory, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
-    h, corrected, _ = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
+    if keep:
+        w, h, corrected = memory
+    else:
+        w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
+        h, corrected, _ = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
     dv = chunk_bwd_dv_local(q, k, g_hi, g_lo, do, scale=scale, **kernels)
     dh, dh0, dv = chunk_bwd_dhu(q, k, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
     dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g_hi, g_lo, h, dv, do, dh, scale=scale, **kernels)
@@ -1419,12 +1427,13 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
 
 
-chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9))
+chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10))
 """fla's chunked gated delta rule on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalized as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g`
 `[B, T, HV]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the
 final one each row's. `cu_seqlens` (`[N + 1]` int32 over the `B * T` tokens, fla's varlen) splits the
 rows into sequences, the memory starting from zero at each one a row does not begin with; None runs
-each row as one. Its numbers are fla's: bf16 operands store `A`, `w`, `u`, `h` and the corrected
-values in bf16, with fp32 accumulation and fp32 decay, the memory fp32 across chunks."""
+each row as one. `keep` keeps the rule's memory for the backward, which otherwise recomputes it, as
+fla's does (`_rule_fwd`). Its numbers are fla's: bf16 operands store `A`, `w`, `u`, `h` and the
+corrected values in bf16, with fp32 accumulation and fp32 decay, the memory fp32 across chunks."""
 chunk_gated_delta_rule.defvjp(_rule_fwd, _rule_bwd)
