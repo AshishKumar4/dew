@@ -6,6 +6,6 @@
 # tree.
 staged() { git diff --cached --name-only --diff-filter=ACMR -z -- "$@"; }
 staged 'src/dew/*.py' 'tests/*.py' 'examples/*.py' 'recipes/*.py' \
-    tools/lint_slop.py tools/complexity.py tools/mutation.py | xargs -0r uvx ruff@0.14.3 check --quiet || exit 1
+    tools/lint_slop.py tools/complexity.py tools/mutation.py | xargs -0r python -m ruff check --quiet || exit 1
 staged 'src/dew/*.py' 'tests/*.py' 'tools/*.py' 'examples/*.py' 'recipes/*.py' |
     JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
