@@ -45,6 +45,9 @@ import numpy as np
 import torch
 import transformers.utils as transformers_utils
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from torch_precision import default_dtype, wide  # noqa: E402
+
 # Diffusers 0.34.0's pipeline modules import two names Transformers dropped
 # after 4.x; the pipeline walk needs `WanPipeline` itself, so the names are
 # restored, as tools/diffusers_sd3_reference.py restores them.
@@ -107,16 +110,11 @@ def float64_scheduler(module: ModuleType):
     """
     from unittest.mock import patch
 
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        with contextlib.ExitStack() as scope:
-            for name, library in (("torch", torch), ("np", np)):
-                if hasattr(module, name):
-                    scope.enter_context(patch.object(module, name, Float64Library(library)))
-            yield
-    finally:
-        torch.set_default_dtype(previous)
+    with default_dtype(torch.float64), contextlib.ExitStack() as scope:
+        for name, library in (("torch", torch), ("np", np)):
+            if hasattr(module, name):
+                scope.enter_context(patch.object(module, name, Float64Library(library)))
+        yield
 
 
 @contextlib.contextmanager
@@ -139,9 +137,6 @@ def widened():
     _device_constructors()
     float_, to, type_, arange = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange
 
-    def wide(dtype):
-        return torch.float64 if dtype == torch.float32 else dtype
-
     def widened_to(self, *args, **kwargs):
         if "dtype" in kwargs:
             kwargs["dtype"] = wide(kwargs["dtype"])
@@ -152,14 +147,11 @@ def widened():
     torch.Tensor.type = lambda self, dtype=None, *args, **kwargs: type_(
         self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
-    default = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
     try:
-        with patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
+        with default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
             yield
     finally:
         torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange = float_, to, type_, arange
-        torch.set_default_dtype(default)
 
 
 @contextlib.contextmanager

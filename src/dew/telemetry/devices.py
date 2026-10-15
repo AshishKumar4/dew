@@ -162,7 +162,8 @@ CUDA_BUILDS = (("cuda13", 580, (7, 5)), ("cuda12", 525, (5, 2)))
 """JAX's CUDA builds, newest first, each with the least NVIDIA driver major
 and GPU SM it runs on: JAX's installation guide, and NVIDIA's CUDA release
 notes (Table 3, minor-version compatibility). docs/installation.md, "Which
-CUDA build", states the rule, and dewml.dev's install script applies it."""
+CUDA build", states the rule; site/scripts/gen_install.py generates the
+standalone install script's minima from this table."""
 
 
 def runs_on(build: str, driver: str, sm: tuple[int, int]) -> bool:
