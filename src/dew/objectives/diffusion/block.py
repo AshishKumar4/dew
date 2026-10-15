@@ -283,19 +283,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
-            variables, batch, step.key, train=step.training)
-        canvas_stats, encoder_stats = (
-            _row_losses(canvas_losses, target_mask, batch),
-            _row_losses(encoder_losses, encoder_target_mask, batch),
-        )
-        support = (
-            self.decoder_loss_weight * self.row_mean(target_mask, batch).total
-            + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
-        )
-        stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
-        return stats, Aux(metrics={"canvas_ce": canvas_stats.mean()[0],
-                                  "encoder_ce": encoder_stats.mean()[0]})
+        stats, _ = self._scored(variables, batch, step.key, train=step.training)
+        return stats, Aux(metrics={"canvas_ce": stats.canvas.mean()[0],
+                                  "encoder_ce": stats.encoder.mean()[0]})
 
     def _evaluation_scores(self, params: Variables, batch: Batch, key: jax.Array) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
@@ -303,9 +293,30 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         One noise level and one canvas per row are drawn from the pass's key,
         as in training, with dropout off. So `perplexity` over a validation
         pass is the exponential of the denoising loss per target."""
-        canvas_losses, target_mask, _, _, correct = self._token_losses(params, batch, key, train=False)
-        assert correct is not None
-        return TokenScores(canvas_losses, target_mask.astype(canvas_losses.dtype), correct)
+        _, scores = self._scored(params, batch, key, train=False)
+        assert scores is not None
+        return scores
+
+    def _validation_scores(self, params: Variables, batch: Batch, step: Step
+                           ) -> tuple[BlockSFTStatistics, TokenScores]:
+        stats, scores = self._scored(params, batch, step.key, train=False)
+        assert scores is not None
+        return stats, scores
+
+    def _scored(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
+                ) -> tuple[BlockSFTStatistics, TokenScores | None]:
+        """The SFT statistics and, out of training, the canvas targets'
+        scores, from one scoring of the batch."""
+        canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct = self._token_losses(
+            params, batch, key, train=train)
+        support = (
+            self.decoder_loss_weight * self.row_mean(target_mask, batch).total
+            + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
+        )
+        stats = BlockSFTStatistics(_row_losses(canvas_losses, target_mask, batch),
+                                   _row_losses(encoder_losses, encoder_target_mask, batch), support)
+        return stats, None if correct is None else TokenScores(
+            canvas_losses, target_mask.astype(canvas_losses.dtype), correct)
 
     def _row(self, batch: Batch):
         """Read one batch's rows and the masks every later phase reads.
