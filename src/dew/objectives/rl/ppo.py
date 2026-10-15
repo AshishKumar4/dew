@@ -10,7 +10,6 @@ import numpy as np
 from flax import linen as nn
 
 from dew.coordination import agreed, from_every_process
-from dew.data.dataset import DataPartition
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.protocols import HiddenStates
@@ -50,12 +49,6 @@ from .sessions import (
 
 OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"
-
-
-def _share_totals(share: int, values: Sequence[float]) -> np.ndarray:
-    """Sum host statistics once per data share, as evaluation counts its rows."""
-    shares = from_every_process([share, list(values)])
-    return np.sum(np.asarray(list(dict(shares).values()), np.float64), axis=0)
 
 
 class ValueHead(nn.Module):
@@ -292,8 +285,8 @@ class PPORollout:
         return order
 
     def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray],
-                 rewards: np.ndarray, share: int) -> dict[str, np.ndarray]:
-        """Run verl's masked GAE over each episode's actions, then whiten over unique shares.
+                 rewards: np.ndarray) -> dict[str, np.ndarray]:
+        """Run verl's masked GAE over each episode's actions, then whiten over every process.
 
         The reward of an episode lands on its last action id, and GAE runs
         across the actions of all its turns at once. Whitening reads the
@@ -311,7 +304,7 @@ class PPORollout:
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
         moments = [float(np.sum(keep)), float(np.sum(raw * keep)), float(np.sum(raw * raw * keep))]
-        count, total, squares = _share_totals(share, moments)
+        count, total, squares = np.sum(np.asarray(from_every_process(moments), np.float64), axis=0)
         mean = total / (count + MEAN_EPS)
         variance = (squares - 2 * mean * total + mean * mean * count) / (count + MEAN_EPS)
         advantages = (raw - mean) / np.sqrt(variance * (count / (count - 1)) + WHITEN_EPS)
@@ -329,15 +322,14 @@ class PPORollout:
         """Collect one cohort of episodes and return its packed rows with critic targets."""
         episodes = self.episodes.collect(state, batch, key)
         projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
-        mesh = mesh_of(state.variables)
-        share = jax.process_index() if mesh is None else DataPartition.of(mesh).index
-        count, = _share_totals(share, [min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))])
+        count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
             # Every episode was masked (truncated): zero mass, so the step makes no update.
             zeros = np.zeros(projected[IDS_KEY].shape, np.float32)
             return {**projected, OLD_VALUES_KEY: zeros, ADVANTAGES_KEY: zeros, RETURNS_KEY: zeros}
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
+        mesh = mesh_of(state.variables)
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
@@ -346,4 +338,4 @@ class PPORollout:
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )
-        return {**projected, **self._targets(np.asarray(values), projected, rewards, share)}
+        return {**projected, **self._targets(np.asarray(values), projected, rewards)}
