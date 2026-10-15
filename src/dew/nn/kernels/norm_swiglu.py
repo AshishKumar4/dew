@@ -311,12 +311,16 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
 
 
 def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """A gated norm's fp32 gate `act(gate)` and its derivative, for 'silu' or 'sigmoid'."""
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+
+    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
+    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
     sigmoid = jax.nn.sigmoid(gate)
+    slope = sigmoid * (1.0 - sigmoid)
     if activation == 'sigmoid':
-        return sigmoid, sigmoid * (1.0 - sigmoid)
-    activated = gate * sigmoid
-    return activated, activated * (1.0 - sigmoid) + sigmoid
+        return sigmoid, slope
+    return gate * sigmoid, sigmoid + gate * slope
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
@@ -668,9 +672,8 @@ def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, in
     gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    sigmoid = jax.nn.sigmoid(gate)
-    activated = gate * sigmoid
-    dg = dy * (activated * (1.0 - sigmoid) + sigmoid) * up
+    activated, slope = _activated(gate, 'silu')
+    dg = dy * slope * up
     plgpu.store(dg_ref.at[index], dg.astype(gate_ref.dtype), mask=mask)
     plgpu.store(du_ref.at[index], (dy * activated).astype(up_ref.dtype), mask=mask)
 
