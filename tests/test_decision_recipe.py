@@ -96,7 +96,9 @@ def test_a_tables_own_integer_labels_name_their_options_by_value():
         tokenizer=ByteTokenizer(), specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
                                                      pad=255),
         layout=layout, shuffle_options=False)
-    data = loader(Decisions(source=rows, validation=rows), batch=8, read="memory", objective=objective.data())
+    parsed, _, _ = Decisions(source=rows).pipelines()
+    data = loader(Decisions(source=rows, validation=parsed), batch=8, read="memory",
+                  objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     scored = batch["scored"].ravel()
     labels = [int(label) for label, real in zip(batch["labels"].ravel(), scored, strict=True) if real]
