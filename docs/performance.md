@@ -1176,7 +1176,7 @@ flash for `attention_packed`, and `flash_refusal` takes a packed call there when
 `Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`). A packed read declares the most
 documents its windows hold: what its plan or memory read placed in one, or a streamed pack's
 `segments`; a streamed pack without one declares the row length, which stays on the mask. Decision
-rows declare their objective's `segments`, the rows its packer lets a window hold.
+rows declare their objective's `segments` (16 by default), the rows its packer lets a window hold.
 
 ### Splash's tiles on the TPU, 2026-10-02
 

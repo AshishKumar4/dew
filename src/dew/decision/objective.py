@@ -387,9 +387,13 @@ class DecisionObjective(Objective[Ratio]):
     options as its `bounds` let a window hold, so a step pays for its tokens
     rather than `max_len` per row, and every batch has one shape. A window
     holds at most `segments` rows, which the backbone's sequence kernel then
-    works on a window (`Coordinates.max_segments`) whether or not they come;
-    None lets a window hold as many as the layout's shortest row fits. The
-    loss is the mean over the batch's scored questions.
+    works on a window (`Coordinates.max_segments`) whether or not they come:
+    16 by default, a few more than a window of mixed tasks' rows was measured
+    to hold, where a window full of the shortest rows would declare tens. A
+    mix of rows shorter than `max_len / segments` tokens fills its windows
+    less under it and takes a larger one; None lets a window hold as many as
+    the layout's shortest row fits. The loss is the mean over the batch's
+    scored questions.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -435,7 +439,7 @@ class DecisionObjective(Objective[Ratio]):
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 segments: int | None = None):
+                 segments: int | None = 16):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
