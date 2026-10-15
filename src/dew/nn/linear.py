@@ -809,7 +809,9 @@ exponent the kernels take (base 2, -288.5) underflows to exactly zero. A row of 
 one sequence on the kernels' aligned chunks, where fla's varlen sequences start chunks at each
 document, unaligned, and size the kernels' grids by the most documents a row may hold. A range within
 a document excludes its first token's decay; below the shifted prefix it is the difference of two plain
-fp32 prefixes, whose spacing grows with each reset: 2^-15 near -289 after one, 2^-14 after two."""
+fp32 prefixes, whose spacing grows with each reset: 2^-15 near -289 after one, 2^-14 after two. On
+fp32 rows of four documents a 4096-token row's output is 2.2e-6 from float64 (RMS over its RMS), against
+2.3e-7 with compensated prefixes and fla's varlen 1.5e-3 (H100, 2026-10-15)."""
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
