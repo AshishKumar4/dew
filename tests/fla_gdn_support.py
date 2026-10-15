@@ -256,7 +256,8 @@ def reference_dv_local(q, k, g, g_lo, do, *, scale: float, chunk: int = 64):
 
 def reference_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened, and a key
-    head's value heads summed in fp32 before `dq` and `dk` round."""
+    head's value heads summed in fp32 before `dq` and `dk` round. The decay's gradient is each
+    token's, its terms summed over the ranges through it (`fla_gdn._summed_back`)."""
     key_heads = q.shape[2]
     group = v.shape[2] // key_heads
     q_dtype, k_dtype = q.dtype, k.dtype
@@ -280,16 +281,22 @@ def reference_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: 
     dq = dq * jnp.exp2(gc)[..., None] * scale
     dk = dk * jnp.exp2(
         compensated_difference((last[:, :, None], lc[:, :, -1][:, :, None]), (gc, lc)))[..., None]
-    dg_last = dg_last + jnp.einsum('bnshk,bnshk->bnh', dk, kc.astype(f32))
     gh, lh = jnp.moveaxis(gc, 3, 2), jnp.moveaxis(lc, 3, 2)
     index = jnp.arange(chunk)
     causal = index[:, None] >= index[None, :]
+    strict = index[:, None] > index[None, :]
     ds = jnp.where(causal, ds * jnp.exp2(pairwise(gh, lh)), 0.0) * scale
+    scores = jnp.einsum('bnshk,bnthk->bnhst', qc.astype(f32), kc.astype(f32), precision=exact)
+    leaving = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dk, kc.astype(f32)), 3, 2)
+    pairs = jnp.where(strict, ds * scores, 0.0)
+    pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
+    after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
+    after = after.at[..., -1].add(dg_last)
+    through = jnp.einsum('...ij,jt->...it', pairs, strict.T.astype(f32), precision=exact)
+    dg = jnp.moveaxis(jnp.sum(jnp.where(causal, through + after[..., :, None], 0.0), axis=-2), 2, 3)
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
-    dg = jnp.sum(dq * qc.astype(f32), -1) - jnp.sum(dk * kc.astype(f32), -1)
-    dg = dg.at[:, :, -1].add(dg_last)
     shape = (batch, length, key_heads, group, q.shape[-1])
     dq, dk = dq.reshape(shape).sum(3).astype(q_dtype), dk.reshape(shape).sum(3).astype(k_dtype)
     return dq, dk, dw.reshape(w.shape).astype(w.dtype), dg.reshape(batch, length, heads)
