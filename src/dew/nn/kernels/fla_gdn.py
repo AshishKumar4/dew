@@ -30,7 +30,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.precision import compensated_add, compensated_difference
+from dew.nn.precision import compensated_difference
 
 RCP_LN2 = 1.4426950216
 """fla's 1 / ln 2: its kernels take the cumulated decay in base 2 and exponentiate with exp2."""
@@ -286,21 +286,17 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *refs, chunk: int, aligned: bool, sc
     sums from the end and stores each sum rounded once."""
     start, count = _chunk_of(chunk_ref, chunk, aligned)
 
-    def step(i, total):
-        row = start + (count - 1 - i if reverse else i)
-        token = _rows(s_ref, row, 1)[...].astype(jnp.float32)
-        if scale is not None:
-            token = token * scale
-        total = compensated_add(total, (token, jnp.zeros_like(token)))
+    @pl.when(count > 0)
+    def _():
+        step = _read(_rows(s_ref, start, chunk), count).astype(jnp.float32)
+        total = jnp.cumsum(step, axis=0)
         if reverse:
-            _rows(o_ref, row, 1)[...] = total[0] + total[1]
-        else:
-            _rows(o_ref, row, 1)[...] = total[0]
-            _rows(refs[0], row, 1)[...] = total[1]
-        return total
-
-    zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
-    jax.lax.fori_loop(0, count, step, (zero, zero))
+            total = -total + jnp.sum(step, axis=0) + step
+        if scale is not None:
+            total = total * scale
+        _write(_rows(o_ref, start, chunk), count, total)
+        if not reverse:
+            _write(_rows(refs[0], start, chunk), count, jnp.zeros_like(total))
 
 
 @dataclasses.dataclass(frozen=True)
