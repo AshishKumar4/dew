@@ -51,7 +51,7 @@ from dew.data.dataset import (
 from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -1299,11 +1299,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
-        (`dew.training.narrow`), by path under `params`: on the CUDA
-        generations measured to gain, for a step this trainer composes,
+        (`dew.training.narrow`), by path under `params`: on every GPU but
+        one whose row measured them off, for a step this trainer composes,
         without a loss scale."""
-        if (measured_kernel('narrow_copies', 'off') == 'off' or self.step is not None
-                or self.dynamic_scale or FROZEN in state.variables):
+        if (measured_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
+                or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
             return {}
         variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
