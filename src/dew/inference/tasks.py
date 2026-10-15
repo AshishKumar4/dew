@@ -127,8 +127,8 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
         inputs = prepared_inputs(processor, request, images=images)
-        return inputs, _budget(max_new_tokens, default_tokens, max_length,
-                               inputs.tokens.shape[1]), random_key
+        return inputs, generation_budget(max_new_tokens, default_tokens, max_length,
+                                         inputs.tokens.shape[1]), random_key
 
     return agreed("inference task input preparation", prepared) if collective else prepared()
 
@@ -145,7 +145,12 @@ def decoded_rows(
                  for row in range(rows.shape[0]))
 
 
-def _budget(requested: int | None, default: int | None, max_length: int | None, prompt_width: int) -> int:
+def generation_budget(requested: int | None, default: int | None, max_length: int | None,
+                      prompt_width: int) -> int:
+    """The tokens a request generates: the ones it asks for, else its task's
+    default `max_new_tokens`, else what its task's `max_length` leaves past
+    the request's `prompt_width` tokens (the prompt rows' width, padding
+    included). A task call and a server size a request alike through it."""
     if requested is not None:
         return requested
     if default is not None:

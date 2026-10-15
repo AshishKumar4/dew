@@ -1046,7 +1046,7 @@ class ScaledObjective(Objective):
     def __init__(self):
         self.ema = EMASpec(decay=lambda step: 0.5)
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.ones((2,))}}
 
     def loss(self, variables, batch, step):
@@ -1095,7 +1095,7 @@ class Counted(Objective):
 
     ema = None
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": jnp.zeros(())}}
 
     def loss(self, variables, batch, step):
@@ -1123,7 +1123,7 @@ class TwoTrees(Objective):
     def __init__(self, ema):
         self.ema = ema
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"tracked": {"w": jnp.ones((2,))},
                            "untracked": {"w": jnp.ones((2,))}}}
 
@@ -1160,7 +1160,7 @@ class TwoPlayers(Objective):
 
     ema = None
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"gen": {"g": jnp.zeros(())}, "disc": {"d": jnp.zeros(())}}}
 
     def loss(self, variables, batch, step):
