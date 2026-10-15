@@ -75,9 +75,9 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     slower than XLA's default, and 1 x 128 gives up the 1.6 ms it would gain apart.
 
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
-    objective's frozen step runs apart. A GPU's dots are cuBLAS calls, without XLA's Triton GEMM
-    fusions, unless its target row names them on (`KERNELS['xla_triton_gemm']`) or a module the
-    step runs keeps them (`TritonGemm`): no GPU measured them faster on a training step.
+    objective's frozen step runs apart. Triton GEMM fusions are turned off where
+    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
+    keeps them (`TritonGemm`).
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
@@ -88,7 +88,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (generation.startswith('sm') and gpu_target(generation).kernels.get('xla_triton_gemm', 'off') == 'off'
+    if (gpu_target(generation).kernels.get('xla_triton_gemm') == 'off'
             and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
