@@ -47,7 +47,7 @@ from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, lay
 from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import Coordinates, ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
-from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
+from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
     CountedLogits,
     CountedLogitsTraining,
@@ -1375,12 +1375,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if self.seq_aux:
             for scores, indices in routers:
                 valid = _router_queries(scores.shape[:2], queries, documents)
-                losses, supported = sequence_router_losses(
-                    scores, indices, alpha, valid,
+                moments = sequence_router_moments(
+                    scores, indices, valid,
                     None if documents is None else documents[:, :scores.shape[1]],
                     max_segments=max_segments)
+                losses = global_router_loss(moments, alpha)
+                supported = (moments.positions > 0).astype(losses.dtype)
                 sequence.append(Ratio(self.row_mean(losses, batch).total,
-                                      self.row_mean(supported.astype(losses.dtype), batch).total))
+                                      self.row_mean(supported, batch).total))
         global_routers = (() if self.seq_aux else
                           tuple(router_moments(s, i, batch, queries, documents) for s, i in routers))
         statistics = LMStatistics(prediction, tuple(sequence), global_routers)
