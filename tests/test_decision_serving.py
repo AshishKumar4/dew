@@ -1,12 +1,11 @@
 """examples/serve_decisions.py: Jev's endpoint over Starlette, on Laya's toy checkpoint."""
 
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
+from tool_support import load
 
 from dew.decision import Decide
 
@@ -17,12 +16,7 @@ REQUEST = json.loads((FIXTURES / "cases.json").read_text())["quickstart"]
 
 @pytest.fixture(scope="module")
 def example():
-    spec = importlib.util.spec_from_file_location("serve_decisions", ROOT / "examples" / "serve_decisions.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load("serve_decisions", "examples")
 
 
 @pytest.fixture(scope="module")

@@ -77,7 +77,7 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     from dew.objectives.base import Aux, Objective
 
     class Pixels(Objective):
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return {"params": {"value": jnp.asarray(0., jnp.float32)}}
 
         def loss(self, variables, batch, step):

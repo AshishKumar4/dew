@@ -8,21 +8,17 @@ Each JSON variant runs with and without reasoning, since a family may split
 on one of those settings for reasons unrelated to the JSON.
 """
 
-import importlib.util
 from pathlib import Path
 
 import pytest
+from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="module")
 def audit():
-    spec = importlib.util.spec_from_file_location("audit_template", ROOT / "tools" / "audit_template.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load("audit_template")
 
 
 def test_a_non_hermes_template_audits_its_own_tool_call_syntax(audit):

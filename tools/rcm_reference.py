@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from einops import rearrange, repeat
+from recorded_draws import Tape, TorchDraws
 from reference_source import definitions
 
 RCM = "https://raw.githubusercontent.com/NVlabs/rcm/ed3cb14dd936f92cdc9f9381af7369991509b41f/"
@@ -51,37 +52,6 @@ def velocity(strength: float):
     return net
 
 
-class Recorded:
-    """torch as the reference reads it on the CPU in float64: `randn` takes
-    the next of the draws the fixture records instead of a CUDA stream, and
-    `ones` drops the CUDA device."""
-
-    def __init__(self, generator: torch.Generator):
-        self.generator = generator
-        self.draws: list[torch.Tensor] = []
-
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-    def randn(self, *size, device=None, **kwargs):
-        shape = size[0] if len(size) == 1 and not isinstance(size[0], int) else size
-        draw = torch.randn(tuple(shape), generator=self.generator, dtype=torch.float64)
-        self.draws.append(draw)
-        return draw
-
-    def rand(self, *size, device=None, **kwargs):
-        draw = torch.rand(size, generator=self.generator, dtype=torch.float64)
-        self.draws.append(draw)
-        return draw
-
-    def randn_like(self, like):
-        return self.randn(like.shape)
-
-    @staticmethod
-    def ones(*size, device=None, **kwargs):
-        return torch.ones(*size, dtype=torch.float64)
-
-
 class Condition:
     def __init__(self, label):
         self.label = label
@@ -92,7 +62,10 @@ class Condition:
 
 def main() -> None:
     generator = torch.Generator().manual_seed(0)
-    recorded = Recorded(generator)
+    # torch as the reference reads it on the CPU in float64, its draws recorded from `generator` instead of a
+    # CUDA stream.
+    tape = Tape()
+    recorded = TorchDraws(tape, torch.float64, generator=generator)
     scope = {"torch": recorded, "np": np, "math": math, "rearrange": rearrange, "repeat": repeat,
              "log": types.SimpleNamespace(debug=lambda *args: None), "Literal": object, "TextCondition": object,
              "TensorWithT": tuple, "DenoisePrediction": lambda x0, F=None: types.SimpleNamespace(x0=x0, F=F)}
@@ -132,23 +105,23 @@ def main() -> None:
     arrays = {"x0": x0.numpy(), "label": label.numpy(), "config": np.asarray(json.dumps({**CONFIG, **{
         f"strength_{name}": value for name, value in STRENGTH.items()}}))}
     for iteration in (3, 12):
-        recorded.draws.clear()
+        tape.drawn.clear()
         times["G"].clear()
         _, loss = model._student_scm_step(ctx, iteration)
         arrays[f"scm{iteration}.loss"] = loss.detach().numpy()
         arrays[f"scm{iteration}.time"] = times["G"][0].numpy()
-        arrays[f"scm{iteration}.noise"] = recorded.draws[0].numpy()
-    recorded.draws.clear()
+        arrays[f"scm{iteration}.noise"] = tape.drawn[0].numpy()
+    tape.drawn.clear()
     _, loss = model._student_dcm_step(ctx, 0)
     arrays["dcm.loss"] = loss.detach().numpy()
-    arrays["dcm.noise"], arrays["dcm.u"] = (draw.numpy() for draw in recorded.draws)
+    arrays["dcm.noise"], arrays["dcm.u"] = (draw.numpy() for draw in tape.drawn)
     for name, step in (("dmd", model._student_dmd_step), ("critic", model.training_step_critic)):
-        recorded.draws.clear()
+        tape.drawn.clear()
         times["D"].clear()
         _, loss = step(ctx, 7)
         arrays[f"{name}.loss"] = loss.detach().numpy()
         arrays[f"{name}.times"] = torch.stack(times["D"]).numpy()
-        arrays[f"{name}.draws"] = torch.stack(recorded.draws).numpy()
+        arrays[f"{name}.draws"] = torch.stack(tape.drawn).numpy()
     FIXTURE.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE / "losses.npz", **arrays)
     print(f"{FIXTURE}: sCM at two iterations, dCM, DMD and critic losses over {SHAPE[0]} rows")
