@@ -10,7 +10,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple
+from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +35,7 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import Admitted, AttentionMetadata, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
@@ -132,6 +132,11 @@ class CausalSelfAttention(nn.Module):
     sharing): it reads the keys, values and positions its provider stashed in
     `kv_store`, post rope and norm, and keeps no cache.
     """
+    reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "position_bias",
+                                                 "admitted"})
+    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask,
+    places keys, adds a position bias and runs a server's mixed step."""
+
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
     them for its kind (`MixerContext`)."""
@@ -452,8 +457,8 @@ class CausalSelfAttention(nn.Module):
             or (self.bidirectional_images and metadata.image_groups is not None))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None, train: bool = False):
+    def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
+        decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
         B, S, _ = x.shape
         # The tokens' places and documents: the caller's or a packed batch's, else none given
         # (`Coordinates`).

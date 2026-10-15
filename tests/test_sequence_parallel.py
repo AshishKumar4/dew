@@ -33,6 +33,7 @@ from dew.nn.attention import (
     gathered_keys_attention,
     scaled_dot_product_attention,
 )
+from dew.nn.inputs import MixerCall
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 
@@ -228,13 +229,12 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
     hidden = jax.random.normal(jax.random.key(1), (1, 3, 16))
     positions = jnp.asarray([[0, 1, 4093]], jnp.int32)
     places = token_coordinates(positions=positions)
-    variables = plain.init(jax.random.key(2), hidden,
-                           attention_metadata=AttentionMetadata(coordinates=places))
+    variables = plain.init(jax.random.key(2), hidden, MixerCall(AttentionMetadata(coordinates=places)))
     coordinates = jnp.repeat(positions[..., None], 3, axis=-1)
 
     def shared_keys(layer, metadata):
         store = {}
-        layer.apply(variables, hidden, kv_store=store, attention_metadata=metadata)
+        layer.apply(variables, hidden, MixerCall(metadata, kv_store=store))
         return store["shared"][0]
 
     np.testing.assert_array_equal(
