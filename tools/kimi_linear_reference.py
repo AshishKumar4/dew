@@ -57,8 +57,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from kimi_k3_reference import LEARNING_RATE, fixture_batch, greedy, remote_modules, scatter, sgd_step
-from safetensors.torch import load_file, save_file
+from kimi_k3_reference import (
+    LEARNING_RATE,
+    fixture_batch,
+    greedy,
+    record_orders,
+    remote_modules,
+    scatter,
+    sgd_step,
+)
+from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
@@ -202,37 +210,21 @@ def main() -> None:
 
 
 def orders(drawn: Path) -> None:
-    """The reference's own rounding draws: the SGD step over each residual
-    order tools/rounding_orders.py wrote under `drawn`, its updated logits'
-    RMS distance from float64 written to DESTINATION/orders.npz beside the
-    orders (tests/reference_error.py's K-order rule). Order 0 is the
-    fixture's own run and must reproduce its updated logits bit for bit."""
+    """The reference's own rounding draws over the residual orders
+    tools/rounding_orders.py wrote under `drawn` (`record_orders`), every
+    parameter trained."""
     configuration, modeling = released_modules()
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config))).float()
     model.config._attn_implementation = "eager"
     model = model.cuda().eval()
-    ids, mask = fixture_batch()
-    input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
-    valid = mask.astype(bool)
-    with np.load(DESTINATION / "numerics.npz") as exact, np.load(DESTINATION / "reference.npz") as stored:
-        truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
-    drawn_orders = np.load(drawn / "orders.npy")
-    distances = []
-    for k in range(len(drawn_orders)):
-        weights = load_file(str(drawn / str(k) / "model.safetensors"))
+
+    def load(model, weights):
         with torch.no_grad():
             for name, parameter in model.named_parameters():
                 parameter.copy_(weights[name].to(parameter))
-        _, _, updated = sgd_step(model, input_ids, attention_mask, lambda name: True)
-        updated = updated.cpu().numpy()
-        if k == 0:
-            assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
-        distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
-    np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-             updated_logits=np.asarray(distances), precision=matmul_precision())
-    print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
+    record_orders(model, drawn, DESTINATION, load, lambda name: True, matmul_precision())
 
 if __name__ == "__main__":
     import sys

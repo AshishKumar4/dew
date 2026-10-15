@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import stub_torch_utils
 
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"
@@ -53,14 +54,7 @@ def networks(dtype: str) -> types.ModuleType:
     computing in `dtype`: float32 as published, and its float64 twin with the
     float32 casts it makes retargeted, whose distance from the first is the
     rounding error a float32 evaluation makes."""
-    persistence = types.ModuleType("torch_utils.persistence")
-    persistence.persistent_class = lambda cls: cls
-    misc = types.ModuleType("torch_utils.misc")
-    misc.const_like = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
-    package = types.ModuleType("torch_utils")
-    package.persistence, package.misc = persistence, misc
-    sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
-                        "torch_utils.misc": misc})
+    stub_torch_utils()
     module = types.ModuleType("networks_edm2")
     source = urllib.request.urlopen(SOURCE).read().decode()
     exec(source.replace("torch.float32", f"torch.{dtype}"), module.__dict__)

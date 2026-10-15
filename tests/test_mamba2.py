@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import decode_through
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs, coordinates
@@ -188,18 +189,9 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     hidden = jnp.asarray(reference["layer.hidden"])
     parallel = module.apply(variables, hidden)
 
-    cache = module.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
+    decoded, cache, _ = decode_through(module, variables, hidden, prefill=5)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
-    prefill = 5
-    out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill], MixerCall(decode=True),
-                                mutable=["cache"])
-    steps = [out]
-    for position in range(prefill, hidden.shape[1]):
-        out, mutated = module.apply({**variables, **mutated}, hidden[:, position:position + 1],
-                                    MixerCall(decode=True), mutable=["cache"])
-        steps.append(out)
-
-    assert largest(jnp.concatenate(steps, axis=1), parallel) < BOUND
+    assert largest(decoded, parallel) < BOUND
 
 
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):

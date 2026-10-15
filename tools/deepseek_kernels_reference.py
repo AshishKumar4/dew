@@ -27,7 +27,6 @@ compiles with nvcc, which takes a host gcc of at most 14:
 """
 
 import importlib.util
-import json
 import subprocess
 import sys
 import tempfile
@@ -36,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from deepseek_v41_kernels import E2M1
-from reference_source import CACHE, verified
+from reference_source import CACHE, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_kernels.npz"
@@ -126,9 +125,7 @@ def main():
     meta = {"kernels": {release: {"repo": repo, "commit": commit, "sha256": digest}
                         for release, (_, repo, commit, digest) in KERNELS.items()},
             "torch": torch.__version__, "device": torch.cuda.get_device_name()}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    saved_fixture(FIXTURE, arrays, meta)
     print(f"{FIXTURE}: {FIXTURE.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays, {meta['device']}")
 
 
