@@ -24,7 +24,7 @@ from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import DecoderBlock
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
@@ -88,7 +88,7 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read():
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
     for kind, reads in ((AttentionMixer(), True), (delta, False)):
-        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32)
+        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32, wiring=BlockWiring())
         params = layer.init(jax.random.key(0), x)
         if reads:
             assert not jnp.allclose(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
