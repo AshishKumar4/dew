@@ -271,14 +271,18 @@ def test_a_split_product_retains_the_fp32_operands_bf16_residual():
     assert float(rounded[0, 0]) == 1.0
 
 
-def test_the_wy_decay_gradient_subtracts_before_adding_the_accumulator():
-    """The ordering matters when large row/column sums cancel a small gate gradient."""
-    gate = jnp.ones((1,), jnp.float32)
-    weighted = jnp.full((1, 1), 2 ** 24, jnp.float32)
-    got = fla_gdn._wy_gate_sum(gate, weighted)
-    np.testing.assert_array_equal(np.asarray(got), np.ones(1, np.float32))
-    reordered = gate + jnp.sum(weighted, axis=1) - jnp.sum(weighted, axis=0)
-    np.testing.assert_array_equal(np.asarray(reordered), np.zeros(1, np.float32))
+def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
+    """`_summed_back` gives token t the pairs `(i, j)` with `j < t <= i` and the terms from the chunk's
+    start through `s >= t`: a pair of 2^24 outside a token's ranges leaves its small gradient exact,
+    where summing each cumulated decay's gradient back adds the pair and takes it back."""
+    index = jnp.arange(3)
+    pairs = jnp.zeros((3, 3), jnp.float32).at[1, 0].set(2.0 ** 24)
+    after = jnp.asarray([0.0, 0.0, 1.0], jnp.float32)
+    got = np.asarray(fla_gdn._summed_back(index, pairs, after))
+    np.testing.assert_array_equal(got, np.asarray([1.0, 2.0 ** 24 + 1.0, 1.0], np.float32))
+    cumulated = after + jnp.sum(pairs, axis=1) - jnp.sum(pairs, axis=0)
+    summed_back = np.cumsum(np.asarray(cumulated)[::-1])[::-1]
+    assert summed_back[0] != 1.0
 
 
 def wy_math(k, v, beta, g, chunk=64):
@@ -299,11 +303,11 @@ def wy_math(k, v, beta, g, chunk=64):
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)])
 def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype, bound):
     """fla's prepare_wy_repr_bwd gives the gradients of `w` and `u`'s cotangents with respect to the
-    keys, values, beta and the cumulated decay through the inverse: as float64 autodiff of the same
+    keys, values, beta and each token's decay through the inverse: as float64 autodiff of the same
     representation, within fp32 rounding of fp32 operands and bf16 storage's of bf16. The kernels
-    read the decay in base 2 and give its gradient in the natural-log units the caller's gate is in,
-    so the reference's gradient with respect to the base-2 decay is scaled by 1 / ln 2 (fla's
-    RCP_LN2) to compare."""
+    read the cumulated decay in base 2 and give each token's decay's gradient in the natural-log
+    units the caller's gate is in, so the reference's gradient with respect to the base-2 cumulated
+    decay is scaled by 1 / ln 2 (fla's RCP_LN2) and summed back over each chunk to compare."""
     batch, length, heads, width, columns = 1, 128, 2, 64, 64
     keys = jax.random.split(jax.random.key(12), 6)
     k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(dtype)
@@ -325,7 +329,8 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
             return jnp.sum(w * cot_w) + jnp.sum(u * cot_u)
 
         want = [np.asarray(x) for x in jax.grad(scored, argnums=(0, 1, 2, 3))(*operands)]
-    want[3] = want[3] * fla_gdn.RCP_LN2
+    cumulated = (want[3] * fla_gdn.RCP_LN2).reshape(batch, length // 64, 64, heads)
+    want[3] = np.flip(np.cumsum(np.flip(cumulated, 2), 2), 2).reshape(want[3].shape)
     a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), dtype)
     kernel = functools.partial(fla_gdn.prepare_wy_repr_bwd, interpret=INTERPRETED)
     for got in tiled(fla_gdn.PrepareWyReprBwd, kernel, k, v, beta, *g, a, dw, du):
@@ -414,7 +419,8 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
 def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key):
     """The decay of a sequence's first token scales the memory before it alone, so its gradient is
     exactly zero where that memory is: a row's first sequence from a zero initial memory and any
-    other sequence, which starts from none (`fla_gdn.first_decay_grad`). From a nonzero initial
+    other sequence, which starts from none (the gated delta rule's per-token sums,
+    `fla_gdn._summed_back`, and Kimi's `fla_kda.first_decay_grad`). From a nonzero initial
     memory it is that memory's inner product with its gradient, which is not zero."""
     batch, length, heads, width = 2, 80, 2, 64
     keys = jax.random.split(jax.random.key(17), 8)
@@ -451,7 +457,12 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     decay gradient adds that memory's whole share at the chunk's last token and takes it back at the
     key's, an fp32 cancellation of terms larger than the gradient that the math, summing each pair's
     range, never makes; with one, the port's per-head decay gradient sits 5.8 times the math's
-    distance whatever the first token's decay."""
+    distance whatever the first token's decay. Kimi's port implements fla's factorised decay
+    gradient, each token's `q dq - k dk` summed back over its chunk, so its decay gradient is held to
+    that formula's terms (`float64_terms`), each token's root sum of squares of the products summed
+    back to it, in float64: where keys of zero make a token's gradient zero, the terms it adds and
+    takes back are not. The gated delta rule's port sums each token's own pairs (`_summed_back`) and
+    is held to its gradient alone."""
     length, width, key_at, query_at = 64, 64, 48, 63
     keys = jax.random.split(jax.random.key(29), 6)
     decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
@@ -479,7 +490,13 @@ def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
     missed = (plain[query_at] - plain[key_at]) - (exact[query_at] - exact[key_at])
     with pytest.raises(AssertionError):
         assert_leaves_as_exact(truth[0] * np.exp2(missed), want[0], truth[0], reductions=CHUNKED)
-    assert_leaves_as_exact(got, want, truth, reductions=CHUNKED)
+    terms = truth
+    if per_key:
+        products = np.square(operands[0] * truth[2]) + np.square(operands[1] * truth[3])
+        chunks = products.reshape(1, length // 64, 64, 1, width)
+        summed_back = np.sqrt(np.flip(np.cumsum(np.flip(chunks, 2), 2), 2)).reshape(products.shape)
+        terms = (*truth[:5], summed_back, *truth[6:])
+    assert_leaves_as_exact(got, want, truth, reductions=CHUNKED, terms=terms)
 
 
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
