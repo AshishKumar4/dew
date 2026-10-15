@@ -91,6 +91,8 @@ def run_arguments() -> argparse.ArgumentParser:
     parser.add_argument("--work", required=True,
                         help="the workload's count, which Dew's side writes and the reference reads")
     parser.add_argument("--batch", type=int, required=True, help="global rows per step")
+    parser.add_argument("--documents", default=None,
+                        help="LOW:HIGH packs every row with documents of these lengths (`documents`)")
     parser.add_argument("--steps", type=int, default=None, help="stop early; unset runs every epoch")
     parser.add_argument("--lr-peak", type=float, default=2e-5)
     parser.add_argument("--lr-init", type=float, default=2e-6)
@@ -403,6 +405,26 @@ def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
 def host() -> dict:
     return {"hostname": platform.node(), "python": platform.python_version(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+
+
+def documents(shape: tuple[int, int], lengths: str, seed: int = 0) -> np.ndarray:
+    """Packed rows' segment ids, `shape` `[windows, seq + 1]`, numbered from 1
+    in each row: documents whose lengths a PCG64 generator seeded with `seed`
+    draws uniformly from `lengths`' LOW:HIGH, both ends included, the last
+    cut at the row's end. Each side of a run reads the same layout from the
+    same string."""
+    low, high = (int(part) for part in lengths.split(":"))
+    if not 1 <= low <= high:
+        raise ValueError(f"documents are LOW:HIGH lengths, 1 <= LOW <= HIGH, got {lengths}")
+    rng = np.random.Generator(np.random.PCG64(seed))
+    segments = np.empty(shape, np.int32)
+    for row in segments:
+        filled, segment = 0, 1
+        while filled < row.size:
+            length = int(rng.integers(low, high, endpoint=True))
+            row[filled:filled + length] = segment
+            filled, segment = filled + length, segment + 1
+    return segments
 
 
 def window_rows(order: np.ndarray, step: int, batch: int) -> np.ndarray:
