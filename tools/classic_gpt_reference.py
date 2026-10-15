@@ -65,7 +65,8 @@ def check_checkpoint(checkpoint, output, revision=None):
     layers = config.num_hidden_layers
     bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
-    ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, sampling=Sampling(temperature=0)).tokens)
+    ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, key=0,
+                               sampling=Sampling(temperature=0)).tokens)
     metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
     revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
     result = {'checkpoint': checkpoint, 'revision': revision,
