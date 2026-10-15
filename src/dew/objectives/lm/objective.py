@@ -617,7 +617,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     (`dew.nn.moe.global_router_loss`), summed over every sparse
     layer, and `seq_aux` chooses its per-sequence form
     (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
-    under these names. Unset, it adds nothing.
+    under these names. Unset, it adds nothing. A packed row's sequences are
+    its documents, each balanced alone and their losses averaged, as DeepSeek
+    defines it for the sequences its model trains on; Megatron-LM and MaxText
+    balance a packed row as one sequence, so their packed loss differs.
 
     `loss_role` counts only the targets whose `text_roles` entry matches
     it, for SFT on the chat data path (`dew.data.chat.Role`). None
