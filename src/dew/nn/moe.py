@@ -111,18 +111,28 @@ def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
     positions = jax.lax.stop_gradient(stats.positions.astype(scores.dtype))
     counts = jax.lax.stop_gradient(stats.counts.astype(scores.dtype))
     denominator = jnp.where(positions > 0, positions, 1) ** 2 * stats.top_k
-    return alpha * scores.size * jnp.vdot(counts, scores) / denominator
+    return alpha * scores.shape[-1] * jnp.sum(counts * scores, axis=-1) / denominator
 
 
-def sequence_router_losses(scores: jax.Array, indices: jax.Array,
-                           alpha: float) -> jax.Array:
-    """Compute one DeepSeek V2 load-times-score loss per intact sequence
-    (arXiv 2405.04434, section 2.1.4)."""
-    _, length, experts = scores.shape
+def sequence_router_losses(scores: jax.Array, indices: jax.Array, alpha: float,
+                           valid: jax.Array, documents: jax.Array | None = None, *,
+                           max_segments: int | None = None) -> tuple[jax.Array, jax.Array]:
+    """Each document's DeepSeek V2 balance loss and whether it has routed queries."""
+    rows, length, experts = scores.shape
     scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
-    chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
-    load = jnp.sum(chosen, axis=(1, 2)) / (length * indices.shape[-1] / experts)
-    return jnp.sum(load * jnp.mean(scores, axis=1), axis=1) * alpha
+    segments = (1 if documents is None else length) if max_segments is None else max_segments
+    documents = jnp.ones((rows, length), jnp.int32) if documents is None else documents
+    owners = jnp.where(valid & (documents != 0), documents - 1, segments)
+
+    def moments(row_scores, row_indices, row_valid, row_owners):
+        summed = jax.ops.segment_sum(jnp.where(row_valid[:, None], row_scores, 0), row_owners, segments)
+        counts = jnp.zeros((segments, experts), scores.dtype).at[row_owners[:, None], row_indices].add(
+            row_valid[:, None].astype(scores.dtype), mode="drop")
+        positions = jax.ops.segment_sum(row_valid.astype(scores.dtype), row_owners, segments)
+        return RouterMoments(summed, counts, positions, indices.shape[-1])
+
+    stats = jax.vmap(moments)(scores, indices, valid, owners)
+    return global_router_loss(stats, alpha), stats.positions > 0
 
 
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
