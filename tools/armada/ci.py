@@ -56,6 +56,7 @@ recorded and reused on the GPU's class as a CPU task's are on the CPU's.
 import argparse
 import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import heapq
 import json
@@ -232,15 +233,20 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None. The record of a run
-    on these shared inputs comes first, then the last run's, which may be another commit's whose
-    file's inputs are these."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The last run's
+    record decides where it was made on these shared inputs, as its record under them may not have
+    been written; else the record under these inputs, then the last run's, which may be another
+    commit's whose file's inputs are these."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    for inputs in (common, None):
-        record = cache_request(cache_url(python, row(python, name, split), device_class(), inputs), token)
-        if record is not None and fresh(recorded := json.loads(record), name, common):
+    url = functools.partial(cache_url, python, row(python, name, split), device_class())
+    last = json.loads(record) if (record := cache_request(url(), token)) is not None else None
+    if last is not None and last.get("inputs") == common[:16]:
+        return last["row"] if fresh(last, name, common) else None
+    exact = json.loads(record) if (record := cache_request(url(common), token)) is not None else None
+    for recorded in (exact, last):
+        if recorded is not None and fresh(recorded, name, common):
             return recorded["row"]
     return None
 
@@ -551,8 +557,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
-                           "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           "peak": ran["peak"]})
+                           "inputs": common[:16], "depends": ran["depends"], "row": row_,
+                           "reads": ran["reads"], "peak": ran["peak"]})
         for inputs in (None, common):
             cache_request(cache_url(python, row_["name"], held, inputs), token, body.encode())
 
