@@ -56,7 +56,6 @@ recorded and reused on the GPU's class as a CPU task's are on the CPU's.
 import argparse
 import concurrent.futures
 import contextlib
-import functools
 import hashlib
 import heapq
 import json
@@ -234,15 +233,12 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
     (`device_class`), if it ran green there on exactly these inputs; else None. The record of the
-    last run on these shared inputs decides, green or red (`record` writes it before the last run's);
-    with none, the last run's, which may be another commit's whose file's inputs are these."""
+    last run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others,
+    whose record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    url = functools.partial(cache_url, python, row(python, name, split), device_class())
-    record = cache_request(url(common), token)
-    if record is None:
-        record = cache_request(url(), token)
+    record = cache_request(cache_url(python, row(python, name, split), device_class(), common), token)
     recorded = None if record is None else json.loads(record)
     return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
 
@@ -559,8 +555,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"]}).encode()
-        # The record under these inputs first, and the last run's only once it is written: the last
-        # run's record is then never newer than these inputs' (`reused`).
+        # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
+        # lane read, only once the first is written, so it is never newer.
         if written(cache_url(python, row_["name"], held, common), token, body):
             written(cache_url(python, row_["name"], held), token, body)
 
