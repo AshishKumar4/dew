@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Concatenate, Protocol
+from typing import Concatenate, Protocol, overload
 
 import jax
 import jax.numpy as jnp
@@ -768,26 +768,31 @@ def placeable(field) -> bool:
         for leaf in jax.tree.leaves(field))
 
 
-def device_fields(batch: Batch) -> Batch:
-    """`batch` without the fields no device can hold (`placeable`), which host
-    code reads and a compiled step cannot take: the batch a step and an
-    objective's programs are called on. A batch with no such field, a bare
-    array among them, is itself."""
-    if not host_fields(batch):
-        return batch
-    return {name: device_fields(value) if isinstance(value, Mapping) else value
-            for name, value in batch.items() if isinstance(value, Mapping) or placeable(value)}
-
-
-def host_fields(batch: Batch | np.ndarray | jax.Array) -> dict:
-    """The fields of `batch` no device can hold, in the mappings that hold them:
-    none for a batch that is no mapping of fields."""
+@overload
+def split_fields(batch: Batch) -> tuple[Batch, dict]: ...
+@overload
+def split_fields(batch: np.ndarray | jax.Array) -> tuple[np.ndarray | jax.Array, dict]: ...
+def split_fields(batch: Batch | np.ndarray | jax.Array) -> tuple[Batch | np.ndarray | jax.Array, dict]:
+    """`batch` split in one walk into the fields a device can hold
+    (`placeable`), the batch a step and an objective's programs are called
+    on, and those none can, which host code reads and a compiled step cannot
+    take, each in the mappings that hold them (`with_host` joins them back).
+    A batch with no host field, a bare array among them, is its own device
+    part."""
     if not isinstance(batch, Mapping):
-        return {}
-    nested = {name: host_fields(value) for name, value in batch.items() if isinstance(value, Mapping)}
-    return {**{name: value for name, value in batch.items()
-               if not isinstance(value, Mapping) and not placeable(value)},
-            **{name: value for name, value in nested.items() if value}}
+        return batch, {}
+    device: dict = {}
+    host: dict = {}
+    for name, value in batch.items():
+        if isinstance(value, Mapping):
+            device[name], nested = split_fields(value)
+            if nested:
+                host[name] = nested
+        elif placeable(value):
+            device[name] = value
+        else:
+            host[name] = value
+    return (device if host else batch), host
 
 
 def with_host(placed: Batch, host: Batch) -> Batch:
@@ -897,9 +902,10 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
     actually carry validity, the way `agreed_validity` does for a generation
     request, belongs where the caller's own collectives are issued.
     """
-    if host := host_fields(batch):
+    device, host = split_fields(batch)
+    if host:
         # A field no device holds (`placeable`) stays on the host, where host code reads it.
-        return with_host(shard_batch(mesh, device_fields(batch), reads), host)
+        return with_host(shard_batch(mesh, device, reads), host)
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     leaves, tree = jax.tree.flatten(batch)

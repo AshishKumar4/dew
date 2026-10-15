@@ -19,7 +19,7 @@ import dataclasses
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -30,6 +30,26 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
+
+
+class TokenizerSpecials(Protocol):
+    """What `Specials.of` reads off a transformers tokenizer: its special
+    tokens' ids, each None where it has none, and an id's token text."""
+
+    @property
+    def cls_token_id(self) -> int | None: ...
+    @property
+    def sep_token_id(self) -> int | None: ...
+    @property
+    def eos_token_id(self) -> int | None: ...
+    @property
+    def bos_token_id(self) -> int | None: ...
+    @property
+    def mask_token_id(self) -> int | None: ...
+    @property
+    def pad_token_id(self) -> int | None: ...
+
+    def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
 
 
 @dataclass(frozen=True)
@@ -48,16 +68,19 @@ class Specials:
     pad: int
 
     @classmethod
-    def of(cls, tokenizer: Tokenizer) -> "Specials":
-        """Return a Hugging Face tokenizer's own special tokens.
+    def of(cls, tokenizer: Tokenizer | TokenizerSpecials) -> "Specials":
+        """Return a Hugging Face tokenizer's own special tokens, read off the
+        transformers tokenizer itself or the one an `HFTokenizer` loads.
 
         That is [CLS] or its start token, [SEP] or its end token, [MASK] (or else its
         end token) as the marker, and its padding token or else its end token.
         """
-        if not isinstance(tokenizer, HFTokenizer):
+        from transformers import PreTrainedTokenizerBase
+
+        hf = tokenizer.tokenizer if isinstance(tokenizer, HFTokenizer) else tokenizer
+        if not isinstance(hf, PreTrainedTokenizerBase):
             raise ValueError("Specials.of reads a Hugging Face tokenizer's special tokens; "
                              "give a ByteTokenizer's Specials explicitly")
-        hf = tokenizer.tokenizer
 
         def first(*names: str) -> int | None:
             ids = [getattr(hf, name) for name in names]

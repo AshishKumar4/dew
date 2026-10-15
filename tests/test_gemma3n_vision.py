@@ -5,6 +5,7 @@ The locally initialized 84-block fixture and its SGD update come from
 needed to run these comparisons.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -129,7 +130,7 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
 
 def test_drop_path_uses_training_rng_and_is_disabled_for_evaluation(bundle):
     _, variables, tower, _, _ = bundle
-    tower = tower.clone(drop_path_rate=0.4)
+    tower = tower.clone(construction=dataclasses.replace(tower.construction, drop_path_rate=0.4))
     pixels = jnp.asarray(np.load(FIXTURE / "pixels_even.npy"))
     training = jax.jit(lambda key: tower.apply(variables["tower"], pixels, train=True,
                                              rngs={"dropout": key}))
