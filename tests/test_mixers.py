@@ -88,7 +88,8 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read():
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
     for kind, reads in ((AttentionMixer(), True), (delta, False)):
-        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32, wiring=BlockWiring())
+        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32,
+                             wiring=BlockWiring())
         params = layer.init(jax.random.key(0), x)
         if reads:
             assert not jnp.allclose(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
