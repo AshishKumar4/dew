@@ -31,12 +31,21 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
-from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, patch_lengths, projection_flops
+from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
-from .joint import DoubleStreamBlock, embedding, embedding_flops, guided_time, layer_norm, modulate
+from .joint import (
+    DoubleStreamBlock,
+    TextStream,
+    embedding,
+    embedding_axes,
+    embedding_flops,
+    guided_time,
+    layer_norm,
+    modulate,
+)
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -113,12 +122,8 @@ class Flux2SingleBlock(nn.Module):
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
-               ("proj_out",): ("embed", None),
-               ("timestep_embedder_linear_1",): (None, "embed"),
-               ("timestep_embedder_linear_2",): (None, "embed"),
-               ("guidance_embedder_linear_1",): (None, "embed"),
-               ("guidance_embedder_linear_2",): (None, "embed")})
-class Flux2Transformer(nn.Module):
+               ("proj_out",): ("embed", None), **embedding_axes("timestep_embedder", "guidance_embedder")})
+class Flux2Transformer(TextStream, nn.Module):
     """Runs Diffusers 0.40.0's `Flux2Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes the pipeline's NHWC latent (the VAE's channels folded
@@ -148,26 +153,9 @@ class Flux2Transformer(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @property
-    def features(self) -> int:
-        return self.heads * self.head_dim
-
-    @nn.nowrap
-    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
-        return spans
-
-    @property
-    def text_keyword(self) -> str:
-        """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
-        return "conditioning"
-
-    @property
     def modulation_pieces(self) -> dict[str, int]:
         return {'double_stream_modulation_img': 6, 'double_stream_modulation_txt': 6,
                 'single_stream_modulation': 3, 'norm_out': 2}
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        raise MissingFlopsCount("Flux2Transformer needs multisequence_flops(image_lengths, text_lengths)")
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
