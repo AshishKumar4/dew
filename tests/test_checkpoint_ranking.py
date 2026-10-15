@@ -22,7 +22,7 @@ from dew.training.trainer import Best, Plateau
 
 
 class Overfit(Objective):
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {'params': {'w': jnp.zeros(())}}
 
     def loss(self, variables, batch, step):

@@ -16,12 +16,13 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
+from dew.data.dataset import rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
-from dew.training import Trainer, memory, planning, rungs
+from dew.training import Trainer, planning, rungs
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -122,8 +123,14 @@ def trained(trainer, steps=3):
 
 def room(monkeypatch, bytes_free):
     """Give every compile `bytes_free` for its temporaries, as XLA's memory analysis reads them."""
-    monkeypatch.setattr(memory, "step_headroom", lambda executable, devices, held=0:
-                        bytes_free - executable.memory_analysis().temp_size_in_bytes)
+
+    def fit(candidate, executable, mesh):
+        if executable is None:
+            return False, None
+        headroom = bytes_free - executable.memory_analysis().temp_size_in_bytes
+        return headroom >= 0, headroom
+
+    monkeypatch.setattr(planning, "device_fit", fit)
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
@@ -262,19 +269,13 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
         windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
 
 
-def fitting(monkeypatch, trainer, fits):
+def fitting(monkeypatch, trainer, fits, rows=ROWS):
     """Make each compile of `trainer`'s plan fit by `fits(split, remat,
-    tiled)`, read off the split it lowered last and its objective's rung."""
-    lowered = []
-    lower = trainer._candidate
-
-    def recorded(*args):
-        lowered.append(args[5])
-        return lower(*args)
-
-    monkeypatch.setattr(trainer, "_candidate", recorded)
-    monkeypatch.setattr(planning, "step_fits", lambda executable, mesh, held=0: (fits(
-        lowered[-1], trainer.objective.model.remat, trainer.objective.head_tile is not None), 0))
+    tiled)`, read off the candidate's microbatch of a `rows`-row batch and
+    its objective's rung."""
+    monkeypatch.setattr(planning, "device_fit", lambda candidate, executable, mesh: (fits(
+        rows // rows_of(candidate.micro), trainer.objective.model.remat,
+        trainer.objective.head_tile is not None), 0))
 
 
 @pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
@@ -381,7 +382,8 @@ def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     """Under `fit`, a frontier is timed on the run's own state, and the run
     trains on from a fresh copy of it: the timed steps count for nothing."""
     trainer = windowed(tmp_path / "timed", None)
-    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 2 or (remat is not None and tiled))
+    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 2 or (remat is not None and tiled),
+            rows=8)
     state = trainer.fit(windows(token_files(tmp_path)), steps=3, checkpoint_every=None)
     assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
     assert int(state.step) == 3

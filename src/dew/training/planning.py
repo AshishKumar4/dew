@@ -80,6 +80,14 @@ class Candidate:
     launches: str
 
 
+def device_fit(candidate: Candidate, executable: jax.stages.Compiled | None,
+               mesh: Mesh) -> tuple[bool, int | None]:
+    """Whether `candidate`'s compiled step fits every device of `mesh` beside
+    the bytes it holds, and this process's headroom: the plan's one reading
+    of the devices (`step_fits`)."""
+    return step_fits(executable, mesh, candidate.held)
+
+
 @jax.jit
 def whole_step(outputs):
     """A step's outputs from those of the microbatches it was read in: the
@@ -338,7 +346,7 @@ def plan_step[LossT, EffectsT](
         candidate = lowered[key]
         chosen = None if xla_defaults else options(candidate)
         executable = compiled_if_it_fits(candidate.program, chosen, refusals)
-        fit, headroom = step_fits(executable, mesh, candidate.held)
+        fit, headroom = device_fit(candidate, executable, mesh)
         stats = None if executable is None else executable.memory_analysis()
         probes.append(Probe(split, rows_of(candidate.micro), rung_record(objective, xla_defaults), fit,
                             headroom, None if stats is None else int(stats.temp_size_in_bytes),
