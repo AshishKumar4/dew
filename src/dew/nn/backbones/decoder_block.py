@@ -30,6 +30,7 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
+from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
@@ -273,8 +274,11 @@ class RematPolicy:
     `save` names the residuals (from `RESIDUALS`) to keep in device memory, and
     `offload` names those to move to pinned host memory. Both empty is
     MaxText's `full`. `recompute` instead names the only residuals recomputed,
-    every other value of the forward kept (jax's
-    `save_anything_except_these_names`), and takes neither list.
+    each by the layer that computes it (a delta rule its memory,
+    `dew.nn.linear.RECOMPUTED`), the block running without remat and keeping
+    every other value; it takes neither list. A checkpoint policy cannot
+    say it: one that saves anything but a name saves the value the name
+    marks from the op that made it.
     `REMAT_POLICIES` holds MaxText's recipes under this decoder's names:
     `q_proj`... for MaxText's `query_proj`..., and
     `gate_proj`/`up_proj`/`down_proj` for `mlpwi_0`/`mlpwi_1`/`mlpwo`.
@@ -303,8 +307,6 @@ class RematPolicy:
 
     def checkpoint_policy(self):
         """Return the policy that `nn.remat` runs the block under, or None to recompute everything."""
-        if self.recompute:
-            return jax.checkpoint_policies.save_anything_except_these_names(*self.recompute)
         if self.offload:
             return jax.checkpoint_policies.save_and_offload_only_these_names(
                 names_which_can_be_saved=self.save,
@@ -655,9 +657,10 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
                  prediction_phase: PredictionPhase = "ordinary"):
-        if self.remat is None or self.is_initializing() or decode:
-            return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
-                                 prediction_phase)
+        if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
+            with recomputing(() if self.remat is None else self.remat.recompute):
+                return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
+                                     prediction_phase)
 
         def run(module, x, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
