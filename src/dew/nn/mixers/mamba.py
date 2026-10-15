@@ -32,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import AttentionMetadata, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
@@ -115,6 +116,10 @@ class Mamba(nn.Module):
     (`segment_ids`) run as if alone.
     """
 
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
+    of its document, with no mask or bias to narrow it."""
+
     emb_features: int
     intermediate_size: int
     state_size: int = 16
@@ -167,9 +172,8 @@ class Mamba(nn.Module):
             self.init_std if self.output_init_std is None else self.output_init_std))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        del kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, attention_metadata = call.decode, call.metadata
         batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
         valid = tokens.valid

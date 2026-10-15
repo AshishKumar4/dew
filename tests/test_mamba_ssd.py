@@ -18,7 +18,7 @@ from reference_error import assert_leaves_as_exact, ieee_fixture, widened
 from sharded import assert_runs_per_shard
 from tuned import each_config
 
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import mamba_ssd, tuning
 from dew.nn.mixers import mamba2
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
@@ -175,7 +175,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound)
     metadata = AttentionMetadata(coordinates=coordinates(segments=segments))
 
     def loss(params):
-        out = jnp.asarray(layer.apply(params, x, attention_metadata=metadata))
+        out = jnp.asarray(layer.apply(params, x, MixerCall(metadata)))
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     row_names_port(monkeypatch, port=False)
