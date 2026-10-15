@@ -69,6 +69,12 @@ def arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--tp", type=int, default=1, help="tensor-parallel size")
     parser.add_argument("--sequence-parallel", action="store_true")
     parser.add_argument("--recompute", choices=("none", "selective", "full"), default="none")
+    parser.add_argument("--cross-entropy", choices=("native", "te"), default="native",
+                        help="the fused vocabulary cross entropy: Megatron-Core's, or Transformer Engine's, "
+                             "which keeps no fp32 copy of the logits")
+    parser.add_argument("--precision-aware-optimizer", action="store_true",
+                        help="Transformer Engine's Adam updates the fp32 master weights and writes the bf16 "
+                             "ones in one kernel")
     parser.add_argument("--seed", type=int, default=0, help="Megatron's model init")
     return parser.parse_args(argv)
 
@@ -117,7 +123,7 @@ def model_parts(hf: dict, args: argparse.Namespace):
         tensor_model_parallel_size=args.tp, sequence_parallel=args.sequence_parallel,
         bias_activation_fusion=True, bias_dropout_fusion=True, masked_softmax_fusion=True,
         persist_layer_norm=True, apply_rope_fusion=True, gradient_accumulation_fusion=True,
-        cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="native",
+        cross_entropy_loss_fusion=True, cross_entropy_fusion_impl=args.cross_entropy,
         attention_backend=AttnBackend.auto,
         recompute_granularity=None if args.recompute == "none" else args.recompute,
         recompute_method="uniform" if args.recompute == "full" else None,
@@ -199,7 +205,8 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     optimizer = get_megatron_optimizer(OptimizerConfig(
         optimizer="adam", lr=args.lr_peak, min_lr=args.lr_end, weight_decay=args.weight_decay,
         adam_beta1=args.b1, adam_beta2=args.b2, adam_eps=args.eps, clip_grad=args.clip, bf16=True,
-        params_dtype=torch.bfloat16, use_distributed_optimizer=True), [model])
+        params_dtype=torch.bfloat16, use_distributed_optimizer=True,
+        use_precision_aware_optimizer=args.precision_aware_optimizer), [model])
     config.finalize_model_grads_func = finalize_model_grads
     config.grad_scale_func = optimizer.scale_loss
     config.no_sync_func = model.no_sync
