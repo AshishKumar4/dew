@@ -32,6 +32,7 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
     from dew.interop.decoder_parts import DecoderFields
+    from dew.nn.mixer_base import MixerBase
 
 MODEL_TYPE = "mamba2"
 
@@ -54,9 +55,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     """Read `Mamba2Config` fields into `CausalTransformer` kwargs.
 
     `used` collects the config keys read, the set `hf_decoders.translate_config`
-    checks the rest against. The attention geometry the backbone validates
-    (num_heads, head_dim) takes one head of the model width; the SSD layer
-    reads its own heads from the mixer value and never that.
+    checks the rest against. The backbone's attention geometry is
+    `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
     """
     if hf_config.get("model_type", MODEL_TYPE) != MODEL_TYPE:
         raise ValueError(f"model_type {hf_config.get('model_type')!r} is not {MODEL_TYPE!r}")
@@ -105,21 +105,24 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         use_bias=flag("use_bias", default=False),
         use_conv_bias=flag("use_conv_bias", default=True),
         time_step_limit=(lower, upper))
-    fields: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=integer("vocab_size", 32768),
-        emb_features=hidden,
-        num_layers=integer("num_hidden_layers", 64),
-        num_heads=1,
-        num_kv_heads=1,
-        head_dim=hidden,
-        mlp_features=0,
-        qk_norm=False,
+    return mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 32768),
+                         num_layers=integer("num_hidden_layers", 64),
+                         tie_embeddings=flag("tie_word_embeddings", default=False),
+                         residual_in_fp32=flag("residual_in_fp32", default=True))
+
+
+def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase, *, vocab_size: int,
+                  num_layers: int, tie_embeddings: bool, residual_in_fp32: bool) -> DecoderFields:
+    """The decoder fields of a Mamba family's model, every layer `mixer`
+    alone, `hidden` wide, its norms at the config's `layer_norm_epsilon`. The
+    attention geometry the backbone validates is one head of the model width,
+    with no feed-forward and no query and key norm, none of which a layer
+    reads."""
+    return native_fields(CausalTransformer)(
+        vocab_size=vocab_size, emb_features=hidden, num_layers=num_layers, num_heads=1, num_kv_heads=1,
+        head_dim=hidden, mlp_features=0, qk_norm=False,
         norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
-        tie_embeddings=flag("tie_word_embeddings", default=False),
-        residual_in_fp32=flag("residual_in_fp32", default=True),
-        mixer=mixer,
-    )
-    return fields
+        tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
 
 
 def weight_path(name: str, config: Mapping[str, object], *, layer: Mapping[str, tuple[str, ...]] = LAYER,

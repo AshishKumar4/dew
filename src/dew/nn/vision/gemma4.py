@@ -29,6 +29,7 @@ from .common import (
     TowerBase,
     TowerGeometry,
     _vision_section,
+    head_width,
     projector_weight_path,
 )
 
@@ -80,11 +81,7 @@ class Gemma4VisionTransformer(nn.Module):
 
     def setup(self):
         cfg = self.config
-        if cfg.head_dim is None and cfg.hidden_size % cfg.num_heads:
-            raise ValueError(
-                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
-                f"({cfg.num_heads})")
-        head_dim = cfg.hidden_size // cfg.num_heads if cfg.head_dim is None else cfg.head_dim
+        head_dim = head_width(cfg.hidden_size, cfg.num_heads) if cfg.head_dim is None else cfg.head_dim
         if head_dim <= 0 or head_dim % 4:
             raise ValueError(
                 f"the head width ({head_dim}) must split "
