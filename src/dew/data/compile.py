@@ -413,6 +413,38 @@ def compile(
             budget=budget,
             resume=resume,
         )
+    staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
+                     seed=seed, rejections=rejections, budget=budget)
+    return _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Staged:
+    """A run's branches prepared, and materialized for a memory read, before
+    their readers are built (`_compiled`): `original` is the training branch
+    before a memory read ran it."""
+
+    train: Pipeline
+    validation: Pipeline | None
+    original: Pipeline
+    build: _Build
+    counts: dict[str, CorpusCounts]
+    validation_counts: dict[str, CorpusCounts]
+    batch_tokens: int | None
+
+
+def _staged(
+    train: Pipeline,
+    validation: Pipeline | None,
+    *,
+    objective: ObjectiveData | None,
+    read: Read,
+    provision: bool,
+    loading: Loading,
+    seed: int,
+    rejections: Literal["drop", "mask"],
+    budget: SearchBudget,
+) -> _Staged:
     if rejections == "mask":
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
@@ -422,7 +454,7 @@ def compile(
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
     branches = _prepared(
-        branches,
+        (train,) if validation is None else (train, validation),
         read,
         provision=provision,
         training=True,
@@ -443,31 +475,21 @@ def compile(
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
-    return _compiled(
-        train,
-        validation,
-        original,
-        build,
-        host=host,
-        resume=resume,
-        counts=counts,
-        validation_counts=validation_counts,
-        batch_tokens=batch_tokens,
-    )
+    return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
 
 def _compiled(
-    train: Pipeline,
-    validation: Pipeline | None,
-    original: Pipeline,
-    build: _Build,
+    staged: _Staged,
+    packed: tuple[Coordinated, ...],
     *,
     host: tuple[HostStep, ...],
     resume: Literal["exact", "non-exact"],
-    counts: Mapping[str, CorpusCounts],
-    validation_counts: Mapping[str, CorpusCounts],
-    batch_tokens: int | None,
 ) -> Loader:
+    """The readers of `staged`, each training batch's packed windows laid out
+    as `packed` declares them and each validation batch's as its own packs do
+    (`_held_coordinated`)."""
+    train, validation, original, build = staged.train, staged.validation, staged.original, staged.build
+    counts, validation_counts = staged.counts, staged.validation_counts
     read, seed, batch, global_order = (
         build.read,
         build.seed,
@@ -497,7 +519,6 @@ def _compiled(
     )
     build = build.tuned(train)
     train_host, device = _batch_steps(train)
-    packed = _coordinated(original)
     train_host = packed + train_host + host
     statistics = _Statistics(counts)
     training = functools.partial(
@@ -518,7 +539,7 @@ def _compiled(
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
             ).tuned(validation),
-            host=packed + _held_steps(validation) + host,
+            host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
     records = _epoch_records(train, build)
@@ -537,7 +558,7 @@ def _compiled(
         validation_counts=validation_counts,
         plan=plan,
         statistics=statistics,
-        batch_tokens=batch_tokens,
+        batch_tokens=staged.batch_tokens,
         device=device,
     )
 
@@ -550,25 +571,69 @@ def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[Device
             tuple(step for step in steps if isinstance(step, DeviceStep)))
 
 
-def _coordinated(pipeline: Pipeline) -> tuple[Coordinated, ...]:
+def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     """The step that lays each packed window's documents out as the model
-    reads them (`Coordinated`), one per packed ids field, before the stages
-    that pack are planned away: a window holds no more documents than tokens.
-    A pack counts wherever it runs: as a stage, in the stages a memory read
-    already ran, or as the plan a source reads its windows by (`PackedSource`)."""
+    reads them (`Coordinated`), one per packed ids field, declaring the most
+    documents a window of `pipelines` holds (`Coordinates.max_segments`),
+    which a sequence kernel's work follows. A plan's windows hold as many as
+    it placed (`PackedSource`) and a memory read's as many as it packed; a
+    pack that runs as rows arrive holds its windows to its cap
+    (`Pack.segments`), or to its window's length where it has none: a window
+    holds no more documents than tokens. A corpus that shows no packing
+    while another packs into the same batches holds windows packed where
+    none of this can see, so then each declares its window's length."""
     from dew.data.packing import PackedSource
 
-    packs = [stage for stage in _steps(pipeline) if isinstance(stage, Pack)]
-    for _, source in _leaves(pipeline):
-        packs += [stage for stage in _written(source, ()) if isinstance(stage, Pack)]
+    fields: dict[str, tuple[str, ...]] = {}
+    bounds: dict[str, int] = {}
+    unseen = False
+
+    def declare(pack: Pack, most: int | None) -> None:
+        ids = pack.fields[0]
+        fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
+        bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
+        bounds[ids] = max(bounds.get(ids, 0), bound)
+
+    def walk(pipeline: Pipeline, *, packed: bool) -> None:
+        nonlocal unseen
+        for stage in pipeline.stages:
+            if isinstance(stage, Pack):
+                declare(stage, stage.segments)
+                packed = True
+        source = pipeline.source
+        if isinstance(source, (Mixture, Phases)):
+            for child in source.pipelines:
+                walk(child, packed=packed)
+            return
+        documents = _packed_documents(source)
+        for stage in _written(source, ()):
+            if isinstance(stage, Pack):
+                declare(stage, stage.segments if documents is None else documents)
+                packed = True
         while isinstance(source, (_Facts, _Ran)):
             source = source.source if isinstance(source, _Facts) else source.original
         if isinstance(source, PackedSource):
-            packs.append(source.plan.pack)
-    caps: dict[tuple[str, ...], int] = {}
-    for stage in packs:
-        caps[stage.fields] = max(caps.get(stage.fields, 0), stage.seq_len)
-    return tuple(Coordinated(fields, cap) for fields, cap in caps.items())
+            declare(source.plan.pack, source.plan.most_documents)
+            packed = True
+        unseen = unseen or not packed
+
+    for pipeline in pipelines:
+        walk(pipeline, packed=False)
+    return tuple(Coordinated(fields[ids], None if unseen else bound) for ids, bound in bounds.items())
+
+
+def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
+    """A validation pass's `Coordinated` steps: its own packs' declarations,
+    and for a field only the training packs it, a window's length, since a
+    validation source may hold packed windows whose packing it does not show."""
+    held = _coordinated(validation)
+    declared = {step.fields[0] for step in held}
+    return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
+
+
+def _packed_documents(source: Source) -> int | None:
+    """The most documents a window of a memory read's packed windows holds, None where it packed none."""
+    return source.documents if isinstance(source, _Memory) else None
 
 
 def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
@@ -599,38 +664,33 @@ def _compile_phases(
         raise TypeError("phased compilation needs a Phases source")
     _tokenizer_contract((train,) if validation is None else (train, validation))
     consumed: dict[str, int] = {}
-    built: list[tuple[Loader, int | None]] = []
+    staged: list[tuple[_Staged, int | None]] = []
     previous = 0
     for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
-        continued = _continued(pipeline, consumed).then(*train.stages)
-        loaded = compile(
-            continued,
-            validation=validation if index == 0 else None,
-            host=host,
-            objective=objective,
-            read=read,
-            provision=provision,
-            loading=loading,
-            seed=seed,
-            rejections=rejections,
-            budget=budget,
-            resume=resume,
-        )
+        phase = _staged(_continued(pipeline, consumed).then(*train.stages),
+                        validation if index == 0 else None, objective=objective, read=read,
+                        provision=provision, loading=loading, seed=seed, rejections=rejections, budget=budget)
+        end = None if until is None else until * phase.build.batch
+        staged.append((phase, end))
+        if end is not None:
+            _delivered(pipeline, end - previous, consumed)
+            previous = end
+    # Every phase declares the most documents a window of any phase holds, so the run steps one program.
+    packed = _coordinated(*(phase.train for phase, _ in staged))
+    built: list[tuple[Loader, int | None]] = []
+    for index, (phase, end) in enumerate(staged):
+        loaded = _compiled(phase, packed, host=host, resume=resume)
         if loaded.plan is None or loaded.plan.lowering != "global":
             raise ValueError(
                 f"phase {index} needs a global order; "
                 "streamed, rejecting and online-packed phases are refused"
             )
-        end = None if until is None else until * loaded.batch
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
             raise ValueError(f"phase {index} ends in other device steps than phase 0; every phase of "
                              f"a run runs the same ones, written after the phases")
         built.append((loaded, end))
-        if end is not None:
-            _delivered(pipeline, end - previous, consumed)
-            previous = end
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         def global_reader(reader: Reader) -> GlobalReader:
@@ -862,9 +922,9 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
             for stage in pipeline.stages))
     (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
                             counts=(counts,) if records is None else None)
-    packed = _coordinated(pipeline)
     if read == "memory" and records is None:
         pipeline = _materialize(pipeline, counts)
+    packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read)
     if records is not None:
         lowering = _cut(lowering, per_share=True)
@@ -964,11 +1024,11 @@ def validation(
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
-    packed = _coordinated(pipeline)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
+    packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),

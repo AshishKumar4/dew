@@ -57,3 +57,9 @@ from dew_flash_attn import flash_mha_varlen
 
 out = flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen, is_causal=True)
 ```
+
+The packed backward launches its CTAs over the batch's blocks, not over `N` times
+`max_seqlen`'s: `patches/` changes both ports' backward kernels so that a sequence's blocks start
+at `cu_seqlens[i] / block + i` and a CTA finds its sequence by a binary search, so a batch of many
+empty or short sequences costs what its tokens do. The patches apply to the pinned checkouts
+(build.sh) and are written to go upstream.
