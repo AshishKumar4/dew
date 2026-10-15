@@ -808,8 +808,8 @@ decays by e^-200, and every range of the chunk that crosses it by at least as mu
 exponent the kernels take (base 2, -288.5) underflows to exactly zero. A row of documents then runs as
 one sequence on the kernels' aligned chunks, where fla's varlen sequences start chunks at each
 document, unaligned, and size the kernels' grids by the most documents a row may hold. A range within
-a document excludes its first token's decay; below the shifted prefix it is the difference of two fp32
-prefixes near -289, each rounded to 2^-15."""
+a document excludes its first token's decay; below the shifted prefix it is the difference of two plain
+fp32 prefixes, whose spacing grows with each reset: 2^-15 near -289 after one, 2^-14 after two."""
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
