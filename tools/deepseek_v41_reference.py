@@ -597,7 +597,7 @@ def widened(model_module):
     model.py and the stand-ins widened, which are their `.float()` casts, the
     MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
     and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
-    from diffusers_wan_reference import default_dtype, wide
+    from torch_precision import default_dtype, wide
 
     float_, zeros_like, new_zeros, arange = (torch.Tensor.float, torch.zeros_like,
                                              torch.Tensor.new_zeros, torch.arange)

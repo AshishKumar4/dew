@@ -183,7 +183,7 @@ def write_mel() -> None:
 
     waveform = np.random.RandomState(5).randn(12000).astype(np.float32) * 0.3
 
-    from diffusers_wan_reference import default_dtype
+    from torch_precision import default_dtype
 
     def mel(dtype):
         # The filters and the window are built in the default dtype, so float64's are built in float64.

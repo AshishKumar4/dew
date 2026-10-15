@@ -44,7 +44,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from hf_reference import QWEN35_MM_TEXT
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -59,7 +58,26 @@ TINY = "qwen35-tiny"
 REAL_MODEL = "Qwen/Qwen3.5-0.8B"
 BATCH, LENGTH = 2, 12
 
-CONFIG = QWEN35_MM_TEXT
+# Small enough to live in git, shaped so every gap the family opens is
+# exercised: value heads outnumbering key heads, key and value dims apart,
+# a partial rotary of a quarter of the head (the released factor), the
+# doubled gated q_proj, and a conv with a real history. The multimodal
+# fixture's text decoder is this one too (tools/hf_reference.py).
+CONFIG: dict = dict(
+    vocab_size=256, hidden_size=64, intermediate_size=128,
+    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+    head_dim=32, hidden_act="silu", max_position_embeddings=64,
+    rms_norm_eps=1e-6, tie_word_embeddings=True,
+    linear_conv_kernel_dim=4, linear_key_head_dim=12, linear_value_head_dim=16,
+    linear_num_key_heads=2, linear_num_value_heads=4,
+    layer_types=["linear_attention"] * 3 + ["full_attention"],
+    # A quarter of head_dim 32 rotates: 8 dims, 4 frequency pairs, which the
+    # three mRoPE sections split as 2 + 1 + 1 (the released [11, 11, 10]
+    # splits the 32 pairs of a 64-dim rope the same way).
+    rope_parameters={"rope_type": "default", "rope_theta": 1000000.0,
+                     "partial_rotary_factor": 0.25,
+                     "mrope_interleaved": True, "mrope_section": [2, 1, 1]},
+)
 
 # The rule fixture: two chunks of 64 with the second one padded, three heads
 # so a head index mistake shows, and key and value dims apart.
