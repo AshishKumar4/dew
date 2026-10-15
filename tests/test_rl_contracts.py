@@ -49,6 +49,7 @@ def test_ppo_whitening_counts_each_replicated_share_once(tmp_path):
     single, = run_pool("ppo", tmp_path / "single", 1, script=WORKER, devices=2, timeout=120)
     reports = run_pool("ppo", tmp_path / "pool", 2, script=WORKER, devices=1, timeout=120)
     assert single["readers"] == 1 and all(report["readers"] == 2 for report in reports)
+    assert np.max(np.abs(single["actor_gradient"])) > 1e-6
     for report in reports:
         assert not report["refused"]
         for name in ("advantages", "returns", "old_values", "actor_gradient"):
