@@ -427,11 +427,16 @@ class RematChoosing(Protocol):
 class Recomputing(Protocol):
     """A model one remat rung up (None at the top), its rung as a checkpoint
     records it, and the model at a record's rung where that is above its
-    own: a resumed run never compiles a lighter rung than it trained on."""
+    own: a resumed run never compiles a lighter rung than it trained on.
+    `recompute_half` is the model one rung up where that rung recomputes only
+    the few values it names, a half rung the planner tries at each split
+    (`dew.training.planning.plan_step`), else None."""
 
     def recompute_record(self) -> JSON: ...
 
     def recompute_more(self) -> Self | None: ...
+
+    def recompute_half(self) -> Self | None: ...
 
     def restore_recompute(self, record: JSON) -> Self: ...
 
