@@ -273,3 +273,62 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False]
+
+
+WIDENED = """
+import inspect
+from dew.nn.kernels import norm_swiglu
+# This checkout's norm launch as a checkout whose kernel takes one operand more names it.
+fwd = norm_swiglu.RmsForward._fwd
+parameters = list(inspect.signature(fwd).parameters.values())
+at = next(i for i, p in enumerate(parameters) if p.kind is inspect.Parameter.KEYWORD_ONLY)
+parameters.insert(at, inspect.Parameter("shift", inspect.Parameter.KEYWORD_ONLY, default=None))
+def widened(self, *args, shift=None, **kwargs):
+    return fwd(self, *args, **kwargs)
+widened.__signature__ = inspect.Signature(parameters)
+norm_swiglu.RmsForward._fwd = widened
+"""
+
+STORES = """
+import json, sys
+import jax
+import tokamax
+from test_tuning import operands, step
+from dew import cache
+from dew.nn.kernels import norm_swiglu, tuning
+with tuning.launches():
+    found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+[norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                               metadata={})
+config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
+pick = tuning.AutotuningData({config: timing})
+tuning._store(tokamax.AutotuningResult(jax.devices()[0].device_kind, ((norm, pick),)))
+path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+read, foreign = tuning._read(path)
+picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]
+         for ba, timings in read.values() if type(ba.op) is norm_swiglu.RmsForward}
+print(json.dumps([path, picks, len(foreign)]))
+"""
+
+
+def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(tmp_path):
+    """Two checkouts share a store: one whose norm launch takes an operand more (`shift`) and this
+    one. Each stores its own pick of the launch through the store's writer. This checkout reads only
+    its own, and its write leaves the other's entry as it was, which that checkout still reads back as
+    its pick, where a launch binding stored arguments by name and dropping the one its kernel lacks
+    took that pick as this checkout's and rewrote it without the operand."""
+    flags = keeping_picks()
+    cache_dir = tmp_path / "cache"
+    path, theirs, _ = fresh(WIDENED + STORES, "[4, 2]", cache_dir=cache_dir, flags=flags)
+    [(names, pick)] = theirs.items()
+    assert "shift" in json.loads(names) and pick == [4, 2]
+    with open(path) as file:
+        [entry] = json.load(file)["data"]
+    _, ours, foreign = fresh(STORES, "[2, 8]", cache_dir=cache_dir, flags=flags)
+    [(names, pick)] = ours.items()
+    assert "shift" not in json.loads(names) and pick == [2, 8] and foreign == 1
+    with open(path) as file:
+        assert entry in json.load(file)["data"]
+    _, theirs, foreign = fresh(WIDENED + STORES, "[4, 2]", cache_dir=cache_dir, flags=flags)
+    assert theirs == {names: [4, 2] for names in theirs} and len(theirs) == 1 and foreign == 1

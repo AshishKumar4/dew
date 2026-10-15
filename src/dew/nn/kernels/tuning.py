@@ -342,10 +342,15 @@ def _read(path: str) -> tuple[Keyed, list]:
     """The launches stored at `path` that this checkout's kernels read
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
-    config fields, or another signature of a kernel, as before a launch
-    gained an operand), which a write keeps as they are. Each launch is read
-    alone, so one launch this checkout cannot read leaves the others
-    readable. A missing file, or one that is not JSON, holds nothing."""
+    config fields, or another signature of a kernel, with an operand more or
+    one fewer), which a write keeps as they are. A launch binds its stored
+    arguments by name, dropping any its kernel lacks and leaving out any it
+    has, so an entry whose names are not its kernel's signature's is another
+    checkout's: re-keyed here, every write from a checkout that dropped an
+    operand took that kernel's picks from the checkouts that still have it.
+    Each launch is read alone, so one launch
+    this checkout cannot read leaves the others readable. A missing file, or
+    one that is not JSON, holds nothing."""
     if not os.path.exists(path):
         return {}, []
     try:
@@ -359,9 +364,15 @@ def _read(path: str) -> tuple[Keyed, list]:
     foreign = []
     for entry in entries:
         try:
-            read.update(_keyed(tokamax.AutotuningResult.loads(json.dumps({**stored, "data": [entry]})).data))
+            launches = _keyed(tokamax.AutotuningResult.loads(json.dumps({**stored, "data": [entry]})).data)
         except ValueError:
             foreign.append(entry)
+            continue
+        if any(set(entry[0]["arguments"]) != set(ba.signature.parameters) - {"config"}
+               for ba, _ in launches.values()):
+            foreign.append(entry)
+            continue
+        read.update(launches)
     return read, foreign
 
 
