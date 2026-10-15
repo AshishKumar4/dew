@@ -42,6 +42,29 @@ def torch_kernel(value: np.ndarray) -> np.ndarray:
     return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
 
 
+def dew_leaf(path: tuple[str, ...], value: np.ndarray, heads: int) -> np.ndarray:
+    """A torch tensor other than a fused qkv in Dew's layout at Dew `path`: the output projection per
+    head, any other kernel as [in, out], the rest as stored."""
+    if path[-2:] == ("to_out_0", "kernel"):
+        return output_heads(value, heads)
+    return dew_kernel(value) if path[-1] == "kernel" else value
+
+
+def torch_leaf(path: tuple[str, ...], value: np.ndarray) -> np.ndarray:
+    """`dew_leaf`'s inverse."""
+    if path[-2:] == ("to_out_0", "kernel"):
+        return output_merged(value)
+    return torch_kernel(value) if path[-1] == "kernel" else value
+
+
+def case_arrays(arrays, case: str):
+    """A reference fixture's arrays of one case, written as `<case>/<name>`: a reader of them by
+    `name`, and the case's parameter names (`<case>/param.<name>`) in the file's order."""
+    prefix = f"{case}/param."
+    return (lambda name: arrays[f"{case}/{name}"]), [name.removeprefix(prefix) for name in arrays
+                                                     if name.startswith(prefix)]
+
+
 def leaf(tree, path: tuple[str, ...]) -> np.ndarray:
     """The array at `path` in a nested tree."""
     for key in path:
