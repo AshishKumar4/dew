@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn import joined
 from dew.nn.linear import GatedDeltaNet
@@ -21,7 +21,34 @@ def row_joins(monkeypatch, choice: str, *, joins: bool = True):
 
 
 def dots(function, *args) -> int:
-    return sum(equation.primitive.name == "dot_general" for equation in jax.make_jaxpr(function)(*args).eqns)
+    """The dot products `function`'s jaxpr runs, its sub-jaxprs' included."""
+    graph = jax.make_jaxpr(function)(*args)
+    return sum(equation.primitive.name == "dot_general" for equation in equations(graph))
+
+
+def assert_joined_as_exact(monkeypatch, choice: str, run, arguments, wide_run):
+    """`run(*arguments)` with `choice` joined, every leaf within tests/reference_error.py's rule of
+    the run with it apart, both measured from `wide_run`, the apart run in float64."""
+    row_joins(monkeypatch, choice, joins=False)
+    apart = jax.jit(run)(*arguments)
+    row_joins(monkeypatch, choice)
+    together = jax.jit(run)(*arguments)
+    row_joins(monkeypatch, choice, joins=False)
+    with jax.enable_x64(new_val=True):
+        truth = wide_run(*jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), arguments))
+    for (path, mine), theirs, want in zip(jax.tree_util.tree_leaves_with_path(together),
+                                          jax.tree.leaves(apart), jax.tree.leaves(truth), strict=True):
+        assert mine.dtype == theirs.dtype
+        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path))
+
+
+def gradients(apply):
+    """`apply`'s output and the gradients of its arguments under a cotangent, the last argument."""
+    def run(*arguments):
+        out, pull = jax.vjp(apply, *arguments[:-1])
+        return out, *pull(arguments[-1])
+
+    return run
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -37,25 +64,12 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(monkeypatch, dtyp
     # Drawn biases too, which init leaves at zero.
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                           layer.init(jax.random.key(4), x))
-
-    def run(layer, params, x, cotangent):
-        out, pull = jax.vjp(layer.apply, params, x)
-        return out, *pull(cotangent)
-
     row_joins(monkeypatch, "gate_up", joins=False)
     assert dots(layer.apply, params, x) == 3
-    apart = jax.jit(lambda *args: run(layer, *args))(params, x, cotangent)
     row_joins(monkeypatch, "gate_up")
     assert dots(layer.apply, params, x) == 2
-    together = jax.jit(lambda *args: run(layer, *args))(params, x, cotangent)
-    row_joins(monkeypatch, "gate_up", joins=False)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), (params, x, cotangent))
-        truth = run(layer.clone(dtype=jnp.float64), *wide)
-    for (path, mine), theirs, want in zip(jax.tree_util.tree_leaves_with_path(together),
-                                          jax.tree.leaves(apart), jax.tree.leaves(truth), strict=True):
-        assert mine.dtype == theirs.dtype
-        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path))
+    assert_joined_as_exact(monkeypatch, "gate_up", gradients(layer.apply), (params, x, cotangent),
+                           gradients(layer.clone(dtype=jnp.float64).apply))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -68,22 +82,9 @@ def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(monkeypatc
     layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=16, head_v_dim=16,
                           dtype=dtype)
     params = layer.init(jax.random.key(9), x)
-
-    def run(layer, params, x, cotangent):
-        out, pull = jax.vjp(layer.apply, params, x)
-        return out, *pull(cotangent)
-
     row_joins(monkeypatch, "delta_gates", joins=False)
-    apart_dots = dots(layer.apply, params, x)
-    apart = jax.jit(lambda *args: run(layer, *args))(params, x, cotangent)
+    apart = dots(layer.apply, params, x)
     row_joins(monkeypatch, "delta_gates")
-    assert dots(layer.apply, params, x) == apart_dots - 1
-    together = jax.jit(lambda *args: run(layer, *args))(params, x, cotangent)
-    row_joins(monkeypatch, "delta_gates", joins=False)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), (params, x, cotangent))
-        truth = run(layer.clone(dtype=jnp.float64), *wide)
-    for (path, mine), theirs, want in zip(jax.tree_util.tree_leaves_with_path(together),
-                                          jax.tree.leaves(apart), jax.tree.leaves(truth), strict=True):
-        assert mine.dtype == theirs.dtype
-        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path))
+    assert dots(layer.apply, params, x) == apart - 1
+    assert_joined_as_exact(monkeypatch, "delta_gates", gradients(layer.apply), (params, x, cotangent),
+                           gradients(layer.clone(dtype=jnp.float64).apply))
