@@ -264,23 +264,31 @@ def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',
     copy's slice-and-negate ran as separate passes: without it Qwen3-0.6B's
     training step at 8 x 1024 took 140.6 against 145.6 ms, and Qwen3-1.7B's
     at 4 x 1024 150.0 against 153.8 (docs/performance.md).
+
+    Only the turned channels are written back into x (`dynamic_update_slice`);
+    the channels that pass through are x as it came, scaled where `scale` asks.
+    Rebuilding the whole head through fp32 and concatenating moved every channel
+    of a partial rotary: at Qwen3.5-0.8B's queries (8 x 3072 tokens, 8 heads
+    of 256, 64 turned) an A100 80GB's forward took 69.5 against 127.5 us and
+    its forward and VJP 135.9 against 220.7, bitwise the same.
     """
     if x.ndim == 4:
         cos, sin = cos[..., None, :], sin[..., None, :]
     wide = x.astype(at_least_fp32(x.dtype))
     count = cos.shape[-1]
     start = 0 if span == 'leading' else wide.shape[-1] - 2 * count
-    lead, turned, tail = wide[..., :start], wide[..., start:start + 2 * count], wide[..., start + 2 * count:]
+    turned = wide[..., start:start + 2 * count]
     if pairs == 'half':
         first, second = turned[..., :count], turned[..., count:]
-        rotated = [first * cos - second * sin, second * cos + first * sin]
+        rotated = jnp.concatenate([first * cos - second * sin, second * cos + first * sin], axis=-1)
     else:
         split = turned.reshape(*turned.shape[:-1], count, 2)
         first, second = split[..., 0], split[..., 1]
-        rotated = [jnp.stack([first * cos - second * sin, second * cos + first * sin],
-                             axis=-1).reshape(turned.shape)]
-    out = jnp.concatenate([part for part in (lead, *rotated, tail) if part.shape[-1]], axis=-1)
-    return (out if scale is None else out * scale).astype(x.dtype)
+        rotated = jnp.stack([first * cos - second * sin, second * cos + first * sin],
+                            axis=-1).reshape(turned.shape)
+    base = x if scale is None else (wide * scale).astype(x.dtype)
+    rotated = rotated if scale is None else rotated * scale
+    return jax.lax.dynamic_update_slice_in_dim(base, rotated.astype(x.dtype), start, axis=-1)
 
 
 @dataclasses.dataclass(frozen=True)
