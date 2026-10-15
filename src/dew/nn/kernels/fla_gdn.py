@@ -1036,7 +1036,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, lo_ref, h_ref, do_ref, 
             # The queries' reads of the memory the chunk enters, and that memory's own decay to its end.
             after = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
                      + jnp.where(last_row, dg_last * jnp.exp2(last[0]), 0.0))
-            _write(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after, exact=exact))
+            _write(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
             ds = ds.astype(keys.dtype)
             dq += _dot(ds, keys, exact=exact)
             dk += _dot(ds.T, queries, exact=exact)
@@ -1122,7 +1122,7 @@ def _chunk_states(h):
     return h.reshape(-1, *h.shape[2:])
 
 
-def _summed_back(index, pairs, after, *, exact: bool):
+def _summed_back(index, pairs, after):
     """The gradient of each of a chunk's per-token decays, `d/dg_t`, from the gradients of terms through
     ranges of its cumulated decay: `pairs` `[C, C]`, each `(i, j)` a term through the range `(j, i]`
     (strictly lower), and `after` `[C]`, each `s` a term through the range from the chunk's start to
@@ -1131,9 +1131,9 @@ def _summed_back(index, pairs, after, *, exact: bool):
     those back, adding and taking back every term whose range misses the token: fp32's residue where
     the gradient is exactly zero (keys of zero before a token, 1.7e-10 in
     test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens), and the cancellation of terms
-    many times the gradient where it is not."""
-    upper = (index[:, None] < index[None, :]).astype(jnp.float32)
-    through = _dot(pairs, upper, exact=exact)
+    many times the gradient where it is not. Each row's pairs before `t` are its running sum less
+    its `t`th, exactly zero where no pair before `t` is nonzero."""
+    through = jnp.cumsum(pairs, axis=1) - pairs
     return jnp.sum(jnp.where(index[:, None] >= index[None, :], through + after[:, None], 0.0), axis=0)
 
 
@@ -1223,7 +1223,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, lo_ref, a_ref, dw_r
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         _write(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
-        _write(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate, exact=exact))
+        _write(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
 
 
 @dataclasses.dataclass(frozen=True)

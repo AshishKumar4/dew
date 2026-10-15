@@ -278,7 +278,7 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
     index = jnp.arange(3)
     pairs = jnp.zeros((3, 3), jnp.float32).at[1, 0].set(2.0 ** 24)
     after = jnp.asarray([0.0, 0.0, 1.0], jnp.float32)
-    got = np.asarray(fla_gdn._summed_back(index, pairs, after, exact=True))
+    got = np.asarray(fla_gdn._summed_back(index, pairs, after))
     np.testing.assert_array_equal(got, np.asarray([1.0, 2.0 ** 24 + 1.0, 1.0], np.float32))
     cumulated = after + jnp.sum(pairs, axis=1) - jnp.sum(pairs, axis=0)
     summed_back = np.cumsum(np.asarray(cumulated)[::-1])[::-1]
