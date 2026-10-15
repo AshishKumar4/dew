@@ -773,10 +773,7 @@ def split_fields(batch: Batch) -> tuple[Batch, dict]:
     (`placeable`), the batch a step and an objective's programs are called
     on, and those none can, which host code reads and a compiled step cannot
     take, each in the mappings that hold them (`with_host` joins them back).
-    A batch with no host field, a bare array among them, is its own device
-    part."""
-    if not isinstance(batch, Mapping):
-        return batch, {}
+    A batch with no host field is its own device part."""
     device: dict = {}
     host: dict = {}
     for name, value in batch.items():

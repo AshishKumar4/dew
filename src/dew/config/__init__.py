@@ -1156,12 +1156,12 @@ class RunConfig:
         dataset = self.loader(objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))
 
-    def loader(self, objective: ObjectiveData | None, data: RunData | None = None) -> Loader:
-        """The run's `data`, or `data` in its place, compiled with the
+    def loader(self, objective: ObjectiveData | None, recipe: RunData | None = None) -> Loader:
+        """The run's `data`, or `recipe` in its place, compiled with the
         `objective`'s steps under the run's data controls: the trainer's batch
         rows or tokens, `data_read`, `provision`, `data_seed`, `loading` and
         `validation_records`. Every kind of run's `prepare` loads through it."""
-        return loader(self.data if data is None else data, batch=self.trainer.batch_size,
+        return loader(self.data if recipe is None else recipe, batch=self.trainer.batch_size,
                       tokens=self.trainer.batch_tokens, read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading, validation_records=self.validation_records,
                       objective=objective)

@@ -51,7 +51,7 @@ class Specials:
     pad: int
 
     @classmethod
-    def of(cls, tokenizer: Tokenizer | PreTrainedTokenizerBase) -> "Specials":
+    def of(cls, tokenizer: "Tokenizer | PreTrainedTokenizerBase") -> "Specials":
         """Return a Hugging Face tokenizer's own special tokens, read off the
         transformers tokenizer itself or the one an `HFTokenizer` loads.
 
