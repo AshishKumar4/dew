@@ -155,9 +155,13 @@ def model_parts(hf: dict, args: argparse.Namespace):
         rotary_percent = rope.get("partial_rotary_factor", 1.0)
     else:
         raise SystemExit(f"{model_type} has no Megatron-Core mapping here; llama and qwen3_5 do")
+    # Llama 3.1's frequency scaling is Megatron-Core's rope_scaling.
+    scaling = {"rope_scaling": True, "rope_scaling_factor": rope["factor"]} \
+        if rope.get("rope_type") == "llama3" else {}
     return config, spec, dict(
         vocab_size=hf["vocab_size"], share_embeddings_and_output_weights=hf.get("tie_word_embeddings", False),
-        position_embedding_type="rope", rotary_percent=rotary_percent, rotary_base=int(rope["rope_theta"]))
+        position_embedding_type="rope", rotary_percent=rotary_percent, rotary_base=int(rope["rope_theta"]),
+        **scaling)
 
 
 @dataclasses.dataclass
