@@ -36,6 +36,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
+from dew.nn.joined import joined_outputs, joins
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
@@ -107,7 +108,7 @@ class _Masking(NamedTuple):
     cursor: jax.Array | None
 
 
-@logical_axes({
+PROJECTION_AXES = {
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
     ("v_proj",): ("embed", "kv"),
@@ -115,7 +116,13 @@ class _Masking(NamedTuple):
     # like the query's; the longer suffix outranks the MLP's `gate_proj`.
     ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
-})
+}
+QKV_AXES = tuple(PROJECTION_AXES[(name,)] for name in ('q_proj', 'k_proj', 'v_proj'))
+"""The query, key and value kernels' logical axes, by which a joined call keeps each shard's columns
+together (`dew.nn.joined.joined_outputs`)."""
+
+
+@logical_axes(PROJECTION_AXES)
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
@@ -290,6 +297,22 @@ class CausalSelfAttention(nn.Module):
             if not self.ctx.k_eq_v:
                 sites['v_proj'] = (self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim)
         return sites
+
+    def _qkv(self) -> tuple[nn.Module, nn.Module, nn.Module]:
+        return self.q_proj, self.k_proj, self.v_proj
+
+    def _projected(self, x):
+        """The query projection, and the keys' and values' where one product
+        made them too: the packed `qkv_proj`, or the three kernels joined per
+        call where the generation measured that faster (`joins`)."""
+        group = self._group()
+        if group is not None and self._packed():
+            projected, key, value = group.split(self.qkv_proj(x))
+            return projected, (key, value)
+        if group is not None and joins('qkv', self._qkv(), QKV_AXES):
+            projected, key, value = joined_outputs(x, self._qkv(), QKV_AXES, HEADS)
+            return projected, (key, value)
+        return self.q_proj(x), None
 
     def _group(self) -> ProjectionGroup | None:
         """Its query, key and value projections of the layer's input, packed
@@ -468,13 +491,7 @@ class CausalSelfAttention(nn.Module):
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
-        projected_kv = None
-        group = self._group()
-        if group is not None and self._packed():
-            projected, key, value = group.split(self.qkv_proj(x))
-            projected_kv = (key, value)
-        else:
-            projected = self.q_proj(x)
+        projected, projected_kv = self._projected(x)
         projected = checkpoint_name(projected, 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3

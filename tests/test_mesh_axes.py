@@ -388,8 +388,9 @@ def test_topologies_agree_with_data_parallel():
 
 
 def one_step(spec):
-    """One step's loss and gradients under `spec`: the parameters one seed
-    initialises, placed by the default rules, and one batch of the fixture.
+    """One step's loss and gradients under `spec`, and its compiled text: the
+    parameters one seed initialises, placed by the default rules, and one
+    batch of the fixture.
 
     The step is the trainer's inner call without the optimizer: what the
     default rules place is the only thing `spec` changes between two runs of
@@ -413,15 +414,16 @@ def one_step(spec):
         return jax.value_and_grad(loss_fn, has_aux=True)(trainable)
 
     with jax.set_mesh(mesh):
-        (loss, _), grads = step(placed["params"])
-    return float(loss), grads
+        compiled = step.lower(placed["params"]).compile()
+        (loss, _), grads = compiled(placed["params"])
+    return float(loss), grads, compiled.as_text()
 
 
 def test_the_tensor_axis_changes_no_value():
     """Four tensor shards against none, from one seed and one batch: the same
     loss and the same gradient in every leaf."""
-    whole_loss, whole_grads = one_step(MeshSpec(fsdp=2))
-    split_loss, split_grads = one_step(MeshSpec(fsdp=2, tensor=4))
+    whole_loss, whole_grads, _ = one_step(MeshSpec(fsdp=2))
+    split_loss, split_grads, _ = one_step(MeshSpec(fsdp=2, tensor=4))
 
     assert abs(split_loss - whole_loss) < 1e-5, (whole_loss, split_loss)
     differences = jax.tree.map(
