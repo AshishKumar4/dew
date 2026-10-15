@@ -162,7 +162,7 @@ class DecisionHead(Head):
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
-        x = states + self.type_embedding(kinds).astype(states.dtype)
+        x = states + _embedded(self.type_embedding, kinds).astype(states.dtype)
         metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
@@ -247,6 +247,24 @@ def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
 def _gathered(values: jax.Array, indices: jax.Array) -> jax.Array:
     """`values` `[B, N, ...]` at each row's `indices` `[B, P]`: `[B, P, ...]`."""
     return jnp.take_along_axis(values, indices.reshape(*indices.shape, *(1,) * (values.ndim - 2)), axis=1)
+
+
+def _selected(values: jax.Array, indices: jax.Array) -> jax.Array:
+    """`_gathered` where N or P is a row's questions, `values` `[B, N, F]`, as a one-hot product, as
+    `_span_means` reads its spans: its transpose is a product too, where a gather's is a scatter that
+    XLA's deterministic GPU scatter sorts. The joint head's three question gathers, [8, 75, 1024] to
+    [8, 7500, 1024], and its last-token gather took 4.6 ms of an A100 80GB's step in those scatters."""
+    chosen = jax.nn.one_hot(indices, values.shape[1], dtype=values.dtype)
+    return jnp.einsum("bpn,bnf->bpf", chosen, values, precision=jax.lax.Precision.HIGHEST)
+
+
+def _embedded(embed: nn.Embed, ids: jax.Array) -> jax.Array:
+    """`embed`'s rows at `ids` as a one-hot product: a lookup's transpose scatters every position's
+    gradient into the table's three rows, which XLA's deterministic GPU scatter sorts (1.8 ms of an
+    A100 80GB's step at 8 x 75 positions)."""
+    table = jnp.asarray(embed.embedding, embed.dtype)
+    chosen = jax.nn.one_hot(ids, table.shape[0], dtype=table.dtype)
+    return jnp.einsum("...k,kw->...w", chosen, table, precision=jax.lax.Precision.HIGHEST)
 
 
 def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
@@ -377,7 +395,7 @@ class JointSchemaHead(Head):
         rows = inputs.question_segments
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
-        last_state = _gathered(hidden, last)
+        last_state = _selected(hidden, last)
         questions = _span_means(hidden, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
@@ -390,7 +408,7 @@ class JointSchemaHead(Head):
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
-                   + _gathered(self.option_question_projection(questions), owners))
+                   + _selected(self.option_question_projection(questions), owners))
         # A slot reads its own row's tokens and questions, and a padding slot every one of them, so
         # each query has a key. The masks are [B, 1, queries, keys], one for every head.
         read = _gathered(own, owners)[:, None]
@@ -406,16 +424,16 @@ class JointSchemaHead(Head):
         summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
         types = jnp.asarray(_TYPE_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
-                  + self.type_embedding(types))
+                  + _embedded(self.type_embedding, types))
         for layer in self.field_layers:
             fields = layer(fields, memory, asked, own[:, None])
         fields = self.field_norm(fields)
 
-        anchor = _gathered(l2_normalized(questions + last_state, 1e-12), owners)
+        anchor = _selected(l2_normalized(questions + last_state, 1e-12), owners)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
                  * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
-        repeated = _gathered(fields, owners)
+        repeated = _selected(fields, owners)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
