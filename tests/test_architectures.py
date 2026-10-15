@@ -486,7 +486,9 @@ def shard_terms(case: Case, tmp_path, initial):
                  for row in range(BATCH)]
     summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
     for got, want in zip(jax.tree.leaves(summed), jax.tree.leaves(whole), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-12 * float(np.max(np.abs(want), initial=0)))
+        # float64's rounding of the two sums parts them by ~1e-11 of the leaf; a step whose rows do not
+        # add up (a batch-wide statistic) parts them by its own size.
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-9 * float(np.max(np.abs(want), initial=0)))
     terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
     return SimpleNamespace(**terms)
 
