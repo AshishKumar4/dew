@@ -47,7 +47,7 @@ from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, lay
 from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import Coordinates, ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
-from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
+from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
     CountedLogits,
     CountedLogitsTraining,
@@ -384,7 +384,29 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
 ROUTER_BIAS = "e_score_correction_bias"
 
 
-def router_counts(moe: Variables, routing: Variables) -> Variables:
+def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
+                    documents: jax.Array | None) -> jax.Array:
+    """The real queries of a router, including a prediction depth's shifted inputs."""
+    if queries is None:
+        return jnp.ones(shape, bool)
+    width = shape[1]
+    valid = queries[:, :width].astype(bool)
+    for offset in range(1, queries.shape[1] - width + 1):
+        valid = valid & queries[:, offset:offset + width].astype(bool)
+        if documents is not None:
+            valid = valid & (documents[:, :width] == documents[:, offset:offset + width])
+    return valid
+
+
+def _selected_counts(indices: jax.Array, valid: jax.Array, experts: int) -> jax.Array:
+    """Each row's integer expert counts over its real queries."""
+    weights = jnp.broadcast_to(valid[..., None], indices.shape).astype(jnp.int32)
+    return jax.vmap(lambda ids, weight: jnp.bincount(ids.ravel(), weights=weight.ravel(),
+                                                   length=experts))(indices, weights)
+
+
+def router_counts(moe: Variables, routing: Variables, queries: jax.Array | None = None,
+                  documents: jax.Array | None = None) -> Variables:
     """Count the slots each router the forward ran selected, at the path of
     the balancing bias it keeps in `moe`.
 
@@ -397,8 +419,9 @@ def router_counts(moe: Variables, routing: Variables) -> Variables:
     for path, node in _sown_nodes(routing, "indices"):
         if (*path, ROUTER_BIAS) in biases:
             (indices,) = node["indices"]
-            counts[(*path, ROUTER_BIAS)] = jnp.bincount(indices.ravel(),
-                                                        length=biases[(*path, ROUTER_BIAS)].shape[0])
+            valid = _router_queries(indices.shape[:2], queries, documents)
+            counts[(*path, ROUTER_BIAS)] = jnp.sum(
+                _selected_counts(indices, valid, biases[(*path, ROUTER_BIAS)].shape[0]), axis=0)
     return unflatten_dict(counts)
 
 
@@ -408,7 +431,8 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
 
-def router_z_terms(routing: Variables, weight: float, batch: Batch) -> tuple[Ratio, ...]:
+def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax.Array | None = None,
+                   documents: jax.Array | None = None) -> tuple[Ratio, ...]:
     """Return ST-MoE's router z-loss, one `Ratio` per router.
 
     This is eq. 5 of ST-MoE (arXiv 2202.08906): `weight` times the squared log
@@ -422,13 +446,16 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch) -> tuple[Rat
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
     for _, node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
-        work = Objective.row_mean(jnp.square(log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))),
-                                  batch)
-        terms.append(Ratio(weight * work.total, work.mass))
+        valid = _router_queries(log_z.shape, queries, documents)
+        dtype = jnp.promote_types(log_z.dtype, jnp.float32)
+        total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
+        mass = Objective.row_mean(valid.astype(dtype), batch).total
+        terms.append(Ratio(weight * total, mass))
     return tuple(terms)
 
 
-def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch) -> RouterMoments:
+def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
+                   queries: jax.Array | None = None, documents: jax.Array | None = None) -> RouterMoments:
     """Return one router's routed-position statistics over `batch`'s rows (`Objective.row_mean`).
 
     `scores` is `[rows, positions, experts]` and `indices` the experts each
@@ -436,11 +463,13 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch) -> Route
     """
     experts = scores.shape[-1]
     dtype = jnp.promote_types(scores.dtype, jnp.float32)
+    valid = _router_queries(scores.shape[:2], queries, documents)
     # These counts enter a floating loss, unlike the exact integer bias effects.
-    summed = Objective.row_mean(scores.astype(dtype), batch, axis=(0, 1))
-    chosen = jax.vmap(lambda row: jnp.bincount(row.ravel(), length=experts))(indices)
+    summed = Objective.row_mean(jnp.where(valid[..., None], scores.astype(dtype), 0), batch, axis=(0, 1))
+    chosen = _selected_counts(indices, valid, experts)
     counts = Objective.row_mean(chosen, batch, axis=0).total.astype(dtype)
-    return RouterMoments(summed.total, counts, summed.mass, indices.shape[-1])
+    positions = Objective.row_mean(valid.astype(dtype), batch).total
+    return RouterMoments(summed.total, counts, positions, indices.shape[-1])
 
 
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
@@ -588,7 +617,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     (`dew.nn.moe.global_router_loss`), summed over every sparse
     layer, and `seq_aux` chooses its per-sequence form
     (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
-    under these names. Unset, it adds nothing.
+    under these names. Unset, it adds nothing. A packed row's sequences are
+    its documents, each balanced alone and their losses averaged, as DeepSeek
+    defines it for the sequences its model trains on; Megatron-LM and MaxText
+    balance a packed row as one sequence, so their packed loss differs.
 
     `loss_role` counts only the targets whose `text_roles` entry matches
     it, for SFT on the chat data path (`dew.data.chat.Role`). None
@@ -1144,7 +1176,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return jnp.asarray(batch[ROLES_KEY])
 
     def _query_weights(self, prepared: ModelInputs, dtype):
-        """Mark with 1 every query whose indexer KL counts.
+        """Mark every real query whose router statistics and indexer KL count.
 
         A query counts when its token is real, neither the pad id nor a slot
         the `ModelInputs` attention mask leaves out, and, in a packed batch,
@@ -1159,6 +1191,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         valid = prepared.token_fields.get("attention_mask")
         if valid is not None:
             weights = weights * valid[:, :-1].astype(dtype)
+        laid = prepared.token_fields.get("coordinates")
+        if isinstance(laid, Coordinates) and laid.valid is not None:
+            weights = weights * laid.valid[:, :-1].astype(dtype)
         return weights
 
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
@@ -1299,10 +1334,16 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
         statistics: Ratio | LMStatistics = prediction
+        queries = (self._query_weights(prepared, bool)
+                   & (self.row_weights(batch, weights.shape[0]) > 0)[:, None])
+        documents = documents_of(prepared.token_fields)
         if alpha is not None:
-            statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha, batch)
+            laid = prepared.token_fields.get("coordinates")
+            statistics, reported["aux_loss"] = self._router_statistics(
+                prediction, routing, alpha, batch, queries, documents,
+                max_segments=laid.max_segments if isinstance(laid, Coordinates) else None)
         if self.router_z_loss:
-            router_z = router_z_terms(routing or {}, self.router_z_loss, batch)
+            router_z = router_z_terms(routing or {}, self.router_z_loss, batch, queries, documents)
             if not router_z:
                 raise ValueError(
                     "router_z_loss needs routers that sow their gate's log partition "
@@ -1312,7 +1353,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
         effects = None
         if rate is not None:
-            effects, load = self._router_load(params, routing)
+            effects, load = self._router_load(params, routing, queries, documents)
             reported.update(load)
         if self.qk_stats:
             peak = _global_qk_max(qk)
@@ -1320,7 +1361,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
-    def _router_statistics(self, prediction: Ratio, routing, alpha: float, batch: Batch
+    def _router_statistics(self, prediction: Ratio, routing, alpha: float, batch: Batch,
+                           queries: jax.Array, documents: jax.Array | None, *,
+                           max_segments: int | None = None
                            ) -> tuple[LMStatistics, jax.Array]:
         """Add the balance loss's own statistics beside the prediction's.
 
@@ -1331,15 +1374,27 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if not routing:
             raise ValueError("aux_loss_alpha requires a model with a mixture")
         routers = _router_scores(routing)
-        sequence = tuple(self.row_mean(sequence_router_losses(s, i, alpha), batch)
-                         for s, i in routers) if self.seq_aux else ()
-        global_routers = () if self.seq_aux else tuple(router_moments(s, i, batch) for s, i in routers)
-        statistics = LMStatistics(prediction, sequence, global_routers)
+        sequence = []
+        if self.seq_aux:
+            for scores, indices in routers:
+                valid = _router_queries(scores.shape[:2], queries, documents)
+                moments = sequence_router_moments(
+                    scores, indices, valid,
+                    None if documents is None else documents[:, :scores.shape[1]],
+                    max_segments=max_segments)
+                losses = global_router_loss(moments, alpha)
+                supported = (moments.positions > 0).astype(losses.dtype)
+                sequence.append(Ratio(self.row_mean(losses, batch).total,
+                                      self.row_mean(supported, batch).total))
+        global_routers = (() if self.seq_aux else
+                          tuple(router_moments(s, i, batch, queries, documents) for s, i in routers))
+        statistics = LMStatistics(prediction, tuple(sequence), global_routers)
         combined, _ = self.reduce_loss(statistics)
         prediction_loss, _ = prediction.mean()
         return statistics, combined - prediction_loss
 
-    def _router_load(self, params: Variables, routing) -> tuple[Variables, dict[str, jax.Array]]:
+    def _router_load(self, params: Variables, routing, queries: jax.Array, documents: jax.Array | None
+                     ) -> tuple[Variables, dict[str, jax.Array]]:
         """Count what each balanced router selected, and report how evenly.
 
         The counts are the effect the optimizer applies once per commit;
@@ -1347,8 +1402,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         if "moe" not in params or routing is None:
             raise ValueError("balance_rate requires a mixture with bias=True")
-        counts = router_counts(params["moe"], routing)
-        shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
+        counts = router_counts(params["moe"], routing, queries, documents)
+        shares = [count / jnp.maximum(jnp.sum(count), 1) for count in jax.tree.leaves(counts)]
         if not shares:
             raise ValueError(
                 "balance_rate requires routers that keep a balancing bias, "
