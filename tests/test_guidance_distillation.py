@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
+from diffusion_support import saved_after_one_step
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
@@ -116,14 +117,7 @@ def test_the_loss_is_the_papers_equation(runs):
 
 def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, tmp_path):
     _, config, batch = runs
-    task = config.build()
-    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(tmp_path / "student"))
+    task, state = saved_after_one_step(config, batch, tmp_path / "student", 1e-2)
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert restored.guidance is None and TEACHER not in restored.variables
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

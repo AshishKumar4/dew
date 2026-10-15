@@ -12,16 +12,11 @@ measured from (tests/reference_error.py). No model weights are downloaded
 at test time.
 """
 
-import json
 from pathlib import Path
 
 import numpy as np
 import pytest
-from flax.traverse_util import flatten_dict
-from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, assert_update_as_exact, kimi_source
-from safetensors.numpy import load_file
-
-from dew.interop import Pretrained
+from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-linear-tiny"
@@ -60,23 +55,12 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
 
     The export writes every source name back at its stored shape, A_log as
     [1, 1, heads, 1], and reloading restores the trained weights exactly."""
-    loaded, _, _ = source
-    variables = assert_update_as_exact(source, TINY)
-    loaded.save(tmp_path, variables=variables)
-    written, shipped = (
-        load_file(str(tmp_path / "model.safetensors")),
-        load_file(str(TINY / "model.safetensors")),
-    )
+    trained, restored, written, shipped = exported(source, TINY, tmp_path)
     assert {name: value.shape for name, value in written.items()} == {
         name: value.shape for name, value in shipped.items()
     }
     assert written["model.layers.0.self_attn.A_log"].shape == (1, 1, 2, 1)
-    assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
-        (TINY / "config.json").read_text()
-    )
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    trained = flatten_dict(variables, sep=".")
-    for name, after in flatten_dict(restored.variables, sep=".").items():
+    for name, after in restored.items():
         np.testing.assert_array_equal(np.asarray(after), np.asarray(trained[name]), err_msg=name)
 
 

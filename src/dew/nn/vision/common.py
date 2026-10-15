@@ -28,6 +28,14 @@ class ProjectorBase:
             f"{type(self).__name__} names a projector kind but builds no module")
 
 
+def head_width(hidden_size: int, num_heads: int) -> int:
+    """Each head's width where `num_heads` split a tower's `hidden_size`
+    evenly, and a refusal where they leave a remainder."""
+    if hidden_size % num_heads:
+        raise ValueError(f"hidden_size ({hidden_size}) must split over num_heads ({num_heads})")
+    return hidden_size // num_heads
+
+
 @dataclasses.dataclass(frozen=True)
 class TowerGeometry:
     """The shapes a conditioner has to invent to create a tower's media leaves.
