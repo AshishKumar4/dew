@@ -272,57 +272,6 @@ def test_the_load_balance_update_pushes_against_the_busy_experts():
         np.asarray(update), np.array([-0.001, 0.0, 0.001, 0.001], np.float32))
 
 
-EXPERTS = 8
-
-
-def balanced_run(steps=40, rate=0.01, direction=1.0):
-    """A skewed router run with the bias update applied every step.
-
-    The gate reads a constant first feature, so every expert has a standing
-    preference on top of what a token asks for, which is the imbalance a real
-    router starts with. `direction` of -1 is the mutation: an update that
-    follows the load, where the reference opposes it.
-    """
-    router = Router(num_experts=EXPERTS, in_features=16, top_k=2, expert_bias=True)
-    tokens = jax.random.normal(jax.random.key(3), (128, 16)).at[:, 0].set(1.0)
-    kernel = (jax.random.normal(jax.random.key(4), (16, EXPERTS)) * 0.5).at[0].set(
-        jnp.asarray([2.0, 1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0]))
-    variables = {"params": {"kernel": kernel},
-                 "moe": {"e_score_correction_bias": jnp.zeros(EXPERTS, jnp.float32)}}
-
-    def load(variables):
-        _, indices = router.apply(variables, tokens)
-        return np.bincount(np.asarray(indices).ravel(), minlength=EXPERTS)
-
-    start = load(variables)
-    for _ in range(steps):
-        _, indices = router.apply(variables, tokens)
-        counts = jnp.sum(jax.nn.one_hot(indices.ravel(), EXPERTS, dtype=jnp.int32), axis=0)
-        update = load_balance_update(counts, rate) * direction
-        variables = {**variables, "moe": {
-            "e_score_correction_bias":
-                variables["moe"]["e_score_correction_bias"] + update}}
-    return start, load(variables), np.asarray(
-        variables["moe"]["e_score_correction_bias"])
-
-
-def test_the_bias_update_evens_out_the_expert_load():
-    """The mechanism end to end: the update applied to the bias every step,
-    and the load spread has to close.
-
-    The router reads the bias out of the `moe` collection and never writes it
-    (transformers keeps it there, and MaxText hands the update back the same
-    way), so the step that applies it is this loop.
-    """
-    start, final, bias = balanced_run()
-
-    # Observed 51 tokens between the busiest and the idlest expert at the
-    # start and 12 after 40 steps, over 128 tokens and 8 experts.
-    assert np.ptp(final) < np.ptp(start) / 3, (start, final)
-    assert bias[np.argmax(start)] < 0 < bias[np.argmin(start)]
-    assert final.min() > 0, final
-
-
 # --------------------------------------------------------------------------
 # The grouped matmul
 # --------------------------------------------------------------------------

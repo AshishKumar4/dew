@@ -225,6 +225,9 @@ class PPOObjective(Objective[Ratio, Variables]):
         """Score source prompts under the live actor, without rollout targets or the critic."""
         return self.actor.validation_loss(part(variables, "policy"), batch, replace(step, ema=None))
 
+    def _validation_scores(self, params: Variables, batch, step: Step):
+        return self.actor._validation_scores(part(params, "policy"), batch, replace(step, ema=None))
+
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
 

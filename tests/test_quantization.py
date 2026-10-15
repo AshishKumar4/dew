@@ -6,7 +6,11 @@ everywhere, since construction never imports it.
 
 import dataclasses
 import itertools
+import os
+import subprocess
+import sys
 from importlib import import_module
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -111,22 +115,6 @@ def test_an_int8_trunk_trains_down():
         params, opt_state, loss = train(params, opt_state, subkey)
         losses.append(float(loss))
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
-
-
-def int8_products(jaxpr) -> int:
-    """How many convolutions and matmuls of two int8 operands `jaxpr` runs,
-    a scan's body counted once per iteration."""
-    count = 0
-    for equation in jaxpr.eqns:
-        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
-                and all(operand.aval.dtype == jnp.int8 for operand in equation.invars)):
-            count += 1
-        repeats = equation.params["length"] if equation.primitive.name == "scan" else 1
-        for value in equation.params.values():
-            inner = getattr(value, "jaxpr", value)
-            if hasattr(inner, "eqns"):
-                count += repeats * int8_products(inner)
-    return count
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",
@@ -260,6 +248,50 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         assert 0.0 < float(jnp.linalg.norm(got_part - float_part) / jnp.linalg.norm(float_part)) < 0.02
 
 
+QUANTIZED_CONVOLUTION = """
+import sys
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import qwix
+
+from dew.nn.conv import Conv
+from dew.training.quantization import Quantization
+
+dtype = sys.argv[1]
+# Without the bias, which the quantization leaves alone and a bf16
+# module adds, and differentiates, in bf16.
+settings = {"features": 128, "kernel_size": (2, 2), "strides": (2, 2), "padding": "VALID", "use_bias": False}
+conv = Conv(**settings, dtype=jnp.bfloat16)
+x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
+variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
+cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
+qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
+reference = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+    [qwix.QtRule(module_path=".*", weight_qtype=qtype, act_qtype=qtype)]))
+
+
+def dew(variables, x):
+    return Quantization(dtype=dtype).apply(conv).apply(variables, x)
+
+
+def qwix_in_float32(variables, x):
+    as_float32 = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), (variables, x))
+    return reference.apply(*as_float32).astype(jnp.bfloat16)
+
+
+def value_and_gradients(function):
+    out, transpose = jax.vjp(jax.jit(function), variables, x)
+    return out, *transpose(cotangent)
+
+
+got, want = value_and_gradients(dew), value_and_gradients(qwix_in_float32)
+assert got[0].dtype == jnp.bfloat16
+jax.tree.map(np.testing.assert_array_equal, got, want)
+"""
+
+
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
     """A bf16 convolution with quantized activations, a hybrid DiT's patch
@@ -268,41 +300,21 @@ def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
     rounded to bf16: the same value and gradients, bitwise, compiled, on
     CPU and on the RTX 4080. Before, Qwix scaled the bf16 module's 8-bit
     product in bf16, and XLA:GPU failed to compile the int8 convolution
-    (`UNIMPLEMENTED: Can't lower one or more integer convolutions`)."""
-    qwix = pytest.importorskip("qwix")
-    from dew.nn.conv import Conv
+    (`UNIMPLEMENTED: Can't lower one or more integer convolutions`).
 
-    # Without the bias, which the quantization leaves alone and a bf16
-    # module adds, and differentiates, in bf16.
-    settings = {
-        "features": 128,
-        "kernel_size": (2, 2),
-        "strides": (2, 2),
-        "padding": "VALID",
-        "use_bias": False,
-    }
-    conv = Conv(**settings, dtype=jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
-    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
-    cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
-    qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
-    reference = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
-        [qwix.QtRule(module_path=".*", weight_qtype=qtype, act_qtype=qtype)]))
-
-    def dew(variables, x):
-        return Quantization(dtype=dtype).apply(conv).apply(variables, x)
-
-    def qwix_in_float32(variables, x):
-        as_float32 = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), (variables, x))
-        return reference.apply(*as_float32).astype(jnp.bfloat16)
-
-    def value_and_gradients(function):
-        out, transpose = jax.vjp(jax.jit(function), variables, x)
-        return out, *transpose(cotangent)
-
-    got, want = value_and_gradients(dew), value_and_gradients(qwix_in_float32)
-    assert got[0].dtype == jnp.bfloat16
-    jax.tree.map(np.testing.assert_array_equal, got, want)
+    It runs in a fresh process under the lane's flags without
+    `--xla_gpu_autotune_level=0`, as a training run compiles: at level 0
+    XLA leaves a cuDNN call the configuration it was emitted with, which
+    cuDNN refuses for the fp8 convolution on an H100
+    (CUDNN_STATUS_NOT_SUPPORTED), and XLA reads its flags once a process."""
+    pytest.importorskip("qwix")
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith("--xla_gpu_autotune_level")]
+    root = Path(__file__).resolve().parents[1]
+    run = subprocess.run([sys.executable, "-c", QUANTIZED_CONVOLUTION, dtype], capture_output=True, text=True,
+                         env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": str(root / "src")},
+                         timeout=600)
+    assert run.returncode == 0, run.stderr[-3000:]
 
 
 def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does():
@@ -618,23 +630,6 @@ def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
     products = jax.lax.dot(activations.qvalue, kernel.qvalue, preferred_element_type=jnp.int32)
     scaled = products * activations.scale.astype(jnp.float32) * kernel.scale.astype(jnp.float32)
     np.testing.assert_array_equal(served.apply(served_variables, x), scaled.astype(jnp.bfloat16))
-
-
-def converted_int32_products(jaxpr) -> set:
-    """The dtypes the int32 results of the convolutions and matmuls in
-    `jaxpr`, and in the jaxprs it calls, are converted to."""
-    products, dtypes = set(), set()
-    for equation in jaxpr.eqns:
-        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
-                and equation.outvars[0].aval.dtype == jnp.int32):
-            products.add(id(equation.outvars[0]))
-        if equation.primitive.name == "convert_element_type" and id(equation.invars[0]) in products:
-            dtypes.add(jnp.dtype(equation.params["new_dtype"]))
-        for value in equation.params.values():
-            inner = getattr(value, "jaxpr", value)
-            if hasattr(inner, "eqns"):
-                dtypes |= converted_int32_products(inner)
-    return dtypes
 
 
 def test_quantized_training_differentiates_through_complex_matmuls_in_float():
