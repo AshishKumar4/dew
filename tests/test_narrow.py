@@ -68,7 +68,8 @@ def _trained(monkeypatch, optimizer, *, copies, steps=3, mesh=None, padded=0, ac
     microbatches each, over `rows` rows. A `mixture` routes its MLPs over
     four experts under a balance loss. A `ragged` run's even steps end
     every other row in padding, so no two neighbouring microbatches count
-    as many tokens, whether a window reads steps or a step's parts."""
+    as many tokens, whether a window reads steps or a step's parts. Returns
+    the state, each step's loss and the trainer."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -92,7 +93,7 @@ def _trained(monkeypatch, optimizer, *, copies, steps=3, mesh=None, padded=0, ac
     for current in trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
         state, loss, *_ = step(state, current)
         losses.append(np.asarray(loss))
-    return state, losses
+    return state, losses, trainer
 
 
 def _assert_plain_update(narrow, losses, plain, plain_losses):
@@ -135,8 +136,9 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
-    narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
-    plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, mesh=mesh)
+    narrow, losses, _ = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
+    plain, plain_losses, _ = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False,
+                                      mesh=mesh)
     names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
 
@@ -166,8 +168,8 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
-    narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, **run)
-    plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, **run)
+    narrow, losses, _ = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, **run)
+    plain, plain_losses, _ = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, **run)
     assert int(narrow.updates) == int(plain.updates) == 2
     assert _assert_plain_update(narrow, losses, plain, plain_losses)
 
@@ -178,8 +180,8 @@ def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept(monkeypatch
     their copies. Adam's moments would have moved every parameter had the
     update been taken, so copies cast from the update the step discarded
     would differ from the parameters it kept."""
-    trained, _ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2)
-    skipped, _ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2, padded=1)
+    trained, *_ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2)
+    skipped, *_ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2, padded=1)
     assert int(skipped.updates) == int(trained.updates) == 2
     for a, b in zip(jax.tree.leaves(trained.variables), jax.tree.leaves(skipped.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
@@ -195,22 +197,27 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     """The fit check reads the state's arguments as already on the devices;
     the copies are not yet when the first step compiles, since `run` builds
     them before its first call, so their bytes count beside the step with the
-    prefetched batches."""
-    from dew.training import planning as module
+    prefetched batches: the headroom the check leaves is the step's own,
+    `step_headroom` of the devices' free bytes, less the bytes held beside it."""
     from dew.training.distributed import placed_bytes
+    from dew.training.memory import step_headroom
 
-    asked = []
+    limit = 2 ** 40
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
+    held = []
 
-    def fits(candidate, executable, mesh):
-        asked.append(candidate.held)
-        return True, None
+    def trained(*, copies):
+        state, _, trainer = _trained(monkeypatch, optax.adam(1e-3), copies=copies, steps=1)
+        devices = [device for device in trainer.device_mesh.devices.flat
+                   if device.process_index == jax.process_index()]
+        held.append(step_headroom(trainer.executable, devices) - trainer.plan["probes"][0]["headroom"])
+        return state
 
-    monkeypatch.setattr(module, "device_fit", fits)
-    narrow, _ = _trained(monkeypatch, optax.adam(1e-3), copies=True, steps=1)
-    _trained(monkeypatch, optax.adam(1e-3), copies=False, steps=1)
+    narrow = trained(copies=True)
+    trained(copies=False)
     copies = placed_bytes(jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
-    assert copies > 0 and asked[0] - asked[1] == copies
+    assert copies > 0 and held[0] - held[1] == copies
 
 
 def test_a_restored_state_drops_its_templates_copies():
