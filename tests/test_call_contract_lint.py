@@ -85,5 +85,6 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
     (tmp_path / "src" / "dew" / "nn").mkdir(parents=True)
     (tmp_path / "src" / "dew" / "nn" / "inputs.py").write_text(INPUTS)
     (tmp_path / "src" / "dew" / "nn" / "layer.py").write_text(textwrap.dedent(body))
-    [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew") if module.path.stem == "layer"]
+    [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
+                if module.path.stem == "layer"]
     assert any(True for _ in lint.calls(module)) is reported
