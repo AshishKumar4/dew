@@ -1410,8 +1410,10 @@ def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret:
 def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
     """fla's `chunk_gated_delta_rule_fwd` (fla/ops/gated_delta_rule/chunk.py:33-123): the decay
     cumulated in base 2, its compensated halves, the inverse, `w` and `u`, the memory across chunks,
-    then the output. Saves what fla saves: the cumulated decay, both halves, and the inverse, named
-    'delta_decay' and 'delta_inverse' for a remat policy, and the initial memory."""
+    then the output. Saves the cumulated decay's halves and the inverse, as fla does, and `w`, the
+    memory each chunk enters and the corrected values, which fla recomputes in its backward: named
+    'delta_decay', 'delta_inverse' and 'delta_memory' for a remat policy, which keeps or recomputes
+    each (`dew.nn.backbones.decoder_block.DECODER_REMAT`)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     g_hi, g_lo = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
@@ -1419,18 +1421,18 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
     h, corrected, final = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
     o = chunk_fwd_o(q, k, corrected, h, g_hi, g_lo, scale=scale, **kernels)
-    return (o, final), (q, k, v, g_hi, g_lo, beta, a, h0, spans)
+    w, h, corrected = checkpoint_name((w, h, corrected), 'delta_memory')
+    return (o, final), (q, k, v, g_hi, g_lo, beta, a, w, h, corrected, spans)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
-    """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250): `w`, `u` and the memory recomputed, then
-    the output's local value gradient, the reverse recurrence, the query, key, `w` and decay
-    gradients, the WY backward, and the decay's gradient summed back over each chunk."""
-    q, k, v, g_hi, g_lo, beta, a, h0, spans = residual
+    """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250) from the forward's `w`, memory and
+    corrected values, which fla recomputes here: the output's local value gradient, the reverse
+    recurrence, the query, key, `w` and decay gradients, the WY backward, and the decay's gradient
+    summed back over each chunk."""
+    q, k, v, g_hi, g_lo, beta, a, w, h, corrected, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
-    h, corrected, _ = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
     dv = chunk_bwd_dv_local(q, k, g_hi, g_lo, do, scale=scale, **kernels)
     dh, dh0, dv = chunk_bwd_dhu(q, k, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
     dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g_hi, g_lo, h, dv, do, dh, scale=scale, **kernels)

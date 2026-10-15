@@ -298,6 +298,24 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     assert factory.keywords.get(policy) == POLICY_VALUES[policy]
 
 
+@pytest.mark.parametrize("kind, rungs", [
+    ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
+    ("mamba2", [None, "minimal_with_conv", "minimal", "full"]),
+    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_conv", "minimal", "full"]),
+])
+def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
+    """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
+    below or above it: 'all_but_delta_memory', which recomputes a delta rule's memory alone, is a
+    rung only for a decoder with a delta rule, and the ladder of any other is the one before it (a
+    recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=64, **overrides)
+    climbed = [model]
+    while (stronger := climbed[-1].recompute_more()) is not None:
+        climbed.append(stronger)
+    assert [rung.recompute_record() for rung in climbed] == rungs
+
+
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, monkeypatch, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so

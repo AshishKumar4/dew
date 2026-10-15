@@ -21,7 +21,7 @@ class GatedDeltaNetMixer(MixerBase):
     layer has no keys to cache, no rope and no window.
     """
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse')
+    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
 
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 32
