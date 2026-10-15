@@ -25,6 +25,7 @@ from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.kv_cache import KVCache
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
@@ -52,9 +53,9 @@ def assert_same_generation(served, alone):
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
     """Biases, head norms, RoPE and the cached append still read the same projections."""
     with jax.enable_x64():
-        model = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=1,
-                                   head_dim=4, max_seq_len=64, attention_bias=True,
-                                   attention_impl="xla", dtype=jnp.float64)
+        model = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=1, head_dim=4,
+                                                 max_seq_len=64, attention_bias=True, attention_impl="xla",
+                                                 dtype=jnp.float64))
         x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
         variables = model.init(jax.random.key(0), x)
         # Dyadic weights make the projection sums exact, so a different dot
@@ -700,6 +701,23 @@ def test_a_served_request_is_forced_to_end_at_its_own_budget():
     expected = bound("12", 3, key=0)
     np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
     assert int(np.asarray(ticket.result().tokens)[0, -1]) == 5
+
+
+def test_a_served_request_without_a_budget_takes_what_the_tasks_max_length_leaves():
+    """A task that declares `max_length` and no `max_new_tokens` sizes a request by what the length
+    leaves past its prompt's width; a server built from it sizes the same request alike, alone or
+    in a batch whose rows are as wide as the widest."""
+    bound = dataclasses.replace(task(Sampling(temperature=0)), max_length=8)
+    server = Server.from_task(bound, slots=2, capacity=64)
+    ticket = server.submit("123", key=0)
+    server.run()
+    alone = bound("123", key=0)
+    assert int(np.asarray(alone.lengths)[0]) == 5
+    assert_same_generation(ticket.result(), alone)
+    batch = bound(["12", "1234"], key=0).host()
+    served = server(["12", "1234"], key=0)
+    assert np.asarray(batch.lengths).tolist() == [int(np.asarray(row.lengths)[0]) for row in served] == [4, 4]
+    assert [row.text[0] for row in served] == list(batch.text)
 
 
 def test_a_padding_positions_value_is_not_part_of_a_served_row():

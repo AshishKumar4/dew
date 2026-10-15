@@ -1243,19 +1243,6 @@ GEMMA4_MM_TEXT: Dict[str, Any] = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
-QWEN35_MM_TEXT: Dict[str, Any] = dict(
-    vocab_size=256, hidden_size=64, intermediate_size=128,
-    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-    head_dim=32, hidden_act="silu", max_position_embeddings=64,
-    rms_norm_eps=1e-6, tie_word_embeddings=True,
-    linear_conv_kernel_dim=4, linear_key_head_dim=12, linear_value_head_dim=16,
-    linear_num_key_heads=2, linear_num_value_heads=4,
-    layer_types=["linear_attention"] * 3 + ["full_attention"],
-    rope_parameters={"rope_type": "default", "rope_theta": 1000000.0,
-                     "partial_rotary_factor": 0.25,
-                     "mrope_interleaved": True, "mrope_section": [2, 1, 1]})
-
-
 def write_gemma4_mm_tiny() -> None:
     """A Gemma 4 wrapper fixture: the vision and embedder halves under the
     released model.* prefixes beside a tiny dense decoder half, with the
@@ -1327,6 +1314,7 @@ def write_qwen35_mm_tiny() -> None:
     so the wrapper reference runs on pre-merged embeddings with no vision
     inputs, which scores with plain sequential positions on both sides.
     """
+    from qwen_linear_reference import CONFIG as QWEN35_MM_TEXT
     from safetensors.torch import load_file, save_file
 
     system = qwen35_vision_tiny_system(seed=4321)

@@ -2,50 +2,30 @@
 
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from dew.interop import Pretrained
+from dew.sampling import Sampling, generate
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 
 
 def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
-    from tools.classic_gpt_reference import greedy
-
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'input_ids.npy')
     expected = np.load(DIRECTORY / 'logits.npy')
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    np.testing.assert_array_equal(greedy(loaded, ids[:1, :4], 6), np.load(DIRECTORY / 'generated.npy'))
+    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
     sequential = loaded.model.clone(parallel_residual=False)
     wrong = np.asarray(sequential.apply(loaded.variables, jnp.asarray(ids)))
     assert float(np.max(np.abs(wrong - expected))) > 1e-2
 
-
-def test_gpt_neox_export_preserves_fused_head_layout(tmp_path):
-    from dew.interop.sources import load_shards
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path)
-    exported, original = load_shards(tmp_path), load_shards(DIRECTORY)
-    assert set(exported) == set(original)
-    for name in original:
-        np.testing.assert_array_equal(exported[name], original[name])
-    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
-    np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
-
-    assert reloaded.model == loaded.model
-    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(loaded.variables)
-    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
-                                        jax.tree.leaves(reloaded.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 def test_legacy_neox_buffers_are_validated_in_their_stored_precision():

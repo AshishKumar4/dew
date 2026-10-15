@@ -37,6 +37,7 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
+from dew.hashing import fmix32
 from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
@@ -126,12 +127,7 @@ class SyntheticBanks(LayerBanks):
         name = jax.tree_util.keystr(path)
         key = np.uint32(zlib.crc32(f"{name}/{layer}/{self.seed}".encode()) | 1)
         count = math.prod(shape) if shape else 1
-        word = np.arange(count, dtype=np.uint32) + key
-        word ^= word >> np.uint32(16)
-        word *= np.uint32(0x85EBCA6B)
-        word ^= word >> np.uint32(13)
-        word *= np.uint32(0xC2B2AE35)
-        word ^= word >> np.uint32(16)
+        word = fmix32(np.arange(count, dtype=np.uint32) + key)
         unit = (word >> np.uint32(8)).astype(np.float32) * np.float32(2.0 ** -23) - 1.0
         if name.endswith("['scale']"):
             values = 1.0 + 0.02 * unit

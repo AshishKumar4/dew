@@ -17,7 +17,6 @@ channels last and hand the autoencoder pixels in [-1, 1]. Every gap is
 scaled by max(1, |reference|).
 """
 
-import importlib.util
 from pathlib import Path
 
 import jax
@@ -31,6 +30,7 @@ from interop_support import (
     fixture_arrays,
     scaled_gap,
 )
+from tool_support import load
 
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.rae import UNREAD, load_dinov2, load_rae
@@ -114,11 +114,7 @@ def test_the_published_rae_matches_the_source(name):
     twice the source's own float32 distance from that result: two float32
     walks rounding in different orders, and SigLIP's residual stream reaches
     several hundred."""
-    spec = importlib.util.spec_from_file_location(
-        "diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py"
-    )
-    tool = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tool)
+    tool = load("diffusers_rae_reference")
     repo, revision = tool.PUBLISHED[name]
     reference = np.load(ROOT / "tests/fixtures/rae_published.npz")
     autoencoder, params, _, config = load_rae(repo, revision=revision)
@@ -173,11 +169,7 @@ def test_the_plain_dinov2_matches_transformers(source, tmp_path):
 def test_the_published_dinov2_matches_transformers():
     """`facebook/dinov2-base`, downloaded, on the smooth image at 224 pixels,
     against `Dinov2Model` in float64, as the published RAEs are held."""
-    spec = importlib.util.spec_from_file_location(
-        "diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py"
-    )
-    tool = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tool)
+    tool = load("diffusers_rae_reference")
     reference = np.load(ROOT / "tests/fixtures/rae_published.npz")
     module, params, _ = load_dinov2(tool.DINOV2[0], revision=tool.DINOV2[1])
     mean, std = (np.asarray(value, np.float32) for value in tool.IMAGENET)

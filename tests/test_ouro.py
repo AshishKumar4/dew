@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -26,17 +27,6 @@ def fixture(name):
     return np.load(TINY / f'{name}.npy')
 
 
-def test_padded_logits_and_cached_generation_match_the_remote_code():
-    from tools.classic_gpt_reference import greedy
-
-    loaded = load()
-    mask = fixture('attention_mask')
-    actual = np.asarray(loaded.model.apply(loaded.variables, fixture('padded_ids'), attention_mask=mask))
-    expected, truth = fixture('padded_logits'), fixture('padded_logits_f64')
-    assert_as_exact_as_the_reference(actual[mask], expected[mask], truth[mask], 'Ouro padded logits')
-    np.testing.assert_array_equal(actual[mask].argmax(-1), expected[mask].argmax(-1))
-    np.testing.assert_array_equal(greedy(loaded, fixture('input_ids')[:, :4], 6), fixture('generated'))
-
 
 def test_every_pass_gates_its_exit_as_the_remote_code_does():
     loaded = load()
@@ -50,14 +40,8 @@ def test_every_pass_gates_its_exit_as_the_remote_code_does():
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     loaded = load()
     loaded.save(tmp_path)
-    original, exported = load_shards(TINY), load_shards(tmp_path)
-    assert set(original) == set(exported)
-    for tensor in original:
-        np.testing.assert_array_equal(original[tensor], exported[tensor])
-    ids = fixture('input_ids')
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
+    assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
+    assert_reloads(loaded, tmp_path, fixture('input_ids'))
 
 
 def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):

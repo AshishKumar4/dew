@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import hashlib
 import json
 import shlex
@@ -17,14 +18,18 @@ from pathlib import Path
 class Target:
     path: str
     tests: tuple[str, ...]
+    nightly: bool = False
 
 
 # Tests execute in fresh interpreters: a JAX backend is never forked. Naming
 # files rather than an expression also makes an empty selection a failure.
 TARGETS = {
+    "process": Target("src/dew/diffusion/process.py", (
+        "tests/test_diffusion_process.py", "tests/test_guidance.py",
+        "tests/test_shortcut.py", "tests/test_mean_flow.py"), nightly=True),
     "transaction": Target("src/dew/training/transaction.py", (
         "tests/test_training_transactions.py", "tests/test_support_replay.py",
-        "tests/test_optional_ema.py", "tests/test_training_dtypes.py")),
+        "tests/test_optional_ema.py", "tests/test_training_dtypes.py"), nightly=True),
     "checkpoints": Target("src/dew/checkpoints", (
         "tests/test_training_transactions.py", "tests/test_optional_ema.py",
         "tests/test_posthoc.py", "tests/test_frozen_reference.py",
@@ -32,10 +37,7 @@ TARGETS = {
         "tests/test_trainer.py::test_the_ema_comes_back_bit_for_bit_however_it_is_read",
         "tests/test_trainer.py::test_an_ema_held_in_lists_comes_back_bit_for_bit",
         "tests/test_trainer.py::test_a_checkpoint_that_stores_the_ema_as_itself_still_restores",
-        "tests/test_trainer.py::test_a_global_position_is_read_by_any_process_count")),
-    "process": Target("src/dew/diffusion/process.py", (
-        "tests/test_diffusion_process.py", "tests/test_guidance.py",
-        "tests/test_shortcut.py", "tests/test_mean_flow.py")),
+        "tests/test_trainer.py::test_a_global_position_is_read_by_any_process_count"), nightly=True),
     "schedules": Target("src/dew/diffusion/schedules", (
         "tests/test_schedule_contracts.py", "tests/test_schedulers.py", "tests/test_flow_matching.py",
         "tests/test_native_diffusion_edges.py")),
@@ -46,6 +48,16 @@ TARGETS = {
         "tests/test_hf_options_contract.py", "tests/test_hf_data.py", "tests/test_online_loader.py",
         "tests/test_text_data.py", "tests/test_tfds_read.py", "tests/test_data_av.py")),
 }
+CI_SHARDS = 8
+
+
+def plan(target: str | None, weekday: int) -> dict:
+    """CI's mutation run: `target`, else the nightly targets' turn on `weekday`, over CI_SHARDS
+    shards, as the workflow's matrix reads it."""
+    nightly = tuple(name for name, spec in TARGETS.items() if spec.nightly)
+    return {"module": target or nightly[weekday % len(nightly)], "shards": CI_SHARDS,
+            "matrix": {"shard": list(range(CI_SHARDS))}}
+
 
 # A file batch runs the proofs of that file's behavior, not unrelated I/O or
 # reference-model suites from neighboring source modules. Directory batches
@@ -228,6 +240,7 @@ def summarize(directory: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=TARGETS, nargs="?")
+    parser.add_argument("--plan", action="store_true", help="print CI's module and shard matrix as JSON")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path)
     parser.add_argument("--file", type=Path, help="one file within the chosen module's source directory")
@@ -238,6 +251,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=180,
                         help="each mutant's least limit; twice the unmutated suite's time where longer")
     arguments = parser.parse_args()
+    if arguments.plan:
+        print(json.dumps(plan(arguments.target, datetime.datetime.now(datetime.UTC).weekday())))
+        return
     if arguments.summarize is not None:
         print(json.dumps(summarize(arguments.summarize), indent=2))
         return

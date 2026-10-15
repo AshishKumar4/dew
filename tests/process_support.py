@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -70,10 +71,29 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
 
 
 def terminate(process: subprocess.Popen[str]) -> None:
-    """Kill the session even if its leader already exited and left descendants."""
+    """Kill the session even if its leader already exited and left descendants,
+    and return once none of them still runs: SIGKILL lands asynchronously, so a
+    descendant can still be running when the leader has been reaped."""
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
     process.wait(timeout=60)
+    deadline = time.monotonic() + 60
+    while running := session_members(process.pid):
+        assert time.monotonic() < deadline, f"session {process.pid} still runs {running} after SIGKILL"
+        time.sleep(0.01)
+
+
+def session_members(group: int) -> list[int]:
+    """The live (not zombie) processes of process group `group`."""
+    members = []
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if fields[0] != "Z" and int(fields[2]) == group:
+            members.append(int(stat.parent.name))
+    return members
 
 
 class ProcessGroup:
@@ -148,3 +168,12 @@ def run_pool(mode: str | Path, directory: Path, processes: int, *, timeout: floa
                                       coordinator=coordinator, **flags))
         return [report_of(process, out, timeout=timeout, pool=pool.running)
                 for process, out in zip(pool.running, outs, strict=True)]
+
+
+def assert_exits_cleanly(program: str) -> None:
+    """`program` runs to its end in a fresh CPU interpreter over this checkout's source and exits 0;
+    its output is the failure's message. A worker left running at exit aborts it in finalization."""
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, capture_output=True, text=True,
+                          timeout=300, env={**os.environ, "JAX_PLATFORMS": "cpu",
+                                            "PYTHONPATH": str(REPO_ROOT / "src")})
+    assert done.returncode == 0, done.stdout + done.stderr

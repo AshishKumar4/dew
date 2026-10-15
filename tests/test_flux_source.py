@@ -186,54 +186,18 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     released towers and the autoencoder are state, so every one of their
     leaves survives the step, and the export reloads to the same forward.
     """
-    import optax
+    from diffusion_support import image_batch, trained_step
 
     from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import Pretrained
-    from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.training import Trainer
 
     loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
-    height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
-    rows = jax.device_count()
-    pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
-                     (rows, 1, 1, 1))
-    # One row per device, the recorded prompts in turn: a device count that
-    # is odd, one GPU included, still gets a prompt for every image.
-    prompts = pipeline_record["prompts"]
-    batch = {"image": pixels,
-             **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
-    checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
-                      checkpoints=checkpoints)
-    initial = trainer.initial_state()
-    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
-
-    def value(params) -> float:
-        loss, _ = objective.loss(params, batch, fixed)
-        return float(loss.total / loss.mass)
-
-    before = value(initial.variables)
-    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
-    assert value(state.variables) < before
-    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
-                           initial.variables["params"]["proj_out"]["kernel"])
-    for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.variables[held]),
-                             jax.tree.leaves(initial.variables[held]), strict=True):
-            np.testing.assert_array_equal(got, want)
-
-    checkpoints.save(1, state, None, {})
-    checkpoints.wait()
-    restored, _, _ = trainer.place()
-    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from affine_run import raw_leaf
-        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
+    batch = image_batch(loaded, pipeline_record["prompts"])
+    _, state = trained_step(objective, batch, Checkpoints(str(tmp_path / "run")))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)

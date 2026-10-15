@@ -2,7 +2,20 @@
 
 import json
 
-from tools.mutation import source_digest, summarize
+from tools.mutation import TARGETS, plan, source_digest, summarize
+
+
+def test_nightly_plan_keeps_the_rotation_and_covers_every_shard():
+    for weekday, module in enumerate(("process", "transaction", "checkpoints", "process",
+                                      "transaction", "checkpoints", "process")):
+        result = plan(None, weekday)
+        assert result["module"] == module
+        assert result["matrix"]["shard"] == list(range(result["shards"]))
+
+
+def test_requested_target_overrides_the_nightly_rotation():
+    for target in TARGETS:
+        assert plan(target, 0)["module"] == target
 
 
 def test_shards_are_weighted_by_their_mutation_counts(tmp_path):

@@ -61,7 +61,8 @@ BATCH, LENGTH = 2, 12
 # Small enough to live in git, shaped so every gap the family opens is
 # exercised: value heads outnumbering key heads, key and value dims apart,
 # a partial rotary of a quarter of the head (the released factor), the
-# doubled gated q_proj, and a conv with a real history.
+# doubled gated q_proj, and a conv with a real history. The multimodal
+# fixture's text decoder is this one too (tools/hf_reference.py).
 CONFIG: dict = dict(
     vocab_size=256, hidden_size=64, intermediate_size=128,
     num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
