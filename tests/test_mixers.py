@@ -24,9 +24,10 @@ from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.inputs import TOKENWISE, MixerCall, coordinates
-from dew.nn.mixers import MixerBase, MixerContext
+from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
+from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
 
@@ -77,22 +78,28 @@ def test_mixer_records_and_values_compute_the_same_logits():
 
 
 def test_a_layer_runs_no_mask_its_mixer_does_not_read():
-    """A pairwise mask says which keys each query reads. Attention reads it, so a mask that keeps
-    only each token's own key moves its logits; a gated delta net reads every earlier token of its
-    document and no mask, so its layer refuses the call rather than run it as if unmasked."""
-    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
-    own = jnp.eye(4, dtype=bool)[None]
-    attention = tiny()
-    params = attention.init(jax.random.key(0), ids)
-    masked = attention.apply(params, ids, attention_pairwise_mask=own)
-    assert not jnp.allclose(masked, attention.apply(params, ids))
+    """A pairwise mask says which keys each query reads. An attention layer reads it, so a mask
+    that keeps only each token's own key moves its output; a gated delta net reads every earlier
+    token of its document and no mask, so its layer refuses the call rather than run it as if
+    unmasked. A model asked for a mask refuses it at the layer that cannot read it."""
+    x = jax.random.normal(jax.random.key(1), (1, 4, 32))
+    own = AttentionMetadata(pairwise_mask=jnp.eye(4, dtype=bool)[None])
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16)
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
+    for kind, reads in ((AttentionMixer(), True), (delta, False)):
+        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32)
+        params = layer.init(jax.random.key(0), x)
+        if reads:
+            assert not jnp.allclose(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
+        else:
+            with pytest.raises(ValueError):
+                layer.apply(params, x, attention_metadata=own)
     recurrent = hybrid(kinds={"linear": LayerKind(mixer=delta)})
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = recurrent.init(jax.random.key(0), ids)
-    recurrent.apply(params, ids)
     with pytest.raises(ValueError):
-        recurrent.apply(params, ids, attention_pairwise_mask=own)
+        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
 
 
 def hybrid(**overrides):

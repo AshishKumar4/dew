@@ -422,8 +422,8 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: a token mixer, then a feed-forward, each added to the residual.
 
     `mixer` and `feedforward` are factories that take only a name. The mixer
-    becomes self_attn and accepts (x, decode=..., attention_metadata=...), its
-    tokens' places and documents the metadata's `Coordinates`. The
+    becomes self_attn, called (x, call) with one `MixerCall`, its tokens'
+    places and documents the call metadata's `Coordinates`. The
     feed-forward becomes mlp and takes the normalized
     states, plus the token ids on a `hash_routed` block. A `feedforward` of
     None gives Mamba-2's block, which has the mixer alone. `wiring` places the
