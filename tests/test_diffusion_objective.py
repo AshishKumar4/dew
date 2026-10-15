@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 from diffusion_stubs import RES, StubText
 from flax import linen as nn
 
@@ -190,28 +191,11 @@ def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
     objective = make_objective()
     batch = make_batch()
 
-    class Stream:
-        def __init__(self):
-            self.position = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.position += 1
-            return batch
-
-        def get_state(self):
-            return str(self.position).encode()
-
-        def set_state(self, state):
-            self.position = int(state.decode())
-
     def trainer():
         return Trainer(make_objective(), optax.adam(1e-3), key=jax.random.PRNGKey(0),
                        checkpoints=Checkpoints(str(tmp_path), keep=1))
 
-    data = Loader(train=lambda partition: Stream(), val=None, records=None, batch=8)
+    data = Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None, batch=8)
     first = trainer()
     first.fit(data, steps=1, log_every=100, checkpoint_every=1)
     assert first.checkpoints is not None

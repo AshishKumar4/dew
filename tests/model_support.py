@@ -18,6 +18,39 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
+def two_documents(rng: np.random.Generator, rows: int, length: int):
+    """The `Coordinates` of `rows` packed rows of `length` tokens: two documents a row, the second
+    starting at a column `rng` draws for each row, and the last row's final three slots padding."""
+    from dew.nn.inputs import coordinates
+
+    segments = np.ones((rows, length), np.int32)
+    positions = np.zeros((rows, length), np.int32)
+    for row in range(rows):
+        boundary = int(rng.integers(3, length - 3))
+        segments[row, boundary:] = 2
+        positions[row, :boundary] = np.arange(boundary)
+        positions[row, boundary:] = np.arange(length - boundary)
+    segments[-1, -3:] = 0
+    return coordinates(segments=segments, positions=positions, max_segments=length, right_padded=True, xp=np)
+
+
+def decode_through(module: nn.Module, variables, hidden, prefill: int):
+    """`module` over `hidden` through its decode cache: the call that allocates the cache, then the
+    first `prefill` tokens at once, then one token a step. Returns the outputs joined along the
+    sequence, the cache as allocated and the cache after the last step."""
+    from dew.nn.inputs import MixerCall
+
+    step = MixerCall(decode=True)
+    allocated = module.apply(variables, hidden[:, :1], step, mutable=["cache"])[1]
+    out, cache = module.apply({**variables, **allocated}, hidden[:, :prefill], step, mutable=["cache"])
+    outputs = [out]
+    for position in range(prefill, hidden.shape[1]):
+        out, cache = module.apply({**variables, **cache}, hidden[:, position:position + 1], step,
+                                  mutable=["cache"])
+        outputs.append(out)
+    return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
+
+
 def flat_tree(tree) -> dict:
     """`tree`'s leaves by their dictionary keys joined with dots, the way a
     checkpoint names them: 'params.layers_0.mlp.gate.kernel'."""

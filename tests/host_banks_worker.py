@@ -14,11 +14,9 @@ devices.
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
 
-from process_support import prepare_worker
+from process_support import serve_mode, worker_parser
 
 VOCAB = 32
 SEQ_LEN = 8
@@ -167,25 +165,12 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
 MODES = {"banked": banked}
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=sorted(MODES))
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--coordinator", help="host:port of the jax.distributed service")
-    parser.add_argument("--processes", type=int, default=1)
-    parser.add_argument("--process-id", type=int, default=0)
-    parser.add_argument("--fsdp-size", type=int, default=1)
+def main(argv=None) -> None:
+    parser = worker_parser(MODES, __doc__)
     parser.add_argument("--tensor-size", type=int, default=1)
     parser.add_argument("--bank-layers", type=int)
     parser.add_argument("--run-dir")
-    return parser.parse_args(argv)
-
-
-def main(argv=None) -> None:
-    args = parse_args(argv)
-    prepare_worker(args)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(MODES[args.mode](args)))
+    serve_mode(MODES, parser.parse_args(argv))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ reference's inputs and outputs (reference.npz), the same model in float64 (numer
 reference's updated logits over residual orders (orders.npz), and each suite's docstrings give its
 family's own measurements."""
 
+import json
 from pathlib import Path
 
 import jax
@@ -73,6 +74,23 @@ def assert_update_as_exact(source, directory: Path) -> Variables:
             for order in drawn["orders"]]
     assert_as_exact_over_orders(mine, drawn["updated_logits"], "updated logits")
     return {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}
+
+
+def exported(source, directory: Path, written: Path) -> tuple[dict, dict, dict, dict]:
+    """The model stepped once (`assert_update_as_exact`) and saved to `written` with the config
+    `directory` ships: the stepped weights and the reloaded ones, flat by dotted name, and the tensors
+    it wrote and the ones `directory` ships, by name."""
+    from flax.traverse_util import flatten_dict
+    from safetensors.numpy import load_file
+
+    loaded, _, _ = source
+    variables = assert_update_as_exact(source, directory)
+    loaded.save(written, variables=variables)
+    assert (json.loads((written / "config.json").read_text())
+            == json.loads((directory / "config.json").read_text()))
+    restored = Pretrained.load(written, dtype="float32", attention_impl="reference")
+    return (flatten_dict(dict(variables), sep="."), flatten_dict(dict(restored.variables), sep="."),
+            load_file(str(written / "model.safetensors")), load_file(str(directory / "model.safetensors")))
 
 
 def assert_greedy_as_exact(source) -> None:

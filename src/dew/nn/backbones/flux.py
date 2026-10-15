@@ -35,7 +35,9 @@ from .joint import (
     TIME_FEATURES,
     DoubleStreamBlock,
     JointAttention,
+    TextStream,
     embedding,
+    embedding_axes,
     embedding_flops,
     guided_time,
     layer_norm,
@@ -112,13 +114,8 @@ class FluxSingleBlock(nn.Module):
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
                ("proj_out",): ("embed", None),
-               ("timestep_embedder_linear_1",): (None, "embed"),
-               ("timestep_embedder_linear_2",): (None, "embed"),
-               ("guidance_embedder_linear_1",): (None, "embed"),
-               ("guidance_embedder_linear_2",): (None, "embed"),
-               ("text_embedder_linear_1",): (None, "embed"),
-               ("text_embedder_linear_2",): (None, "embed")})
-class FluxTransformer(nn.Module):
+               **embedding_axes("timestep_embedder", "guidance_embedder", "text_embedder")})
+class FluxTransformer(TextStream, nn.Module):
     """Runs Diffusers 0.34.0's `FluxTransformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents, the model time the schedule supplies, and
@@ -145,23 +142,6 @@ class FluxTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
-
-    @property
-    def features(self) -> int:
-        return self.heads * self.head_dim
-
-    @nn.nowrap
-    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
-        return spans
-
-    @property
-    def text_keyword(self) -> str:
-        """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
-        return "conditioning"
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        raise MissingFlopsCount("FluxTransformer needs multisequence_flops(image_lengths, text_lengths)")
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:

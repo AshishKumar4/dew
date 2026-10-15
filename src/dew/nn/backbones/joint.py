@@ -11,7 +11,7 @@ family's own module keeps what only that family does.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +53,42 @@ def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | 
     hidden = nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
     return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision,
                     name=f"{name}_linear_2")(activation(hidden))
+
+
+def embedding_axes(*names: str) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The logical axes of the two layers `embedding` builds under each of
+    `names`: each shards its output, the model's width."""
+    return {(f"{name}_linear_{index}",): (None, "embed") for name in names for index in (1, 2)}
+
+
+class TextStream:
+    """What a transformer that runs its text as a second stream beside the
+    image declares (SD3, Flux, FLUX.2): its width is its heads' together,
+    each row's text attends as the span it fills, every call takes the text
+    as `conditioning`, and its FLOPs are counted over both streams
+    (`multisequence_flops`), never one."""
+
+    if TYPE_CHECKING:
+        heads: int
+        head_dim: int
+
+    @property
+    def features(self) -> int:
+        return self.heads * self.head_dim
+
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return spans
+
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
+        return "conditioning"
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount(
+            f"{type(self).__name__} needs multisequence_flops(image_lengths, text_lengths)")
 
 
 def embedding_flops(lengths, input_features: int, features: int) -> float:
