@@ -603,6 +603,7 @@ class DecisionObjective(Objective[Ratio]):
             probabilities=probabilities,
             options=inputs.options,
             labels=batch["labels"],
+            targets=batch["targets"],
             ordinal=inputs.kinds == _SCORE,
             scored=batch["scored"],
         )

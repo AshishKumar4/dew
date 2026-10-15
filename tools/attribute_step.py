@@ -270,8 +270,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "xprof_peak_gflops": xprof_peak, "step_program": step,
         "programs_ms": {program: round(us / 1e3 / steps, 3)
                         for program, us in sorted(programs.items(), key=lambda item: -item[1])[:6]},
-        "device_ms_per_step": round(device_us / 1e3, 3),
+        # Busy is the kernels' own time, idle the gaps between them: the step's span is their sum.
+        "device_busy_ms_per_step": round(device_us / 1e3, 3),
         "device_idle_ms_per_step": round(idle_us / 1e3, 3),
+        "device_window_ms_per_step": round((device_us + idle_us) / 1e3, 3),
         "by_part_ms": {part: {direction: round(us / 1e3, 3) for direction, us in directions.items()}
                        for part, directions in heaviest(by_part)},
         "by_kind_ms": ms(by_kind),
@@ -481,8 +483,8 @@ def main(argv: list[str] | None = None) -> int:
     args.out.write_text(json.dumps(result, indent=1))
     time = result.get("time", {})
     if "by_part_ms" in time:
-        print(f"time: {time['device_ms_per_step']} ms device a step, "
-              f"{time['device_idle_ms_per_step']} ms idle, "
+        print(f"time: {time['device_window_ms_per_step']} ms a step on the device = "
+              f"{time['device_busy_ms_per_step']} busy + {time['device_idle_ms_per_step']} idle, "
               f"GEMMs at {time['gemm_fraction_of_peak']} of peak, {time['gemm_lost_ms']} ms lost to it, "
               f"MFU of device time: bf16 {time.get('mfu_bf16_of_device_time')}, "
               f"mixed {time.get('mfu_mixed_of_device_time')}")

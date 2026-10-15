@@ -176,7 +176,7 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter. A split tree stays split, so its `params` train and its `frozen` part does not change. |
 | `loss_role` | `None` | Count only targets whose `text_roles` entry equals this `Role` (SFT). |
 | `balance_rate` | `None` | Aux-loss-free routing-bias update rate for mixture layers. |
-| `aux_loss_alpha`, `seq_aux` | `None`, `True` | DeepSeek V2 expert balance loss and its per-sequence form. |
+| `aux_loss_alpha`, `seq_aux` | `None`, `True` | DeepSeek V2 expert balance loss and its per-sequence form, balancing each packed document alone (Megatron-LM and MaxText balance a packed row as one sequence). |
 | `router_z_loss` | `0.0` | ST-MoE router z-loss coefficient. |
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
