@@ -2248,7 +2248,9 @@ class CausalTransformer(nn.Module):
         """The decoder one rung up where that rung recomputes only the residuals it names
         (`RematPolicy.recompute`, a delta rule's memory), else None."""
         stronger = self.recompute_more()
-        return stronger if stronger is not None and stronger.remat.recompute else None
+        if stronger is None or stronger.remat is None or not stronger.remat.recompute:
+            return None
+        return stronger
 
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
