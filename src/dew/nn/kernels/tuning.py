@@ -343,12 +343,9 @@ def _read(path: str) -> tuple[Keyed, list]:
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
     config fields, or another signature of a kernel, with an operand more or
-    one fewer), which a write keeps as they are. A launch binds its stored
-    arguments by name, dropping any its kernel lacks and leaving out any it
-    has, so an entry whose names are not its kernel's signature's is another
-    checkout's: re-keyed here, every write from a checkout that dropped an
-    operand took that kernel's picks from the checkouts that still have it.
-    Each launch is read alone, so one launch
+    one fewer), which a write keeps as they are. An entry is read only where
+    its argument names are exactly its kernel's parameters. Each launch is
+    read alone, so one launch
     this checkout cannot read leaves the others readable. A missing file, or
     one that is not JSON, holds nothing."""
     if not os.path.exists(path):
