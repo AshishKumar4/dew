@@ -13,6 +13,10 @@ from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 
 pytestmark = pytest.mark.kernel
 
+LAUNCHES = {launch for module in (fla_gdn, fla_kda) for launch in vars(module).values()
+            if isinstance(launch, fla_gdn._Launch)}
+"""Every launch of the two ports."""
+
 
 def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
     shapes = support.COMPILED_SHAPES.values()
@@ -29,11 +33,9 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
     for every kernel."""
     with generation.assumed(target):
         assert fla_gdn._wide() is wide
-    for picks, space in ((fla_gdn.HEURISTICS["bfloat16", wide], fla_gdn._space),
-                         (fla_kda.HEURISTICS[wide], fla_kda._space)):
-        for kernel, tiles in picks.items():
-            assert tiles in space(kernel, wide), kernel
-    assert set(fla_gdn.HEURISTICS["bfloat16", wide]) == set(fla_gdn.HEURISTICS["float32", wide])
+    for launch in LAUNCHES:
+        assert launch.PICKS["bfloat16", wide] in launch.SPACES[wide], launch.NAME
+        assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
 
 
 @pytest.mark.parametrize("module", [fla_gdn, fla_kda])
