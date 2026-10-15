@@ -38,6 +38,7 @@ from dew.rl.surrogate import (
 
 from ..lm import LMObjective
 from ..lm.objective import _shift_rows, _unpadded
+from ._lm import check_lm_terms
 from .sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -110,6 +111,7 @@ class GRPOObjective(LMObjective):
     `model` and `seq_len` are as in `LMObjective`, with `seq_len` one less
     than the row width. An `ema_decay` other than None is refused, and so is
     `loss_role`, because the response mask already says which targets count.
+    Auxiliary LM training terms are refused because this loss does not apply them.
 
     `policy_loss` picks the surrogate:
 
@@ -179,6 +181,7 @@ class GRPOObjective(LMObjective):
             raise ValueError(
                 "the response mask already says which targets count, "
                 "so loss_role is refused on a GRPO objective")
+        check_lm_terms(kwargs)
         if policy_loss not in POLICY_LOSSES:
             raise ValueError(f"policy_loss must be one of {POLICY_LOSSES}, got {policy_loss!r}")
         if aggregation not in AGGREGATIONS:
