@@ -31,7 +31,7 @@ from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextCo
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.mixers import MixerContext
 from dew.registry import mixers
 from tools.hf_reference import scatter_weights
@@ -150,10 +150,10 @@ def test_the_block_matches_the_reference_and_is_sparse():
     variables = translated(block)
     metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
 
-    ours = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
+    ours = np.asarray(module().apply(variables, jnp.asarray(hidden), MixerCall(metadata)))
     assert scaled(ours[valid], wanted[valid]) < BOUND
     dense = np.asarray(
-        module(index_topk=64).apply(variables, jnp.asarray(hidden), attention_metadata=metadata)
+        module(index_topk=64).apply(variables, jnp.asarray(hidden), MixerCall(metadata))
     )
     assert scaled(dense[valid], wanted[valid]) > 1e-2
 
@@ -170,7 +170,7 @@ def test_the_block_matches_the_reference_with_biased_projections():
     assert set(variables['params']['q_b_proj']) == {'kernel'}
 
     metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
-    ours = module(attention_bias=True).apply(variables, jnp.asarray(hidden), attention_metadata=metadata)
+    ours = module(attention_bias=True).apply(variables, jnp.asarray(hidden), MixerCall(metadata))
     assert scaled(np.asarray(ours)[valid], wanted[valid]) < BOUND
 
 
@@ -192,7 +192,7 @@ def test_the_gradients_match_torch_autograd():
     metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
 
     def loss(x, variables):
-        out = module().apply(variables, x, attention_metadata=metadata)
+        out = module().apply(variables, x, MixerCall(metadata))
         assert isinstance(out, jax.Array)
         return jnp.sum(out * jnp.asarray(cotangent))
 
@@ -223,17 +223,15 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
             return None
         return AttentionMetadata(coordinates=coordinates(valid=row_valid[:, start:stop]))
 
-    _, allocated = block_module.apply(variables, x[:, :1], decode=True, mutable=["cache"])
+    _, allocated = block_module.apply(variables, x[:, :1], MixerCall(decode=True), mutable=["cache"])
     assert not bool(jnp.any(allocated["cache"]["cache_index"]))
-    out, state = block_module.apply({**variables, **allocated}, x[:, :prefill], decode=True,
-                                    attention_metadata=metadata(0, prefill), mutable=["cache"])
+    out, state = block_module.apply({**variables, **allocated}, x[:, :prefill],
+                                    MixerCall(metadata(0, prefill), decode=True), mutable=["cache"])
     steps = [out]
     for position in range(prefill, S):
         out, state = block_module.apply(
             {**variables, **state},
-            x[:, position : position + 1],
-            decode=True,
-            attention_metadata=metadata(position, position + 1),
+            x[:, position : position + 1], MixerCall(metadata(position, position + 1), decode=True),
             mutable=["cache"],
         )
         steps.append(out)
@@ -276,7 +274,7 @@ def test_a_row_with_a_hole_pools_as_its_cache_does():
     valid[0, 3] = False
     variables = translated(block)
     metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
-    parallel = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
+    parallel = np.asarray(module().apply(variables, jnp.asarray(hidden), MixerCall(metadata)))
 
     stepped = decode_steps(module(), variables, hidden, valid, prefill=5)
     assert scaled(stepped[valid], parallel[valid]) < BOUND
@@ -312,8 +310,8 @@ def test_a_budget_the_pool_does_not_divide_is_refused():
 
 def selection_step(block, variables, cache, x, valid, phase):
     return jax.jit(lambda state, values, active: block.apply(
-        {**variables, "cache": state}, values, decode=True,
-        attention_metadata=AttentionMetadata(coordinates=coordinates(valid=active)),
+        {**variables, "cache": state}, values,
+        MixerCall(AttentionMetadata(coordinates=coordinates(valid=active)), decode=True),
         prediction_phase=phase, mutable=["cache"]))(cache, x, valid)
 
 
@@ -322,7 +320,7 @@ def test_prediction_selection_seed_miss_hit_and_fixed_tail():
     variables = translated(reference_block())
     hidden, valid = inputs()
     x, active = jnp.asarray(hidden), jnp.asarray(valid)
-    _, allocated = block.apply(variables, x[:, :1], decode=True,
+    _, allocated = block.apply(variables, x[:, :1], MixerCall(decode=True),
                                prediction_phase="extend", mutable=["cache"])
     np.testing.assert_array_equal(allocated["cache"]["selection_position"], [-1, -1])
     _, extended = selection_step(block, variables, allocated["cache"], x[:, :5], active[:, :5], "extend")
@@ -357,7 +355,7 @@ def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
     hidden, _ = inputs()
     x = jnp.asarray(hidden)
     valid = jnp.asarray([[True], [False]])
-    _, allocated = block.apply(variables, x[:, :1], decode=True,
+    _, allocated = block.apply(variables, x[:, :1], MixerCall(decode=True),
                                prediction_phase="extend", mutable=["cache"])
     _, extended = selection_step(block, variables, allocated["cache"], x[:, :1], valid, "extend")
     np.testing.assert_array_equal(extended["cache"]["selection_position"], [0, -1])
@@ -377,7 +375,7 @@ def test_prediction_selection_rewind_recomputes_only_invalidated_row():
     variables = translated(reference_block())
     hidden, _ = inputs()
     x, valid = jnp.asarray(hidden), jnp.ones((2, 5), bool)
-    _, allocated = block.apply(variables, x[:, :1], decode=True,
+    _, allocated = block.apply(variables, x[:, :1], MixerCall(decode=True),
                                prediction_phase="extend", mutable=["cache"])
     _, extended = selection_step(block, variables, allocated["cache"], x[:, :5], valid, "extend")
     cache = {**extended["cache"], "cache_index": jnp.asarray([3, 5], jnp.int32)}
