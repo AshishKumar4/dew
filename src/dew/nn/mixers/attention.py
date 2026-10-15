@@ -301,18 +301,24 @@ class CausalSelfAttention(nn.Module):
     def _qkv(self) -> tuple[nn.Module, nn.Module, nn.Module]:
         return self.q_proj, self.k_proj, self.v_proj
 
-    def _projected(self, x):
-        """The query projection, and the keys' and values' where one product
-        made them too: the packed `qkv_proj`, or the three kernels joined per
-        call where the generation measured that faster (`joins`)."""
+    def _projected(self, x, whole: bool):
+        """The query projection, its gate apart where one product made both,
+        and the keys' and values' where one product made them too: the packed
+        `qkv_proj`, or the three kernels joined per call where the generation
+        measured that faster (`joins`). The join hands a gated query's query
+        and gate back as contiguous blocks, so neither direction interleaves
+        them, unless `whole`, a norm of the whole projection, reads them
+        interleaved."""
         group = self._group()
         if group is not None and self._packed():
             projected, key, value = group.split(self.qkv_proj(x))
-            return projected, (key, value)
-        if group is not None and joins('qkv', self._qkv(), QKV_AXES):
-            projected, key, value = joined_outputs(x, self._qkv(), QKV_AXES, HEADS)
-            return projected, (key, value)
-        return self.q_proj(x), None
+            return projected, None, (key, value)
+        heads = (self.ctx.num_heads, self.ctx.num_kv_heads, self.ctx.num_kv_heads)
+        if group is None or not joins('qkv', self._qkv(), QKV_AXES, heads):
+            return self.q_proj(x), None, None
+        gated = self.ctx.output_gate and self.gate_projection == 'query' and not whole
+        *query, key, value = joined_outputs(x, self._qkv(), QKV_AXES, HEADS, heads, (2 if gated else 1, 1, 1))
+        return query[0], query[1] if gated else None, (key, value)
 
     def _group(self) -> ProjectionGroup | None:
         """Its query, key and value projections of the layer's input, packed
@@ -491,17 +497,19 @@ class CausalSelfAttention(nn.Module):
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
-        projected, projected_kv = self._projected(x)
-        projected = checkpoint_name(projected, 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
         # and the Gemmas norm each head after it, which the reference marks
         # "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147).
         whole = self.ctx.qk_norm and self.ctx.qk_norm_scope == 'projection'
+        projected, gate, projected_kv = self._projected(x, whole)
+        projected = checkpoint_name(projected, 'q_proj')
         if whole:
             projected = self.q_norm(projected)
-        gate = None
-        if self.ctx.output_gate and self.gate_projection == 'query':
+        if gate is not None:
+            query = projected.reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
+            gate = checkpoint_name(gate, 'q_proj').reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
+        elif self.ctx.output_gate and self.gate_projection == 'query':
             # The reference views the doubled output as [.., heads, 2*head_dim]
             # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
             query, gate = jnp.split(

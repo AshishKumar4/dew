@@ -17,7 +17,7 @@ from dew.nn import joined
 from dew.nn.mlp import GatedMLP
 from dew.training import MeshSpec
 
-LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
 def row_joins(monkeypatch, choice: str, *, joins: bool = True):
@@ -79,14 +79,17 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(monkeypatch, dtyp
                            gradients(layer.clone(dtype=jnp.float64).apply))
 
 
-def test_query_key_and_value_joined_are_as_exact_as_apart_from_float64(monkeypatch):
+@pytest.mark.parametrize("fixture", ["llama-tiny", "qwen35-tiny"])
+def test_query_key_and_value_joined_are_as_exact_as_apart_from_float64(monkeypatch, fixture):
     """A decoder whose row joins each attention's query, key and value runs
-    one GEMM where it ran three, and its logits and every parameter's
-    gradient lie within tests/reference_error.py's rule of the decoder's with
-    them apart, both measured from float64."""
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    one GEMM where it ran three, Qwen3.5's gated query leaving it as a query
+    block and a gate block, and its logits and every parameter's gradient
+    lie within tests/reference_error.py's rule of the decoder's with them
+    apart, both measured from float64."""
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
     tokens = jnp.asarray([[3, 17, 42, 9, 200, 5, 77, 31, 64, 128]], jnp.int32)
-    cotangent = jax.random.normal(jax.random.key(8), (1, tokens.shape[1], 256))
+    shape = jax.eval_shape(loaded.model.apply, loaded.variables, tokens)
+    cotangent = jax.random.normal(jax.random.key(8), shape.shape)
 
     def logits(model):
         return gradients(lambda variables: model.apply(variables, tokens))
@@ -100,19 +103,22 @@ def test_query_key_and_value_joined_are_as_exact_as_apart_from_float64(monkeypat
 
 
 @pytest.mark.mesh(devices=4)
-def test_query_key_and_value_joined_over_tensor_shards_change_no_value_and_move_nothing_more(monkeypatch):
+@pytest.mark.parametrize("output_gate", [False, True])
+def test_query_key_and_value_joined_over_tensor_shards_change_no_value_and_move_nothing_more(monkeypatch,
+                                                                                           output_gate):
     """Two tensor shards, each holding whole query and key heads: the joined
-    product keeps each shard's columns of the three kernels together, so the
-    step's loss and gradients are the apart step's on the same mesh within
-    fp32 reassociation, and its compiled step moves no operand between
-    devices that the apart step does not."""
+    product keeps each shard's columns of the three kernels together, a
+    gated query's query and gate blocks included, so the step's loss and
+    gradients are the apart step's on the same mesh within fp32
+    reassociation, and its compiled step moves no operand between devices
+    that the apart step does not."""
     from test_mesh_axes import one_step
 
     spec = MeshSpec(fsdp=2, tensor=2)
     row_joins(monkeypatch, "qkv", joins=False)
-    loss, grads, text = one_step(spec)
+    loss, grads, text = one_step(spec, output_gate=output_gate)
     row_joins(monkeypatch, "qkv")
-    joined_loss, joined_grads, joined_text = one_step(spec)
+    joined_loss, joined_grads, joined_text = one_step(spec, output_gate=output_gate)
     assert sum(" dot(" in line for line in joined_text.splitlines()) < sum(
         " dot(" in line for line in text.splitlines())
     assert abs(joined_loss - loss) < 1e-5

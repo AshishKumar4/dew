@@ -39,11 +39,17 @@ def _split(projection: nn.Module, axes: LogicalAxes) -> tuple[str, ...]:
     return mesh_axes(spec[1]) if len(spec) > 1 else ()
 
 
-def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[LogicalAxes] | None = None
-                 ) -> str | None:
+def _shards(projection: nn.Module, axes: LogicalAxes) -> int:
+    mesh = jax.sharding.get_abstract_mesh()
+    return math.prod(mesh.shape[name] for name in _split(projection, axes))
+
+
+def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[LogicalAxes] | None = None,
+                 heads: Sequence[int] | None = None) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None.
-    `kernel_axes`, each kernel's logical axes, are a concatenation's
-    (`joined_outputs`), whose features a mesh must split alike."""
+    `kernel_axes`, each kernel's logical axes, and `heads`, each one's heads,
+    are a concatenation's (`joined_outputs`), whose features a mesh must
+    split alike and, where it regroups them, at whole heads."""
     first = projections[0]
     return first_refusal(
         (all(type(projection) is nn.Dense for projection in projections),
@@ -59,18 +65,21 @@ def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[Logical
         (kernel_axes is None or len({_split(projection, axes) for projection, axes
                                      in zip(projections, kernel_axes, strict=True)}) == 1,
          "a mesh splits the projections' features over different axes"),
+        (kernel_axes is None or heads is None or all(
+            count % _shards(first, kernel_axes[0]) == 0 for count in heads),
+         "a mesh splits a projection inside a head, which the join regroups whole"),
     )
 
 
-def joins(choice: str, projections: Sequence[nn.Module], kernel_axes: Sequence[LogicalAxes] | None = None
-          ) -> bool:
+def joins(choice: str, projections: Sequence[nn.Module], kernel_axes: Sequence[LogicalAxes] | None = None,
+          heads: Sequence[int] | None = None) -> bool:
     """Whether `projections` run as one GEMM (`joined_dense`, `joined_outputs`): where the
     generation's row measured `choice` 'joined', unless their calls take what the join does not
     reproduce (`join_refusal`), which `ran_kernel` logs. Initialization creates each projection's
     parameters through its own call."""
     if measured_kernel(choice, 'apart') != 'joined' or projections[0].is_initializing():
         return False
-    reason = join_refusal(projections, kernel_axes)
+    reason = join_refusal(projections, kernel_axes, heads)
     if reason is not None:
         ran_kernel(choice, 'apart', reason)
     return reason is None
@@ -106,24 +115,35 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
 
 
 def joined_outputs(x: jax.Array, projections: Sequence[nn.Module], kernel_axes: Sequence[LogicalAxes],
-                   output_axes: LogicalAxes) -> list[jax.Array]:
-    """`projections`' outputs of `x`, each as its own call gives it, from one
-    GEMM over their kernels joined on the features. Where a mesh splits the
-    features (by `kernel_axes`, each kernel's logical axes, alike for all, as
-    `joins` checks), each shard's columns of every projection sit together,
-    so every device's product reads its own columns alone. The joined
-    output, `[..., shards, columns]`, is placed by `output_axes`."""
+                   output_axes: LogicalAxes, heads: Sequence[int], parts: Sequence[int]) -> list[jax.Array]:
+    """`projections`' outputs of `x` from one GEMM over their kernels joined
+    on the features. Projection i holds `heads[i]` heads of `parts[i]` equal
+    pieces each, and comes back as `parts[i]` outputs, piece p of every head
+    in head order: as its own call gives it for one part, regrouped for more,
+    so a head's pieces (a gated query's query and gate) leave the product as
+    contiguous blocks. Where a mesh splits the features (by `kernel_axes`,
+    each kernel's logical axes, alike for all and at whole heads, as `joins`
+    checks), each shard's columns of every projection sit together, so every
+    device's product reads its own columns alone. The joined output,
+    `[..., shards, columns]`, is placed by `output_axes`."""
     promoted = _promoted(x, projections)
-    mesh = jax.sharding.get_abstract_mesh()
-    shards = math.prod(mesh.shape[name] for name in _split(projections[0], kernel_axes[0]))
+    shards = _shards(projections[0], kernel_axes[0])
 
-    def by_shard(value):
-        return value.reshape(*value.shape[:-1], shards, value.shape[-1] // shards)
+    def regrouped(value, heads: int, parts: int):
+        """A kernel's or bias's features `[heads, parts, width]` as `[shards, parts, heads / shards, width]`,
+        flattened after the shards."""
+        grouped = value.reshape(*value.shape[:-1], shards, heads // shards, parts, -1)
+        return jnp.swapaxes(grouped, -3, -2).reshape(*value.shape[:-1], shards, -1)
 
-    y = _product(promoted[0][0], jnp.concatenate([by_shard(kernel) for _, kernel, _ in promoted], axis=-1),
+    layouts = list(zip(heads, parts, strict=True))
+    y = _product(promoted[0][0], jnp.concatenate([regrouped(kernel, *layout) for (_, kernel, _), layout
+                                                  in zip(promoted, layouts, strict=True)], axis=-1),
                  projections[0])
     if projections[0].use_bias:
-        y = y + jnp.concatenate([by_shard(bias) for _, _, bias in promoted], axis=-1)
-    ends = np.cumsum([projection.features // shards for projection in projections])[:-1]
-    return [part.reshape(*part.shape[:-2], -1)
-            for part in jnp.split(constrain(y, output_axes), [int(end) for end in ends], axis=-1)]
+        y = y + jnp.concatenate([regrouped(bias, *layout) for (_, _, bias), layout
+                                 in zip(promoted, layouts, strict=True)], axis=-1)
+    widths = [projection.features // shards // count
+              for projection, count in zip(projections, parts, strict=True) for _ in range(count)]
+    ends = np.cumsum(widths)[:-1]
+    return [piece.reshape(*piece.shape[:-2], -1)
+            for piece in jnp.split(constrain(y, output_axes), [int(end) for end in ends], axis=-1)]

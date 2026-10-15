@@ -387,10 +387,10 @@ def test_topologies_agree_with_data_parallel():
     assert difference < 4e-6, difference
 
 
-def one_step(spec):
+def one_step(spec, **overrides):
     """One step's loss and gradients under `spec`, and its compiled text: the
-    parameters one seed initialises, placed by the default rules, and one
-    batch of the fixture.
+    parameters one seed initialises for `tiny(**overrides)`, placed by the
+    default rules, and one batch of the fixture.
 
     The step is the trainer's inner call without the optimizer: what the
     default rules place is the only thing `spec` changes between two runs of
@@ -398,7 +398,7 @@ def one_step(spec):
     tensor axis are not the ones the rules meant.
     """
     mesh = spec.build()
-    objective = LMObjective(tiny(), SEQ_LEN)
+    objective = LMObjective(tiny(**overrides), SEQ_LEN)
     initial = objective.init(jax.random.key(0))
     placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
     assert_sharded(placed["params"], mesh)
