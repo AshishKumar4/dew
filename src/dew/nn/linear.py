@@ -46,6 +46,7 @@ from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
+from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
@@ -1084,15 +1085,24 @@ class GatedDeltaNet(nn.Module):
         which no rule splits, and b and a with their heads where the tensor
         axis splits the kernels'. Unplaced, an fsdp mesh ran the layer
         head-split with every row gathered to every device, its all-to-alls
-        8.4 GiB of a Qwen3.5-9B step over FSDP 2 (docs/performance.md)."""
+        8.4 GiB of a Qwen3.5-9B step over FSDP 2 (docs/performance.md).
+        Where the generation's row joins b and a (`dew.nn.joined`, 'delta_gates'),
+        they are one GEMM, each head's two gates side by side so a tensor split
+        of the heads keeps both: two narrow GEMMs of a head's width run at a few
+        percent of the device (24,576 tokens of Qwen3.5-0.8B's layer: 2.006 ->
+        1.945 ms fwd+bwd on an H100, 5.44 -> 5.29 on an A100 40GB)."""
         B, S, _ = x.shape
 
         def projected(dense, axes=RESIDUAL):
             return constrain(dense(x), axes)
 
         if not self.fused_in_proj:
-            return (projected(self.in_proj_qkv), projected(self.in_proj_z),
-                    projected(self.in_proj_b, HEADS[:3]), projected(self.in_proj_a, HEADS[:3]))
+            gates = (self.in_proj_b, self.in_proj_a)
+            if joins('delta_gates', gates):
+                b, a = jnp.moveaxis(constrain(joined_dense(x, gates, axis=-1), HEADS), -1, 0)
+            else:
+                b, a = (projected(dense, HEADS[:3]) for dense in gates)
+            return projected(self.in_proj_qkv), projected(self.in_proj_z), b, a
         # One row group per key head: its q, its k, then the v and z of the
         # value heads it serves (modeling_qwen3_next.py:558-586).
         per_key = self.per_v * self.head_v_dim
