@@ -25,6 +25,7 @@ from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.kv_cache import KVCache
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
@@ -52,9 +53,9 @@ def assert_same_generation(served, alone):
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
     """Biases, head norms, RoPE and the cached append still read the same projections."""
     with jax.enable_x64():
-        model = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=1,
-                                   head_dim=4, max_seq_len=64, attention_bias=True,
-                                   attention_impl="xla", dtype=jnp.float64)
+        model = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=1, head_dim=4,
+                                                 max_seq_len=64, attention_bias=True, attention_impl="xla",
+                                                 dtype=jnp.float64))
         x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
         variables = model.init(jax.random.key(0), x)
         # Dyadic weights make the projection sums exact, so a different dot

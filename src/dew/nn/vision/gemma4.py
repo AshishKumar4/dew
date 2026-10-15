@@ -17,6 +17,7 @@ from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.objectives.base import Variables
@@ -100,11 +101,12 @@ class Gemma4VisionTransformer(nn.Module):
             (2, cfg.position_embedding_size, cfg.hidden_size))
         linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears)
         attention = functools.partial(
-            CausalSelfAttention, emb_features=cfg.hidden_size, num_heads=cfg.num_heads,
-            num_kv_heads=cfg.num_key_value_heads, head_dim=head_dim, max_seq_len=cfg.position_embedding_size,
-            causal=False, v_norm=True, norm_eps=cfg.rms_norm_eps, attention_scale=1.0,
-            rotary_axes=(head_dim // 2, head_dim // 2), rotary_per_axis=True, rope_theta=cfg.rope_theta,
-            linear=linear, dtype=self.dtype, precision=self.precision)
+            CausalSelfAttention, ctx=MixerContext(
+                emb_features=cfg.hidden_size, num_heads=cfg.num_heads, num_kv_heads=cfg.num_key_value_heads,
+                head_dim=head_dim, max_seq_len=cfg.position_embedding_size, causal=False, v_norm=True,
+                norm_eps=cfg.rms_norm_eps, attention_scale=1.0, rope_theta=cfg.rope_theta, dtype=self.dtype,
+                precision=self.precision),
+            rotary_axes=(head_dim // 2, head_dim // 2), rotary_per_axis=True, linear=linear)
         mlp = functools.partial(
             GatedMLP, hidden_features=cfg.intermediate_size, out_features=cfg.hidden_size,
             activation="geglu" if cfg.hidden_act == "gelu_pytorch_tanh" else "geglu_exact", linear=linear,

@@ -4,11 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       module:
-        description: Source module to mutate
+        description: Source module to mutate (tools/mutation.py --help lists choices)
         required: true
         default: process
-        type: choice
-        options: [transaction, checkpoints, process, schedules, attention, sources]
+        type: string
       file:
         description: One Python source file inside the selected module (blank selects all)
         required: false
@@ -28,22 +27,21 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      module: ${{ steps.module.outputs.module }}
+      plan: ${{ steps.plan.outputs.plan }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
       - name: Choose the night's module
-        id: module
+        id: plan
         env:
           REQUESTED_MODULE: ${{ inputs.module }}
         run: |
-          python - <<'PY'
-          import datetime
-          import os
-
-          modules = ("process", "transaction", "checkpoints")
-          module = os.environ["REQUESTED_MODULE"] or modules[datetime.datetime.now(datetime.UTC).weekday() % 3]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"module={module}\n")
-          PY
+          module=()
+          if [[ -n "$REQUESTED_MODULE" ]]; then module=("$REQUESTED_MODULE"); fi
+          plan=$(python tools/mutation.py --plan "${module[@]}")
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
 
   mutation:
     needs: plan
@@ -52,20 +50,19 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 2
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+      matrix: ${{ fromJSON(needs.plan.outputs.plan).matrix }}
     env:
       JAX_PLATFORMS: cpu
       PYTHONDONTWRITEBYTECODE: "1"
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "2"
-      MODULE: ${{ needs.plan.outputs.module }}
+      MODULE: ${{ fromJSON(needs.plan.outputs.plan).module }}
       SOURCE_FILE: ${{ inputs.file }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -77,7 +74,7 @@ jobs:
         run: |
           file=()
           if [[ -n "$SOURCE_FILE" ]]; then file=(--file "$SOURCE_FILE"); fi
-          python tools/mutation.py "$MODULE" "${file[@]}" --shard ${{ matrix.shard }} --shards 8 \
+          python tools/mutation.py "$MODULE" "${file[@]}" --shard ${{ matrix.shard }} --shards ${{ fromJSON(needs.plan.outputs.plan).shards }} \
             --output "mutation-${{ matrix.shard }}" --seconds 9600
       - name: Upload mutations and results
         if: always()
@@ -95,7 +92,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
       - uses: actions/download-artifact@v4
         with:
           pattern: mutations-*
