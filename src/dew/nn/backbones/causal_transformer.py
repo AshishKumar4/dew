@@ -15,11 +15,11 @@ attention_output_norm and mlp_output_norm, and the pre-norms keep their names.
 dew.interop.hf_decoders does that rename. A model family is supported only after
 its translator and a same-weight parity test against the reference have landed.
 
-The block holds its token mixer in a slot. Any module with the
-(x, decode=..., attention_metadata=...) -> x signature of CausalSelfAttention,
-reading its tokens' places and documents off the metadata's `Coordinates`, can
-be self_attn without changes to the block, and that is where a linear-attention
-mixer goes.
+The block holds its token mixer in a slot. Any module called (x, call) -> x
+with one `dew.nn.inputs.MixerCall`, as CausalSelfAttention is, reading its
+tokens' places and documents off the call metadata's `Coordinates` and
+declaring the masks it reads (`reads`), can be self_attn without changes to the
+block, and that is where a linear-attention mixer goes.
 """
 
 import dataclasses
@@ -1765,12 +1765,9 @@ class CausalTransformer(nn.Module):
         takes, the token ids a hash router selects by, the engram layers'
         bucket ids, and the media mask, which only a model with engram or a
         router with a media bias reads."""
+        # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
-        if pairwise_mask is not None:
-            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
-            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
-                raise ValueError("explicit pairwise masks require ordinary attention mixers")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
         if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
@@ -2229,15 +2226,28 @@ class CausalTransformer(nn.Module):
             return None
         marked = self.marked_residuals()
 
-        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], frozenset[str]] | None:
-            return None if policy is None else (frozenset(policy.save) & marked,
-                                                frozenset(policy.offload) & marked)
+        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], ...] | None:
+            """What `policy` does with the names these layers mark: None where it recomputes none of
+            them and keeps the rest, as no remat does."""
+            if policy is None or (policy.recompute and not frozenset(policy.recompute) & marked):
+                return None
+            return (frozenset(policy.save) & marked, frozenset(policy.offload) & marked,
+                    frozenset(policy.recompute) & marked)
 
         index = DECODER_REMAT.index(self.remat) + 1
         while (index < len(DECODER_REMAT) - 1
-               and kept(DECODER_REMAT[index]) == kept(DECODER_REMAT[index + 1])):
+               and kept(DECODER_REMAT[index]) in (kept(self.remat), kept(DECODER_REMAT[index + 1]))):
             index += 1
         return self.clone(remat=DECODER_REMAT[index])
+
+    @nn.nowrap
+    def recompute_half(self) -> Self | None:
+        """The decoder one rung up where that rung recomputes only the residuals it names
+        (`RematPolicy.recompute`, a delta rule's memory), else None."""
+        stronger = self.recompute_more()
+        if stronger is None or stronger.remat is None or not stronger.remat.recompute:
+            return None
+        return stronger
 
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:

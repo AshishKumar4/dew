@@ -41,6 +41,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -58,7 +59,7 @@ from dew.nn.attention import (
 )
 from dew.nn.attention_sinks import sink_softmax
 from dew.nn.fake_quant import FakeQuantizing
-from dew.nn.inputs import AttentionMetadata, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
@@ -498,6 +499,10 @@ class DeepseekV4Attention(FakeQuantizing):
     and `kv_qat` V4.1's FP8/FP4 rounding.
     """
 
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): its windows and compressed
+    entries read every earlier token of the row, with no mask or bias to narrow them."""
+
     emb_features: int
     num_heads: int
     head_dim: int
@@ -666,8 +671,8 @@ class DeepseekV4Attention(FakeQuantizing):
         return entries, selected
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
         tokens = coordinates_of(attention_metadata, *x.shape[:2])
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
@@ -785,9 +790,9 @@ class DSparkAttention(DeepseekV4Attention):
     """
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        store = {} if kv_store is None else kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode = call.decode
+        store = {} if call.kv_store is None else call.kv_store
         main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]
         if decode:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +38,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata, coordinates_of
+from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .linear import (
     CHUNK_SIZE,
     DepthwiseConv1d,
@@ -77,6 +78,10 @@ class KimiDeltaAttention(nn.Module):
     of moonshotai/Kimi-K3 at f831ab6); the rest of K3's layer is this one (fla
     `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
+
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
+    of its document, with no mask or bias to narrow it."""
 
     emb_features: int
     num_heads: int
@@ -151,9 +156,8 @@ class KimiDeltaAttention(nn.Module):
         return -rate * jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(jnp.minimum(gate, 20.0))))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        del kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, attention_metadata = call.decode, call.metadata
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid
@@ -213,7 +217,7 @@ class KimiDeltaAttentionMixer(MixerBase):
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse')
+    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

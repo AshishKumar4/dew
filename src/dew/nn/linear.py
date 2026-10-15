@@ -26,9 +26,11 @@ does the history it caches, `[B, K-1, D]`.
 value head.
 """
 
+import contextlib
+import contextvars
 import functools
 from collections.abc import Sequence
-from typing import overload
+from typing import ClassVar, overload
 
 import jax
 import jax.numpy as jnp
@@ -43,7 +45,7 @@ from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata, Coordinates, coordinates_of, valid_order
+from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
@@ -810,6 +812,23 @@ a document excludes its first token's decay, and the compensated halves (`chunk_
 its precision below the shifted prefix."""
 
 
+RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
+"""The residuals a decoder block's remat rung has the layers that compute them recompute, the block
+keeping every other (`dew.nn.backbones.decoder_block.RematPolicy.recompute`): a delta rule traced
+inside recomputes its memory in its backward where this names 'delta_memory' (`_blocked_rule`),
+and keeps it otherwise. A block sets it as it traces its layers (`recomputing`)."""
+
+
+@contextlib.contextmanager
+def recomputing(names: tuple[str, ...]):
+    """Trace the layers inside with `names` recomputed by the layers that compute them (`RECOMPUTED`)."""
+    token = RECOMPUTED.set(names)
+    try:
+        yield
+    finally:
+        RECOMPUTED.reset(token)
+
+
 def _blocked_rule(query, key, value, g, beta, state, starts):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
@@ -821,7 +840,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     every padded product is an exact zero. The outputs are cut back. A packed
     document's first token (`starts`) forgets the memory (`FORGET`). The
     decay's shape picks the port: per head fla's gated delta rule, per key
-    dimension its Kimi delta attention."""
+    dimension its Kimi delta attention. It keeps its memory for the backward
+    but where the block's remat rung recomputes it (`RECOMPUTED`)."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -850,7 +870,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     g = jnp.where(starts.reshape(B, S, *(1,) * (g.ndim - 2)), jax.lax.stop_gradient(g) + FORGET, g)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, None, scale, CHUNK_SIZE,
-                      not generation.triton_runs())
+                      not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get())
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
@@ -952,6 +972,10 @@ class GatedDeltaNet(nn.Module):
     `in_proj_qkvz` and `in_proj_ba`, split per key-head row group as
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
+
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
+    of its document, with no mask or bias to narrow it."""
 
     emb_features: int
     num_k_heads: int
@@ -1082,9 +1106,8 @@ class GatedDeltaNet(nn.Module):
         return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        del kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, attention_metadata = call.decode, call.metadata
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid

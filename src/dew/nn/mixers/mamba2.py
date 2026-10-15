@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -64,7 +65,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.attention import FORWARD_MODE, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import AttentionMetadata, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import mamba_ssd
 from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
@@ -361,6 +362,10 @@ class Mamba2(nn.Module):
     (`_entering_state`); decoding and padded rows are refused there.
     """
 
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
+    of its document, with no mask or bias to narrow it."""
+
     emb_features: int
     num_heads: int
     head_dim: int
@@ -429,9 +434,8 @@ class Mamba2(nn.Module):
             self.init_std if self.output_init_std is None else self.output_init_std))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        del kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, attention_metadata = call.decode, call.metadata
         batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
         valid = tokens.valid

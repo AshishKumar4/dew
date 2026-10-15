@@ -21,6 +21,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
+from dew.registry import mixers
 from dew.training import Trainer, planning, rungs
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
@@ -104,9 +105,9 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
 
 
-def lm(split=None, accumulation=1):
+def lm(split=None, accumulation=1, **fields):
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=SEQ)
+                              max_seq_len=SEQ, **fields)
     return one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
@@ -311,6 +312,54 @@ def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, fits):
     last = trainer.plan["probes"][-1]
     assert (last["split"], last["remat"], last["fits"]) == ((1, None, True) if trainer.plan["split"] == 1
                                                             else (1, "minimal", False))
+
+
+DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear_num_value_heads=2,
+                               linear_key_head_dim=8, linear_value_head_dim=8)}
+"""A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
+
+
+def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
+    """Where no recomputation fits the batch only at eight microbatches and recomputing a delta rule's
+    memory alone fits it at four, the plan is four at that half rung: no plan splits the batch further
+    at a rung where the half rung fits it, and the search asks each split there after it misses."""
+    trainer = lm(**DELTA)
+    half = REMAT_POLICIES["all_but_delta_memory"]
+    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= (8 if remat is None else 4))
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, "all_but_delta_memory")
+    assert trainer.objective.model.remat == half
+    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
+        (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, False),
+        (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False),
+        (1, "minimal_with_conv", False)]
+
+
+def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
+    """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
+    fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
+    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    trainer = lm(**DELTA)
+    half = REMAT_POLICIES["all_but_delta_memory"]
+    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 4 and remat != half)
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
+    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
+        (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, True),
+        (2, None, False), (2, "all_but_delta_memory", False), (1, "minimal_with_conv", False)]
+
+
+def test_a_decoder_without_a_half_rung_asks_the_splits_it_did(monkeypatch):
+    """Without a delta rule no rung is a half rung: the search asks the batch whole, the largest split,
+    and halves the range, each at no recomputation, and the frontier one rung up."""
+    trainer = lm()
+    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 4)
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
+    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
+        (1, None, False), (32, None, True), (4, None, True), (2, None, False), (1, "minimal", False)]
 
 
 def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():

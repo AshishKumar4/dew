@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mlp import GatedMLP
@@ -74,10 +74,11 @@ def test_decode_matches_prefill_on_both_rules():
         variables = attention_variables(tensors)
         whole = jnp.asarray(module.apply(variables, hidden))
         # The first decode call allocates the cache without writing it.
-        state = {**module.init(jax.random.key(0), hidden[:, :1], decode=True), **variables}
+        state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **variables}
         steps = []
         for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, 12)]:
-            step, mutated = module.apply(state, hidden[:, start:stop], decode=True, mutable=["cache"])
+            step, mutated = module.apply(state, hidden[:, start:stop], MixerCall(decode=True),
+                                         mutable=["cache"])
             state = {**state, "cache": mutated["cache"]}
             steps.append(step)
         incremental = jnp.concatenate(steps, axis=1)
@@ -98,9 +99,9 @@ def test_a_left_padded_row_scores_its_tokens_as_the_row_alone_cached_or_not():
         module = attention(**settings)
         variables = attention_variables(tensors)
         alone = np.asarray(module.apply(variables, real))
-        uncached = module.apply(variables, padded, attention_metadata=metadata)
-        state = {**module.init(jax.random.key(0), padded[:, :1], decode=True), **variables}
-        cached, _ = module.apply(state, padded, decode=True, attention_metadata=metadata, mutable=["cache"])
+        uncached = module.apply(variables, padded, MixerCall(metadata))
+        state = {**module.init(jax.random.key(0), padded[:, :1], MixerCall(decode=True)), **variables}
+        cached, _ = module.apply(state, padded, MixerCall(metadata, decode=True), mutable=["cache"])
         for got in (uncached, cached):
             assert float(np.max(np.abs(np.asarray(got)[:, 3:] - alone))) < 1e-5, settings
 
@@ -115,9 +116,9 @@ def test_the_temperature_reads_logical_positions_through_a_cache():
         positions=jnp.broadcast_to(jnp.arange(6) + 8, hidden.shape[:2])))
     module = attention(use_rope=False)
     variables = attention_variables(tensors)
-    uncached = np.asarray(module.apply(variables, hidden, attention_metadata=metadata))
-    state = {**module.init(jax.random.key(0), hidden[:, :1], decode=True), **variables}
-    cached, _ = module.apply(state, hidden, decode=True, attention_metadata=metadata, mutable=["cache"])
+    uncached = np.asarray(module.apply(variables, hidden, MixerCall(metadata)))
+    state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **variables}
+    cached, _ = module.apply(state, hidden, MixerCall(metadata, decode=True), mutable=["cache"])
     assert float(np.max(np.abs(np.asarray(cached) - uncached))) < 1e-5
 
 

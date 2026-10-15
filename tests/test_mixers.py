@@ -13,6 +13,7 @@ and values agree, and an unknown kind or field raises naming what was asked for.
 import dataclasses
 import functools
 import itertools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -23,9 +24,11 @@ from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.inputs import coordinates
-from dew.nn.mixers import MixerBase, MixerContext
+from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
+from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -37,13 +40,14 @@ def tiny(**overrides):
 
 
 class ScaleMixerModule(nn.Module):
-    """A token mixer with no parameters: scale and pass through."""
+    """A token mixer with no parameters: scale and pass through, token by token."""
+
+    reads: ClassVar[frozenset[str]] = TOKENWISE
 
     scale: float = 2.0
 
     @nn.compact
-    def __call__(self, x, decode: bool = False):
-        del decode
+    def __call__(self, x, call: MixerCall):
         return x * self.scale
 
 
@@ -71,6 +75,32 @@ def test_mixer_records_and_values_compute_the_same_logits():
                   models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
     assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
+
+
+def test_a_layer_runs_no_mask_its_mixer_does_not_read():
+    """A pairwise mask says which keys each query reads. An attention layer reads it, so a mask
+    that keeps only each token's own key moves its output; a gated delta net reads every earlier
+    token of its document and no mask, so its layer refuses the call rather than run it as if
+    unmasked. A model asked for a mask refuses it at the layer that cannot read it."""
+    x = jax.random.normal(jax.random.key(1), (1, 4, 32))
+    own = AttentionMetadata(pairwise_mask=jnp.eye(4, dtype=bool)[None])
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16)
+    delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
+                               linear_value_head_dim=8)
+    for kind, reads in ((AttentionMixer(), True), (delta, False)):
+        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32,
+                             wiring=BlockWiring())
+        params = layer.init(jax.random.key(0), x)
+        if reads:
+            assert not jnp.allclose(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
+        else:
+            with pytest.raises(ValueError):
+                layer.apply(params, x, attention_metadata=own)
+    recurrent = hybrid(kinds={"linear": LayerKind(mixer=delta)})
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    params = recurrent.init(jax.random.key(0), ids)
+    with pytest.raises(ValueError):
+        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
 
 
 def hybrid(**overrides):
@@ -299,6 +329,24 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     held = factory.keywords.get("ctx")
     taken = factory.keywords.get(policy) if held is None else getattr(held, policy)
     assert taken == POLICY_VALUES[policy]
+
+
+@pytest.mark.parametrize("kind, rungs", [
+    ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
+    ("mamba2", [None, "minimal_with_conv", "minimal", "full"]),
+    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_conv", "minimal", "full"]),
+])
+def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
+    """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
+    below or above it: 'all_but_delta_memory', which recomputes a delta rule's memory alone, is a
+    rung only for a decoder with a delta rule, and the ladder of any other is the one before it (a
+    recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=64, **overrides)
+    climbed = [model]
+    while (stronger := climbed[-1].recompute_more()) is not None:
+        climbed.append(stronger)
+    assert [rung.recompute_record() for rung in climbed] == rungs
 
 
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
