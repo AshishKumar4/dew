@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn import joined
+from dew.nn.linear import GatedDeltaNet
 from dew.nn.mlp import GatedMLP
 
 
@@ -68,4 +69,22 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(monkeypatch, dtyp
     row_joins(monkeypatch, "gate_up")
     assert dots(layer.apply, params, x) == 2
     assert_joined_as_exact(monkeypatch, "gate_up", gradients(layer.apply), (params, x, cotangent),
+                           gradients(layer.clone(dtype=jnp.float64).apply))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(monkeypatch, dtype):
+    """A gated delta net whose row joins its b and a projections ('delta_gates') runs them as one
+    GEMM, one dot fewer, and its output and the gradients of its input and every parameter lie within
+    tests/reference_error.py's rule of the layer's with them apart, both measured from float64."""
+    x = jax.random.normal(jax.random.key(7), (2, 40, 64)).astype(dtype)
+    cotangent = jax.random.normal(jax.random.key(8), (2, 40, 64)).astype(dtype)
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=16, head_v_dim=16,
+                          dtype=dtype)
+    params = layer.init(jax.random.key(9), x)
+    row_joins(monkeypatch, "delta_gates", joins=False)
+    apart = dots(layer.apply, params, x)
+    row_joins(monkeypatch, "delta_gates")
+    assert dots(layer.apply, params, x) == apart - 1
+    assert_joined_as_exact(monkeypatch, "delta_gates", gradients(layer.apply), (params, x, cotangent),
                            gradients(layer.clone(dtype=jnp.float64).apply))
