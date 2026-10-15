@@ -297,8 +297,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
     common = ci.shared("3.12")
     for name, inputs in itertools.product(names, (None, common)):
-        stored[ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]] = json.dumps(
-            {"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30}).encode()
+        at = ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]
+        stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
+                                 "peak": 4 * 2 ** 30}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
