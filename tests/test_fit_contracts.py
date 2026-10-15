@@ -20,7 +20,7 @@ class ScalarRegression(Objective):
         self.auxiliary = auxiliary
         self.statistics = statistics
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {'params': {'weight': jnp.zeros(2)}}
 
     def loss(self, variables, batch, step):

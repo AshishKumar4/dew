@@ -1,7 +1,6 @@
 """The live bridge (site/live/container/shared_bridge.py) over real sockets: a page's WebSocket, as the
 Worker forwards it, to a stand-in for the Kernel Gateway that speaks its REST and channel protocol."""
 import asyncio
-import importlib.util
 import json
 import os
 import subprocess
@@ -12,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from aiohttp import web
+from tool_support import load
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site/live/container"
 SECRET = "bridge-secret"
@@ -20,10 +20,7 @@ SECRET = "bridge-secret"
 @pytest.fixture(scope="module")
 def bridge():
     sys.path.insert(0, str(CONTAINER))
-    spec = importlib.util.spec_from_file_location("shared_bridge", CONTAINER / "shared_bridge.py")
-    loaded = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(loaded)
-    yield loaded
+    yield load("shared_bridge", "site/live/container")
     sys.path.remove(str(CONTAINER))
 
 
@@ -303,11 +300,9 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
 def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
     """benchmark_gateway.py, the preparation's required context smoke, imports and reports the host's
     load through the bridge's own probe."""
-    spec = importlib.util.spec_from_file_location("benchmark_gateway", CONTAINER / "benchmark_gateway.py")
-    smoke = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(CONTAINER))
     try:
-        spec.loader.exec_module(smoke)
+        smoke = load("benchmark_gateway", "site/live/container")
     finally:
         sys.path.remove(str(CONTAINER))
     assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
