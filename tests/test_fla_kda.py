@@ -16,7 +16,13 @@ import numpy as np
 import pytest
 from delta_rule_support import CHUNKED, NAMES, fla_side, recurrence, through
 from kernel_compile import compile_kernels, failures
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    distance,
+    float64_terms,
+    widened,
+)
 from sharded import boundary_copies
 from tuned import each_config
 
@@ -76,7 +82,8 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
     with jax.enable_x64(new_val=True):
         operands64 = widened((*inputs, do, dht))
         truth = through(recurrence, *operands64[6:])(*operands64[:6])
-    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED)
+        _, terms = float64_terms(through(math, *operands64[6:]), *operands64[:6])
+    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED, terms=terms)
 
 
 @pytest.mark.gpu(reason="the layer runs the port where the GPU's own target row names it")
