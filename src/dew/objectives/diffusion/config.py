@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, Prepared, RunConfig
-from dew.config.data import Augment, HoldOut, ImageData, VideoData, loader
+from dew.config.data import Augment, HoldOut, ImageData, VideoData
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
@@ -385,10 +385,7 @@ class DiffusionRunConfig(RunConfig):
 
         run = self.pinned()
         objective = run.build()
-        dataset = loader(run.data, batch=run.trainer.batch_size, tokens=run.trainer.batch_tokens,
-                       read=run.data_read, provision=run.provision,
-                       seed=run.data_seed, loading=run.loading,
-                       validation_records=run.validation_records, objective=objective.data())
+        dataset = run.loader(objective.data())
         metrics = run.build_eval_metrics()
         rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
