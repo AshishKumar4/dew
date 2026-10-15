@@ -10,10 +10,10 @@ name: Tutorials
 on:
   push:
     branches: [ "main", "ci/**" ]
-    paths: [ "tutorials/**", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
+    paths: &paths [ "tutorials/**", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml", ".github/actions/proven/**" ]
   pull_request:
     branches: [ "main" ]
-    paths: [ "tutorials/**", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
+    paths: *paths
   workflow_dispatch:
 
 permissions:
@@ -27,19 +27,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
     outputs:
       run: ${{ steps.find.outputs.run }}
     steps:
+    - uses: actions/checkout@v4
+      if: github.event_name == 'push'
     - id: find
       if: github.event_name == 'push'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        # A pull request's run tested a merge, not this commit.
-        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/tutorials.yml/runs?head_sha=$GITHUB_SHA&status=success" \
-          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
-        echo "run=$run" >> "$GITHUB_OUTPUT"
-        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+      uses: ./.github/actions/proven
+      with:
+        workflow: tutorials.yml
 
   smoke:
     needs: proven
@@ -61,7 +59,7 @@ jobs:
         fetch-depth: 0  # the outputs check reads the history since each notebook's recorded commit
     - uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version-file: .python-version
     - uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
