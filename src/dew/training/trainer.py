@@ -112,7 +112,6 @@ from dew.training.distributed import (
     batch_signature,
     check_batch,
     check_stream,
-    device_fields,
     device_mesh,
     explicit_axes,
     link_bandwidth,
@@ -122,6 +121,7 @@ from dew.training.distributed import (
     prefetched_bytes,
     ruled,
     shard_batch,
+    split_fields,
     stage_microbatches,
     step_reads,
 )
@@ -1536,7 +1536,7 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
-                device = device_fields(batch)
+                device, _ = split_fields(batch)
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.

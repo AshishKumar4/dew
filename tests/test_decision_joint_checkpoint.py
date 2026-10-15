@@ -51,6 +51,21 @@ def tokenizer() -> HFTokenizer:
     return HFTokenizer(str(BACKBONE), local_files_only=True)
 
 
+def test_a_transformers_tokenizer_gives_the_special_tokens_its_dew_wrapper_gives(tokenizer):
+    """Specials.of reads the special tokens off a loaded transformers tokenizer as it does off the
+    HFTokenizer over the same files, with no wrapper to build first; a record naming it reads its
+    argument against a type its module holds at runtime."""
+    from transformers import AutoTokenizer
+
+    from dew.data.text import Tokenizer
+    from dew.decision.layout import TokenizerSpecials
+    from dew.registry import parameter_type
+
+    assert Specials.of(AutoTokenizer.from_pretrained(str(BACKBONE), local_files_only=True)) == Specials.of(
+        tokenizer)
+    assert parameter_type(Specials.of, "tokenizer") == Tokenizer | TokenizerSpecials
+
+
 def laid_out(tokenizer: HFTokenizer) -> dict[str, tuple[dict[str, Question], Encoded]]:
     """Each case's questions and its one joint row."""
     rows = {}

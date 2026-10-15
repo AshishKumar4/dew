@@ -32,6 +32,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from recorded_draws import JaxDraws, Tape
 from reference_source import fetched
 
 COMMIT = "601004348667094e1b71f30942199759412d4432"
@@ -45,35 +46,6 @@ SHAPE = (12, 4, 4, 3)
 
 def source(path: str) -> str:
     return fetched(SOURCE + path)
-
-
-class Draws:
-    """`jax.random` as `get_targets` calls it: each draw recorded, or, given
-    recorded draws, the next one, a float one widened to `dtype`."""
-
-    def __init__(self, dtype, replayed: list[np.ndarray] | None = None):
-        self.dtype = dtype
-        self.drawn: list[np.ndarray] = []
-        self.replayed = None if replayed is None else list(replayed)
-
-    def __getattr__(self, name):
-        return getattr(jax.random, name)
-
-    def _next(self, value):
-        if self.replayed is not None:
-            value = jnp.asarray(self.replayed.pop(0))
-        else:
-            self.drawn.append(np.asarray(value))
-        return value.astype(self.dtype) if jnp.issubdtype(value.dtype, jnp.floating) else value
-
-    def normal(self, key, shape=()):
-        return self._next(jax.random.normal(key, shape, jnp.float32))
-
-    def randint(self, key, shape, minval, maxval):
-        return self._next(jax.random.randint(key, shape, minval, maxval))
-
-    def bernoulli(self, key, p, shape):
-        return self._next(jax.random.bernoulli(key, p, shape))
 
 
 def velocity(weights, x, t, level, labels):
@@ -91,7 +63,9 @@ def run(dtype, images, labels, weights, teacher, replayed=None):
     # follow the run's precision.
     jax.config.update("jax_enable_x64", val=dtype == jnp.float64)
     images, weights, teacher = (jnp.asarray(value, dtype) for value in (images, weights, teacher))
-    draws = Draws(dtype, replayed)
+    # jax.random as `get_targets` calls it, each draw recorded, or replayed, a float one in `dtype`.
+    tape = Tape(replayed)
+    draws = JaxDraws(tape, dtype)
     targets: dict = {}
     exec(source("targets_shortcut.py"), targets)
     targets["jax"] = types.SimpleNamespace(**{**vars(jax), "random": draws})
@@ -116,7 +90,7 @@ def run(dtype, images, labels, weights, teacher, replayed=None):
     (loss, _), gradient = jax.value_and_grad(scope["loss_fn"], has_aux=True)(weights)
     assert loss.dtype == dtype and gradient.dtype == dtype, (loss.dtype, dtype)
     return {"x_t": x_t, "v_t": v_t, "t": t, "level": level, "labels": dropped, "loss": loss,
-            "grad": gradient}, draws.drawn
+            "grad": gradient}, tape.drawn
 
 
 def main() -> None:
