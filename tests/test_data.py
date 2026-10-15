@@ -1212,7 +1212,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
         def __init__(self):
             self.model = nn.Dense(2)
 
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return self.model.init(key, jnp.zeros((1, 3)))
 
         def loss(self, variables, batch, step):
@@ -1409,7 +1409,7 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
         def __init__(self):
             self.model = nn.Dense(1)
 
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return self.model.init(key, jnp.zeros((1, 2)))
 
         def loss(self, variables, batch, step):
@@ -1445,7 +1445,7 @@ def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
         def __init__(self):
             self.model = nn.Dense(1)
 
-        def init(self, key, variables=None):
+        def fresh_variables(self, key, held):
             return self.model.init(key, jnp.zeros((1, 2)))
 
         def loss(self, variables, batch, step):
