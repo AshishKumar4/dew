@@ -101,7 +101,7 @@ A named Hub source takes `repo`, `config`, `revision`, `split` and `cache_dir`. 
 
 ## Validation and branches
 
-`HoldOut(records=N)` reserves the first N source records. `HoldOut(fraction=f, by="hash")` splits by immutable record identity without scanning a stream. `Split("validation")` opens a named split. An explicit source or Pipeline is also valid.
+`HoldOut(records=N)` reserves the first N source records, which it reads by index: a memory or indexed read. `HoldOut(fraction=f, by="hash")` splits by immutable record identity as each record is read, so it also streams, and its validation pass reads every record to find its own. `Split("validation")` opens a named split. An explicit source or Pipeline is also valid.
 
 A recipe shares deterministic prefix steps between training and evaluation. Random crop, flip and jitter belong to training; evaluation resizes the full image. Caption encoding is a common host stage. A custom pipeline spells out these branches:
 
@@ -163,7 +163,7 @@ finally:
 
 Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
 
-`TextData` ends each document with the tokenizer's EOS (`eos=True`) and, where no `validation` is named, holds out the head 1% of its tokens after tokenization and before windows; `token_holdout=None` holds out nothing. A token store keeps its producer's own validation split. Streamed runs need producer-published token splits. `ImageData` holds out its first 256 records where no `validation` is named; `validation=None` keeps every record for training.
+`TextData` ends each document with the tokenizer's EOS (`eos=True`) and, where no `validation` is named, holds out the head 1% of its tokens after tokenization and before windows; `token_holdout=None` holds out nothing. A token store keeps its producer's own validation split. Streamed runs need producer-published token splits. `ImageData` holds out its first 256 records where no `validation` is named; `validation=None` keeps every record for training. A streamed read refuses that default and names what streams: `validation=HoldOut(fraction=f, by="hash")` or `validation=None`. The default stays the slice, because a hash fraction's validation pass streams the whole source: over the 7,169 records of Oxford Flowers' Hub train split, a 1% pass took 11.2 s against 0.3 s for the 256-record slice read by index.
 
 ## Mixtures, objectives and order
 

@@ -224,6 +224,41 @@ def test_a_token_store_keeps_its_producer_validation_split_with_text_data_defaul
     assert trained.isdisjoint(scored)
 
 
+def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_default_slice_is_refused(
+        tmp_path):
+    """The default holdout, the first 256 records, reads by index, so a streamed read of a Parquet
+    file refuses it before reading a row. The stream takes what that refusal names instead: a hash
+    fraction, each record on one side of it, or no holdout."""
+    import cv2
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data import Files
+
+    rows = [{"image": {"bytes": cv2.imencode(".png", np.full((8, 8, 3), index % 256, np.uint8))[1].tobytes(),
+                       "path": None}, "label": index} for index in range(320)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "images.parquet")
+    source = Files(str(tmp_path / "images.parquet"))
+
+    def labels(reader):
+        stream = reader(DataPartition())
+        try:
+            return [int(label) for batch in stream for label in batch["label"]]
+        finally:
+            stream.close()
+
+    with pytest.raises(ValueError):
+        ImageData(source, image_size=4, augment=None).load(batch=1, read="streamed", loading=READ)
+    data = ImageData(source, image_size=4, augment=None, validation=HoldOut(fraction=0.1, by="hash")).load(
+        batch=1, read="streamed", loading=READ)
+    assert data.val is not None
+    trained, scored = labels(data.train), labels(data.val)
+    assert scored and sorted(trained + scored) == list(range(320))
+    whole = ImageData(source, image_size=4, augment=None, validation=None).load(batch=1, read="streamed",
+                                                                               loading=READ)
+    assert whole.val is None and sorted(labels(whole.train)) == list(range(320))
+
+
 def test_image_data_defaults_hold_out_256_records_and_resize_both_parts():
     source = [{"image": np.full((8, 8, 3), index % 256, np.uint8), "label": index}
               for index in range(320)]
