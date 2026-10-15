@@ -34,8 +34,8 @@ class MixerContext:
     and `kv_shared` with `kv_store_key` mark a layer that reads another
     layer's keys and values. A kind's own record (LoRA ranks, head splits, a
     yarn scaling) lives on the kind's value; this holds what the backbone
-    configures. `AttentionMixer` passes every field to `CausalSelfAttention`
-    by name, so a new field needs a namesake there or the build raises.
+    configures. `CausalSelfAttention` holds it whole (`ctx`) and reads its
+    geometry and policies off it.
     """
 
     emb_features: int
@@ -44,7 +44,8 @@ class MixerContext:
     head_dim: int
     max_seq_len: int
     value_head_dim: int | None = None
-    """The value heads' width; None is `head_dim`."""
+    """The value heads' width; None is `head_dim`. A narrower value is cached
+    at its own width and widened only inside the kernel."""
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base; a kind's yarn record transforms it."""
@@ -72,15 +73,21 @@ class MixerContext:
     """The kind's chunk: a query reads only the keys whose position shares
     its `position // attention_chunk` (`LayerKind.chunk`)."""
     attention_bias: bool = False
+    """The q/k/v biases, as config.attention_bias in HF."""
     o_proj_bias: bool | None = None
+    """None follows attention_bias; Qwen2 biases q/k/v only."""
     attention_scale: float | None = None
+    """None is the kernel's own 1/sqrt(head_dim)."""
     value_scale: float | None = None
-    """Multiplies the projected values before they are cached."""
+    """Multiplies the values as projected, before the cache and the kernel
+    read them (MiMo-V2-Flash's `attention_value_scale`)."""
     attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None
+    """Gemma 2's tanh on the logits (attn_logit_softcapping)."""
     partial_rotary_factor: float | None = None
+    """The share of each head that rotates; None rotates all of it."""
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
     or 'default' (Qwen3.5); `dew.nn.rope.rotary_freqs` cites both."""

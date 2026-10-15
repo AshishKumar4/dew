@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from interop_support import assert_same_stored_tensors
+from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.data.dataset import Loader
@@ -61,10 +61,13 @@ EXPORTS = (
     Export('phi-tiny', derived=True),
     Export('phi3-tiny', derived=True),
     Export('bloom-tiny'),
-    # Its fixture has no float64 logits, so the dense-family fp32 bound.
+    # These fixtures have no float64 logits, so the dense-family fp32 bound.
     Export('gpt2-tiny', bound=1e-4),
+    Export('gpt-neox-tiny', bound=1e-4),
+    Export('opt-tiny', bound=1e-4),
     Export('gpt-neo-tiny'),
     Export('mimo-v2-flash-tiny'),
+    Export('mamba-tiny', derived=True),
     Export('modernbert-tiny', masked=True),
 )
 
@@ -85,8 +88,6 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
     exported.save(tmp_path)
     family = case.writes or json.loads((directory / 'config.json').read_text())['model_type']
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == family
-    if case.writes is None:
-        assert_same_stored_tensors(load_shards(tmp_path), load_shards(directory))
     auto = transformers.AutoModelForMaskedLM if case.masked else transformers.AutoModelForCausalLM
     reference = auto.from_pretrained(tmp_path, attn_implementation='eager',
                                      experts_implementation='eager').float().eval()
@@ -102,13 +103,9 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
         np.testing.assert_allclose(actual, expected, atol=case.bound, rtol=0)
         np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    assert restored.model == loaded.model
-    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
-    for original, again in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(restored.variables),
-                               strict=True):
-        np.testing.assert_array_equal(np.asarray(again), np.asarray(original))
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
+    if case.writes is None:
+        assert_same_stored_tensors(load_shards(tmp_path), load_shards(directory))
+    assert_reloads(loaded, tmp_path, ids)
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ trained weights back into the source's own tensor names with
 for the parameter tree and the logits, and with transformers 5.16.1 for the
 reference logits on the same ids.
 
-    JAX_PLATFORMS=cpu PYTHONPATH=src python tools/masked_diffusion_export_reference.py
+    JAX_PLATFORMS=cpu PYTHONPATH=src:. python tools/masked_diffusion_export_reference.py
 
 transformers 5.16.1 carries no LLaDA or Dream class; both releases ship
 remote code. What it does carry is the block each of them is: LLaDA is the
@@ -35,27 +35,21 @@ and the assertions come from one pipeline.
 from __future__ import annotations
 
 import json
-import math
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew.diffusion.discrete import MDLM
 from dew.interop.pretrained import Pretrained
-from dew.objectives.base import Variables
+from tools.decoder_export_reference import RATE, Trip, logits, source_tensors, stepped, trained_export
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
-RATE = 5e-2
-SEED = 3
 
 _LLADA_TRUNK = {
     "model.transformer.wte.weight": "model.embed_tokens.weight",
@@ -179,47 +173,19 @@ CASES = (
 
 
 @dataclass(frozen=True)
-class RoundTrip:
-    """One family trained, exported and read back by both implementations."""
+class RoundTrip(Trip):
+    """A masked family's trip, with the reference's loading report over the export (`report`)."""
 
     case: Case
-    source: Pretrained
-    trained: Variables
-    export: Path
-    ids: np.ndarray
-    ours: np.ndarray
-    reloaded: Pretrained
-    theirs: np.ndarray
     report: Mapping[str, list]
-    source_tensors: dict[str, np.ndarray] = field(repr=False)
-    exported_tensors: dict[str, np.ndarray] = field(repr=False)
-
-
-def source_tensors(directory: Path) -> dict[str, np.ndarray]:
-    """The checkpoint's own tensor table, as the loader reads it."""
-    from dew.interop.sources import load_shards
-
-    return load_shards(directory)
-
-
-def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndarray:
-    return np.asarray(source.model.apply(variables, jnp.asarray(ids, jnp.int32)), np.float32)
 
 
 def train(source: Pretrained, ids: np.ndarray):
-    """One real `Trainer` step of plain SGD from the loaded checkpoint.
-
-    The objective holds the loaded tree, so the trainer takes it through
-    `held_variables` as an argument of its state JIT rather than compiling
-    it in. The rows are the fixture's own ids repeated to fill one batch per
-    device, so the step runs on whatever devices the process has.
-    """
-    import grain.python as pygrain
-
-    from dew.data.dataset import Loader
+    """One real `Trainer` step of plain SGD from the loaded checkpoint (`stepped`). The objective
+    holds the loaded tree, so the trainer takes it through `held_variables` as an argument of its
+    state JIT rather than compiling it in."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.training import Trainer
 
     model = source.model
     if not isinstance(model, CausalTransformer):
@@ -230,14 +196,7 @@ def train(source: Pretrained, ids: np.ndarray):
     objective = MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask_id))(), seq_len=int(ids.shape[1]),
         ema_decay=None, variables=source.variables)
-    count = math.lcm(int(ids.shape[0]), jax.device_count())
-    rows = np.concatenate([ids] * (count // int(ids.shape[0])), axis=0)
-    entries = [{"text": rows[row]} for row in range(count)]
-    stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
-              .batch(count, drop_remainder=True))
-    data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
-    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(SEED)).fit(
-        data, steps=1, log_every=1)
+    return stepped(objective, ids, RATE)
 
 
 def reference_logits(case: Case, export: Path, ids: np.ndarray,
@@ -278,17 +237,13 @@ def reference_logits(case: Case, export: Path, ids: np.ndarray,
 
 def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
-    directory = FIXTURES / case.fixture
-    ids = np.load(directory / "input_ids.npy")
-    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
-    state = train(source, ids)
-    export = workspace / case.name
-    source.save(export, variables=state.variables)
-    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
+    directory, export = FIXTURES / case.fixture, workspace / case.name
+    source, ids, trained, reloaded = trained_export(directory, export, train)
     theirs, report = reference_logits(case, export, ids, workspace)
-    return RoundTrip(case, source, state.variables, export, ids,
-                     logits(source, state.variables, ids), reloaded, theirs, report,
-                     source_tensors(directory), source_tensors(export))
+    return RoundTrip(source=source, trained=trained, export=export, ids=ids,
+                     ours=logits(source, trained, ids), reloaded=reloaded, theirs=theirs,
+                     source_tensors=source_tensors(directory), exported_tensors=source_tensors(export),
+                     case=case, report=report)
 
 
 def moved(trip: RoundTrip) -> dict[str, float]:
