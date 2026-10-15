@@ -78,6 +78,8 @@ def arguments() -> argparse.Namespace:
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
+    parser.add_argument("--split", type=int, default=None,
+                        help="the microbatches each step's batch is read in (Trainer's split); unset plans it")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
@@ -160,7 +162,7 @@ def build(args: argparse.Namespace) -> Run:
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
-                      mesh=mesh, checkpoints=None, tracker=None)
+                      mesh=mesh, checkpoints=None, tracker=None, split=args.split)
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))
