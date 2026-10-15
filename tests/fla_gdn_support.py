@@ -292,7 +292,7 @@ def reference_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: 
     pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
     after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
     after = after.at[..., -1].add(dg_last)
-    through = jnp.einsum('...ij,jt->...it', pairs, strict.T.astype(f32), precision=exact)
+    through = jnp.cumsum(pairs, axis=-1) - pairs
     dg = jnp.moveaxis(jnp.sum(jnp.where(causal, through + after[..., :, None], 0.0), axis=-2), 2, 3)
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
