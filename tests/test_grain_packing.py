@@ -59,7 +59,10 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
     def windows(read):
         reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
         try:
-            return [jax.tree.map(lambda value: np.asarray(value).tolist(), batch) for batch in reader]
+            # The windows' arrays: each read declares its own bound on the documents a window holds
+            # (`Coordinates.max_segments`), the memory read the most it packed into one and the
+            # indexed read, packing as it streams, its window's length.
+            return [[np.asarray(value).tolist() for value in jax.tree.leaves(batch)] for batch in reader]
         finally:
             reader.close()
 

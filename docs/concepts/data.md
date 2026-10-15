@@ -101,7 +101,7 @@ A named Hub source takes `repo`, `config`, `revision`, `split` and `cache_dir`. 
 
 ## Validation and branches
 
-`HoldOut(records=N)` reserves the first N source records. `HoldOut(fraction=f, by="hash")` splits by immutable record identity without scanning a stream. `Split("validation")` opens a named split. An explicit source or Pipeline is also valid.
+`HoldOut(records=N)` reserves the first N source records, which it reads by index: a memory or indexed read. `HoldOut(fraction=f, by="hash")` splits by immutable record identity as each record is read, so it also streams, and its validation pass reads every record to find its own. `Split("validation")` opens a named split. An explicit source or Pipeline is also valid.
 
 A recipe shares deterministic prefix steps between training and evaluation. Random crop, flip and jitter belong to training; evaluation resizes the full image. Caption encoding is a common host stage. A custom pipeline spells out these branches:
 
@@ -125,7 +125,7 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 ## Text, chat and packing
 
-`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
+`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Its static `.max_segments` is the most documents a window of the run holds: as many as the packing plan or the memory read placed in one, or a streamed pack's `segments`, or else its window length; a flash kernel's work follows it (performance.md). Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
@@ -163,7 +163,7 @@ finally:
 
 Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
 
-`TextData` ends each document with the tokenizer's EOS (`eos=True`) and, where no `validation` is named, holds out the head 1% of its tokens after tokenization and before windows; `token_holdout=None` holds out nothing. A token store keeps its producer's own validation split. Streamed runs need producer-published token splits. `ImageData` holds out its first 256 records where no `validation` is named; `validation=None` keeps every record for training.
+`TextData` ends each document with the tokenizer's EOS (`eos=True`) and, where no `validation` is named, holds out the head 1% of its tokens after tokenization and before windows; `token_holdout=None` holds out nothing. A token store keeps its producer's own validation split. Streamed runs need producer-published token splits. `ImageData` holds out its first 256 records where no `validation` is named; `validation=None` keeps every record for training. A streamed read refuses that default and names what streams: `validation=HoldOut(fraction=f, by="hash")` or `validation=None`. The default stays the slice, because a hash fraction's validation pass streams the whole source: over the 7,169 records of Oxford Flowers' Hub train split, a 1% pass took 11.2 s against 0.3 s for the 256-record slice read by index.
 
 ## Mixtures, objectives and order
 
