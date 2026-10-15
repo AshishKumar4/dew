@@ -45,9 +45,8 @@ from .attention import (
     scaled_dot_product_attention,
 )
 from .inputs import AttentionMetadata, PredictionPhase, coordinates_of, valid_order
-from .kv_cache import KVCache
 from .mixer_base import MixerBase, MixerContext
-from .mla import INDEXER, open_mla_cache
+from .mla import INDEXER, latent_refusals, open_mla_cache
 from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection
 from .sparse_selection import index_scores, selection_mask, top_k_selection
@@ -419,17 +418,10 @@ class KPoolSparseAttentionMixer(MixerBase):
                 "kpool_sparse_attention requires causal=True; its indexer selects among "
                 "the keys at or before each query")
         ctx.refuse("kpool_sparse_attention", {
-            **ctx.policies(),
+            **latent_refusals(ctx),
             "force_fp32_for_softmax": False,  # forwarded
-            "v_norm": ctx.v_norm,
-            "k_eq_v": ctx.k_eq_v,
-            "sliding_window": ctx.sliding_window,
-            "attention_chunk": ctx.attention_chunk,
-            "attention_scale": ctx.attention_scale,
-            "partial_rotary_factor": ctx.partial_rotary_factor,
             "kv_shared": ctx.kv_shared,
             "output_gate": ctx.output_gate,
-            "kv_cache": ctx.kv_cache != KVCache(),
         }, "the layer scales by its nope head dim, rotates nothing, attends its own selection of the "
            "whole sequence and norms its latents, not its values")
         return functools.partial(
