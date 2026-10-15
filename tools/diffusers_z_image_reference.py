@@ -34,7 +34,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import (
+    perturb,
+    recording,
     rounded_timestep_embedding as shared_timestep_embedding,
+    saved_pipeline,
     tiny_qwen3_encoder,
 )
 
@@ -161,21 +164,11 @@ def build_pipeline(root: Path):
     vae = AutoencoderKL(**PIPELINE_VAE, scaling_factor=published["scaling_factor"],
                         shift_factor=published["shift_factor"]).eval()
     transformer = ZImageTransformer2DModel(**PIPELINE).eval()
-    generator = torch.Generator().manual_seed(SEED + 8)
-    with torch.no_grad():
-        for module in (vae, transformer):
-            for parameter in module.parameters():
-                parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 8), 0.05, vae, transformer)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     pipe = ZImagePipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
                           text_encoder=encoder, tokenizer=tok, transformer=transformer)
-    directory = root / "pipeline"
-    pipe.save_pretrained(directory, safe_serialization=True)
-    pipe.set_progress_bar_config(disable=True)
-    index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_height=HEIGHT, dew_width=WIDTH)
-    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
-    return pipe
+    return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH)
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
@@ -206,13 +199,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    import diffusers
-
-    if diffusers.__version__ != DIFFUSERS:
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
+    root = recording(destination, DIFFUSERS)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})

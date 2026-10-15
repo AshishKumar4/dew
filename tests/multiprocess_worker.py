@@ -10,16 +10,14 @@ processes are the same run in two topologies.
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import hashlib
-import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-from process_support import prepare_worker
+from process_support import serve_mode, worker_parser
 
 from dew.config.data import loader
 from dew.data import Loading
@@ -2395,13 +2393,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=sorted(MODES))
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--coordinator", help="host:port of the jax.distributed service")
-    parser.add_argument("--processes", type=int, default=1)
-    parser.add_argument("--process-id", type=int, default=0)
-    parser.add_argument("--fsdp-size", type=int, default=1)
+    parser = worker_parser(MODES, __doc__)
     parser.add_argument("--stage-size", type=int, default=1)
     parser.add_argument("--microbatches", type=int)
     parser.add_argument("--name", default="worker")
@@ -2435,10 +2427,7 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 def main(argv=None) -> None:
-    args = parse_args(argv)
-    prepare_worker(args)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(MODES[args.mode](args)))
+    serve_mode(MODES, parse_args(argv))
 
 
 if __name__ == "__main__":

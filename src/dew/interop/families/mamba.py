@@ -17,7 +17,6 @@ from functools import partial
 
 from dew import records
 from dew.interop import mamba2
-from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import DecoderFamily, DecoderFields, decoder_tensors, refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
@@ -74,20 +73,10 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         conv_kernel=integer("conv_kernel", 4),
         use_bias=flag("use_bias", default=False),
         use_conv_bias=flag("use_conv_bias", default=True))
-    return native_fields(CausalTransformer)(
-        vocab_size=integer("vocab_size", 50280),
-        emb_features=hidden,
-        num_layers=integer("num_hidden_layers", 32),
-        num_heads=1,
-        num_kv_heads=1,
-        head_dim=hidden,
-        mlp_features=0,
-        qk_norm=False,
-        norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
-        tie_embeddings=flag("tie_word_embeddings", default=True),
-        residual_in_fp32=flag("residual_in_fp32", default=True),
-        mixer=mixer,
-    )
+    return mamba2.mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 50280),
+                                num_layers=integer("num_hidden_layers", 32),
+                                tie_embeddings=flag("tie_word_embeddings", default=True),
+                                residual_in_fp32=flag("residual_in_fp32", default=True))
 
 
 def _export(model: CausalTransformer) -> Mapping[str, object]:

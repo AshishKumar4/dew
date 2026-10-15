@@ -27,20 +27,11 @@ TINY_SHARD = 256
 def packed_batch(seed: int = 0):
     """Two documents a row, the boundary moving from row to row, and the tail
     of the last row padding (segment 0)."""
-    from dew.nn.inputs import coordinates
+    from model_support import two_documents
 
     rng = np.random.default_rng(seed)
     text = rng.integers(1, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)
-    segments = np.ones((BATCH, SEQ_LEN + 1), np.int32)
-    positions = np.zeros((BATCH, SEQ_LEN + 1), np.int32)
-    for row in range(BATCH):
-        boundary = int(rng.integers(3, SEQ_LEN - 2))
-        segments[row, boundary:] = 2
-        positions[row, :boundary] = np.arange(boundary)
-        positions[row, boundary:] = np.arange(SEQ_LEN + 1 - boundary)
-    segments[-1, -3:] = 0
-    return {"text": text, "text_coordinates": coordinates(
-        segments=segments, positions=positions, max_segments=SEQ_LEN + 1, right_padded=True, xp=np)}
+    return {"text": text, "text_coordinates": two_documents(rng, BATCH, SEQ_LEN + 1)}
 
 
 def fsdp_group_processes(mesh) -> list[list[int]]:

@@ -19,6 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
+from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
 from dew.nn.backbones.uvit import UViT
 from dew.nn.dit import TextContext
@@ -73,50 +74,26 @@ def to_dew(name: str, value: np.ndarray, config: dict) -> dict[tuple[str, ...], 
     q, k and v split per head, the output projection read per head."""
     path = dew_path(name)
     heads = config["num_heads"]
-    width = config["embed_dim"]
     if path[-1] == "qkv":
-        split = value.reshape(3, heads, width // heads, width).transpose(0, 3, 1, 2)
-        return {(*path[:-1], part, "kernel"): split[index]
-                for index, part in enumerate(("to_q", "to_k", "to_v"))}
-    if path[-2:] == ("to_out_0", "kernel"):
-        return {path: value.T.reshape(heads, width // heads, width)}
-    if path[-1] == "kernel":
-        return {path: value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T}
-    return {path: value}
+        split = split_qkv(value, heads)
+        return {(*path[:-1], part, "kernel"): split[index] for index, part in enumerate(QKV)}
+    return {path: dew_leaf(path, value, heads)}
 
 
-def from_dew(name: str, tree, config: dict) -> np.ndarray:
+def from_dew(name: str, tree) -> np.ndarray:
     """The inverse of `to_dew`: a Dew gradient back in U-ViT's layout."""
     path = dew_path(name)
-
-    def leaf(path):
-        node = tree
-        for key in path:
-            node = node[key]
-        return np.asarray(node)
-
-    width = config["embed_dim"]
     if path[-1] == "qkv":
-        parts = [leaf((*path[:-1], part, "kernel")) for part in ("to_q", "to_k", "to_v")]
-        return np.stack(parts).transpose(0, 2, 3, 1).reshape(3 * width, width)
-    value = leaf(path)
-    if path[-2:] == ("to_out_0", "kernel"):
-        return value.reshape(width, width).T
-    if path[-1] == "kernel":
-        return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
-    return value
+        return join_qkv([leaf(tree, (*path[:-1], part, "kernel")) for part in QKV])
+    return torch_leaf(path, leaf(tree, path))
 
 
 @pytest.mark.parametrize("case", CASES)
 def test_the_output_and_every_gradient_are_as_exact_as_u_vits(reference, case):
     arrays, meta = reference
     config = meta["cases"][case]
-
-    def part(name):
-        return arrays[f"{case}/{name}"]
-
-    prefix = f"{case}/param."
-    names = sorted(name.removeprefix(prefix) for name in arrays if name.startswith(prefix))
+    part, names = case_arrays(arrays, case)
+    names = sorted(names)
     params: dict = {}
     for name in names:
         value = part(f"param.{name}").view(ml_dtypes.bfloat16).astype(np.float32)
@@ -149,7 +126,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_u_vits(reference, case):
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
     native = [np.asarray(grads[1]).transpose(0, 3, 1, 2), np.asarray(grads[2])]
-    native += [from_dew(name, grads[0], config) for name in names]
+    native += [from_dew(name, grads[0]) for name in names]
     native_order = np.concatenate([np.ravel(leaf) for leaf in native])
     assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
                                      f"{case} gradients")
