@@ -146,21 +146,23 @@ def test_qwen35_logits_match_the_reference_implementation():
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token
     steps against the parallel forward, every argmax equal. Largest
-    observed logit difference 1.3e-05."""
+    observed logit difference 1.3e-05. The products run in float32, which
+    a GPU's default precision rounds through TF32, so that the two orders
+    differ by float32's rounding there too."""
     directory = FIXTURES / "qwen35-tiny"
     model, variables = fp32_decoder(directory, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    full = jnp.asarray(model.apply(variables, ids))
-
-    cache = model.apply(variables, ids.shape[0], method="init_cache",
-                        mutable=["cache"])[1]["cache"]
-    logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
-                                  decode=True, mutable=["cache"])
-    steps = [logits[:, -1]]
-    for position in range(4, ids.shape[1]):
-        logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
+    with jax.default_matmul_precision("highest"):
+        full = jnp.asarray(model.apply(variables, ids))
+        cache = model.apply(variables, ids.shape[0], method="init_cache",
+                            mutable=["cache"])[1]["cache"]
+        logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
                                       decode=True, mutable=["cache"])
-        steps.append(logits[:, -1])
+        steps = [logits[:, -1]]
+        for position in range(4, ids.shape[1]):
+            logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
+                                          decode=True, mutable=["cache"])
+            steps.append(logits[:, -1])
     incremental = jnp.stack(steps, axis=1)
 
     difference = float(jnp.abs(full[:, 3:] - incremental).max())
