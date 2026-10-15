@@ -18,7 +18,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section, head_width
 
 
 def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
@@ -94,10 +94,7 @@ class Llama4VisionTransformer(nn.Module):
 
     def setup(self):
         cfg = self.config
-        if cfg.hidden_size % cfg.num_heads:
-            raise ValueError(
-                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
-                f"({cfg.num_heads})")
+        head = head_width(cfg.hidden_size, cfg.num_heads)
         grid = cfg.image_size // cfg.patch_size
         if grid * cfg.patch_size != cfg.image_size:
             raise ValueError(
@@ -118,7 +115,7 @@ class Llama4VisionTransformer(nn.Module):
         # The grid's rotary turns adjacent pairs, the x angles over the first
         # half of each head and the y angles over the second
         # (modeling_llama4.py, Llama4VisionRotaryEmbedding).
-        side = cfg.hidden_size // cfg.num_heads // 2
+        side = head // 2
         self.layers = [
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid * grid + 1,
                        activation="gelu_exact", eps=cfg.layer_norm_eps, rotary_axes=(side, side),

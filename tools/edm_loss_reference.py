@@ -28,13 +28,12 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import sys
 import types
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import fetched, ran, selected
+from reference_source import fetched, ran, selected, stub_torch_utils
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
@@ -42,17 +41,6 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss
 IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 6, 3, 4, 16
 TINY_UNET = {"model_channels": 8, "channel_mult": [1], "num_blocks": 1, "attn_resolutions": []}
 """Precond builds a U-Net it is then given the stand-in in place of; a tiny one."""
-
-
-def stub_torch_utils() -> None:
-    persistence = types.ModuleType("torch_utils.persistence")
-    persistence.persistent_class = lambda cls: cls
-    misc = types.ModuleType("torch_utils.misc")
-    misc.const_like = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
-    package = types.ModuleType("torch_utils")
-    package.persistence, package.misc = persistence, misc
-    sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
-                        "torch_utils.misc": misc})
 
 
 def published(repo: str, commit: str, path: str, dtype: str,

@@ -291,13 +291,9 @@ def main() -> None:
 
 
 def orders(drawn: Path) -> None:
-    """The reference's own rounding draws: the SGD step over each residual
-    order tools/rounding_orders.py wrote under `drawn` (in MXFP4's groups of
-    32), its updated logits' RMS distance from float64 written to
-    DESTINATION/orders.npz beside the orders (tests/reference_error.py's
-    K-order rule). Order 0 must reproduce the fixture's run bit for bit."""
-    from safetensors.torch import load_file
-
+    """The reference's own rounding draws over the residual orders
+    tools/rounding_orders.py wrote under `drawn`, in MXFP4's groups of 32
+    (`record_orders`)."""
     configuration, modeling, linear = released_modules()
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiK3ForConditionalGeneration(
@@ -306,23 +302,36 @@ def orders(drawn: Path) -> None:
     model = model.cuda().eval()
     moe = linear.KimiSparseMoeBlock
     moe.moe_infer = moe.moe_infer.__wrapped__
+    record_orders(model, drawn, DESTINATION, load_weights, lambda name: name.startswith("language_model."),
+                  matmul_precision())
+
+
+def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
+                  load: Callable[[torch.nn.Module, dict[str, torch.Tensor]], None],
+                  trainable: Callable[[str], bool], precision: str) -> None:
+    """The SGD step of `model`'s `trainable` parameters over each residual
+    order under `drawn`, each order's weights read in by `load`: its updated
+    logits' RMS distance from float64 written to `destination`/orders.npz
+    beside the orders (tests/reference_error.py's K-order rule). Order 0 is
+    the fixture's own run and must reproduce its updated logits bit for bit."""
+    from safetensors.torch import load_file
+
     ids, mask = fixture_batch()
     input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
     valid = mask.astype(bool)
-    with np.load(DESTINATION / "numerics.npz") as exact, np.load(DESTINATION / "reference.npz") as stored:
+    with np.load(destination / "numerics.npz") as exact, np.load(destination / "reference.npz") as stored:
         truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
     drawn_orders = np.load(drawn / "orders.npy")
     distances = []
     for k in range(len(drawn_orders)):
-        load_weights(model, load_file(str(drawn / str(k) / "model.safetensors")))
-        _, _, updated = sgd_step(model, input_ids, attention_mask,
-                                 lambda name: name.startswith("language_model."))
+        load(model, load_file(str(drawn / str(k) / "model.safetensors")))
+        _, _, updated = sgd_step(model, input_ids, attention_mask, trainable)
         updated = updated.cpu().numpy()
         if k == 0:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
-    np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-             updated_logits=np.asarray(distances), precision=matmul_precision())
+    np.savez(destination / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
+             updated_logits=np.asarray(distances), precision=precision)
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 

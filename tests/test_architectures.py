@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import StubText
 from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
@@ -33,7 +34,6 @@ from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
-from dew.nn.dit import TextContext
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
@@ -67,41 +67,6 @@ MASK = MultiBlockMask.for_grid(GRID, num_targets=2, scale=(0.2, 0.3))
 TEXT_TOKENS = 8
 TEXT_FEATURES = 32
 TEXT_VOCAB = 16
-
-
-@dataclass(frozen=True)
-class StubText(ConditionEncoder):
-    """Stands in for CLIP-L/14, whose weights would put a download in every
-    case here. Pretokenized text of a fixed width, embedded from a table."""
-
-    params: dict
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
-        if params is None:
-            params = {"table": jnp.asarray(
-                np.random.RandomState(0).normal(size=(TEXT_VOCAB, TEXT_FEATURES)).astype(np.float32))}
-        return cls(params=params)
-
-    def tokenize(self, texts):
-        ids = np.zeros((len(texts), TEXT_TOKENS), np.int32)
-        mask = np.zeros((len(texts), TEXT_TOKENS), np.int32)
-        for row, text in enumerate(texts):
-            codes = [1] + [2 + (ord(char) % (TEXT_VOCAB - 2)) for char in text[:TEXT_TOKENS - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-    def encode(self, params, tokens):
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
-
-    def captions(self, tokens):
-        return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
-                     for row in np.asarray(tokens["input_ids"]))
-
-    def to_json(self):
-        return {"checkpoint": "stub"}
 
 
 @dataclass(frozen=True)
@@ -352,7 +317,8 @@ def make_trainer(case: Case, tmp_path, fsdp, tracker=None, devices=None, optimiz
     """The trainer a recipe would build for this case: a registry model, the
     real objective, a real optimizer, no wandb, over `devices` devices (all
     by default)."""
-    encoder = None if case.is_lm or case.is_jepa else StubText.from_pretrained("stub")
+    encoder = None if case.is_lm or case.is_jepa else StubText.from_pretrained(
+        "stub", tokens=TEXT_TOKENS, features=TEXT_FEATURES, vocab=TEXT_VOCAB)
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
         make_objective(case, model, encoder), optimizer, key=jax.random.key(0),

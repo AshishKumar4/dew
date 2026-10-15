@@ -10,7 +10,9 @@ scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
 takes single lines out of a published function. `verified` keeps a
 reference file on disk, fetched once and checked against its pinned SHA-256
-on every use.
+on every use. `stub_torch_utils` stands in for the two `torch_utils` names
+NVIDIA's EDM and EDM2 networks import. `saved_fixture` writes a generator's
+arrays with its provenance as the suite reads them.
 """
 
 from __future__ import annotations
@@ -25,6 +27,37 @@ TIMEOUT = 120
 """Seconds a fetch may take."""
 CACHE = Path.home() / ".cache" / "dew" / "upstream"
 """Where `verified` keeps fetched reference files, each under its own source's path."""
+
+
+def stub_torch_utils() -> None:
+    """NVIDIA's `torch_utils` as EDM and EDM2's networks import it:
+    `persistence.persistent_class` is only pickling metadata, and
+    `misc.const_like` a tensor of a value on another tensor's dtype and device."""
+    import sys
+    import types
+
+    import torch
+
+    persistence = types.ModuleType("torch_utils.persistence")
+    persistence.persistent_class = lambda cls: cls
+    misc = types.ModuleType("torch_utils.misc")
+    misc.const_like = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
+    package = types.ModuleType("torch_utils")
+    package.persistence, package.misc = persistence, misc
+    sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
+                        "torch_utils.misc": misc})
+
+
+def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
+    """`arrays` compressed to `path`, with `meta` as the JSON bytes of an
+    array named "meta", the provenance a test reads back."""
+    import json
+
+    import numpy as np
+
+    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
 
 
 def fetched(url: str) -> str:

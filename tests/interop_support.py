@@ -59,14 +59,18 @@ def assert_reloads(loaded, saved: Path, ids: np.ndarray) -> None:
     it was saved from."""
     from dew.interop import Pretrained
 
-    restored = Pretrained.load(saved, dtype='float32', attention_impl='reference')
-    assert restored.model == loaded.model
-    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
-    for original, again in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(restored.variables),
-                               strict=True):
+    assert_restores(loaded.model, loaded.variables,
+                    Pretrained.load(saved, dtype='float32', attention_impl='reference'), ids)
+
+
+def assert_restores(model, variables, restored, ids: np.ndarray) -> None:
+    """`restored`, a checkpoint read back, is `model` with `variables` bit for bit, so it computes
+    the same logits over `ids`."""
+    assert restored.model == model, "the checkpoint rebuilds a different model"
+    assert jax.tree.structure(restored.variables) == jax.tree.structure(variables)
+    for original, again in zip(jax.tree.leaves(variables), jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(again), np.asarray(original))
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), model.apply(variables, ids))
 
 
 def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:

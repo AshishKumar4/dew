@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import drawn_wan_vae
 from reference_vjp import recorded_vjp
 
 DIFFUSERS = "0.34.0"
@@ -48,18 +49,7 @@ SEED = 37
 def build(root: Path) -> dict[str, np.ndarray]:
     from diffusers import AutoencoderKLWan
 
-    torch.manual_seed(SEED)
-    generator = torch.Generator().manual_seed(SEED)
-    z_dim = CONFIG["z_dim"]
-    latents_mean = torch.randn(z_dim, generator=generator).mul(0.5).tolist()
-    latents_std = torch.rand(z_dim, generator=generator).add(0.5).tolist()
-    model = AutoencoderKLWan(**CONFIG, latents_mean=latents_mean, latents_std=latents_std).eval()
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if name.endswith(("gamma", "bias")):
-                parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
-    model.save_pretrained(root / "vae", safe_serialization=True)
+    model, generator = drawn_wan_vae(AutoencoderKLWan, CONFIG, SEED, root / "vae")
     named = list(model.named_parameters())
 
     video = (torch.rand((BATCH, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1).requires_grad_()

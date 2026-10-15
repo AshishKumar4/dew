@@ -289,8 +289,7 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
     logits than the saved config did, or if any tensor outside the depth
     goes unread.
     """
-    from huggingface_hub import model_info
-    from hf_reference import FIXTURES
+    from hf_reference import FIXTURES, write_config, write_provenance
     from dew.interop.verify import reference_logits
 
     directory = FIXTURES / name
@@ -300,13 +299,8 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
         saved.pop(field, None)
     config = {"architectures": ["DeepseekV4ForCausalLM"], **saved, **DEEPSEEK_V4_RELEASED,
               "model_type": "deepseek_v4", "transformers_version": transformers.__version__}
-    (directory / "config.json").write_text(
-        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({
-        "released": {"repo": repo, "revision": model_info(repo).sha},
-        "transformers": {"version": transformers.__version__,
-                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-    }, indent=1) + "\n")
+    write_config(directory, config)
+    write_provenance(directory, repo)
 
     loaded = DeepseekV4ForCausalLM.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
