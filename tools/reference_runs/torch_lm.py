@@ -317,8 +317,8 @@ def main() -> None:
         dist.all_reduce(losses, op=dist.ReduceOp.AVG)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
     result = record(
-        args, place, run.split, curves, work, losses, framework="torch",
-        fields={"precision": args.precision, "parallel": args.parallel},
+        args, place, run.split, curves, work, losses, framework="torch", precision=args.precision,
+        parallel=args.parallel,
         config={"model_type": hf_config["model_type"], "optimizer": "torch.optim.AdamW(fused=True)",
                 "attention_implementation": run.model.config._attn_implementation,
                 "experts_implementation": getattr(run.model.config, "_experts_implementation", None)},
