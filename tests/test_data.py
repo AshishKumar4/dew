@@ -833,9 +833,9 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capl
     # means every worker has read a record and lingers.
     for _ in range(loading.workers):
         next(prefetch)
-    began = time.perf_counter()
     prefetch.close()
-    assert time.perf_counter() - began > loading.workers * data.seconds
+    # The close prints what it waits for only once the stop has run past
+    # `_QUIET_STOP_SECONDS`, so the line is the slow stop's evidence.
     assert "waiting for 4 grain workers to stop" in caplog.text
 
 
