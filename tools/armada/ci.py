@@ -67,6 +67,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,8 +75,16 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
 
-PYTHONS = ("3.12", "3.14")
-"""The compatibility floor, which runs every test, and the newest release CI proves."""
+REPO = Path(__file__).resolve().parents[2]
+_CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
+_PREFIX = "Programming Language :: Python :: "
+PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLASSIFIERS
+                        if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
+                       key=lambda version: tuple(int(part) for part in version.split("."))))
+"""The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
+test, the newest the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints them
+for tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's
+smoke (.armada.json) to them."""
 NEWEST_FILES = (
     # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
@@ -364,9 +373,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     rest = [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS):
         names = rest[index::COLLECT_TASKS]
-        entries.append({"name": f"{PYTHONS[1]}-{COLLECT}-{index + 1}", "python": PYTHONS[1],
+        entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
                         "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target,
+                        "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
                         "cache": cache})
     return entries
 
@@ -690,6 +699,24 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
     return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
 
 
+def pythons(*, check: bool) -> int:
+    """Print the tested versions, one a line; with `check`, refuse the files that name them apart."""
+    if not check:
+        print(*PYTHONS, sep="\n")
+        return 0
+    problems = []
+    pinned = (REPO / ".python-version").read_text().strip()
+    if pinned != PYTHONS[0]:
+        problems.append(f".python-version is {pinned}, and the oldest tested version is {PYTHONS[0]}")
+    smoke = json.loads((REPO / ".armada.json").read_text())["environment"]["smoke"]
+    smoked = tuple(re.findall(r"\.venv-(\d+\.\d+)/", smoke))
+    if smoked != PYTHONS:
+        problems.append(f".armada.json's smoke imports dew in {smoked}; the tested versions are {PYTHONS}")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    return 1 if problems else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -717,10 +744,15 @@ def main() -> int:
     lane.add_argument("--cache", choices=("on", "off"), required=True)
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
+    versions = operations.add_parser("pythons")
+    versions.add_argument("--check", action="store_true",
+                          help="refuse a .python-version other than the oldest, or a smoke of other versions")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
     args = parser.parse_args()
+    if args.operation == "pythons":
+        return pythons(check=args.check)
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")

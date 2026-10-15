@@ -177,12 +177,13 @@ TRAINING_SHAPES = {
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("model", sorted(TRAINING_SHAPES))
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
-    """A delta net's conv at its training shape, bf16 projections into the bf16 operands fla's rule
-    takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as XLA's
-    own conv (`assert_as_exact_as_the_reference`)."""
-    shape, parts = TRAINING_SHAPES[model]
-    x, weights, _, _ = operands(*shape, parts, dtype=dtype)
-    segments = documents(*shape) if packed else None
+    """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
+    fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
+    XLA's own conv (`assert_as_exact_as_the_reference`). Two rows: a row's tokens are the distances'
+    terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
+    (_, length), parts = TRAINING_SHAPES[model]
+    x, weights, _, _ = operands(2, length, parts, dtype=dtype)
+    segments = documents(2, length) if packed else None
     grads = cotangents(x, parts, dtype)
     got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)

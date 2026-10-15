@@ -273,32 +273,12 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
     the prompt, and the transformer takes the gradient. The text encoder and
     the VAE are state, so every one of their leaves survives the step, and
     the export reloads, its clip geometry with it, to the same forward."""
-    import optax
+    from diffusion_support import trained_step
 
     from dew.interop.pretrained import Pretrained
-    from dew.objectives import Step
-    from dew.training import Trainer
 
     objective = DiffusionObjective(pipeline, unconditional_prob=0.0, ema_decay=None, steps=2)
-    batch = clip_batch(objective, walk[1]["prompts"])
-    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3))
-    initial = trainer.initial_state()
-    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
-
-    def value(params) -> float:
-        loss, _ = objective.loss(params, batch, fixed)
-        return float(loss.total / loss.mass)
-
-    before = value(initial.variables)
-    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
-    assert value(state.variables) < before
-    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
-                           initial.variables["params"]["proj_out"]["kernel"])
-    for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.variables[held]), jax.tree.leaves(initial.variables[held]),
-                             strict=True):
-            np.testing.assert_array_equal(got, want)
+    _, state = trained_step(objective, clip_batch(objective, walk[1]["prompts"]))
 
     export = tmp_path / "export"
     pipeline.save(export, variables=state.variables)

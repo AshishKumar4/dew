@@ -20,6 +20,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import BATCH, TimingRegression as Regression, batches
+from process_support import assert_exits_cleanly
 
 from dew.artifacts import Representations
 from dew.data import Loading, Rejected, from_grain, mix
@@ -707,16 +708,7 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         "prefetch = DevicePrefetchIterator(endless(), MeshSpec().build(), depth=1)\n"
         "for _ in range(20):\n"
         "    next(prefetch)\n")
-    root = Path(__file__).resolve().parents[1]
-    done = subprocess.run(
-        [sys.executable, "-c", program],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
-    )
-    assert done.returncode == 0, done.stdout + done.stderr
+    assert_exits_cleanly(program)
 
 
 def _running(pid: int) -> bool:
