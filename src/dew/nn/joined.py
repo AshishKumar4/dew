@@ -61,14 +61,15 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     own call casts it; `joins` says when the result is theirs."""
     if axis not in (-2, -1):
         raise ValueError(f"the projections stack on output axis -2 or -1, not {axis}")
-    kernels, biases = [], []
-    for projection in projections:
-        kernel = meta.unbox(projection.get_variable('params', 'kernel'))
-        bias = meta.unbox(projection.get_variable('params', 'bias')) if projection.use_bias else None
-        inputs, kernel, bias = projection.promote_dtype(x, kernel, bias, dtype=projection.dtype)
-        kernels.append(kernel)
-        biases.append(bias)
+    promoted = [projection.promote_dtype(
+        x, meta.unbox(projection.get_variable('params', 'kernel')),
+        meta.unbox(projection.get_variable('params', 'bias')) if projection.use_bias else None,
+        dtype=projection.dtype) for projection in projections]
+    inputs = promoted[0][0]
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
-    y = jax.lax.dot_general(inputs, jnp.stack(kernels, axis=axis + 3), (((inputs.ndim - 1,), (0,)), ((), ())),
+    kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
+    y = jax.lax.dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
                             precision=projections[0].precision)
-    return y if biases[0] is None else y + jnp.stack(biases, axis=axis + 2)
+    if not projections[0].use_bias:
+        return y
+    return y + jnp.stack([bias for _, _, bias in promoted], axis=axis + 2)

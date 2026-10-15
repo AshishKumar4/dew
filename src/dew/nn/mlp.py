@@ -113,29 +113,29 @@ class GatedMLP(nn.Module):
         # down_proj's sum returns to the residual placement in the block.
         activation = self._activation()
         if not isinstance(activation, (str, Situ)):
-            up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-            hidden = self.dropout(activation(up), deterministic=not train)
-            return checkpoint_name(self.down_proj(hidden), 'down_proj')
+            return self._down(activation(checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')),
+                              train)
         # A SiTU, the clamp and the gate's top-k take the halves apart.
-        packs = isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
-        gate_up = self._gate_up(x) if packs else None
-        if gate_up is not None:
-            # Both names on the one output: a remat policy that keeps either keeps it whole.
-            gate_up = checkpoint_name(checkpoint_name(constrain(gate_up, PACKED_HIDDEN), 'gate_proj'),
-                                      'up_proj')
-            hidden = packed_gated_product(activation, axes=MLP_HIDDEN)(gate_up)
-        else:
-            gate, up = self._group().split(self.gate_up_proj(x)) if self._packed() else (
-                self.gate_proj(x), self.up_proj(x))
-            gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
-            up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
-            if self.swiglu_limit is not None:
-                # GLM-5.3-Flash's clamp, modeling_glm5_next.py:98-104.
-                gate = jnp.minimum(gate, self.swiglu_limit)
-                up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
-            if self.activation_sparsity:
-                gate = gaussian_topk(gate, self.activation_sparsity)
-            hidden = gated_product(activation, axes=MLP_HIDDEN)(gate, up)
+        if isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity:
+            gate_up = self._gate_up(x)
+            if gate_up is not None:
+                # Both names on the one output: a remat policy that keeps either keeps it whole.
+                gate_up = checkpoint_name(checkpoint_name(constrain(gate_up, PACKED_HIDDEN), 'gate_proj'),
+                                          'up_proj')
+                return self._down(packed_gated_product(activation, axes=MLP_HIDDEN)(gate_up), train)
+        gate, up = self._group().split(self.gate_up_proj(x)) if self._packed() else (
+            self.gate_proj(x), self.up_proj(x))
+        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
+        if self.swiglu_limit is not None:
+            # GLM-5.3-Flash's clamp, modeling_glm5_next.py:98-104.
+            gate = jnp.minimum(gate, self.swiglu_limit)
+            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        if self.activation_sparsity:
+            gate = gaussian_topk(gate, self.activation_sparsity)
+        return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+
+    def _down(self, hidden, train: bool):
         hidden = self.dropout(hidden, deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 

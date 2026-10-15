@@ -885,6 +885,9 @@ def packed_swiglu(gate_up, *, axes=None):
 
     if not _split():
         return local(gate_up)
+    if axes is None:
+        raise ValueError("a mesh splits the packed SwiGLU's operands, and it places them by their logical "
+                         "axes, which the call does not name")
     shape = gate_up.shape[:-2] + gate_up.shape[-1:]
     spec = logical_spec(axes, shape)
     entries = (*spec, *(None,) * (len(shape) - len(spec)))
