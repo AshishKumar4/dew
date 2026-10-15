@@ -105,7 +105,7 @@ def test_a_stored_collection_whose_content_changed_is_refused(tmp_path):
 class Counting(Objective):
     """A regression whose `count` collection moves every step, beside a frozen `table`."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.zeros((3,))}, "count": {"n": jnp.zeros(())},
                 "constants": {"table": jnp.arange(1000.0)}}
 
@@ -173,7 +173,7 @@ def test_the_adapter_and_its_task_load_from_a_run_whose_base_is_stored_once(tmp_
 class Wide(Objective):
     """A regression beside a float64 table no step moves."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.zeros((3,), jnp.float32)},
                 "constants": {"table": jnp.linspace(0.0, 1.0, 1000, dtype=jnp.float64)}}
 
