@@ -7,6 +7,7 @@ qwen_qualification_reference.py; no model weights are downloaded at test time.
 
 import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -54,7 +55,11 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
             messages, tokenize=False, add_generation_prompt=True) == rendered
         expected_chat = tokenizer.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
-        np.testing.assert_array_equal(processor.chat(messages).tokens, expected_chat["input_ids"])
+        with monkeypatch.context() as torchless:
+            # A text-only chat needs no Torch, as a text prompt needs none.
+            torchless.setitem(sys.modules, "torch", None)
+            chat = processor.chat(messages)
+        np.testing.assert_array_equal(chat.tokens, expected_chat["input_ids"])
 
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None,
                             pad_id=tokenizer.pad_token_id)
