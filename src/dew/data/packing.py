@@ -54,6 +54,12 @@ def chunks_for(step: ExpandStep, pack: Pack) -> bool:
             and set(pack.fields) <= set(step.fields))
 
 
+def most_documents(starts: np.ndarray, accepted: np.ndarray) -> int:
+    """The most documents, or a cut document's pieces, one of a plan's `accepted` windows holds,
+    from where each window starts in its packing order (`plan_windows`)."""
+    return int(np.diff(np.asarray(starts))[np.asarray(accepted)].max(initial=0))
+
+
 def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
     """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
     windows: each chunk's document, offset and size, the chunks in packing
@@ -121,6 +127,12 @@ class _Published:
     def location(self) -> str:
         return self.generation.url
 
+    @functools.cached_property
+    def most_documents(self) -> int:
+        """The most documents a window this plan reads holds (`most_documents`)."""
+        return most_documents(self.generation.plan(plan_name(self.pack, "starts")),
+                              self.generation.plan(plan_name(self.pack, "accepted")))
+
     def refuse_cuts(self) -> None:
         """Refuse a plan that cut a document, as one published before packs placed
         documents whole may have: an unchunked pack does not cut."""
@@ -160,6 +172,11 @@ class _Held:
     @property
     def location(self) -> str:
         return self.source.describe()
+
+    @property
+    def most_documents(self) -> int:
+        """The most documents a window this plan reads holds (`most_documents`)."""
+        return most_documents(self.arrays["starts"], self.arrays["accepted"])
 
     def refuse_cuts(self) -> None:
         """Refuse documents the plan would cut, which an unchunked pack places whole."""
