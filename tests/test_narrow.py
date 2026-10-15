@@ -197,10 +197,10 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     """The fit check reads the state's arguments as already on the devices;
     the copies are not yet when the first step compiles, since `run` builds
     them before its first call, so their bytes count beside the step with the
-    prefetched batches: of the free bytes every device reports, the headroom
-    the check leaves is what the step's memory analysis does not take, less
-    the bytes held beside it."""
+    prefetched batches: the headroom the check leaves is the step's own,
+    `step_headroom` of the devices' free bytes, less the bytes held beside it."""
     from dew.training.distributed import placed_bytes
+    from dew.training.memory import step_headroom
 
     limit = 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
@@ -208,9 +208,9 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
 
     def trained(copies):
         state, _, trainer = _trained(monkeypatch, optax.adam(1e-3), copies=copies, steps=1)
-        stats = trainer.executable.memory_analysis()
-        step = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
-        held.append(limit - step - trainer.plan["probes"][0]["headroom"])
+        devices = [device for device in trainer.device_mesh.devices.flat
+                   if device.process_index == jax.process_index()]
+        held.append(step_headroom(trainer.executable, devices) - trainer.plan["probes"][0]["headroom"])
         return state
 
     narrow = trained(True)
