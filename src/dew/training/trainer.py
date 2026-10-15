@@ -51,7 +51,7 @@ from dew.data.dataset import (
 from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -1140,16 +1140,16 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
+                if candidate.copies and current.compute is None:
+                    current = dataclasses.replace(current, compute=jax.jit(
+                        lambda variables: narrowed(variables, candidate.copies),
+                        out_shardings=candidate.shardings.compute)(current.variables))
                 if current.accumulation is None and split * self.accumulation > 1 and self.step is None:
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
                         current, candidate.micro, candidate.shapes, window=split * self.accumulation),
                         window_size=jnp.asarray(split * self.accumulation, jnp.int32))
                     current = jax.device_put(current, candidate.shardings)
-                if candidate.copies and current.compute is None:
-                    current = dataclasses.replace(current, compute=jax.jit(
-                        lambda variables: narrowed(variables, candidate.copies),
-                        out_shardings=candidate.shardings.compute)(current.variables))
                 outputs = []
                 for part in parts:
                     current, *output = executable(current, batch, part)
@@ -1242,7 +1242,7 @@ class Trainer(Generic[Loss, Effects]):
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        copies = self._narrow_copies(state, batch, window)
+        copies = self._narrow_copies(state, batch)
         if copies:
             prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
                 lambda variables: narrowed(variables, copies), prepared.variables))
@@ -1297,13 +1297,13 @@ class Trainer(Generic[Loss, Effects]):
             return jitted.trace(*placed, jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
                 lowering_platforms=('cuda',))
 
-    def _narrow_copies(self, state: TrainState, batch: Batch, window: int) -> dict:
+    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
-        (`dew.training.narrow`), by path under `params`: on the CUDA
-        generations measured to gain, for a step this trainer composes that
-        commits every microbatch, a `window` of one, without a loss scale."""
-        if (measured_kernel('narrow_copies', 'off') == 'off' or self.step is not None
-                or window != 1 or self.dynamic_scale or FROZEN in state.variables):
+        (`dew.training.narrow`), by path under `params`: on every GPU but
+        one whose row measured them off, for a step this trainer composes,
+        without a loss scale."""
+        if (measured_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
+                or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
             return {}
         variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
