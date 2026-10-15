@@ -134,7 +134,7 @@ class SuppliedRule(Objective):
     batch's rows for the total, whatever the error, as e-prop or a
     forward-gradient estimate states one the loss's derivative is not."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.zeros((3,))}}
 
     def loss(self, variables, batch, step):
