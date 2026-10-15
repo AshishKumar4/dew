@@ -28,7 +28,6 @@ under `v4/` and `v4_1/`. Run from the checkout with torch 2.14 on the CPU:
 """
 
 import importlib.util
-import json
 import sys
 import tempfile
 import types
@@ -37,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
-from reference_source import CACHE, verified
+from reference_source import CACHE, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_v4_release.npz"
@@ -166,9 +165,7 @@ def main():
                          for release, (repo, commit, block) in RELEASES.items()},
             "sha256": {f"{release}/{path}": digest for (release, path), digest in SHA256.items()},
             "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    saved_fixture(FIXTURE, arrays, meta)
     print(f"{FIXTURE}: {FIXTURE.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays, "
           f"torch {torch.__version__}")
 

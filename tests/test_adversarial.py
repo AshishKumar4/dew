@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
+from diffusion_support import saved_after_one_step
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
@@ -236,14 +237,7 @@ def test_each_side_trains_on_its_own_loss(runs):
 
 def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     config, batch = runs
-    task = config.build()
-    trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(tmp_path / "student"))
+    task, state = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert TEACHER not in restored.variables and DISCRIMINATOR not in restored.variables["params"]
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

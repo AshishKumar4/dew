@@ -8,9 +8,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import decode_through
 
 from dew.interop import Pretrained
-from dew.nn.inputs import MixerCall
 from dew.nn.mixers.mamba import Mamba, selective_scan
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
@@ -66,14 +66,9 @@ def test_the_layer_decodes_as_it_prefills():
     x = jax.random.normal(jax.random.key(0), (2, 9, 8))
     variables = mixer.init(jax.random.key(1), x)
     whole = mixer.apply(variables, x)
-    _, cache = mixer.apply(variables, x[:, :1], MixerCall(decode=True), mutable=['cache'])
-    steps = []
-    for t in range(9):
-        out, cache = mixer.apply({**variables, **cache}, x[:, t:t + 1], MixerCall(decode=True),
-                                 mutable=['cache'])
-        steps.append(out)
-    np.testing.assert_allclose(jnp.concatenate(steps, 1), whole, rtol=1e-5, atol=1e-5)
-    assert cache['cache']['ssm_state'].shape == (2, 16, 4)
+    decoded, _, cache = decode_through(mixer, variables, x, prefill=1)
+    np.testing.assert_allclose(decoded, whole, rtol=1e-5, atol=1e-5)
+    assert cache['ssm_state'].shape == (2, 16, 4)
 
 
 

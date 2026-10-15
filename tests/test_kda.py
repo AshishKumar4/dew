@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import decode_through
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -274,17 +275,9 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     x = jnp.asarray(np.random.RandomState(6).randn(B, S, E), jnp.float32)
     full = module.apply(variables, x)
 
-    _, allocated = module.apply(variables, x[:, :1], MixerCall(decode=True), mutable=["cache"])
-    assert float(jnp.abs(jnp.asarray(allocated["cache"]["recurrent_state"])).max()) == 0.0
-    out, state = module.apply({**variables, **allocated}, x[:, :3], MixerCall(decode=True), mutable=["cache"])
-    steps = [out]
-    for position in range(3, S):
-        out, state = module.apply(
-            {**variables, **state}, x[:, position : position + 1], MixerCall(decode=True), mutable=["cache"]
-        )
-        steps.append(out)
-
-    assert scaled(jnp.concatenate(steps, axis=1), np.asarray(full)) < BOUND
+    decoded, allocated, _ = decode_through(module, variables, x, prefill=3)
+    assert float(jnp.abs(jnp.asarray(allocated["recurrent_state"])).max()) == 0.0
+    assert scaled(decoded, np.asarray(full)) < BOUND
 
 
 def test_padded_rows_preserve_the_memory_and_the_history():

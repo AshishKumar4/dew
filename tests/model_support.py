@@ -34,6 +34,23 @@ def two_documents(rng: np.random.Generator, rows: int, length: int):
     return coordinates(segments=segments, positions=positions, max_segments=length, right_padded=True, xp=np)
 
 
+def decode_through(module: nn.Module, variables, hidden, prefill: int):
+    """`module` over `hidden` through its decode cache: the call that allocates the cache, then the
+    first `prefill` tokens at once, then one token a step. Returns the outputs joined along the
+    sequence, the cache as allocated and the cache after the last step."""
+    from dew.nn.inputs import MixerCall
+
+    step = MixerCall(decode=True)
+    allocated = module.apply(variables, hidden[:, :1], step, mutable=["cache"])[1]
+    out, cache = module.apply({**variables, **allocated}, hidden[:, :prefill], step, mutable=["cache"])
+    outputs = [out]
+    for position in range(prefill, hidden.shape[1]):
+        out, cache = module.apply({**variables, **cache}, hidden[:, position:position + 1], step,
+                                  mutable=["cache"])
+        outputs.append(out)
+    return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
+
+
 def flat_tree(tree) -> dict:
     """`tree`'s leaves by their dictionary keys joined with dots, the way a
     checkpoint names them: 'params.layers_0.mlp.gate.kernel'."""

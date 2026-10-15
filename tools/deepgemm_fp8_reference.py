@@ -24,13 +24,12 @@ from the checkout with any torch that has float8_e4m3fn on the CPU:
 """
 
 import importlib.util
-import json
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 REPO = "deepseek-ai/DeepGEMM"
 COMMIT = "057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7"
@@ -82,9 +81,7 @@ def main():
     arrays["edge/weight"] = (np.float32(448) * quotients)[:, None]
     cast("edge", torch.from_numpy(arrays["edge/weight"]), 1)
     meta = {"repo": REPO, "commit": COMMIT, "source": SOURCE, "sha256": SHA256, "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    saved_fixture(FIXTURE, arrays, meta)
     print(f"{FIXTURE}: {FIXTURE.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays, "
           f"torch {torch.__version__}")
 
