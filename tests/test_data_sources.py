@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
+from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
@@ -1361,28 +1362,11 @@ def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path)
                        read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                        ).train(DataPartition())
 
-    before = reader()
-    try:
-        identity = before.identity()
-        batch = next(before)
+    def read(batch):
         assert 0 <= int(batch["id"][0]) < 33
         assert batch["text"].tolist() == ["a" * (192 * 1024)]
-        position = before.get_state()
-    finally:
-        before.close()
-    path = tmp_path / "part-16.jsonl"
-    size = path.stat().st_size
-    with path.open("r+b") as file:
-        file.seek(size // 2)
-        file.write(b"b")
-    assert path.stat().st_size == size
-    after = reader()
-    try:
-        assert after.identity() != identity
-        with pytest.raises(ValueError):
-            after.set_state(position)
-    finally:
-        after.close()
+
+    assert_a_rewrite_moves_the_identity(reader, tmp_path / "part-16.jsonl", b"b", read)
 
 
 def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):

@@ -19,6 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
+from torch_layout import QKV, dew_kernel, join_qkv, leaf, output_heads, output_merged, split_qkv, torch_kernel
 
 from dew.nn.backbones.uvit import UViT
 from dew.nn.dit import TextContext
@@ -73,38 +74,23 @@ def to_dew(name: str, value: np.ndarray, config: dict) -> dict[tuple[str, ...], 
     q, k and v split per head, the output projection read per head."""
     path = dew_path(name)
     heads = config["num_heads"]
-    width = config["embed_dim"]
     if path[-1] == "qkv":
-        split = value.reshape(3, heads, width // heads, width).transpose(0, 3, 1, 2)
-        return {(*path[:-1], part, "kernel"): split[index]
-                for index, part in enumerate(("to_q", "to_k", "to_v"))}
+        split = split_qkv(value, heads)
+        return {(*path[:-1], part, "kernel"): split[index] for index, part in enumerate(QKV)}
     if path[-2:] == ("to_out_0", "kernel"):
-        return {path: value.T.reshape(heads, width // heads, width)}
-    if path[-1] == "kernel":
-        return {path: value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T}
-    return {path: value}
+        return {path: output_heads(value, heads)}
+    return {path: dew_kernel(value) if path[-1] == "kernel" else value}
 
 
-def from_dew(name: str, tree, config: dict) -> np.ndarray:
+def from_dew(name: str, tree) -> np.ndarray:
     """The inverse of `to_dew`: a Dew gradient back in U-ViT's layout."""
     path = dew_path(name)
-
-    def leaf(path):
-        node = tree
-        for key in path:
-            node = node[key]
-        return np.asarray(node)
-
-    width = config["embed_dim"]
     if path[-1] == "qkv":
-        parts = [leaf((*path[:-1], part, "kernel")) for part in ("to_q", "to_k", "to_v")]
-        return np.stack(parts).transpose(0, 2, 3, 1).reshape(3 * width, width)
-    value = leaf(path)
+        return join_qkv([leaf(tree, (*path[:-1], part, "kernel")) for part in QKV])
+    value = leaf(tree, path)
     if path[-2:] == ("to_out_0", "kernel"):
-        return value.reshape(width, width).T
-    if path[-1] == "kernel":
-        return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
-    return value
+        return output_merged(value)
+    return torch_kernel(value) if path[-1] == "kernel" else value
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -149,7 +135,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_u_vits(reference, case):
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
     native = [np.asarray(grads[1]).transpose(0, 3, 1, 2), np.asarray(grads[2])]
-    native += [from_dew(name, grads[0], config) for name in names]
+    native += [from_dew(name, grads[0]) for name in names]
     native_order = np.concatenate([np.ravel(leaf) for leaf in native])
     assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
                                      f"{case} gradients")

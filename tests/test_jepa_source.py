@@ -21,6 +21,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
+from torch_layout import QKV, dew_kernel, join_qkv, leaf, output_heads, output_merged, split_qkv, torch_kernel
 
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 
@@ -63,40 +64,24 @@ def to_dew(name: str, value: np.ndarray, heads: int) -> dict[tuple[str, ...], np
     q, k and v split per head, the output projection read per head."""
     path = dew_path(name)
     if path[-2] == "qkv":
-        width = value.shape[-1] if value.ndim == 2 else value.shape[0] // 3
-        parts = value.reshape(3, heads, width // heads, *value.shape[1:])
-        if value.ndim == 2:
-            parts = parts.transpose(0, 3, 1, 2)
+        parts = split_qkv(value, heads)
         return {(*path[:-2], part, "kernel" if value.ndim == 2 else "bias"): parts[index]
-                for index, part in enumerate(("to_q", "to_k", "to_v"))}
+                for index, part in enumerate(QKV)}
     if path[-2:] == ("to_out_0", "kernel"):
-        return {path: value.T.reshape(heads, -1, value.shape[0])}
-    if path[-1] == "kernel":
-        return {path: value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T}
-    return {path: value}
+        return {path: output_heads(value, heads)}
+    return {path: dew_kernel(value) if path[-1] == "kernel" else value}
 
 
 def from_dew(name: str, tree, heads: int) -> np.ndarray:
     """The inverse of `to_dew`: a Dew gradient back in V-JEPA's layout."""
     path = dew_path(name)
-
-    def leaf(path):
-        node = tree
-        for key in path:
-            node = node[key]
-        return np.asarray(node)
-
     if path[-2] == "qkv":
-        if path[-1] == "weight":
-            parts = [leaf((*path[:-2], part, "kernel")) for part in ("to_q", "to_k", "to_v")]
-            return np.stack(parts).transpose(0, 2, 3, 1).reshape(-1, parts[0].shape[0])
-        return np.concatenate([leaf((*path[:-2], part, "bias")).ravel() for part in ("to_q", "to_k", "to_v")])
-    value = leaf(path)
+        stored = "kernel" if path[-1] == "weight" else "bias"
+        return join_qkv([leaf(tree, (*path[:-2], part, stored)) for part in QKV])
+    value = leaf(tree, path)
     if path[-2:] == ("to_out_0", "kernel"):
-        return value.reshape(-1, value.shape[-1]).T
-    if path[-1] == "kernel":
-        return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
-    return value
+        return output_merged(value)
+    return torch_kernel(value) if path[-1] == "kernel" else value
 
 
 @pytest.mark.parametrize("case", CASES)

@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
 from steady_state import steady_state
 
@@ -75,27 +76,12 @@ def make_run(
                      (8, 1, RES, 3)).astype(np.uint8)
     batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
 
-    class Stream:
-        def __init__(self):
-            self.position = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.position += 1
-            return batch
-
-        def get_state(self):
-            return str(self.position).encode()
-
-        def set_state(self, state):
-            self.position = int(state.decode())
-
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                       checkpoints=checkpoints)
-    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    stream = Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
+                    batch=8)
+    state = trainer.fit(stream,
                         steps=steps, log_every=100, checkpoint_every=steps)
     checkpoints.wait()
     config.save(str(directory))
@@ -287,27 +273,12 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
 
-    class Stream:
-        def __init__(self):
-            self.position = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.position += 1
-            return batch
-
-        def get_state(self):
-            return str(self.position).encode()
-
-        def set_state(self, state):
-            self.position = int(state.decode())
-
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints,
                       mesh=MeshSpec() if mesh is None else mesh)
-    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    stream = Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
+                    batch=8)
+    state = trainer.fit(stream,
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
@@ -438,23 +409,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
                   "mlp_features": 32, "max_seq_len": 16}
 
-    class Stream:
-        def __init__(self):
-            self.position = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.position += 1
-            return {"text": np.random.RandomState(0).randint(1, 250, (batch, seq + 1)).astype(np.int32)}
-
-        def get_state(self):
-            return str(self.position).encode()
-
-        def set_state(self, state):
-            self.position = int(state.decode())
-
+    ids = np.random.RandomState(0).randint(1, 250, (batch, seq + 1)).astype(np.int32)
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
@@ -462,7 +417,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
-                         Loader(lambda partition: Stream(), None, None, batch), name="run")
+                         Loader(lambda partition: Replaying(lambda position: {"text": ids}), None, None,
+                                batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
     record = json.loads((tmp_path / "run" / "run.json").read_text())["fields"]
