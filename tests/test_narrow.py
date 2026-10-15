@@ -59,7 +59,7 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
-def _trained(monkeypatch, copies, optimizer, steps=3, mesh=None, padded=0, accumulation=1, split=None,
+def _trained(monkeypatch, optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
              mixture=False, rows=8, ragged=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
@@ -111,8 +111,8 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
-    narrow, losses = _trained(monkeypatch, True, _keeping_gradients(optax.sgd(0.5)), mesh=mesh)
-    plain, plain_losses = _trained(monkeypatch, False, _keeping_gradients(optax.sgd(0.5)), mesh=mesh)
+    narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
+    plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, mesh=mesh)
     paths = {tuple(key.key for key in path)[1:]: leaf.dtype
              for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
     names = {"/".join(path) for path in paths}
@@ -149,8 +149,8 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True}
-    narrow, losses = _trained(monkeypatch, True, _keeping_gradients(optax.sgd(0.5)), **run)
-    plain, plain_losses = _trained(monkeypatch, False, _keeping_gradients(optax.sgd(0.5)), **run)
+    narrow, losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=True, **run)
+    plain, plain_losses = _trained(monkeypatch, _keeping_gradients(optax.sgd(0.5)), copies=False, **run)
     assert plain.compute is None and int(narrow.updates) == int(plain.updates) == 2
     paths = {tuple(key.key for key in path)[1:]: leaf.dtype
              for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
@@ -171,8 +171,8 @@ def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept(monkeypatch
     their copies. Adam's moments would have moved every parameter had the
     update been taken, so copies cast from the update the step discarded
     would differ from the parameters it kept."""
-    trained, _ = _trained(monkeypatch, True, optax.adam(1e-2), steps=2)
-    skipped, _ = _trained(monkeypatch, True, optax.adam(1e-2), steps=2, padded=1)
+    trained, _ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2)
+    skipped, _ = _trained(monkeypatch, optax.adam(1e-2), copies=True, steps=2, padded=1)
     assert int(skipped.updates) == int(trained.updates) == 2
     for a, b in zip(jax.tree.leaves(trained.variables), jax.tree.leaves(skipped.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
@@ -199,8 +199,8 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
         return True, None
 
     monkeypatch.setattr(module, "step_fits", fits)
-    narrow, _ = _trained(monkeypatch, True, optax.adam(1e-3), steps=1)
-    _trained(monkeypatch, False, optax.adam(1e-3), steps=1)
+    narrow, _ = _trained(monkeypatch, optax.adam(1e-3), copies=True, steps=1)
+    _trained(monkeypatch, optax.adam(1e-3), copies=False, steps=1)
     copies = placed_bytes(jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
     assert copies > 0 and asked[0] - asked[1] == copies
