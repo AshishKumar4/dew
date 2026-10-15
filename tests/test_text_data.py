@@ -480,6 +480,8 @@ def test_a_producer_document_index_allows_packing_without_an_eos_id(tmp_path):
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, 0, 0, 0]
     assert window["text_coordinates"].segments.tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
+    # The plan's one window holds two documents, which its batches declare (`Coordinates.max_segments`).
+    assert window["text_coordinates"].max_segments == 2
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
@@ -496,7 +498,8 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
 
     laid = batch["text_coordinates"]
     assert set(batch) == {"text", "text_coordinates"}
-    assert laid.max_segments == seq_len + 1 and laid.right_padded
+    # The most documents a window holds (two), not the window's length.
+    assert laid.max_segments == int(laid.segments.max()) == 2 and laid.right_padded
     assert all(isinstance(value, np.ndarray) for value in jax.tree.leaves(laid))
     for value in (batch["text"], laid.segments, laid.positions):
         assert value.shape == (2, seq_len + 1)

@@ -366,7 +366,10 @@ def _read(path: str) -> tuple[Keyed, list]:
 
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
-    """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op."""
+    """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op,
+    none where the process keeps no picks (`dew.cache.keeps_picks`)."""
+    if not cache.keeps_picks():
+        return {}
     stored, _ = _read(cache.kernel_picks_path(kind))
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
     for op, key, fastest in _kernel_launches(stored):

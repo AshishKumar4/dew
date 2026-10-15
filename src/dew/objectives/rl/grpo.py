@@ -357,10 +357,13 @@ class GRPOObjective(LMObjective):
 
     def validation_loss(self, variables, batch, step):
         """Score the source prompts' NLL, not the surrogate's rollout-only fields."""
-        scores = self._evaluation_scores(variables, batch, step.key)
-        assert scores.weights is not None
+        return self._validation_scores(variables, batch, step)[0]
+
+    def _validation_scores(self, params, batch, step):
+        """The prompts' NLL with the per-token scores it is the mean of."""
+        scores = self._evaluation_scores(params, batch, step.key)
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
-                     self.row_mean(scores.weights, batch).total)
+                     self.row_mean(scores.weights, batch).total), scores
 
     def evaluate(self, params, batch, step):
         """Return the per-token scores of the prompts under the policy, for their perplexity,

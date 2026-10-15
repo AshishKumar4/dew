@@ -1191,14 +1191,21 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
-        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared, batch)
-        reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
+        statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
+        reported = {"indexer_kl": kl}
         qk = gathered.get("qk") if self.qk_stats else None
         if self.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return Ratio(self.indexer.weight * total, mass), Aux(reported, qk_stats=qk)
+        return statistics, Aux(reported, qk_stats=qk)
+
+    def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, jax.Array]:
+        """The warm-up's loss, the indexer's weighted KL over the queries it
+        counted, and the KL per query it reports."""
+        assert self.indexer is not None
+        total, mass = self._indexer_term(sown, prepared, batch)
+        return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
 
     def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
         """Split a `[B, seq_len + 1]` batch into its inputs and shifted targets."""
@@ -1240,7 +1247,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
-                     summed: bool = False, logits: bool = False
+                     summed: bool = False, logits: bool = False, predict: bool | None = None
                      ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from.
 
@@ -1248,7 +1255,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         their weighted sums alone (`token_scores`'s `z_loss`), which a
         training step's loss is: a sum of a batch's rows, each counted once.
         `logits` scores them from the whole logits and keeps those
-        (`token_scores`'s `logits`).
+        (`token_scores`'s `logits`). `predict` is `token_scores`'.
         """
         prepared = batch_text(batch)
         rate = self.balance_rate
@@ -1259,7 +1266,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
-            z_loss=self.z_loss if summed else None, logits=logits)
+            z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
@@ -1386,6 +1393,20 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
         assert scores.correct is not None
         return TokenScores(scores.losses, scores.weights, scores.correct)
+
+    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio | LMStatistics, TokenScores]:
+        """The validation loss and the batch's scores, from one scoring of it:
+        the loss's, or in the warm-up, whose loss is the indexer's KL alone
+        (`_warmup_loss`), the tokens' with the KL the trunk sows."""
+        if self._warmup:
+            prepared = batch_text(batch)
+            scores = self.token_scores(params, prepared, roles=self._batch_roles(batch), indexer=True,
+                                       predict=True)
+            statistics, _ = self._warmup_statistics(scores.indexer, prepared, batch)
+        else:
+            statistics, _, scores = self._scored_loss(params, batch, step, train=False, predict=True)
+        assert scores.correct is not None
+        return statistics, TokenScores(scores.losses, scores.weights, scores.correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
