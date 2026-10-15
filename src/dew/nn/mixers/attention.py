@@ -132,10 +132,10 @@ class CausalSelfAttention(nn.Module):
     sharing): it reads the keys, values and positions its provider stashed in
     `kv_store`, post rope and norm, and keeps no cache.
     """
-    reads: ClassVar[frozenset[str]] = frozenset({"image_groups", "pairwise_mask", "key_positions",
-                                                 "position_bias", "admitted"})
-    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by image groups and a
-    pairwise mask, places keys, adds a position bias and runs a server's mixed step."""
+    reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "position_bias",
+                                                 "admitted"})
+    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask,
+    places keys, adds a position bias and runs a server's mixed step."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
