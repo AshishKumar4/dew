@@ -299,6 +299,7 @@ class ChunkLocalCumsum(_Launch):
 
     NAME = "chunk_local_cumsum"
     KEYS, VALUES = None, None
+    revision: int = 2
     SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4, 8), (1,)))
     PICKS = _picks(Tiles(0, 0, 2, 1))
 
