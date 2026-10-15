@@ -271,6 +271,35 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
         reader.close()
 
 
+@pytest.mark.parametrize("causal", [True, False])
+def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row(causal):
+    """A decision objective given the joint head and no layout lays a request out
+    as that head reads it, every question in one row (`JointLayout`), over a
+    causal and a bidirectional backbone alike, as a run's config does: it
+    scores a three-question request as the same objective given the
+    JointLayout does."""
+    example = EXAMPLES[4]
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
+                                 max_seq_len=2048, attention_impl="xla", causal=causal)
+    head = JointSchemaHead(32, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)
+
+    def objective(**layout):
+        return DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, head=head,
+                                 shuffle_options=False, **layout)
+
+    stated, defaulted = objective(layout=JointLayout()), objective()
+    # Drawn over a window the backbone holds; the weights are the same whatever the layout's length.
+    variables = objective(layout=JointLayout(max_len=2048)).init(jax.random.key(0))
+
+    def scores(objective):
+        rows = objective.layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
+        return np.asarray(objective.model.logits(variables, DecisionInputs.collate(rows, SPECIALS.pad)))
+
+    expected = scores(stated)
+    assert expected.shape[:2] == (1, len(example.questions))
+    np.testing.assert_array_equal(scores(defaulted), expected)
+
+
 @pytest.mark.parametrize("questions", [1, 2])
 def test_single_option_questions_fit_the_packing_bounds(questions):
     """A fitting singleton-choice schema packs even where a two-option row cannot fit."""
