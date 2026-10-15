@@ -387,7 +387,8 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
-    after, though the red run died before it wrote a report. Each task runs as armada starts it:
+    after, though the red run died before it wrote a report. A commit's retry reuses its green rows
+    though a run of another commit recorded the file since. Each task runs as armada starts it:
     .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
         "import os\n"
@@ -446,6 +447,14 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 7
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
+    # Another commit's run between a commit's run and its retry: a fixture's change is every file's input.
+    fixture = tmp_path / "tests/fixture.json"
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 9
+    fixture.write_text('{"changed": true}')
+    assert run("GenuineIntel-6-143") == 10
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 10
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
