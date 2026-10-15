@@ -77,7 +77,11 @@ class _Wrapping(Protocol):
 
 @runtime_checkable
 class _RestrictedReads(Protocol):
+    """A holdout or slice that takes fewer reads than its store, and says why
+    and what reads instead (`refusal`)."""
+
     reads: tuple[Read, ...]
+    refusal: str
 
 
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
@@ -641,9 +645,22 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
             preparer = _provisioner(source, read)
             if preparer is not None:
                 preparer.provision()
-    refused = [source.describe() for source in missing if not source.supports(read)]
+    refused = [source for source in missing if not source.supports(read)]
     if refused:
-        raise ValueError(
-            f"read={read!r} is unavailable for {', '.join(refused)}; "
-            "provision the named artifact with dew data provision or provision=True"
-        )
+        raise ValueError(f"read={read!r} is unavailable: "
+                         + "; ".join(_refusal(source, read, provision=provision) for source in refused))
+
+
+def _refusal(source: Source, read: Read, *, provision: bool) -> str:
+    """Why `source` cannot take `read`: a holdout or slice over its store that
+    reads no such way, which says what does, else the store, which
+    provisioning prepares where it can and which otherwise names its reads."""
+    wrapper = source
+    while isinstance(wrapper, _Wrapping):
+        if isinstance(wrapper, _RestrictedReads) and read not in wrapper.reads:
+            return f"{source.describe()}: {wrapper.refusal}"
+        wrapper = wrapper.source
+    if not provision and _provisioner(source, read) is not None:
+        return f"{source.describe()}: provision it with dew data provision or provision=True"
+    reads = [mode for mode in READS if wrapper.supports(mode)]
+    return f"{source.describe()} reads {' or '.join(reads) if reads else 'no way here'}"
