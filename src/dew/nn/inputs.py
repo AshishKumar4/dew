@@ -399,6 +399,45 @@ class AttentionMetadata:
         return self.coordinates is not None and self.coordinates.right_padded
 
 
+MIXING = ("image_groups", "pairwise_mask", "key_positions", "position_bias", "admitted")
+"""The `AttentionMetadata` fields that say which tokens a mixer lets each token
+read. A mixer runs a call that sets one only where it reads it (`MixerCall`).
+The rest are the tokens' own coordinates and rotary positions, which a mixer
+reads as far as its form uses them, and the ids the block itself reads for its
+feed-forward and n-gram lookup."""
+
+TOKENWISE = frozenset(MIXING)
+"""The `MIXING` fields a mixer that reads no other token holds to: every one,
+by construction, since none changes what a token alone computes."""
+
+
+@dataclass(frozen=True)
+class MixerCall:
+    """Everything a token mixer is called with beside its input: the stack's
+    per-token `metadata`, whether the call `decode`s against the layer's cache,
+    and the store a run of layers shares keys and values through (`kv_store`),
+    which a provider writes and a sharing layer reads. A mixer declares the
+    `MIXING` fields it reads (`reads`), and the block refuses to call it with
+    any other one set (`unread`)."""
+
+    metadata: AttentionMetadata | None = None
+    decode: bool = False
+    kv_store: dict | None = None
+    """Each name a layer publishes under to the run's later layers: attention's
+    keys, values and positions, an index selection, a draft's context."""
+
+    def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
+        """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""
+        if self.metadata is None:
+            return ()
+        return tuple(name for name in MIXING
+                     if name not in reads and getattr(self.metadata, name) is not None)
+
+
+PLAIN_CALL = MixerCall()
+"""A mixer call over whole rows of real tokens: no metadata, no cache, no store."""
+
+
 @struct.dataclass
 class Admitted:
     """A serving step's cached call over every token it runs, in one row.

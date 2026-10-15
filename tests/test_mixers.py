@@ -13,6 +13,7 @@ and values agree, and an unknown kind or field raises naming what was asked for.
 import dataclasses
 import functools
 import itertools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -24,8 +25,9 @@ from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.inputs import coordinates
+from dew.nn.inputs import TOKENWISE, MixerCall, coordinates
 from dew.nn.mixers import MixerBase, MixerContext
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -37,13 +39,14 @@ def tiny(**overrides):
 
 
 class ScaleMixerModule(nn.Module):
-    """A token mixer with no parameters: scale and pass through."""
+    """A token mixer with no parameters: scale and pass through, token by token."""
+
+    reads: ClassVar[frozenset[str]] = TOKENWISE
 
     scale: float = 2.0
 
     @nn.compact
-    def __call__(self, x, decode: bool = False):
-        del decode
+    def __call__(self, x, call: MixerCall):
         return x * self.scale
 
 
@@ -71,6 +74,25 @@ def test_mixer_records_and_values_compute_the_same_logits():
                   models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
     assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
+
+
+def test_a_layer_runs_no_mask_its_mixer_does_not_read():
+    """A pairwise mask says which keys each query reads. Attention reads it, so a mask that keeps
+    only each token's own key moves its logits; a gated delta net reads every earlier token of its
+    document and no mask, so its layer refuses the call rather than run it as if unmasked."""
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    own = jnp.eye(4, dtype=bool)[None]
+    attention = tiny()
+    params = attention.init(jax.random.key(0), ids)
+    masked = attention.apply(params, ids, attention_pairwise_mask=own)
+    assert not jnp.allclose(masked, attention.apply(params, ids))
+    delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
+                               linear_value_head_dim=8)
+    recurrent = hybrid(kinds={"linear": LayerKind(mixer=delta)})
+    params = recurrent.init(jax.random.key(0), ids)
+    recurrent.apply(params, ids)
+    with pytest.raises(ValueError):
+        recurrent.apply(params, ids, attention_pairwise_mask=own)
 
 
 def hybrid(**overrides):
