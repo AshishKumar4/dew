@@ -70,6 +70,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import position, records
 from dew.coordination import broadcast_from_process_zero, from_every_process
 from dew.files import write_atomically
+from dew.hashing import fmix32
 from dew.nn import sharding
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import Variables
@@ -325,13 +326,8 @@ def _leaf_marks(leaf: jax.Array) -> jax.Array:
     for axis in reversed(range(bits.ndim)):
         index = index + jax.lax.broadcasted_iota(jnp.uint32, bits.shape, axis) * jnp.uint32(stride)
         stride = stride * bits.shape[axis] % 2 ** 32
-    marks = []
-    for seed in _SEEDS:
-        mixed = bits ^ (index * jnp.uint32(seed))
-        mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x85EBCA6B)
-        mixed = (mixed ^ (mixed >> 13)) * jnp.uint32(0xC2B2AE35)
-        marks.append(jnp.sum(mixed ^ (mixed >> 16), dtype=jnp.uint32))
-    return jnp.stack(marks)
+    return jnp.stack([jnp.sum(fmix32(bits ^ (index * jnp.uint32(seed))), dtype=jnp.uint32)
+                      for seed in _SEEDS])
 
 
 def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
@@ -347,10 +343,7 @@ def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
             bits = words[start:start + chunk].astype(np.uint32)
             index = (np.arange(start, start + bits.size, dtype=np.uint64) & 0xFFFFFFFF).astype(np.uint32)
             for slot, seed in enumerate(_SEEDS):
-                mixed = bits ^ (index * np.uint32(seed))
-                mixed = (mixed ^ (mixed >> np.uint32(16))) * np.uint32(0x85EBCA6B)
-                mixed = (mixed ^ (mixed >> np.uint32(13))) * np.uint32(0xC2B2AE35)
-                marks[slot] += np.sum(mixed ^ (mixed >> np.uint32(16)), dtype=np.uint32)
+                marks[slot] += np.sum(fmix32(bits ^ (index * np.uint32(seed))), dtype=np.uint32)
     return marks
 
 
