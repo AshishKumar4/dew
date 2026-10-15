@@ -141,11 +141,11 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
 
     asked = []
 
-    def fits(executable, mesh, held=0):
-        asked.append(held)
+    def fits(candidate, executable, mesh):
+        asked.append(candidate.held)
         return True, None
 
-    monkeypatch.setattr(module, "step_fits", fits)
+    monkeypatch.setattr(module, "device_fit", fits)
     narrow, _ = _trained(monkeypatch, {device_generation()}, optax.adam(1e-3), steps=1)
     _trained(monkeypatch, set(), optax.adam(1e-3), steps=1)
     copies = placed_bytes(jax.tree.map(
