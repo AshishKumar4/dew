@@ -64,7 +64,7 @@ FACTOR = 2.0
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
-row (`worst_row`). An RMS over every entry averages a few wrong rows into a
+row (`rows_over`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
@@ -147,42 +147,62 @@ def distance(value, truth) -> float:
     return float(np.sqrt(np.mean(np.square(difference))))
 
 
-def worst_row(value, truth, terms=None) -> float:
-    """The largest row's RMS distance from float64 over that row's own size,
-    each row every axis but the last: the RMS of its float64 values, or, where
-    `terms` gives each entry's float64 terms (`float64_terms`), the larger of
-    that and the RMS of what the row sums, so a row that cancels is held to its
-    terms' rounding and not to its near-zero result. No other row's size
-    enters: a small row beside large ones is held to its own. A row whose size
-    is zero must equal it exactly (its ratio is 0 or infinite). A value of
-    rank one or less is one row, which `distance` already judges, and has none
-    of its own (0)."""
-    value, truth = np.asarray(value, np.float64), np.asarray(truth, np.float64)
+def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
+    """Each row's float64 size and `value`'s RMS distance from float64 on it,
+    a row every axis but the last. A row's size is the RMS of its float64
+    values, or, where `terms` gives each entry's float64 terms
+    (`float64_terms`), the larger of that and the RMS of what the row sums,
+    so a row that cancels is sized by its terms' rounding and not by its
+    near-zero result. No other row's size enters: a small row beside large
+    ones has its own. A value of rank one or less is one row, which
+    `distance` already judges, and has none here."""
+    truth = np.asarray(truth, np.float64)
     if truth.ndim < 2:
-        return 0.0
+        return np.zeros(0), np.zeros(0)
 
     def rms(rows):
         return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
 
     sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
-    errors = rms(value - truth)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratios = np.where(errors == 0, 0.0, errors / sizes)
-    return float(np.max(ratios)) if ratios.size else 0.0
+    return sizes, rms(np.asarray(value, np.float64) - truth)
+
+
+def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
+    """Where Dew's rows are further from float64 than ROW_FACTOR times the
+    reference's (`row_errors`): its worst row over its own size against the
+    reference's worst, at least `floor` (an order floor in the rows' units),
+    and each row of size zero, a sum that cancels exactly before anything its
+    terms see (a query that keeps one key), against the reference's distance
+    on that same row, which is all the evidence such a row has: where the
+    reference is exactly the float64 zero, Dew must be too."""
+    sizes, mine = row_errors(dew, truth, terms)
+    _, theirs = row_errors(reference, truth, terms)
+    sized = sizes > 0
+    over = []
+    if sized.any():
+        row = float(np.max(mine[sized] / sizes[sized]))
+        their_row = float(np.max(theirs[sized] / sizes[sized]))
+        if not within(row, ROW_FACTOR * max(their_row, floor)):
+            over.append(f"the worst row is {row:.3e} from float64 over its size, the reference's "
+                        f"{their_row:.3e}, allowed {ROW_FACTOR * max(their_row, floor):.3e}")
+    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
+    if zero.any():
+        at = int(np.flatnonzero(zero)[0])
+        over.append(f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
+                    f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}")
+    return over
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64, and
-    its worst row within ROW_FACTOR times the reference's (`worst_row`)."""
+    its rows within ROW_FACTOR times the reference's (`rows_over`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
-    row, their_row = worst_row(dew, truth), worst_row(reference, truth)
-    assert within(row, ROW_FACTOR * their_row), (
-        f"{label}: dew's worst row is {row:.3e} from float64 (rms over the row's size), the "
-        f"reference's {their_row:.3e} (ratio {row / their_row:.2f}, allowed {ROW_FACTOR})")
+    over = rows_over(dew, reference, truth)
+    assert not over, f"{label}: " + "; ".join(over)
 
 
 
@@ -221,13 +241,9 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # The worst row, each over its own terms where they are given, its order floor in those units.
-        sums = None if terms is None else summed
-        row = worst_row(mine, true, sums)
-        row_bar = ROW_FACTOR * max(worst_row(theirs, true, sums), spread * unit)
-        if not within(row, row_bar):
-            over.append(f"{jax.tree_util.keystr(path)}: the worst row {row:.3e} from float64 "
-                        f"(rms over its size), allowed {row_bar:.3e}")
+        # Each row over its own terms where they are given, the order floor in those units.
+        over += [f"{jax.tree_util.keystr(path)}: {row}"
+                 for row in rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)]
     assert not over, "\n".join(over)
 
 

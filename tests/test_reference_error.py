@@ -43,3 +43,22 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+
+
+def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
+    """A sum that cancels exactly before anything its terms see, as a query that keeps one key
+    has a zero gradient through the flash formula's delta, has no size of its own: its distance
+    is held to the reference's on that same row. Dew at the reference's residue passes; Dew with a
+    residue where the reference computes the float64 zero exactly does not, though the tensor-wide
+    RMS admits it."""
+    rng = np.random.default_rng(1)
+    truth = rng.normal(size=(64, 16))
+    truth[0] = 0.0
+    unit = float(np.finfo(np.float32).eps)
+    reference = truth + unit * rng.normal(size=truth.shape)
+    dew = truth + unit * rng.normal(size=truth.shape)
+    assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
+    reference[0], dew[0] = 0.0, unit
+    assert distance(dew, truth) <= FACTOR * distance(reference, truth)
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
