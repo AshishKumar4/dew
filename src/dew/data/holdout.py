@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from dew.data.sources.files import Format
 
 _INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
+_BY_INDEX = ("reads by index, under read='memory' or 'indexed'; a stream holds out a hash fraction "
+             "(HoldOut(fraction=..., by='hash'), or Dataset.holdout(fraction)) or nothing (validation=None)")
+"""Why a holdout that picks records by their index refuses a streamed read, and what streams."""
 
 
 @runtime_checkable
@@ -42,6 +45,7 @@ def _named_split(source: Source, name: str) -> Source:
 @dataclasses.dataclass(frozen=True)
 class _SliceRecords:
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
+    refusal: ClassVar[str] = f"a records= or index-fraction holdout {_BY_INDEX}"
     source: Source
     start: int
     stop: int | None = None
@@ -76,7 +80,7 @@ class _SliceRecords:
         return None if lengths is None else lengths[self.start : self.stop]
 
     def manifest(self) -> ShardManifest:
-        raise ValueError("a records= holdout reads by index; hold out fractions of a stream")
+        raise ValueError(self.refusal)
 
 
 def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> bool:
@@ -119,6 +123,8 @@ class _HashSource:
     machine and resume."""
 
     reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
+    refusal: ClassVar[str] = ("a hash holdout reads every row to place it, under read='memory' or "
+                              "'streamed'; an indexed read holds out records= or an index fraction")
     source: Source
     low: float
     high: float
@@ -270,6 +276,7 @@ class Split:
 @dataclasses.dataclass(frozen=True)
 class _RandomSource:
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
+    refusal: ClassVar[str] = f"a random holdout {_BY_INDEX}"
     source: Source
     split: HoldOut
     held: bool
@@ -312,7 +319,7 @@ class _RandomSource:
         return None if lengths is None else lengths[list(self._indices(len(lengths)))]
 
     def manifest(self) -> ShardManifest:
-        raise ValueError("random-index HoldOut needs indexed records; use by='hash' for streams")
+        raise ValueError(self.refusal)
 
 
 def rebased(source: Source | Mixture | Phases, replacement: Source) -> Source:

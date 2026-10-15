@@ -11,7 +11,7 @@ import sys
 
 import jax
 
-from dew.telemetry.devices import xla_flag
+from dew.telemetry.devices import deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:
@@ -55,6 +55,11 @@ def enable_compilation_cache(path: str):
     directory nor the mode is in JAX's cache key, so a run and a process
     that compiled its programs ahead of it share executables. XLA reads its
     flags at the first compile; a directory the run names is kept.
+
+    A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
+    jax 0.11.2's XLA measures nothing there and gives each instruction the
+    first configuration that compiles, but would still take a stored pick
+    over that one, so such a run names an empty directory.
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
@@ -64,8 +69,9 @@ def enable_compilation_cache(path: str):
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
-        picks = autotune_dir(path)
-        os.makedirs(picks, exist_ok=True)
+        picks = autotune_dir(path) if keeps_picks() else ''
+        if picks:
+            os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
 
 
@@ -103,12 +109,24 @@ KERNEL_PINS = jax.make_user_context(())
 thread, keyed on as `KERNEL_TUNES` is."""
 
 
+def keeps_picks() -> bool:
+    """Whether this process reads and stores GPU picks, XLA's and the
+    kernels' alike: not under `--xla_gpu_deterministic_ops`, whose kernels
+    must stay the same between a run and its resumption while other runs
+    measure into the cache. There XLA takes the first configuration that
+    compiles (`enable_compilation_cache`) and Dew's kernels their heuristic
+    ones (`dew.nn.kernels.tuning`), the same in every process."""
+    return not deterministic_ops_requested()
+
+
 def measures_picks() -> bool:
     """Whether this process may measure GPU picks and store them, XLA's and
-    the kernels' alike: not beside other work on its GPU, where `gpu-run -n
-    0.5` asks XLA to read its picks and write none
-    (AUTOTUNE_CACHE_MODE_READ), since a measurement there is unfair."""
-    return xla_flag('xla_gpu_experimental_autotune_cache_mode') != 'AUTOTUNE_CACHE_MODE_READ'
+    the kernels' alike: where it keeps picks at all (`keeps_picks`), and
+    not beside other work on its GPU, where `gpu-run -n 0.5` asks XLA to
+    read its picks and write none (AUTOTUNE_CACHE_MODE_READ), since a
+    measurement there is unfair."""
+    mode = xla_flag('xla_gpu_experimental_autotune_cache_mode')
+    return keeps_picks() and mode != 'AUTOTUNE_CACHE_MODE_READ'
 
 
 def persist_compilations() -> None:
