@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import itertools
 import json
 import os
 import re
@@ -292,9 +293,11 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
     assert overlapping(first) == 1
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
-    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once.
-    for name in names:
-        stored[ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class())[len(url):]] = json.dumps(
+    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
+    # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
+    common = ci.shared("3.12")
+    for name, inputs in itertools.product(names, (None, common)):
+        stored[ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]] = json.dumps(
             {"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
