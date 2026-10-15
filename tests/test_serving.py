@@ -714,6 +714,23 @@ def test_a_served_request_is_forced_to_end_at_its_own_budget():
     assert int(np.asarray(ticket.result().tokens)[0, -1]) == 5
 
 
+def test_a_served_request_without_a_budget_takes_what_the_tasks_max_length_leaves():
+    """A task that declares `max_length` and no `max_new_tokens` sizes a request by what the length
+    leaves past its prompt's width; a server built from it sizes the same request alike, alone or
+    in a batch whose rows are as wide as the widest."""
+    bound = dataclasses.replace(task(Sampling(temperature=0)), max_length=8)
+    server = Server.from_task(bound, slots=2, capacity=64)
+    ticket = server.submit("123", key=0)
+    server.run()
+    alone = bound("123", key=0)
+    assert int(np.asarray(alone.lengths)[0]) == 5
+    assert_same_generation(ticket.result(), alone)
+    batch = bound(["12", "1234"], key=0).host()
+    served = server(["12", "1234"], key=0)
+    assert np.asarray(batch.lengths).tolist() == [int(np.asarray(row.lengths)[0]) for row in served] == [4, 4]
+    assert [row.text[0] for row in served] == list(batch.text)
+
+
 def test_a_padding_positions_value_is_not_part_of_a_served_row():
     """The server strips padding and derives valid-token positions from its cursor."""
     from dew.nn.inputs import ModelInputs
