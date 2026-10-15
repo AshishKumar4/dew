@@ -851,37 +851,44 @@ def bwd_intra(q, k, g, g_lo, beta, daqk, dakk, dq, dk, db, dg, *, chunk: int = 6
                       interpret=interpret)
 
 
-def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
-    return _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret)[0]
+def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
+    return _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep)[0]
 
 
-def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool):
+def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
     """fla's `chunk_kda_fwd` (fla/ops/kda/chunk_fwd.py:20-134): the decay cumulated in base 2, the
     intra-chunk scores and inverse, `w`, `u` and the gated keys, the memory across chunks
-    (`fla_gdn.chunk_fwd_h`'s USE_GK branch), then the output. Saves what fla saves."""
+    (`fla_gdn.chunk_fwd_h`'s USE_GK branch), then the output. Saves what fla saves, and where `keep`
+    its memory: `w`, the gated queries and keys, the memory each chunk enters and the corrected
+    values, which fla recomputes in its backward ('delta_memory', as `fla_gdn._rule_fwd` keeps it)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     # Named as the gated delta rule's port names them (`fla_gdn._rule_fwd`) for a remat policy.
     g_hi, g_lo = checkpoint_name(fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
     aqk, akk = intra_solve(q, k, g_hi, g_lo, beta, scale=scale, **kernels)
     akk = checkpoint_name(akk, 'delta_inverse')
-    w, u, kg, _ = recompute_w_u(k, v, beta, akk, g_hi, g_lo, **kernels)
+    w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q if keep else None, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
     o = chunk_fwd_o(q, corrected, g_hi, aqk, h, scale=scale, **kernels)
-    return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans)
+    memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
+    return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, h0, memory, spans)
 
 
-def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
-    """fla's `chunk_kda_bwd` (fla/ops/kda/chunk_bwd.py:434-615): `w`, `u`, the gated queries and keys
-    and the memory recomputed, then `dAqk` and the values' local gradient, the reverse recurrence
+def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, cotangent):
+    """fla's `chunk_kda_bwd` (fla/ops/kda/chunk_bwd.py:434-615): `w`, the gated queries and keys, the
+    memory and corrected values the forward kept, or recomputed as fla does, then `dAqk` and the values'
+    local gradient, the reverse recurrence
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
     each chunk, each sequence's first token's from its memory (`fla_gdn.first_decay_grad`)."""
-    q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans = residual
+    q, k, v, g_hi, g_lo, beta, aqk, akk, h0, memory, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q, **kernels)
-    h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
+    if keep:
+        w, kg, qg, h, corrected = memory
+    else:
+        w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q, **kernels)
+        h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
     dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
@@ -895,7 +902,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
-chunk_kda = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9))
+chunk_kda = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10))
 """fla's chunked Kimi delta attention on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalised as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g` `[B,
 T, HV, K]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the
