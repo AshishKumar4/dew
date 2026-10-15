@@ -97,15 +97,17 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
 
 def phases(corpora: Mapping[str, str], steps: int) -> tuple[DataPhase, ...]:
     """Rigel's phases over the named corpus directories, boundaries rescaled
-    to `steps`; phases left empty by the corpora given merge into the one
-    before them."""
+    to `steps`; empty phases extend the preceding mixture, or the first
+    non-empty mixture when they lead the run."""
     scale = steps / STEPS
     out: list[DataPhase] = []
     for until, shares in PHASES:
+        end = None if until is None else round(until * scale)
         mixture = {corpora[name]: share for name, share in shares.items() if name in corpora}
         if not mixture:
+            if out:
+                out[-1] = DataPhase(out[-1].path, end)
             continue
-        end = None if until is None else round(until * scale)
         path: str | dict[str, float] = next(iter(mixture)) if len(mixture) == 1 else mixture
         if out and out[-1].path == path:
             out[-1] = DataPhase(path, end)
