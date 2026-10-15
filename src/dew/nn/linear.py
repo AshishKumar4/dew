@@ -290,18 +290,25 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
     stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
     valid = None if valid is None else jnp.asarray(valid, bool)
     # The K-1 stream rows that end at the row's last real token.
-    ends = (jnp.full((batch,), length, jnp.int32) if valid is None
+    ends = (rows_like(jnp.full((batch,), length, jnp.int32), x) if valid is None
             else jnp.sum(valid, axis=1, dtype=jnp.int32))
     rows = ends[:, None] + jnp.arange(width)[None, :]
     history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
     if segments is not None:
         # The next call continues the last real token's document, so the history keeps only its tokens,
         # the held ones counting as the first document's, as `_masked_conv1d`'s does.
-        owners = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')
+        owners = _held_first(segments, width)
         last = jnp.take_along_axis(owners, ends[:, None] + width - 1, axis=1)
         history = jnp.where((jnp.take_along_axis(owners, rows, axis=1) == last)[:, :, None], history, 0)
     return _behind(x, kernel=kernel, held=held, bias=bias, valid=valid, segments=segments, parts=parts,
                    dtype=dtype), history
+
+
+def _held_first(segments, width: int):
+    """`segments` `[B, S]` behind `width` held tokens of the first one's
+    document. Not `jnp.pad`'s 'edge' mode, which slices every axis's edge, the
+    rows an Explicit axis splits too."""
+    return jnp.concatenate([jnp.broadcast_to(segments[:, :1], (segments.shape[0], width)), segments], axis=1)
 
 
 def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dtype=None):
@@ -314,7 +321,7 @@ def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dty
     if valid is not None:
         valid = jnp.pad(valid, ((0, 0), (width, 0)), constant_values=True)
     if segments is not None:
-        segments = jnp.pad(segments, ((0, 0), (width, 0)), mode='edge')
+        segments = _held_first(segments, width)
     out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, bias=bias, valid=valid, segments=segments,
                         parts=parts, dtype=dtype)
     return jax.tree.map(lambda piece: piece[:, width:], out)
@@ -392,7 +399,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     if segments is not None:
         # The stream's documents, the history in front counting as the first real token's.
         ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
-        owners = jnp.pad(ordered, ((0, 0), (width, 0)), mode='edge')
+        owners = _held_first(ordered, width)
         # The next call continues the last real token's document, so the history keeps only its
         # tokens; an earlier document's, where the last is shorter than K-1, read as its start's zeros.
         kept = jnp.take_along_axis(owners, rows, axis=1)
