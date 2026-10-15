@@ -24,7 +24,12 @@ def _euler_step(x, denoised, source, target):
     dt = sigma_s - sigma_t
     x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
     derivative = (x - x_0_coeff * denoised) / sigma_t
-    return x + derivative * dt, derivative, x_0_coeff, dt
+    # A step to sigma 0 lands on the clean prediction. As x + derivative dt, the sum XLA computes with the
+    # reciprocal of sigma_t left x a gradient of an ulp where the prediction is clipped and the source's
+    # is exactly 0; every other step keeps the source's form, whose rounding a cancelling first step
+    # from a zero-SNR sigma carries to the end.
+    stepped = jnp.where(sigma_s == 0, x_0_coeff * denoised, x + derivative * dt)
+    return stepped, derivative, x_0_coeff, dt
 
 
 def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
