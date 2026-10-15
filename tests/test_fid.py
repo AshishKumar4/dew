@@ -247,9 +247,10 @@ def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
     from dew.inputs import unit_range
 
     # Oxford Flowers' published Parquet copy, read and resized by dew.data's image recipe: no
-    # dataset preparation, which TFDS runs through TensorFlow.
-    data = loader(ImageData(source=f"hf://{FLOWERS}", image_size=64, augment=None), batch=128,
-                  read="streamed", seed=0, loading=Loading(workers=0, threads=1, read_buffer=2))
+    # dataset preparation, which TFDS runs through TensorFlow. The halves are the run's own, so it
+    # holds out nothing; the recipe's default first 256 records are a slice read by index, not a stream.
+    data = loader(ImageData(source=f"hf://{FLOWERS}", image_size=64, augment=None, validation=None),
+                  batch=128, read="streamed", seed=0, loading=Loading(workers=0, threads=1, read_buffer=2))
     stream = data.train(DataPartition())
     try:
         photos = np.asarray(next(stream)["image"])

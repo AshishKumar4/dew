@@ -174,11 +174,11 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     objective = objective_for(arm)
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
-    # A sequence kernel holds as many documents as the coordinates bound, each row's first and its
-    # padding among them (`dew.nn.linear._cu_seqlens`).
+    # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
+    # more sequence (`dew.nn.attention.flash_attention`).
     segments = objective.bounds.segments
     laid = laid_out(batch, segments).coordinates()
-    assert 1 + int(np.sum(np.asarray(laid.starts)[:, 1:], axis=1).max()) <= laid.max_segments
+    assert int(np.max(laid.segments)) <= laid.max_segments == segments
     variables = objective.init(jax.random.key(0))
     packed_logits, packed_grads = decided(objective, variables, batch, segments)
     order = [owners(batch)[window] == row for window, row in rows_of(batch)]
@@ -226,16 +226,32 @@ def test_a_decision_run_steps_one_program_over_rows_of_every_length():
     assert all(np.isfinite(scalars["train/loss"]) for scalars in logged)
 
 
+def test_segments_caps_the_rows_a_window_holds_and_declares():
+    """`segments` holds every packed window to that many rows, which its packer enforces and its
+    windows declare to the backbone's sequence kernel (`Coordinates.max_segments`), rather than
+    as many as the layout's shortest row fits."""
+    layout, backbone, head = ARMS["marker"]
+    capped = DecisionObjective(backbone(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS,
+                               layout=layout, head=head(), loss=LogLoss(), shuffle_options=False, segments=1)
+    assert capped.data().pack.segments == capped.bounds.segments == 1
+    assert int(windows(objective_for("marker"), 4)["segments"].max()) > 1, "no window packed two rows"
+    batch = windows(capped, 4)
+    assert int(batch["segments"].max()) == 1
+    assert laid_out(batch, capped.bounds.segments).coordinates().max_segments == 1
+
+
 def test_a_batch_of_requests_holds_each_row_and_its_padding_within_the_sequence_capacity():
     """Requests of different lengths, right-padded into one batch, one row a window: the backbone's
-    sequence kernel counts each row's tokens and its padding as documents (`_cu_seqlens`), every
-    one within the capacity the rows' coordinates state, so no request runs in another's."""
+    sequence kernel runs each row and its padding as two sequences (`dew.nn.inputs.cu_seqlens`),
+    the row within the documents the rows' coordinates state and the padding the one more the kernel
+    adds, so no request runs in another's."""
     rows = [row for example in EXAMPLES for row in ROWS.rows(TOKENIZER, SPECIALS, example.state,
                                                              example.questions)]
     laid = DecisionInputs.collate(rows, SPECIALS.pad).coordinates()
     starts = np.asarray(laid.starts)
     assert starts[:, 1:].any(), "no request was padded"
-    assert 1 + int(starts[:, 1:].sum(axis=1).max()) <= laid.max_segments
+    assert 1 + int(starts[:, 1:].sum(axis=1).max()) <= laid.max_segments + 1
+    assert int(np.max(laid.segments)) == laid.max_segments == 1
 
 
 def test_a_one_question_head_reads_joint_rows_only_of_one_question():
