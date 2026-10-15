@@ -147,20 +147,28 @@ def distance(value, truth) -> float:
     return float(np.sqrt(np.mean(np.square(difference))))
 
 
-def worst_row(value, truth, scale: float) -> float:
-    """The largest row's RMS distance from float64, each row (every axis but
-    the last) over the larger of its own RMS and `scale`: a row's rounding
-    follows the size of what it sums, which a row that cancels or is masked to
-    zeros (a single-key query's gradient) does not show, and the leaf's own size
-    stands for it. A value of rank one or less is one row, which `distance`
-    already judges, and has none of its own (0), as has a zero leaf."""
+def worst_row(value, truth, terms=None) -> float:
+    """The largest row's RMS distance from float64 over that row's own size,
+    each row every axis but the last: the RMS of its float64 values, or, where
+    `terms` gives each entry's float64 terms (`float64_terms`), the larger of
+    that and the RMS of what the row sums, so a row that cancels is held to its
+    terms' rounding and not to its near-zero result. No other row's size
+    enters: a small row beside large ones is held to its own. A row whose size
+    is zero must equal it exactly (its ratio is 0 or infinite). A value of
+    rank one or less is one row, which `distance` already judges, and has none
+    of its own (0)."""
     value, truth = np.asarray(value, np.float64), np.asarray(truth, np.float64)
-    if truth.ndim < 2 or not scale > 0:
+    if truth.ndim < 2:
         return 0.0
-    rows = (-1, truth.shape[-1])
-    sizes = np.sqrt(np.mean(np.square(truth.reshape(rows)), axis=1))
-    errors = np.sqrt(np.mean(np.square((value - truth).reshape(rows)), axis=1))
-    return float(np.max(errors / np.maximum(sizes, scale)))
+
+    def rms(rows):
+        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
+
+    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+    errors = rms(value - truth)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratios = np.where(errors == 0, 0.0, errors / sizes)
+    return float(np.max(ratios)) if ratios.size else 0.0
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
@@ -171,8 +179,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
-    scale = distance(truth, 0)
-    row, their_row = worst_row(dew, truth, scale), worst_row(reference, truth, scale)
+    row, their_row = worst_row(dew, truth), worst_row(reference, truth)
     assert within(row, ROW_FACTOR * their_row), (
         f"{label}: dew's worst row is {row:.3e} from float64 (rms over the row's size), the "
         f"reference's {their_row:.3e} (ratio {row / their_row:.2f}, allowed {ROW_FACTOR})")
@@ -214,9 +221,10 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # The worst row, its order floor the leaf's in the rows' own units.
-        row = worst_row(mine, true, scale)
-        row_bar = ROW_FACTOR * max(worst_row(theirs, true, scale), spread * unit)
+        # The worst row, each over its own terms where they are given, its order floor in those units.
+        sums = None if terms is None else summed
+        row = worst_row(mine, true, sums)
+        row_bar = ROW_FACTOR * max(worst_row(theirs, true, sums), spread * unit)
         if not within(row, row_bar):
             over.append(f"{jax.tree_util.keystr(path)}: the worst row {row:.3e} from float64 "
                         f"(rms over its size), allowed {row_bar:.3e}")
