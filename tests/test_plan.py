@@ -329,9 +329,25 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
     trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, "all_but_delta_memory")
     assert trainer.objective.model.remat == half
-    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]][:6] == [
+    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
         (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, False),
-        (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False)]
+        (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False),
+        (1, "minimal_with_conv", False)]
+
+
+def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
+    """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
+    fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
+    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    trainer = lm(**DELTA)
+    half = REMAT_POLICIES["all_but_delta_memory"]
+    fitting(monkeypatch, trainer, lambda split, remat, tiled: split >= 4 and remat != half)
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
+    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
+        (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, True),
+        (2, None, False), (2, "all_but_delta_memory", False), (1, "minimal_with_conv", False)]
 
 
 def test_a_decoder_without_a_half_rung_asks_the_splits_it_did(monkeypatch):
