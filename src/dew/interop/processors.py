@@ -269,7 +269,8 @@ class Processor:
 
         The checkpoint's template interprets template options such as
         `reasoning_effort` and `preserve_thinking`. Messages with media go
-        through the same processor and numeric normalization as plain text.
+        through the same processor and numeric normalization as plain text;
+        text alone is tokenized to NumPy arrays, without Torch.
         """
         from dew.data.chat import ContentPart
 
@@ -279,11 +280,11 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="pt",
+            messages, tokenize=True, return_dict=True, return_tensors="pt" if media else "np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
-        return self._from_tensors(values)
+        return self._from_tensors(values) if media else self.from_hf(values)
 
     def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
         import torch

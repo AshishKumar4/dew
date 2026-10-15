@@ -6,7 +6,6 @@ run the way a reader runs them: their own process, their own command line,
 one artifact each to show they got to the end.
 """
 
-import importlib.util
 import itertools
 import json
 import os
@@ -21,6 +20,7 @@ import pytest
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
 from test_inference import make_run
+from tool_support import load
 
 from dew import Checkpoints
 from dew.artifacts import uint8_pixels
@@ -60,15 +60,6 @@ def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True, dev
     return finished
 
 
-def load_example(name):
-    path = REPO_ROOT / "examples" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"example_{name}", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_flow(tmp_path):
     """The public chain restores a real checkpoint and keeps DPO's reference unchanged."""
     out = tmp_path / "demo"
@@ -97,7 +88,7 @@ def test_text_to_image_example_records_requested_seeds_and_their_real_pixels(tmp
     run, out = tmp_path / "run", tmp_path / "samples"
     make_run(run, Flow(), encoder="clip_text", checkpoint=str(REPO_ROOT / "tests/fixtures/clip/tiny"),
              steps=1)
-    example = load_example("sample_text_to_image")
+    example = load("sample_text_to_image", "examples")
     config = example.Config(model=str(run), out=out, prompts=("a bird", "a flower"),
                             seeds=(3, 17), samplers=("heun40",), negative="a cat")
     example.main(config)
@@ -174,7 +165,7 @@ def fake_dataset(batch, classes=None, size=RES):
 
 @pytest.mark.mesh
 def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
-    example = load_example("train_diffusion")
+    example = load("train_diffusion", "examples")
     config = example.Config(image_size=RES, batch_size=8, steps=3, prompts=("a", "b"),
                             model={"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2},
                             out=tmp_path)
@@ -193,7 +184,7 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
 
 @pytest.mark.mesh
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
-    example = load_example("train_jepa")
+    example = load("train_jepa", "examples")
     # An 8x8 patch grid, the smallest the default mask geometry fits on.
     config = example.Config(classes=5, image_size=32, patch_size=4, batch_size=8, steps=3,
                             model={"emb_features": 32, "num_layers": 2, "num_heads": 2}, out=tmp_path)
@@ -299,7 +290,7 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     shutil.copytree(fixtures / "gemma4-ple", model)
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(fixtures / "diffusion-gemma-workflow" / name, model / name)
-    example = load_example("sft_gemma4")
+    example = load("sft_gemma4", "examples")
     chat = example.write_conversations(example.SMOKE_CONVERSATIONS, tmp_path)
 
     finished = subprocess.run(

@@ -56,7 +56,7 @@ def test_keep_and_a_ranking_retain_the_steps_orbaxs_own_policies_retain(tmp_path
 class Flagged(Objective):
     """A loss whose gradient is infinite on a batch flagged bad."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.ones((2,), jnp.float32)}}
 
     def loss(self, variables, batch, step):
@@ -89,7 +89,7 @@ def test_the_loss_scale_follows_flaxs_dynamic_scale_through_finite_and_rejected_
 class Linear(Objective):
     """A masked least-squares loss pooled as the ratio of its sums."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.asarray([0.3, -0.2], jnp.float32)}}
 
     def loss(self, variables, batch, step):
