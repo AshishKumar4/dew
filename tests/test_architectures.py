@@ -16,6 +16,7 @@ afterwards.
 import json
 import math
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +35,7 @@ from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step
+from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -455,6 +456,41 @@ def update_terms(case: Case, tmp_path, initial, steps=2):
         return float64_terms(stepped, state)[1]
 
 
+def shard_terms(case: Case, tmp_path, initial):
+    """The terms a data-parallel layout's first step sums across devices, in
+    float64 from `initial`: each device's partial of every leaf the step
+    writes, summed absolutely (`float64_terms`' terms are the root sum of
+    squares of what one device sums). At BATCH rows over BATCH devices a
+    device's partial is its row's: the step from the whole batch with that
+    row alone valid (`VALID_ROWS`), the same draws, weighted by its share of
+    the batch. The step is linear in its gradient (SGD with momentum and
+    the EMA), so the partials sum to the whole step, which is checked."""
+    trainer, encoder = make_trainer(case, tmp_path / "shards", 1, devices=1)
+    batch = model_batch(wide(case, next(batches(case, encoder)())))
+    state = widened_state(initial)
+
+    def with_rows(valid):
+        return {**batch, VALID_ROWS: np.asarray(valid)}
+
+    with trainer._traced_on(trainer.device_mesh):
+        body = trainer._step_body(trainer._loss_shape(state, with_rows(np.ones(BATCH, bool))), {}, 1)
+
+        def written(valid):
+            advanced, *_ = body(state, with_rows(valid), 0)
+            return {name: jax.device_get(jax.tree.map(lambda after, before: after - before,
+                                                      getattr(advanced, name), getattr(state, name)))
+                    for name in ("variables", "opt_state", "ema")}
+
+        whole = written(np.ones(BATCH, bool))
+        parts = [jax.tree.map(lambda delta: delta / BATCH, written(np.arange(BATCH) == row))
+                 for row in range(BATCH)]
+    summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
+    for got, want in zip(jax.tree.leaves(summed), jax.tree.leaves(whole), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-12 * float(np.max(np.abs(want), initial=0)))
+    terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
+    return SimpleNamespace(**terms)
+
+
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
     """Each gated delta net layer's decay parameters' gradients as their
     terms summed absolutely, by head, in float64, keyed by the parameter's
@@ -582,6 +618,13 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         with jax.enable_x64(new_val=True):
             exact = jax.device_get(truth(case, tmp_path, copied(), steps))
             terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
+            if rows:
+                # A layout's step adds its devices' partials, whose terms can far exceed the
+                # whole batch's where the rows' gradients cancel across devices.
+                across = shard_terms(case, tmp_path, copied())
+                terms = replace(terms, **{name: jax.tree.map(np.maximum, getattr(terms, name),
+                                                             getattr(across, name))
+                                          for name in ("variables", "opt_state", "ema")})
         # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
         # rule's cumulative sums of the decay, which the step's own terms do not see.
         terms = raised(terms, decay_invariants(case, tmp_path, initial, steps))
