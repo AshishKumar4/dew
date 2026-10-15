@@ -985,10 +985,13 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, lo_ref, h_ref, do_ref, 
     """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
     head and `BK` key columns, over the value heads it serves in turn: over the value columns `bv` at
     a time, `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the
-    gates, `ds`'s causal mask, `dq += ds k`, `dk += ds^T q` and the decay's gradient, its last row
-    taking the memory's. The value heads' `dq` and `dk` sum in fp32 and round to their dtype once,
-    where fla rounds each value head's and sums them after. The heads are a loop, not unrolled, so a
-    program holds one head's accumulators at a time."""
+    gates, `ds`'s causal mask, `dq += ds k` and `dk += ds^T q`. The decay's gradient is each token's
+    own (`_summed_back`): the scores' terms `ds (q k^T)` through the ranges between their tokens, the
+    keys' terms into the memory the chunk leaves through the ranges to its end, and the queries'
+    reads of the memory it enters and that memory's decay through the ranges from its start, where
+    fla gives each cumulated decay's and sums them back. The value heads' `dq` and `dk` sum in fp32
+    and round to their dtype once, where fla rounds each value head's and sums them after. The heads
+    are a loop, not unrolled, so a program holds one head's accumulators at a time."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -1000,6 +1003,9 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, lo_ref, h_ref, do_ref, 
         queries, keys = read(q_ref), read(k_ref)
         index = jnp.arange(chunk)
         causal = index[:, None] >= index[None, :]
+        strict = index[:, None] > index[None, :]
+        last_row = index == taken - 1
+        scores = _dot(queries, keys.T, exact=exact)
 
         def head_grads(head, sums):
             ds = jnp.zeros((chunk, chunk), jnp.float32)
@@ -1020,17 +1026,20 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, lo_ref, h_ref, do_ref, 
             _write(_rows(dw_ref, start, chunk, head), taken, -dw)
             gate = _halves(g_ref, lo_ref, start, taken, chunk, 0, head)
             last = _row(g_ref, lo_ref, (start + taken - 1, head))
-            dg_last = dg_last * jnp.exp2(last[0])
             dq = dq * jnp.exp2(gate[0])[:, None] * scale
             dk = dk * jnp.exp2(compensated_difference(last, gate))[:, None]
-            dg_last += jnp.sum(dk * keys.astype(jnp.float32))
             ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate)), 0.0) * scale
+            # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
+            leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
+            pairs = (jnp.where(strict, ds * scores, 0.0)
+                     + jnp.where(last_row[:, None] & strict, leaving[None, :], 0.0))
+            # The queries' reads of the memory the chunk enters, and that memory's own decay to its end.
+            after = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
+                     + jnp.where(last_row, dg_last * jnp.exp2(last[0]), 0.0))
+            _write(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
             ds = ds.astype(keys.dtype)
             dq += _dot(ds, keys, exact=exact)
             dk += _dot(ds.T, queries, exact=exact)
-            dg = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
-                  - jnp.sum(dk * keys.astype(jnp.float32), axis=1))
-            _write(_rows(dg_ref, start, chunk, head), taken, jnp.where(index < taken - 1, dg, dg + dg_last))
             return sums[0] + dq, sums[1] + dk
 
         zeros = jnp.zeros((chunk, width), jnp.float32)
@@ -1113,9 +1122,19 @@ def _chunk_states(h):
     return h.reshape(-1, *h.shape[2:])
 
 
-def _wy_gate_sum(d_gate, weighted):
-    """fla wy_fast.py:246: subtract the two fp32 reductions before adding the gate accumulator."""
-    return d_gate + (jnp.sum(weighted, axis=1) - jnp.sum(weighted, axis=0))
+def _summed_back(index, pairs, after):
+    """The gradient of each of a chunk's per-token decays, `d/dg_t`, from the gradients of terms through
+    ranges of its cumulated decay: `pairs` `[C, C]`, each `(i, j)` a term through the range `(j, i]`
+    (strictly lower), and `after` `[C]`, each `s` a term through the range from the chunk's start to
+    `s`. Each token sums only the terms whose range holds it, `sum_{j < t <= i} pairs + sum_{s >= t}
+    after`, where fla takes the gradient of each cumulated decay (row sums less column sums) and sums
+    those back, adding and taking back every term whose range misses the token: fp32's residue where
+    the gradient is exactly zero (keys of zero before a token, 1.7e-10 in
+    test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens), and the cancellation of terms
+    many times the gradient where it is not. Each row's pairs before `t` are its running sum less
+    its `t`th, exactly zero where no pair before `t` is nonzero."""
+    through = jnp.cumsum(pairs, axis=1) - pairs
+    return jnp.sum(jnp.where(index[:, None] >= index[None, :], through + after[:, None], 0.0), axis=0)
 
 
 def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, lo_ref, a_ref, dw_ref, du_ref, *refs, chunk: int,
@@ -1204,7 +1223,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, lo_ref, a_ref, dw_r
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         _write(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
-        _write(_rows(dg_ref, start, chunk), taken, _wy_gate_sum(d_gate, weighted))
+        _write(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1389,28 +1408,12 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     return (o, final), (q, k, v, g_hi, g_lo, beta, a, h0, memory, spans)
 
 
-def first_decay_grad(dg, h0, dh0, spans: Sequences):
-    """`dg` `[B, T, HV, ...]`, the decay's gradient summed back over each chunk, with each sequence's
-    first token's taken from the memory its decay scales: `<h0, dh0>` over the values (and over the
-    keys where the decay is per head, `dg` `[B, T, HV]`) for a row's first sequence, and exactly zero
-    for any other, which starts from no memory. Summed back, that token's gradient is every term of
-    its chunk, which cancel to fp32's residue where the memory is zero (1.8e-10 on a zero initial
-    memory, as a float64 recurrence and the portable math hold exactly)."""
-    batch, length = dg.shape[:2]
-    first, count = spans.spans[:, 0], spans.spans[:, 1]
-    shared = jnp.sum(h0.astype(jnp.float32) * dh0, axis=(-1,) if dg.ndim == 4 else (-2, -1))
-    value = jnp.where((first % length == 0).reshape(-1, *(1,) * (dg.ndim - 2)), shared[first // length], 0.0)
-    flat = dg.reshape(batch * length, *dg.shape[2:])
-    index = jnp.where(count > 0, first, batch * length)
-    return flat.at[index].set(value.astype(dg.dtype), mode='drop').reshape(dg.shape)
-
-
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, cotangent):
     """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250): `w`, `u` and the memory the forward kept,
     or recomputed from the initial memory as fla does, then the output's local value gradient, the
     reverse recurrence, the query, key, `w` and decay gradients, the WY backward, and the decay's
-    gradient summed back over each chunk, each sequence's first token's from its memory
-    (`first_decay_grad`)."""
+    gradient, each token's summed over the terms through it (`_summed_back`), which a sequence's first
+    token with no memory before it takes as exactly zero."""
     q, k, v, g_hi, g_lo, beta, a, h0, memory, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
@@ -1423,8 +1426,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
     dh, dh0, dv = chunk_bwd_dhu(q, k, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
     dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g_hi, g_lo, h, dv, do, dh, scale=scale, **kernels)
     dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, g_hi, g_lo, a, dw, dv, dk, **kernels)
-    dg = first_decay_grad(chunk_local_cumsum(dg + dg2, reverse=True, **kernels), h0, dh0, spans)
-    return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
+    return dq, dk, dv, (dg + dg2).astype(jnp.float32), db, dh0, None
 
 
 chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10))
