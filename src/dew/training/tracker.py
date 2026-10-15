@@ -436,7 +436,8 @@ def _(value: TokenScores, prefix: Path) -> list[Path]:
 def _(value: Decisions, prefix: Path) -> list[Path]:
     path = prefix.with_suffix('.npz')
     np.savez(path, probabilities=_home(value.probabilities), options=_home(value.options),
-             labels=_home(value.labels), ordinal=_home(value.ordinal), scored=_home(value.scored))
+             labels=_home(value.labels), targets=_home(value.targets), ordinal=_home(value.ordinal),
+             scored=_home(value.scored))
     return [path]
 
 

@@ -184,7 +184,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
     split = window_split([(name, start, end) for name, start, end, _ in kernels])
     scale = 1e-6 / steps
     return {"capture": str(path), "steps": steps, "step_program": "torch.compile",
-            "device_ms_per_step": split["busy"] * scale,
+            "device_busy_ms_per_step": split["busy"] * scale,
             "device_window_ms_per_step": split["window"] * scale,
             "device_idle_ms_per_step": (split["idle_host"] + split["idle_input"]) * scale,
             "by_kind_ms": {kind: kinds[kind] for kind in KINDS}, "by_part_ms": dict(parts),
@@ -223,7 +223,7 @@ def smoke_attribution(path: Path) -> dict:
     for kind in KINDS:
         if abs(result["by_kind_ms"][kind] - (0.010 if kind == "layout" else 0.005)) > 1e-9:
             raise AssertionError(f"incorrect kernel/launch classification for {kind}")
-    if abs(result["device_ms_per_step"] - 0.040) > 1e-9:
+    if abs(result["device_busy_ms_per_step"] - 0.040) > 1e-9:
         raise AssertionError("overlapping copy counted twice in device busy time")
     if abs(result["device_idle_ms_per_step"] - 0.035) > 1e-9:
         raise AssertionError("incorrect interval-union idle accounting")
