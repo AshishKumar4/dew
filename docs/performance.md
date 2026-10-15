@@ -1090,6 +1090,33 @@ names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHO
 tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
 --head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
 
+### FlashAttention's packed backward over the batch's blocks, 2026-10-15
+
+FlashAttention-3's packed backward, and FlashAttention-2's, launched a CTA for every (sequence,
+block) pair of `N` sequences by `max_seqlen` rows (flash_bwd_launch_template.h), along with their
+preprocess and postprocess kernels. Dew hands the kernel `B * max_segments` sequences, most of them
+empty, so the CTAs mostly found their sequence ended, and at heads of 256, whose backward fits one
+CTA an SM, they ran one wave at a time: at Qwen3.5-0.8B's attention (8 x 3072 packed rows of 200 to
+1600-token documents, 8 query heads over 2 of 256, causal, bf16) the backward took longer as the
+declared bound grew while the forward did not. The kernels now launch over the batch's padded block
+space, in which sequence `i`'s blocks start at `cu_seqlens[i] / block + i`, and each CTA finds its
+sequence by a binary search (`kernels/flash_attn/patches/`). FlashAttention-2's port also stops
+zeroing its whole `dq_accum` outside the deterministic order, whose padded rows grew with `N` and
+whose blocks the preprocess kernel clears. Backward ms against the declared `max_segments`, 8, 16,
+32 and 64:
+
+| GPU | before | after |
+|---|---|---|
+| H100 (FlashAttention-3) | 1.35, 1.57, 1.95, 2.75 | 1.23, 1.26, 1.28, 1.36 |
+| A100 (FlashAttention-2) | 3.3 to 4.0, 4.5 to 4.6, 5.1 to 5.4, 5.5 to 6.1 | 3.3 to 3.8, 3.9 to 4.1, 3.9 to 4.1, 3.1 to 4.6 |
+
+The outputs are bitwise those of the stock kernels, and the gradients' float64 distances theirs to
+six digits (dk and dv bitwise on FlashAttention-2, whose dq and FlashAttention-3's gradients sum
+with atomics). What growth remains at 64 comes from the accumulators FlashAttention-3 pads by a
+block a sequence. Through the trainer, the packed Qwen3.5-0.8B step at 8 x 3072 tokens went from
+336.7 and 335.9 ms to 333.0 and 332.0 on an H100, and from 897.9 and 896.6 ms to 891.9 and 892.1
+on an A100, alternated.
+
 ### Heads of 64 on the A100, 2026-10-14
 
 FlashAttention-2 (`dew_flash_attn` 0.3.0) now beats tokamax's Pallas-Triton kernel at every 64-wide
