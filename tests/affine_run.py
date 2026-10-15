@@ -33,7 +33,7 @@ class Regression(Objective):
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
         self.probe = probe
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, variables, batch, step):
