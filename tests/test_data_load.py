@@ -240,10 +240,10 @@ def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_defau
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "images.parquet")
     source = Files(str(tmp_path / "images.parquet"))
 
-    def labels(reader):
+    def labels(reader, rows=None):
         stream = reader(DataPartition())
         try:
-            return [int(label) for batch in stream for label in batch["label"]]
+            return [int(label) for batch in itertools.islice(stream, rows) for label in batch["label"]]
         finally:
             stream.close()
 
@@ -252,11 +252,13 @@ def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_defau
     data = ImageData(source, image_size=4, augment=None, validation=HoldOut(fraction=0.1, by="hash")).load(
         batch=1, read="streamed", loading=READ)
     assert data.val is not None
-    trained, scored = labels(data.train), labels(data.val)
+    scored = labels(data.val)
+    # The training stream repeats its shuffled pass; its first pass is the rest of the records.
+    trained = labels(data.train, 320 - len(scored))
     assert scored and sorted(trained + scored) == list(range(320))
     whole = ImageData(source, image_size=4, augment=None, validation=None).load(batch=1, read="streamed",
                                                                                loading=READ)
-    assert whole.val is None and sorted(labels(whole.train)) == list(range(320))
+    assert whole.val is None and sorted(labels(whole.train, 320)) == list(range(320))
 
 
 def test_image_data_defaults_hold_out_256_records_and_resize_both_parts():
