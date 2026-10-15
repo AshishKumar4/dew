@@ -18,6 +18,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Co
 
 from dew.interop import Pretrained
 from dew.interop.verify import _ROUNDING
+from dew.sampling import Sampling, generate
 
 
 def write_fixture(family):
@@ -36,23 +37,6 @@ def write_fixture(family):
     model = AutoModelForCausalLM.from_config(config, attn_implementation='eager')
     write_device_tiny(f'{family}-tiny', model, 'cuda',
                       f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}')
-
-
-def greedy(loaded, ids, steps):
-    """Use the decoder cache rather than recomputing the prompt at each draw."""
-    model = loaded.model
-    variables = loaded.variables
-    _, cache = model.apply(variables, jnp.asarray(ids), decode=True, mutable=['cache'])
-    logits, cache = model.apply({**variables, **cache}, jnp.asarray(ids),
-                                decode=True, mutable=['cache'])
-    generated = ids
-    for index in range(steps):
-        token = np.asarray(jnp.argmax(logits[:, -1], axis=-1), np.int32)[:, None]
-        generated = np.concatenate((generated, token), axis=1)
-        if index + 1 < steps:
-            logits, cache = model.apply({**variables, **cache}, jnp.asarray(token),
-                                        decode=True, mutable=['cache'])
-    return generated
 
 
 def check_checkpoint(checkpoint, output, revision=None):
@@ -81,7 +65,7 @@ def check_checkpoint(checkpoint, output, revision=None):
     layers = config.num_hidden_layers
     bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
-    ours = greedy(loaded, ids, 6)
+    ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, sampling=Sampling(temperature=0)).tokens)
     metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
     revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
     result = {'checkpoint': checkpoint, 'revision': revision,

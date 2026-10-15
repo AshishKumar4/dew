@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -25,21 +26,11 @@ def fixture(name):
     return np.load(TINY / f'{name}.npy')
 
 
-def test_grouped_norms_and_yarn_compute_the_remote_codes_logits():
-    """Norms over two groups of the width and the 0.9B's YaRN, unpadded and
-    left-padded, and the cached greedy continuation."""
-    from tools.classic_gpt_reference import greedy
-
-    loaded = load()
-    assert {name: spec.groups for name, spec in loaded.model.norms.items()} == dict.fromkeys(
+def test_the_loaded_model_norms_over_two_groups_of_the_width():
+    """The fixture's norms each split the width into two groups, which the shared reference flow's
+    logits then hold to the remote code (tests/test_hf_reference_decoders.py)."""
+    assert {name: spec.groups for name, spec in load().model.norms.items()} == dict.fromkeys(
         ('input_layernorm', 'post_attention_layernorm', 'norm'), 2)
-    logits = np.asarray(loaded.model.apply(loaded.variables, fixture('input_ids')))
-    assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), 'K2 Horizon logits')
-    mask = fixture('attention_mask')
-    padded = np.asarray(loaded.model.apply(loaded.variables, fixture('padded_ids'), attention_mask=mask))
-    assert_as_exact_as_the_reference(padded[mask], fixture('padded_logits')[mask],
-                                     fixture('padded_logits_f64')[mask], 'K2 Horizon padded logits')
-    np.testing.assert_array_equal(greedy(loaded, fixture('input_ids')[:, :4], 6), fixture('generated'))
 
 
 def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
@@ -51,14 +42,8 @@ def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
     assert config['model_type'] == 'k2_horizon' and config['layernorm_num_groups'] == 2
     assert config['num_experts'] == 0 and config['query_key_norm'] is False
     assert config['auto_map']['AutoModelForCausalLM'].endswith('modeling_k2_horizon.K2HorizonForCausalLM')
-    original, exported = load_shards(TINY), load_shards(tmp_path)
-    assert set(original) == set(exported)
-    for tensor in original:
-        np.testing.assert_array_equal(original[tensor], exported[tensor])
-    ids = fixture('input_ids')
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
+    assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
+    assert_reloads(loaded, tmp_path, fixture('input_ids'))
 
 
 def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):

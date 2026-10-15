@@ -1,6 +1,5 @@
 """Classic decoder ports against transformers 5.16.1, with nonzero biases."""
 
-import dataclasses
 from pathlib import Path
 
 import jax
@@ -11,6 +10,7 @@ import pytest
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
@@ -31,10 +31,8 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     actual = np.asarray(model.apply(loaded.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    from tools.classic_gpt_reference import greedy
-
-    generated = greedy(dataclasses.replace(loaded, model=model), ids[:1, :4], 6)
-    np.testing.assert_array_equal(generated, np.load(directory / 'generated.npy'))
+    generated = generate(model, loaded.variables, ids[:1, :4], 6, sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(directory / 'generated.npy'))
 
 
 def test_gpt2_public_generation_matches_the_reference_continuation():
