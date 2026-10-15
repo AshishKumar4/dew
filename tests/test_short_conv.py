@@ -34,15 +34,24 @@ def operands(batch, length, parts, *, taps=4, dtype=jnp.bfloat16, bias=False, va
     return x, weights, shift, kept if valid else None
 
 
+def documents(batch, length, seed=2):
+    """Packed rows `[batch, length]`: documents numbered from 1 of 1 to a few tens of tokens, so some
+    are shorter than a conv's window and others cross a forward tile and a backward run."""
+    rng = np.random.default_rng(seed)
+    starts = rng.random((batch, length)) < rng.choice([0.03, 0.3], size=(batch, length))
+    starts[:, 0] = True
+    return jnp.asarray(np.cumsum(starts, axis=1), jnp.int32)
+
+
 def cotangents(x, parts, dtype, seed=1):
     rng = np.random.default_rng(seed)
     return tuple(jnp.asarray(rng.normal(size=(*x.shape[:2], width)), dtype) for width, _ in parts)
 
 
-def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True):
+def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True, segments=None):
     """`conv`'s pieces and its gradients for `x`, the taps and the bias under `grads`."""
     def loss(x, weights, shift):
-        out = conv(x, weights, activation, shift, valid=valid, parts=parts, dtype=dtype)
+        out = conv(x, weights, activation, shift, valid=valid, segments=segments, parts=parts, dtype=dtype)
         return sum(jnp.sum(piece.astype(jnp.float32) * grad.astype(jnp.float32))
                    for piece, grad in zip(out, grads, strict=True)), out
 
@@ -50,18 +59,18 @@ def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True):
     return out, found
 
 
-def kernel_conv(x, weights, activation, shift, *, valid, parts, dtype):
-    return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), parts,
-                           activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
+def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
+    return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), segments,
+                           parts, activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
                            interpret=jax.default_backend() != "gpu")
 
 
-def truth(x, weights, shift, valid, parts, grads, activation=True):
+def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None):
     """The float64 conv and its gradients, the same cotangents widened."""
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda a: None if a is None else jnp.asarray(a, jnp.float64), (x, weights, shift))
         return run(xla_conv1d, *wide, valid, parts, jnp.float64,
-                   tuple(jnp.asarray(grad, jnp.float64) for grad in grads), activation)
+                   tuple(jnp.asarray(grad, jnp.float64) for grad in grads), activation, segments)
 
 
 def assert_follows_xla(got, want, exact, label):
@@ -78,22 +87,26 @@ def assert_follows_xla(got, want, exact, label):
 
 @pytest.mark.parametrize("dtype, out", [(jnp.bfloat16, jnp.bfloat16), (jnp.bfloat16, jnp.float32),
                                          (jnp.float32, jnp.float32)])
-@pytest.mark.parametrize("shape, parts, taps, bias, valid", [
-    ((2, 37), DELTA, 4, False, False),
-    ((2, 37), DELTA, 4, False, True),
-    ((1, 700), ((64, None),), 4, True, False),
-    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True),
-    ((2, 9), ((48, None),), 2, True, False),
+@pytest.mark.parametrize("shape, parts, taps, bias, valid, packed", [
+    ((2, 37), DELTA, 4, False, False, False),
+    ((2, 37), DELTA, 4, False, True, False),
+    ((2, 37), DELTA, 4, False, False, True),
+    ((1, 700), ((64, None),), 4, True, False, False),
+    ((1, 700), ((64, None),), 4, True, False, True),
+    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, False),
+    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, True),
+    ((2, 9), ((48, None),), 2, True, False, False),
 ])
-def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid):
+def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
     """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them:
     bf16 values rounded where XLA rounds them, fp32 ones within fp32 reassociation, at lengths that
-    leave runs and a tile partly past the end."""
+    leave runs and a tile partly past the end, and over packed documents that start inside a window."""
     x, weights, shift, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+    segments = documents(*shape) if packed else None
     grads = cotangents(x, parts, out)
-    got, got_grads = run(kernel_conv, x, weights, shift, kept, parts, out, grads)
-    want, want_grads = run(xla_conv1d, x, weights, shift, kept, parts, out, grads)
-    exact, exact_grads = truth(x, weights, shift, kept, parts, grads)
+    got, got_grads = run(kernel_conv, x, weights, shift, kept, parts, out, grads, segments=segments)
+    want, want_grads = run(xla_conv1d, x, weights, shift, kept, parts, out, grads, segments=segments)
+    exact, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
     for number, (piece, reference, value) in enumerate(zip(got, want, exact, strict=True)):
         assert piece.dtype == jnp.dtype(out)
         assert_follows_xla(piece, reference, value, f"piece {number}")
@@ -152,7 +165,7 @@ def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason)
 
 
 TRAINING_SHAPES = {
-    # Qwen3.5-0.8B's decision step: 16 key and 16 value heads of 128.
+    # Qwen3.5-0.8B: 16 key and 16 value heads of 128.
     "0.8b": ((8, 3072), ((2048, 128), (2048, 128), (2048, None))),
     # Qwen3.5-9B: 16 key heads, 32 value heads.
     "9b": ((4, 3072), ((2048, 128), (2048, 128), (4096, None))),
@@ -160,18 +173,20 @@ TRAINING_SHAPES = {
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("model", sorted(TRAINING_SHAPES))
-def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype):
+def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training shape, bf16 projections into the bf16 operands fla's rule
-    takes, and fp32 into fp32: each piece and gradient as exact as XLA's own conv
-    (`assert_as_exact_as_the_reference`)."""
+    takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as XLA's
+    own conv (`assert_as_exact_as_the_reference`)."""
     shape, parts = TRAINING_SHAPES[model]
     x, weights, _, _ = operands(*shape, parts, dtype=dtype)
+    segments = documents(*shape) if packed else None
     grads = cotangents(x, parts, dtype)
-    got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads)
-    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads)
+    got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
+    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
     labels = ("q", "k", "v", "dx", "dtaps")
     # The gradients of the projection and the taps; there is no bias.
     for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
@@ -181,26 +196,31 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype):
 
 def training_cases():
     """Both kernels, through the conv's VJP, at each training shape: a delta net's bf16 conv into bf16
-    pieces over right-padded rows, and Mamba's fp32 output with a bias and no norm."""
-    def case(name, shape, parts, out, bias, valid):
+    pieces over right-padded rows and over packed ones, and Mamba's fp32 output with a bias and no norm
+    over whole rows and packed ones."""
+    def case(name, shape, parts, out, bias, valid, packed):
         def call():
             x = jax.ShapeDtypeStruct((*shape, sum(width for width, _ in parts)), jnp.bfloat16)
             weights = jax.ShapeDtypeStruct((x.shape[-1], 4), jnp.float32)
             shift = jax.ShapeDtypeStruct((x.shape[-1],), jnp.float32) if bias else None
             kept = jax.ShapeDtypeStruct(shape, jnp.int8) if valid else None
+            segments = jax.ShapeDtypeStruct(shape, jnp.int32) if packed else None
 
-            def grads(x, weights, shift, kept):
+            def grads(x, weights, shift, kept, segments):
                 def loss(x, weights, shift):
-                    out_ = short_conv.conv(x, weights, shift, kept, parts, activation=True, eps=1e-6,
-                                           dtype=jnp.dtype(out), interpret=False)
+                    out_ = short_conv.conv(x, weights, shift, kept, segments, parts, activation=True,
+                                           eps=1e-6, dtype=jnp.dtype(out), interpret=False)
                     return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
                 return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
-            return grads, (x, weights, shift, kept)
+            return grads, (x, weights, shift, kept, segments)
         return KernelCase(name, call)
 
     for model, (shape, parts) in sorted(TRAINING_SHAPES.items()):
-        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, bias=False, valid=True)
-    yield case("mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True, valid=False)
+        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, bias=False, valid=True, packed=False)
+        yield case(f"{model}/packed", shape, parts, jnp.bfloat16, bias=False, valid=False, packed=True)
+    for packed in (False, True):
+        yield case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True,
+                   valid=False, packed=packed)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
@@ -209,7 +229,7 @@ def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
     CPU (tests/kernel_compile.py), within the compile bound and the block's shared memory."""
     pytest.importorskip("triton")
     found = compile_kernels(training_cases(), target)
-    assert len(found) == len(TRAINING_SHAPES) + 1
+    assert len(found) == 2 * len(TRAINING_SHAPES) + 2
     failures = [f"{record['name']}: {record['error']}" if "error" in record else
                 f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
                 for record in found if "error" in record or not record["shared"] <= record["limit"]]
@@ -221,19 +241,21 @@ def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
 def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
     (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
-    over padded rows, and the gradients of the input, the taps and the bias within the float64 gate
-    of one device's, and no operand moved between devices. On a GPU each shard is the fused kernel."""
+    over padded rows of packed documents, and the gradients of the input, the taps and the bias within
+    the float64 gate of one device's, and no operand moved between devices. On a GPU each shard is the
+    fused kernel."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
     x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True)
+    segments = documents(4, 48)
     grads = cotangents(x, DELTA, jnp.float32)
 
-    def gradients(x, weights, shift, valid, *grads):
-        return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads)
+    def gradients(x, weights, shift, valid, segments, *grads):
+        return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
 
-    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads))
+    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads, segments=segments))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     rows, whole = PartitionSpec(axis), PartitionSpec()
-    assert_runs_per_shard(gradients, (x, weights, shift, valid, *grads),
-                          [rows, whole, whole, rows, rows, rows, rows], mesh, expected)
+    assert_runs_per_shard(gradients, (x, weights, shift, valid, segments, *grads),
+                          [rows, whole, whole, rows, rows, rows, rows, rows], mesh, expected)

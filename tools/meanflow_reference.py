@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from recorded_draws import JaxDraws, Tape
 from reference_source import definitions
 
 jax.config.update("jax_enable_x64", val=True)
@@ -64,31 +65,7 @@ class Numpy:
         return jnp.clip(x, a_min, a_max)
 
 
-class Draws:
-    """`jax.random` as the reference calls it: each draw recorded, or, given
-    recorded draws, the next one widened to the dtype asked for."""
-
-    def __init__(self, replayed: list[np.ndarray] | None = None):
-        self.drawn: list[np.ndarray] = []
-        self.replayed = None if replayed is None else list(replayed)
-
-    def __getattr__(self, name):
-        return getattr(jax.random, name)
-
-    def _next(self, value, dtype):
-        if self.replayed is not None:
-            return jnp.asarray(self.replayed.pop(0), dtype)
-        self.drawn.append(np.asarray(value))
-        return value
-
-    def normal(self, key, shape=(), dtype=jnp.float32):
-        return self._next(jax.random.normal(key, shape, dtype=jnp.float32), dtype)
-
-    def uniform(self, key, shape=(), dtype=jnp.float32, minval=0.0, maxval=1.0):
-        return self._next(jax.random.uniform(key, shape, jnp.float32, minval, maxval), dtype)
-
-
-def published(draws: Draws, dtype) -> type:
+def published(draws: JaxDraws, dtype) -> type:
     scope = definitions(MEANFLOW, ("MeanFlow",), {
         "nn": nn, "jax": types.SimpleNamespace(**{**vars(jax), "random": draws}), "jnp": Numpy(),
         "models_dit": types.SimpleNamespace(Tiny=lambda **kwargs: Tiny(name=kwargs["name"]))})
@@ -104,7 +81,9 @@ def published(draws: Draws, dtype) -> type:
 
 
 def run(settings: dict, dtype, x, labels, weights, replayed=None):
-    draws = Draws(replayed)
+    # jax.random as the reference calls it, each draw recorded, or replayed in the dtype asked for.
+    tape = Tape(replayed)
+    draws = JaxDraws(tape, jnp.float32)
     model = published(draws, dtype)(model_str="Tiny", model_config={}, **settings)
 
     def loss(weights):
@@ -115,7 +94,7 @@ def run(settings: dict, dtype, x, labels, weights, replayed=None):
 
     (value, times), gradient = jax.value_and_grad(loss, has_aux=True)(jnp.asarray(weights, dtype))
     assert value.dtype == dtype and gradient.dtype == dtype, (value.dtype, dtype)
-    return value, gradient, times, draws.drawn
+    return value, gradient, times, tape.drawn
 
 
 def main() -> None:
