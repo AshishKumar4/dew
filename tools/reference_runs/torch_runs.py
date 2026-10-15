@@ -134,11 +134,13 @@ def train(args: argparse.Namespace, place: Ranks, run: Split, optimizer,
 
 
 def record(args: argparse.Namespace, place: Ranks, run: Split, curves: Curves, work: WorkloadWork,
-           loss: torch.Tensor, *, framework: str, fields: dict, config: dict, versions: dict) -> dict | None:
+           loss: torch.Tensor, *, framework: str, precision: str, parallel: str, config: dict,
+           versions: dict) -> dict | None:
     """Rank 0's record of the run, None on the others: `loss`, each step's
     loss as the ranks agree on it, every rank's memory peak, gathered by all
     of them, the timed throughput, and MFU from Dew's count of the same step
-    (`work`), which must train the run's tokens. `fields` and `config` are
+    (`work`), which must train the run's tokens. `precision` and `parallel`
+    label the row as every runner's record does; `config` and `versions` add
     the backend's own."""
     peak = torch.tensor([torch.cuda.max_memory_allocated(place.device),
                          torch.cuda.max_memory_reserved(place.device)],
@@ -157,7 +159,8 @@ def record(args: argparse.Namespace, place: Ranks, run: Split, curves: Curves, w
     peak_rate = peak_flops(device_name)
     return {
         "framework": framework,
-        **fields,
+        "precision": precision,
+        "parallel": parallel,
         "world": place.world,
         "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps,
                    "seq": run.seq, "accumulation": run.accumulation, "micro_batch": run.micro,

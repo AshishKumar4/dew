@@ -287,10 +287,14 @@ def main() -> None:
     # token mean, whatever the ranks repeat under tensor parallelism.
     summed = torch.stack(curves.losses)
     dist.all_reduce(summed)
+    from megatron.core import parallel_state
+
     hf = text_config(args.model)
+    data = f"{'fsdp' if args.fsdp else 'data'}={parallel_state.get_data_parallel_world_size()}"
     result = record(
         args, place, run.split, curves, work, summed[:, 0] / summed[:, 1], framework="megatron-core",
-        fields={},
+        precision=f"bf16 compute, fp32 weights, {args.moments} moments",
+        parallel=data if args.tp == 1 else f"{data}, tensor={args.tp}",
         config={"model_type": hf["model_type"],
                 "transformer_config": {name: str(value) for name, value in vars(run.config).items()
                                        if not name.startswith("_") and not callable(value)},
