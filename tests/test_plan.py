@@ -16,11 +16,11 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
-from dew.nn import mixers
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
+from dew.registry import mixers
 from dew.training import Trainer, memory, planning, rungs
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
