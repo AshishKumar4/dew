@@ -1171,6 +1171,24 @@ def test_each_pass_declares_the_most_documents_its_own_windows_hold():
         assert int(laid.segments.max()) == laid.max_segments == most
 
 
+def test_a_corpus_packed_where_the_read_cannot_see_declares_its_windows_length():
+    """A mixture of windows a pack makes and windows a corpus holds already packed: the read cannot
+    see how many documents the second's windows hold, so the batches declare a window's length
+    rather than the first's most, which the second's windows pass."""
+    packed = Memory(tuple({"text": np.arange(8, dtype=np.int32)} for _ in range(4))).named("packed").pack(9)
+    ready = Memory(tuple({"text": np.arange(9, dtype=np.int32),
+                          "text_segment_ids": np.asarray([1, 1, 2, 2, 3, 3, 4, 4, 0], np.int32),
+                          "text_positions": np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], np.int32)}
+                         for _ in range(4))).named("ready")
+    opened = compile(mix([packed, ready]).batch(4), read="memory", loading=READ).train(DataPartition())
+    try:
+        laid = [batch["text_coordinates"] for batch in itertools.islice(opened, 2)]
+    finally:
+        opened.close()
+    assert max(int(coordinates.segments.max()) for coordinates in laid) == 4
+    assert {coordinates.max_segments for coordinates in laid} == {9}
+
+
 def test_a_window_holding_more_documents_than_its_read_declares_is_refused():
     """A sequence kernel sized by the declared documents would run the rest into the next row's."""
     from dew.data.steps.generic import Coordinated
