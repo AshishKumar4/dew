@@ -12,7 +12,7 @@ from dew.data.dataset import DataPartition
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, EpisodeStatus, PPORollout
 from dew.objectives.rl.records import episode_from_record
-from dew.training import MeshSpec
+from dew.training import MeshSpec, Trainer
 
 
 def native(args):
@@ -52,7 +52,8 @@ def ppo(args):
     # Replay one collected share on its readers without re-executing its tools.
     captured = CapturedEpisodes(**{field.name: getattr(rollout.episodes, field.name)
                                   for field in fields(rollout.episodes)})
-    trainer.mesh = MeshSpec(sequence=args.processes)
+    trainer = Trainer(trainer.objective, trainer.optimizer, key=trainer.key,
+                      mesh=MeshSpec(sequence=args.processes))
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)
     rollout = PPORollout(rollout.objective, captured, gamma=rollout.gamma, lam=rollout.lam)
