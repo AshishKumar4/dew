@@ -33,7 +33,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import rounded_timestep_embedding as shared_timestep_embedding
+from diffusers_reference_helpers import (
+    rounded_timestep_embedding as shared_timestep_embedding,
+    tiny_qwen3_encoder,
+)
 
 DIFFUSERS = "0.40.0"
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
@@ -138,22 +141,7 @@ def text_encoder(tok):
     """The published Qwen3 config, narrowed and three layers deep; a causal
     language model with tied embeddings, which saves as the release is
     stored (`model.` names, no head)."""
-    from transformers import Qwen3Config, Qwen3ForCausalLM
-
-    config = json.loads((SOURCE / "text_encoder" / "config.json").read_text())
-    config.pop("torch_dtype", None)
-    config.pop("dtype", None)
-    config.update(hidden_size=PIPELINE["cap_feat_dim"], intermediate_size=32, num_hidden_layers=3,
-                  layer_types=["full_attention"] * 3, max_window_layers=3, num_attention_heads=2,
-                  num_key_value_heads=1, head_dim=8, vocab_size=len(tok), max_position_embeddings=1024,
-                  bos_token_id=None, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
-    torch.manual_seed(SEED + 5)
-    model = Qwen3ForCausalLM(Qwen3Config(**config)).eval()
-    generator = torch.Generator().manual_seed(SEED + 6)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
-    return model
+    return tiny_qwen3_encoder(SOURCE, tok, hidden_size=PIPELINE["cap_feat_dim"], layers=3, seed=SEED)
 
 
 def build_pipeline(root: Path):
