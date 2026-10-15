@@ -131,8 +131,10 @@ def model_parts(hf: dict, args: argparse.Namespace):
         rotary_percent = 1.0
     elif model_type == "qwen3_5_text":
         kinds = hf["layer_types"]
+        # Qwen3.5's full attention always gates its output with half of a
+        # doubled query projection, whatever the config says, as Dew's does.
         config = TransformerConfig(
-            **common, qk_layernorm=True, attention_output_gate=hf.get("attn_output_gate", False),
+            **common, qk_layernorm=True, attention_output_gate=True,
             layernorm_zero_centered_gamma=True,
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[int(kind == "linear_attention") for kind in kinds],
