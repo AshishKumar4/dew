@@ -71,11 +71,14 @@ class TokenScores:
 class Decisions:
     """A decision model's probabilities `[N, Q, K]` over the options of each
     row's questions, the real options `[N, Q, K]`, each question's right option
-    `[N, Q]`, which questions `[N, Q]` ask a score, whose options are ordered
-    levels, and which `[N, Q]` have a known answer to score."""
+    `[N, Q]` and its gold distribution over the options `[N, Q, K]`, one-hot
+    where the answer is certain and soft where annotators split, which
+    questions `[N, Q]` ask a score, whose options are ordered levels, and which
+    `[N, Q]` have a known answer to score."""
     probabilities: jax.Array
     options: jax.Array
     labels: jax.Array
+    targets: jax.Array
     ordinal: jax.Array
     scored: jax.Array
 
