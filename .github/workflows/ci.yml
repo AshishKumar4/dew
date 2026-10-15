@@ -40,19 +40,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
     outputs:
       run: ${{ steps.find.outputs.run }}
     steps:
+    - uses: actions/checkout@v4
+      if: github.event_name == 'push'
     - id: find
       if: github.event_name == 'push'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        # A pull request's run tested a merge, not this commit.
-        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" \
-          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
-        echo "run=$run" >> "$GITHUB_OUTPUT"
-        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+      uses: ./.github/actions/proven
+      with:
+        workflow: ci.yml
 
   # Lint and the site's checks, and the type check beside them: each installs
   # dewml as tools/armada/install.sh does, with uv, from uv's cache.
@@ -64,7 +62,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version-file: .python-version
     - uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
@@ -108,7 +106,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version-file: .python-version
     - name: Build and check the sdist and wheel
       run: |
         python -m pip install --upgrade pip build twine uv
@@ -157,7 +155,7 @@ jobs:
       run: |
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
-            | uv pip compile - --python-version 3.12 --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
+            | uv pip compile - --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
     - name: Install the jax for GPU pools as docs/installation.md says
       run: |
@@ -243,5 +241,5 @@ jobs:
               {"gang": 4, "select": "not layouts"}]' \
           | $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
           --deadline=1800 --gang-start-timeout=300 \
-          --label="${{ github.ref_name }}" -- .venv-3.12/bin/python -m pytest -q \
+          --label="${{ github.ref_name }}" -- ".venv-$(tr -d '\n' < .python-version)/bin/python" -m pytest -q \
           -m "not network" -k "{select}" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py

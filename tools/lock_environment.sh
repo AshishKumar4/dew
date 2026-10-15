@@ -17,7 +17,7 @@ lock() {
   shift
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
-    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" --python-version 3.12 "$@" -o "locks/$name.txt"
+    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
 lock cpu --universal --torch-backend cpu
 gpu="--python-platform x86_64-manylinux_2_35"

@@ -9,7 +9,7 @@ and the logits, and with transformers 5.16.1 for the reference logits on the
 same ids. It prints what moved, what the export holds and where the two
 implementations disagree.
 
-    JAX_PLATFORMS=cpu PYTHONPATH=src python tools/decoder_export_reference.py
+    JAX_PLATFORMS=cpu PYTHONPATH=src:. python tools/decoder_export_reference.py
 
 Nothing is downloaded and nothing is written outside the temporary
 directory it works in. The tests import `round_trip` from here, so the
@@ -18,6 +18,7 @@ numbers below and the assertions come from one pipeline.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import tempfile
@@ -36,6 +37,7 @@ from torch.overrides import TorchFunctionMode
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
 from dew.objectives.lm import LMObjective
+from dew.training import TrainState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
@@ -116,10 +118,12 @@ CASES = (
 
 
 @dataclass(frozen=True)
-class RoundTrip:
-    """One family trained, exported and read back by both implementations."""
+class Trip:
+    """One family trained, exported and read back by both implementations: Dew's logits over the
+    trained weights (`ours`) and the reference's over the export (`theirs`). The causal and the
+    masked lifecycles (tools/masked_diffusion_export_reference.py) each add what their reference
+    reports."""
 
-    case: Case
     source: Pretrained
     trained: Variables
     export: Path
@@ -127,9 +131,16 @@ class RoundTrip:
     ours: np.ndarray
     reloaded: Pretrained
     theirs: np.ndarray
-    truth: np.ndarray
     source_tensors: dict[str, np.ndarray] = field(repr=False)
     exported_tensors: dict[str, np.ndarray] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class RoundTrip(Trip):
+    """A causal family's trip, with the reference's logits in float64 over the export (`truth`)."""
+
+    case: Case
+    truth: np.ndarray
 
 
 def source_tensors(directory: Path) -> dict[str, np.ndarray]:
@@ -144,28 +155,40 @@ def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndar
 
 
 def train(case: Case, source: Pretrained, ids: np.ndarray):
-    """One real `Trainer` step of plain SGD over the loaded checkpoint.
+    """One real `Trainer` step of plain SGD over the loaded checkpoint (`stepped`)."""
+    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
+                            balance_rate=case.balance_rate,
+                            mtp_weight=case.mtp_weight)
+    return stepped(objective, ids, case.rate)
 
-    The rows are the fixture's own ids repeated to fill one batch per
-    device, so the step runs on whatever devices the process has.
-    """
+
+def stepped(objective, ids: np.ndarray, rate: float):
+    """One real `Trainer` step of plain SGD at `rate` of `objective`, started from the weights it
+    holds. The rows are the fixture's own ids repeated to fill one batch per device, so the step
+    runs on whatever devices the process has."""
     import grain.python as pygrain
 
     from dew.data.dataset import Loader
     from dew.training import Trainer
 
-    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
-                            balance_rate=case.balance_rate,
-                            mtp_weight=case.mtp_weight)
     count = math.lcm(int(ids.shape[0]), jax.device_count())
     rows = np.concatenate([ids] * (count // int(ids.shape[0])), axis=0)
     entries = [{"text": rows[row]} for row in range(count)]
     stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
     data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
-    state = Trainer(objective, optax.sgd(case.rate), key=jax.random.key(SEED)).fit(
-        data, steps=1, log_every=1)
-    return state
+    return Trainer(objective, optax.sgd(rate), key=jax.random.key(SEED)).fit(data, steps=1, log_every=1)
+
+
+def trained_export(directory: Path, export: Path, train: Callable[[Pretrained, np.ndarray], TrainState]
+                   ) -> tuple[Pretrained, np.ndarray, Variables, Pretrained]:
+    """The checkpoint in `directory` loaded, trained one step on its own ids (`train`), its trained
+    weights written back into the source's own tensor names at `export`, and the export loaded."""
+    ids = np.load(directory / "input_ids.npy")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    trained = train(source, ids).variables
+    source.save(export, variables=trained)
+    return source, ids, trained, Pretrained.load(str(export), dtype="float32", attention_impl="reference")
 
 
 def _text_half_prefixes(model) -> tuple[str, ...]:
@@ -402,17 +425,13 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
 
 def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
-    directory = FIXTURES / case.fixture
-    ids = np.load(directory / "input_ids.npy")
-    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
-    state = train(case, source, ids)
-    export = workspace / case.name
-    source.save(export, variables=state.variables)
-    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
-    return RoundTrip(case, source, state.variables, export, ids,
-                     logits(source, state.variables, ids), reloaded,
-                     reference_logits(case, export, ids), reference_logits(case, export, ids, wide=True),
-                     source_tensors(directory), source_tensors(export))
+    directory, export = FIXTURES / case.fixture, workspace / case.name
+    source, ids, trained, reloaded = trained_export(directory, export, functools.partial(train, case))
+    return RoundTrip(source=source, trained=trained, export=export, ids=ids,
+                     ours=logits(source, trained, ids), reloaded=reloaded,
+                     theirs=reference_logits(case, export, ids),
+                     source_tensors=source_tensors(directory), exported_tensors=source_tensors(export),
+                     case=case, truth=reference_logits(case, export, ids, wide=True))
 
 
 def moved(trip: RoundTrip) -> dict[str, float]:

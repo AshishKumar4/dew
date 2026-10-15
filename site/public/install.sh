@@ -16,11 +16,16 @@
 #   --version X     install dewml X instead of the newest release
 #   --pip           use pip instead of uv
 #
-# The CUDA build follows the driver and the GPUs: driver 580 or newer with every GPU at
-# SM 7.5 or newer runs CUDA 13, driver 525 or newer with SM 5.2 or newer runs CUDA 12
-# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python 3.12
-# or newer.
+# The CUDA build follows the driver and every GPU's SM, using the generated minima below
+# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python 3.12 or newer.
 set -eu
+
+# BEGIN CUDA minima (site/scripts/gen_install.py)
+cuda13_driver=580
+cuda13_sm=7.5
+cuda12_driver=525
+cuda12_sm=5.2
+# END CUDA minima
 
 if [ -t 1 ]; then
 	bold=$(printf '\033[1m') dim=$(printf '\033[2m') green=$(printf '\033[32m')
@@ -83,10 +88,10 @@ if [ -n "$gpus" ]; then
 	sm=$(printf '%s\n' "$gpus" | cut -s -d, -f3 | tr -d ' ' | sort -n | head -n 1)
 	at_least() { awk -v sm="$sm" -v need="$1" 'BEGIN { exit !(sm + 0 >= need) }'; }
 	major=${driver%%.*}
-	if [ "$major" -lt 525 ]; then runs=cpu why="CUDA 12 needs driver 525 or newer; update the driver to use the GPU"
+	if [ "$major" -lt "$cuda12_driver" ]; then runs=cpu why="CUDA 12 needs driver $cuda12_driver or newer; update the driver to use the GPU"
 	elif [ -z "$sm" ]; then runs=cpu why="nvidia-smi did not report its compute capability; choose with --cuda 12 or 13"
-	elif [ "$major" -ge 580 ] && at_least 7.5; then runs=cuda13
-	elif at_least 5.2; then runs=cuda12
+	elif [ "$major" -ge "$cuda13_driver" ] && at_least "$cuda13_sm"; then runs=cuda13
+	elif at_least "$cuda12_sm"; then runs=cuda12
 	else runs=cpu why="SM $sm is older than JAX's CUDA builds support"
 	fi
 	if [ "$runs" = cpu ]; then hardware="$gpu, driver $driver: no GPU build, as $why"
