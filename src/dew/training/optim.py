@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from dew.hashing import fmix32
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
@@ -335,15 +336,6 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
         scale_by_qk_clip(qk_clip_threshold))
 
 
-def _mix(h: jax.Array) -> jax.Array:
-    """murmur3's 32-bit finaliser: every input bit reaches every output bit."""
-    h = h ^ (h >> 16)
-    h = h * jnp.uint32(0x85EBCA6B)
-    h = h ^ (h >> 13)
-    h = h * jnp.uint32(0xC2B2AE35)
-    return h ^ (h >> 16)
-
-
 def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     """`x` rounded to bf16 up or down with the probability of its distance to
     each, from a hash of `seed` and each element's flat index.
@@ -359,7 +351,7 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     """
     x = x.astype(jnp.float32)
     index = jax.lax.iota(jnp.uint32, x.size).reshape(x.shape)
-    noise = _mix(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)) & jnp.uint32(0xFFFF)
+    noise = fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)) & jnp.uint32(0xFFFF)
     bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
     rounded = jax.lax.bitcast_convert_type((bits + noise) & jnp.uint32(0xFFFF0000), jnp.float32)
     return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
@@ -392,7 +384,7 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
 
     def update_fn(updates, state, params=None):
         del params  # scale_by_adam reads none
-        step = _mix(jnp.asarray(state.count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
+        step = fmix32(jnp.asarray(state.count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
         leaves, structure = jax.tree.flatten(updates)
         mus, nus = structure.flatten_up_to(state.mu), structure.flatten_up_to(state.nu)
         scaled, new_mu, new_nu, count = [], [], [], state.count
@@ -403,11 +395,11 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
             if not isinstance(one, optax.ScaleByAdamState):
                 raise TypeError(f"optax.scale_by_adam returned {type(one).__name__}")
             count = one.count
-            salt = _mix(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
+            salt = fmix32(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
             scaled.append(update)
             new_mu.append(stochastic_round_bf16(jnp.asarray(one.mu), salt))
             new_nu.append(stochastic_round_bf16(jnp.asarray(one.nu),
-                                                _mix(salt + jnp.uint32(0x9E3779B9))))
+                                                fmix32(salt + jnp.uint32(0x9E3779B9))))
         return structure.unflatten(scaled), optax.ScaleByAdamState(
             count=count, mu=structure.unflatten(new_mu), nu=structure.unflatten(new_nu))
 

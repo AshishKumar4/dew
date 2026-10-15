@@ -779,7 +779,7 @@ class Regression(Objective):
     def __init__(self):
         self.model = Affine()
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return self.model.init(key, np.zeros((1, FEATURES), np.float32))
 
     def loss(self, variables, batch, step):

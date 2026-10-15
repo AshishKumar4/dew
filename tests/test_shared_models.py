@@ -1,24 +1,11 @@
 """Shared model requests keep untrusted inputs away from model memory."""
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1] / "site/live/container"
-
-
-def module(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / f"{name}.py")
-    loaded = importlib.util.module_from_spec(spec)
-    sys.modules[name] = loaded
-    spec.loader.exec_module(loaded)
-    return loaded
+from tool_support import load
 
 
 @pytest.fixture(scope="module")
 def service():
-    return module("model_service")
+    return load("model_service", "site/live/container")
 
 
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):
@@ -27,8 +14,8 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
 
     from dew.sampling import CFG, Heun, TextToImage
 
-    progress = module("progress")
-    client = module("model_client")
+    progress = load("progress", "site/live/container")
+    client = load("model_client", "site/live/container")
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
