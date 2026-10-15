@@ -37,6 +37,7 @@ from common import (
     TracedWindow,
     WorkloadWork,
     attach_xplane_profile,
+    documents,
     git_head,
     host,
     peak_flops,
@@ -118,9 +119,12 @@ def build(args: argparse.Namespace) -> Run:
     from dew.training.distributed import batch_shardings
     from dew.training.optim import Cosine, ParamGroup
 
+    from dew.nn.inputs import coordinates
+
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
     seq = windows.shape[1] - 1
+    segments = None if args.documents is None else documents(windows.shape, args.documents)
     # The schedule decays over every epoch; --steps only stops the run early.
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
@@ -135,7 +139,14 @@ def build(args: argparse.Namespace) -> Run:
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
                             variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
-    work = measure(objective, {TEXT_KEY: windows[:args.batch]})
+    def rows(indices) -> dict:
+        """The windows' rows, a packed run's documents laid out beside them."""
+        if segments is None:
+            return {TEXT_KEY: windows[indices]}
+        return {TEXT_KEY: windows[indices], "text_coordinates": coordinates(
+            segments=segments[indices], max_segments=int(segments.max()), xp=np)}
+
+    work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
@@ -150,10 +161,10 @@ def build(args: argparse.Namespace) -> Run:
                       mesh=mesh, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     del pretrained
-    placement = batch_shardings(trainer.device_mesh, {TEXT_KEY: windows[:args.batch]})
+    placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))
 
     def batch(step: int):
-        return jax.device_put({TEXT_KEY: windows[window_rows(order, step, args.batch)]}, placement)
+        return jax.device_put(rows(window_rows(order, step, args.batch)), placement)
 
     compile_start = time.perf_counter()
     step = trainer.compile(state, batch(0))
