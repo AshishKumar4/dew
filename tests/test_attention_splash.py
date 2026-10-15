@@ -120,6 +120,47 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, mask=None, segment_
     return keep
 
 
+def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None):
+    """Each entry's float64 terms of attention's output and its query, key and
+    value gradients under `cotangent` (`reference_error.float64_terms`'s
+    sizes), for `[B, S, H, D]` operands with key heads repeated over their
+    group and the keys `keep` `[B or 1, 1, q, k]` keeps, a sink joining each
+    head's denominator. A logit's gradient P (dP - delta) cancels: on a query
+    that keeps one key P is 1 and delta is dP, so it is zero in float64,
+    while a flash kernel forms delta as rowsum(out * dout) and dP as dout . v,
+    two roundings of one value of their size. Its terms are therefore
+    P (|dP| + |delta|), and such a row is held to their rounding, not to its
+    own zero."""
+    with jax.enable_x64(new_val=True):
+        q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
+        heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
+        group = jnp.arange(heads) // (heads // kv_heads)
+        raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(width)
+        logits = raw if softcap is None else softcap * jnp.tanh(raw / softcap)
+        keep = np.broadcast_to(keep, logits.shape)
+        sees = keep.any(-1, keepdims=True)
+        logits = jnp.where(keep, logits, jnp.where(sees, -jnp.inf, 0.0))
+        if sinks is not None:
+            sink = jnp.broadcast_to(jnp.asarray(np.asarray(sinks, np.float64))[None, :, None, None],
+                                    (*logits.shape[:3], 1))
+            logits = jnp.concatenate([logits, sink], -1)
+        weights = jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :keep.shape[-1]], 0.0)
+        products = jnp.einsum('bqhd,bkhd->bhqk', dout, v[:, :, group])
+        delta = jnp.sum(weights * products, axis=-1, keepdims=True)
+        logit_terms = weights * (jnp.abs(products) + jnp.abs(delta)) / np.sqrt(width)
+        if softcap is not None:
+            logit_terms = logit_terms * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
+
+        def per_key_head(x):
+            return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, width).sum(3)
+
+        terms = (jnp.einsum('bhqk,bkhd->bqhd', weights, jnp.abs(v[:, :, group])),
+                 jnp.einsum('bhqk,bkhd->bqhd', logit_terms, jnp.abs(k[:, :, group])),
+                 per_key_head(jnp.einsum('bhqk,bqhd->bkhd', logit_terms, jnp.abs(q))),
+                 per_key_head(jnp.einsum('bhqk,bqhd->bkhd', weights, jnp.abs(dout))))
+        return [np.asarray(x) for x in terms]
+
+
 def flash_gradients(query, key, value, sinks=None, *, softcap=None, live=None, **structure):
     """The q, k and v gradients of `value_and_grads`' loss by Splash's published
     untiled flash-formula reference, over the same heads and the keys `kept`
@@ -435,13 +476,18 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
         widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
         twin[1:4] = flash_gradients(*widened, **wide)
     ordered = "sinks" if case in ("sinks", "sinks-window") else None
-    for name, mine, theirs, wide_theirs, want in zip(
-            names, splash, expected, twin, truth, strict=True):
+    # The loss is the outputs' squares, so the cotangent is twice the output.
+    layout = {name: structure[name] for name in ("causal", "sliding_window", "mask", "segment_ids")
+              if name in structure}
+    terms = attention_terms(query, key, value, 2 * truth[0], kept(query.shape[1], key.shape[1], **layout),
+                            sinks=structure.get("sinks"), softcap=structure.get("softcap"))
+    for name, mine, theirs, wide_theirs, want, summed in zip(
+            names, splash, expected, twin, truth, (*terms, None)[:len(names)], strict=True):
         # A key's logit sums the head width, its weight the keys.
         assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
                                    roundings=query.shape[-1] + key.shape[1])
         if name != ordered:
-            assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}")
+            assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}", terms=summed)
     if ordered is not None:
         sinks = structure.get("sinks")
         kwargs = {name: value for name, value in structure.items() if name != "sinks"}
