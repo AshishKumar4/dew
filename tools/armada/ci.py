@@ -67,6 +67,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,8 +75,11 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
 
-PYTHONS = ("3.12", "3.14")
-"""The compatibility floor, which runs every test, and the newest release CI proves."""
+PYTHONS = tuple(classifier.removeprefix("Programming Language :: Python :: ")
+                for classifier in tomllib.loads((Path(__file__).resolve().parents[2]
+                                                 / "pyproject.toml").read_text())["project"]["classifiers"]
+                if re.fullmatch(r"Programming Language :: Python :: \d+\.\d+", classifier))
+"""The tested versions pyproject.toml declares, oldest first; the floor runs every test."""
 NEWEST_FILES = (
     # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
