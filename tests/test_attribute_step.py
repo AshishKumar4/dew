@@ -249,7 +249,7 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert time["xprof_peak_gflops"] == 3742430.0
     assert (time["peak_gflops"], time["mfu_bf16_of_device_time"], time["mfu_mixed_of_device_time"],
             time["gemm_lost_ms"], time["gemm_fraction_of_peak"]) == (None, None, None, None, None)
-    assert time["device_ms_per_step"] == 1.0
+    assert time["device_busy_ms_per_step"] == 1.0
 
 
 CONTRACT_1 = ('backend_config={"gemm_backend_config":{"dot_dimension_numbers":'
