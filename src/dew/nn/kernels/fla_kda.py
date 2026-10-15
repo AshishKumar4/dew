@@ -870,8 +870,8 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q if keep else None, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
     o = chunk_fwd_o(q, corrected, g_hi, aqk, h, scale=scale, **kernels)
-    memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else h0
-    return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, memory, spans)
+    memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
+    return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, h0, memory, spans)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, cotangent):
@@ -880,15 +880,15 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
     local gradient, the reverse recurrence
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
-    each chunk."""
-    q, k, v, g_hi, g_lo, beta, aqk, akk, memory, spans = residual
+    each chunk, each sequence's first token's from its memory (`fla_gdn.first_decay_grad`)."""
+    q, k, v, g_hi, g_lo, beta, aqk, akk, h0, memory, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     if keep:
         w, kg, qg, h, corrected = memory
     else:
         w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q, **kernels)
-        h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, memory, **kernels)
+        h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
     dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
@@ -898,7 +898,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
-    dg = fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels)
+    dg = fla_gdn.first_decay_grad(fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels), h0, dh0, spans)
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
