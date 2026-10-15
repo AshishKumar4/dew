@@ -89,15 +89,12 @@ Changelog = "https://github.com/AshishKumar4/dew/blob/main/CHANGELOG.md"
 dew = "dew.cli.main:main"
 
 [project.optional-dependencies]
-# The accelerator builds of jax 0.11.2, installed as `dewml[cuda13]`: jax's
-# own extras of the same names, repeated so that one dewml install brings the
-# build; jaxlib comes from jax itself. They move with jax:
-# tests/test_packaging.py compares them with the installed jax's extras.
+# JAX owns its accelerator requirements; the core dependency pins its release.
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
 # A100 or an Ada GPU; its wheels are built for Linux x86_64 alone.
-cuda12 = ["jax-cuda12-plugin[with-cuda]>=0.11.2,<=0.11.2",
+cuda12 = ["jax[cuda12]",
           "dew-flash-attn-cu12~=0.3.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
-cuda13 = ["jax-cuda13-plugin[with-cuda]>=0.11.2,<=0.11.2",
+cuda13 = ["jax[cuda13]",
           "dew-flash-attn-cu13~=0.3.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 tpu = ["libtpu==0.0.48.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
@@ -112,26 +109,32 @@ quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
     "moto[server,s3]>=5.1.15",
-    "deltalake>=1.0",
+    # Delta source and publication scenarios use the optional table implementation.
+    "dewml[delta]",
     # tests/test_kernel_configs.py compiles every declared Pallas kernel config with Triton's own
     # compiler for each GPU generation on a CPU: the release torch 2.14 (the torchax extra) takes.
     "triton~=3.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
+    # tools/check.sh's duplicate-code gate (tools/duplicates.py) and its red fixture run this pylint.
+    "pylint==4.1.3",
     # The legacy decoder graph test deserializes jax.export; JAX does not
     # declare flatbuffers. This version wrote the committed export fixture.
     "flatbuffers==25.12.19",
     "pytest-xdist",
-    "safetensors",
-    "torch",
+    # The interop suite reads and writes safetensors with its native reader.
+    "dewml[interop]",
+    # Reference parity and PyTorch checkpoint imports run on the host.
+    "dewml[torch]",
     # A published scheduler's beta sigma grid is an inverse incomplete beta,
     # which the source scheduler also takes from scipy and refuses without.
     "scipy",
-    "wandb",
+    # tests/test_reporting.py exercises the WandbTracker adapter.
+    "dewml[wandb]",
     # The committed VAE fixture was generated with this reference release.
     "diffusers==0.34.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
-    "ftfy",
+    "dewml[wan]",
     # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
     # release its container installs (the live extra).
     "dewml[live]",
@@ -147,29 +150,24 @@ test = [
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
     # unbounded so the suite runs the release `pip install dewml[streaming]`
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.
-    "datasets",
+    "dewml[streaming]",
     # The MLflow, TensorBoard and Optuna adapters are proven against the real
     # libraries: tests/test_reporting.py reads an MLflow run back with
     # MlflowClient and an event file back with the official accumulator, and
     # tests/test_sweep.py asks Optuna for a point. Type checking reads them too.
-    "mlflow",
-    "tensorboard",
-    "optuna",
+    "dewml[mlflow,tensorboard,hpo]",
     # tests/test_inference_clients.py exercises the official SDK clients over a
     # mocked transport; the same pins as the inference-clients extra.
-    "ollama>=0.6.2,<0.7",
-    "openai>=3.8,<4",
+    "dewml[inference-clients]",
     # tests/test_guided_decoding.py compiles regex and JSON-schema automata with it.
-    "outlines-core>=0.2.14",
+    "dewml[guided]",
     # tests/test_eval_harness.py scores DewLM against lm-eval's own HFLM on the
     # same weights, and its tolerances were measured against this release;
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
     # tests/test_tools.py runs tools/run_tutorials.py, which executes the
     # tutorials through a Jupyter kernel of this interpreter.
-    "nbclient",
-    "nbformat",
-    "ipykernel",
+    "dewml[notebooks]",
 ]
 # Run mutation tests in CI, one source module at a time. Pin the operators so
 # two reports describe the same mutation population.
@@ -237,7 +235,9 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
 # The tutorial notebooks' environment (.github/workflows/tutorials.yml).
-tutorials = ["dewml[streaming,interop,plots]", "nbclient", "nbformat", "ipykernel"]
+tutorials = ["dewml[streaming,interop,plots,notebooks]"]
+# Execute notebooks through a Jupyter kernel of the selected interpreter.
+notebooks = ["nbclient", "nbformat", "ipykernel"]
 
 [tool.ruff]
 target-version = "py312"

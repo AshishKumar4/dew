@@ -31,7 +31,13 @@ jobs:
     timeout-minutes: 300
     strategy:
       matrix:
-        cuda: [ "12.9.1", "13.0.0" ]
+        include: &variants
+        - cuda: "12.9.1"
+          environment: pypi
+          project: dew-flash-attn-cu12
+        - cuda: "13.0.0"
+          environment: pypi-cu13
+          project: dew-flash-attn-cu13
     container: nvidia/cuda:${{ matrix.cuda }}-devel-rockylinux8
     defaults:
       run:
@@ -69,13 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-        - cuda: "12.9.1"
-          environment: pypi
-          project: dew-flash-attn-cu12
-        - cuda: "13.0.0"
-          environment: pypi-cu13
-          project: dew-flash-attn-cu13
+        include: *variants
     environment:
       name: ${{ matrix.environment }}
       url: https://pypi.org/p/${{ matrix.project }}

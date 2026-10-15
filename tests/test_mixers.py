@@ -280,8 +280,9 @@ ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "m
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 @pytest.mark.parametrize("policy", sorted(POLICY_VALUES))
 def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kind, policy):
-    """A layer asking an attention policy builds a mixer that takes it as an argument, or refuses
-    it by name; no attention-family kind builds without it."""
+    """A layer asking an attention policy builds a mixer that takes it, as an argument or in the
+    context it holds (`CausalSelfAttention.ctx`), or refuses it by name; no attention-family kind
+    builds without it."""
     if kind in ATTENDS_NOTHING:
         pytest.skip(f"{kind} attends nothing")
     context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32,
@@ -295,7 +296,9 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     except ValueError as refused:
         assert policy in str(refused)
         return
-    assert factory.keywords.get(policy) == POLICY_VALUES[policy]
+    held = factory.keywords.get("ctx")
+    taken = factory.keywords.get(policy) if held is None else getattr(held, policy)
+    assert taken == POLICY_VALUES[policy]
 
 
 @pytest.mark.parametrize("kind, rungs", [

@@ -18,7 +18,7 @@ from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
 from dew.nn import kernels, linear
-from dew.nn.kernels import fla_gdn, tuning
+from dew.nn.kernels import fla_gdn, fla_kda, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
@@ -408,6 +408,33 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     assert relative(final, want_final) < bound
     for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
         assert relative(mine, theirs) < bound, name
+
+
+@pytest.mark.parametrize("per_key", [False, True])
+def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key):
+    """The decay of a sequence's first token scales the memory before it alone, so its gradient is
+    exactly zero where that memory is: a row's first sequence from a zero initial memory and any
+    other sequence, which starts from none (`fla_gdn.first_decay_grad`). From a nonzero initial
+    memory it is that memory's inner product with its gradient, which is not zero."""
+    batch, length, heads, width = 2, 80, 2, 64
+    keys = jax.random.split(jax.random.key(17), 8)
+    q, k = (l2norm(jax.random.normal(key, (batch, length, heads, width))) for key in keys[:2])
+    v = jax.random.normal(keys[2], (batch, length, heads, width))
+    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, *((width,) if per_key else ()))) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+    h0 = h0.at[0].set(0.0)
+    do = jax.random.normal(keys[6], v.shape)
+    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+    cuts = jnp.asarray([0, 30, 80, 130, 160], jnp.int32)
+    port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
+
+    def ported(*args):
+        return port(*args, cuts, width ** -0.5, 64, INTERPRETED)
+
+    dg = np.asarray(through(ported, do, dht)(q, k, v, g, beta, h0)[5]).reshape(batch * length, -1)
+    assert np.all(dg[[0, 30, 130]] == 0)
+    assert np.all(dg[80] != 0)
 
 
 @pytest.mark.skipif(not INTERPRETED, reason="interpreted, the kernels' products are exact, so the decay's "
