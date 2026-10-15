@@ -23,6 +23,10 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP011 is about the suite. A test proves behaviour, not wording or source.
 - SLOP012 runs everywhere but the suite, which SLOP008 covers.
 - SLOP013 is about what importing `src/<package>` does to the process.
+- SLOP014 is about the mixer call contract in `src/<package>`: a layer's call
+  reads every call argument it takes, and a token mixer's `reads` names the
+  `MIXING` fields (`src/<package>/nn/inputs.py`) it reads, no more and no
+  fewer, since its block refuses a call that sets any other.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -45,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
 import io
 import re
 import sys
@@ -108,6 +113,8 @@ INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "sys.displayhook", 
                      "threading.excepthook"}
 # The calls that hand a test a function's source text.
 SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
+# What a layer's call is handed by its block, which it may not take and drop.
+CALL_ARGUMENTS = {"decode", "kv_store", "attention_metadata", "call"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
                  "register_event_listener", "filterwarnings", "simplefilter")
@@ -838,7 +845,91 @@ def imports(module: Module) -> Iterator[Finding]:
                               "changes process-wide state at import; do it where the caller asks for it")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names, imports)
+def _mixing(module: Module) -> frozenset[str]:
+    """The `MIXING` names the package's `nn/inputs.py` assigns, or none where it has none."""
+    root = module.path.parents[len(Path(module.relative).parents) - 1]
+    return _assigned_mixing(root / "src" / module.package / "nn" / "inputs.py")
+
+
+@functools.cache
+def _assigned_mixing(inputs: Path) -> frozenset[str]:
+    if not inputs.is_file():
+        return frozenset()
+    for node in ast.parse(inputs.read_text()).body:
+        if (isinstance(node, ast.Assign) and any(_named(target) == "MIXING" for target in node.targets)
+                and isinstance(node.value, ast.Tuple)):
+            return frozenset(item.value for item in node.value.elts if isinstance(item, ast.Constant))
+    return frozenset()
+
+
+def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
+    """A `reads` declaration's names, "tokenwise" for `TOKENWISE`, or None
+    where it is spelled some other way, which this rule cannot read."""
+    if _named(value) == "TOKENWISE":
+        return "tokenwise"
+    if not (isinstance(value, ast.Call) and _named(value.func) == "frozenset" and len(value.args) <= 1):
+        return None
+    if not value.args:
+        return frozenset()
+    spelled = value.args[0]
+    if isinstance(spelled, ast.Set) and all(isinstance(item, ast.Constant) for item in spelled.elts):
+        return frozenset(item.value for item in spelled.elts if isinstance(item, ast.Constant))
+    return None
+
+
+def calls(module: Module) -> Iterator[Finding]:
+    """SLOP014: a layer's call that drops what its block hands it, and a mixer
+    (a class whose call takes a `call`) whose `reads` is not what it reads."""
+    mixing = _mixing(module)
+    loaded = {node.attr for node in ast.walk(module.tree)
+              if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)}
+    for cls in (node for node in ast.walk(module.tree) if isinstance(node, ast.ClassDef)):
+        called = [function for function in cls.body
+                  if isinstance(function, ast.FunctionDef) and function.name == "__call__"]
+        if not called:
+            continue
+        function = called[-1]
+        taken = {argument.arg for argument in (*function.args.args, *function.args.kwonlyargs)}
+        declarations = [statement for statement in cls.body
+                        if isinstance(statement, ast.Assign | ast.AnnAssign) and statement.value is not None
+                        and any(_named(target) == "reads" for target in
+                                (statement.targets if isinstance(statement, ast.Assign)
+                                 else [statement.target]))]
+        declared = _declared_reads(declarations[-1].value) if declarations else frozenset()
+        where = declarations[-1] if declarations else cls
+        if "call" in taken and declared is None:
+            yield Finding(module.relative, where.lineno, where.col_offset + 1, "SLOP014",
+                          f"{cls.name} declares reads as neither frozenset({{...}}) nor TOKENWISE")
+            continue
+        used = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)}
+        # A tokenwise mixer is handed the call and has no use for it.
+        ignored = {"call"} if declared == "tokenwise" else set()
+        for name in sorted((taken & CALL_ARGUMENTS) - used - ignored):
+            yield Finding(module.relative, function.lineno, function.col_offset + 1, "SLOP014",
+                          f"{cls.name}.__call__ takes {name} and never reads it; read it or refuse it")
+        if "call" not in taken or declared is None:
+            continue
+        read = {node.attr for node in ast.walk(cls) if isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)} & mixing
+        if declared == "tokenwise":
+            extra, unread, unknown = read, set(), set()
+        else:
+            extra, unread, unknown = read - declared, (declared & mixing) - loaded, declared - mixing
+        line, col = where.lineno, where.col_offset + 1
+        for name in sorted(extra):
+            yield Finding(module.relative, line, col, "SLOP014",
+                          f"{cls.name} reads {name} and does not declare it in reads")
+        for name in sorted(unread):
+            yield Finding(module.relative, line, col, "SLOP014",
+                          f"{cls.name} declares it reads {name} and never does; its block would let "
+                          f"a call that sets it through")
+        if mixing and unknown:
+            yield Finding(module.relative, line, col, "SLOP014",
+                          f"{cls.name} reads {', '.join(sorted(unknown))}, which no call sets")
+
+
+CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls)
 UNIVERSAL_RULES = (swallowed, comments, size)
 
 

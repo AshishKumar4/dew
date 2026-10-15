@@ -29,7 +29,7 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, PredictionPhase
+from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
@@ -101,6 +101,16 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
+class ReadsMixing(Protocol):
+    """A token mixer's declaration of the `MIXING` fields of its call it reads
+    (`dew.nn.inputs.MixerCall`), or `TOKENWISE` for one that reads no other
+    token. One that declares nothing reads none."""
+
+    @property
+    def reads(self) -> frozenset[str]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -412,8 +422,8 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: a token mixer, then a feed-forward, each added to the residual.
 
     `mixer` and `feedforward` are factories that take only a name. The mixer
-    becomes self_attn and accepts (x, decode=..., attention_metadata=...), its
-    tokens' places and documents the metadata's `Coordinates`. The
+    becomes self_attn, called (x, call) with one `MixerCall`, its tokens'
+    places and documents the call metadata's `Coordinates`. The
     feed-forward becomes mlp and takes the normalized
     states, plus the token ids on a `hash_routed` block. A `feedforward` of
     None gives Mamba-2's block, which has the mixer alone. `wiring` places the
@@ -876,21 +886,26 @@ class DecoderBlock(nn.Module):
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
              train: bool, routes: dict):
-        """The token mixer over `x`. The store, the metadata, a prediction
-        phase other than ordinary and the layer's replayed experts reach it
-        only when the call carries them, since a mixer with no use for one
-        does not take it."""
+        """The token mixer over `x`, called with one `MixerCall`. It is never
+        called with a `MIXING` field set that it does not read (`ReadsMixing`),
+        which it would compute as if unset. The train flag, a prediction phase
+        other than ordinary and the layer's replayed experts reach it only
+        when the call carries them, since a mixer with no use for one does not
+        take it."""
+        call = MixerCall(attention_metadata, decode, kv_store)
+        unread = call.unread(self.self_attn.reads if isinstance(self.self_attn, ReadsMixing) else frozenset())
+        if unread:
+            raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "
+                             "and would run it as if unset; give this layer a mixer that reads them")
         return self.self_attn(
             x,
-            decode=decode,
+            call,
             **routes,
             **(
                 {"train": train}
                 if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
                 else {}
             ),
-            **({} if kv_store is None else {"kv_store": kv_store}),
-            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 

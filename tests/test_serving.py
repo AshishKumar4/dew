@@ -24,6 +24,7 @@ from dew.inference.pipeline import place
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.inputs import MixerCall
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
@@ -72,7 +73,7 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
             for name in ("kernel", "bias")}
         for name in ("q_proj", "k_proj", "v_proj"):
             del packed["params"][name]
-        applied = jax.jit(lambda weights: model.apply(weights, x, decode=True, mutable=["cache"]))
+        applied = jax.jit(lambda weights: model.apply(weights, x, MixerCall(decode=True), mutable=["cache"]))
         expected, cache = applied(variables)
         actual, packed_cache = applied(packed)
         np.testing.assert_array_equal(actual, expected)

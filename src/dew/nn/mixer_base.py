@@ -1,8 +1,10 @@
 """Token mixers: what a decoder layer mixes across the sequence, by kind.
 
-A mixer is the module a `DecoderBlock` holds as `self_attn`, with the `(x,
-decode=..., attention_metadata=...) -> x` signature, its tokens' places and
-documents the metadata's `Coordinates` (`dew.nn.inputs.coordinates_of`). Grouped-query
+A mixer is the module a `DecoderBlock` holds as `self_attn`, called `(x, call)
+-> x` with one `dew.nn.inputs.MixerCall`, its tokens' places and documents the
+call metadata's `Coordinates` (`dew.nn.inputs.coordinates_of`). It declares the
+call's `MIXING` fields it reads (`reads`), and the block calls it with no other
+one set. Grouped-query
 causal attention is the `attention` kind; MLA, the gated delta rule and the
 rest sit beside it as frozen dataclass values under the reference's
 field names. A kind builds its `DecoderBlock` factory with `mixer.build(ctx)`

@@ -17,6 +17,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +37,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import AttentionMetadata, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
@@ -256,6 +257,10 @@ class MultiHeadLatentAttention(nn.Module):
     (`widen_value_heads`). A mask materialized outside decode (packed
     documents, row validity, the selection) takes 'auto' and 'cudnn' to xla.
     """
+
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): it narrows its keys by the
+    documents, the rows' validity and its own selection, no mask, bias or mixed step."""
 
     emb_features: int
     num_heads: int
@@ -482,8 +487,8 @@ class MultiHeadLatentAttention(nn.Module):
         return jnp.concatenate([nope, rot], axis=-1), values
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
         causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
         batch, length, _ = x.shape
