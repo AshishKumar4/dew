@@ -106,7 +106,8 @@ def test_global_router_validation_is_scalar_and_ignores_repeated_rows(routed):
                                                max_segments=2, right_padded=True)}
     real = jax.tree.map(lambda value: value[:2], batch)
     expected, _ = objective.scalar_loss(variables, real, step(training=False))
-    batch[VALID_ROWS] = jnp.asarray([True, True, False])
+    batch = jax.tree.map(lambda value: value[jnp.asarray([0, 1, 2, 2, 2, 2, 2, 2])], batch)
+    batch[VALID_ROWS] = jnp.arange(8) < 2
     result = Evaluation.run(objective, variables, lambda partition: iter([batch]), key=3, loss=True)
     assert result.records == 2
     assert result.scores["val/loss"] == pytest.approx(float(expected), rel=1e-5)
