@@ -2229,13 +2229,17 @@ class CausalTransformer(nn.Module):
             return None
         marked = self.marked_residuals()
 
-        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], frozenset[str]] | None:
-            return None if policy is None else (frozenset(policy.save) & marked,
-                                                frozenset(policy.offload) & marked)
+        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], ...] | None:
+            """What `policy` does with the names these layers mark: None where it recomputes none of
+            them and keeps the rest, as no remat does."""
+            if policy is None or (policy.recompute and not frozenset(policy.recompute) & marked):
+                return None
+            return (frozenset(policy.save) & marked, frozenset(policy.offload) & marked,
+                    frozenset(policy.recompute) & marked)
 
         index = DECODER_REMAT.index(self.remat) + 1
         while (index < len(DECODER_REMAT) - 1
-               and kept(DECODER_REMAT[index]) == kept(DECODER_REMAT[index + 1])):
+               and kept(DECODER_REMAT[index]) in (kept(self.remat), kept(DECODER_REMAT[index + 1]))):
             index += 1
         return self.clone(remat=DECODER_REMAT[index])
 

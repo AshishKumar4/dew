@@ -251,16 +251,17 @@ class BlockWiring:
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse')
+DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
 RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 the attention kernel's or the gated delta rule's output before `o_proj`,
 `conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay` and
-`delta_inverse` the rule's cumulated decay and chunk inverse the port saves
-for its backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the
-dense MLP and the routed experts alike. A remat policy picks from these; a
+its queries, keys and values for a delta rule), `delta_decay`,
+`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
+and memory (with `w` and the corrected values) the port saves for its
+backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
+and the routed experts alike. A remat policy picks from these; a
 name off the list is a typo that would otherwise recompute silently."""
 
 
@@ -271,19 +272,27 @@ class RematPolicy:
     A block under remat saves its inputs and recomputes its forward pass.
     `save` names the residuals (from `RESIDUALS`) to keep in device memory, and
     `offload` names those to move to pinned host memory. Both empty is
-    MaxText's `full`. `REMAT_POLICIES` holds MaxText's recipes under this
-    decoder's names: `q_proj`... for MaxText's `query_proj`..., and
+    MaxText's `full`. `recompute` instead names the only residuals recomputed,
+    every other value of the forward kept (jax's
+    `save_anything_except_these_names`), and takes neither list.
+    `REMAT_POLICIES` holds MaxText's recipes under this decoder's names:
+    `q_proj`... for MaxText's `query_proj`..., and
     `gate_proj`/`up_proj`/`down_proj` for `mlpwi_0`/`mlpwi_1`/`mlpwo`.
     MaxText's fused `qkv_proj`/`mlpwi` and AQT `quantization` have no
-    counterpart here. A config gives either a policy name or the two lists.
+    counterpart here. A config gives a policy name or its lists.
     """
     save: tuple[str, ...] = ()
     offload: tuple[str, ...] = ()
+    recompute: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, 'save', tuple(self.save))
         object.__setattr__(self, 'offload', tuple(self.offload))
-        unknown = sorted(set(self.save + self.offload) - set(RESIDUALS))
+        object.__setattr__(self, 'recompute', tuple(self.recompute))
+        if self.recompute and (self.save or self.offload):
+            raise ValueError("a remat policy recomputes named residuals and keeps the rest, or keeps "
+                             "named residuals and recomputes the rest, not both")
+        unknown = sorted(set(self.save + self.offload + self.recompute) - set(RESIDUALS))
         if unknown:
             raise ValueError(
                 f"a remat policy names residuals from {list(RESIDUALS)}, got {unknown}")
@@ -294,6 +303,8 @@ class RematPolicy:
 
     def checkpoint_policy(self):
         """Return the policy that `nn.remat` runs the block under, or None to recompute everything."""
+        if self.recompute:
+            return jax.checkpoint_policies.save_anything_except_these_names(*self.recompute)
         if self.offload:
             return jax.checkpoint_policies.save_and_offload_only_these_names(
                 names_which_can_be_saved=self.save,
@@ -306,6 +317,7 @@ class RematPolicy:
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
+    'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
     'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
@@ -318,7 +330,8 @@ REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
 }
 """MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
-largest first. `full` keeps nothing but the block's inputs."""
+largest first, and Dew's `all_but_delta_memory`, which recomputes only a
+delta rule's memory. `full` keeps nothing but the block's inputs."""
 
 
 def remat_policy(
@@ -339,25 +352,27 @@ def remat_policy(
                 f"save/offload residual names, got {value!r}")
         return REMAT_POLICIES[value]
     if isinstance(value, Mapping):
-        unknown = sorted(set(value) - {'save', 'offload'})
+        unknown = sorted(set(value) - {'save', 'offload', 'recompute'})
         if unknown:
             raise ValueError(
-                f"a remat record holds 'save' and 'offload' residual names, got {unknown}")
+                f"a remat record holds 'save', 'offload' and 'recompute' residual names, got {unknown}")
         return RematPolicy(save=tuple(value.get('save', ())),
-                           offload=tuple(value.get('offload', ())))
+                           offload=tuple(value.get('offload', ())),
+                           recompute=tuple(value.get('recompute', ())))
     raise ValueError(
         f"remat is a RematPolicy, its name, its record, or None, not {value!r}")
 
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
-    None, REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'],
-    REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_conv'],
+    REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
-none 59 GiB; 'minimal_with_conv' keeps a linear-attention or SSM layer's
-short conv output beside 'minimal''s. A decoder's own remat is where it
+none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
+as fla's backward always does; 'minimal_with_conv' keeps a linear-attention
+or SSM layer's short conv output beside 'minimal''s. A decoder's own remat is where it
 starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
@@ -369,7 +384,10 @@ def remat_record(remat: RematPolicy | None) -> JSON:
     if remat is None:
         return None
     names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
-    return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
+    if names:
+        return names[0]
+    return ({'recompute': list(remat.recompute)} if remat.recompute
+            else {'save': list(remat.save), 'offload': list(remat.offload)})
 
 
 @logical_axes({

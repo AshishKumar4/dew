@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from delta_rule_support import CHUNKED, recurrence, rule_math, through
 from reference_error import assert_leaves_as_exact, widened
 from sharded import assert_runs_per_shard, boundary_copies
@@ -660,17 +661,26 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     assert called and set(called) == {jnp.dtype(jnp.bfloat16)}
 
 
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch, capsys):
-    """A block's remat policy may keep the rule's output and the port's saved decay and inverse
-    (`decoder_block.RESIDUALS`): under `jax.checkpoint` with that policy the layer saves those three
-    for its backward, and off a GPU computes the gradients it computes without one, bitwise. A GPU
-    compiles the remat step as another program, whose roundings differ: on an H100 even the XLA
-    math's A_log gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
+@pytest.mark.parametrize("policy, saved, recomputed", [
+    (None, ("delta_decay", "delta_inverse", "delta_memory"), ()),
+    ({"recompute": ("delta_memory",)}, ("delta_decay", "delta_inverse"), ("delta_memory",)),
+    ({"save": ("context", "delta_decay", "delta_inverse")}, ("context", "delta_decay", "delta_inverse"),
+     ("delta_memory",)),
+])
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch, capsys, policy,
+                                                                               saved, recomputed):
+    """A block's remat policy keeps or recomputes the port's named residuals
+    (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory for its
+    backward, which then recomputes none of the memory ('delta_memory', one launch of chunk_fwd_h
+    and of recompute_w_u in the whole step); 'all_but_delta_memory' recomputes the memory alone; a
+    policy saving the output, decay and inverse saves those three. Off a GPU each computes the
+    gradients the layer computes without remat, bitwise. A GPU compiles the remat step as another
+    program, whose roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5
+    relative between the two, the remat one nearer float64."""
     from jax.ad_checkpoint import print_saved_residuals
 
-    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.backbones.decoder_block import remat_policy
 
-    policy = RematPolicy(save=("context", "delta_decay", "delta_inverse")).checkpoint_policy()
     layer = layer_on(monkeypatch, port=True)
     x = jax.random.normal(jax.random.key(71), (1, 64, 64))
     params = layer.init(jax.random.key(73), x)
@@ -678,15 +688,23 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     def loss(params):
         return jnp.sum(layer.apply(params, x) ** 2)
 
+    remat = loss if policy is None else jax.checkpoint(loss, policy=remat_policy(policy).checkpoint_policy())
     capsys.readouterr()
-    print_saved_residuals(jax.checkpoint(loss, policy=policy), params)
-    saved = capsys.readouterr().out
-    for name in ("context", "delta_decay", "delta_inverse"):
-        assert f"named '{name}'" in saved, (name, saved)
+    print_saved_residuals(remat, params)
+    found = capsys.readouterr().out
+    for name in saved:
+        assert f"named '{name}'" in found, (name, found)
+    for name in recomputed:
+        assert f"named '{name}'" not in found, (name, found)
+    if policy is None:
+        with tuning.launches():
+            launches = tokamax.autotuning.get_bound_args(jax.jit(jax.grad(loss)), params)
+        kinds = [type(ba.op) for ba in launches]
+        assert kinds.count(fla_gdn.ChunkFwdH) == kinds.count(fla_gdn.RecomputeWU) == 1, kinds
     if jax.default_backend() == "gpu":
         return
     want = jax.jit(jax.grad(loss))(params)
-    got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params)
+    got = jax.jit(jax.grad(remat))(params)
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                     strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
