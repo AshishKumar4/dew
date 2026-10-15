@@ -278,11 +278,11 @@ def plan_step[LossT, EffectsT](
     have a half rung above it (`remat_half`, a decoder's delta rule
     recomputing its memory alone), the same split is compiled there, and the
     plan stays there where it fits: no plan splits the batch further at a
-    rung where the half rung fits it whole, and climbing passes the half
-    rung, which every split asked has tried. That costs a compile a split
+    rung where the half rung fits it whole, and climbing and the frontier
+    pass every half rung asked (`onward`). That costs a compile a split
     that misses: on an A100-40 Qwen3.5-0.8B's packed 8 x 3072 search asks
-    seven where it asked five, about 240 s each, once a program, whose rung
-    record holds the plan. `resumed`, the rung a checkpoint trained the shape
+    seven where it asked five, once a program, whose rung record holds the
+    plan. `resumed`, the rung a checkpoint trained the shape
     on, is warned of where it does not fit. Where nothing fits, it raises
     with the closest candidate's numbers. Beside the plans come every
     compile the search made, the frontier's included.
@@ -300,11 +300,23 @@ def plan_step[LossT, EffectsT](
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
     halves: set[str] = set()
+    """The remat rungs (`recompute_record`) the search has asked as half rungs."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
 
     def rung() -> str:
         return json.dumps(rung_record(objective, xla_defaults), sort_keys=True)
+
+    def remat_rung() -> str:
+        return json.dumps(recompute_record(objective), sort_keys=True)
+
+    def onward(step: Callable[[], bool]) -> bool:
+        """`step` the objective up its ladder, past every half rung the search has asked: each split
+        tried there missed, so a rung above it is the next to ask."""
+        moved = step()
+        while moved and remat_rung() in halves:
+            moved = step()
+        return moved
 
     def fits(split: int) -> bool:
         if fits_here(split):
@@ -312,7 +324,7 @@ def plan_step[LossT, EffectsT](
         held = remat_half(objective)
         if held is None:
             return False
-        halves.add(rung())
+        halves.add(remat_rung())
         if fits_here(split):
             return True
         objective.substitute(held)
@@ -350,10 +362,7 @@ def plan_step[LossT, EffectsT](
             return True
         xla_defaults = False
         lowered.clear()
-        moved = recompute_more(objective, base)
-        while moved and rung() in halves:
-            moved = recompute_more(objective, base)
-        return moved
+        return onward(lambda: recompute_more(objective, base))
 
     def found(split: int) -> Planned:
         assert fitted is not None
@@ -364,7 +373,7 @@ def plan_step[LossT, EffectsT](
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
     plans = [found(split)]
-    if frontier and split != candidates[0] and remat_more(objective):
+    if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
         xla_defaults = False
         lowered.clear()
