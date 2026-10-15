@@ -183,15 +183,13 @@ def write_mel() -> None:
 
     waveform = np.random.RandomState(5).randn(12000).astype(np.float32) * 0.3
 
+    from torch_precision import default_dtype
+
     def mel(dtype):
         # The filters and the window are built in the default dtype, so float64's are built in float64.
-        default = torch.get_default_dtype()
-        torch.set_default_dtype(dtype)
-        try:
+        with default_dtype(dtype):
             transform = MelSpectrogram(sample_rate=24000, n_fft=960, hop_length=240, win_length=960, f_min=0,
                                        f_max=None, n_mels=128, power=1.0, center=True)
-        finally:
-            torch.set_default_dtype(default)
         spec = transform(torch.from_numpy(waveform).to(dtype)[None, :])
         return torch.log(torch.clip(spec, min=1e-7)).squeeze(0).T.numpy()
 

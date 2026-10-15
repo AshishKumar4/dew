@@ -47,6 +47,7 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.sharding import logical_axes
@@ -119,14 +120,14 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     """
     head_dim = width // heads if head_dim is None else head_dim
     attention = functools.partial(
-        CausalSelfAttention, emb_features=width, num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else kv_heads,
-        head_dim=head_dim, max_seq_len=positions, causal=causal, nope=rotary_axes is None, qk_norm=False,
-        attention_bias=True, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, rope_theta=rope_theta,
-        packed=packed,
-        # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
-        sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
-        dtype=dtype, precision=precision)
+        CausalSelfAttention, ctx=MixerContext(
+            emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
+            head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=False, attention_bias=True,
+            rope_theta=rope_theta,
+            # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
+            sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
+            dtype=dtype, precision=precision),
+        nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, packed=packed)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
                             use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
     return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type=norm_type,
@@ -699,10 +700,11 @@ class T5EncoderTransformer(nn.Module):
     @nn.nowrap
     def _layer(self, **scope):
         attention = functools.partial(
-            CausalSelfAttention, emb_features=self.d_model, num_heads=self.num_heads,
-            num_kv_heads=self.num_heads, head_dim=self.head_dim, max_seq_len=0, causal=False, nope=True,
-            qk_norm=False, attention_scale=1.0, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
-            precision=self.precision)
+            CausalSelfAttention, ctx=MixerContext(
+                emb_features=self.d_model, num_heads=self.num_heads, num_kv_heads=self.num_heads,
+                head_dim=self.head_dim, max_seq_len=0, causal=False, qk_norm=False, attention_scale=1.0,
+                attention_dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision),
+            nope=True)
         mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
                                 activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
                                 dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)

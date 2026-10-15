@@ -1204,10 +1204,11 @@ def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
 def test_a_per_axis_rotary_without_its_axes_is_refused():
     """Turning each axis in its own halves needs the axes; without them the
     layer would rotate by its positions and drop the per-axis layout."""
+    from dew.nn.mixer_base import MixerContext
     from dew.nn.mixers.attention import CausalSelfAttention
 
-    layer = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=4,
-                                causal=False, rotary_per_axis=True)
+    layer = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4,
+                                             max_seq_len=4, causal=False), rotary_per_axis=True)
     with pytest.raises(ValueError):
         layer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
 

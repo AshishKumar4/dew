@@ -37,6 +37,7 @@ from common import (
     TracedWindow,
     WorkloadWork,
     attach_xplane_profile,
+    documents,
     git_head,
     host,
     peak_flops,
@@ -77,6 +78,8 @@ def arguments() -> argparse.Namespace:
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
+    parser.add_argument("--split", type=int, default=None,
+                        help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
@@ -118,9 +121,14 @@ def build(args: argparse.Namespace) -> Run:
     from dew.training.distributed import batch_shardings
     from dew.training.optim import Cosine, ParamGroup
 
+    from dew.nn.inputs import coordinates
+
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
     seq = windows.shape[1] - 1
+    segments = None if args.documents is None else documents(windows.shape, args.documents)
+    # A packed batch's documents a row, the same each step, so one compile serves every step.
+    most = None if segments is None else int(segments.max())
     # The schedule decays over every epoch; --steps only stops the run early.
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
@@ -135,7 +143,14 @@ def build(args: argparse.Namespace) -> Run:
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
                             variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
-    work = measure(objective, {TEXT_KEY: windows[:args.batch]})
+    def rows(indices) -> dict:
+        """The windows' rows, a packed run's documents laid out beside them."""
+        if segments is None:
+            return {TEXT_KEY: windows[indices]}
+        return {TEXT_KEY: windows[indices], "text_coordinates": coordinates(
+            segments=segments[indices], max_segments=most, xp=np)}
+
+    work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
@@ -147,13 +162,13 @@ def build(args: argparse.Namespace) -> Run:
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
-                      mesh=mesh, checkpoints=None, tracker=None)
+                      mesh=mesh, checkpoints=None, tracker=None, split=args.split)
     state, _, _ = trainer.place()
     del pretrained
-    placement = batch_shardings(trainer.device_mesh, {TEXT_KEY: windows[:args.batch]})
+    placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))
 
     def batch(step: int):
-        return jax.device_put({TEXT_KEY: windows[window_rows(order, step, args.batch)]}, placement)
+        return jax.device_put(rows(window_rows(order, step, args.batch)), placement)
 
     compile_start = time.perf_counter()
     step = trainer.compile(state, batch(0))

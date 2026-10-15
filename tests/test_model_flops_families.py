@@ -36,6 +36,7 @@ from dew.nn.dit import TextContext
 from dew.nn.flops import MissingFlopsCount, patch_lengths
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
@@ -423,8 +424,9 @@ def test_prediction_depths_and_the_lm_objective_match_every_forward_product(dept
 
 
 def test_multistream_prediction_projects_each_carried_stream_and_collapses_its_output():
-    attention = partial(CausalSelfAttention, emb_features=8, num_heads=2, num_kv_heads=2,
-                        head_dim=4, max_seq_len=8, causal=False, nope=True, attention_impl="reference")
+    context = MixerContext(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=8,
+                           causal=False, attention_impl="reference")
+    attention = partial(CausalSelfAttention, context, nope=True)
     model = MTPBlock(attention, partial(GatedMLP, hidden_features=16, out_features=8), 8, BlockWiring(),
                      hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
     streams, embeds = jnp.ones((1, 4, 2, 8)), jnp.ones((1, 4, 8))
