@@ -3,10 +3,13 @@ program, keyed by bucketed shape, resolved from a pin, a stored pick or a
 heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
+import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -64,11 +67,11 @@ def launches(function, *args) -> dict[str, tuple[tuple[int, ...], int]]:
             for eqn in equations(graph) if eqn.primitive.name == "pallas_call"}
 
 
-def fresh(script: str, *arguments: str, cache_dir, flags: str) -> list:
-    """`script`'s last printed JSON, run by a fresh interpreter on this checkout
-    and these tests, compiling into `cache_dir` under XLA `flags`."""
+def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src") -> list:
+    """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
+    checkout's) and these tests, compiling into `cache_dir` under XLA `flags`."""
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
-                   "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}
+                   "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests")))}
     run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stderr[-3000:]
@@ -273,3 +276,62 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False]
+
+
+STORES = """
+import json, sys
+import jax
+import tokamax
+from test_tuning import operands, step
+from dew import cache
+from dew.nn.kernels import norm_swiglu, tuning
+with tuning.launches():
+    found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+[norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                               metadata={})
+config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
+pick = tuning.AutotuningData({config: timing})
+tuning._store(tokamax.AutotuningResult(jax.devices()[0].device_kind, ((norm, pick),)))
+path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+read, foreign = tuning._read(path)
+picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]
+         for ba, timings in read.values() if type(ba.op) is norm_swiglu.RmsForward}
+print(json.dumps([path, picks, len(foreign)]))
+"""
+
+
+def widened_checkout(root: Path) -> Path:
+    """A copy of this checkout's package whose norm launch takes one operand more (`shift`), as
+    another branch's would."""
+    shutil.copytree(REPO_ROOT / "src" / "dew", root / "dew")
+    path = root / "dew" / "nn" / "kernels" / "norm_swiglu.py"
+    tree = ast.parse(path.read_text())
+    [kernel] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RmsForward"]
+    [fwd] = [node for node in kernel.body if isinstance(node, ast.FunctionDef) and node.name == "_fwd"]
+    fwd.args.kwonlyargs.insert(0, ast.arg("shift"))
+    fwd.args.kw_defaults.insert(0, ast.Constant(None))
+    path.write_text(ast.unparse(tree))
+    return root
+
+
+def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(tmp_path):
+    """Two checkouts share a store: another branch's, whose norm launch takes an operand more, and
+    this one. Each stores its pick of the launch through the store's writer and reads back only its
+    own, and each write leaves the other's entry as it was."""
+    flags = keeping_picks()
+    cache_dir = tmp_path / "cache"
+    other = widened_checkout(tmp_path / "other")
+    path, theirs, _ = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
+    [(names, pick)] = theirs.items()
+    assert "shift" in json.loads(names) and pick == [4, 2]
+    with open(path) as file:
+        [entry] = json.load(file)["data"]
+    _, ours, foreign = fresh(STORES, "[2, 8]", cache_dir=cache_dir, flags=flags)
+    [(names, pick)] = ours.items()
+    assert "shift" not in json.loads(names) and pick == [2, 8] and foreign == 1
+    with open(path) as file:
+        assert entry in json.load(file)["data"]
+    _, theirs, foreign = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
+    [(names, pick)] = theirs.items()
+    assert "shift" in json.loads(names) and pick == [4, 2] and foreign == 1
