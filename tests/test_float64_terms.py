@@ -57,3 +57,17 @@ def test_a_sum_of_one_sign_has_its_own_size_and_an_update_its_steps_terms():
     np.testing.assert_allclose(trace_terms, np.sqrt((0.81 + 1) * energy), rtol=1e-12)
     # The weight moved by 0.1 of each step's momentum; the value it started at carries none.
     np.testing.assert_allclose(moved_terms, np.sqrt(0.01 * (1 + 0.81 + 1) * energy), rtol=1e-12)
+
+
+def test_a_recomputed_body_sums_its_own_terms():
+    """A body under jax.checkpoint, as a recomputed norm's, is the computation's own: a key bias's
+    gradient through it sums the same cancelling terms as without it."""
+    rng = np.random.default_rng(0)
+    query, keys, values = (rng.normal(size=shape) for shape in ((2, 4), (2, 6, 4), (2, 6, 3)))
+
+    with jax.enable_x64(new_val=True):
+        _, plain = float64_terms(jax.grad(lambda bias: loss_of(keys + bias, query, values)), jnp.zeros(4))
+        _, recomputed = float64_terms(
+            jax.grad(lambda bias: jax.checkpoint(loss_of)(keys + bias, query, values)), jnp.zeros(4))
+    np.testing.assert_allclose(recomputed, plain, rtol=1e-12)
+    assert np.all(recomputed > 1e-3)

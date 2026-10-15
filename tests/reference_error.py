@@ -236,10 +236,10 @@ added to a parameter) and moved. A product or quotient of a sum by a value
 that is none carries them too, scaled element by element (`_applied`), as
 `s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
+                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A body that runs elsewhere, a
 shard_map's per-device program or a Pallas kernel, is one operation, its
 outputs their own size."""
 
