@@ -16,31 +16,17 @@ from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.registry import Record, from_record
 
-from ..mobilenet import _ARCHITECTURE, MobileNetV5Encoder
+from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
 from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
 
 
 @dataclasses.dataclass(frozen=True)
-class Gemma3nVision(TowerBase):
-    """MobileNet-v5's encoder construction fields, as timm model_args names them."""
-
-    channel_multiplier: float = 1.0
-    stem_size: int = 64
-    stem_bias: bool = True
-    fix_stem: bool | None = None
-    in_chans: int = 3
-    pad_type: str = "same"
-    group_size: int | None = None
-    msfa_indices: tuple[int, ...] = (-2, -1)
-    msfa_output_resolution: int = 16
-    layer_scale_init_value: float | None = 1e-5
-    drop_path_rate: float = 0.0
-
-    def __post_init__(self):
-        object.__setattr__(self, "msfa_indices", tuple(self.msfa_indices))
+class Gemma3nVision(MobileNetV5, TowerBase):
+    """Gemma 3n's vision tower: MobileNet-v5's encoder, by its construction
+    fields (`MobileNetV5`)."""
 
     def build(self) -> nn.Module:
-        return MobileNetV5Encoder(**dataclasses.asdict(self))
+        return MobileNetV5Encoder(MobileNetV5(**dataclasses.asdict(self)))
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(channels=self.in_chans)
