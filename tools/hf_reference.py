@@ -1243,6 +1243,10 @@ GEMMA4_MM_TEXT: Dict[str, Any] = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
+# Qwen3.5's tiny text decoder, its own (tools/qwen_linear_reference.py) and inside the multimodal
+# fixture: small enough to live in git, shaped so every gap the family opens is exercised: value heads
+# outnumbering key heads, key and value dims apart, a partial rotary of a quarter of the head (the
+# released factor), the doubled gated q_proj, and a conv with a real history.
 QWEN35_MM_TEXT: Dict[str, Any] = dict(
     vocab_size=256, hidden_size=64, intermediate_size=128,
     num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
@@ -1251,6 +1255,9 @@ QWEN35_MM_TEXT: Dict[str, Any] = dict(
     linear_conv_kernel_dim=4, linear_key_head_dim=12, linear_value_head_dim=16,
     linear_num_key_heads=2, linear_num_value_heads=4,
     layer_types=["linear_attention"] * 3 + ["full_attention"],
+    # A quarter of head_dim 32 rotates: 8 dims, 4 frequency pairs, which the
+    # three mRoPE sections split as 2 + 1 + 1 (the released [11, 11, 10]
+    # splits the 32 pairs of a 64-dim rope the same way).
     rope_parameters={"rope_type": "default", "rope_theta": 1000000.0,
                      "partial_rotary_factor": 0.25,
                      "mrope_interleaved": True, "mrope_section": [2, 1, 1]})

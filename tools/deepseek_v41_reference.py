@@ -597,27 +597,23 @@ def widened(model_module):
     model.py and the stand-ins widened, which are their `.float()` casts, the
     MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
     and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
+    from diffusers_wan_reference import default_dtype, wide
+
     float_, zeros_like, new_zeros, arange = (torch.Tensor.float, torch.zeros_like,
                                              torch.Tensor.new_zeros, torch.arange)
-
-    def wide(dtype):
-        return torch.float64 if dtype == torch.float32 else dtype
-
     torch.Tensor.float = lambda self, *args, **kwargs: self.double()
     torch.zeros_like = lambda x, *args, dtype=None, **kwargs: zeros_like(
         x, *args, dtype=wide(dtype), **kwargs)
     torch.Tensor.new_zeros = lambda self, *size, dtype=None, **kwargs: new_zeros(
         self, *size, dtype=wide(dtype), **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
-    default = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
     model_module.precompute_freqs_cis.cache_clear()
     try:
-        yield
+        with default_dtype(torch.float64):
+            yield
     finally:
         torch.Tensor.float, torch.zeros_like, torch.Tensor.new_zeros, torch.arange = (
             float_, zeros_like, new_zeros, arange)
-        torch.set_default_dtype(default)
         model_module.precompute_freqs_cis.cache_clear()
 
 
