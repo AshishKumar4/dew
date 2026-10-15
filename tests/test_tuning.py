@@ -15,13 +15,22 @@ import tokamax
 from process_support import REPO_ROOT
 from reference_error import equations
 
-from dew import cache
 from dew.nn.attention import rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
 from dew.nn.moe import gated_product
 
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
 """The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
+
+REPEATABLE = "--xla_gpu_deterministic_ops=true"
+"""The flag under which a process keeps no picks, so its kernels repeat from run to run."""
+
+
+def keeping_picks() -> str:
+    """This process's XLA flags without `REPEATABLE`, which the cuda lane sets:
+    the stored picks these tests write and read are kept only without it."""
+    return " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                    if not flag.startswith(REPEATABLE.split("=")[0]))
 
 
 def loss(x, branch, scale, gate, up):
@@ -108,7 +117,9 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     process the picks stored for its device beside its compilation cache,
     for every token count in the bucket, and a token count stored for no
     bucket the nearest bucket's, beside a launch of a kernel only another
-    checkout has. Nothing measures on a CPU or beside other work on a GPU."""
+    checkout has. Nothing measures on a CPU or beside other work on a GPU.
+    A process under deterministic ops reads none of them and launches its
+    heuristics, the same in every process while other runs store picks."""
     with tuning.launches():
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
         thirteen = tokamax.autotuning.get_bound_args(step(), *operands(13))
@@ -146,7 +157,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
         *((ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found),
         (alone, tuning.AutotuningData({norm_swiglu.RowsConfig(2, 1): timing}))))
-    flags = f"{os.environ.get('XLA_FLAGS', '')} {READ_ONLY}".strip()
+    flags = f"{keeping_picks()} {READ_ONLY}".strip()
     [path] = fresh(STORED, with_foreign(picks.dumps()), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
@@ -157,6 +168,10 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
     assert tuned is True
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
+    repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {REPEATABLE}")
+    heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
+    assert repeatable == json.loads(json.dumps(heuristics))
+    assert repeatable != stored
 
 
 TRAINED = """
@@ -201,9 +216,9 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     measures each launch over every config of its space, stores every time
     and keeps the fastest; the next pass measures nothing, and one beside
     other work on its GPU (gpu-run -n 0.5) adds no picks for a new shape."""
-    if not cache.measures_picks():
+    inherited = keeping_picks()
+    if READ_ONLY in inherited:
         pytest.skip("measuring needs the GPU to itself: gpu-run without -n")
-    inherited = os.environ.get("XLA_FLAGS", "")
     path, untouched = fresh(TRAINED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
     assert untouched is None
     # Another checkout's launch, which the pass reads past and keeps.
