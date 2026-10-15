@@ -63,6 +63,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import asks_default_precision
+from dew.registry import wrapping
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -194,9 +195,24 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
         raise ValueError(f"{type(model).__name__} already computes under a Qwix quantization, which a "
                          f"second one would replace; quantize the model once")
     wrapped = _qwix().quantize_model(model, provider, methods=entry_methods(model))
-    layer = type(wrapped)
-    layer._dew_wrapped = type(model)
-    layer._dew_wrapper = staticmethod(lambda: wrapper)
+    quantized = type(wrapped)
+
+    class Quantized(quantized):
+        # Unannotated, or Flax would read them as fields.
+        _dew_wrapped = type(model)
+        _dew_wrapper = staticmethod(lambda: wrapper)
+
+        def apply(self, *args, **kwargs):
+            with wrapping():
+                return super().apply(*args, **kwargs)
+
+        def init_with_output(self, *args, **kwargs):
+            with wrapping():
+                return super().init_with_output(*args, **kwargs)
+
+    Quantized.__name__ = Quantized.__qualname__ = quantized.__name__
+    # As Qwix itself makes the model an instance of its class.
+    wrapped.__class__ = Quantized
     return wrapped
 
 
@@ -623,11 +639,12 @@ class InputQuantization:
                 return record.quantizer(module)
 
             def apply(self, variables, *args, **kwargs):
-                with nn.intercept_methods(quantize_inputs):
+                with nn.intercept_methods(quantize_inputs), wrapping():
                     return super().apply(variables, *args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):
-                output, variables = super().init_with_output(*args, **kwargs)
+                with wrapping():
+                    output, variables = super().init_with_output(*args, **kwargs)
                 return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__

@@ -348,21 +348,25 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
             decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
 
 
-def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(decoder, reference, monkeypatch):
-    """A row that joins gate and up into one GEMM (`dew.nn.joined`) leaves an
+@pytest.mark.parametrize("scan", [False, True])
+@pytest.mark.parametrize("choice, modules", [("gate_up", ("gate_proj", "up_proj")), ("qkv", ("q_proj",))])
+def test_an_adapter_keeps_its_branch_where_the_row_joins_its_targets(decoder, reference, monkeypatch, choice,
+                                                                    modules, scan):
+    """A row that joins projections into one GEMM (`dew.nn.joined`) leaves an
     adapted model's projections to their own calls, which the adapter
-    intercepts: the adapted logits are those with the projections apart, and
-    the branch moves them off the base model's."""
-    adapter = LoRA(rank=3, modules=("gate_proj", "up_proj")).apply(
-        decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
+    intercepts, in a scanned stack too: the adapted logits are those with the
+    projections apart, and the branch moves them off the base model's."""
+    adapter = LoRA(rank=3, modules=modules).apply(decoder.model, decoder.variables, key=0,
+                                                   layouts=decoder.layouts)
+    model = adapter.model.clone(scan_layers=scan)
     variables = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, adapter.variables)
     tokens = jnp.asarray(reference["input_ids"])
-    row_joins(monkeypatch, "gate_up", joins=False)
-    apart = np.asarray(adapter.model.apply(variables, tokens))
-    row_joins(monkeypatch, "gate_up")
-    np.testing.assert_array_equal(np.asarray(adapter.model.apply(variables, tokens)), apart)
+    row_joins(monkeypatch, choice, joins=False)
+    apart = np.asarray(model.apply(variables, tokens))
+    row_joins(monkeypatch, choice)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, tokens)), apart)
     assert np.max(np.abs(apart - np.asarray(decoder.model.apply(decoder.variables, tokens)))) > 1e-2
 
 

@@ -17,15 +17,9 @@ import numpy as np
 from flax import linen as nn
 from flax.core import meta
 
-from ..registry import wrapper_layers
+from ..registry import WRAPPED
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 from .sharding import LogicalAxes, constrain, logical_spec, mesh_axes
-
-
-def _root(module: nn.Module) -> nn.Module:
-    while isinstance(module.parent, nn.Module):
-        module = module.parent
-    return module
 
 
 def _kernel(projection: nn.Module) -> jax.Array:
@@ -59,7 +53,7 @@ def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[Logical
         (len({(projection.use_bias, projection.dtype, projection.precision, projection.promote_dtype)
               for projection in projections}) == 1,
          "the projections differ in bias, dtype, precision or promotion"),
-        (not wrapper_layers(type(_root(first)))[1],
+        (not WRAPPED.get(),
          "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
          "projection's own call"),
         (kernel_axes is None or len({_split(projection, axes) for projection, axes
