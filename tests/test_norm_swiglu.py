@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, distance, float64_terms
+from reference_error import assert_as_exact_as_the_reference, distance, float64_terms, widened
 from tuned import each_config
 
 from dew.nn import attention
@@ -116,8 +116,7 @@ def float64(function, operands, seed):
     float64 terms (`float64_terms`), what its sums add, by which the gate sizes its rows."""
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), (operands, seed))
-        return float64_terms(functools.partial(evaluated, function), *wide)
+        return float64_terms(functools.partial(evaluated, function), *widened((operands, seed)))
 
 
 def gated(labels, actual, reference, truth, terms, seed, coefficient):
