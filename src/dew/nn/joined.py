@@ -44,8 +44,7 @@ def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[Logical
     `kernel_axes`, each kernel's logical axes, and `heads`, each one's heads,
     are a concatenation's (`joined_outputs`), whose features a mesh must
     split alike and, where it regroups them, at whole heads."""
-    first = projections[0]
-    return first_refusal(
+    reason = first_refusal(
         (all(type(projection) is nn.Dense for projection in projections),
          "a projection is not a plain nn.Dense, whose call the join reproduces"),
         (all(projection.dot_general is None and projection.dot_general_cls is None
@@ -56,11 +55,18 @@ def join_refusal(projections: Sequence[nn.Module], kernel_axes: Sequence[Logical
         (not WRAPPED.get(),
          "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
          "projection's own call"),
-        (kernel_axes is None or len({_split(projection, axes) for projection, axes
-                                     in zip(projections, kernel_axes, strict=True)}) == 1,
+        (all(projection.has_variable('params', 'kernel') for projection in projections),
+         "a projection holds no kernel of its own"),
+    )
+    if reason is not None or kernel_axes is None:
+        return reason
+    # Read only where every projection holds its kernel.
+    shards = _shards(projections[0], kernel_axes[0])
+    return first_refusal(
+        (len({_split(projection, axes)
+              for projection, axes in zip(projections, kernel_axes, strict=True)}) == 1,
          "a mesh splits the projections' features over different axes"),
-        (kernel_axes is None or heads is None or all(
-            count % _shards(first, kernel_axes[0]) == 0 for count in heads),
+        (heads is None or all(count % shards == 0 for count in heads),
          "a mesh splits a projection inside a head, which the join regroups whole"),
     )
 
