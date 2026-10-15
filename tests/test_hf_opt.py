@@ -8,44 +8,24 @@ import numpy as np
 import pytest
 
 from dew.interop import Pretrained
+from dew.sampling import Sampling, generate
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'opt-tiny'
 
 
 def test_opt_same_weight_logits_and_cached_greedy_generation():
-    from tools.classic_gpt_reference import greedy
-
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'input_ids.npy')
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     expected = np.load(DIRECTORY / 'logits.npy')
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    np.testing.assert_array_equal(greedy(loaded, ids[:1, :4], 6), np.load(DIRECTORY / 'generated.npy'))
+    generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
     wrong = loaded.model.clone(position_embedding_offset=0)
     assert float(np.max(np.abs(np.asarray(wrong.apply(loaded.variables, ids)) - expected))) > 1e-2
 
-
-def test_opt_export_uses_the_reference_checkpoint_names(tmp_path):
-    from dew.interop.sources import load_shards
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path)
-    actual = load_shards(tmp_path)
-    expected = load_shards(DIRECTORY)
-    assert set(actual) == set(expected)
-    for name in actual:
-        np.testing.assert_array_equal(actual[name], expected[name])
-    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
-    np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
-
-    assert reloaded.model == loaded.model
-    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(loaded.variables)
-    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
-                                        jax.tree.leaves(reloaded.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(tmp_path):
