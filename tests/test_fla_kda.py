@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, NAMES, fla_side, recurrence, through
+from delta_rule_support import CHUNKED, NAMES, factorised_decay_terms, fla_side, recurrence, through
 from kernel_compile import compile_kernels, failures
 from reference_error import (
     assert_as_exact_as_the_reference,
@@ -83,6 +83,8 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
         operands64 = widened((*inputs, do, dht))
         truth = through(recurrence, *operands64[6:])(*operands64[:6])
         _, terms = float64_terms(through(math, *operands64[6:]), *operands64[:6])
+        # The port's decay gradient is fla's factorised one, whose terms the math's pairs never add.
+        terms = (*terms[:5], np.maximum(terms[5], factorised_decay_terms(*operands64)), *terms[6:])
     assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED, terms=terms)
 
 
@@ -169,27 +171,41 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
     assert boundary_copies(text) == []
 
 
-def float64_truth(inputs, cuts) -> list[np.ndarray]:
-    """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
-    so a head's backward fits, each key head's gradients summed over the value heads it serves."""
+def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """The token recurrence's outputs and gradients in float64 (`recurrence`), and each one's float64
+    terms, what the sums of Dew's portable math add (`float64_terms`) and, for the decay's gradient,
+    fla's factorised terms besides (`factorised_decay_terms`): a value head at a time so a head's
+    backward fits, each key head's gradients summed over the value heads it serves."""
     q, k, v, g, beta, h0, do, dht = inputs
     group = v.shape[2] // q.shape[2]
+    rows = None if cuts is None else (cuts,)
     with jax.enable_x64(new_val=True):
-        rows = None if cuts is None else (cuts,)
         run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
             functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
-        heads = []
+        heads, sizes = [], []
         for head in range(v.shape[2]):
             keyed = slice(head // group, head // group + 1)
             valued = slice(head, head + 1)
-            sliced = (q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
-                      h0[:, valued], do[:, :, valued], dht[:, valued])
-            heads.append([np.asarray(x) for x in run(*widened(sliced))])
-    found = [np.concatenate([leaves[i] for leaves in heads], axis=axis)
-             for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+            sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
+                              beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
+            heads.append([np.asarray(x) for x in run(*sliced)])
+            chunked = functools.partial(recurrence, cuts=rows, rule=linear.chunk_delta_rule)
+            _, terms = float64_terms(through(chunked, *sliced[6:]), *sliced[:6])
+            terms = [np.asarray(x) for x in terms]
+            terms[5] = np.maximum(terms[5], factorised_decay_terms(*sliced, cuts=rows))
+            sizes.append(terms)
+
+    def joined(leaves):
+        return [np.concatenate([each[i] for each in leaves], axis=axis)
+                for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+
+    def grouped(x):
+        return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
+
+    found, terms = joined(heads), joined(sizes)
     for i in (2, 3):
-        found[i] = found[i].reshape(*found[i].shape[:2], q.shape[2], group, -1).sum(axis=3)
-    return found
+        found[i], terms[i] = grouped(found[i]), np.sqrt(grouped(np.square(terms[i])))
+    return found, terms
 
 
 GPU_CASES = {
@@ -219,8 +235,8 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
     inputs, run, cuts = gpu_case(case, dtype)
     mine = [np.asarray(x, np.float64) for x in run(*inputs[:-2])]
     theirs = fla_side(inputs, cuts, dtype)
-    for name, dew, fla, value in zip(NAMES, mine, theirs, float64_truth(inputs, cuts), strict=True):
-        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}")
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, cuts), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}", terms=summed)
 
 
 LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
@@ -236,12 +252,13 @@ def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch):
     recurrence as fla's own, at a partial last chunk."""
     inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
     theirs = fla_side(inputs, cuts, jnp.bfloat16)
-    truth = float64_truth(inputs, cuts)
+    truth, terms = float64_truth(inputs, cuts)
     for tiles in each_config(launch, run, *inputs[:-2]):
         with tuning.pinned({launch: tiles}):
             mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
-        for name, dew, fla, value in zip(NAMES, mine, theirs, truth, strict=True):
-            assert_as_exact_as_the_reference(dew, fla, value, f"{launch.__name__}/{tiles}/{name}")
+        for name, dew, fla, value, summed in zip(NAMES, mine, theirs, truth, terms, strict=True):
+            label = f"{launch.__name__}/{tiles}/{name}"
+            assert_as_exact_as_the_reference(dew, fla, value, label, terms=summed)
 
 
 def gpu_case(case, dtype):
