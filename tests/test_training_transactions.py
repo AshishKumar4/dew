@@ -34,7 +34,7 @@ class Tiny(Objective[Ratio | Terms, None]):
     def __init__(self, composite=False):
         self.composite = composite
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"w": jnp.array(.2)}, "stats": {"seen": jnp.array(0.)}}
 
     def loss(self, variables, batch, step):

@@ -97,7 +97,7 @@ def unbanked(tree):
 class Coupled(Objective):
     ema = EMASpec(optax.constant_schedule(.5))
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {"params": {"first": jnp.array([1., 2.]), "second": jnp.array([3., 4., 5.])}}
 
     def loss(self, variables, batch, step):

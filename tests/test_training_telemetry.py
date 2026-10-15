@@ -22,7 +22,7 @@ from dew.training.optim import Cosine
 class Squared(Objective):
     """A two-coordinate gradient with unit direction (0.6, 0.8)."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {'params': {'weight': jnp.zeros(2)}}
 
     def loss(self, variables, batch, step):
@@ -33,7 +33,7 @@ class Squared(Objective):
 class ComplexSquared(Objective):
     """A real loss whose optimizer input has complex coordinates, as an SSM's can."""
 
-    def init(self, key, variables=None):
+    def fresh_variables(self, key, held):
         return {'params': {'weight': jnp.zeros(2, jnp.complex64)}}
 
     def loss(self, variables, batch, step):

@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import TextData, loader
+from dew.config.data import TextData
 from dew.data.sources import source
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.records import integer, text
@@ -140,10 +140,7 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = loader(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
-                      read=self.data_read, provision=self.provision,
-                      seed=self.data_seed, loading=self.loading,
-                      validation_records=self.validation_records, objective=objective.data())
+        loaded = self.loader(objective.data(), tokens)
         if loaded.steps_per_epoch is None and self.trainer.steps is None:
             raise ValueError("this data has no epoch length, so a run cannot count epochs of it: online "
                              "packing or a filter over an indexed or streamed read cuts its order per share. "
