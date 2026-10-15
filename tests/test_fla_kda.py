@@ -65,6 +65,25 @@ def math(q, k, v, g, beta, h0):
     return linear.chunk_delta_rule(q, k, v, g, beta, h0)
 
 
+def plain_prefix(g, chunk: int = CHUNKED):
+    """`g` re-cut from fla's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`), each chunk of `chunk`
+    tokens from the row's start: each token's decay the difference of its prefix and the one before,
+    so the portable rule, rebuilding the prefixes, takes every range as the difference of two plain
+    prefixes, as fla and the port do. Its gradient passes to `g` unchanged."""
+    batch, length = g.shape[:2]
+    padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
+    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2)
+    earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
+    recut = (prefix - earlier).reshape(padded.shape)[:, :length]
+    return g + jax.lax.stop_gradient(recut - g)
+
+
+def fla_math(q, k, v, g, beta, h0):
+    """The portable rule on fla's plain prefix (`plain_prefix`): a float32 sample of the formula the
+    port runs, which it is held to on the host, where fla does not run."""
+    return math(q, k, v, plain_prefix(g), beta, h0)
+
+
 @ON_A_GPU
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
     (1, 2, 64, 64, 128),    # value heads sharing a key head, two whole chunks
@@ -75,10 +94,12 @@ def math(q, k, v, g, beta, h0):
 def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
     """`fla_rule` with a decay per key dimension, the port as a GPU runs it: padded to the kernels'
     blocks, through every kernel and the custom VJP, its output, final memory and six gradients as near
-    the float64 recurrence as the portable math, up to fp32 rounding of a chunk's sums."""
+    the float64 recurrence as the portable math on fla's plain prefix (`fla_math`), up to fp32
+    rounding of a chunk's sums, each sized by the portable math's float64 terms and the decay's
+    gradient by fla's factorised ones too."""
     *inputs, do, dht = operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=11)
     got = through(fla_rule, do, dht)(*inputs)
-    want = through(math, do, dht)(*inputs)
+    want = through(fla_math, do, dht)(*inputs)
     with jax.enable_x64(new_val=True):
         operands64 = widened((*inputs, do, dht))
         truth = through(recurrence, *operands64[6:])(*operands64[:6])
