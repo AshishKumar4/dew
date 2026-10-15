@@ -202,12 +202,14 @@ def worker() -> str:
     return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
 
 
-def cache_url(python: str, row_name: str, held: str) -> str:
-    """Where the record of `row_name` on class `held` (`device_class`) lives: the Worker's key alphabet
-    has no colon or hash."""
+def cache_url(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
+    """Where the record of `row_name` on class `held` (`device_class`) lives: the last run's, or with
+    `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
+    (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
+    under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{worker()}/{CACHE_PREFIX}/{python}/{held}/{name}/"
-            + ("-of-".join(split.split("/")) if split else "whole"))
+    at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
+    return f"{worker()}/{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -230,15 +232,17 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The record of a run
+    on these shared inputs comes first, then the last run's, which may be another commit's whose
+    file's inputs are these."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), device_class()), token)
-    if record is None:
-        return None
-    recorded = json.loads(record)
-    return recorded["row"] if fresh(recorded, name, common) else None
+    for inputs in (common, None):
+        record = cache_request(cache_url(python, row(python, name, split), device_class(), inputs), token)
+        if record is not None and fresh(recorded := json.loads(record), name, common):
+            return recorded["row"]
+    return None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -549,7 +553,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"]})
-        cache_request(cache_url(python, row_["name"], held), token, body.encode())
+        for inputs in (None, common):
+            cache_request(cache_url(python, row_["name"], held, inputs), token, body.encode())
 
 
 def listed(prefix: str, token: str) -> list[str]:
