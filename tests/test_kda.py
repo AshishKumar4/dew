@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import chunk_gated_delta_rule, l2norm as jax_l2norm, recurrent_delta_rule
 
@@ -273,13 +274,13 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     x = jnp.asarray(np.random.RandomState(6).randn(B, S, E), jnp.float32)
     full = module.apply(variables, x)
 
-    _, allocated = module.apply(variables, x[:, :1], decode=True, mutable=["cache"])
+    _, allocated = module.apply(variables, x[:, :1], MixerCall(decode=True), mutable=["cache"])
     assert float(jnp.abs(jnp.asarray(allocated["cache"]["recurrent_state"])).max()) == 0.0
-    out, state = module.apply({**variables, **allocated}, x[:, :3], decode=True, mutable=["cache"])
+    out, state = module.apply({**variables, **allocated}, x[:, :3], MixerCall(decode=True), mutable=["cache"])
     steps = [out]
     for position in range(3, S):
         out, state = module.apply(
-            {**variables, **state}, x[:, position : position + 1], decode=True, mutable=["cache"]
+            {**variables, **state}, x[:, position : position + 1], MixerCall(decode=True), mutable=["cache"]
         )
         steps.append(out)
 
@@ -296,8 +297,7 @@ def test_padded_rows_preserve_the_memory_and_the_history():
     valid = jnp.array([[True, True, False, True, True, False]])
     compact = x[:, jnp.array([0, 1, 3, 4])]
 
-    gapped = module.apply(variables, x,
-                          attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
+    gapped = module.apply(variables, x, MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid))))
     wanted = module.apply(variables, compact)
 
     assert scaled(np.asarray(gapped)[:, [0, 1, 3, 4]], np.asarray(wanted)) < BOUND

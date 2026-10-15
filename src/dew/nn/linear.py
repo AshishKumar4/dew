@@ -28,7 +28,7 @@ value head.
 
 import functools
 from collections.abc import Sequence
-from typing import overload
+from typing import ClassVar, overload
 
 import jax
 import jax.numpy as jnp
@@ -43,7 +43,7 @@ from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata, Coordinates, coordinates_of, valid_order
+from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
@@ -953,6 +953,10 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
+    reads: ClassVar[frozenset[str]] = frozenset()
+    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
+    of its document, with no mask or bias to narrow it."""
+
     emb_features: int
     num_k_heads: int
     num_v_heads: int
@@ -1082,9 +1086,8 @@ class GatedDeltaNet(nn.Module):
         return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        del kv_store
+    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+        decode, attention_metadata = call.decode, call.metadata
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid
