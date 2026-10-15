@@ -38,7 +38,7 @@ from delta_rule_support import recurrence, through
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -310,14 +310,14 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     hidden = jnp.asarray(reference["layer.hidden"])
     parallel = module.apply(variables, hidden)
 
-    cache = module.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    cache = module.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
     prefill = 5
-    out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill],
-                                decode=True, mutable=["cache"])
+    out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill], MixerCall(decode=True),
+                                mutable=["cache"])
     steps = [out]
     for position in range(prefill, hidden.shape[1]):
         out, mutated = module.apply({**variables, **mutated}, hidden[:, position:position + 1],
-                                    decode=True, mutable=["cache"])
+                                    MixerCall(decode=True), mutable=["cache"])
         steps.append(out)
 
     assert largest(jnp.concatenate(steps, axis=1), parallel) < 5e-4
@@ -336,20 +336,20 @@ def test_a_bf16_layer_decodes_its_state_in_bf16_within_its_prefills_error(refere
     hidden = jnp.asarray(reference["layer.hidden"])
     truth = np.asarray(module.apply(variables, hidden), np.float64)
     narrow = module.clone(dtype=jnp.bfloat16)
-    exact = narrow.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    exact = narrow.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
     assert {leaf.dtype for leaf in jax.tree.leaves(exact)} == {jnp.dtype(jnp.float32)}
 
     with jax.default_matmul_precision("default"):
         parallel = np.asarray(narrow.apply(variables, hidden), np.float64)
-        cache = narrow.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+        cache = narrow.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
         assert {leaf.dtype for leaf in jax.tree.leaves(cache)} == {jnp.dtype(jnp.bfloat16)}
         prefill = 5
         out, mutated = narrow.apply({**variables, "cache": cache}, hidden[:, :prefill],
-                                    decode=True, mutable=["cache"])
+                                    MixerCall(decode=True), mutable=["cache"])
         steps = [out]
         for position in range(prefill, hidden.shape[1]):
             out, mutated = narrow.apply({**variables, **mutated}, hidden[:, position:position + 1],
-                                        decode=True, mutable=["cache"])
+                                        MixerCall(decode=True), mutable=["cache"])
             steps.append(out)
     decoded = np.asarray(jnp.concatenate(steps, axis=1), np.float64)
 
@@ -502,7 +502,7 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
 
     alone = module.apply(variables, hidden)
     holed = module.apply(variables, spread,
-                         attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
+                         MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid))))
 
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
@@ -556,7 +556,7 @@ def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
 
     def call(metadata, variables=variables):
-        return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
+        return jax.jit(lambda hidden: module.apply(variables, hidden, MixerCall(metadata)))
 
     masked = AttentionMetadata(coordinates=coordinates(valid=valid))
     declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))

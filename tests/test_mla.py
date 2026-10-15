@@ -29,6 +29,7 @@ from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import MixerCall
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq, yarn_query_scale, yarn_rope_freqs
 from dew.objectives.lm import LMObjective
@@ -130,13 +131,12 @@ def test_yarn_matches_the_reference_derivation():
 
 def decode_loop(module, variables, tokens):
     """Prefill plus one-token steps, the sampler's decode protocol."""
-    state = module.init(jax.random.key(0), tokens[:, :1], decode=True)
+    state = module.init(jax.random.key(0), tokens[:, :1], MixerCall(decode=True))
     state = {**state, "params": variables["params"]}
     outputs = []
     for position in range(tokens.shape[1]):
         out, mutated = module.apply(
-            state, tokens[:, position:position + 1],
-            decode=True, mutable=["cache"])
+            state, tokens[:, position:position + 1], MixerCall(decode=True), mutable=["cache"])
         state = {**state, "cache": mutated["cache"]}
         outputs.append(out)
     return jnp.concatenate(outputs, axis=1)
