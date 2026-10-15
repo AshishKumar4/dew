@@ -10,15 +10,18 @@ FLASH_ATTN3_JAX_COMMIT=4af680283658f467ced12a0811894a672e8d87d1
 here=$(cd "$(dirname "$0")" && pwd)
 python=${PYTHON:-python3}
 major=$(nvcc --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p')
+# patches/ holds Dew's changes to the two ports' kernels, applied once to a fresh checkout.
 if [ ! -d "$here/upstream" ]; then
   git clone --quiet "$FLASH_ATTN_JAX" "$here/upstream"
   git -C "$here/upstream" checkout --quiet "$FLASH_ATTN_JAX_COMMIT"
   git -C "$here/upstream" submodule update --quiet --init --depth 1 csrc/cutlass
+  git -C "$here/upstream" apply "$here"/patches/flash-attention-2-*.patch
 fi
 if [ ! -d "$here/upstream3" ]; then
   git clone --quiet "$FLASH_ATTN3_JAX" "$here/upstream3"
   git -C "$here/upstream3" checkout --quiet "$FLASH_ATTN3_JAX_COMMIT"
   git -C "$here/upstream3" submodule update --quiet --init --depth 1 csrc/cutlass
+  git -C "$here/upstream3" apply "$here"/patches/flash-attention-3-*.patch
 fi
 cmake -S "$here" -B "$here/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$here/build" --parallel "${JOBS:-4}"
