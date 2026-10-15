@@ -15,27 +15,13 @@ at test time.
 import json
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
-from reference_error import (
-    FACTOR,
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-    distance,
-    ieee_fixture,
-)
-from residual_orders import permuted
+from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, assert_update_as_exact, kimi_source
 from safetensors.numpy import load_file
-from scipy.special import log_softmax
 
 from dew.interop import Pretrained
-from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
-from dew.sampling import Sampling, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-linear-tiny"
@@ -43,11 +29,7 @@ TINY = ROOT / "kimi-linear-tiny"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
-    reference = ieee_fixture(TINY / "reference.npz") | ieee_fixture(TINY / "numerics.npz")
-    inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
-                         {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
-    return loaded, inputs, reference
+    return kimi_source(TINY)
 
 
 def test_forward_matches_the_reference_over_left_padding(source):
@@ -58,12 +40,7 @@ def test_forward_matches_the_reference_over_left_padding(source):
     sits 1.04e-6 from float64 (RMS); Dew at 0.88 of that on CPU, 0.79 on an
     AVX-512 CPU (Intel SDE's Ice Lake server, the CI runners' ISA) and 0.68
     on an RTX 4080."""
-    loaded, inputs, reference = source
-    logits = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
-    valid = reference["attention_mask"].astype(bool)
-    assert_as_exact_as_the_reference(np.asarray(logits)[valid], reference["logits"][valid],
-                                     reference["logits_f64"][valid], "logits")
-    np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
+    assert_forward_as_exact(source)
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
@@ -83,33 +60,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
 
     The export writes every source name back at its stored shape, A_log as
     [1, 1, heads, 1], and reloading restores the trained weights exactly."""
-    loaded, inputs, reference = source
-    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
-                            ema_decay=None, pad_id=0)
-    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
-
-    def stepped(params):
-        gradient = jax.grad(loss)(params)
-        return jax.tree.map(lambda weight, grad: weight - reference["learning_rate"] * grad, params, gradient)
-
-    value = jax.jit(loss)(loaded.variables["params"])
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    valid = reference["attention_mask"].astype(bool)
-    updated = jax.jit(lambda params: loaded.model.apply(
-        {**loaded.variables, "params": stepped(params)}, inputs.tokens, **inputs.kwargs()))
-    drawn = ieee_fixture(TINY / "orders.npz")
-    orders, theirs = drawn["orders"], drawn["updated_logits"]
-    truth = reference["updated_logits_f64"][valid]
-    mine = [distance(np.asarray(updated(permuted(loaded.variables, order)["params"]))[valid], truth)
-            for order in orders]
-    assert_as_exact_over_orders(mine, theirs, "updated logits")
-
-    variables = {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}
-
+    loaded, _, _ = source
+    variables = assert_update_as_exact(source, TINY)
     loaded.save(tmp_path, variables=variables)
     written, shipped = (
         load_file(str(tmp_path / "model.safetensors")),
@@ -136,15 +88,4 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     margin exceeds 2 FACTOR E (smallest 0.034 against 2.1e-5), so the ids
     must be exact, and each chosen token's log probability is within 2
     FACTOR E of float64's (observed 1.8e-6)."""
-    loaded, inputs, reference = source
-    error = float(np.max(np.abs(reference["step_logits"] - reference["step_logits_f64"])))
-    ranked = np.sort(reference["step_logits_f64"], -1)
-    assert np.min(ranked[..., -1] - ranked[..., -2]) > 2 * FACTOR * error
-    generated = generate(loaded.model, loaded.variables, inputs, 4, key=jax.random.key(1),
-                         sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -4:], reference["generated"][:, -4:])
-    exact = np.take_along_axis(log_softmax(reference["step_logits_f64"], -1),
-                               reference["generated"][:, -4:, None], -1)[..., 0]
-    assert (
-        np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
-    )
+    assert_greedy_as_exact(source)
