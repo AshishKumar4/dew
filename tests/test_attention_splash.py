@@ -120,6 +120,27 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, mask=None, segment_
     return keep
 
 
+def _float64_weights(q, k, keep, sinks, softcap):
+    """The attention weights of `[B, S, H, D]` queries over their keys, key
+    heads repeated over their group, and the logits before the cap: over
+    sqrt(D), capped `c tanh(l / c)`, the keys `keep` `[B or 1, 1, q, k]`
+    keeps, a softmax whose denominator a sink joins. A query that keeps no
+    key has no weight."""
+    heads, kv_heads = q.shape[2], k.shape[2]
+    group = jnp.arange(heads) // (heads // kv_heads)
+    raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(q.shape[3])
+    logits = raw if softcap is None else softcap * jnp.tanh(raw / softcap)
+    keep = np.broadcast_to(keep, logits.shape)
+    sees = keep.any(-1, keepdims=True)
+    # A row that keeps no key softmaxes zeros instead of only -inf, whose
+    # NaN would reach every gradient through the weights zeroed below.
+    logits = jnp.where(keep, logits, jnp.where(sees, -jnp.inf, 0.0))
+    if sinks is not None:
+        sink = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:3], 1))
+        logits = jnp.concatenate([logits, sink], -1)
+    return jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :keep.shape[-1]], 0.0), raw
+
+
 def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None):
     """Each entry's float64 terms of attention's output and its query, key and
     value gradients under `cotangent` (`reference_error.float64_terms`'s
@@ -135,16 +156,8 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
         group = jnp.arange(heads) // (heads // kv_heads)
-        raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(width)
-        logits = raw if softcap is None else softcap * jnp.tanh(raw / softcap)
-        keep = np.broadcast_to(keep, logits.shape)
-        sees = keep.any(-1, keepdims=True)
-        logits = jnp.where(keep, logits, jnp.where(sees, -jnp.inf, 0.0))
-        if sinks is not None:
-            sink = jnp.broadcast_to(jnp.asarray(np.asarray(sinks, np.float64))[None, :, None, None],
-                                    (*logits.shape[:3], 1))
-            logits = jnp.concatenate([logits, sink], -1)
-        weights = jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :keep.shape[-1]], 0.0)
+        sunk = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
+        weights, raw = _float64_weights(q, k, keep, sunk, softcap)
         products = jnp.einsum('bqhd,bkhd->bhqk', dout, v[:, :, group])
         delta = jnp.sum(weights * products, axis=-1, keepdims=True)
         logit_terms = weights * (jnp.abs(products) + jnp.abs(delta)) / np.sqrt(width)
@@ -382,22 +395,10 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
     then the keys `kept` keeps, a softmax whose denominator a sink joins, and
     the values. A query that keeps no key reads nothing: its output is zero."""
     def attention(q, k, v, s):
-        _, q_len, heads, width = q.shape
-        k_len, kv_heads = k.shape[1], k.shape[2]
-        group = jnp.arange(heads) // (heads // kv_heads)
-        logits = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(width)
-        if softcap is not None:
-            logits = softcap * jnp.tanh(logits / softcap)
-        keep = np.broadcast_to(kept(q_len, k_len, causal=causal, sliding_window=sliding_window, mask=mask,
-                                    segment_ids=segment_ids), logits.shape)
-        sees = keep.any(-1, keepdims=True)
-        # A row that keeps no key softmaxes zeros instead of only -inf, whose
-        # NaN would reach every gradient through the weights zeroed below.
-        logits = jnp.where(keep, logits, jnp.where(sees, -jnp.inf, 0.0))
-        if s is not None:
-            sink = jnp.broadcast_to(s[None, :, None, None], (*logits.shape[:3], 1))
-            logits = jnp.concatenate([logits, sink], -1)
-        weights = jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :k_len], 0.0)
+        group = jnp.arange(q.shape[2]) // (q.shape[2] // k.shape[2])
+        keep = kept(q.shape[1], k.shape[1], causal=causal, sliding_window=sliding_window, mask=mask,
+                    segment_ids=segment_ids)
+        weights, _ = _float64_weights(q, k, keep, s, softcap)
         return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
 
     def loss(q, k, v, s):
