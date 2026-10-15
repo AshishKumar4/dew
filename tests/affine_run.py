@@ -80,6 +80,27 @@ class Counting:
         self.index = json.loads(state)["index"]
 
 
+class Replaying:
+    """An endless, checkpointable stream of `batch_at(position)`, the batch for each step it has
+    handed out, its state that count."""
+
+    def __init__(self, batch_at):
+        self.batch_at, self.position = batch_at, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.position += 1
+        return self.batch_at(self.position - 1)
+
+    def get_state(self):
+        return str(self.position).encode()
+
+    def set_state(self, state):
+        self.position = int(state)
+
+
 def frozen_trainer(tmp_path=None, **kwargs) -> Trainer:
     """The regression's trainer with its average frozen at unit decay, the
     reference a preference or RL objective reads, checkpointing under

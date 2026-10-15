@@ -41,6 +41,9 @@ import torch
 from diffusers_reference_helpers import (
     rounded_frequency_table as rounded_frequency_table,
     rounded_timestep_embedding as rounded_timestep_embedding,
+    perturb,
+    recording,
+    saved_pipeline,
     tiny_qwen3_encoder,
 )
 
@@ -231,24 +234,14 @@ def build_pipeline(root: Path):
     vae = AutoencoderKLFlux2(**PIPELINE_VAE).eval()
     transformer = Flux2Transformer2DModel(**PIPELINE).eval()
     generator = torch.Generator().manual_seed(SEED + 8)
+    perturb(generator, 0.05, vae, transformer)
     with torch.no_grad():
-        for module in (vae, transformer):
-            for parameter in module.parameters():
-                parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
         vae.bn.running_mean.copy_(0.3 * torch.randn(vae.bn.running_mean.shape, generator=generator))
         vae.bn.running_var.copy_(torch.rand(vae.bn.running_var.shape, generator=generator) + 0.2)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
                               text_encoder=encoder, tokenizer=tok, transformer=transformer, is_distilled=False)
-    directory = root / "pipeline"
-    pipe.save_pretrained(directory, safe_serialization=True)
-    pipe.set_progress_bar_config(disable=True)
-    # The class declares no sample size, so the directory declares the
-    # geometry it is read at.
-    index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_height=HEIGHT, dew_width=WIDTH)
-    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
-    return pipe
+    return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH)
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
@@ -334,13 +327,7 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    import diffusers
-
-    if diffusers.__version__ != DIFFUSERS:
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
+    root = recording(destination, DIFFUSERS)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})

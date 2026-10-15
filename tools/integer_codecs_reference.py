@@ -37,7 +37,6 @@ for gptqmodel's pack extension. Run from the checkout:
 
 import copy
 import importlib.util
-import json
 import os
 import re
 import sys
@@ -52,7 +51,7 @@ from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_gptq_v2_to_v1_format_module
 from safetensors.numpy import load_file
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
@@ -228,9 +227,7 @@ def main():
     meta = {"gptqmodel": gptqmodel.__version__, "autoawq": {"repo": AWQ_REPO, "commit": AWQ_COMMIT,
                                                             "sha256": AWQ_FILES},
             "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    saved_fixture(FIXTURE, arrays, meta)
     print(f"{FIXTURE}: {FIXTURE.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

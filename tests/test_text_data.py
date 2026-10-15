@@ -19,6 +19,7 @@ import numpy as np
 import optax
 import pytest
 from absl import flags
+from reader_support import assert_a_rewrite_moves_the_identity
 from token_support import write_token_corpus
 
 from dew.config.data import TextData, loader
@@ -1021,26 +1022,9 @@ def test_a_same_size_write_between_token_samples_changes_the_readers_identity(tm
                       loading=Loading(workers=0))
         return data.train(DataPartition())
 
-    before = reader()
-    try:
-        identity = before.identity()
-        np.testing.assert_array_equal(next(before)["text"], np.full((1, 1025), 7, dtype=np.int32))
-        position = before.get_state()
-    finally:
-        before.close()
-    path = directory / "train.bin"
-    size = path.stat().st_size
-    with path.open("r+b") as file:
-        file.seek(size // 2)
-        file.write(np.asarray([9], dtype=np.uint16).tobytes())
-    assert path.stat().st_size == size
-    after = reader()
-    try:
-        assert after.identity() != identity
-        with pytest.raises(ValueError):
-            after.set_state(position)
-    finally:
-        after.close()
+    assert_a_rewrite_moves_the_identity(
+        reader, directory / "train.bin", np.asarray([9], dtype=np.uint16).tobytes(),
+        lambda batch: np.testing.assert_array_equal(batch["text"], np.full((1, 1025), 7, dtype=np.int32)))
 
 
 def test_a_token_mixture_validates_on_the_corpora_that_hold_a_validation_split(tmp_path):

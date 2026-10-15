@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 
 import dew
 from dew.config import ModelConfig, TrainerConfig
@@ -29,24 +30,10 @@ BATCH, SEQ = 8, 8
 IDS = jnp.asarray([[3, 4, 5, 6, 7, 8, 9, 10]], jnp.int32)
 
 
-class Stream:
+def stream(vocab: int) -> Replaying:
     """The same batch of token windows each step, below `vocab`."""
-
-    def __init__(self, vocab: int):
-        self.vocab, self.position = vocab, 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        self.position += 1
-        return {"text": np.random.RandomState(0).randint(1, self.vocab, (BATCH, SEQ + 1)).astype(np.int32)}
-
-    def get_state(self):
-        return str(self.position).encode()
-
-    def set_state(self, state):
-        self.position = int(state.decode())
+    windows = np.random.RandomState(0).randint(1, vocab, (BATCH, SEQ + 1)).astype(np.int32)
+    return Replaying(lambda position: {"text": windows})
 
 
 def trained_run(directory, objective, vocab, quantization=None):
@@ -54,7 +41,7 @@ def trained_run(directory, objective, vocab, quantization=None):
     config = LMRunConfig(trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=1,
                                                eval_every=None, checkpoint_every=1,
                                                compilation_cache_dir=None, quantization=quantization))
-    state = config.train(objective, Loader(lambda partition: Stream(vocab), None, None, BATCH), name="run")
+    state = config.train(objective, Loader(lambda partition: stream(vocab), None, None, BATCH), name="run")
     Checkpoints(str(directory / "run")).wait()
     return state, dew.pipeline(str(directory / "run"))
 
@@ -125,7 +112,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
                                   eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                                   quantization=Quantization()))
         objective = LMObjective(config.model.build(), SEQ)
-        state = config.train(objective, Loader(lambda partition: Stream(64), None, None, BATCH), name="run")
+        state = config.train(objective, Loader(lambda partition: stream(64), None, None, BATCH), name="run")
         Checkpoints(str(directory / "run")).wait()
         return state
 
@@ -180,7 +167,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
             checkpoint_every=1, compilation_cache_dir=None))
         objective = (LMObjective(record.model.build(), SEQ) if record
                      else LMObjective(source.model, SEQ, variables=source.variables))
-        state = config.train(objective, Loader(lambda partition: Stream(96), None, None, BATCH), name="run")
+        state = config.train(objective, Loader(lambda partition: stream(96), None, None, BATCH), name="run")
         Checkpoints(str(directory / "run")).wait()
         return state
 

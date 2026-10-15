@@ -92,6 +92,61 @@ def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[list[int
         yield taken
 
 
+def recording(destination: str, version: str) -> Path:
+    """The directory a generator records into, refused unless the installed
+    diffusers is `version`, the one its fixtures were recorded against, with
+    torch on the two threads they were recorded on."""
+    import diffusers
+
+    if diffusers.__version__ != version:
+        raise RuntimeError(f"recorded against diffusers {version}, not {diffusers.__version__}")
+    torch.set_num_threads(2)
+    root = Path(destination)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def perturb(generator: torch.Generator, scale: float, *modules: torch.nn.Module) -> None:
+    """Move every parameter of `modules` off its initialization by `scale`
+    times a standard normal draw from `generator`, in order."""
+    with torch.no_grad():
+        for module in modules:
+            for parameter in module.parameters():
+                parameter.add_(scale * torch.randn(parameter.shape, generator=generator))
+
+
+def saved_pipeline(pipe, directory: Path, height: int, width: int):
+    """`pipe` saved to `directory` as safetensors, its progress bar off, and
+    the geometry it is read at declared in its model_index.json (`dew_height`,
+    `dew_width`), which the pipeline classes do not declare."""
+    pipe.save_pretrained(directory, safe_serialization=True)
+    pipe.set_progress_bar_config(disable=True)
+    index = json.loads((directory / "model_index.json").read_text())
+    index.update(dew_height=height, dew_width=width)
+    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
+    return pipe
+
+
+def drawn_wan_vae(model_class, config: dict, seed: int, directory: Path):
+    """A Wan-family VAE `model_class` of `config`, its latent statistics, its
+    norm gains and biases drawn from `seed` (every branch live), each weight
+    rounded to bfloat16's grid so a bfloat16 run reads it exactly, saved to
+    `directory`. Returns the model and the generator, to draw on from."""
+    torch.manual_seed(seed)
+    generator = torch.Generator().manual_seed(seed)
+    z_dim = config["z_dim"]
+    latents_mean = torch.randn(z_dim, generator=generator).mul(0.5).tolist()
+    latents_std = torch.rand(z_dim, generator=generator).add(0.5).tolist()
+    model = model_class(**config, latents_mean=latents_mean, latents_std=latents_std).eval()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith(("gamma", "bias")):
+                parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
+            parameter.copy_(parameter.to(torch.bfloat16).float())
+    model.save_pretrained(directory, safe_serialization=True)
+    return model, generator
+
+
 def tiny_qwen3_encoder(source: Path, tok, *, hidden_size: int, layers: int, seed: int):
     """The published Qwen3 text encoder's config under `source`, narrowed to `hidden_size` wide and
     `layers` deep with two query heads over one key head, every field it does not name the
@@ -107,8 +162,5 @@ def tiny_qwen3_encoder(source: Path, tok, *, hidden_size: int, layers: int, seed
                   bos_token_id=None, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
     torch.manual_seed(seed + 5)
     model = Qwen3ForCausalLM(Qwen3Config(**config)).eval()
-    generator = torch.Generator().manual_seed(seed + 6)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(seed + 6), 0.05, model)
     return model

@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import frequency_exponent, torch_exp_disagreements
+from diffusers_reference_helpers import frequency_exponent, perturb, saved_pipeline, torch_exp_disagreements
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
@@ -225,22 +225,11 @@ def build_pipeline(root: Path):
         **VAE, latents_mean=published["latents_mean"][:VAE["z_dim"]],
         latents_std=published["latents_std"][:VAE["z_dim"]]).eval()
     transformer = QwenImage21Transformer2DModel(**PIPELINE).eval()
-    generator = torch.Generator().manual_seed(SEED + 8)
-    with torch.no_grad():
-        for module in (vae, transformer):
-            for parameter in module.parameters():
-                parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 8), 0.05, vae, transformer)
     pipe = QwenImage21Pipeline(
         scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
         text_encoder=encoder, processor=proc, transformer=transformer)
-    pipe.save_pretrained(directory, safe_serialization=True)
-    pipe.set_progress_bar_config(disable=True)
-    # The class declares no sample size, so the directory declares the
-    # geometry it is read at, which is what these keys are for.
-    index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_height=HEIGHT, dew_width=WIDTH)
-    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
-    return pipe
+    return saved_pipeline(pipe, directory, HEIGHT, WIDTH)
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
