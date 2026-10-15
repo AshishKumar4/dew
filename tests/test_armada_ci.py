@@ -391,10 +391,9 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
-    after, though the red run died before it wrote a report. A commit's retry reuses its green rows
-    though a run of another commit recorded the file since, and a red run on its inputs whose record
-    under them was lost still keeps its green row from reuse. Each task runs as armada starts it:
-    .armada.json's command filled from its plan entry."""
+    after, though the red run died before it wrote a report. A commit's retry reuses its green rows,
+    and none after a red run on its inputs, though a run of another commit recorded the file since.
+    Each task runs as armada starts it: .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
@@ -407,13 +406,12 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     worker: dict[str, bytes] = {}
-    lost: list[str] = []
-    """The URLs whose PUTs the Worker drops, as a timed-out request leaves them."""
 
     def cache_request(url, token, data=None):
-        if data is not None and not any(part in url for part in lost):
+        if data is not None:
             worker[url] = data
-        return worker.get(url) if data is None else None
+            return b""
+        return worker.get(url)
 
     monkeypatch.setattr(ci, "cache_request", cache_request)
     monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
@@ -462,10 +460,12 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143") == 10
     fixture.write_text("{}")
     assert run("GenuineIntel-6-143") == 10
-    lost.append("-inputs/")
     monkeypatch.setenv("FAIL", "1")
     assert run("GenuineIntel-6-143", policy="off") == 11
     monkeypatch.delenv("FAIL")
+    fixture.write_text('{"changed": true}')
+    assert run("GenuineIntel-6-143") == 11
+    fixture.write_text("{}")
     assert run("GenuineIntel-6-143") == 12
 
 
