@@ -415,7 +415,7 @@ def compile(
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, budget=budget)
-    return _compiled(staged, _coordinated(*staged.branches), host=host, resume=resume)
+    return _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -431,10 +431,6 @@ class _Staged:
     counts: dict[str, CorpusCounts]
     validation_counts: dict[str, CorpusCounts]
     batch_tokens: int | None
-
-    @property
-    def branches(self) -> tuple[Pipeline, ...]:
-        return (self.train,) if self.validation is None else (self.train, self.validation)
 
 
 def _staged(
@@ -489,7 +485,9 @@ def _compiled(
     host: tuple[HostStep, ...],
     resume: Literal["exact", "non-exact"],
 ) -> Loader:
-    """The readers of `staged`, each batch's packed windows laid out as `packed` declares them."""
+    """The readers of `staged`, each training batch's packed windows laid out
+    as `packed` declares them and each validation batch's as its own packs do
+    (`_held_coordinated`)."""
     train, validation, original, build = staged.train, staged.validation, staged.original, staged.build
     counts, validation_counts = staged.counts, staged.validation_counts
     read, seed, batch, global_order = (
@@ -541,7 +539,7 @@ def _compiled(
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
             ).tuned(validation),
-            host=packed + _held_steps(validation) + host,
+            host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
     records = _epoch_records(train, build)
@@ -584,11 +582,14 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     holds no more documents than tokens."""
     from dew.data.packing import PackedSource
 
-    bounds: dict[tuple[str, ...], int] = {}
+    fields: dict[str, tuple[str, ...]] = {}
+    bounds: dict[str, int] = {}
 
     def declare(pack: Pack, most: int | None) -> None:
+        ids = pack.fields[0]
+        fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
-        bounds[pack.fields] = max(bounds.get(pack.fields, 0), bound)
+        bounds[ids] = max(bounds.get(ids, 0), bound)
 
     for pipeline in pipelines:
         for stage in _steps(pipeline):
@@ -603,7 +604,16 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 source = source.source if isinstance(source, _Facts) else source.original
             if isinstance(source, PackedSource):
                 declare(source.plan.pack, source.plan.most_documents)
-    return tuple(Coordinated(fields, bound) for fields, bound in bounds.items())
+    return tuple(Coordinated(fields[ids], bound) for ids, bound in bounds.items())
+
+
+def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
+    """A validation pass's `Coordinated` steps: its own packs' declarations,
+    and for a field only the training packs it, a window's length, since a
+    validation source may hold packed windows whose packing it does not show."""
+    held = _coordinated(validation)
+    declared = {step.fields[0] for step in held}
+    return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
 
 
 def _packed_documents(source: Source) -> int | None:
@@ -651,7 +661,7 @@ def _compile_phases(
             _delivered(pipeline, end - previous, consumed)
             previous = end
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
-    packed = _coordinated(*(branch for phase, _ in staged for branch in phase.branches))
+    packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
         loaded = _compiled(phase, packed, host=host, resume=resume)
