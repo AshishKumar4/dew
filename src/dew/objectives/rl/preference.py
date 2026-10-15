@@ -20,6 +20,7 @@ from dew.objectives.base import Aux, Variables
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm import LMObjective
+from ._lm import check_lm_terms
 
 
 class DPOObjective(LMObjective):
@@ -31,6 +32,7 @@ class DPOObjective(LMObjective):
     `ema_decay` other than None is refused, and so is `loss_role`, because the
     completion mask already says which targets count. Validation scores the
     chosen responses' perplexity under the policy.
+    Auxiliary LM training terms are refused because this loss does not apply them.
     """
 
     _ema_is_reference = True
@@ -49,6 +51,7 @@ class DPOObjective(LMObjective):
             raise ValueError(
                 "the completion mask already says which targets count, "
                 "so loss_role is refused on a DPO objective")
+        check_lm_terms(kwargs)
         kwargs["ema_decay"] = 1.0
         super().__init__(model, seq_len, **kwargs)
         # The batch is `input_ids` pairs, chosen then rejected, not text windows.
