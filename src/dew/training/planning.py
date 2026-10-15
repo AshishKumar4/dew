@@ -12,6 +12,7 @@ search bounds how many a step takes.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -31,6 +32,7 @@ from dew.training.memory import (
     head_tile_of,
     recompute_more,
     recompute_record,
+    remat_half,
     remat_more,
     rung_record,
     step_fits,
@@ -106,9 +108,12 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     A candidate is a rung of the objective's ladder, which `climb` moves one
     up, and one of `candidates`, ascending: the batch read in that many equal
     microbatches. The best is the first that fits in rung-major order, the
-    least recomputation and then the most rows a microbatch: recomputing
-    costs every token (9-18% on Qwen3.5-0.8B at 3,072-token rows, A100),
-    where a smaller microbatch at the same rung costs little. Memory falls
+    least recomputation and then the most rows a microbatch: a rung that
+    recomputes the block costs every token (9-18% on Qwen3.5-0.8B at
+    3,072-token rows, A100), where a smaller microbatch at the same rung
+    costs little. A half rung, which recomputes only a few named values,
+    costs little too, and `fits` tries it at each split it asks
+    (`plan_step`), so it is no rung here. Memory falls
     along both, so `fits(split)`, a compile at the current rung, is asked of
     `candidates[first]` first (the batch whole, or a recorded plan), then of the
     largest split at each rung until one fits, and that rung's smallest
@@ -277,7 +282,15 @@ def plan_step[LossT, EffectsT](
     current rung once, and compiled under its
     `options`, or under XLA's defaults on the half rung above, the head
     returning to the run's own tile `base` at each remat rung
-    (`recompute_more`). `resumed`, the rung a checkpoint trained the shape
+    (`recompute_more`). Where a split does not fit at a rung whose models
+    have a half rung above it (`remat_half`, a decoder's delta rule
+    recomputing its memory alone), the same split is compiled there, and the
+    plan stays there where it fits: no plan splits the batch further at a
+    rung where the half rung fits it whole, and climbing and the frontier
+    pass every half rung asked (`onward`). That costs a compile a split
+    that misses: on an A100-40 Qwen3.5-0.8B's packed 8 x 3072 search asks
+    seven where it asked five, once a program, whose rung record holds the
+    plan. `resumed`, the rung a checkpoint trained the shape
     on, is warned of where it does not fit. Where nothing fits, it raises
     with the closest candidate's numbers. Beside the plans come every
     compile the search made, the frontier's included.
@@ -293,15 +306,44 @@ def plan_step[LossT, EffectsT](
     `tile`)."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
-    lowered: dict[int, Candidate] = {}
+    lowered: dict[tuple[int, str], Candidate] = {}
+    halves: set[str] = set()
+    """The remat rungs (`recompute_record`) the search has asked as half rungs."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
 
+    def rung() -> str:
+        return json.dumps(rung_record(objective, xla_defaults), sort_keys=True)
+
+    def remat_rung() -> str:
+        return json.dumps(recompute_record(objective), sort_keys=True)
+
+    def onward(step: Callable[[], bool]) -> bool:
+        """`step` the objective up its ladder, past every half rung the search has asked: each split
+        tried there missed, so a rung above it is the next to ask."""
+        moved = step()
+        while moved and remat_rung() in halves:
+            moved = step()
+        return moved
+
     def fits(split: int) -> bool:
+        if fits_here(split):
+            return True
+        held = remat_half(objective)
+        if held is None:
+            return False
+        halves.add(remat_rung())
+        if fits_here(split):
+            return True
+        objective.substitute(held)
+        return False
+
+    def fits_here(split: int) -> bool:
         nonlocal resumed, chosen, fitted
-        if split not in lowered:
-            lowered[split] = lower(split)
-        candidate = lowered[split]
+        key = (split, rung())
+        if key not in lowered:
+            lowered[key] = lower(split)
+        candidate = lowered[key]
         chosen = None if xla_defaults else options(candidate)
         executable = compiled_if_it_fits(candidate.program, chosen, refusals)
         fit, headroom = device_fit(candidate, executable, mesh)
@@ -328,7 +370,7 @@ def plan_step[LossT, EffectsT](
             return True
         xla_defaults = False
         lowered.clear()
-        return recompute_more(objective, base)
+        return onward(lambda: recompute_more(objective, base))
 
     def found(split: int) -> Planned:
         assert fitted is not None
@@ -339,7 +381,7 @@ def plan_step[LossT, EffectsT](
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
     plans = [found(split)]
-    if frontier and split != candidates[0] and remat_more(objective):
+    if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
         xla_defaults = False
         lowered.clear()

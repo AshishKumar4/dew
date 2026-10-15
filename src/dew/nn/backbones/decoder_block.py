@@ -29,7 +29,8 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, PredictionPhase
+from ..inputs import LayerInputs, MixerCall, PredictionPhase
+from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
@@ -101,6 +102,16 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
+class ReadsMixing(Protocol):
+    """A token mixer's declaration of the `MIXING` fields of its call it reads
+    (`dew.nn.inputs.MixerCall`), or `TOKENWISE` for one that reads no other
+    token. One that declares nothing reads none."""
+
+    @property
+    def reads(self) -> frozenset[str]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -251,16 +262,17 @@ class BlockWiring:
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse')
+DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
 RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 the attention kernel's or the gated delta rule's output before `o_proj`,
 `conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay` and
-`delta_inverse` the rule's cumulated decay and chunk inverse the port saves
-for its backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the
-dense MLP and the routed experts alike. A remat policy picks from these; a
+its queries, keys and values for a delta rule), `delta_decay`,
+`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
+and memory (with `w` and the corrected values) the port saves for its
+backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
+and the routed experts alike. A remat policy picks from these; a
 name off the list is a typo that would otherwise recompute silently."""
 
 
@@ -271,19 +283,30 @@ class RematPolicy:
     A block under remat saves its inputs and recomputes its forward pass.
     `save` names the residuals (from `RESIDUALS`) to keep in device memory, and
     `offload` names those to move to pinned host memory. Both empty is
-    MaxText's `full`. `REMAT_POLICIES` holds MaxText's recipes under this
-    decoder's names: `q_proj`... for MaxText's `query_proj`..., and
+    MaxText's `full`. `recompute` instead names the only residuals recomputed,
+    each by the layer that computes it (a delta rule its memory,
+    `dew.nn.linear.RECOMPUTED`), the block running without remat and keeping
+    every other value; it takes neither list. A checkpoint policy cannot
+    say it: one that saves anything but a name saves the value the name
+    marks from the op that made it.
+    `REMAT_POLICIES` holds MaxText's recipes under this decoder's names:
+    `q_proj`... for MaxText's `query_proj`..., and
     `gate_proj`/`up_proj`/`down_proj` for `mlpwi_0`/`mlpwi_1`/`mlpwo`.
     MaxText's fused `qkv_proj`/`mlpwi` and AQT `quantization` have no
-    counterpart here. A config gives either a policy name or the two lists.
+    counterpart here. A config gives a policy name or its lists.
     """
     save: tuple[str, ...] = ()
     offload: tuple[str, ...] = ()
+    recompute: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, 'save', tuple(self.save))
         object.__setattr__(self, 'offload', tuple(self.offload))
-        unknown = sorted(set(self.save + self.offload) - set(RESIDUALS))
+        object.__setattr__(self, 'recompute', tuple(self.recompute))
+        if self.recompute and (self.save or self.offload):
+            raise ValueError("a remat policy recomputes named residuals and keeps the rest, or keeps "
+                             "named residuals and recomputes the rest, not both")
+        unknown = sorted(set(self.save + self.offload + self.recompute) - set(RESIDUALS))
         if unknown:
             raise ValueError(
                 f"a remat policy names residuals from {list(RESIDUALS)}, got {unknown}")
@@ -306,6 +329,7 @@ class RematPolicy:
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
+    'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
     'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
@@ -318,7 +342,8 @@ REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
 }
 """MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
-largest first. `full` keeps nothing but the block's inputs."""
+largest first, and Dew's `all_but_delta_memory`, which recomputes only a
+delta rule's memory. `full` keeps nothing but the block's inputs."""
 
 
 def remat_policy(
@@ -339,25 +364,27 @@ def remat_policy(
                 f"save/offload residual names, got {value!r}")
         return REMAT_POLICIES[value]
     if isinstance(value, Mapping):
-        unknown = sorted(set(value) - {'save', 'offload'})
+        unknown = sorted(set(value) - {'save', 'offload', 'recompute'})
         if unknown:
             raise ValueError(
-                f"a remat record holds 'save' and 'offload' residual names, got {unknown}")
+                f"a remat record holds 'save', 'offload' and 'recompute' residual names, got {unknown}")
         return RematPolicy(save=tuple(value.get('save', ())),
-                           offload=tuple(value.get('offload', ())))
+                           offload=tuple(value.get('offload', ())),
+                           recompute=tuple(value.get('recompute', ())))
     raise ValueError(
         f"remat is a RematPolicy, its name, its record, or None, not {value!r}")
 
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
-    None, REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'],
-    REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_conv'],
+    REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
-none 59 GiB; 'minimal_with_conv' keeps a linear-attention or SSM layer's
-short conv output beside 'minimal''s. A decoder's own remat is where it
+none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
+as fla's backward always does; 'minimal_with_conv' keeps a linear-attention
+or SSM layer's short conv output beside 'minimal''s. A decoder's own remat is where it
 starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
@@ -369,7 +396,10 @@ def remat_record(remat: RematPolicy | None) -> JSON:
     if remat is None:
         return None
     names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
-    return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
+    if names:
+        return names[0]
+    return ({'recompute': list(remat.recompute)} if remat.recompute
+            else {'save': list(remat.save), 'offload': list(remat.offload)})
 
 
 @logical_axes({
@@ -412,8 +442,8 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: a token mixer, then a feed-forward, each added to the residual.
 
     `mixer` and `feedforward` are factories that take only a name. The mixer
-    becomes self_attn and accepts (x, decode=..., attention_metadata=...), its
-    tokens' places and documents the metadata's `Coordinates`. The
+    becomes self_attn, called (x, call) with one `MixerCall`, its tokens'
+    places and documents the call metadata's `Coordinates`. The
     feed-forward becomes mlp and takes the normalized
     states, plus the token ids on a `hash_routed` block. A `feedforward` of
     None gives Mamba-2's block, which has the mixer alone. `wiring` places the
@@ -637,9 +667,10 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
                  prediction_phase: PredictionPhase = "ordinary"):
-        if self.remat is None or self.is_initializing() or decode:
-            return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
-                                 prediction_phase)
+        if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
+            with recomputing(() if self.remat is None else self.remat.recompute):
+                return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
+                                     prediction_phase)
 
         def run(module, x, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
@@ -876,21 +907,26 @@ class DecoderBlock(nn.Module):
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
              train: bool, routes: dict):
-        """The token mixer over `x`. The store, the metadata, a prediction
-        phase other than ordinary and the layer's replayed experts reach it
-        only when the call carries them, since a mixer with no use for one
-        does not take it."""
+        """The token mixer over `x`, called with one `MixerCall`. It is never
+        called with a `MIXING` field set that it does not read (`ReadsMixing`),
+        which it would compute as if unset. The train flag, a prediction phase
+        other than ordinary and the layer's replayed experts reach it only
+        when the call carries them, since a mixer with no use for one does not
+        take it."""
+        call = MixerCall(attention_metadata, decode, kv_store)
+        unread = call.unread(self.self_attn.reads if isinstance(self.self_attn, ReadsMixing) else frozenset())
+        if unread:
+            raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "
+                             "and would run it as if unset; give this layer a mixer that reads them")
         return self.self_attn(
             x,
-            decode=decode,
+            call,
             **routes,
             **(
                 {"train": train}
                 if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
                 else {}
             ),
-            **({} if kv_store is None else {"kv_store": kv_store}),
-            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 

@@ -3120,7 +3120,7 @@ At 128 tokens the shapes disagree. In two more sessions, 1 x 128 ran in 20.65 an
 A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
 one CUDA kernel per weight every step (5.7 ms of casts on Qwen3-0.6B at
 1 x 1024 on the RTX 4080), and widened each weight's bf16 gradient back to
-fp32 in the backward (1.8 ms). On `sm80` and `sm89` the update now writes
+fp32 in the backward (1.8 ms). On every GPU the update now writes
 the bf16 copy of each such weight (`TrainState.compute`) from the new fp32
 value. The forward reads that copy, and the gradient reaches the update in
 bf16 and is widened as the update reads it (`dew.training.narrow`). Only a
@@ -3176,6 +3176,37 @@ them.
 A TPU fuses the cast into the matmul, so there the copies would only add
 writes. Compiled for a v6e, Qwen3-0.6B's widths at 8 x 1024 write 85.8 GiB a
 step with the copies against 79.8 without, with 2.1 GiB more temporaries.
+
+On 2026-10-15 the copies went to every GPU, and to steps that pool several
+microbatches into one update. Such a window reads one set of copies
+throughout, widens each microbatch's gradient to fp32 as it pools it, and
+rewrites the copies only in the branch that commits. The optimized HLO of the
+A100 run below shows the commit's conditional passing the copies through
+untouched on the microbatches that don't commit. A generation's row names
+`KERNELS['narrow_copies']` 'off' only where a measurement says the copies
+cost more than they save. With XLA's Triton GEMM fusions off, each cast was a
+`wrapped_convert` kernel of its own before a cuBLAS GEMM. The step runs 741
+cuBLAS calls and no Triton GEMM fusion either way. Main (`a29433e79`)
+against the copies, two alternating rounds, ms, peak in GiB:
+
+| row | before | copies | peak GiB |
+|---|---:|---:|---:|
+| H100 SXM, packed Qwen3.5-0.8B 8 x 3072, split 1, window 2 | 232.3 / 233.1 | 235.6 / 231.2 | 53.75 -> 53.79 |
+| H100 SXM, dense 1.1B 8 x 2048 (dew_lm) | 222.8 / 222.1 | 218.6 / 218.6 | 37.43 -> 37.43 |
+| A100 40 GB, packed Qwen3.5-0.8B 8 x 3072, split 4, window 8 | 697.1 / 700.4 | 688.1 / 688.3 | 25.09 -> 26.81 |
+| A100 40 GB, dense 1.1B 8 x 2048 (dew_lm) | 616.3 / 616.8 | 610.5 / 608.1 | 29.90 -> 30.08 |
+
+The packed step's real-token MFU moved from 35.9 / 35.7% to 36.4 / 36.3% on
+the A100 and stayed within noise on the H100 (34.0 / 33.9% against 33.6 /
+34.1%). The dense 1.1B moved from 50.3 / 50.4% to 51.2 / 51.2% on the H100,
+and from 57.6 / 57.6% to 58.2 / 58.4% on the A100. Profiled over five steps,
+the casts were 1.66 ms in 268 launches a step on the H100's packed step and
+13.06 ms in 1,072 on the A100's, and both are gone. On the A100 the window's
+gradient pooling ran 3.6 ms slower (33.2 against 29.5 ms a step). The kernels
+are the same, but the MLP's pools read at 1.45 TB/s instead of 2.17, which is
+above the A100's HBM rate and so came partly from L2 before. Device time fell
+from 697.2 to 684.2 ms a step there, and from 228.2 to 227.0 on the H100. The
+A100's peak rises by the copies' 1.7 GB, which split 4 fits.
 
 ### Generations below sm80
 
