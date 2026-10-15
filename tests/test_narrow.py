@@ -106,7 +106,8 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     still sum in fp32.
     So too where the batch is split over data-parallel devices, whose
     gradients are summed across them, and where every parameter is split
-    over fsdp devices too (the lane's eight: data 8, data 4 x fsdp 2, fsdp 8)."""
+    over fsdp devices too (the lane's eight: data 8, data 4 x fsdp 2, fsdp 8).
+    Each copy is split as its parameter is, so a gather moves bf16."""
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
@@ -122,6 +123,10 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
     for a, b in zip(losses, plain_losses, strict=True):
         np.testing.assert_array_equal(a, b)
+    masters = {tuple(key.key for key in path): leaf.sharding
+               for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.variables)[0]}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]:
+        assert leaf.sharding.is_equivalent_to(masters[tuple(key.key for key in path)], leaf.ndim), path
     # The copies are the cast of the parameters the last update wrote.
     for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
                     strict=True):
