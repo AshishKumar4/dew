@@ -18,7 +18,9 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from test_attention_splash import (
     TOLERANCE,
+    attention_terms,
     exact_value_and_grads,
+    kept,
     packed_ids,
     qkv,
     reference,
@@ -73,9 +75,12 @@ def run(implementation, case, dtype):
 def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
     query, key, value, structure, found, truth = run(implementation, case, jnp.float32)
     expected = reference(query, key, value, **structure)
-    for name, mine, theirs, want in zip(("output", "query", "key", "value"), found, expected, truth,
-                                        strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, want, f"{implementation} {case} {name}")
+    # The loss is the outputs' squares, so the cotangent is twice the output.
+    keep = kept(query.shape[1], key.shape[1], **structure)
+    terms = attention_terms(query, key, value, 2 * truth[0], keep)
+    for name, mine, theirs, want, summed in zip(("output", "query", "key", "value"), found, expected, truth,
+                                                terms, strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, want, f"{implementation} {case} {name}", terms=summed)
 
 
 @pytest.mark.gpu(reason="cuDNN's and flash's fused attention")
