@@ -117,6 +117,24 @@ def _rows(ref, tokens, columns, length: int):
                       other=0).astype(jnp.float32)
 
 
+def _documents(documents_ref, tokens, length: int):
+    """The packed document of each of `tokens`, clipped into the row; None without `documents_ref`."""
+    from jax.experimental.pallas import triton as plgpu
+
+    if documents_ref is None:
+        return None
+    return plgpu.load(documents_ref.at[jnp.clip(tokens, 0, length - 1)])
+
+
+def _alone(tiles, documents, document):
+    """Each of `tiles` `[segments, block]` zeroed where its token, in `documents`, is not in `document`:
+    a packed document's tap reads none of another's tokens."""
+    if document is None:
+        return tiles
+    return tuple(jnp.where((theirs == document)[:, None], tile, 0.0)
+                 for theirs, tile in zip(documents, tiles, strict=True))
+
+
 def _kept(valid_ref, tokens, length: int):
     """Whether each of `tokens` is a real token: inside the row and, with `valid_ref`, not padding."""
     from jax.experimental.pallas import triton as plgpu
@@ -175,25 +193,29 @@ def _inverse_norm(y, eps: float, *, interpret: bool):
     return _divide(1.0, root, interpret=interpret)
 
 
-def _unpack(refs, has_bias: bool, has_valid: bool):
+def _unpack(refs, has_bias: bool, has_valid: bool, has_documents: bool):
     refs = list(refs)
     x_ref, w_ref = refs.pop(0), refs.pop(0)
     b_ref = refs.pop(0) if has_bias else None
     valid_ref = refs.pop(0) if has_valid else None
-    return x_ref, w_ref, b_ref, valid_ref, refs
+    documents_ref = refs.pop(0) if has_documents else None
+    return x_ref, w_ref, b_ref, valid_ref, documents_ref, refs
 
 
 def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows: int, count: int, length: int,
-                    has_bias: bool, has_valid: bool, activation: bool, eps: float, interpret: bool):
+                    has_bias: bool, has_valid: bool, has_documents: bool, activation: bool, eps: float,
+                    interpret: bool):
     """A tile of `rows` tokens of one block of one piece, each token computed from its K-window loaded
     at the conv's shifts, all at once: the forward needs nothing from the tokens past the tile, so it
     walks nothing. `pieces` holds each piece's first program, first channel, block and whether it
     normalises; the programs of grid axis 0 run through the pieces' blocks in order, so one call
     writes every piece."""
-    x_ref, w_ref, b_ref, valid_ref, out_refs = _unpack(refs, has_bias, has_valid)
+    x_ref, w_ref, b_ref, valid_ref, documents_ref, out_refs = _unpack(refs, has_bias, has_valid,
+                                                                       has_documents)
     program = pl.program_id(0)
     tokens = pl.program_id(1) * rows + jnp.arange(rows, dtype=jnp.int32)
     ends = [lo for lo, *_ in pieces[1:]] + [None]
+    documents = tuple(_documents(documents_ref, tokens - count + 1 + tap, length) for tap in range(count))
 
     for (lo, first, block, normalised), end, out_ref in zip(pieces, ends, out_refs, strict=True):
         def piece(lo=lo, first=first, block=block, normalised=normalised, out_ref=out_ref):
@@ -203,7 +225,7 @@ def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows:
             columns = first + local
             taps, bias = _taps(w_ref, b_ref, columns, count)
             window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
-            y = _preactivation(window, taps, bias)
+            y = _preactivation(_alone(window, documents, documents[-1]), taps, bias)
             if activation:
                 y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
             if normalised:
@@ -219,31 +241,33 @@ def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows:
 
 
 def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
-                     count: int, length: int, has_bias: bool, has_valid: bool, aliased: bool,
-                     activation: bool, eps: float, interpret: bool):
+                     count: int, length: int, has_bias: bool, has_valid: bool, has_documents: bool,
+                     aliased: bool, activation: bool, eps: float, interpret: bool):
     from jax.experimental.pallas import triton as plgpu
 
-    x_ref, w_ref, b_ref, valid_ref, rest = _unpack(refs, has_bias, has_valid)
+    x_ref, w_ref, b_ref, valid_ref, documents_ref, rest = _unpack(refs, has_bias, has_valid, has_documents)
     # The gradient the calls before wrote, aliased to this call's, is read by none.
     dy_ref, dx_ref, dw_ref, *db_ref = rest[1:] if aliased else rest
     columns, starts = _program(first, block, segments, steps)
     local = columns - first
     taps, bias = _taps(w_ref, b_ref, columns, count)
     history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
+    owners = tuple(_documents(documents_ref, starts - count + 1 + tap, length) for tap in range(count - 1))
     zero = jnp.zeros((segments, block), jnp.float32)
 
     def load(tokens):
         kept = _kept(valid_ref, tokens, length)[:, None]
         grad = plgpu.load(dy_ref.at[jnp.clip(tokens, 0, length - 1)[:, None], local[None, :]], mask=kept,
                           other=0).astype(jnp.float32)
-        return _rows(x_ref, tokens, columns, length), grad
+        return _rows(x_ref, tokens, columns, length), grad, _documents(documents_ref, tokens, length)
 
     def step(index, carry):
-        history, later, sums, (current, grad) = carry
+        history, owners, later, sums, (current, grad, document) = carry
         tokens = starts + index
         # The next token's loads go out before this one's arithmetic, which hides their latency.
         ahead = load(tokens + 1)
-        window = (*history, current)
+        stream, documents = (*history, current), (*owners, document)
+        window = _alone(stream, documents, document)
         pre = _preactivation(window, taps, bias)
         gate = _sigmoid(pre, interpret=interpret) if activation else None
         out = pre if gate is None else pre * gate
@@ -260,18 +284,20 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         owned = jnp.where(((index < steps) & (tokens < length))[:, None], grad, 0.0)
         terms = (*(owned * inputs for inputs in window), owned)
         added = tuple(total + term for total, term in zip(sums, terms, strict=True))
-        # Token `tokens - (K - 1)` reads this one through the last tap and the K-1 before through the others.
+        # Token `tokens - (K - 1)` reads this one through the last tap and the K-1 before through the others,
+        # those of its own document.
         gradients = (*later, grad)
-        dx = gradients[0] * taps[count - 1][None, :]
+        reads = _alone(gradients, documents, documents[0])
+        dx = reads[0] * taps[count - 1][None, :]
         for shift in range(1, count):
-            dx = dx + gradients[shift] * taps[count - 1 - shift][None, :]
+            dx = dx + reads[shift] * taps[count - 1 - shift][None, :]
         emitted = tokens - (count - 1)
         plgpu.store(dx_ref.at[jnp.maximum(emitted, 0)[:, None], columns[None, :]], dx.astype(dx_ref.dtype),
                     mask=((index >= count - 1) & (emitted < length))[:, None])
-        return window[1:], gradients[1:], added, ahead
+        return stream[1:], documents[1:], gradients[1:], added, ahead
 
-    carry = (history, (zero,) * (count - 1), (zero,) * (count + 1), load(starts))
-    _, _, totals, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
+    carry = (history, owners, (zero,) * (count - 1), (zero,) * (count + 1), load(starts))
+    _, _, _, totals, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     for tap, total in enumerate(totals[:count]):
         dw_ref[local, tap] = jnp.sum(total, axis=0)
     if db_ref:
@@ -284,9 +310,9 @@ def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, 
     return segments, steps
 
 
-def _inputs(x, w, bias, valid):
+def _inputs(x, w, bias, valid, documents):
     """The inputs' specs over a grid of channel blocks, time tiles and rows: each program sees its row
-    of `x` and `valid` whole and indexes its tokens."""
+    of `x`, `valid` and `documents` whole and indexes its tokens."""
     _, length, channels = x.shape
     specs = [pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0)),
              pl.BlockSpec(w.shape, lambda c, t, b: (0, 0))]
@@ -294,9 +320,10 @@ def _inputs(x, w, bias, valid):
     if bias is not None:
         specs.append(pl.BlockSpec(bias.shape, lambda c, t, b: (0,)))
         operands.append(bias)
-    if valid is not None:
-        specs.append(pl.BlockSpec((None, length), lambda c, t, b: (b, 0)))
-        operands.append(valid)
+    for tokens in (valid, documents):
+        if tokens is not None:
+            specs.append(pl.BlockSpec((None, length), lambda c, t, b: (b, 0)))
+            operands.append(tokens)
     return specs, operands
 
 
@@ -315,7 +342,7 @@ def _params(warps: int | None, stages: int | None):
                                 num_stages=1 if stages is None else stages)
 
 
-def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
+def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: float, dtype, interpret: bool,
              rows: int | None = None, warps: int | None = None, stages: int | None = None):
     """Every piece in one call (`_forward_kernel`): at one decoding row the conv's cost is its launches."""
     batch, length, _ = x.shape
@@ -325,11 +352,11 @@ def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, i
         block = block_width(width, head)
         pieces.append((programs, first, block, head is not None))
         programs += width // block
-    specs, operands = _inputs(x, taps, bias, valid)
+    specs, operands = _inputs(x, taps, bias, valid, documents)
     kernel = functools.partial(
         _forward_kernel, pieces=tuple(pieces), rows=rows, count=taps.shape[1], length=length,
-        has_bias=bias is not None, has_valid=valid is not None, activation=activation, eps=eps,
-        interpret=interpret)
+        has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
+        activation=activation, eps=eps, interpret=interpret)
     widths = [width for width, _ in parts]
     return tuple(pl.pallas_call(
         kernel, grid=(programs, pl.cdiv(length, rows), batch), in_specs=specs,
@@ -339,9 +366,9 @@ def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, i
     )(*operands))
 
 
-def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: float, interpret: bool,
-              segments: int | None = None, steps: int | None = None, warps: int | None = None,
-              stages: int | None = None):
+def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
+              interpret: bool, segments: int | None = None, steps: int | None = None,
+              warps: int | None = None, stages: int | None = None):
     batch, length, channels = x.shape
     count = taps.shape[1]
     segments, steps = _config(length, segments, steps)
@@ -349,12 +376,13 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
     for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
         block = block_width(width, head)
         grid = (width // block, pl.cdiv(length, segments * steps), batch)
-        specs, operands = _inputs(x, taps, bias, valid)
+        specs, operands = _inputs(x, taps, bias, valid, documents)
         tiles = grid[1]
         kernel = functools.partial(
             _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
             steps=steps, count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
-            aliased=dx is not None, activation=activation, eps=eps, interpret=interpret)
+            has_documents=documents is not None, aliased=dx is not None, activation=activation, eps=eps,
+            interpret=interpret)
         whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
         out_specs = [whole, pl.BlockSpec((None, None, width, count), lambda c, t, b: (b, t, 0, 0))]
         out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -380,25 +408,26 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
-def _conv(x, taps, bias, valid, parts, activation, eps, dtype, interpret):
-    return _forward(x, taps, bias, valid, parts, activation, eps, dtype, interpret)
+def _conv(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
+    return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
 
 
-def _conv_fwd(x, taps, bias, valid, parts, activation, eps, dtype, interpret):
-    out = _forward(x, taps, bias, valid, parts, activation, eps, dtype, interpret)
-    return out, (x, taps, bias, valid)
+def _conv_fwd(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
+    out = _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
+    return out, (x, taps, bias, valid, documents)
 
 
 def _conv_bwd(parts, activation, eps, dtype, interpret, residual, cotangents):
-    x, taps, bias, valid = residual
-    dx, dw, db = _backward(x, taps, bias, valid, cotangents, parts, activation, eps, interpret)
-    return dx, dw, db, None
+    x, taps, bias, valid, documents = residual
+    dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
+    return dx, dw, db, None, None
 
 
-conv = jax.custom_vjp(_conv, nondiff_argnums=(4, 5, 6, 7, 8))
+conv = jax.custom_vjp(_conv, nondiff_argnums=(5, 6, 7, 8, 9))
 """`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
 K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
 `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
 l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
-outputs. Gradients for `x`, `taps` and `bias`."""
+outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
+its output token's. Gradients for `x`, `taps` and `bias`."""
 conv.defvjp(_conv_fwd, _conv_bwd)
