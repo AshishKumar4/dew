@@ -207,12 +207,14 @@ jobs:
         PROVEN: ${{ needs.proven.outputs.run }}
       run: |
         armada="bunx --bun $ARMADA"
-        gangs=0
+        # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
+        # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
+        trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null; done' INT TERM
         if [ -z "$PROVEN" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           echo '[{"gang": 4, "select": "layouts and dense"}, {"gang": 4, "select": "layouts and moe"},
                 {"gang": 4, "select": "not layouts"}]' \
-            | $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
+            | setsid $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
             --deadline=1800 --gang-start-timeout=300 \
             --label="${{ github.ref_name }}" -- ".venv-$(tr -d '\n' < .python-version)/bin/python" -m pytest -q \
             -m "not network" -k "{select}" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py \
@@ -222,14 +224,31 @@ jobs:
         # Its own deadline sits below this job's 60 minutes, so a hang is armada's named error, and
         # above what every file takes on 84 containers when no row is cached (a change to a module
         # most tests import, and the daily run, which proves the commit again with every file).
-        suite=0
         if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
-          $armada run ${{ github.sha }} --deadline=2700 --label="${{ github.ref_name }}" || suite=$?
+          setsid $armada run ${{ github.sha }} --deadline=2700 --label="${{ github.ref_name }}" \
+            2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
+          suite=$!
         fi
-        status=0
-        if [ "$gangs" != 0 ]; then
-          wait "$gangs" || status=$?
+        failed=0
+        if [ -n "${suite:-}" ]; then wait "$suite" || failed=1; fi
+        if [ -n "${gangs:-}" ]; then
+          wait "$gangs" || failed=1
           echo "--- the multi-host gangs"
           cat "$RUNNER_TEMP/gangs.log"
         fi
-        exit $(( suite || status ))
+        exit $failed
+    - name: Cancel the armada jobs of a cancelled run
+      # A client killed before it cancelled leaves its job running to its deadline, on the fleet the
+      # next run needs: each job the clients named is cancelled (armada's POST /jobs/<id>/cancel, at
+      # the wire version of the client pinned above).
+      if: cancelled()
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+      run: |
+        for id in $(cat "$RUNNER_TEMP"/gangs.log "$RUNNER_TEMP"/suite.err 2>/dev/null \
+                    | grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' | cut -d' ' -f2 | sort -u); do
+          curl -sS -X POST "${ARMADA_URL%/}/jobs/$id/cancel" -H "authorization: Bearer $ARMADA_TOKEN" \
+            -H "armada-protocol: 10" || true
+          echo " cancelled $id"
+        done
