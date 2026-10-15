@@ -152,7 +152,7 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
             logit_terms = logit_terms * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
 
         def per_key_head(x):
-            return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, width).sum(3)
+            return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, x.shape[-1]).sum(3)
 
         terms = (jnp.einsum('bhqk,bkhd->bqhd', weights, jnp.abs(v[:, :, group])),
                  jnp.einsum('bhqk,bkhd->bqhd', logit_terms, jnp.abs(k[:, :, group])),
