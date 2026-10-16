@@ -10,7 +10,14 @@ from flax import linen as nn
 from dew import records
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
+from .common import (
+    ProjectorBase,
+    TowerBase,
+    TowerGeometry,
+    _vision_section,
+    activation_name,
+    block_tensor_path,
+)
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -111,9 +118,7 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A MiMo-V2 vision_config into a MiMoVision value's fields. The trunk computes SwiGLU, as the
     release's silu names it, and no other activation."""
     vision = _vision_section(hf_config)
-    if str(vision.get("hidden_act", "silu")) != "silu":
-        raise ValueError(f"hidden_act {vision.get('hidden_act')!r} is not expressible: MiMo ViT's "
-                         "feed-forward is a SwiGLU")
+    activation_name(vision, ("silu",), "silu")
     depth = records.integer(vision["depth"], "depth")
     types = records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
     return {"class": "mimo", "fields": {

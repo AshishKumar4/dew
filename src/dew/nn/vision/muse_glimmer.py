@@ -14,7 +14,15 @@ from dew.nn.attention import RMSNorm
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
+from .common import (
+    ProjectorBase,
+    TowerBase,
+    TowerGeometry,
+    _vision_section,
+    activation_name,
+    block_tensor_path,
+    rope_base,
+)
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -145,15 +153,6 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     vision = _vision_section(hf_config)
     if vision.get("model_type", "muse_glimmer_vision") != "muse_glimmer_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not Muse Glimmer's trunk")
-    rope = records.record(vision.get("rope_parameters") or {"rope_type": "default", "rope_theta": 10000.0},
-                          "rope_parameters")
-    if rope.get("rope_type", "default") != "default":
-        raise ValueError(f"rope_type {rope.get('rope_type')!r} is not expressible: the trunk's 2D rotary "
-                         "is the default rope")
-    activation = str(vision.get("hidden_act", "gelu"))
-    if activation not in TOWER_ACTIVATIONS:
-        raise ValueError(f"hidden_act {activation!r} is not expressible: the trunk runs "
-                         f"{', '.join(TOWER_ACTIVATIONS)}")
     layers = records.integer(vision["num_hidden_layers"], "num_hidden_layers")
     default = ["full_attention" if (i + 1) % 4 == 0 or i == layers - 1 else "window_attention"
                for i in range(layers)]
@@ -166,14 +165,14 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_attention_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "hidden_act": activation,
+        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu"),
         "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "patch_temporal": records.integer(vision.get("patch_temporal", 2), "patch_temporal"),
         "merge_size": records.integer(vision.get("merge_size", 2), "merge_size"),
         "pos_emb_height": records.integer(vision.get("pos_emb_height", 32), "pos_emb_height"),
         "pos_emb_width": records.integer(vision.get("pos_emb_width", 32), "pos_emb_width"),
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
-        "rope_theta": records.number(rope.get("rope_theta", 10000.0), "rope_theta"),
+        "rope_theta": rope_base(vision, 10000.0),
         "layer_types": kinds,
     }}
 
@@ -188,9 +187,8 @@ def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> 
     merged = records.integer(hf_config.get("out_hidden_size", width * merge ** 2), "out_hidden_size")
     if merged != width * merge ** 2:
         raise ValueError(f"out_hidden_size ({merged}) is not the trunk's merge blocks ({width} x {merge}^2)")
-    activation = str(hf_config.get("projector_hidden_act", "gelu"))
-    if activation not in ("gelu", "gelu_pytorch_tanh", "quick_gelu", "silu", "relu"):
-        raise ValueError(f"projector_hidden_act {activation!r} is not expressible")
+    activation = activation_name(hf_config, ("gelu", "gelu_pytorch_tanh", "quick_gelu", "silu", "relu"),
+                                 "gelu", ("projector_hidden_act",))
     return {"class": "muse_glimmer", "fields": {
         "vision_width": width,
         "merge_size": merge,
