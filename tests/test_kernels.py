@@ -550,6 +550,27 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
         assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
 
 
+@on_gpu
+def test_queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
+    """Queries packed by documents over a context of no tokens at all: every query reads nothing,
+    its output and gradient exactly zero on flash as on the reference kernel, and the empty keys
+    and values take empty gradients. Called outside jit, so the kernel launches over its empty keys,
+    whose length FA3 needs bounded by at least one."""
+    flash_here()
+    rng = np.random.default_rng(31)
+    queries = jnp.asarray(documents([[3, 2, 1]]))
+    query = jnp.asarray(rng.normal(size=(1, 6, 8, 64)), jnp.bfloat16)
+    key = value = jnp.zeros((1, 0, 8, 64), jnp.bfloat16)
+    for implementation in ("flash", "reference"):
+        out, pull = jax.vjp(lambda q, k, v, implementation=implementation: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, segment_ids=queries,
+            key_segment_ids=jnp.zeros((1, 0), jnp.int32), max_segments=2), query, key, value)
+        dq, dk, dv = pull(jnp.ones_like(out))
+        np.testing.assert_array_equal(np.asarray(out, np.float32), 0)
+        np.testing.assert_array_equal(np.asarray(dq, np.float32), 0)
+        assert dk.shape == dv.shape == key.shape
+
+
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_a_query_reading_another_sequences_documents_reads_its_own_documents_keys_alone(implementation):
     """Queries packed by documents read a context packed by its own (`key_segment_ids`): each query
