@@ -210,10 +210,13 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
             sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
                               beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
             heads.append([np.asarray(x) for x in run(*sliced)])
-            chunked = functools.partial(recurrence, cuts=rows, rule=linear.chunk_delta_rule)
-            _, terms = float64_terms(through(chunked, *sliced[6:]), *sliced[:6])
-            terms = [np.asarray(x) for x in terms]
-            terms[5] = np.maximum(terms[5], factorised_decay_terms(*sliced, cuts=rows))
+            # Evaluated op by op, which dispatches faster on the host than on a GPU.
+            with jax.default_device(jax.devices("cpu")[0]):
+                host = jax.device_put(sliced, jax.devices("cpu")[0])
+                chunked = functools.partial(recurrence, cuts=rows, rule=linear.chunk_delta_rule)
+                _, terms = float64_terms(through(chunked, *host[6:]), *host[:6])
+                terms = [np.asarray(x) for x in terms]
+                terms[5] = np.maximum(terms[5], factorised_decay_terms(*host, cuts=rows))
             sizes.append(terms)
 
     def joined(leaves):
