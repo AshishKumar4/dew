@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from torch_precision import replaced
 
 
 def frequency_exponent(half: int, shift: float, max_period: float) -> torch.Tensor:
@@ -51,12 +52,8 @@ def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
 def rounded_frequency_table():
     from diffusers.models import embeddings
 
-    original = embeddings.get_timestep_embedding
-    embeddings.get_timestep_embedding = rounded_timestep_embedding
-    try:
+    with replaced((embeddings, "get_timestep_embedding", rounded_timestep_embedding)):
         yield
-    finally:
-        embeddings.get_timestep_embedding = original
 
 
 def step_noise(shape: tuple[int, ...], count: int,

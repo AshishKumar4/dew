@@ -9,6 +9,7 @@ replacements here are the ones several generators make.
 """
 
 import contextlib
+import inspect
 from collections.abc import Callable
 
 import torch
@@ -33,8 +34,9 @@ def default_dtype(dtype):
 @contextlib.contextmanager
 def replaced(*patches: tuple[object, str, object]):
     """Each `(owner, name, value)` set as `owner.name` within the block, every previous value restored
-    after it, whether or not the block raised."""
-    kept = [(owner, name, getattr(owner, name)) for owner, name, _ in patches]
+    after it, whether or not the block raised. A class keeps its own descriptor, a staticmethod
+    included, rather than the function the attribute reads as."""
+    kept = [(owner, name, inspect.getattr_static(owner, name)) for owner, name, _ in patches]
     try:
         for owner, name, value in patches:
             setattr(owner, name, value)
