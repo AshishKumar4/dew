@@ -284,10 +284,12 @@ class Adapter:
 
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
-              dropout: float, layouts: Mapping[str, WeightLayout], base: AdapterBase | None) -> Adapter:
+              dropout: float, layouts: Mapping[str, WeightLayout],
+              base: AdapterBase | None = None) -> Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
-        The factors go under `params` and everything else under `FROZEN`.
+        The factors go under `params` and everything else under `FROZEN`. `base` is the published
+        model it was bound to, None for a model built from its class.
         """
         adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts, base)
         factors = {(*path, factor) for path in targets for factor in FACTORS}
