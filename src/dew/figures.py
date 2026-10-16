@@ -366,7 +366,7 @@ def bars(frames: Sequence[Sequence[float]], *, labels: Sequence[str], captions: 
         figure.text(x + slot * 0.32, floor + 20, labels[k], size=13, mono=True, anchor="middle")
         numbers = [figure.text(x + slot * 0.32, floor - tall * min(h / y_max, 1) - 7, f"{h:.2f}", size=12,
                                color="muted", anchor="middle") for h in heights[:, k]]
-        figure.show_in_turn(numbers, times)
+        figure.show_in_turn(numbers, times, fade=0.15)
     if captions:
         _captions(figure, captions, times, width - right, 18)
     return figure
