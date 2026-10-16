@@ -301,7 +301,10 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
 
 
 class Counting(ByteTokenizer):
-    """The byte vocabulary, counting the texts it tokenizes."""
+    """The byte vocabulary, counting the texts it tokenizes. It does not hash,
+    as a tokenizer that compares by value need not."""
+
+    __hash__ = None
 
     def __init__(self):
         super().__init__()
@@ -317,7 +320,8 @@ def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
     """A reader lays each record out twice, to fit it and to train on it, and
     every record asks its questions over options in a fresh order, yet each
     text is tokenized once: each template, instruction and option once for
-    the run, and each record's state once."""
+    the run, and each state as its record is fit, which the row it trains on
+    lays out again."""
     layout, _, head = ARMS[arm]
     tokenizer = Counting()
     objective = DecisionObjective(attending(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
