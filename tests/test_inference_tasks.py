@@ -166,8 +166,8 @@ def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims()
 class Counting(nn.Module):
     """A user's own block denoiser, no Dew class: its prefix cache counts the
     clean tokens it encoded, and it scores each canvas slot as its own
-    position past them, modulo the vocabulary, so a canvas commits the next
-    positions in order."""
+    position, the one it is handed or else the next past them, modulo the
+    vocabulary, so a canvas commits the next positions in order."""
 
     vocab_size: int = 11
     canvas_length: int = 4
@@ -181,11 +181,11 @@ class Counting(nn.Module):
         return jnp.zeros((*tokens.shape, self.vocab_size))
 
     @nn.compact
-    def __call__(self, tokens, *, self_conditioning_logits=None, self_conditioning_mask=None):
+    def __call__(self, tokens, *, self_conditioning_logits=None, self_conditioning_mask=None, positions=None):
         scale = self.param("scale", nn.initializers.constant(30.0), ())
         encoded = (self.get_variable("cache", "length") if self.has_variable("cache", "length")
                    else jnp.zeros(tokens.shape[0], jnp.int32))
-        position = encoded[:, None] + jnp.arange(tokens.shape[1])
+        position = encoded[:, None] + jnp.arange(tokens.shape[1]) if positions is None else positions
         return scale * jax.nn.one_hot(position % self.vocab_size, self.vocab_size)
 
 
@@ -203,6 +203,22 @@ def test_a_user_block_denoiser_generates_through_the_block_task():
                                   [[1, 5, 7, 3, 4, 5, 6, 7, 8], [2, 4, 6, 3, 4, 5, 6, 7, 8]])
     np.testing.assert_array_equal(generated.lengths, [6, 6])
     assert not bool(generated.terminated.any())
+
+
+def test_a_block_denoisers_canvases_continue_the_prompts_logical_positions():
+    """A prompt that gives its logical positions has each canvas refined on
+    from its last real token's, canvas after canvas: a left-padded row at
+    ranks, and a row whose positions start past zero, where the cache's count
+    of encoded slots would put both at 3."""
+    model = Counting()
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = BlockGeneration(model, variables, BlockProcess(canvas_length=4, vocab_size=11))
+    prompt = ModelInputs(jnp.asarray([[0, 5, 7], [2, 4, 6]], jnp.int32),
+                         {"attention_mask": jnp.asarray([[0, 1, 1], [1, 1, 1]], bool),
+                          "positions": jnp.asarray([[0, 0, 1], [7, 8, 9]], jnp.int32)})
+    generated = task(prompt, 6, key=0)
+    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, 3:],
+                                  [[2, 3, 4, 5, 6, 7], [10, 0, 1, 2, 3, 4]])
 
 
 def test_seed_is_the_key():

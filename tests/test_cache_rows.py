@@ -116,3 +116,17 @@ def test_beam_branching_reuses_one_prefill_without_mixing_prompts():
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, :3], np.asarray(prompts))
     # Width one is the greedy walk, so a mixed prefix shows up immediately.
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, 3:], walk(model, params, prompts, 4)[:, 3:])
+
+
+def test_a_multimodal_cache_continues_each_row_where_its_response_does():
+    """The wrapper's cache cursor after a prefill is where each row's response continues
+    (`next_position`): past its last real token's position, which a document reset lowered in the
+    first row, as `ModelInputs.extended` continues it, not past the row's largest."""
+    model = multimodal()
+    tokens = jnp.asarray([[2, 3, 4, 5], [6, 7, 8, 9]], jnp.int32)
+    positions = jnp.asarray([[5, 6, 7, 0], [0, 1, 2, 3]], jnp.int32)
+    variables = model.init(jax.random.key(0), tokens, decode=True)
+    _, state = model.apply(variables, tokens, positions=positions, decode=True, mutable=["cache"])
+    response = ModelInputs(tokens, {"positions": positions}).extended(jnp.zeros((2, 1), jnp.int32))
+    np.testing.assert_array_equal(state["cache"]["next_position"],
+                                  np.asarray(response.token_fields["positions"])[:, -1])

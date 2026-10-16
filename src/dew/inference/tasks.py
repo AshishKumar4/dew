@@ -605,8 +605,9 @@ class BlockGeneration:
         records, over the weights of the latest checkpoint (or of `step`),
         and samples with the run's saved `BlockProcess` over the canvas the
         model declares. The run's preview budget becomes the task's
-        `max_new_tokens`. A run whose model is not a `BlockDenoiser` raises
-        `TypeError` naming the operations it lacks.
+        `max_new_tokens`, and its pad id the task's `pad_token_id`. A run
+        whose model is not a `BlockDenoiser` raises `TypeError` naming the
+        operations it lacks.
 
         The arguments work as in `TextGeneration.from_run`: `ema` selects
         the averaged weights, `mesh` and `layout` place them, and the two
@@ -621,6 +622,7 @@ class BlockGeneration:
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         process = from_record(BlockProcess, json_value(record['process'], 'process'), dtypes=False)
         return cls(model, variables, process, processor,
+                   pad_token_id=integer(record['pad_token_id'], 'pad_token_id'),
                    max_new_tokens=_saved_budget(record) or None)
 
     @classmethod

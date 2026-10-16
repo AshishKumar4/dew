@@ -15,8 +15,9 @@ Scope is per rule, because the rules are not all about the same thing:
   SLOP008 will not see patched).
 - `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
   names and annotations are local, so the contract rules (SLOP001, SLOP002,
-  SLOP004, SLOP005) do not run there. A swallowed exception, a narration
-  comment and an unsplittable function are defects anywhere, so those do.
+  SLOP004, SLOP005) do not run there. A suppression, a swallowed exception, a
+  narration comment and an unsplittable function are defects anywhere, so
+  those do.
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
@@ -29,6 +30,10 @@ Scope is per rule, because the rules are not all about the same thing:
   fewer, since its block refuses a call that sets any other.
 - SLOP015 is about the suite. A test imports its own package, so an import
   the package breaks fails the suite instead of skipping it.
+- SLOP016 is about `src/<package>`: a choice keyed on which device runs (its
+  hardware generation) lives in one table, `nn/kernels/generation.py`'s
+  `TARGETS`; any other module reads that table's facts, a library's support
+  rule the compute capability, and a launch config the autotuner.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -41,6 +46,9 @@ dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
 scope (tools/lint_scopes.py).
+SLOP016 follows the device's generation through the names one file binds, in
+statement order: both arms of a branch in turn and a loop's body once, so a
+name an arm rebinds counts as rebound after it.
 SLOP004's isinstance half fires only when the annotation it needs is written in
 the same scope; a value whose type arrives from another module is not narrowed
 by this checker and is not reported. SLOP006 walks the handler body it can see,
@@ -56,13 +64,14 @@ import io
 import re
 import sys
 import tokenize
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes  # noqa: E402
+import lint_scopes as scopes
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
@@ -98,8 +107,13 @@ NARRATION = re.compile(
     r"|loop over|iterate|call |return the|set the|get the|create (a|the)|initialize|init )",
     re.IGNORECASE)
 MARKERS = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
-SUPPRESSIONS = re.compile(r"(?P<hit>typing\.cast\(|(?<![\w.])cast\(|# *type: *ignore"
-                          r"|# *pyright: *ignore|# *noqa)")
+# What a comment says to make a checker look away.
+SUPPRESSIONS = re.compile(r"\b(noqa|type: *ignore|pyright: *ignore)\b")
+# `typing.cast`, which typing_extensions re-exports.
+CASTS = {"typing.cast", "typing_extensions.cast"}
+# The calls that set a warning aside: each ignores one when its action is "ignore".
+WARNING_FILTERS = {"warnings.simplefilter", "warnings.filterwarnings", "warnings.catch_warnings",
+                   "pytest.mark.filterwarnings"}
 # A probe that asks a library or the environment what it supports, not a probe
 # that asks one of our own values whether it kept its contract.
 PROBE_ROOTS = {"jax", "jnp", "np", "numpy", "environ", "os", "sys", "flags", "importlib"}
@@ -297,21 +311,44 @@ def contracts(module: Module) -> Iterator[Finding]:
 
 
 def suppressions(module: Module) -> Iterator[Finding]:
-    """SLOP003: a cast or an ignore comment is evidence nobody produced."""
-    for number, text in enumerate(module.lines, start=1):
-        code, _, comment = text.partition("#")
+    """SLOP003: a cast, an ignore comment or an ignored warning is evidence nobody
+    produced. Comments are read as Python tokenizes them, so a string that spells
+    one is not one; `typing.cast` and the warning filters through each scope's
+    imports, so a function of the file's own named `cast` is not one either."""
+    for token in tokenize.generate_tokens(io.StringIO(module.source).readline):
+        if token.type != tokenize.COMMENT or (match := SUPPRESSIONS.search(token.string)) is None:
+            continue
+        line, col = token.start
+        code = module.lines[line - 1][:col]
         # One sanctioned inline suppression: an import kept for the registry
         # entry it makes, which is a side effect ruff has no way to see. The
         # name may stand on an import line or inside a parenthesized block.
         imported = (code.lstrip().startswith(("import ", "from "))
                     or re.fullmatch(r"\s*[\w.]+ *,? *", code) is not None)
-        registration = imported and "F401" in comment and "registers" in comment
-        for match in SUPPRESSIONS.finditer(text):
-            hit = match.group("hit")
-            if registration and hit.lstrip().startswith("#"):
-                continue
-            yield Finding(module.relative, number, match.start() + 1, "SLOP003",
-                          f"{hit.strip()} asserts what the code did not prove")
+        if imported and "F401" in token.string and "registers" in token.string:
+            continue
+        yield Finding(module.relative, line, col + match.start() + 1, "SLOP003",
+                      f"# {match.group(1)} asserts what the code did not prove")
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if not isinstance(node, ast.Call):
+            continue
+        called = scopes.resolved(node.func, table)
+        if called in CASTS:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          "cast() asserts what the code did not prove")
+        elif called in WARNING_FILTERS and _ignores(called, node):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          f"{called} ignores a warning; fix what raises it")
+
+
+def _ignores(called: str, call: ast.Call) -> bool:
+    """Does a warning filter's call set its warnings aside: a warnings call whose
+    action, the first argument or `action=`, is "ignore", or a pytest mark any of
+    whose filters, each argument, starts with it?"""
+    actions = [*(call.args if called == "pytest.mark.filterwarnings" else call.args[:1]),
+               *(keyword.value for keyword in call.keywords if keyword.arg == "action")]
+    return any(isinstance(action, ast.Constant) and isinstance(action.value, str)
+               and action.value.split(":")[0] == "ignore" for action in actions)
 
 
 def probes(module: Module) -> Iterator[Finding]:
@@ -521,21 +558,53 @@ def _labels(module: Module, line: int, word: str) -> bool:
     return False
 
 
+def _patched(node: ast.Call, table: dict[str, str]) -> str:
+    """What a patching call replaces, as a dotted path: `mock.patch("a.b")`'s
+    string; `patch.object(owner, "b")`'s and `monkeypatch.setattr(owner, "b",
+    ...)`'s or `monkeypatch.setattr("a.b", ...)`'s attribute, its owner read
+    through the scope's imports (`scopes.resolved`), however it was imported or
+    aliased; `monkeypatch.setitem(mapping, ...)`'s and `delitem`'s mapping,
+    which a module's table or registry is. "" for any other call."""
+    name = _named(node.func)
+    first = node.args[0]
+    spelled = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+    if name.endswith(("mock.patch", ".patch")) or name == "patch":
+        return spelled or ""
+    if name.endswith(("patch.object", "monkeypatch.setattr", "monkeypatch.delattr")):
+        if spelled is not None:
+            return spelled
+        attribute = node.args[1] if len(node.args) > 1 else None
+        attribute_name = (attribute.value if isinstance(attribute, ast.Constant)
+                          and isinstance(attribute.value, str) else "*")
+        owner = scopes.resolved(first, table)
+        return f"{owner}.{attribute_name}" if owner else ""
+    if name.endswith(("monkeypatch.setitem", "monkeypatch.delitem")):
+        return scopes.resolved(first, table)
+    return ""
+
+
+def _seam(target: str) -> bool:
+    """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
+    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
+    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?"""
+    words = [word for word in re.split(r"[._]", target.lower()) if word]
+    for seam in SEAMS:
+        parts = [word for word in re.split(r"[._]", seam) if word]
+        if any(words[start:start + len(parts)] == parts for start in range(len(words))):
+            return True
+    return False
+
+
 def mocks(module: Module) -> Iterator[Finding]:
-    """SLOP008: a first-party module replaced instead of a seam taken."""
-    for node in ast.walk(module.tree):
+    """SLOP008: a first-party module, or a table or registry it holds, replaced
+    instead of a seam taken."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.Call) or not node.args:
             continue
-        name = _named(node.func)
-        target = ""
-        if name.endswith(("mock.patch", "patch", "patch.object")):
-            target = node.args[0].value if isinstance(node.args[0], ast.Constant) else ""
-        elif name.endswith("monkeypatch.setattr"):
-            target = (node.args[0].value if isinstance(node.args[0], ast.Constant)
-                      else _named(node.args[0]))
-        if not isinstance(target, str) or not target.startswith(f"{module.package}."):
+        target = _patched(node, dict(table))
+        if not target.startswith(f"{module.package}."):
             continue
-        if any(seam in target.lower() for seam in SEAMS):
+        if _seam(target):
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
@@ -943,8 +1012,205 @@ def calls(module: Module) -> Iterator[Finding]:
                           f"{cls.name} reads {', '.join(sorted(unknown))}, which no call sets")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls)
-UNIVERSAL_RULES = (swallowed, comments, size)
+# Where the device's hardware generation comes from, and the one module that keys choices on it.
+GENERATION = "{package}.nn.kernels.generation"
+
+
+@dataclass
+class _Hardware:
+    """What one scope's names hold of the device's hardware, as SLOP016 reads it: the names bound to
+    its generation and those bound to its target (`gpu_target()`), and how each node resolves names."""
+
+    owner: str
+    tables: Mapping[int, Mapping[str, str]]
+    generations: frozenset[str] = frozenset()
+    targets: frozenset[str] = frozenset()
+
+    def called(self, node: ast.expr, name: str) -> bool:
+        return (isinstance(node, ast.Call)
+                and scopes.resolved(node.func, self.tables.get(id(node), {})) == f"{self.owner}.{name}")
+
+    def generation(self, node: ast.expr) -> bool:
+        """Is `node` the device's generation: `device_generation()`, a name bound to it, or the
+        `.generation` of `gpu_target()` or of a name bound to that?"""
+        if isinstance(node, ast.Name):
+            return node.id in self.generations
+        if isinstance(node, ast.Attribute) and node.attr == "generation":
+            return ((isinstance(node.value, ast.Name) and node.value.id in self.targets)
+                    or self.called(node.value, "gpu_target"))
+        return self.called(node, "device_generation")
+
+    def assigned(self, targets: Sequence[ast.expr], value: ast.expr | None) -> _Hardware:
+        """These names after `targets` take `value`: one name taking the generation or the target holds
+        it, and every other name they bind no longer holds either."""
+        names = [name.id for target in targets for name in ast.walk(target)
+                 if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)]
+        rest = self.without(names)
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or value is None:
+            return rest
+        if self.generation(value):
+            return replace(rest, generations=rest.generations | {targets[0].id})
+        if self.called(value, "gpu_target"):
+            return replace(rest, targets=rest.targets | {targets[0].id})
+        return rest
+
+    def without(self, names: Iterable[str]) -> _Hardware:
+        """These names but `names`, which hold something else here."""
+        held = set(names)
+        return replace(self, generations=self.generations - held, targets=self.targets - held)
+
+    def inside(self, scope: ast.AST) -> _Hardware:
+        """These names as a nested scope sees them: less its parameters."""
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            return self.without(argument.arg for argument in scopes.arguments(scope))
+        return self
+
+    def keyed(self, node: ast.AST) -> bool:
+        """Does `node` choose by the generation: compare it with one the source spells, match its
+        prefix or a spelled case, cut it up, or key a table with it?"""
+        if isinstance(node, ast.Compare):
+            operands = (node.left, *node.comparators)
+            return any(map(self.generation, operands)) and any(map(_spelled, operands))
+        if isinstance(node, ast.Subscript):
+            return self.generation(node.value) or self.generation(node.slice)
+        if isinstance(node, ast.Match):
+            spelled = any(_spelled_pattern(case.pattern) for case in node.cases)
+            return self.generation(node.subject) and spelled
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Attribute):
+            return ((node.func.attr in ("startswith", "endswith") and self.generation(node.func.value))
+                    or (node.func.attr == "get" and bool(node.args) and self.generation(node.args[0])))
+        builtin = scopes.resolved(node.func, self.tables.get(id(node), {})) == "builtins.getattr"
+        return builtin and len(node.args) > 1 and self.generation(node.args[1])
+
+
+def _spelled(node: ast.expr) -> bool:
+    """Is `node` a string written in the source, or a collection of them?"""
+    if isinstance(node, ast.Tuple | ast.List | ast.Set):
+        return bool(node.elts) and all(map(_spelled, node.elts))
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _spelled_pattern(pattern: ast.pattern) -> bool:
+    """Is a match case's `pattern` a string the source spells, or several?"""
+    if isinstance(pattern, ast.MatchOr):
+        return any(map(_spelled_pattern, pattern.patterns))
+    return isinstance(pattern, ast.MatchValue) and _spelled(pattern.value)
+
+
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _eager(node: ast.AST) -> Iterator[ast.AST]:
+    """`node` and every node under it that runs where it stands: not a lambda's body."""
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(node, ast.Lambda) and child is node.body:
+            continue
+        yield from _eager(child)
+
+
+def _scope_choices(body: Sequence[ast.stmt], hardware: _Hardware, closure: _Hardware | None,
+                   found: list[ast.expr | ast.stmt]) -> _Hardware:
+    """Read a scope's `body` in statement order (`_choices`) from `hardware`, its names on entry. A
+    function or the module (`closure` None) hands the functions in it its names as they stand once it
+    has bound them all, as a closure reads them; a class body hands on its enclosing scope's, as its
+    namespace reaches no function in it."""
+    if closure is None:
+        closure = hardware
+        for statement in body:
+            closure = _choices(statement, closure, closure, None)
+    for statement in body:
+        hardware = _choices(statement, hardware, closure, found)
+    return hardware
+
+
+def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
+             found: list[ast.expr | ast.stmt] | None) -> _Hardware:
+    """Append to `found` each node under `node` that chooses by the device's generation (`keyed`),
+    reading `hardware`'s names; return them once `node` has bound its own. A value is read before its
+    targets take it, and a comprehension's first iterable before its targets hide a name inside it.
+    With `found` None, only the names: nested scopes are not read."""
+    def read(child: ast.AST | None, names: _Hardware, inherited: _Hardware = closure) -> _Hardware:
+        return names if child is None else _choices(child, names, inherited, found)
+
+    if isinstance(node, ast.Lambda):
+        for child in (*node.args.defaults, *node.args.kw_defaults):
+            hardware = read(child, hardware)
+        if found is not None:
+            read(node.body, closure.inside(node), closure.inside(node))
+        return hardware
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        for child in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
+            hardware = read(child, hardware)
+        if found is not None:
+            _scope_choices(node.body, closure.inside(node), None, found)
+        return hardware.without([node.name])
+    if isinstance(node, ast.ClassDef):
+        for child in (*node.decorator_list, *node.bases, *node.keywords):
+            hardware = read(child, hardware)
+        if found is not None:
+            _scope_choices(node.body, hardware, closure, found)
+        return hardware.without([node.name])
+    if isinstance(node, COMPREHENSIONS):
+        first = node.generators[0]
+        hardware = read(first.iter, hardware)
+        names = [name.id for generator in node.generators for name in ast.walk(generator.target)
+                 if isinstance(name, ast.Name)]
+        inner, inherited = hardware.without(names), closure.without(names)
+        for generator in node.generators:
+            for child in (*([] if generator is first else [generator.iter]), *generator.ifs):
+                inner = read(child, inner, inherited)
+        for child in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
+            inner = read(child, inner, inherited)
+        if isinstance(node, ast.GeneratorExp):
+            # Its body runs later, as it is consumed.
+            return hardware
+        # An assignment expression in it binds the enclosing scope's name; one in a lambda, the lambda's.
+        walrus = {expression.target.id for expression in _eager(node)
+                  if isinstance(expression, ast.NamedExpr)}
+        outer = hardware.without(walrus)
+        return replace(outer, generations=outer.generations | (inner.generations & walrus),
+                       targets=outer.targets | (inner.targets & walrus))
+    if found is not None and isinstance(node, ast.expr | ast.stmt) and hardware.keyed(node):
+        found.append(node)
+    if isinstance(node, ast.Assign | ast.AnnAssign | ast.NamedExpr):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        hardware = read(node.value, hardware)
+        for target in targets:
+            # Read for the keys a target holds; the names it binds are `assigned`'s.
+            read(target, hardware)
+        return hardware.assigned(targets, node.value)
+    for child in ast.iter_child_nodes(node):
+        hardware = read(child, hardware)
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+        return hardware.without([node.id])
+    if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name is not None:
+        return hardware.without([node.name])
+    return hardware
+
+
+def authorities(module: Module) -> Iterator[Finding]:
+    """SLOP016: a choice keyed on which device runs, outside the table that owns them: the device's
+    generation compared with or prefix-matched against one the source spells, matched against a
+    spelled case, cut up, or used as a table's key or attribute name. Comparing it with a recorded
+    one, the generation a measurement was taken on, is a measurement's provenance and not reported."""
+    owner = GENERATION.format(package=module.package)
+    if module.relative == f"src/{owner.replace('.', '/')}.py":
+        return
+    builtins = {"getattr": "builtins.getattr"}
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, builtins, _parent(module))}
+    found: list[ast.expr | ast.stmt] = []
+    _scope_choices(module.tree.body, _Hardware(owner, tables), None, found)
+    for node in found:
+        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
+                      "chooses by the device's generation; read the target table's fact (`gpu_target()`), "
+                      "a library's rule the compute capability (`capability`), a launch config the autotuner")
+
+
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:
