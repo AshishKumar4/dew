@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 
+from dew import cache
 from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
@@ -190,8 +191,9 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
 
 @pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
 def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
-    """A step's kernel launches are read from a lowering of its own (`tune`) and recorded with
-    its plan, so a later run settles their configs from the record and lowers the step once."""
+    """A step's lowering records its kernel launches as it traces them (`tune`), with its plan,
+    so each run lowers its step once: the first again only where settling the launches changed
+    a config its trace read, and a later run, which settles them from the record first, never."""
     lowered = []
 
     def lowering(event, seconds, *, fun_name=None, **_):
@@ -199,15 +201,18 @@ def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_f
             lowered.append(seconds)
 
     counts = []
+    settled = cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
+            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
-    assert counts == [2, 1]
+    assert counts[1] == 1
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():

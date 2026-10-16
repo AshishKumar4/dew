@@ -91,7 +91,7 @@ def _tiles(dtype: jnp.dtype, staged: Callable[[Tile], int]) -> set[Tile]:
     Hopper tile is sized for the larger."""
     target = generation.gpu_target()
     limit = target.shared_limit or 99 * 1024
-    held = 0 if target.generation == 'sm90' else 1
+    held = 0 if target.wgmma else 1
     width = jnp.dtype(dtype).itemsize
     tiles = (Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (32, 64, 128),
                                                          (4, 8), (2, 3, 4)))

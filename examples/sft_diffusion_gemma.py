@@ -9,8 +9,10 @@ fetching one layer at a time. The 26B-A4B base has not been run through it:
         --chat data/tulu-3-sft.parquet --steps 2000
 
 `--chat` is an `hf://` Hub dataset, a `.jsonl` file or a parquet file of
-conversations, which is what the `ChatData` recipe reads and renders with the
-checkpoint's own chat template. The run writes the PEFT adapter directory
+conversations, which is what the `ChatCanvasData` recipe reads and renders with
+the checkpoint's own chat template. Each assistant turn becomes one row: the
+conversation before it is the clean prompt, and the turn alone fills the
+canvases the denoiser scores. The run writes the PEFT adapter directory
 `Adapter.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
 canvases to `samples.txt`. Image-conditioned training on real Oxford Flowers
@@ -30,7 +32,7 @@ import tyro
 
 import dew
 from dew.config import OptimConfig
-from dew.config.data import ChatData, loader
+from dew.config.data import ChatCanvasData, loader
 from dew.data import Loading
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
@@ -43,7 +45,8 @@ SMOKE_SOURCE = FIXTURES / "hf/diffusion-gemma-workflow"
 CONVERSATIONS = [
     [{"role": "user", "content": "t5 t7"}, {"role": "assistant", "content": "t9 t11"}],
     [{"role": "user", "content": "t6 t8"}, {"role": "assistant", "content": "t10 t12"}],
-    [{"role": "user", "content": "t13 t15"}, {"role": "assistant", "content": "t17 t19"}],
+    [{"role": "user", "content": "t13 t15"}, {"role": "assistant", "content": "t17 t19"},
+     {"role": "user", "content": "t21 t23"}, {"role": "assistant", "content": "t25 t27 t29 t31 t33"}],
 ]
 
 PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
@@ -69,46 +72,50 @@ class Config:
     """PEFT's target_modules: which projections carry a delta."""
     response_tokens: int = 32
     smoke: bool = False
-    """Fine-tune the committed tiny checkpoint on three canned turns instead."""
+    """Fine-tune the committed tiny checkpoint on canned turns instead."""
 
 
-def smoke_conversations(out: Path) -> Path:
-    """The canned turns as the JSONL file the `Chat` recipe reads line by line."""
-    jsonl = out / "chat.jsonl"
+def smoke_config(config: Config) -> Config:
+    """The run over the committed tiny checkpoint, which carries the tokenizer
+    too, and the canned turns as the JSONL file the recipe reads line by line."""
+    config.out.mkdir(parents=True, exist_ok=True)
+    jsonl = config.out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
-    return jsonl
+    return replace(config, model=str(SMOKE_SOURCE), chat=str(jsonl), prompt_tokens=8, canvases=2,
+                   batch_size=2, steps=2, rank=2, alpha=4.0, response_tokens=4)
 
 
-def main(config: Config) -> Path:
-    if config.smoke:
-        config.out.mkdir(parents=True, exist_ok=True)
-        tokenizer = str(SMOKE_SOURCE)
-        config = replace(config, model=tokenizer, chat=str(smoke_conversations(config.out)),
-                         prompt_tokens=8, canvases=2, batch_size=2, steps=2, rank=2,
-                         alpha=4.0, response_tokens=4)
-    else:
-        tokenizer = config.model
-        if config.chat is None:
-            raise ValueError("--chat names the conversations to fine-tune on: a hub "
-                             "dataset id, a .jsonl file or a parquet file")
-
+def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiffusionObjective]:
+    """The base with its adapter, and the SFT objective over it."""
     source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32).adapt(
         LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
-    sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
     # A host layout streams the stack one layer per scan iteration, so the
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
     # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
-    objective = BlockDiffusionObjective(
+    return source, BlockDiffusionObjective(
         scanned, prompt_length=config.prompt_tokens,
         num_canvases=config.canvases, variables=source.variables,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
-    # A packed window is seq_len + 1 ids wide, and the objective reads rows of
-    # exactly prompt + canvases: the spec is asked for one less.
-    data = loader(ChatData(tokenizer=tokenizer, source=config.chat, long="chunk",
-                     seq_len=sequence_length - 1), batch=config.batch_size, read="memory",
-                loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
+
+def chat_rows(config: Config, objective: BlockDiffusionObjective) -> ChatCanvasData:
+    """`--chat` as the objective's rows, one per assistant turn, in its geometry."""
+    return ChatCanvasData(source=config.chat, tokenizer=config.model, prompt_length=objective.prompt_length,
+                          canvas_size=objective.canvas_size, canvases=objective.num_canvases,
+                          pad_id=objective.pad_token_id)
+
+
+def main(config: Config) -> Path:
+    if config.smoke:
+        config = smoke_config(config)
+    elif config.chat is None:
+        raise ValueError("--chat names the conversations to fine-tune on: a hub "
+                         "dataset id, a .jsonl file or a parquet file")
+
+    source, objective = adapted_objective(config)
+    data = loader(chat_rows(config, objective), batch=config.batch_size, read="memory",
+                  loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),

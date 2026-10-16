@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
@@ -110,23 +110,32 @@ def test_the_embeddings_predictions_and_every_gradient_are_as_exact_as_v_jepas(r
         context = encoder.apply({"params": params["encoder"]}, images, context_idx)
         return context, predictor.apply({"params": params["predictor"]}, context, context_idx, target_idx)
 
-    context, predictions = forward(params, images)
     def objective(params, images):
         return sum(jnp.sum(out * probe) for out, probe in zip(forward(params, images), probes, strict=True))
 
-    grads = jax.grad(objective, argnums=(0, 1))(params, images)
+    def outputs_and_gradients(params, images):
+        return (*forward(params, images), *jax.grad(objective, argnums=(0, 1))(params, images))
+
+    context, predictions, *grads = outputs_and_gradients(params, images)
+    # Dew's own path in float64 on the CPU: each entry's terms, what its sums add, by which the gate sizes
+    # its rows and elements (`float64_terms`).
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, terms = float64_terms(outputs_and_gradients, *widened((params, images)))
+    context_terms, prediction_terms, *gradient_terms = terms
     assert_as_exact_as_the_reference(np.asarray(context), part("fp32.context"), part("fp64.context"),
-                                     f"{case} context embeddings")
+                                     f"{case} context embeddings", terms=context_terms)
     assert_as_exact_as_the_reference(np.asarray(predictions), part("fp32.predictions"),
-                                     part("fp64.predictions"), f"{case} predictions")
+                                     part("fp64.predictions"), f"{case} predictions", terms=prediction_terms)
 
     def source_order(precision: str) -> np.ndarray:
         leaves = [part(f"{precision}.grad_images")]
         leaves += [part(f"{precision}.grad_param.{name}") for name in names]
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
-    native = [np.asarray(grads[1]).transpose(0, 3, 1, 2)]
-    native += [from_dew(name, grads[0], heads[name.split(".")[0]]) for name in names]
-    native_order = np.concatenate([np.ravel(leaf) for leaf in native])
-    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
-                                     f"{case} gradients")
+    def native_order(gradients) -> np.ndarray:
+        native = [np.asarray(gradients[1]).transpose(0, 3, 1, 2)]
+        native += [from_dew(name, gradients[0], heads[name.split(".")[0]]) for name in names]
+        return np.concatenate([np.ravel(leaf) for leaf in native])
+
+    assert_as_exact_as_the_reference(native_order(grads), source_order("fp32"), source_order("fp64"),
+                                     f"{case} gradients", terms=native_order(gradient_terms))
