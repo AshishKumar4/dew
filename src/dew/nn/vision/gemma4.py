@@ -4,7 +4,7 @@
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,24 @@ from .common import (
 )
 
 
+def clipped_linear(module: nn.Module, linear: Callable[[jax.Array], jax.Array], inputs: jax.Array,
+                   clipped: bool) -> jax.Array:
+    """`linear(inputs)`, its input and output clamped where `clipped` to the
+    nontrainable bounds `module` keeps: the reference's one clippable linear
+    for both Gemma 4 towers (modeling_gemma4.py:168-194). The bounds stay
+    FP32 and clamp in each operand's dtype, as torch.clamp against a 0-dim
+    buffer does, so a bf16 tower stays bf16 through the map."""
+    if not clipped:
+        return linear(inputs)
+
+    def clamp(value, side):
+        low = module.variable("constants", f"{side}_min", lambda: jnp.array(-jnp.inf, jnp.float32)).value
+        high = module.variable("constants", f"{side}_max", lambda: jnp.array(jnp.inf, jnp.float32)).value
+        return jnp.clip(value, low.astype(value.dtype), high.astype(value.dtype))
+
+    return clamp(linear(clamp(inputs, "input")), "output")
+
+
 class Gemma4ClippableLinear(nn.Dense):
     """The reference linear map with optional nontrainable activation bounds.
 
@@ -45,16 +63,7 @@ class Gemma4ClippableLinear(nn.Dense):
 
     @nn.compact
     def __call__(self, inputs):
-        if self.use_clipped_linears:
-            low = self.variable("constants", "input_min", lambda: jnp.array(-jnp.inf, jnp.float32))
-            high = self.variable("constants", "input_max", lambda: jnp.array(jnp.inf, jnp.float32))
-            inputs = jnp.clip(inputs, low.value.astype(inputs.dtype), high.value.astype(inputs.dtype))
-        output = super().__call__(inputs)
-        if self.use_clipped_linears:
-            low = self.variable("constants", "output_min", lambda: jnp.array(-jnp.inf, jnp.float32))
-            high = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf, jnp.float32))
-            output = jnp.clip(output, low.value.astype(output.dtype), high.value.astype(output.dtype))
-        return output
+        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
 
 
 class Gemma4VisionTransformer(nn.Module):
