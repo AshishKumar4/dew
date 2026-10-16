@@ -69,7 +69,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, small_cases
 from reference_runs.common import peak_flops
-from trace_window import kernel_category, length, union
+from trace_window import kernel_category, kernel_totals, window_split
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -694,15 +694,10 @@ def profile_step(step, n_steps):
                       if e.device_type == torch.autograd.DeviceType.CUDA), key=lambda kernel: kernel[1])
     if not kernels:
         return None
-    busy = length(union([(start, end) for _, start, end in kernels]))
-    window = kernels[-1][2] - kernels[0][1]
-    by_cat, by_name, count_cat, count_name = {}, {}, {}, {}
-    for name, start, end in kernels:
-        cat = kernel_category(name)
-        by_cat[cat] = by_cat.get(cat, 0.0) + (end - start)
-        count_cat[cat] = count_cat.get(cat, 0) + 1
-        by_name[name] = by_name.get(name, 0.0) + (end - start)
-        count_name[name] = count_name.get(name, 0) + 1
+    split = window_split(kernels)
+    busy, window = split["busy"], split["window"]
+    by_cat, count_cat = kernel_totals(kernels, kernel_category)
+    by_name, count_name = kernel_totals(kernels)
     top = sorted(by_name.items(), key=lambda kv: -kv[1])[:15]
     per_cat = {}
     for name, us in sorted(by_name.items(), key=lambda kv: -kv[1]):

@@ -88,7 +88,7 @@ from benchmark_models import (
     media_values as media_values,
     trainer_mesh,
 )
-from trace_window import device_events, kernel_category, length, overlap, union, window_split
+from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
 
 Row = dict[str, object]
 
@@ -271,13 +271,10 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
         raise ValueError(
             f"the trace under {directory} holds no device kernels: the profiler "
             "saw no accelerator, and a CPU run has no device timeline to read")
-    spans = union([(start, end) for _, start, end in kernels])
-    busy, window = length(spans), spans[-1][1] - spans[0][0]
-    by_category: dict[str, float] = {}
-    by_name: dict[str, float] = {}
-    for name, start, end in kernels:
-        by_category[kernel_category(name)] = by_category.get(kernel_category(name), 0.0) + end - start
-        by_name[name] = by_name.get(name, 0.0) + end - start
+    split = window_split(kernels)
+    busy, window = split["busy"], split["window"]
+    by_category, _ = kernel_totals(kernels, kernel_category)
+    by_name, _ = kernel_totals(kernels)
     per_step = 1e-6 / steps
     return {
         "profiled_steps": steps,
@@ -293,25 +290,6 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
     }
 
 
-# The HLO collective each NCCL kernel runs for, read off the `hlo_op` stat
-# XLA puts on the kernel: `all-to-all.3` where the partitioner made the op,
-# `all_to_all.124.1` where a shard_map's `jax.lax.all_to_all` did. NCCL runs
-# an all-to-all and a collective-permute as the same SendRecv kernel, so a
-# sequence exchange's Ulysses all-to-alls and a ring's or a Mamba-2 state's
-# shifts are told apart only here.
-HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter",
-                   "all-reduce")
-
-
-def _hlo_collective(event) -> str | None:
-    """The HLO collective op an NCCL kernel event ran for, or None."""
-    for name, value in event.stats:
-        if name == "hlo_op" and isinstance(value, str):
-            spelled = value.replace("_", "-")
-            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
-    return None
-
-
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     """Each device's traced window split by `trace_window.window_split` into
     compute, every collective, the communication no compute kernel
@@ -320,31 +298,18 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`HLO_COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`trace_window.HLO_COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
     if planes is None:
         planes = device_events(directory)[0]
-    devices = [([(event.name, event.start_ns, event.end_ns) for event in kernels],
-                [_hlo_collective(event) for event in kernels])
-               for kernels in planes.values() if kernels]
+    devices = [kernels for kernels in planes.values() if kernels]
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals: dict[str, float] = {}
-    for events, ops in devices:
-        figures = window_split(events)
-        figures.pop("busy")  # device_timeline's, over every device
-        compute = union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
-        for op in HLO_COLLECTIVES:
-            spans = union([(start, end) for (_, start, end), of in zip(events, ops, strict=True)
-                           if of == op])
-            key = op.replace("-", "_")
-            figures[key] = length(spans)
-            figures[f"{key}_exposed"] = length(spans) - overlap(spans, compute)
-        for key, value in figures.items():
-            totals[key] = totals.get(key, 0.0) + value
+    totals = communication_totals(devices)
+    totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")
     return {

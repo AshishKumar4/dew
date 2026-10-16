@@ -15,6 +15,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -492,6 +493,93 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
         "AllGather": 0}
     assert split["window"] == (split["compute"] + split["exposed_communication"]
                                + split["idle_input"] + split["idle_host"])
+
+
+def test_trace_reports_keep_global_busy_time_separate_from_per_device_averages():
+    tool = load("benchmark_step")
+    common = load("reference_runs/common")
+    rows = [
+        (0, "gemm_fusion_dot", 0, 10, None),
+        (0, "ncclDevKernel_SendRecv", 5, 20, "all_to_all.124.1"),
+        (0, "MemcpyH2D", 25, 26, None),
+        (0, "gemm_fusion_dot", 26, 30, None),
+        (0, "ncclDevKernel_SendRecv", 40, 50, "collective-permute.3"),
+        (1, "loop_add_fusion", 100, 110, None),
+        (1, "ncclDevKernel_AllReduce_Sum_bf16_RING_LL", 105, 120, "all-reduce.3"),
+        (1, "loop_add_fusion", 125, 130, None),
+    ]
+    planes = {f"/device:GPU:{device}": [
+        SimpleNamespace(name=name, start_ns=start * 1_000_000, end_ns=end * 1_000_000,
+                        stats=[] if op is None else [("hlo_op", op)])
+        for owner, name, start, end, op in reversed(rows) if owner == device] for device in (0, 1, 2)}
+    kernels = [(name, start * 1_000_000, end * 1_000_000, device)
+               for device, name, start, end, _ in rows]
+
+    timeline = tool.device_timeline("unused", 2, planes=planes)
+    reference = common.kernel_summary(kernels, 2)
+    communication = tool.communication("unused", 2, planes=planes)
+
+    assert timeline["device_busy_ms_per_step"] == pytest.approx(30)
+    assert timeline["device_window_ms_per_step"] == pytest.approx(65)
+    assert timeline["device_busy_percent"] == pytest.approx(100 * 60 / 130)
+    assert timeline["kernels_per_step"] == 4
+    assert timeline["kernel_ms_by_category"] == pytest.approx(
+        {"collective": 20, "elementwise": 7.5, "gemm": 7, "other": 0.5})
+    assert dict(timeline["top_kernels"])["gemm_fusion_dot"] == pytest.approx(7)
+    assert reference["device_busy_ms_per_step"] == pytest.approx(15)
+    assert reference["device_window_ms_per_step"] == pytest.approx(20)
+    assert reference["device_busy_percent"] == pytest.approx(75)
+    assert reference["kernels_per_step"] == 2
+    assert reference["kernel_ms_by_category"] == pytest.approx(
+        {"collective": 10, "elementwise": 3.75, "gemm": 3.5, "other": 0.25})
+    gemm = next(row for row in reference["top_kernels"] if row["name"] == "gemm_fusion_dot")
+    assert (gemm["ms_per_step"], gemm["calls_per_step"]) == pytest.approx((3.5, 0.5))
+    assert communication["traced_devices"] == reference["devices"] == 2
+    assert communication["window_ms_per_step"] == pytest.approx(20)
+    for key, expected in {"compute": 7.5, "communication": 10, "exposed_communication": 7.5,
+                          "idle_input": 1.25, "idle_host": 3.75}.items():
+        assert (communication[f"{key}_ms_per_step"]
+                == reference[f"{key}_ms_per_step"] == pytest.approx(expected))
+    assert communication["all_to_all_ms_per_step"] == pytest.approx(3.75)
+    assert communication["all_to_all_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["collective_permute_ms_per_step"] == pytest.approx(2.5)
+    assert communication["collective_permute_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["all_reduce_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["exposed_communication_percent"] == pytest.approx(37.5)
+
+
+@pytest.mark.parametrize("scale", [1_000, 0.125])
+def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(scale):
+    tool = load("trace_window")
+    rows = [("cudnn_conv", 0, 30), ("flash_gemm", 5, 15), ("cutlass_scatter", 30, 40),
+            ("argmax", 40, 50), ("philox", 60, 70), ("unclassified", 70, 80),
+            ("unclassified", 85, 90), ("ncclDevKernel_SendRecv", 90, 95)]
+    events = [(name, start * scale, end * scale) for name, start, end in reversed(rows)]
+    durations, counts = tool.kernel_totals(events)
+    classes, class_counts = tool.kernel_totals(events, tool.decode_category)
+    training, _ = tool.kernel_totals(events, tool.kernel_category)
+
+    assert {name: duration / scale for name, duration in durations.items()} == pytest.approx({
+        "cudnn_conv": 30, "flash_gemm": 10, "cutlass_scatter": 10, "argmax": 10,
+        "philox": 10, "unclassified": 15, "ncclDevKernel_SendRecv": 5})
+    assert counts == {name: 2 if name == "unclassified" else 1 for name in durations}
+    assert {kind: duration / scale for kind, duration in classes.items()} == pytest.approx(
+        {"attention": 40, "gemm": 10, "reduction": 10, "random": 10, "other": 20})
+    assert class_counts == {"attention": 2, "gemm": 1, "reduction": 1, "random": 1, "other": 3}
+    assert {kind: duration / scale for kind, duration in training.items()} == pytest.approx(
+        {"conv": 30, "attention": 10, "gemm": 10, "other": 35, "collective": 5})
+    split = tool.window_split(events)
+    assert split["busy"] / scale == pytest.approx(80)
+    assert split["window"] / scale == pytest.approx(95)
+    assert sum(durations.values()) == sum(classes.values()) == sum(training.values())
+    assert sum(durations.values()) > split["busy"]
+
+
+def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
+    tool = load("trace_window")
+    split = tool.window_split([("nested", 30.5, 40.25), ("long_kernel", 10.25, 100.75)])
+    assert (split["busy"], split["compute"], split["window"]) == (90.5, 90.5, 90.5)
+    assert split["idle_input"] == split["idle_host"] == 0
 
 
 # ---------------------------------------------------------------------------
