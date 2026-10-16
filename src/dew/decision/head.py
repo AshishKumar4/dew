@@ -162,7 +162,7 @@ class DecisionHead(Head):
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
-        x = states + _embedded(self.type_embedding, kinds).astype(states.dtype)
+        x = states + self.type_embedding(kinds).astype(states.dtype)
         metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
@@ -253,29 +253,13 @@ def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> j
     """Each question's `values` `[B, Q, F]` at its option slots, `[B, P, F]`: on the grid a question's
     `width` slots repeat it, a broadcast whose transpose sums them, and compacted slots gather by their
     `owners`. A gather's transpose is a scatter, which XLA's deterministic GPU scatter sorts: the
-    joint head's three [8, 75, 1024] reads at [8, 7500, 1024] slots and its last-token read took 4.6
-    ms of an A100 80GB's step as scatters."""
+    joint head's three [8, 75, 1024] reads at [8, 7500, 1024] slots took 3.99 ms forward and backward
+    on an A100 40GB as gathers, 0.18 as broadcasts."""
     if inputs.option_slots is not None:
         return _gathered(values, owners)
     batch, count, width = inputs.options.shape
     return jnp.broadcast_to(values[:, :, None], (batch, count, width, *values.shape[2:])).reshape(
         batch, count * width, *values.shape[2:])
-
-
-def _selected(values: jax.Array, indices: jax.Array) -> jax.Array:
-    """`_gathered` of a few rows, `[B, N, F]` at `[B, P]` with P small, as a one-hot product, as
-    `_span_means` reads its spans: its transpose is a product, not a scatter over the N rows."""
-    chosen = jax.nn.one_hot(indices, values.shape[1], dtype=values.dtype)
-    return jnp.einsum("bpn,bnf->bpf", chosen, values, precision=jax.lax.Precision.HIGHEST)
-
-
-def _embedded(embed: nn.Embed, ids: jax.Array) -> jax.Array:
-    """`embed`'s rows at `ids` as a one-hot product: a lookup's transpose scatters every position's
-    gradient into the table's few rows, which XLA's deterministic GPU scatter sorts (1.8 ms of an A100
-    80GB's step at 8 x 75 positions)."""
-    table = jnp.asarray(embed.embedding, embed.dtype)
-    chosen = jax.nn.one_hot(ids, table.shape[0], dtype=table.dtype)
-    return jnp.einsum("...k,kw->...w", chosen, table, precision=jax.lax.Precision.HIGHEST)
 
 
 def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
@@ -340,8 +324,7 @@ class JointSchemaHead(Head):
         maps on memory. The field layers also have Q-by-Q self-attention.
         The residual scorer reads four width-sized features per option.
         Span pooling is a masked matrix product and is counted. Lookup
-        embeddings, the last-token read and pointwise normalization/gates
-        are excluded, the reads computed as one-hot products included.
+        embeddings and pointwise normalization/gates are excluded.
         """
         length, question, option = decision_geometry(lengths, questions, options)
         width, hidden = self.width, self.hidden_size
@@ -407,7 +390,7 @@ class JointSchemaHead(Head):
         rows = inputs.question_segments
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
-        last_state = _selected(hidden, last)
+        last_state = _gathered(hidden, last)
         questions = _span_means(hidden, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
@@ -436,7 +419,7 @@ class JointSchemaHead(Head):
         summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
         types = jnp.asarray(_TYPE_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
-                  + _embedded(self.type_embedding, types))
+                  + self.type_embedding(types))
         for layer in self.field_layers:
             fields = layer(fields, memory, asked, own[:, None])
         fields = self.field_norm(fields)
