@@ -88,7 +88,7 @@ def test_the_device_steps_jitter_rows_an_explicit_mesh_axis_types():
     finally:
         stream.close()
     expected = augmented(data, staged)
-    mesh = MeshSpec(explicit=("data",)).build()
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
     with jax.set_mesh(mesh):
         placed = shard_batch(mesh, staged)
         found = jax.jit(lambda rows: augmented(data, rows))(placed)
