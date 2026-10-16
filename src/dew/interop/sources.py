@@ -195,8 +195,8 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         # never fetched; a lookup the Hub refuses, or offline one never made,
         # finds none.
         try:
-            conversion = hub_answer(f"conversions/{name_or_dir}/{directory.name}",
-                                    lambda: _conversion_revision(name_or_dir, directory.name))
+            conversion = hub_answer(("conversion", name_or_dir, directory.name),
+                                    lambda: _conversion_revision(name_or_dir, directory.name)).value
         except (HfHubHTTPError, OfflineModeIsEnabled):
             conversion = None
         if conversion is not None:
