@@ -726,10 +726,19 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
             "    named = device_generation()\n"
             "    return [lambda: named == 'label' for named in records]\n"
             "def passed(getattr, TILES):\n"
-            "    return getattr(TILES, device_generation())\n"),
+            "    return getattr(TILES, device_generation())\n"
+            "def copied(TILES):\n"
+            "    named = device_generation()\n"
+            "    again: str = named\n"
+            "    return TILES[again]\n"
+            "def relabeled_inside():\n"
+            "    named = device_generation()\n"
+            "    [(named := label) for label in ('label',)]\n"
+            "    held = [(found := device_generation()) for _ in ()]\n"
+            "    return named == 'label' or held and found == 'sm80'\n"),
     })
     assert found == [("src/sparx/tiles.py", line, "SLOP016")
-                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41)]
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41, 54, 59)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
