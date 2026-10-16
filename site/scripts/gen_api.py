@@ -749,7 +749,7 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
 
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
                   home: dict[str, str]) -> list[str]:
-    """Unresolved code and declaration references, with each Python unit seeing the names earlier units bound."""
+    """Unresolved code and declaration references, with each Python unit seeing earlier units' bindings."""
     bound: dict[str, griffe.Object | Instance] = {}
     problems = [problem for code, shown in usage_code(file, path)
                 for problem in unresolved_uses(package, home, pages, code, shown, bound)]
