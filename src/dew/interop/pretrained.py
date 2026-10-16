@@ -855,16 +855,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if not (directory / "model_index.json").is_file():
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json")
-    with open(directory / "model_index.json") as handle:
-        index = json.load(handle)
+    index = json.loads((directory / "model_index.json").read_text())
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
     if variables is None:
         skipped = () if text else text_components(
             pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
-        # Both fetches at the commit the metadata resolved to.
-        directory = sources.snapshot(checkpoint, directory.name, weights=tuple(
-            name for name in index if component_present(index, name) and name not in skipped))
+        directory = _pipeline_weights(checkpoint, directory, index, skipped)
     if size is not None:
         if len(size) not in (2, 3):
             raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
@@ -872,12 +869,36 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         if len(size) == 3:
             index["dew_frames"] = size[0]
     streaming = variables is None and (mesh is not None or layout is not None)
+    return _assembled_pipeline(
+        directory, index, None if os.path.isdir(checkpoint) else directory.name,
+        lambda values: place(values, mesh, layout) if streaming else values, streaming=streaming,
+        dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype, variables=variables, text=text)
+
+
+def _pipeline_weights(name_or_dir: str | Path, directory: Path, index: Mapping[str, object],
+                      skipped: tuple[str, ...] = ()) -> Path:
+    """The snapshot with the weights of every component `index` declares but
+    `skipped`, fetched at the commit the metadata fetch returned as
+    `directory`, so the weights come from that commit even if the requested
+    branch moves."""
+    return sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
+        name for name in index if component_present(index, name) and name not in skipped))
+
+
+def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
+                        placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
+                        attention_impl: str, param_dtype: str, variables: Variables | None = None,
+                        text: bool = True) -> PretrainedPipeline:
+    """The pipeline `index` describes, assembled from the directory its
+    source resolved to (a snapshot, a single file's conversion or a DDUF
+    file's unpacking), its variables `placed` and `commit` its revision.
+    `streaming` reads the weights as `SourceLeaf`s for `placed` to place one
+    leaf at a time; `variables` and `text` are as `assemble_pipeline` takes
+    them."""
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text))
-    if streaming:
-        loaded = replace(loaded, variables=place(loaded.variables, mesh, layout))
-    return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
+    return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
@@ -1021,12 +1042,9 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     """
 
     def pipeline(directory: Path) -> PretrainedPipeline:
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
-            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-            lazy=streaming))
-        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+        index = json.loads((directory / "model_index.json").read_text())
+        return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
+                                   attention_impl=attention_impl, param_dtype=param_dtype)
 
     if single_file is not None and dduf_file is not None:
         raise ValueError(f"single_file={single_file!r} and dduf_file={dduf_file!r} each name a whole "
@@ -1046,12 +1064,8 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        # The metadata fetch returns its commit directory, so the weights
-        # come from that commit even if the requested branch moves.
-        return pipeline(sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
-            name for name in index if component_present(index, name))))
+        return pipeline(_pipeline_weights(name_or_dir, directory,
+                                          json.loads((directory / "model_index.json").read_text())))
     return None
 
 
