@@ -14,7 +14,7 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import saved_after_one_step
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
 from dew.checkpoints import Checkpoints
@@ -145,21 +145,32 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
 
     (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(params)
     np.testing.assert_allclose(float(value), float(STEP["loss_f64"]), rtol=1e-6)
-    student = {name: gradient[name]["kernel"] if name.startswith("layer") else gradient[name]
-               for name in ("embed", "time", "head", "layer_a", "layer_b")}
+    # Dew's own step in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, ((_, aux_terms), gradient_terms) = float64_terms(jax.value_and_grad(loss, has_aux=True),
+                                                            widened(params))
+
+    def student(gradient):
+        return {name: gradient[name]["kernel"] if name.startswith("layer") else gradient[name]
+                for name in ("embed", "time", "head", "layer_a", "layer_b")}
+
+    def vector(tree):
+        return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
+
     # Each tree is held whole, its leaves in one vector: a few entries' root
     # mean square is no estimate of rounding, and the two biases a batch norm
     # follows have a gradient of exactly zero, rounding alone in both runs.
-    for label, tree, prefix in (("student", student, "grad/student"),
-                                ("head 0", gradient[DISCRIMINATOR]["head_0"], "grad/heads/head_0"),
-                                ("head 1", gradient[DISCRIMINATOR]["head_1"], "grad/heads/head_1"),
-                                ("spectral u", aux.variables[SPECTRAL], "spectral")):
-        leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
-        keys = ["/".join([prefix, *(entry.key for entry in path)]) for path, _ in leaves]
+    for label, tree, summed, prefix in (
+            ("student", student(gradient), student(gradient_terms), "grad/student"),
+            *((f"head {index}", gradient[DISCRIMINATOR][f"head_{index}"],
+               gradient_terms[DISCRIMINATOR][f"head_{index}"], f"grad/heads/head_{index}")
+              for index in (0, 1)),
+            ("spectral u", aux.variables[SPECTRAL], aux_terms.variables[SPECTRAL], "spectral")):
+        keys = ["/".join([prefix, *(entry.key for entry in path)])
+                for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]]
         assert_as_exact_as_the_reference(
-            np.concatenate([np.ravel(leaf) for _, leaf in leaves]),
-            np.concatenate([np.ravel(STEP[key]) for key in keys]),
-            np.concatenate([np.ravel(STEP[f"{key}_f64"]) for key in keys]), label)
+            vector(tree), np.concatenate([np.ravel(STEP[key]) for key in keys]),
+            np.concatenate([np.ravel(STEP[f"{key}_f64"]) for key in keys]), label, terms=vector(summed))
 
 
 @pytest.fixture(scope="module")
