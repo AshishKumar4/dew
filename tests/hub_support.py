@@ -90,7 +90,8 @@ def hub_split(monkeypatch, directory: Path, repo: str, splits: Mapping[str, obje
     for split, rows in splits.items():
         assert isinstance(rows, datasets.Dataset)
         rows.to_parquet(directory / f"{split}.parquet")
-        files[split] = DataFilesList([f"hf://datasets/{repo}@{commit}/{split}.parquet"], origin_metadata=[None])
+        located = [f"hf://datasets/{repo}@{commit}/{split}.parquet"]
+        files[split] = DataFilesList(located, origin_metadata=[None])
     built = Parquet(cache_dir=str(directory / "cache"), dataset_name=repo.split("/")[-1], repo_id=repo,
                     hash=commit, data_files=DataFilesDict(files))
 
