@@ -427,7 +427,8 @@ header.header {
 
 /* Figures drawn by dew.figures, in a tutorial's text (.nb-figure) or in its outputs. Each keys
    its own light and dark colors to data-theme, so only its size is set here: it scales with the
-   column, and a narrow screen scrolls it sideways at its drawn size, as the docs figures do. */
+   column, and on a narrow screen it shrinks to no less than 70% of its drawn width (its
+   --fig-width), so its text stays readable, and scrolls sideways past that. */
 
 .sl-markdown-content svg.dew-figure {
 	display: block;
@@ -442,7 +443,7 @@ header.header {
 
 @media (max-width: 50rem) {
 	.sl-markdown-content svg.dew-figure {
-		max-width: none;
+		min-width: calc(var(--fig-width) * 0.7);
 	}
 }
 
