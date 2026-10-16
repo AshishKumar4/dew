@@ -434,27 +434,27 @@ class Asked(pygrain.IterDataset):
     def __init__(self, parent: pygrain.IterDataset, tag: int, gave: collections.Counter,
                  asked: collections.Counter):
         super().__init__(parent)
-        self.tag, self.gave, self.asked = tag, gave, asked
+        self.documents, self.tag, self.gave, self.asked = parent, tag, gave, asked
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _Asked(iter(self._parent), self)
+        return _Asked(self.documents.__iter__(), self)
 
 
 class _Asked(pygrain.DatasetIterator):
     def __init__(self, parent: pygrain.DatasetIterator, corpus: Asked):
         super().__init__(parent)
-        self.corpus = corpus
+        self.documents, self.corpus = parent, corpus
 
     def __next__(self):
         self.corpus.gave[self.corpus.tag] += 1
-        return next(self._parent)
+        return next(self.documents)
 
     def get_state(self):
         self.corpus.asked[self.corpus.tag] += 1
-        return self._parent.get_state()
+        return self.documents.get_state()
 
     def set_state(self, state):
-        self._parent.set_state(state)
+        self.documents.set_state(state)
 
 
 def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_reads():
@@ -466,9 +466,13 @@ def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_rea
     gave, asked = collections.Counter(), collections.Counter()
 
     def corpus(tag: int) -> Pipeline:
+        def counted(dataset: pygrain.MapDataset | pygrain.IterDataset) -> Asked:
+            assert isinstance(dataset, pygrain.IterDataset)
+            return Asked(dataset, tag, gave, asked)
+
         documents = Memory([{"text": np.full(3, tag * 100 + index, np.int32)} for index in range(40)])
         return Pipeline(documents).read("streamed").shuffle(tag, window=8).repeat().grain(
-            lambda dataset: Asked(dataset, tag, gave, asked), identity=f"asked-{tag}")
+            counted, identity=f"asked-{tag}")
 
     run = compile(mix([corpus(tag) for tag in range(1, 7)], weights=[1] * 6).pack(8, bins=2).batch(2),
                   read="streamed", loading=READ)
