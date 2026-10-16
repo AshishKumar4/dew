@@ -660,11 +660,11 @@ def test_the_gate_skips_the_hero_script_while_its_bytes_are_the_recorded_ones(tm
     so the gate leaves it alone while they are the recorded ones and reads it once they are not, as
     an edit the hero is then recorded again for."""
     lint = load("lint_slop")
-    hero = "site/src/data/hero.py"
+    hero, capture = "site/src/data/hero.py", "site/src/data/capture.json"
+    assert {hero: capture} == lint.RECORDED
     recorded = (REPO_ROOT / hero).read_bytes()
-    capture = json.loads((REPO_ROOT / "site/src/data/capture.json").read_text())
-    assert {hero: capture["meta"]["script_sha256"]} == lint.RECORDED
     (tmp_path / hero).parent.mkdir(parents=True)
+    (tmp_path / capture).write_bytes((REPO_ROOT / capture).read_bytes())
     (tmp_path / hero).write_bytes(recorded)
     assert [module.relative for module in lint.collect(["site"], tmp_path, "dew")] == []
     (tmp_path / hero).write_bytes(recorded + b"\n")
