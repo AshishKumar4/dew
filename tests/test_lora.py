@@ -637,8 +637,8 @@ def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_pat
     assert again.bases == bases
     # This file's components differ in rank, which no run records; a run's adapter of one rank keeps
     # its components' bases through JSON.
-    record = AdapterRecord(rank=2, alpha=4.0, rslora=False, dropout=0.0, modules=("unet/conv_in",), layouts={},
-                           bases=again.bases)
+    record = AdapterRecord(rank=2, alpha=4.0, rslora=False, dropout=0.0, modules=("unet/conv_in",),
+                           layouts={}, bases=again.bases)
     assert from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord)))).bases == bases
 
 
