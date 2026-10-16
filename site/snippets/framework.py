@@ -336,16 +336,19 @@ def offline(out):
     served = {"Qwen/Qwen3-0.6B": [decoder, words / "tokenizer.json", words / "tokenizer_config.json"],
               "convaiinnovations/laya": [ROOT / "tests/fixtures/laya/tiny"]}
     served["HuggingFaceTB/SmolLM2-135M-Instruct"] = served["Qwen/Qwen3-0.6B"]
-    commit = "0" * 40
+    # A snapshot named by a ref, not a commit's hash: offline, huggingface_hub resolves a ref from the
+    # cache alone, where a hash would send it for the commit's file listing, which only a download keeps.
+    snapshot = "fixture"
     for repo, sources in served.items():
         cached = hub / f"models--{repo.replace('/', '--')}"
         for source in sources:
             if source.is_dir():
-                shutil.copytree(source, cached / "snapshots" / commit, dirs_exist_ok=True)
+                shutil.copytree(source, cached / "snapshots" / snapshot, dirs_exist_ok=True)
             else:
-                shutil.copy(source, cached / "snapshots" / commit / source.name)
+                shutil.copy(source, cached / "snapshots" / snapshot / source.name)
         (cached / "refs").mkdir()
-        (cached / "refs" / "main").write_text(commit)
+        for ref in ("main", snapshot):
+            (cached / "refs" / ref).write_text(snapshot)
 
     from types import SimpleNamespace
 
