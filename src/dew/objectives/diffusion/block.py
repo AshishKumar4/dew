@@ -152,7 +152,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """
 
     saved_task = BlockGeneration
-    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process'})
+    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process', 'pad_token_id'})
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
