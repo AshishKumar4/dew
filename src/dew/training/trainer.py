@@ -145,7 +145,6 @@ from dew.training.model_flops import (
     _TokenCount,
     model_batch,
     prepare_counts,
-    step_counts,
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
@@ -156,7 +155,7 @@ from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
-from dew.training.transaction import Committed, Transaction, compact_qk, with_ema
+from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
 
 _log = logging.getLogger(__name__)
 
@@ -1261,9 +1260,7 @@ class Trainer(Generic[Loss, Effects]):
             micro = microbatch(batch, part, split)
             advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
                                                   part)
-            return (dataclasses.replace(advanced, step=current.step + (part == split - 1)), loss,
-                    {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                    advanced.microstep > current.microstep, committed)
+            return outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
 
         return jax.jit(step, in_shardings=(shardings, placement, replicated),
                        out_shardings=(shardings, replicated, replicated, replicated, replicated, replicated),
@@ -1349,13 +1346,10 @@ class Trainer(Generic[Loss, Effects]):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0)
-                advanced = dataclasses.replace(advanced, step=current.step + 1)
+                advanced, *stepped = outcome(current, *body(current, model_batch(batch), 0), batch, 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
-                advanced = transfer(advanced, placement)
-                return (advanced, loss, {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                        advanced.microstep > current.microstep, committed)
+                return transfer(advanced, placement), *stepped
         return run
 
     # ------------------------------------------------------------------

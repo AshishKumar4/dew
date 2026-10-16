@@ -25,8 +25,9 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
+from dew.training.model_flops import step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation
+from dew.training.state import Accumulation, TrainState
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -62,6 +63,17 @@ def _only_when(due, taken, kept, operand):
     barrier, an op it counts as expensive, keeps the branch a branch.
     """
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
+
+
+def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array,
+            batch: Batch, stepped: jax.typing.ArrayLike) -> tuple:
+    """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
+    `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
+    with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
+    committed."""
+    return (dataclasses.replace(advanced, step=current.step + stepped), loss,
+            {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss), advanced.microstep > current.microstep,
+            committed)
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
