@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import itertools
 import json
 import os
 import re
@@ -299,10 +300,13 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
     assert overlapping(first) == 1
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
-    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once.
-    for name in names:
-        stored[ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class())[len(url):]] = json.dumps(
-            {"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30}).encode()
+    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
+    # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
+    common = ci.shared("3.12")
+    for name, inputs in itertools.product(names, (None, common)):
+        at = ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]
+        stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
+                                 "peak": 4 * 2 ** 30}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
@@ -394,8 +398,9 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
-    after, though the red run died before it wrote a report. Each task runs as armada starts it:
-    .armada.json's command filled from its plan entry."""
+    after, though the red run died before it wrote a report. A commit's retry reuses its green rows,
+    and none after a red run on its inputs, though a run of another commit recorded the file since.
+    Each task runs as armada starts it: .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
@@ -412,7 +417,8 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     def cache_request(url, token, data=None):
         if data is not None:
             worker[url] = data
-        return worker.get(url) if data is None else None
+            return b""
+        return worker.get(url)
 
     monkeypatch.setattr(ci, "cache_request", cache_request)
     monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
@@ -453,6 +459,21 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 7
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
+    # Another commit's run between a commit's run and its retry: a fixture's change is every file's input.
+    fixture = tmp_path / "tests/fixture.json"
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 9
+    fixture.write_text('{"changed": true}')
+    assert run("GenuineIntel-6-143") == 10
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 10
+    monkeypatch.setenv("FAIL", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 11
+    monkeypatch.delenv("FAIL")
+    fixture.write_text('{"changed": true}')
+    assert run("GenuineIntel-6-143") == 11
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 12
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
