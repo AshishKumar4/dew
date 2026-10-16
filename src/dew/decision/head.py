@@ -12,7 +12,7 @@ given it as `[V, D]` rows.
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -166,6 +166,18 @@ class DecisionHead(Head):
 _TYPE_ROWS = tuple({Noul: 0, Choice: 1, Score: 2}[kind] for kind in KINDS)
 
 
+class _Reading(NamedTuple):
+    """Which of the window's tokens each attention query of the joint head reads: those of its own
+    row, by documents (`dew.nn.documents.CrossDocuments`). `tokens` `[B, L]` are the window's
+    rows, `questions` `[B, Q]` each question's and `slots` `[B, P]` each option slot's, 0 for
+    padding, each in window order with its padding after, as packed sequences need them."""
+
+    tokens: jax.Array
+    questions: jax.Array
+    slots: jax.Array
+    max_segments: int
+
+
 class _RoutingLayer(nn.Module):
     """An evidence routing layer: each option attends to the row's memory, then a feed-forward."""
 
@@ -177,13 +189,14 @@ class _RoutingLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, queries: jax.Array, memory: jax.Array, read: jax.Array) -> jax.Array:
+    def __call__(self, queries: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
         attention = NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                     dtype=self.dtype, precision=self.precision,
                                     attention_impl=self.attention_impl, name="attention")
         memory = _layer_norm(self.dtype, "memory_norm")(memory)
         normed = _layer_norm(self.dtype, "query_norm")(queries)
-        queries = queries + attention(normed, memory, mask=read)
+        queries = queries + attention(normed, memory, segment_ids=read.slots, key_segment_ids=read.tokens,
+                                      max_segments=read.max_segments)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="feedforward")
         return queries + mlp(_layer_norm(self.dtype, "feedforward_norm")(queries))
@@ -201,17 +214,19 @@ class _FieldLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, fields: jax.Array, memory: jax.Array, asked: jax.Array,
-                 read: jax.Array) -> jax.Array:
+    def __call__(self, fields: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
         def attention(name: str) -> NormalAttention:
             return NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                    dtype=self.dtype, precision=self.precision,
                                    attention_impl=self.attention_impl, name=name)
 
         normed = _layer_norm(self.dtype, "norm1")(fields)
-        fields = fields + attention("self_attn")(normed, mask=asked)
+        fields = fields + attention("self_attn")(normed, segment_ids=read.questions,
+                                                 max_segments=read.max_segments)
         normed = _layer_norm(self.dtype, "norm2")(fields)
-        fields = fields + attention("multihead_attn")(normed, memory, mask=read)
+        fields = fields + attention("multihead_attn")(
+            normed, memory, segment_ids=read.questions, key_segment_ids=read.tokens,
+            max_segments=read.max_segments)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="mlp")
         return fields + mlp(_layer_norm(self.dtype, "norm3")(fields))
@@ -380,10 +395,11 @@ class JointSchemaHead(Head):
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
                    + _per_slot(self.option_question_projection(questions), owners, inputs))
-        # A slot reads its own row's tokens and questions, and a padding slot every one of them, so
-        # each query has a key. The masks are [B, 1, queries, keys], one for every head.
-        read = _gathered(own, owners)[:, None]
-        asked = ((rows[:, :, None] == rows[:, None, :]) | (rows[:, :, None] == 0))[:, None]
+        # A slot reads its own row's tokens and questions, by the rows' documents; a padding slot
+        # or question reads nothing, and its attention comes back zero.
+        slot_rows = _per_slot(rows, owners, inputs)
+        read = _Reading(inputs.segments, rows, slot_rows if inputs.slotted is None
+                        else jnp.where(inputs.slotted, slot_rows, 0), inputs.max_segments)
         routed = queries
         for layer in self.evidence_layers:
             routed = layer(routed, memory, read)
@@ -397,7 +413,7 @@ class JointSchemaHead(Head):
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
                   + self.type_embedding(types))
         for layer in self.field_layers:
-            fields = layer(fields, memory, asked, own[:, None])
+            fields = layer(fields, memory, read)
         fields = self.field_norm(fields)
 
         anchor = _per_slot(l2_normalized(questions + last_state, 1e-12), owners, inputs)

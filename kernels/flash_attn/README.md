@@ -58,6 +58,16 @@ from dew_flash_attn import flash_mha_varlen
 out = flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen, is_causal=True)
 ```
 
+Keys packed by offsets of their own, `key_cu_seqlens` `[N + 1]` over the keys' `[T_k, H_k, D]`
+with at most `key_max_seqlen` a sequence, pair sequence i's queries with sequence i's keys alone:
+cross-attention between packed documents, such as a head's slots reading their own document's
+tokens.
+
+```python
+out = flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen,
+                       key_cu_seqlens=key_cu_seqlens, key_max_seqlen=key_max_seqlen)
+```
+
 The packed backward launches its CTAs over the batch's blocks, not over `N` times
 `max_seqlen`'s: `patches/` changes both ports' backward kernels so that a sequence's blocks start
 at `cu_seqlens[i] / block + i` and a CTA finds its sequence by a binary search, so a batch of many
