@@ -10,7 +10,9 @@ give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
 (src/dew/training/trainer.py) and in its compiled step
-(src/dew/training/transaction.py).
+(src/dew/training/transaction.py). The RLVR figures score their answers
+with the counting task of tutorials/10-rl-with-verifiable-rewards.ipynb, and
+take their advantages and clipped objective from dew.rl.
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
         python docs/assets/figures.py [NAME_PREFIX ...]
@@ -32,6 +34,7 @@ from PIL import Image
 from dew.diffusion.presets import Cosine, Flow
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
+from dew.rl import clipped_surrogate_terms, group_advantage
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
@@ -322,9 +325,184 @@ def post_training_figure():
         svg.save(HERE / f"post-training-{variant}.svg")
 
 
+# The counting task of tutorials/10: after the prompt's last digit, each written digit should be
+# one more than the digit before it, 9 wrapping to 0.
+PROMPT = "7294"
+ANSWERS = ["567890", "561290", "314159", "567823"]
+
+
+def right_digits(previous: int, digits: str) -> list[bool]:
+    marks = []
+    for digit in map(int, digits):
+        marks.append(digit == (previous + 1) % 10)
+        previous = digit
+    return marks
+
+
+def digit_boxes(svg: Figure, x, y, digits, fills, size=26):
+    for j, (digit, fill) in enumerate(zip(digits, fills)):
+        svg.rect(x + j * (size + 4), y, size, size + 4, fill=fill, stroke="rule" if fill == "surface" else "none",
+                 rx=4)
+        svg.text(x + j * (size + 4) + size / 2, y + size / 2 + 7, digit, size=15, mono=True, anchor="middle")
+
+
+def rlvr_loop_figure():
+    """The loop: the policy writes several answers, the checker scores them, and the update makes the
+    answers that beat their group more likely."""
+    marks = [right_digits(int(PROMPT[-1]), answer) for answer in ANSWERS]
+    rewards = np.array([np.mean(m) for m in marks], np.float32)
+    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))
+    after = np.exp(0.6 * advantages) / np.exp(0.6 * advantages).sum()
+    svg = Figure(720, 316, seconds=11, label="The policy writes four answers to a prompt, a checker scores "
+                 "each one, and the update makes the answers that scored above the group's mean more likely.")
+    svg.rect(0.5, 0.5, 719, 315, fill="surface", rx=10)
+    svg.text(24, 128, "prompt", size=13, color="muted")
+    digit_boxes(svg, 24, 138, PROMPT, ["surface"] * 4, size=22)
+    svg.arrow(128, 155, 150, 155)
+    svg.rect(154, 86, 124, 140, fill="raised", stroke="accent", rx=8)
+    svg.text(216, 110, "policy", size=15, weight=600, anchor="middle")
+    svg.text(216, 130, "P(answer)", size=12, color="muted", anchor="middle")
+    for k, letter in enumerate("abcd"):
+        x = 172 + k * 24
+        svg.rect(x, 146, 16, 50, fill="rule", stroke="none", rx=2)
+        bar = svg.rect(x, 146, 16, 50, fill="accent", stroke="none", rx=2)
+        svg.animate(bar, {6.4: {"transform": "scaleY(0.25)"}, 7.6: {"transform": f"scaleY({after[k]:.3f})"}},
+                    origin="50% 100%")
+        svg.text(x + 8, 214, letter, size=12, mono=True, color="muted", anchor="middle")
+    svg.text(370, 30, "answers", size=13, color="muted")
+    svg.text(678, 30, "reward", size=13, color="muted", anchor="end")
+    with svg.group() as checker:
+        svg.rect(570, 44, 62, 224, fill="raised", stroke="text", rx=8)
+        svg.text(601, 160, "checker", size=12, color="text", anchor="middle")
+    svg.appear(checker, 2.9)
+    for i, (answer, right) in enumerate(zip(ANSWERS, marks)):
+        y = 44 + i * 58
+        with svg.group() as row:
+            svg.arrow(280, 156, 342, y + 15)
+            svg.text(362, y + 21, "abcd"[i], size=13, mono=True, color="muted", anchor="end")
+            digit_boxes(svg, 370, y, answer, ["surface"] * 6)
+        svg.appear(row, 0.8 + 0.45 * i)
+        with svg.group() as scored:
+            digit_boxes(svg, 370, y, answer, ["accent_fill" if r else "warm_fill" for r in right])
+            svg.arrow(632, y + 15, 640, y + 15)
+            svg.text(678, y + 21, f"{rewards[i]:.2f}", size=15, mono=True, weight=600, anchor="end",
+                     color="accent" if rewards[i] > rewards.mean() else "warm")
+        svg.appear(scored, 3.4 + 0.35 * i)
+    back = svg.polyline([(660, 274), (660, 298), (216, 298), (216, 232)], color="accent", width=1.5)
+    svg.draw(back, 5.2, 6.2)
+    head = svg.add("path", {"d": "M216,229 L212.5,236 L219.5,236 z"}, {"fill": svg.palette["accent"]})
+    svg.appear(head, 6.1, 0.2)
+    svg.appear(svg.text(438, 290, "update: answers that beat the group's mean get more likely", size=13,
+                        color="accent", anchor="middle"), 5.8)
+    svg.save(HERE / "rlvr-loop.svg")
+
+
+def rlvr_advantage_figure():
+    """GRPO's advantage: each reward against its group's mean, in units of the group's deviation."""
+    rewards = np.array([1.0, 0.67, 0.0, 0.83, 0.17, 0.5, 0.0, 0.33], np.float32)
+    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(rewards)))
+    mean, deviation = float(rewards.mean()), float(rewards.std(ddof=1))
+    svg = Figure(720, 300, seconds=11, label="Eight rewards, their group mean, and the advantages: each reward "
+                 "minus the mean, divided by the group's standard deviation.")
+    svg.rect(0.5, 0.5, 719, 299, fill="surface", rx=10)
+    floor, tall, slot = 236, 150, 38
+    svg.text(28, 32, "reward R of 8 answers to one prompt", size=13, color="muted")
+    svg.line(28, floor, 340, floor, color="rule")
+    level = floor - tall * mean
+    for i, reward in enumerate(rewards):
+        x = 36 + i * slot
+        up = reward > mean
+        # The bar grows in a neutral color, then takes the color of its side of the mean.
+        for fill, at in (("tint1", 0.0), ("accent" if up else "warm", 3.6 + 0.1 * i)):
+            with svg.group() as colored:
+                bar = svg.rect(x, floor - tall, 26, tall, fill=fill, stroke="none", rx=3)
+                svg.animate(bar, {0.3 + 0.15 * i: {"transform": "scaleY(0)"},
+                                  0.9 + 0.15 * i: {"transform": f"scaleY({reward:.3f})"}}, origin="50% 100%")
+            if at:
+                svg.appear(colored, at)
+        svg.text(x + 13, floor + 18, f"{reward:.2f}", size=12, mono=True, color="muted", anchor="middle")
+        gap = svg.line(x + 13, floor - tall * reward, x + 13, level, color="accent" if up else "warm", width=2,
+                       dash="2 3")
+        svg.appear(gap, 3.6 + 0.1 * i)
+    with svg.group() as average:
+        svg.line(28, level, 344, level, color="text", width=1.5, dash="5 4")
+        svg.text(344, level - 8, f"mean {mean:.2f}", size=13, mono=True, anchor="end")
+    svg.animate(average, {2.4: {"opacity": 0, "transform": "translateX(-24px)"},
+                          3.0: {"opacity": 1, "transform": "translateX(0px)"}})
+    zero, unit = 146, 44
+    svg.text(392, 32, f"advantage A = (R − {mean:.2f}) / {deviation:.2f}", size=13, color="muted")
+    svg.line(388, zero, 700, zero, color="rule")
+    for i, advantage in enumerate(advantages):
+        x = 396 + i * slot
+        up = advantage > 0
+        bar = svg.rect(x, zero - unit * advantage if up else zero, 26, unit * abs(advantage),
+                       fill="accent" if up else "warm", stroke="none", rx=3)
+        svg.animate(bar, {4.8 + 0.1 * i: {"transform": "scaleY(0)"}, 5.6 + 0.1 * i: {"transform": "scaleY(1)"}},
+                    origin="50% 100%" if up else "50% 0%")
+        y = zero - unit * advantage - 8 if up else zero + unit * abs(advantage) + 18
+        svg.appear(svg.text(x + 13, y, f"{advantage:+.1f}", size=12, mono=True, anchor="middle",
+                            color="accent" if up else "warm"), 6.2)
+    svg.appear(svg.text(544, 280, "above the mean is pushed up, below is pushed down", size=13, color="muted",
+                        anchor="middle"), 6.6)
+    svg.save(HERE / "rlvr-advantage.svg")
+
+
+def rlvr_clip_figure():
+    """PPO's clipped objective against the ratio, from dew.rl's terms, with its flat stretches shaded."""
+    ratios = np.linspace(0.02, 3.5, 351)
+    svg = Figure(720, 290, seconds=9, label="The clipped objective against the ratio for a positive and a "
+                 "negative advantage. Where it is flat the token gets no gradient.")
+    svg.rect(0.5, 0.5, 719, 289, fill="surface", rx=10)
+    for panel, advantage in enumerate((1.0, -1.0)):
+        left, top, wide, high = 52 + panel * 352, 58, 300, 170
+
+        def objective(log_ratio, advantage=advantage):
+            terms, _ = clipped_surrogate_terms(log_ratio[None, :], jnp.asarray([advantage]),
+                                               jnp.ones((1, log_ratio.size)))
+            return -terms[0]
+
+        log_ratio = jnp.log(jnp.asarray(ratios, jnp.float32))
+        values = np.asarray(objective(log_ratio))
+        slopes = np.asarray(jax.vmap(jax.grad(lambda r, objective=objective: objective(r[None])[0]))(log_ratio))
+        low, high_value = (0.0, 1.5) if advantage > 0 else (-3.5, 0.0)
+
+        def at(r, v, left=left, top=top, low=low, high_value=high_value):
+            return left + wide * r / 3.5, top + high - high * (v - low) / (high_value - low)
+
+        flat = slopes == 0
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], flat.astype(int), [0]])))
+        for start, stop in zip(edges[::2], edges[1::2]):
+            x0, _ = at(ratios[start], low)
+            x1, _ = at(ratios[stop - 1], low)
+            with svg.group() as shade:
+                svg.rect(x0, top, x1 - x0, high, fill="warm_fill", stroke="none", rx=0)
+                name = "dual clip" if ratios[start] > 2 else "clipped"
+                svg.text(min((x0 + x1) / 2, left + wide - 26), top - 7, name, size=12, color="warm",
+                         anchor="middle")
+            svg.appear(shade, 3.6)
+        svg.line(left, top + high, left + wide, top + high, color="rule")
+        svg.line(left, top, left, top + high, color="rule")
+        for tick in (0, 1, 2, 3):
+            x, _ = at(tick, low)
+            svg.text(x, top + high + 18, str(tick), size=12, mono=True, color="muted", anchor="middle")
+        x1, _ = at(1.0, low)
+        svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
+        title = "A > 0: raise π(y), up to ρ = 1 + ε" if advantage > 0 else "A < 0: lower π(y), down to ρ = 1 − ε"
+        svg.text(left, 30, title, size=13, weight=600)
+        svg.text(left + wide, top + high + 38, "ratio ρ = π / π_old", size=12, color="muted", anchor="end")
+        name = svg.text(left - 12, top + high / 2, "objective", size=12, color="muted", anchor="middle")
+        name.attributes["transform"] = f"rotate(-90 {left - 12} {top + high / 2})"
+        line = svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5)
+        svg.draw(line, 0.4, 3.2)
+    svg.appear(svg.text(360, 280, "shaded: the objective is flat, so the token gets no gradient", size=12,
+                        color="warm", anchor="middle"), 4.0)
+    svg.save(HERE / "rlvr-clip.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
-           "post-training": post_training_figure}
+           "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
+           "rlvr-advantage": rlvr_advantage_figure, "rlvr-clip": rlvr_clip_figure}
 
 
 if __name__ == "__main__":
