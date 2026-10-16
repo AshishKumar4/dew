@@ -123,7 +123,9 @@ def write_released(modeling, full: bool) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--full', action='store_true', help="also run the released model for probe.npz")
-    assert transformers.__version__ == '4.56.2', f"transformers {transformers.__version__} is on the path"
+    from reference_releases import require
+
+    require("ouro")
     modeling = remote()
     write_tiny(modeling)
     write_released(modeling, parser.parse_args().full)
