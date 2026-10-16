@@ -358,7 +358,7 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         last = float(ys[-window:].mean())
         if legend:
             x, y = legend[index]
-            figure.line(x, y - 5, x + 18, y - 5, color=color, width=2.5)
+            figure.line(x, y - 5, x + 18, y - 5, color=color, width=2.5, dash=dash)
             figure.text(x + 24, y, f"{name} {last:.2f}", size=TEXT, color=color)
         else:
             x, y = at(steps - 1, last)
