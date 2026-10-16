@@ -237,8 +237,10 @@ class Figure:
         keyframes = "".join(f"@keyframes {names[id(shape)]}{{{shape.keyframes}}}" for shape in animated)
         body = "".join(_markup(shape, names, self.seconds) for shape in self.shapes)
         label = f'<title>{_escape(self.label)}</title>' if self.label else ""
+        # --fig-width lets a page keep the figure's text readable on a narrow screen.
         return (f'<svg xmlns="http://www.w3.org/2000/svg" class="dew-figure" viewBox="0 0 {_number(self.width)} '
-                f'{_number(self.height)}" width="{_number(self.width)}" height="{_number(self.height)}" role="img"'
+                f'{_number(self.height)}" width="{_number(self.width)}" height="{_number(self.height)}" '
+                f'style="--fig-width:{_number(self.width)}px" role="img"'
                 f'{f" aria-label={chr(34)}{_escape(self.label)}{chr(34)}" if self.label else ""}>'
                 f'{label}<style>{STYLE}{keyframes}</style>{body}</svg>')
 
