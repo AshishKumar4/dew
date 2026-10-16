@@ -606,7 +606,7 @@ def test_every_process_of_a_pool_takes_the_same_link_bandwidth(tmp_path):
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp_path, monkeypatch):
+def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp_path):
     """Two tensor meshes of one shape over the same four devices, grouped otherwise along the axis,
     are other links: the second measures its own figure beside the compilation cache rather than
     take the first's, and a mesh built again over the first placement takes the first's. A
@@ -621,18 +621,23 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
     from dew.training import Trainer
     from dew.training.distributed import link_bandwidth, link_topology
 
-    monkeypatch.setattr(jax.config, "jax_compilation_cache_dir", str(tmp_path / "cache"))
     devices = np.asarray(jax.devices()[:4])
     paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))
     crossed = Mesh(devices.reshape(2, 2).T, ("data", "tensor"))
     assert link_topology(paired, "tensor") != link_topology(crossed, "tensor")
     assert link_topology(paired, "tensor") == link_topology(Mesh(devices.reshape(2, 2), ("data", "tensor")),
                                                             "tensor")
-    first = link_bandwidth(paired, "tensor", size=1 << 16)
-    link_bandwidth(crossed, "tensor", size=1 << 16)
-    assert len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
-    assert link_bandwidth(Mesh(devices.reshape(2, 2), ("data", "tensor")), "tensor", size=1 << 16) == first
-    assert len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+    # The figures go beside this test's own compilation cache.
+    kept = jax.config.jax_compilation_cache_dir
+    jax.config.update("jax_compilation_cache_dir", str(tmp_path / "cache"))
+    try:
+        first = link_bandwidth(paired, "tensor", size=1 << 16)
+        link_bandwidth(crossed, "tensor", size=1 << 16)
+        assert len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+        again = link_bandwidth(Mesh(devices.reshape(2, 2), ("data", "tensor")), "tensor", size=1 << 16)
+        assert again == first and len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+    finally:
+        jax.config.update("jax_compilation_cache_dir", kept)
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
