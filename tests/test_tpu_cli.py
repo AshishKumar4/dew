@@ -171,7 +171,7 @@ def fake(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("DEW_FAKE_CALLS", str(tmp_path / "calls.jsonl"))
     monkeypatch.setenv("DEW_FAKE_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(tpu_cli, "POLL_SECONDS", 0)
+    monkeypatch.setenv("DEW_TPU_POLL_SECONDS", "0")
     tpu_config.save(CONFIG)
     return Fake(tmp_path)
 
