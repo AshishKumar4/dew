@@ -379,22 +379,29 @@ def save_sharded(
     GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
-    Each shard takes its library's own name, `<stem>-00001-of-00003.safetensors`,
-    the only one Diffusers' Hub download keeps (`variant_compatible_siblings`,
-    pipeline_loading_utils.py:239-289, 0.34.0), so an export written to a
-    fresh directory, as `push_to_hub` stages one, publishes as its libraries
-    name theirs. An export replaces the one `directory` held without a moment
-    at which a loader reads a mix of the two. Where an earlier export holds
-    those names, this one's carry a token instead, so no file an old index
-    names is overwritten; the index (or, unsharded, `<stem>.safetensors`) is
-    published last, in one rename, and commits the export. Only then are the earlier weight files removed: the
-    names `_replaced` matches that this export did not write, read off the
-    directory's own listing. An old index's contents name nothing to
-    delete, so one that names a path outside the directory, or a file of
-    another name, removes nothing. transformers reads a local `model.safetensors`
-    before an index (modeling_utils.py:594-605, 5.16.1), so a crash while an
-    export changes between one file and shards can leave Dew and transformers
-    each reading a whole export, but not the same one. Any other file, a precision variant such as
+    Every export ends with each shard under its library's own name,
+    `<stem>-00001-of-00003.safetensors`, the only one Diffusers' Hub download
+    keeps (`variant_compatible_siblings`, pipeline_loading_utils.py:239-289,
+    0.34.0), so a directory, saved once or over again, publishes as its
+    libraries name theirs.
+
+    An export replaces the one `directory` held without a moment at which a
+    loader reads a mix of the two. Where an earlier export holds those
+    names, this one's are first written under a token, so no file an old
+    index names is overwritten; the index (or, unsharded,
+    `<stem>.safetensors`) is published last, in one rename, and commits the
+    export. Only then are the earlier weight files removed: the names
+    `_replaced` matches that this export did not write, read off the
+    directory's own listing. The token's shards are then linked under their
+    own names, now free, an index naming those is published, and the token
+    names go, so every published index names one whole export; the
+    directory's filesystem links files (a local disk, NFS). An old index's
+    contents name nothing to delete, so one that names a path outside the
+    directory, or a file of another name, removes nothing. transformers reads
+    a local `model.safetensors` before an index (modeling_utils.py:594-605,
+    5.16.1), so a crash while an export changes between one file and shards
+    can leave Dew and transformers each reading a whole export, but not the
+    same one. Any other file, a precision variant such as
     `model.fp16.safetensors` among them, is left as it is.
     """
     from huggingface_hub import split_state_dict_into_shards_factory
@@ -423,6 +430,12 @@ def save_sharded(
         old_index.unlink(missing_ok=True)
     for name in replaced - set(names.values()):
         (folder / name).unlink(missing_ok=True)
+    if taken:
+        for filename, held in names.items():
+            os.link(folder / held, folder / filename)
+        write_index(folder, dict(split.tensor_to_filename), split.metadata["total_size"], stem)
+        for held in names.values():
+            (folder / held).unlink()
 
 
 def write_file(

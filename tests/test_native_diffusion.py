@@ -163,19 +163,23 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
-    source.save(destination, max_shard_size=20_000)
-    # What Diffusers downloads of the export, published as `push_to_hub` stages it.
-    downloaded, _ = variant_compatible_siblings(
-        [path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()])
-    for component, stem in (("unet", "diffusion_pytorch_model"), ("vae", "diffusion_pytorch_model"),
-                            ("text_encoder", "model")):
-        index = json.loads((destination / component / f"{stem}.safetensors.index.json").read_text())
-        shards = {f"{component}/{name}" for name in index["weight_map"].values()}
-        assert len(shards) > 1 and shards <= set(downloaded)
-        assert not (destination / component / f"{stem}.safetensors").exists()
-    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
-    for layout in reloaded.weight_layouts:
-        np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))
+    # Saved over again, the directory replaces its shards of the same names.
+    for _ in range(2):
+        source.save(destination, max_shard_size=20_000)
+        files = [path.relative_to(destination).as_posix() for path in destination.rglob("*")
+                 if path.is_file()]
+        # What Diffusers downloads of the directory, published as it is.
+        downloaded, _ = variant_compatible_siblings(files)
+        for component, stem in (("unet", "diffusion_pytorch_model"), ("vae", "diffusion_pytorch_model"),
+                                ("text_encoder", "model")):
+            index = json.loads((destination / component / f"{stem}.safetensors.index.json").read_text())
+            shards = {f"{component}/{name}" for name in index["weight_map"].values()}
+            assert len(shards) > 1 and shards <= set(downloaded)
+            assert {file for file in files if file.startswith(f"{component}/{stem}-")} == shards
+            assert not (destination / component / f"{stem}.safetensors").exists()
+        reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+        for layout in reloaded.weight_layouts:
+            np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))
 
 
 def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(saved_pipelines):
