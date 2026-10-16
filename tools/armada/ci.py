@@ -57,10 +57,11 @@ recorded and reused on the GPU's class as a CPU task's are on the CPU's.
 `coverage` measures src/dew's branch coverage over the suite, on demand and never
 per batch: `items` prints the plan's tasks for the oldest Python as armada map
 items, each running its files under coverage.py (pyproject.toml's
-[tool.coverage.run]) with the test cache off, since a reused row covers nothing,
-and writing its data among the task's artifacts; `report` combines the
-artifacts' data under DIR and writes DIR/coverage.json and DIR/coverage.md, a
-module a line, the least covered first:
+[tool.coverage.run], the Python processes its tests start included) with the
+test cache off, since a reused row covers nothing, and writing its data among
+the task's artifacts; a traced task records nothing in the cache either.
+`report` combines the artifacts' data under DIR and writes DIR/coverage.json and
+DIR/coverage.md, a module a line, the least covered first:
 
     armada map --artifacts=DIR --items=ITEMS -- bash -lc {item}
 """
@@ -474,8 +475,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
     # log holds every test that finished when a task is cut short.
-    measured = [] if coverage is None else ["-m", "coverage", "run", "--parallel-mode",
-                                            f"--data-file={coverage / '.coverage'}"]
+    # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
+    # its data where COVERAGE_FILE says.
+    measured = [] if coverage is None else ["-m", "coverage", "run"]
+    environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     command = [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", "-m", "not network",
                "-rfE", "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
                "-p", "executed", f"--junitxml={report}", *tests, *grouping]
@@ -540,7 +543,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}})
     out.write_text(json.dumps({"rows": rows + ran}))
-    record(python, ran, executed_report, common)
+    if coverage is None:
+        # A traced run's rows, timed under tracing, are no rows to reuse.
+        record(python, ran, executed_report, common)
     return 0
 
 
@@ -729,8 +734,14 @@ def coverage_items(target: float, timings: dict) -> list[str]:
 
 def coverage_report(directory: Path) -> int:
     """Combine the coverage data `coverage_items`' tasks left under `directory` and write its report:
-    coverage.py's own JSON, and a table a module a line, the least covered first."""
-    python = f".venv-{PYTHONS[0]}/bin/python"
+    coverage.py's own JSON, and a table a module a line, the least covered first. It runs where the
+    artifacts were downloaded, under this interpreter, which must have coverage.py."""
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        print(f"coverage.py is not importable from {sys.executable}; install the test extra", file=sys.stderr)
+        return 1
+    python = sys.executable
     data = directory / ".coverage"
     parts = sorted(str(path) for path in directory.glob("*/.coverage.*"))
     if not parts:
