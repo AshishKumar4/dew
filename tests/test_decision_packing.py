@@ -148,11 +148,23 @@ def at_offset(batch, window: int, row: int) -> dict:
     return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
 
 
-def apart(batch, laid=alone) -> dict:
+def in_place(batch, window: int, row: int) -> dict:
+    """`batch` with row `row` alone in window `window` where the window packed it (`at_offset`) and
+    every other window empty: the packed batch's shapes, so every product a row's tokens enter runs
+    at the packed run's shapes."""
+    one = {name: np.zeros_like(value) for name, value in batch.items()}
+    for name, value in at_offset(batch, window, row).items():
+        one[name][window, :value.shape[1]] = value[0]
+    if "option_slots" in batch:
+        one["option_slots"][window], one["slotted"][window] = compacted(one["options"][window],
+                                                                        batch["option_slots"].shape[1])
+    return one
+
+
+def apart(batch) -> dict:
     """Each row of the batch's windows in a window of its own, as the packer lays out a window that
     holds one row: the row, then segment-0 padding to the window's length, and its question slots
-    first; or, `laid` `at_offset`, the row where its window packed it. Every row's window has one
-    shape, so the rows alone run as one batch."""
+    first. Every row's window has one shape, so the rows alone run as one batch."""
     length, questions = batch["tokens"].shape[1], batch["kinds"].shape[1]
 
     def widened(name, value):
@@ -162,7 +174,7 @@ def apart(batch, laid=alone) -> dict:
 
     ones = []
     for window, row in rows_of(batch):
-        one = {name: widened(name, value) for name, value in laid(batch, window, row).items()
+        one = {name: widened(name, value) for name, value in alone(batch, window, row).items()
                if name not in ("option_slots", "slotted")}
         if "option_slots" in batch:
             slots, real = compacted(one["options"][0], batch["option_slots"].shape[1])
@@ -272,13 +284,18 @@ def asked(batch, logits) -> np.ndarray:
 
 
 def rows_alone(objective, variables, batch):
-    """The logits and gradients of `batch`'s rows each alone in a window of its own where its window
-    packed it (`apart`, `at_offset`), the logits at their questions' options: the packed run's own
-    arithmetic, the rule's chunks and attention's row length as the window's, so the two differ only
-    where another row enters."""
-    rows = apart(batch, at_offset)
-    logits, grads = decided(objective, variables, rows, objective.bounds.segments)
-    return np.asarray(logits)[rows["options"]], grads
+    """The logits and gradients of `batch`'s rows, each alone where its window packed it in a batch of
+    the packed batch's shapes (`in_place`), the logits at their questions' options and the gradients
+    summed over the rows: the packed run's own arithmetic, its products' shapes, the rule's chunks
+    and attention's row length the window's, so the two differ only where another row enters, and in
+    how the rows' gradients add."""
+    logits, grads = [], None
+    for window, row in rows_of(batch):
+        one = in_place(batch, window, row)
+        row_logits, row_grads = decided(objective, variables, one, objective.bounds.segments)
+        logits.append(np.asarray(row_logits)[window][one["options"][window]])
+        grads = row_grads if grads is None else jax.tree.map(jnp.add, grads, row_grads)
+    return np.concatenate(logits), grads
 
 
 def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True, reference=rows_alone) -> None:
