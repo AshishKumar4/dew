@@ -31,9 +31,9 @@ from dew.config.data import HoldOut
 from dew.data.storage import Store
 from dew.data.text import HFTokenizer
 from dew.decision.data import Decisions
-from dew.decision.head import JointSchemaHead
+from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
-from dew.decision.layout import JointLayout, Layout, MarkerLayout, StateFirstLayout
+from dew.decision.layout import Layout, default_layout
 from dew.decision.metrics import AURC, ECE, Accuracy
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
@@ -169,7 +169,8 @@ class DecisionRunConfig(RunConfig):
                 width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
                                                   **dataclasses.asdict(self.head))
-            derived["layout"] = _fresh_layout(start.model.causal, self.head is not None, budgets)
+            head = derived.get("head", DecisionHead)
+            derived["layout"] = _fresh_layout(start.model.causal, head.one_question, budgets)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -221,9 +222,9 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
     return dataclasses.replace(start, model=looped)
 
 
-def _fresh_layout(causal: bool, joint: bool, budgets: dict[str, int]) -> Layout:
-    """The layout a fresh head reads: the joint one, or the one a backbone's order asks for."""
-    return _budgeted(JointLayout() if joint else StateFirstLayout() if causal else MarkerLayout(), budgets)
+def _fresh_layout(causal: bool, one_question: bool, budgets: dict[str, int]) -> Layout:
+    """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
+    return _budgeted(default_layout(causal, one_question), budgets)
 
 
 def _budgeted(layout: Layout, budgets: dict[str, int]) -> Layout:
