@@ -21,7 +21,7 @@ from .flux2 import load_flux2_vae
 from .kl import AutoencoderKL
 from .qwen_image import load_qwen_image_vae
 from .rae import load_rae
-from .sd_vae import StableDiffusionVAE
+from .sd_vae import StableDiffusionVAE, published_normalization
 from .vae import FLAX_REVISIONS, _vae_path
 from .wan import load_wan_vae
 
@@ -68,11 +68,11 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     the SD1-era flax layouts on their own revisions (`load_pretrained_vae`)."""
     directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     model = AutoencoderKL.from_diffusers(config, compute)
+    shift, scale = published_normalization(config)
     return bind_component(
         directory, "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
-                                         latent_shift=config.get("shift_factor") or 0.0,
-                                         latent_scale=config.get("scaling_factor", 0.18215)),
+                                         latent_shift=shift, latent_scale=scale),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy)
 
 
@@ -112,10 +112,13 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
 
     `modelname` is a local directory or a Hub repo; `revision` is as
     `load_pretrained_vae` reads it, so a class of `LOADERS` takes `main` or a
-    commit. Supplied `params` are bound unchanged and only metadata is read.
-    `latent_shift` and `latent_scale` replace the autoencoder's own where
-    given: the checkpoint's normalization, but for Qwen-Image's VAE, which
-    applies its per-channel statistics on top of them.
+    commit. Supplied `params` are bound unchanged and only metadata is read,
+    but for FLUX.2's latent statistics, its batch norm's running statistics
+    in the weights (`load_flux2_vae`). `latent_shift` and `latent_scale`
+    replace the checkpoint's normalization where given, an autoencoder's
+    whose record keeps them: one that normalizes by published per-channel
+    statistics records those, so a run rebuilt from its record
+    (`AutoEncoder.from_json`) would lose the override, and refuses it.
     """
     class_name, subfolder = _published(modelname, revision)
     if class_name is None or class_name not in LOADERS:
@@ -123,6 +126,11 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
                                   latent_scale=latent_scale, params=params)
     autoencoder, *_ = LOADERS[class_name](modelname, dtype, revision=revision, subfolder=subfolder or "",
                                           params=params)
+    given = {name for name, value in (("latent_shift", latent_shift), ("latent_scale", latent_scale))
+             if value is not None}
+    if given - autoencoder.record_arguments().keys():
+        raise ValueError(f"{class_name} normalizes by its published statistics, which its record keeps: "
+                         f"{sorted(given)} would not survive the run's rebuild from that record")
     if latent_shift is not None:
         autoencoder.latent_shift = latent_shift
     if latent_scale is not None:
