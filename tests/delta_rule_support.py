@@ -157,17 +157,9 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     aqk = jnp.einsum('...sd,...td,...std->...st', q, k, decay)
     inverse = linear.strictly_lower_inverse(-akk)
     w, u = inverse @ (k * beta * gated), inverse @ (v * beta)
-    leaving = k * jnp.exp(last - gc)
-
-    def forward(h, step):
-        w_c, u_c, last_c, leaving_c = step
-        corrected = u_c - w_c @ h
-        written = h * jnp.swapaxes(jnp.exp(last_c), -1, -2) + jnp.swapaxes(leaving_c, -1, -2) @ corrected
-        return written, (h, corrected)
-
-    steps = tuple(jnp.moveaxis(x, 2, 0) for x in (w, u, last, leaving))
-    _, (entered, corrected) = jax.lax.scan(forward, h0, steps)
-    entered, corrected = jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2)
+    last_decay = jnp.exp(last - gc)
+    leaving = k * last_decay
+    entered, corrected, _ = linear.xla_chunk_states(k, w, u, gc, last_decay, h0)
     daqk = jnp.where(lower, do @ jnp.swapaxes(corrected, -1, -2), 0.0)
     local = jnp.swapaxes(aqk, -1, -2) @ do
 
@@ -182,10 +174,12 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     _, (written_grad, dcorrected) = jax.lax.scan(backward, dht, reversed_)
     written_grad, dcorrected = (jnp.moveaxis(jnp.flip(x, 0), 0, 2) for x in (written_grad, dcorrected))
     dq_mem = (do @ jnp.swapaxes(entered, -1, -2)) * gated
-    dk_mem = (corrected @ jnp.swapaxes(written_grad, -1, -2)) * jnp.exp(last - gc)
+    dk_mem = (corrected @ jnp.swapaxes(written_grad, -1, -2)) * last_decay
     held = jnp.sum(entered * written_grad, axis=-1)[..., None, :] * jnp.exp(last)
     held = held + jnp.sum(k * dk_mem, axis=3, keepdims=True)
-    closing = jnp.where(jnp.arange(chunk)[:, None] == chunk - 1, held, 0.0)
+    # On each chunk's last real token, the row's last chunk's short of its padding.
+    real = jnp.minimum(chunk, length - chunk * jnp.arange(count))
+    closing = jnp.where((jnp.arange(chunk) == real[:, None] - 1)[..., None], held, 0.0)
     dw = -(dcorrected @ jnp.swapaxes(entered, -1, -2))
     dkgb = jnp.swapaxes(inverse, -1, -2) @ dw
     scores = dcorrected @ jnp.swapaxes(v, -1, -2) + dw @ jnp.swapaxes(k * gated, -1, -2)
