@@ -202,12 +202,14 @@ def worker() -> str:
     return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
 
 
-def cache_url(python: str, row_name: str, held: str) -> str:
-    """Where the record of `row_name` on class `held` (`device_class`) lives: the Worker's key alphabet
-    has no colon or hash."""
+def cache_url(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
+    """Where the record of `row_name` on class `held` (`device_class`) lives: the last run's, or with
+    `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
+    (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
+    under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{worker()}/{CACHE_PREFIX}/{python}/{held}/{name}/"
-            + ("-of-".join(split.split("/")) if split else "whole"))
+    at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
+    return f"{worker()}/{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -230,21 +232,25 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the
+    last run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others,
+    whose record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), device_class()), token)
-    if record is None:
-        return None
-    recorded = json.loads(record)
-    return recorded["row"] if fresh(recorded, name, common) else None
+    record = cache_request(cache_url(python, row(python, name, split), device_class(), common), token)
+    recorded = None if record is None else json.loads(record)
+    return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
     """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
     or one of a file that started another Python process, whose code no event saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
+
+
+RECORD_TRIES = 4
+"""How many times a record's write is tried, two, four and eight seconds apart."""
 
 
 def recorded_tests() -> dict[str, list[float]]:
@@ -548,8 +554,22 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           "peak": ran["peak"]})
-        cache_request(cache_url(python, row_["name"], held), token, body.encode())
+                           "peak": ran["peak"]}).encode()
+        # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
+        # lane read, only once the first is written, so it is never newer.
+        if written(cache_url(python, row_["name"], held, common), token, body):
+            written(cache_url(python, row_["name"], held), token, body)
+
+
+def written(url: str, token: str, body: bytes) -> bool:
+    """Whether `body` was PUT at `url`, tried `RECORD_TRIES` times: a record not written leaves the
+    one before it, such as an older green row a red run should have replaced."""
+    for attempt in range(RECORD_TRIES):
+        if attempt:
+            time.sleep(2 ** attempt)
+        if cache_request(url, token, body) is not None:
+            return True
+    return False
 
 
 def listed(prefix: str, token: str) -> list[str]:

@@ -16,6 +16,7 @@ afterwards.
 import json
 import math
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +35,7 @@ from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
-from dew.objectives.base import Step
+from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -343,36 +344,36 @@ def fsdp_leaves(tree):
     return [leaf for leaf in jax.tree.leaves(tree) if 'fsdp' in str(leaf.sharding.spec)]
 
 
-def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
-    """One two-step run on the mesh over `devices` devices (all by
+def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
+    """One run of `steps` steps on the mesh over `devices` devices (all by
     default), from `state` (the trainer's own initial state by default),
     with everything the assertions read: the trainer, the state and the
     training losses."""
     seen = []
     tracker = RecordingTracker()
-    trainer, encoder = make_trainer(case, tmp_path / f"{devices}", fsdp, tracker, devices)
+    trainer, encoder = make_trainer(case, tmp_path / f"{devices}-{fsdp}-{steps}", fsdp, tracker, devices)
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
     data = Loader(train=lambda partition: source(),
                    val=lambda partition: (batch for batch in [next(source())]),
                    batch=BATCH, records=None)
-    state = trainer.fit(data, steps=2, log_every=1, eval_every=1,
+    state = trainer.fit(data, steps=steps, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {"data": (devices or jax.device_count()) // fsdp, "expert": 1,
                                                "fsdp": fsdp, "tensor": 1, "sequence": 1, "stage": 1}
-    assert int(state.step) == 2
+    assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
-    assert len(losses) == 2 and all(np.isfinite(loss) for loss in losses), losses
-    # Both passes score every row with the same EMA weight selection.
-    assert seen == [shape] * 2, seen
+    assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
+    # Every pass scores every row with the same EMA weight selection.
+    assert seen == [shape] * steps, seen
     scores = [s["val/artifact_spread"] for _, s in tracker.scalars if "val/artifact_spread" in s]
-    assert len(scores) == 2 and all(np.isfinite(score) for score in scores)
+    assert len(scores) == steps and all(np.isfinite(score) for score in scores)
     assert [type(value) for _, value in tracker.artifacts
             if isinstance(value, (ImageGrid, Representations, TokenScores, VideoGrid))] == (
-                [] if case.is_lm else [artifact] * 2)
-    assert Checkpoints(trainer.checkpoints.directory).latest == 2
+                [] if case.is_lm else [artifact] * steps)
+    assert Checkpoints(trainer.checkpoints.directory).latest == steps
     return trainer, state, losses
 
 
@@ -387,38 +388,78 @@ def widened_state(state):
                         else jnp.copy(leaf), state)
 
 
-def truth(case: Case, tmp_path, initial):
-    """The case's two steps on one device in float64, from `initial`
+def truth(case: Case, tmp_path, initial, steps=2):
+    """The case's `steps` steps on one device in float64, from `initial`
     widened: the same rows, keys and draws, every float wider."""
-    trainer, encoder = make_trainer(case, tmp_path / "truth", 1, RecordingTracker(), 1)
+    trainer, encoder = make_trainer(case, tmp_path / f"truth-{steps}", 1, RecordingTracker(), 1)
     source = batches(case, encoder)
 
     data = Loader(train=lambda partition: (wide(case, batch) for batch in source()),
                   val=lambda partition: (wide(case, batch) for batch in [next(source())]),
                   batch=BATCH, records=None)
-    return trainer.fit(data, steps=2, state=widened_state(initial))
+    return trainer.fit(data, steps=steps, state=widened_state(initial))
 
 
-def update_terms(case: Case, tmp_path, initial):
-    """The terms of each leaf the case's two steps write (`float64_terms`), in float64 from
+def update_terms(case: Case, tmp_path, initial, steps=2):
+    """The terms of each leaf the case's `steps` steps write (`float64_terms`), in float64 from
     `initial`: the trainer's own step body, its transaction (the loss's gradient at each step's
     parameters, the momentum update, the EMA), over the rows `truth` trains on. A parameter's
     terms are its updates' sums and the momentum's the gradients', never the parameter it started
     from, whose own size floors it."""
     trainer, encoder = make_trainer(case, tmp_path / "terms", 1, devices=1)
     source = batches(case, encoder)()
-    rows = [model_batch(wide(case, next(source))) for _ in range(2)]
+    rows = [model_batch(wide(case, next(source))) for _ in range(steps)]
     state = widened_state(initial)
     with trainer._traced_on(trainer.device_mesh):
         body = trainer._step_body(trainer._loss_shape(state, rows[0]), {}, 1)
 
-        def two_steps(state):
+        def stepped(state):
             for batch in rows:
                 advanced, *_ = body(state, batch, 0)
                 state = replace(advanced, step=state.step + 1)
             return state
 
-        return float64_terms(two_steps, state)[1]
+        return float64_terms(stepped, state)[1]
+
+
+def shard_terms(case: Case, tmp_path, initial):
+    """The terms a data-parallel layout's first step sums across devices, in
+    float64 from `initial`: each device's partial of every leaf the step
+    writes, summed absolutely (`float64_terms`' terms are the root sum of
+    squares of what one device sums). At BATCH rows over BATCH devices a
+    device's partial is its row's: the step from the whole batch with that
+    row alone valid (`VALID_ROWS`), the same draws, weighted by its share of
+    the batch. The step is linear in its gradient (SGD with momentum and
+    the EMA), so the partials sum to the whole step where its rows add up,
+    and None where they do not."""
+    trainer, encoder = make_trainer(case, tmp_path / "shards", 1, devices=1)
+    batch = model_batch(wide(case, next(batches(case, encoder)())))
+    state = widened_state(initial)
+
+    def with_rows(valid):
+        return {**batch, VALID_ROWS: np.asarray(valid)}
+
+    with trainer._traced_on(trainer.device_mesh):
+        body = trainer._step_body(trainer._loss_shape(state, with_rows(np.ones(BATCH, bool))), {}, 1)
+
+        def written(valid):
+            advanced, *_ = body(state, with_rows(valid), 0)
+            return {name: jax.device_get(jax.tree.map(lambda after, before: after - before,
+                                                      getattr(advanced, name), getattr(state, name)))
+                    for name in ("variables", "opt_state", "ema")}
+
+        whole = written(np.ones(BATCH, bool))
+        parts = [jax.tree.map(lambda delta: delta / BATCH, written(np.arange(BATCH) == row))
+                 for row in range(BATCH)]
+    summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
+    terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
+    # float64 rounds the two sums apart by a few of its units of what they add. A step whose rows do
+    # not add up, through a batch-wide statistic (a router's load, a JEPA batch's masks), parts them by
+    # its own size: its devices' sums are no rows' partials, and it has no such terms (None).
+    if not all(np.all(np.abs(got - want) <= 1e-9 * size) for got, want, size in zip(
+            jax.tree.leaves(summed), jax.tree.leaves(whole), jax.tree.leaves(terms), strict=True)):
+        return None
+    return SimpleNamespace(**terms)
 
 
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
@@ -458,16 +499,25 @@ def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...]
     return terms
 
 
-def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
+def decay_invariants(case: Case, tmp_path, initial,
+                     steps=2) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
     """The declared terms (`raised`) of each gated delta net's decay
-    parameters over a language model's two SGD steps, by state tree. The
-    momentum holds momentum g1 + g2, and a parameter that starts at zero
-    moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
-    steps' gradients' terms (`decay_terms`), measured in float64 at the
-    parameters each step reads. A parameter that starts elsewhere is no such
-    sum, and its own size floors it."""
+    parameters over a language model's one or two SGD steps, by state tree.
+    After two the momentum holds momentum g1 + g2, and a parameter that
+    starts at zero moves to -lr ((1 + momentum) g1 + g2); after one they
+    hold g1 and -lr g1. So each is a sum of the steps' gradients' terms
+    (`decay_terms`), measured in float64 at the parameters each step reads.
+    A parameter that starts elsewhere is no such sum, and its own size
+    floors it."""
     if not case.is_lm:
         return {}
+
+    def starts_at_zero(path):
+        leaf = initial.variables["params"]
+        for part in path:
+            leaf = leaf[part]
+        return not np.any(np.asarray(leaf))
+
     trainer, _ = make_trainer(case, tmp_path / "terms", 1, devices=1)
     batch = {"text": jnp.asarray(next(batches(case, None)())["text"])}
     with jax.enable_x64(new_val=True):
@@ -476,18 +526,15 @@ def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str,
         first = decay_terms(trainer.objective, wide, batch, 0)
         if not first:
             return {}
+        if steps == 1:
+            return {"variables": {path: LEARNING_RATE * first[path]
+                                  for path in first if starts_at_zero(path)}, "opt_state": first}
         step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
         gradient = jax.grad(lambda params: trainer.objective.scalar_loss(
             {**wide, "params": params}, batch, step)[0])(wide["params"])
         moved = {**wide, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
                                                 wide["params"], gradient)}
         second = decay_terms(trainer.objective, moved, batch, 1)
-
-    def starts_at_zero(path):
-        leaf = initial.variables["params"]
-        for part in path:
-            leaf = leaf[part]
-        return not np.any(np.asarray(leaf))
 
     return {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
                           for path in first if starts_at_zero(path)},
@@ -512,31 +559,56 @@ def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
 def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     """One device, 8x1 data parallelism (every parameter replicated, the
     batch split across every device) and 2x4 fsdp (the parameter tree split
-    four ways, the optimizer's state and the EMA with it) train the same two
+    four ways, the optimizer's state and the EMA with it) train the same
     steps from the same state: each layout's variables, momentum and EMA
     are as near a float64 run as one device's are
     (`assert_leaves_as_exact`), so their summing a batch's rows and
     positions in other orders is the only difference, where a layout that
-    dropped or repeated a row would fail by orders of magnitude. Adam's two
-    moments and its count follow the parameters' placement too."""
+    dropped or repeated a row would fail by orders of magnitude. After one
+    step every row is held to its own size; after two each tensor is, as a
+    second step's rows inherit the first's rounding through the parameters
+    they read, which their own terms do not see (Gemma 3n's altup output
+    scale, a cancelling gradient's smallest element, carries it into a
+    per-layer gate's row). Adam's two moments and its count follow the
+    parameters' placement too."""
     initial = make_trainer(case, tmp_path / "initial", 1, devices=1)[0].initial_state()
 
     def copied():
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
-    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied())
-    with jax.enable_x64(new_val=True):
-        exact = jax.device_get(truth(case, tmp_path, copied()))
     # The most terms a gradient sums: every row's positions, and over every
     # layer for a weight the layers share (Gemma 3n's per-layer input norm).
     positions = case.seq_len or math.prod(case.sample_shape[:-1])
     layers = case.config.get("num_layers", 1)
     reductions = BATCH * positions * int(np.sum(layers))
 
-    _, replicated, _ = run_case(case, tmp_path, fsdp=1, state=copied())
+    def as_near(steps, rows):
+        _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
+        layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
+        with jax.enable_x64(new_val=True):
+            exact = jax.device_get(truth(case, tmp_path, copied(), steps))
+            terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
+            # A layout's step adds its devices' partials, whose terms can far exceed the
+            # whole batch's where the rows' gradients cancel across devices.
+            across = shard_terms(case, tmp_path, copied()) if rows else None
+            if across is not None:
+                terms = replace(terms, **{name: jax.tree.map(np.maximum, getattr(terms, name),
+                                                             getattr(across, name))
+                                          for name in ("variables", "opt_state", "ema")})
+        # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
+        # rule's cumulative sums of the decay, which the step's own terms do not see.
+        terms = raised(terms, decay_invariants(case, tmp_path, initial, steps))
+        for layout in layouts:
+            for name in ("variables", "opt_state", "ema"):
+                assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
+                                       getattr(exact, name), reductions=reductions,
+                                       terms=getattr(terms, name), rows=rows)
+        return layouts
+
+    as_near(1, rows=True)
+    replicated, state = as_near(2, rows=False)
     assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
-    _, state, _ = run_case(case, tmp_path, fsdp=4, state=copied())
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
@@ -550,15 +622,6 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
-    with jax.enable_x64(new_val=True):
-        terms = jax.device_get(update_terms(case, tmp_path, copied()))
-    # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
-    # rule's cumulative sums of the decay, which the step's own terms do not see.
-    terms = raised(terms, decay_invariants(case, tmp_path, initial))
-    for layout in (replicated, state):
-        for name in ("variables", "opt_state", "ema"):
-            assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                   getattr(exact, name), reductions=reductions, terms=getattr(terms, name))
 
 
 # --------------------------------------------------------------------------

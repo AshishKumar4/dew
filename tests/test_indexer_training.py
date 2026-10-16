@@ -19,7 +19,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -83,8 +83,17 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
 
     value, gradient = jax.value_and_grad(loss)(data["scores"])
     np.testing.assert_allclose(float(value), float(PUBLISHED[f"{name}/loss_f64"]), rtol=1e-6)
+    # A row of a query that keeps two keys is a difference of nearly equal probabilities; its terms,
+    # not its near-zero result, are what its rounding scales with.
+    with jax.enable_x64(new_val=True):
+        wide = widened(data)
+
+        def wide_loss(scores):
+            return jnp.mean(indexer_kl(scores, wide["query"], wide["key"], region, scale))
+
+        _, (_, terms) = float64_terms(jax.value_and_grad(wide_loss), wide["scores"])
     assert_as_exact_as_the_reference(gradient, PUBLISHED[f"{name}/grad"], PUBLISHED[f"{name}/grad_f64"],
-                                     f"{name}'s gradient")
+                                     f"{name}'s gradient", terms=terms)
 
     legacy = fixture()
     legacy_keep = causal(META["length"]) if mask == "causal" else packed_keep(legacy["segments"])
