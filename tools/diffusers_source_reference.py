@@ -50,11 +50,6 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import numpy as np
 import torch
 from diffusers_reference_helpers import fed_noise as fed_noise, restore_transformers_names, step_noise as step_noise
-
-# The guidance-rescale helper under test lives among the pipelines.
-restore_transformers_names()
-
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg  # noqa: E402
 from diffusers.schedulers import (
     scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
     scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
@@ -64,7 +59,7 @@ from diffusers.schedulers import (
     scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
     scheduling_tcd, scheduling_unipc_multistep,
 )
-from diffusers_wan_reference import float64_scheduler  # noqa: E402
+from diffusers_wan_reference import float64_scheduler
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
@@ -185,6 +180,11 @@ def guided_walk(scheduler, module: ModuleType, case: Case, x: torch.Tensor,
     """The same walk under the pipeline's classifier-free guidance: both raw
     predictions, the guided combination, the source's own `rescale_noise_cfg`
     and only then the scheduler's conversion."""
+    # The guidance-rescale helper under test lives among the pipelines, which
+    # import the transformers names `restore_transformers_names` puts back.
+    restore_transformers_names()
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
+
     latents, inputs = [], []
     with fed_noise(module, noises):
         for time in scheduler.timesteps:
@@ -617,10 +617,10 @@ def main() -> None:
     torch.set_num_threads(2)
     FIXTURES.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
+    cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
                                  "guidance_scale": GUIDANCE_SCALE,
-                                 "label": LABEL, "cases": {}}
-    cases: dict[str, dict[str, object]] = record["cases"]  # type: ignore[assignment]
+                                 "label": LABEL, "cases": cases}
     for name, case in CASES.items():
         result = run(name, case)
         for key, value in result.items():

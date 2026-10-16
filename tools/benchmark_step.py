@@ -61,7 +61,7 @@ import tyro
 from dew.files import write_atomically
 from dew.nn.flops import MissingFlopsCount
 from dew.registry import models
-from dew.telemetry.instrumentation import model_flops_utilization
+from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Trainer
 from dew.training.memory import recompute_record
@@ -302,7 +302,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`trace_window.HLO_COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`instrumentation.COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
@@ -312,7 +312,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals = communication_totals(devices)
+    totals = communication_totals(devices, COLLECTIVES)
     totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")

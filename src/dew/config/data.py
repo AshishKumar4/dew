@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from dew.data.generation import Generation
 from dew.data import audio, images, video
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
+from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat, ResponseCanvases
 from dew.data.steps.generic import Formatting
 from dew.data.steps.image import ConfigureCaption, EncodeCaptions
 from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
@@ -241,6 +241,36 @@ class ChatData(_Loadable):
             None if held is None else held if isinstance(self.validation, Pipeline) else policy(held),
             (),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChatCanvasData(_Loadable):
+    """Conversations rendered as `ChatData` renders them, each assistant turn
+    then one `BlockDiffusionObjective` row (`ResponseCanvases`), never packed:
+    the objective splits every row at `prompt_length`, so the turn alone
+    fills the canvases it scores."""
+
+    source: Annotated[SourceValue, source_argument(SourceValue)]
+    tokenizer: str
+    prompt_length: int
+    canvas_size: int
+    canvases: int = 1
+    pad_id: int = 0
+    column: str = "messages"
+    validation: Annotated[Validation, source_argument(Validation)] = None
+    split: str = "train"
+
+    def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        # The canvases' eos is the rendering's own tokenizer's, one pinned handle for both.
+        renderer = RenderChat(self.tokenizer, self.column)
+        eos = renderer.vocabulary.eos_id
+        if eos is None:
+            raise ValueError(f"tokenizer {self.tokenizer!r} declares no eos token to end a response's canvas")
+        layout = ResponseCanvases(self.prompt_length, self.canvas_size, self.canvases, eos, self.pad_id)
+        rendered = Pipeline(_source(self.source)).map(renderer)
+        prefix = rendered.flat_map(layout).stages
+        train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
+        return train, held, ()
 
 
 @dataclasses.dataclass(frozen=True)

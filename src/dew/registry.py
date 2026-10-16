@@ -1163,6 +1163,7 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
 })
 datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
     "chat": "dew.config.data:ChatData",
+    "chat_canvases": "dew.config.data:ChatCanvasData",
     "decisions": "dew.decision.data:Decisions",
     "images": "dew.config.data:ImageData",
     "preferences": "dew.config.data:PreferenceData",

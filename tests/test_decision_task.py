@@ -351,6 +351,36 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
         assert again.systemone(request) == decide.systemone(request)
 
 
+def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_path):
+    """`dew export` writes a decision run through its task's release writer
+    (`Decide.save_pretrained`): the run of a step's training over Laya's tiny
+    checkpoint exports the files that writer writes for it, byte for byte."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.cli.main import Export
+    from dew.config.data import loader
+    from dew.decision import DecisionObjective
+    from dew.decision.data import Decisions as DecisionRecipe
+    from dew.training.trainer import Trainer
+
+    objective = DecisionObjective(decide)
+    data = loader(DecisionRecipe(source=answered() * 2, validation=answered()), batch=8, read="memory",
+                  objective=objective.data())
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
+    Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1, eval_every=100)
+    checkpoints.wait()
+    assert Export(str(tmp_path / "run"), str(tmp_path / "export")).run_command() == 0
+    Decide.from_run(str(tmp_path / "run")).save_pretrained(tmp_path / "release")
+    written = sorted(path.relative_to(tmp_path / "export") for path in (tmp_path / "export").rglob("*")
+                     if path.is_file())
+    assert written == sorted(path.relative_to(tmp_path / "release")
+                             for path in (tmp_path / "release").rglob("*") if path.is_file())
+    for name in written:
+        assert (tmp_path / "export" / name).read_bytes() == (tmp_path / "release" / name).read_bytes(), name
+
+
 def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):

@@ -21,7 +21,6 @@ and over the most downloaded 200 and 50. Writes coverage.json.
 
 import json
 import sys
-import warnings
 from collections import defaultdict
 from pathlib import Path
 
@@ -87,9 +86,7 @@ def _route(config: dict, *, probe: bool) -> tuple[str, str]:
     if not probe:
         return "tier 2?", ""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            mapping = verify.verify_mapping(config)
+        mapping = verify.verify_mapping(config)
         return "tier 2", f"{mapping.family} {mapping.error:.2e} <= {mapping.bound:.2e}"
     except (KeyError, ValueError, TypeError) as error:
         return "refused", str(error).split(": ", 1)[-1][:300]
