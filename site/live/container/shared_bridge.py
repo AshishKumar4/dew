@@ -113,16 +113,29 @@ def available(meminfo=Path("/proc/meminfo")):
     return int(line.split()[1]) << 10
 
 
+def processes(proc=Path("/proc")):
+    """Each running process as /proc shows it: its pid, its status fields ("Uid", "VmRSS") and its
+    command line. One that exits while it is read is left out, as /proc then has no files for it."""
+    for process in proc.glob("[0-9]*"):
+        try:
+            status, command = (process / "status").read_text(), (process / "cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        yield (int(process.name), dict(line.split(":", 1) for line in status.splitlines() if ":" in line),
+               command)
+
+
+def rss_kib(fields):
+    """A process's resident memory in KiB, from its status `fields`; a kernel thread holds none."""
+    return int(fields.get("VmRSS", "0 kB").split()[0])
+
+
 def resident(proc=Path("/proc")):
     """Resident memory by user, in MiB: the model process, the gateway and bridge, each guest."""
     held = {}
-    for status in proc.glob("[0-9]*/status"):
-        try:
-            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
-            uid, rss = fields["Uid"].split()[1], int(fields.get("VmRSS", "0 kB").split()[0])
-        except (OSError, KeyError, ValueError):
-            continue
-        held[uid] = held.get(uid, 0) + (rss >> 10)
+    for _, fields, _ in processes(proc):
+        uid = fields["Uid"].split()[1]
+        held[uid] = held.get(uid, 0) + (rss_kib(fields) >> 10)
     return held
 
 
@@ -147,15 +160,11 @@ def largest_guest(proc=Path("/proc")):
     """The pids of the guest context holding the most memory, summed over its processes: each
     context runs as a uid of its own (gateway_manager.py). Empty when no guest runs."""
     held, pids = {}, {}
-    for status in proc.glob("[0-9]*/status"):
-        try:
-            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
-            uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
-        except (OSError, KeyError, ValueError):
-            continue
+    for pid, fields, _ in processes(proc):
+        uid = int(fields["Uid"].split()[1])
         if uid in GUEST_UIDS:
-            held[uid] = held.get(uid, 0) + rss
-            pids.setdefault(uid, []).append(int(status.parent.name))
+            held[uid] = held.get(uid, 0) + rss_kib(fields)
+            pids.setdefault(uid, []).append(pid)
     return pids[max(held, key=held.__getitem__)] if held else []
 
 
@@ -276,8 +285,8 @@ class Gateway:
             if not task.cancelled() and task.exception() is not None:
                 print(f"a kernel's cleanup failed: {task.exception()!r}", file=sys.stderr, flush=True)
         task.add_done_callback(ended)
-        with suppress(Exception):
-            await asyncio.shield(task)
+        # Waits for its end without raising its failure, and leaves it running if the caller is cancelled.
+        await asyncio.wait({task})
 
     async def create(self, session):
         if session not in self.contexts:

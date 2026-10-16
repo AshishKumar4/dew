@@ -47,10 +47,11 @@ from pathlib import Path
 
 import pyte
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "snippets"))
+import cells
+
 SITE = Path(__file__).resolve().parents[1]
 DATA = SITE / "src/data"
-sys.path.insert(0, str(SITE / "snippets"))
-import cells  # noqa: E402
 
 # Runs a file as a notebook cell runs: the value of its last line, an image, is saved to the second argument.
 NOTEBOOK = """import ast, sys
@@ -225,7 +226,7 @@ def main() -> None:
                  "screen": screen_cells("".join(text for _, text in writes), options.columns)},
     }
     options.output.write_text(json.dumps(capture, indent="\t") + "\n")
-    print(f"wrote {options.output} and {options.cast}")  # noqa: T201
+    print(f"wrote {options.output} and {options.cast}")
 
 
 if __name__ == "__main__":
