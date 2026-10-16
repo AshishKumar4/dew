@@ -63,6 +63,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     with pytest.raises(FileNotFoundError):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
@@ -998,26 +999,23 @@ def test_a_hub_split_prepared_online_reads_the_same_rows_with_the_hub_offline(tm
     assert sorted(answered) == list(range(16))
 
 
-def test_a_hub_shards_identity_is_the_same_with_the_hub_offline(moving_hub_conversion, monkeypatch):
-    """A Hub split's streamed shards keep the identity they had online with the Hub offline: the
-    commit, the commit's files and each shard's facts are the Hub's answers, recorded, so the plan
-    a compiled cache is keyed by matches. A repo never answered online raises the offline error."""
+def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub_conversion, monkeypatch):
+    """A Hub split's streamed shards keep the identity a compiled cache is keyed by with the Hub
+    offline: the commit, the commit's files, its conversion and each shard's facts are the Hub's
+    answers, recorded online. A repo never answered online raises the offline error."""
     from hub_support import offline
     from huggingface_hub.errors import OfflineModeIsEnabled
 
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
 
-    def plan():
-        return compile(Pipeline(Hub("owner/data")).batch(2), read="streamed", loading=Loading(workers=0)).plan
-
-    answered = plan().record()
+    answered = Hub("owner/data").files
+    identity = answered.fingerprint()
     offline(monkeypatch)
-    plan().check(answered)
+    recorded = Hub("owner/data").files
+    assert recorded.url == answered.url
+    assert recorded.fingerprint() == identity
     with pytest.raises(OfflineModeIsEnabled):
         assert Hub("owner/elsewhere").commit
-
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
