@@ -43,7 +43,7 @@ from flax import linen as nn, struct
 
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
-from dew.nn.precision import compensated_add
+from dew.nn.precision import compensated_add, two_product
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 # A step's index in its walk: traced inside the walk's scan, a Python int at
@@ -226,17 +226,6 @@ class CFGPlusPlus:
         return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
 
 
-def _product_pair(left, right):
-    """Dekker's two-float product keeps the bits an fp32 projection discards."""
-    splitter = (1 << 27) + 1 if left.dtype == jnp.float64 else (1 << 12) + 1
-    split_left, split_right = left * splitter, right * splitter
-    left_hi, right_hi = split_left - (split_left - left), split_right - (split_right - right)
-    left_lo, right_lo = left - left_hi, right - right_hi
-    high = left * right
-    low = ((left_hi * right_hi - high) + left_hi * right_lo + left_lo * right_hi) + left_lo * right_lo
-    return high, low
-
-
 def _projected_components(direction, output):
     """Diffusers projects in float64 and rounds the parallel and orthogonal
     components separately. Two-float products, sums and a corrected quotient
@@ -258,7 +247,7 @@ def _projected_components(direction, output):
     floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
 
     def summed(left, right):
-        high, low = jax.lax.reduce(_product_pair(left, right), (zero, zero), compensated_add, axes)
+        high, low = jax.lax.reduce(two_product(left, right), (zero, zero), compensated_add, axes)
         return high.reshape(shape), low.reshape(shape)
 
     numerator, numerator_lo = summed(vector, conditioned)
@@ -266,11 +255,11 @@ def _projected_components(direction, output):
     denominator_lo = jnp.where(denominator < floor, 0.0, denominator_lo)
     denominator = jnp.maximum(denominator, floor)
     quotient = numerator / denominator
-    product, product_lo = _product_pair(quotient, denominator)
+    product, product_lo = two_product(quotient, denominator)
     residual, residual_lo = compensated_add(
         (numerator, numerator_lo), (-product, -product_lo - quotient * denominator_lo))
     correction = (residual + residual_lo) / denominator
-    parallel, parallel_lo = _product_pair(quotient, conditioned)
+    parallel, parallel_lo = two_product(quotient, conditioned)
     parallel_lo = parallel_lo + correction * conditioned
     orthogonal, orthogonal_lo = compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
     orthogonal = jnp.ldexp(orthogonal + orthogonal_lo, vector_exponent).astype(output.dtype)
