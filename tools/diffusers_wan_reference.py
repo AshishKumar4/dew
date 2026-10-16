@@ -45,8 +45,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import default_dtype, dtype_widened, float_as, replaced, wide, widened_to  # noqa: E402
-from reference_releases import RELEASES, require  # noqa: E402
+from torch_precision import default_dtype, dtype_widened, float_as, replaced, wide, widened_to
+from reference_releases import RELEASES, require
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"

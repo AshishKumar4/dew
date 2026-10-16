@@ -14,11 +14,11 @@ import json
 import numpy as np
 import pytest
 
+from dew.interop import Pretrained
+
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 safetensors_torch = pytest.importorskip("safetensors.torch")
-
-from dew.interop import Pretrained  # noqa: E402
 
 TEXT = {
     "model_type": "muse_glimmer_text", "architectures": ["MuseGlimmerTextModel"], "vocab_size": 256,

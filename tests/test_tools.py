@@ -640,6 +640,37 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
+    """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
+    `typing.cast` however it was imported, and a warning filter whose action is
+    "ignore" are each reported. A string that spells a comment, a function of the
+    file's own named `cast`, a filter that makes warnings errors, and an import kept
+    for the registry entry it makes are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "import warnings\n"
+            "from typing import cast as as_type\n"
+            "import pytest\n"
+            "import sparx.plugins  # noqa: F401  (registers the kind)\n"
+            "WIDTH = 1  # noqa: E501\n"
+            "SPELLED = 'x = 1  # noqa: E501'\n"
+            "def cast(value):\n"
+            "    return value\n"
+            "@pytest.mark.filterwarnings('ignore::DeprecationWarning')\n"
+            "def test_quiet():\n"
+            "    warnings.simplefilter('ignore')\n"
+            "    with warnings.catch_warnings(action='ignore'):\n"
+            "        assert as_type(int, cast(1))\n"
+            "@pytest.mark.filterwarnings('error')\n"
+            "def test_loud():\n"
+            "    warnings.filterwarnings(action='error')\n"),
+        "tools/report.py": "COUNT: int = '1'  # type: ignore[assignment]\n",
+    })
+    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13)),
+                     ("tools/report.py", 1, "SLOP003")]
+
+
 def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):
     """SLOP008: a first-party module's member or table replaced in a test is reported through an
     alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member

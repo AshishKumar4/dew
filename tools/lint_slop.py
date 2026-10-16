@@ -15,8 +15,9 @@ Scope is per rule, because the rules are not all about the same thing:
   SLOP008 will not see patched).
 - `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
   names and annotations are local, so the contract rules (SLOP001, SLOP002,
-  SLOP004, SLOP005) do not run there. A swallowed exception, a narration
-  comment and an unsplittable function are defects anywhere, so those do.
+  SLOP004, SLOP005) do not run there. A suppression, a swallowed exception, a
+  narration comment and an unsplittable function are defects anywhere, so
+  those do.
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
@@ -60,9 +61,10 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes  # noqa: E402
+import lint_scopes as scopes
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
@@ -98,8 +100,11 @@ NARRATION = re.compile(
     r"|loop over|iterate|call |return the|set the|get the|create (a|the)|initialize|init )",
     re.IGNORECASE)
 MARKERS = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
-SUPPRESSIONS = re.compile(r"(?P<hit>typing\.cast\(|(?<![\w.])cast\(|# *type: *ignore"
-                          r"|# *pyright: *ignore|# *noqa)")
+# What a comment says to make a checker look away.
+SUPPRESSIONS = re.compile(r"\b(noqa|type: *ignore|pyright: *ignore)\b")
+# The calls that set a warning aside: each ignores one when its action is "ignore".
+WARNING_FILTERS = {"warnings.simplefilter", "warnings.filterwarnings", "warnings.catch_warnings",
+                   "pytest.mark.filterwarnings"}
 # A probe that asks a library or the environment what it supports, not a probe
 # that asks one of our own values whether it kept its contract.
 PROBE_ROOTS = {"jax", "jnp", "np", "numpy", "environ", "os", "sys", "flags", "importlib"}
@@ -297,21 +302,42 @@ def contracts(module: Module) -> Iterator[Finding]:
 
 
 def suppressions(module: Module) -> Iterator[Finding]:
-    """SLOP003: a cast or an ignore comment is evidence nobody produced."""
-    for number, text in enumerate(module.lines, start=1):
-        code, _, comment = text.partition("#")
+    """SLOP003: a cast, an ignore comment or an ignored warning is evidence nobody
+    produced. Comments are read as Python tokenizes them, so a string that spells
+    one is not one; `typing.cast` and the warning filters through each scope's
+    imports, so a function of the file's own named `cast` is not one either."""
+    for token in tokenize.generate_tokens(io.StringIO(module.source).readline):
+        if token.type != tokenize.COMMENT or (match := SUPPRESSIONS.search(token.string)) is None:
+            continue
+        line, col = token.start
+        code = module.lines[line - 1][:col]
         # One sanctioned inline suppression: an import kept for the registry
         # entry it makes, which is a side effect ruff has no way to see. The
         # name may stand on an import line or inside a parenthesized block.
         imported = (code.lstrip().startswith(("import ", "from "))
                     or re.fullmatch(r"\s*[\w.]+ *,? *", code) is not None)
-        registration = imported and "F401" in comment and "registers" in comment
-        for match in SUPPRESSIONS.finditer(text):
-            hit = match.group("hit")
-            if registration and hit.lstrip().startswith("#"):
-                continue
-            yield Finding(module.relative, number, match.start() + 1, "SLOP003",
-                          f"{hit.strip()} asserts what the code did not prove")
+        if imported and "F401" in token.string and "registers" in token.string:
+            continue
+        yield Finding(module.relative, line, col + match.start() + 1, "SLOP003",
+                      f"# {match.group(1)} asserts what the code did not prove")
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if not isinstance(node, ast.Call):
+            continue
+        called = scopes.resolved(node.func, table)
+        if called == "typing.cast":
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          "cast() asserts what the code did not prove")
+        elif called in WARNING_FILTERS and _ignores(node):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          f"{called} ignores a warning; fix what raises it")
+
+
+def _ignores(call: ast.Call) -> bool:
+    """Does a warning filter's call set its warnings aside: its action, the first
+    argument or `action=`, "ignore", or a pytest mark's filter that starts with it?"""
+    actions = [*call.args[:1], *(keyword.value for keyword in call.keywords if keyword.arg == "action")]
+    return any(isinstance(action, ast.Constant) and isinstance(action.value, str)
+               and action.value.split(":")[0] == "ignore" for action in actions)
 
 
 def probes(module: Module) -> Iterator[Finding]:
@@ -975,8 +1001,8 @@ def calls(module: Module) -> Iterator[Finding]:
                           f"{cls.name} reads {', '.join(sorted(unknown))}, which no call sets")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls)
-UNIVERSAL_RULES = (swallowed, comments, size)
+CONTRACT_RULES = (contracts, probes, names, imports, calls)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:
