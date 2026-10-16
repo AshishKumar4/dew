@@ -12,9 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_side, recurrence, rule_math, through
+from delta_rule_support import NAMES, factorised_decay_terms, fla_side, recurrence, rule_math, through
 from jax.core import ShapedArray
-from reference_error import assert_as_exact_as_the_reference, equations, widened
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
@@ -433,12 +433,13 @@ def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("per_key", [False, True])
 def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
-    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s
-    output, final memory and gradients, through every kernel and the custom VJP, as near the float64
-    recurrence as fla 0.5.2's own on the same operands. Both take each range as the difference of two
-    fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5. A decay per key
-    dimension (Kimi's delta attention) is the same in each, the pair in one 16-token sub-chunk, its
-    diagonal block."""
+    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s output,
+    final memory and gradients, through every kernel and the custom VJP, as near the float64
+    recurrence as fla 0.5.2's own on the same operands, each sized by the portable math's float64
+    terms and Kimi's decay gradient by fla's factorised ones too. Both take each range as the
+    difference of two fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5.
+    A decay per key dimension (Kimi's delta attention) is the same in each, the pair in one 16-token
+    sub-chunk, its diagonal block."""
     length, width, key_at, query_at = 64, 64, 48, 63
     keys = jax.random.split(jax.random.key(29), 6)
     decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
@@ -454,11 +455,20 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
     do, dht = jax.random.normal(keys[5], (1, length, 1, width)), jnp.zeros((1, 1, width, width))
     got = [np.asarray(x, np.float64) for x in through(fla_rule, do, dht)(*inputs)]
     theirs = fla_side((*inputs, do, dht), None, jnp.float32)
+
+    def math(q, k, v, g, beta, h0):
+        return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
+
     with jax.enable_x64(new_val=True):
         operands = widened((*inputs, do, dht))
         truth = widened(through(recurrence, *operands[6:])(*operands[:6]))
-    for name, dew, fla, value in zip(NAMES, got, theirs, truth, strict=True):
-        assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name)
+        _, terms = float64_terms(through(math, *operands[6:]), *operands[:6])
+        if per_key:
+            # Kimi's port takes fla's factorised decay gradient, whose terms the math's pairs never add.
+            decay = factorised_decay_terms(*operands[:2], *truth[2:4])
+            terms = (*terms[:5], np.maximum(terms[5], decay), *terms[6:])
+    for name, dew, fla, value, summed in zip(NAMES, got, theirs, truth, terms, strict=True):
+        assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name, terms=np.asarray(summed))
 
 
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
