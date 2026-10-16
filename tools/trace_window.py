@@ -37,10 +37,6 @@ class KernelEvent(Protocol):
 # with `ncclKernel_` before NCCL 2.19.
 COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
 
-# XLA's hlo_op stat distinguishes the all-to-all and collective-permute
-# operations that NCCL runs as the same SendRecv kernel.
-HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter", "all-reduce")
-
 # The decode report groups movement and reductions separately from training's
 # kernel categories, and keeps random-number generation visible.
 DECODE_CATEGORIES = {
@@ -239,23 +235,27 @@ def window_totals[Time: (int, float)](
     return totals
 
 
-def hlo_collective(event: KernelEvent) -> str | None:
-    """The HLO collective an NCCL kernel ran for, from XLA's hlo_op stat."""
+def hlo_collective(event: KernelEvent, collectives: Sequence[str]) -> str | None:
+    """The HLO collective of `collectives` an NCCL kernel ran for, from XLA's hlo_op stat, which tells
+    apart the all-to-all and collective-permute that NCCL runs as the same SendRecv kernel."""
     for name, value in event.stats:
         if name == "hlo_op" and isinstance(value, str):
             spelled = value.replace("_", "-")
-            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
+            return next((op for op in collectives if spelled.startswith(op)), None)
     return None
 
 
-def communication_totals(devices: Sequence[Sequence[KernelEvent]]) -> dict[str, int]:
-    """Per-device window totals and the busy and exposed time of each HLO collective."""
+def communication_totals(devices: Sequence[Sequence[KernelEvent]],
+                         collectives: Sequence[str]) -> dict[str, int]:
+    """Per-device window totals and the busy and exposed time of each HLO collective of `collectives`
+    (`dew.telemetry.instrumentation.COLLECTIVES`, which an XLA trace's caller passes: this module
+    imports no Dew, for a torch environment's tools)."""
     kernels = [[(event.name, event.start_ns, event.end_ns) for event in events] for events in devices]
     totals = window_totals(kernels)
     for events, records in zip(devices, kernels, strict=True):
         compute = union([(start, end) for name, start, end in records if "nccl" not in name.lower()])
-        ops = [hlo_collective(event) for event in events]
-        for op in HLO_COLLECTIVES:
+        ops = [hlo_collective(event, collectives) for event in events]
+        for op in collectives:
             spans = union([(start, end) for (_, start, end), of in zip(records, ops, strict=True)
                            if of == op])
             key = op.replace("-", "_")
