@@ -108,6 +108,8 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.
+    "coverage",
     "moto[server,s3]>=5.1.15",
     # Delta source and publication scenarios use the optional table implementation.
     "dewml[delta]",
@@ -337,6 +339,13 @@ filterwarnings = [
     # warning from dew's own code still fails the run.
     'ignore:.VariableState. was removed:DeprecationWarning:qwix',
 ]
+
+[tool.coverage.run]
+# tools/armada/ci.py coverage: every task's data names src/dew's files relative to its checkout, so the
+# report combines tasks that ran in other containers.
+branch = true
+relative_files = true
+source = ["src/dew"]
 
 [tool.setuptools.dynamic]
 version = {attr = "dew.__version__"}

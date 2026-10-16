@@ -308,6 +308,42 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
 
 
+def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
+    """`coverage items` runs the floor's tasks with the test cache off, each writing its data among
+    its artifacts; `coverage report` combines them, so a branch one task took and its other branch
+    another took make the module whole, and a module no test reached leads the table."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\npythonpath = ["src"]\n'
+        '[tool.coverage.run]\nbranch = true\nrelative_files = true\nsource = ["src/dew"]\n')
+    package = tmp_path / "src/dew"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "sign.py").write_text("def sign(x):\n    if x < 0:\n        return -1\n    return 1\n")
+    (package / "unused.py").write_text("def never():\n    return 0\n")
+    (tmp_path / "tests/test_negative.py").write_text("from dew.sign import sign\n"
+                                                     "def test_negative(): assert sign(-2) == -1\n")
+    (tmp_path / "tests/test_positive.py").write_text("from dew.sign import sign\n"
+                                                     "def test_positive(): assert sign(2) == 1\n")
+    items = ci.coverage_items(300.0, {})
+    assert items and all("--python=3.12 " in item and "--cache=off" in item
+                         and f"--coverage={ci.ARTIFACTS}" in item for item in items)
+    assert sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split()) == [
+        "tests/test_negative.py", "tests/test_positive.py"]
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    for name in ("negative", "positive"):
+        (tmp_path / "runs" / name).mkdir(parents=True)
+        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / name / "rows.json", 600.0,
+                cache=False, coverage=tmp_path / "runs" / name)
+    assert ci.coverage_report(tmp_path / "runs") == 0
+    files = json.loads((tmp_path / "runs/coverage.json").read_text())["files"]
+    assert files["src/dew/sign.py"]["summary"]["percent_covered"] == 100.0
+    table = (tmp_path / "runs/coverage.md").read_text().splitlines()
+    assert table[2].startswith("| src/dew/unused.py |") and "| 0.0% |" in table[2]
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
