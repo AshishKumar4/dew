@@ -510,11 +510,12 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
     sequences of their own lengths. Every real query's output and gradient, and every key and value
     gradient, lie within tests/reference_error.py's rule of the xla kernel's under the document
     mask, both measured from float64 per document; a document no query reads takes no gradient, and
-    a padding query reads nothing."""
+    a padding query, or one whose document holds no key, reads nothing."""
     flash_here()
     rng = np.random.default_rng(29)
     queries = documents([[20, 1, 40, 35], [9, 0, 30, 57]])
-    keys = documents([[300, 64, 500, 160], [129, 383, 400, 112]])
+    # Row 0's second document has a query and no key.
+    keys = documents([[300, 0, 500, 224], [129, 383, 400, 112]])
     real = queries != 0
     query = jnp.asarray(rng.normal(size=(2, 96, 8, 64)), jnp.bfloat16)
     key = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
@@ -529,12 +530,13 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
     fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
     np.testing.assert_array_equal(fused[0][~real], 0)
+    np.testing.assert_array_equal(fused[0][0][queries[0] == 2], 0)
     truth = [np.zeros_like(x, np.float64) for x in fused]
     with jax.enable_x64(new_val=True):
         for row in range(2):
             for document in range(1, 4):
                 asking, read = queries[row] == document, keys[row] == document
-                if not asking.any():
+                if not asking.any() or not read.any():
                     continue
                 pieces = (query[row][asking], key[row][read], value[row][read], cotangent[row][asking])
                 wide = [jnp.asarray(np.asarray(x, np.float64)) for x in pieces]
@@ -546,6 +548,29 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
         assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
     for name, index in (("dk", 2), ("dv", 3)):
         assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+def test_a_query_reading_another_sequences_documents_reads_its_own_documents_keys_alone(implementation):
+    """Queries packed by documents read a context packed by its own (`key_segment_ids`): each query
+    attends its document's keys as a call over that document alone does, and a query whose document
+    the context does not hold, as one of padding, reads nothing, its output and gradient zero."""
+    with jax.enable_x64(new_val=True):
+        queries, keys = jnp.asarray([[1, 1, 2, 3, 0]]), jnp.asarray([[1, 1, 1, 3, 3, 0]])
+        query, key, value = (jax.random.normal(jax.random.key(seed), (1, length, 2, 8), jnp.float64)
+                             for seed, length in ((0, 5), (1, 6), (2, 6)))
+
+        def attend(q, k, v, **documents):
+            return scaled_dot_product_attention(q, k, v, implementation=implementation, **documents)
+
+        out, pull = jax.vjp(lambda q: attend(q, key, value, segment_ids=queries, key_segment_ids=keys,
+                                             max_segments=3), query)
+        np.testing.assert_array_equal(out[0, 2:3], 0)
+        np.testing.assert_array_equal(out[0, 4:], 0)
+        np.testing.assert_array_equal(pull(jnp.ones_like(out))[0][0, 2:3], 0)
+        for asking, read in ((slice(0, 2), slice(0, 3)), (slice(3, 4), slice(3, 5))):
+            np.testing.assert_allclose(out[:, asking], attend(query[:, asking], key[:, read], value[:, read]),
+                                       rtol=1e-12, atol=1e-14)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
