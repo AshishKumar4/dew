@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, float64_terms
+from reference_error import assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
@@ -115,7 +115,9 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
     """The kernel's forward and all five gradients, interpreted or `compiled` for the device this
     process holds, finite and by the float64 rule against the stepwise recurrence in float64 on the
     host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
-    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums)."""
+    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums). An
+    entry sums a chunk's steps of products over the state or the head width, in another order than
+    the XLA path's, so each is held to the rounding of that many reductions."""
     platform = jax.default_backend() if compiled else "tpu"
     if compiled:
         # pallas interprets only for a platform the process holds no device of
@@ -143,12 +145,15 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
     kernel_gradients = jax.jit(lambda *o: jax.vjp(lambda *p: ssd_chunk_scan(*p, platform), *o)[1](
         seeded))(*operands)
 
+    _, _, size, _, width = operands[0].shape
+    reductions = size * max(width, operands[1].shape[-1])
     names = ("output", "final", "x", "B", "C", "A dt", "state")
     pairs = zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients), twin, truth, terms, strict=True)
     for name, mine, theirs, wide, want, summed in pairs:
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name, terms=summed)
+        assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
+                               reductions=reductions, terms={name: summed})
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):
