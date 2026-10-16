@@ -23,7 +23,6 @@ from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
-from dew.nn import linear
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
@@ -254,22 +253,13 @@ def embedded(module, tokens):
     return module.scaled_embeddings(module.token_embeddings(tokens))
 
 
-DELTA_RULES = frozenset({"gated_delta_net", "kimi_delta_attention"})
-"""The kinds whose rule runs on the delta rule's port where the target row names it (`linear.fla_rule`)."""
-
-
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
-def test_no_token_reaches_another_document(kind, monkeypatch):
+def test_no_token_reaches_another_document(kind):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
     logits, the parameters' gradients of a loss on them alone and its gradient at the second's
     embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
-    information crossing a document boundary. The delta rule's port runs a row as one sequence, each
-    document's decay prefix shifted by the one before (`linear.FORGET`), so a document's values carry
-    the previous one's rounding, not its information: where a target row names the port, the layer
-    is held here with its rule on the portable math, and the port's own documents are held apart
-    against float64 run document by document in test_fla_gdn's packed-documents test and against
-    fla's own distance in test_fla_kda's packed case.
+    information crossing a document boundary.
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -291,7 +281,7 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
     weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-    def second_document(model, variables, row):
+    def second_document(row):
         def loss(variables, inputs):
             logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
@@ -301,13 +291,8 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
             variables, inputs)
         return logits, grads, at_inputs[:, first:first + second]
 
-    measured = linear.measured_kernel
-    if kind in DELTA_RULES:
-        monkeypatch.setattr(linear, "measured_kernel", lambda choice, default: (
-            "xla" if choice == "gated_delta_rule" else measured(choice, default)))
-    moved, unchanged = second_document(model, variables, changed), second_document(model, variables, tokens)
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(unchanged),
-                                    strict=True):
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),
+                                    jax.tree.leaves(second_document(tokens)), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
                                       err_msg=jax.tree_util.keystr(path))
 
