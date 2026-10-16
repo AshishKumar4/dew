@@ -76,7 +76,8 @@ _LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
 _GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
-_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\]')
+_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\](\{[^}]*\})?')
+_PACKED = re.compile(r'E\((\d+)\)')
 _BITS = re.compile(r'(\d+)')
 COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
 """The HLO ops that move data between devices. XLA runs some as an async
@@ -92,11 +93,15 @@ def collective(op: str) -> str | None:
 
 def _buffers(shape: str) -> tuple[int, ...]:
     """The bytes of each array an instruction's result holds, a tuple's every
-    element: its element type's width (`pred` a byte) by its dimensions."""
+    element, as XLA sizes it (`ShapeUtil::ByteSizeOfElements`): its layout's
+    element size where it packs one (`E(4)`), else its type's width rounded up
+    to whole bytes (`pred` and `s4` one byte each), by its elements, rounded up."""
     found = []
-    for element, dims in _ARRAY.findall(shape):
-        bits = 8 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
-        found.append(bits * math.prod(int(d) for d in dims.split(',') if d) // 8)
+    for element, dims, layout in _ARRAY.findall(shape):
+        packed = _PACKED.search(layout)
+        width = 1 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
+        bits = int(packed.group(1)) if packed else -(-width // 8) * 8
+        found.append(-(-bits * math.prod(int(d) for d in dims.split(',') if d) // 8))
     return tuple(found)
 
 
