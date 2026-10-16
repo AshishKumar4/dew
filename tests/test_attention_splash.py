@@ -543,6 +543,7 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, split):
     assert_runs_per_shard(vjp_of(splash), (query, key, value, cotangent), [spec] * 4, mesh, truth)
 
 
+@pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("axes", [{"data": 2}, {"tensor": 2}, {"data": 2, "tensor": 2}],
                          ids=["rows", "heads", "rows-and-heads"])
 @pytest.mark.parametrize("kernel", ["splash", "flash"])
@@ -550,22 +551,26 @@ def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axe
     """jax refuses to lower a Mosaic kernel the partitioner would have to split ("Mosaic kernels
     cannot be automatically partitioned"), so on a v6e mesh splitting rows, heads or both, each
     kernel of attention_impl 'tpu', splash and the flash kernel a bias sends a call to, lowers
-    forward and backward as each shard's rows and heads; sinks split with their heads."""
-    from sharded import tpu_mesh
+    forward and backward as each shard's rows and heads (`sharded.tpu_lowering`); sinks and a bias
+    split with their heads."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    from sharded import tpu_lowering, tpu_mesh
 
-    from dew.nn.kernels import generation
+    mesh = tpu_mesh(**axes)
+    rows, heads = ("data" if "data" in axes else None), ("tensor" if "tensor" in axes else None)
 
-    query = jax.ShapeDtypeStruct((4, 256, 4, 128), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((4, 256, 2, 128), jnp.bfloat16)
-    bias = jax.ShapeDtypeStruct((1, 4, 256, 256), jnp.float32)
-    sinks = jax.ShapeDtypeStruct((4,), jnp.float32)
+    def placed(shape, dtype, *spec):
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, PartitionSpec(*spec)))
+
+    query = placed((4, 256, 4, 128), jnp.bfloat16, rows, None, heads)
+    key = placed((4, 256, 2, 128), jnp.bfloat16, rows, None, heads)
+    extra = (placed((4,), jnp.float32, heads) if kernel == "splash"
+             else placed((1, 4, 256, 256), jnp.float32, None, heads))
 
     def loss(q, k, v, extra):
         call = {"sinks": extra} if kernel == "splash" else {"bias": extra}
         out = scaled_dot_product_attention(q, k, v, implementation='tpu', causal=True, **call)
         return jnp.sum(out.astype(jnp.float32) ** 2)
 
-    with generation.assumed("v6e"), jax.sharding.use_abstract_mesh(tpu_mesh(**axes)):
-        lowered = jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3))).trace(
-            query, key, key, sinks if kernel == "splash" else bias).lower(lowering_platforms=("tpu",))
-    assert "tpu_custom_call" in lowered.as_text()
+    lowered = tpu_lowering(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, extra), mesh)
+    assert "tpu_custom_call" in lowered

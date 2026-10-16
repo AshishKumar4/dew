@@ -101,15 +101,23 @@ MOVES = ("all-gather", "all-to-all", "collective-permute")
 needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not a move."""
 
 
-def tpu_mesh(**axes: int) -> jax.sharding.AbstractMesh:
-    """A mesh of `axes` over abstract TPU v6e devices, none of which this process needs: a program
-    traced on it under `generation.assumed("v6e")` lowers its Mosaic kernels for that TPU on any host
-    (`lowering_platforms=("tpu",)`), where jax refuses one the partitioner would have to split."""
-    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+def tpu_mesh(**axes: int) -> jax.sharding.Mesh:
+    """A mesh of `axes` over the first of this process's devices, its axes left to the partitioner as
+    a run's are (`MeshSpec`), for `tpu_lowering`."""
+    from jax.sharding import AxisType
 
-    device = AbstractDevice(device_kind="TPU v6 lite", num_cores=None, platform="tpu")
-    return AbstractMesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
-                        abstract_device=device)
+    return jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                         devices=jax.devices()[:math.prod(axes.values())])
+
+
+def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
+    """`fn` over `args`, ShapeDtypeStructs placed on `mesh`, lowered for a TPU v6e through `jax.export`
+    on any host, as the module's text: jax refuses there to lower a Mosaic kernel the partitioner
+    would have to split ("Mosaic kernels cannot be automatically partitioned")."""
+    from dew.nn.kernels import generation
+
+    with generation.assumed("v6e"), jax.set_mesh(mesh):
+        return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
 
 
 def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
