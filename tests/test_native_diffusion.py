@@ -163,10 +163,10 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
-    # Saved again over itself, the directory holds the second export alone, under names the first's
-    # index did not hold.
-    for save in range(2):
-        before = {path.relative_to(destination).as_posix() for path in destination.rglob("*")}
+    # Saved over itself, the directory holds the latest export alone, under names no earlier index
+    # held.
+    earlier: set[str] = set()
+    for save in range(3):
         source.save(destination, max_shard_size=20_000)
         files = [path.relative_to(destination).as_posix() for path in destination.rglob("*")
                  if path.is_file()]
@@ -179,7 +179,8 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
             written = {file for file in files if file.startswith(f"{component}/{stem}-")}
             assert len(shards) > 1 and written == shards
             assert not (destination / component / f"{stem}.safetensors").exists()
-            assert shards <= set(downloaded) if save == 0 else not shards & before
+            assert shards <= set(downloaded) if save == 0 else not shards & earlier
+            earlier |= shards
         reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
         for layout in reloaded.weight_layouts:
             np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))

@@ -379,19 +379,19 @@ def save_sharded(
     GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
-    Each shard takes its library's own name, `<stem>-00001-of-00003.safetensors`,
-    the only one Diffusers' Hub download keeps (`variant_compatible_siblings`,
-    pipeline_loading_utils.py:239-289, 0.34.0), so an export to a fresh
-    directory, as `push_to_hub` stages one, publishes as its libraries name
-    theirs.
+    An export to a directory that holds no weights yet, as `push_to_hub`
+    stages one, names its shards as its library does,
+    `<stem>-00001-of-00003.safetensors`, the only names Diffusers' Hub
+    download keeps (`variant_compatible_siblings`,
+    pipeline_loading_utils.py:239-289, 0.34.0).
 
     An export replaces the one `directory` held without a moment at which a
-    loader reads a mix of the two. Where an earlier export holds those
-    names, this one's carry a token instead, so no file an old index names
-    is overwritten or named again, and a reader still holding the old index
-    finds its files gone rather than another export's under their names; a
-    directory saved over again so keeps token names until a later save,
-    which Diffusers' Hub download skips, so publish it through `push_to_hub`.
+    loader reads a mix of the two. A replacement's shards carry a token of
+    their own, so no file an earlier index named is overwritten or named
+    again, and a reader still holding an earlier index finds its files gone
+    rather than another export's under their names. A directory saved over
+    in place so holds token names, which Diffusers' Hub download skips:
+    publish it through `push_to_hub`.
     The index (or, unsharded, `<stem>.safetensors`) is published last, in one
     rename, and commits the export. Only then are the earlier weight files
     removed: the names `_replaced` matches that this export did not write,
@@ -414,11 +414,10 @@ def save_sharded(
         filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)
     old_index = folder / f"{stem}.safetensors.index.json"
     # An interrupted export may leave both an index and a single file.
-    listing = _listing(folder)
-    replaced = {name for name in listing if _replaced(stem).fullmatch(name)}
+    replaced = {name for name in _listing(folder) if _replaced(stem).fullmatch(name)}
     token = secrets.token_hex(4)
-    taken = split.is_sharded and not listing.isdisjoint(split.filename_to_tensors)
-    names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if taken else filename)
+    replacing = split.is_sharded and bool(replaced)
+    names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if replacing else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
         _publish(lambda members=members: {name: tensors[name] for name in members},
