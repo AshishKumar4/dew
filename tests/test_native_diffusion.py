@@ -163,8 +163,10 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
-    # Saved over again, the directory replaces its shards of the same names.
-    for _ in range(2):
+    # Saved again over itself, the directory holds the second export alone, under names the first's
+    # index did not hold.
+    for save in range(2):
+        before = {path.relative_to(destination).as_posix() for path in destination.rglob("*")}
         source.save(destination, max_shard_size=20_000)
         files = [path.relative_to(destination).as_posix() for path in destination.rglob("*")
                  if path.is_file()]
@@ -174,9 +176,10 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
                                 ("text_encoder", "model")):
             index = json.loads((destination / component / f"{stem}.safetensors.index.json").read_text())
             shards = {f"{component}/{name}" for name in index["weight_map"].values()}
-            assert len(shards) > 1 and shards <= set(downloaded)
-            assert {file for file in files if file.startswith(f"{component}/{stem}-")} == shards
+            written = {file for file in files if file.startswith(f"{component}/{stem}-")}
+            assert len(shards) > 1 and written == shards
             assert not (destination / component / f"{stem}.safetensors").exists()
+            assert shards <= set(downloaded) if save == 0 else not shards & before
         reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
         for layout in reloaded.weight_layouts:
             np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))
