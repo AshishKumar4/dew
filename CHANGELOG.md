@@ -10,6 +10,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   the old metric is `train/hlo_flops_util`, and hardware/remat work stays `train/hfu`.
   `train/tokens` counts real tokens per attempted microbatch and `train/tokens_per_s`
   reports their interval rate, independently of gradient accumulation.
+- A `BlockDenoiser`'s call and `encode` take `positions`: block generation
+  refines and commits each canvas at the logical positions that continue its
+  prompt's, as text generation continues them.
 
 ## 0.1.0
 

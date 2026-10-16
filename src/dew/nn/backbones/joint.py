@@ -19,7 +19,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import (
+    LayerNorm,
+    RMSNorm,
+    projected_heads,
+    projected_output,
+    scaled_dot_product_attention,
+)
 from dew.nn.blocks import Modulation
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
@@ -190,13 +196,15 @@ class JointAttention(nn.Module):
                 count += projection_flops(context_lengths, inner, inner)
         return count
 
-    def _heads(self, name: str, x):
-        projected = nn.Dense(self.inner_features, use_bias=self.bias, dtype=self.dtype,
-                             precision=self.precision, name=name)(x)
-        return projected.reshape(x.shape[0], x.shape[1], self.heads, self.head_dim)
+    def _heads(self, name: str, x, norm: str | None = None):
+        return projected_heads(x, name, self.heads, self.head_dim, flat=True, bias=self.bias,
+                               dtype=self.dtype, precision=self.precision,
+                               norm=RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=norm)
+                               if norm and self.qk_norm else None)
 
-    def _norm(self, name: str, x):
-        return RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=name)(x) if self.qk_norm else x
+    def _output(self, name: str, attended):
+        return projected_output(attended, name, self.inner_features, flat=True, bias=self.bias,
+                                dtype=self.dtype, precision=self.precision)
 
     def attend(self, query, key, value, lengths):
         """Return one softmax attention over the joined sequence, masking each row's keys past `lengths`."""
@@ -206,12 +214,12 @@ class JointAttention(nn.Module):
 
     @nn.compact
     def __call__(self, image, context=None, rotation=None, lengths=None):
-        query = self._norm("norm_q", self._heads("to_q", image))
-        key = self._norm("norm_k", self._heads("to_k", image))
+        query = self._heads("to_q", image, "norm_q")
+        key = self._heads("to_k", image, "norm_k")
         value = self._heads("to_v", image)
         if context is not None:
-            added = (self._norm("norm_added_q", self._heads("add_q_proj", context)),
-                     self._norm("norm_added_k", self._heads("add_k_proj", context)),
+            added = (self._heads("add_q_proj", context, "norm_added_q"),
+                     self._heads("add_k_proj", context, "norm_added_k"),
                      self._heads("add_v_proj", context))
             if rotation is not None and rotation[0].shape[-2] == image.shape[1]:
                 query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
@@ -221,19 +229,14 @@ class JointAttention(nn.Module):
         if rotation is not None:
             query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
         attended = self.attend(query, key, value, lengths)
-        inner = self.inner_features
-        attended = attended.reshape(attended.shape[0], attended.shape[1], inner)
-
-        def projection(name: str):
-            return nn.Dense(inner, use_bias=self.bias, dtype=self.dtype, precision=self.precision, name=name)
-
         if context is None:
-            return (projection("to_out_0")(attended) if self.project else attended), None
+            return (self._output("to_out_0", attended) if self.project
+                    else attended.reshape(*attended.shape[:2], self.inner_features)), None
         split = context.shape[1] if self.context_first else image.shape[1]
         image_out, context_out = ((attended[:, split:], attended[:, :split]) if self.context_first
                                   else (attended[:, :split], attended[:, split:]))
-        return (projection("to_out_0")(image_out),
-                projection("to_add_out")(context_out) if self.context_out else None)
+        return (self._output("to_out_0", image_out),
+                self._output("to_add_out", context_out) if self.context_out else None)
 
 
 class DoubleStreamBlock(nn.Module):

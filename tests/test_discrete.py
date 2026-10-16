@@ -337,6 +337,26 @@ def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
         DiscreteProcess(LogLinear(), mask_id=15).generate(model, variables, unruled, 3, key=0)
 
 
+def test_a_packed_prompt_continues_its_last_document_as_if_alone():
+    """A packed prompt numbers its documents from 1 and its padding 0
+    (`dew.nn.inputs.real_slots`), and its tokens sit at their places in their
+    documents (`Coordinates.places`): a row of two documents and a row padded
+    by segment 0 each continue their last document's positions, reading back
+    what that document alone does."""
+    from dew.nn.inputs import ModelInputs
+
+    model = FieldReader()
+    process = DiscreteProcess(LogLinear(), mask_id=15)
+    packed = ModelInputs(jnp.array([[1, 2, 3, 4, 6], [3, 4, 6, 0, 0]]),
+                         {"segment_ids": jnp.array([[1, 1, 2, 2, 2], [1, 1, 1, 0, 0]])})
+    alone = ModelInputs(jnp.array([[3, 4, 6], [3, 4, 6]]))
+    variables = model.init(jax.random.key(0), alone.tokens, positions=jnp.zeros((2, 3), jnp.int32))
+    generated = process.generate(model, variables, packed, 3, key=0, steps=4)
+    expected = process.generate(model, variables, alone, 3, key=0, steps=4)
+    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, 5:], np.asarray(expected.tokens)[:, 3:])
+    np.testing.assert_array_equal(generated.lengths, expected.lengths)
+
+
 def test_a_bidirectional_media_wrapper_fills_a_response_after_an_image():
     """A multimodal wrapper around a bidirectional decoder answers the same
     capabilities its decoder does, so it fills a masked response after an

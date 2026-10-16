@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
-from dew.nn.kernels.generation import device_generation, gpu_target
+from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
@@ -81,10 +81,10 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
-    if generation.startswith('sm') and devices > 1:
+    if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
-    if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
+    if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
