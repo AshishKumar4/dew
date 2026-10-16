@@ -2,7 +2,7 @@
 
 `tools/benchmark_step.py` times one complete compiled optimization step through `Trainer` for each architecture, and `tools/benchmark_data.py` times input loading on its own. The tables below record past runs. Each states its hardware, source revision and shapes, and none promises the same throughput on the current checkout.
 
-The FLOP counts come from the optimized HLO of the compiled executable, through `dew.telemetry.instrumentation.compiled_flops`. It counts every `dot` and `convolution` from its own shapes, along with the cuBLAS matmul, cuDNN convolution and cuDNN fused-attention custom calls that a GPU backend turns them into. `util` is the number the trainer logs as `train/hfu`: the step's measured FLOPs divided by the step time and by the dense bf16 peak of one device (97.5 TFLOP/s for the RTX 4080). `train/mfu` divides the model's FLOPs instead, which count the forward a remat recomputes once (`dew.telemetry.instrumentation.step_flops`); without remat the two agree.
+The FLOP counts come from the optimized HLO of the compiled executable, through `dew.telemetry.instrumentation.compiled_flops`. It counts every `dot` and `convolution` from its own shapes, along with the cuBLAS matmul, cuDNN convolution and cuDNN fused-attention custom calls that a GPU backend turns them into. `util` is the number the trainer logs as `train/hfu`: the step's measured FLOPs divided by the step time and by the dense bf16 peak of one device (97.5 TFLOP/s for the RTX 4080). It counts the hardware's work, a remat's recomputed forward included. `train/mfu` divides the objective's analytical training work instead (`Objective.training_flops`): the model's forward and backward on the batch's real tokens, with causal attention halved and without the optimizer, loss bookkeeping or recomputation. No HLO count stands in for it. `tools/reference_runs/work.py` writes the same count for a reference run in another framework, so `tools/benchmark_torch.py`'s MFU shares the trainer's numerator.
 
 | Column | Meaning |
 |---|---|
@@ -10,6 +10,7 @@ The FLOP counts come from the optimized HLO of the compiled executable, through 
 | `p10 / p50 / p90 ms` | Percentiles from a second window of the same length that waits on every step, so a long tail shows up there. |
 | `GFLOP/step` | FLOPs of the compiled step, counted from the optimized HLO. |
 | `util` | Measured FLOPs over step time and device peak (`train/hfu`). |
+| `mfu` | The objective's training FLOPs over step time and the mesh's peak (`train/mfu`); `n/a` where the model has no count or the device no peak. Tables recorded before 2026-10-16 lack it. |
 | `peak GiB` | Peak device memory of the process. |
 | `compile s` | Time to compile the step. |
 

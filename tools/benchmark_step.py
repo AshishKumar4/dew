@@ -9,8 +9,10 @@ Under `dew launch` every process measures its own devices and process 0
 reports.
 
 FLOPs are read off the compiled executable's optimized HLO
-(dew.telemetry.instrumentation), and the utilisation is the figure the
-trainer logs as train/mfu. Each case is timed twice over the same number of
+(dew.telemetry.instrumentation), and their utilisation is the figure the
+trainer logs as train/hfu. MFU is the trainer's train/mfu: the objective's
+training FLOPs on the case's batch (`Objective.training_flops`) over the
+mesh's peak, or None where the model has no count. Each case is timed twice over the same number of
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
@@ -57,9 +59,11 @@ import numpy as np
 import tyro
 
 from dew.files import write_atomically
+from dew.nn.flops import MissingFlopsCount
 from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
+from dew.training import Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -320,6 +324,16 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
+def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float | None, float | None]:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator, and that MFU over the
+    mesh's peak; both None where the model has no count."""
+    try:
+        flops = trainer.objective.training_flops(None, global_batch(case))
+    except MissingFlopsCount:
+        return None, None
+    return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
+
+
 def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
@@ -394,6 +408,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
+        training_flops, mfu = training_work(trainer, case, step_time)
         peak = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
@@ -431,6 +446,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
             "flops_per_step": flops,
             "utilization": utilization,
+            "training_flops": training_flops,
+            "mfu": mfu,
             "peak_device_bytes": peak,
             "loss": float(loss),
             "finite": bool(is_finite),
@@ -452,11 +469,12 @@ TABLE_COLUMNS = (
     ("samples_per_sec", "samples/s", 10, "{:.1f}"),
     ("flops_per_step", "GFLOP/step", 11, "{:.1f}"),
     ("utilization", "util %", 7, "{:.1f}"),
+    ("mfu", "mfu %", 7, "{:.1f}"),
     ("peak_device_bytes", "peak GiB", 9, "{:.2f}"),
 )
 # Units the table shows a column in: FLOPs as GFLOP, a fraction as a
 # percentage, bytes as GiB.
-TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "peak_device_bytes": 2 ** -30}
+TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30}
 
 
 def format_table(rows: list[Row]) -> str:
