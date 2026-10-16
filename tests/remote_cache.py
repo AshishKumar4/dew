@@ -19,9 +19,11 @@ those names once, and `get` asks only about a program of one of them.
 
 The remote can only make a task slower: a fetch or an upload that fails
 counts against it, and after `FAILURES` in a row it is left alone for the
-rest of the process, so an outage costs a few timeouts. Uploads run on a
-background thread, and the process waits up to `DRAIN_SECONDS` for them at
-exit.
+rest of the process, so an outage costs a few timeouts. Being left alone is
+final and is checked as each request is made: an answer that arrives after
+it, a request already under way, does not take the remote back, and the
+uploads still queued are dropped unsent. Uploads run on a background
+thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
 import json
@@ -52,6 +54,7 @@ class RemoteCache:
         # Cloudflare refuses urllib's own User-Agent with a 403 (error 1010) before the Worker sees it.
         self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
         self.failures = 0
+        self.given_up = False
         self.lock = threading.Lock()
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
         self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
@@ -62,15 +65,25 @@ class RemoteCache:
 
     @property
     def available(self) -> bool:
-        return self.failures < FAILURES
+        return not self.given_up
 
     def _failed(self, error: Exception) -> None:
         with self.lock:
             self.failures += 1
-            if self.failures == FAILURES:
+            if self.failures >= FAILURES and not self.given_up:
+                self.given_up = True
                 logger.warning("the shared XLA cache is unreachable (%s); compiling without it", error)
 
+    def _answered(self) -> None:
+        """A request answered: the failures in a row end, unless the remote was given up meanwhile."""
+        with self.lock:
+            if not self.given_up:
+                self.failures = 0
+
     def _request(self, key: str, method: str, data: bytes | None = None):
+        """The answer to one request, or None, unsent, once the remote is given up."""
+        if self.given_up:
+            return None
         request = urllib.request.Request(f"{self.url}/{self.prefix}/{key}", data=data, method=method,
                                          headers=self.headers)
         return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
@@ -80,7 +93,10 @@ class RemoteCache:
         if value is not None or not self.available or module(key) not in self.names:
             return value
         try:
-            with self._request(key, "GET") as response:
+            answer = self._request(key, "GET")
+            if answer is None:
+                return None
+            with answer as response:
                 value = response.read()
         except urllib.error.HTTPError as error:
             if error.code != 404:
@@ -89,8 +105,8 @@ class RemoteCache:
         except Exception as error:  # a remote that cannot answer is a miss
             self._failed(error)
             return None
+        self._answered()
         with self.lock:
-            self.failures = 0
             self.fetched += 1
         self.base.put(key, value)
         return value
@@ -111,20 +127,28 @@ class RemoteCache:
                     return
         except Exception as error:  # names that cannot be read leave the remote alone
             with self.lock:
-                self.failures = FAILURES
+                self.given_up = True
             logger.warning("the shared XLA cache's names are unreadable (%s); compiling without it", error)
 
     def _upload(self, key: str, value: bytes) -> None:
+        """PUT `value` under `key`, and the program's name where the remote lacks it; nothing once
+        the remote is given up, a queued upload's own or a name's after its entry."""
         try:
-            self._request(key, "PUT", value).close()
+            answer = self._request(key, "PUT", value)
+            if answer is None:
+                return
+            answer.close()
             if module(key) not in self.names:
-                self._request(f"names/{module(key)}", "PUT", b"1").close()
+                named = self._request(f"names/{module(key)}", "PUT", b"1")
+                if named is None:
+                    return
+                named.close()
                 self.names.add(module(key))
         except Exception as error:  # an entry that does not reach the remote is compiled again elsewhere
             self._failed(error)
         else:
+            self._answered()
             with self.lock:
-                self.failures = 0
                 self.uploaded += 1
 
     def put(self, key: str, value: bytes) -> None:
