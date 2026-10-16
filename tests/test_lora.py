@@ -326,52 +326,74 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
         np.testing.assert_array_equal(np.asarray(ours_leaf), np.asarray(theirs_leaf))
 
 
-def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_there(reference, tmp_path,
-                                                                                   monkeypatch):
+_HUB_ADAPTER = """
+import json, sys
+import jax, numpy as np
+from dew.interop.pretrained import Pretrained
+from dew.lora import LoRA
+
+for name, directory in (("dew/llama-tiny", sys.argv[1]), (sys.argv[3], sys.argv[2])):
+    source = Pretrained.load(name, dtype="float32", attention_impl="reference")
+    adapted = source.adapt(LoRA(rank=3, modules=("q_proj", "v_proj")), key=0)
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, adapted.variables)
+    adapted.adapter.save(variables, directory)
+    tokens = np.load(sys.argv[3] + "/input_ids.npy")
+    np.save(directory + "/logits.npy", np.asarray(adapted.model.apply(variables, tokens)))
+    print(json.dumps(LoRA.load(source.model, source.variables, directory, layouts=source.layouts).base))
+"""
+
+
+def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_there(tmp_path):
     """An adapter bound to a model loaded from the Hub names it and the commit the Hub resolved it
     to in PEFT's config, and PEFT, reading only that config and the cache, loads the same base and
     computes the logits Dew computes; Dew's own reload keeps the name. One bound to a local
-    directory names none, since no other machine resolves it."""
+    directory names none, since no other machine resolves it. The process runs offline over a Hub
+    cache holding the tiny Llama at one commit."""
+    import os
     import shutil
-
-    import torch
-    from huggingface_hub import constants
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM
+    import subprocess
+    import sys
 
     commit = "0123456789abcdef0123456789abcdef01234567"
     repo = tmp_path / "hub" / "models--dew--llama-tiny"
     shutil.copytree(LLAMA, repo / "snapshots" / commit)
     (repo / "refs").mkdir()
     (repo / "refs" / "main").write_text(commit)
-    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
-    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    hub, local = tmp_path / "hub-adapter", tmp_path / "local-adapter"
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
+           "PYTHONPATH": str(ROOT / "src")}
 
-    def saved(source, directory):
-        adapted = source.adapt(LoRA(rank=3, modules=("q_proj", "v_proj")), key=0)
-        variables = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
-            if path[-1].key == "lora_B" else leaf, adapted.variables)
-        adapted.adapter.save(variables, directory)
-        return adapted.model, variables, json.loads((directory / "adapter_config.json").read_text())
+    def run(script, *arguments):
+        done = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], env=env, check=False,
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return done.stdout.split("\n")
 
-    local = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    assert not {"base_model_name_or_path", "revision"} & set(saved(local, tmp_path / "local")[2])
-    hub = Pretrained.load("dew/llama-tiny", dtype="float32", attention_impl="reference")
-    model, variables, config = saved(hub, tmp_path / "adapter")
+    reloaded = [json.loads(line) for line in run(_HUB_ADAPTER, hub, local, LLAMA) if line]
+    assert reloaded == [["dew/llama-tiny", commit], None]
+    config = json.loads((hub / "adapter_config.json").read_text())
     assert (config["base_model_name_or_path"], config["revision"]) == ("dew/llama-tiny", commit)
-    tokens = np.asarray(reference["input_ids"])
-    ours = np.asarray(model.apply(variables, jnp.asarray(tokens)))
-    base = AutoModelForCausalLM.from_pretrained(config["base_model_name_or_path"],
-                                                revision=config["revision"])
-    with torch.no_grad():
-        peft = PeftModel.from_pretrained(base, tmp_path / "adapter").eval()
-        theirs = peft(torch.as_tensor(tokens)).logits
-    np.testing.assert_allclose(ours, theirs.numpy(), atol=2e-5)
-    reloaded = LoRA.load(hub.model, hub.variables, tmp_path / "adapter", layouts=hub.layouts)
-    assert reloaded.base == ("dew/llama-tiny", commit)
+    written = json.loads((local / "adapter_config.json").read_text())
+    assert not {"base_model_name_or_path", "revision"} & set(written)
+    run(_PEFT_READS, hub, LLAMA / "input_ids.npy")
+    np.testing.assert_allclose(np.load(hub / "peft.npy"), np.load(hub / "logits.npy"), atol=2e-5)
+
+
+_PEFT_READS = """
+import json, sys
+import numpy as np, torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+directory = sys.argv[1]
+config = json.load(open(directory + "/adapter_config.json"))
+base = AutoModelForCausalLM.from_pretrained(config["base_model_name_or_path"], revision=config["revision"])
+with torch.no_grad():
+    logits = PeftModel.from_pretrained(base, directory).eval()(torch.as_tensor(np.load(sys.argv[2]))).logits
+np.save(directory + "/peft.npy", logits.numpy())
+"""
 
 
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
