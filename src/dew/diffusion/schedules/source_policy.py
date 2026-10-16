@@ -49,7 +49,6 @@ Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
-Variance = Literal["small", "large"]
 
 _SPACINGS: tuple[Spacing, ...] = ("leading", "linspace", "trailing")
 _TERMINALS: tuple[Terminal, ...] = ("zero", "sigma_min")
@@ -103,21 +102,33 @@ _DISTILLED = _fields(_THRESHOLD, {"original_inference_steps": 50, "clip_sample":
 
 _ALL_PREDICTIONS = ("epsilon", "sample", "v_prediction")
 _NO_SAMPLE = ("epsilon", "v_prediction")
+_DPM_ALGORITHMS: tuple[Algorithm, ...] = ("dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver")
+_SOLVER_TYPES = ("midpoint", "heun", "logrho", "bh1", "bh2")
 
 
 class _Controls(NamedTuple):
     """The resolved controls a class's native solver is built from."""
 
-    kind: str
     value: Control
     order: int
     algorithm: Algorithm
     terminal: Terminal
-    variance: Variance
     corrector: tuple[int, ...]
 
     def flag(self, key: str) -> bool:
         return records.boolean(self.value(key), key)
+
+
+def _keeps(value: Control) -> bool:
+    return False
+
+
+def _rounds(value: Control) -> bool:
+    return True
+
+
+def _rounds_off_cosine(value: Control) -> bool:
+    return value("beta_schedule") != "squaredcos_cap_v2"
 
 
 @dataclass(frozen=True)
@@ -127,8 +138,22 @@ class _Class:
     The fields are its grid family, the constructor controls it declares with
     that class's own defaults, the native solver its controls resolve into
     (built once, so nothing downstream re-reads a control), the
-    `beta_schedule` tables it accepts, and the `prediction_type` values its
-    own `step` converts.
+    `beta_schedule` tables it accepts, the `prediction_type` values its
+    own `step` converts, and the `algorithm_type` values it keeps after
+    rewriting `deis` to `dpmsolver++` (none: it has no DPM-Solver algorithm).
+
+    The rest is what this class's `set_timesteps` and `step` do that its
+    family does not settle. `karras_round`: it rounds a Karras grid's
+    recovered model times before truncating them (DPMSolverMultistep except
+    on the cosine table); the others keep the log-linear inverse as it comes,
+    and no class rounds an exponential or beta grid's. `flow_sigmas`: its
+    `use_flow_sigmas` walk is reconstructed, for the classes the published
+    flow pipelines ship (SANA's DPM-Solver++, Wan's UniPC). `grid_terminal`:
+    a transformed grid ends on its own last sigma. `stride`: it steps
+    `train_steps // steps` back. `recompute_epsilon`: it recomputes epsilon
+    from a limited x_0 whatever its algorithm. `boundary`: it applies the
+    consistency model's boundary condition. `limits`: its `step` reads the
+    thresholding and clipping it declares.
     """
 
     family: Family
@@ -136,19 +161,31 @@ class _Class:
     solver: Callable[[_Controls], Solver]
     schedules: tuple[str, ...] = ("linear", "scaled_linear", "squaredcos_cap_v2")
     predictions: tuple[str, ...] = _ALL_PREDICTIONS
+    algorithms: tuple[Algorithm, ...] = ()
+    karras_round: Callable[[Control], bool] = _keeps
+    flow_sigmas: bool = False
+    grid_terminal: bool = False
+    stride: bool = False
+    recompute_epsilon: bool = False
+    boundary: bool = False
+    limits: bool = True
 
 
 _SOURCES: Mapping[str, _Class] = MappingProxyType({
     "DDIM": _Class("tabulated", _fields(_VP_BETAS, _THRESHOLD, _LEADING, clip_sample=True,
                                         clip_sample_range=1.0, set_alpha_to_one=True,
-                                        rescale_betas_zero_snr=False), lambda c: DDIM()),
+                                        rescale_betas_zero_snr=False), lambda c: DDIM(), stride=True),
+    # The published PNDM keeps v-prediction history in the velocity domain;
+    # the native one keeps epsilon history.
     "PNDM": _Class("tabulated", _fields(_VP_BETAS, _LEADING, skip_prk_steps=False,
                                         set_alpha_to_one=False),
-                   lambda c: PNDM(skip_prk_steps=c.flag("skip_prk_steps")), predictions=_NO_SAMPLE),
+                   lambda c: PNDM(skip_prk_steps=c.flag("skip_prk_steps")), predictions=("epsilon",),
+                   stride=True),
     "DDPM": _Class("tabulated", _fields(_VP_BETAS, _THRESHOLD, _LEADING,
                                         variance_type="fixed_small", clip_sample=True,
                                         clip_sample_range=1.0, rescale_betas_zero_snr=False),
-                   lambda c: DDPM(c.variance), ("linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid")),
+                   lambda c: _ddpm(c), ("linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid"),
+                   recompute_epsilon=True),
     "LMSDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED, _TRANSFORMS), lambda c: LMS(order=4)),
     "EulerDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED, _TRANSFORMS,
                                              interpolation_type="linear", sigma_min=None,
@@ -162,9 +199,10 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                             clip_sample_range=1.0),
                            lambda c: Heun(), ("linear", "scaled_linear", "squaredcos_cap_v2", "exp")),
     "KDPM2Discrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
-                            lambda c: KDPM2(ancestral=False), predictions=_NO_SAMPLE),
+                            lambda c: KDPM2(ancestral=False), predictions=_NO_SAMPLE, karras_round=_rounds),
     "KDPM2AncestralDiscrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
-                                     lambda c: KDPM2(ancestral=True), predictions=_NO_SAMPLE),
+                                     lambda c: KDPM2(ancestral=True), predictions=_NO_SAMPLE,
+                                     karras_round=_rounds),
     "DPMSolverSDE": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS,
                                             noise_sampler_seed=None),
                            lambda c: DPMSolverSDE(seed=_optional_seed(c.value)), predictions=_NO_SAMPLE),
@@ -172,7 +210,8 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                                    _FLOW, _DPM, lower_order_final=True,
                                                    euler_at_final=False, use_lu_lambdas=False,
                                                    rescale_betas_zero_snr=False),
-                                 lambda c: _dpm_multistep(c)),
+                                 lambda c: _dpm_multistep(c), algorithms=_DPM_ALGORITHMS,
+                                 karras_round=_rounds_off_cosine, flow_sigmas=True),
     "DPMSolverSinglestep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _TRANSFORMS, _FLOW,
                                                     _DPM, lower_order_final=False),
                                   # `set_timesteps` rewrites lower_order_final for a zero
@@ -181,38 +220,39 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                   lambda c: DPMSolverSinglestep(
                                       c.order, named_choice(c.algorithm, "algorithm_type",
                                                             ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
-                                      _solver_type(c.kind, c.value, ("midpoint", "heun")),
-                                      c.flag("lower_order_final") or c.terminal == "zero")),
-    # DEIS rewrites the two DPM solver names to its own and refuses the rest;
-    # its native integrator carries neither control.
+                                      _solver_type(c.value, ("midpoint", "heun")),
+                                      c.flag("lower_order_final") or c.terminal == "zero"),
+                                  algorithms=_DPM_ALGORITHMS, karras_round=_rounds),
     "DEISMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                               solver_order=2, algorithm_type="deis",
                                               solver_type="logrho", lower_order_final=True),
-                            lambda c: _deis(c)),
+                            lambda c: _deis(c), karras_round=_rounds, grid_terminal=True,
+                            recompute_epsilon=True),
     "UniPCMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                                solver_order=2, predict_x0=True, solver_type="bh2",
                                                lower_order_final=True, disable_corrector=[],
                                                solver_p=None, final_sigmas_type="zero",
                                                rescale_betas_zero_snr=False),
-                             lambda c: UniPC(c.order, _solver_type(c.kind, c.value, ("bh1", "bh2")),
-                                             c.flag("predict_x0"), c.flag("lower_order_final"), c.corrector)),
+                             lambda c: UniPC(c.order, _solver_type(c.value, ("bh2", "bh1")),
+                                             c.flag("predict_x0"), c.flag("lower_order_final"), c.corrector),
+                             karras_round=_rounds, flow_sigmas=True, grid_terminal=True),
     "EDMDPMSolverMultistep": _Class("edm", _fields(
         _THRESHOLD, num_train_timesteps=1000, prediction_type="epsilon", sigma_min=0.002,
         sigma_max=80.0, sigma_data=0.5, sigma_schedule="karras", rho=7.0, solver_order=2,
         algorithm_type="dpmsolver++", solver_type="midpoint", lower_order_final=True,
         euler_at_final=False, final_sigmas_type="zero"),
         lambda c: _dpm_multistep(c),
-        (), _NO_SAMPLE),
+        (), _NO_SAMPLE, algorithms=("dpmsolver++", "sde-dpmsolver++")),
     "FlowMatchEulerDiscrete": _Class("flow", _fields(
         _TRANSFORMS, num_train_timesteps=1000, prediction_type="flow_prediction", shift=1.0,
         use_dynamic_shifting=False,
         base_shift=0.5, max_shift=1.15, base_image_seq_len=256, max_image_seq_len=4096,
         invert_sigmas=False, shift_terminal=None, time_shift_type="exponential",
         stochastic_sampling=False), lambda c: Euler(), (), ("flow_prediction",)),
-    "LCM": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: Consistency()),
+    "LCM": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: Consistency(), boundary=True),
     # The source takes TCD's eta as a step argument, not a checkpoint field, so
     # the solver keeps the step signature's own default.
-    "TCD": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: TCD()),
+    "TCD": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: TCD(), limits=False),
 })
 
 # Controls a class declares whose active meaning this file does not
@@ -223,16 +263,6 @@ _UNIMPLEMENTED: Mapping[str, object] = MappingProxyType({
     "invert_sigmas": False, "stochastic_sampling": False,
     "interpolation_type": "linear", "timestep_type": "discrete",
 })
-
-# The log-SNR classes whose `use_flow_sigmas` walk is reconstructed: the ones
-# the published flow pipelines ship (SANA's DPM-Solver++, Wan's UniPC).
-_FLOW_SIGMA_CLASSES = ("DPMSolverMultistep", "UniPCMultistep")
-
-# The classes that round a Karras grid's recovered model times before
-# truncating them. The rest keep the log-linear inverse as it comes, and no
-# class rounds an exponential or beta grid's.
-_KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
-                  "KDPM2Discrete", "KDPM2AncestralDiscrete")
 
 @dataclass(frozen=True)
 class FlowShift:
@@ -340,15 +370,12 @@ def resolve_config(config: Mapping[str, object]
     # convention, so the family names the transform. A log-SNR class on
     # flow sigmas reads the velocity its flow checkpoint predicts.
     flow_sigmas = records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas")
-    if flow_sigmas and kind not in _FLOW_SIGMA_CLASSES:
-        raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for "
-                         f"{' and '.join(_FLOW_SIGMA_CLASSES)}, not {kind}")
+    if flow_sigmas and not source.flow_sigmas:
+        walked = " and ".join(name for name, other in _SOURCES.items() if other.flow_sigmas)
+        raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for {walked}, not {kind}")
     prediction = ("flow_prediction" if source.family == "flow"
                   else named_choice(value("prediction_type"), "prediction_type",
                                ("flow_prediction",) if flow_sigmas else source.predictions))
-    if kind == "PNDM" and prediction == "v_prediction":
-        raise ValueError("Published PNDM v-prediction requires velocity-domain history; "
-                         "native PNDM uses epsilon history")
     betas = (np.zeros((0,), np.float32) if source.family in ("edm", "flow")
              else published_betas(
         count=value("num_train_timesteps"), start=value("beta_start"),
@@ -358,59 +385,43 @@ def resolve_config(config: Mapping[str, object]
         schedules=source.schedules))
     betas.setflags(write=False)
     policy, solver = _resolve(kind, source, value, betas)
-    return betas, _prediction_transform(policy, prediction), policy, solver
+    return betas, _prediction_transform(policy, prediction, source), policy, solver
 
 
-def _algorithm(kind: str, family: str, declared: Mapping[str, JSON],
-               value: Control) -> Algorithm:
-    """The algorithm this class integrates with, after its own coercions.
-
-    Each pinned class rewrites a few foreign names to its own before refusing
-    the rest, and the EDM class refuses the two non-++ ones outright.
-    """
-    if "algorithm_type" not in declared:
+def _algorithm(source: _Class, value: Control) -> Algorithm:
+    """The DPM-Solver algorithm this class integrates with: the one its file
+    names, `deis` read as `dpmsolver++` as each such constructor rewrites it,
+    and `dpmsolver++` for a class without one. DEIS reads its own (`_deis`)."""
+    if not source.algorithms:
         return "dpmsolver++"
-    algorithm = str(value("algorithm_type"))
-    if kind == "DEISMultistep":
-        named_choice("deis" if algorithm in ("deis", "dpmsolver", "dpmsolver++") else algorithm,
-                "algorithm_type", ("deis",))
-        return "dpmsolver++"
-    if algorithm == "deis":
-        algorithm = "dpmsolver++"
-    allowed: tuple[Algorithm, ...] = ("dpmsolver++", "dpmsolver", "sde-dpmsolver++",
-                                      "sde-dpmsolver")
-    if family == "edm":
-        allowed = ("dpmsolver++", "sde-dpmsolver++")
-    return named_choice(algorithm, "algorithm_type", allowed)
+    algorithm = value("algorithm_type")
+    return named_choice("dpmsolver++" if algorithm == "deis" else algorithm, "algorithm_type",
+                        source.algorithms)
 
 
-def _solver_type[SolverT: str](kind: str, value: Control,
-                               allowed: tuple[SolverT, ...]) -> SolverT:
-    """The class's `solver_type` after its own coercions, in the names the
-    class this is being built for takes."""
-    solver_type = str(value("solver_type"))
-    if kind == "UniPCMultistep":
-        return named_choice("bh2" if solver_type in ("midpoint", "heun", "logrho") else solver_type,
-                       "solver_type", allowed)
-    if kind == "DEISMultistep":
-        return named_choice("logrho" if solver_type in ("midpoint", "heun", "bh1", "bh2")
-                       else solver_type, "solver_type", allowed)
-    return named_choice("midpoint" if solver_type in ("logrho", "bh1", "bh2") else solver_type,
-                   "solver_type", allowed)
+def _solver_type[SolverT: str](value: Control, allowed: tuple[SolverT, ...]) -> SolverT:
+    """The class's `solver_type` in the names it takes, `allowed`: each
+    constructor rewrites another class's name to its own default, the first
+    of `allowed`, and refuses the rest."""
+    solver_type = value("solver_type")
+    return named_choice(allowed[0] if solver_type in _SOLVER_TYPES and solver_type not in allowed
+                        else solver_type, "solver_type", allowed)
 
 
-def _x0_limit(kind: str, declared: Mapping[str, JSON], value: Control,
+def _x0_limit(kind: str, source: _Class, value: Control,
               ) -> tuple[float | None, tuple[float, float] | None]:
     """The clamp or the dynamic thresholding the class's `step` applies to
     x_0, whichever it tests first. A class whose step reads neither is refused
-    an active one rather than quietly limited."""
+    an active one rather than quietly limited, and so is thresholding where
+    the step predicts noise (`predict_x0` off), which its noise branch skips."""
+    declared = source.fields
     thresholding = "thresholding" in declared and records.boolean(value("thresholding"), "thresholding")
     clipping = "clip_sample" in declared and records.boolean(value("clip_sample"), "clip_sample")
-    if (thresholding or clipping) and kind == "TCD":
-        raise ValueError("The published TCD step reads neither thresholding nor clipping")
+    if (thresholding or clipping) and not source.limits:
+        raise ValueError(f"The published {kind} step reads neither thresholding nor clipping")
     if thresholding:
-        if kind == "UniPCMultistep" and not records.boolean(value("predict_x0"), "predict_x0"):
-            raise ValueError("The published epsilon-prediction UniPC step ignores thresholding")
+        if not records.boolean(value("predict_x0", absent=True), "predict_x0"):
+            raise ValueError(f"The published epsilon-prediction {kind} step ignores thresholding")
         ratio = records.number(value("dynamic_thresholding_ratio"), "dynamic_thresholding_ratio")
         maximum = records.number(value("sample_max_value"), "sample_max_value")
         if not 0 < ratio <= 1 or maximum < 1:
@@ -472,31 +483,17 @@ def _final_sigma(family: str, declared: Mapping[str, JSON], value: Control,
     return terminal
 
 
-def _variance_type(kind: str, value: Control) -> Variance:
-    """Which posterior variance a DDPM file's `step` adds.
-
-    Only DDPM has the control. A learned variance is a second model output
-    and is refused rather than approximated.
-    """
-    if kind == "DDPM":
-        mode = named_choice(value("variance_type"), "variance_type",
-                       ("fixed_small", "fixed_small_log", "fixed_large"))
-        return "large" if mode == "fixed_large" else "small"
-    if value("variance_type") in ("learned", "learned_range"):
-        raise ValueError("Native source scheduling does not implement learned variance")
-    return "small"
-
-
-def _lambda_clipping(kind: str, value: Control, betas: np.ndarray) -> tuple[bool, int]:
+def _lambda_clipping(family: Family, value: Control, betas: np.ndarray) -> tuple[bool, int]:
     """`(zero-SNR tail, clipped steps)`: how the class ends its training table.
 
-    The zero-SNR classes substitute a near-zero terminal alpha, and
-    `lambda_min_clipped` drops the steps whose half log-SNR falls below it,
-    counted off the training betas the way the source counts them.
+    The zero-SNR classes that walk sigmas substitute a near-zero terminal
+    alpha for the zero one, whose sigma is infinite; a tabulated class walks
+    the zero alpha itself. `lambda_min_clipped` drops the steps whose half
+    log-SNR falls below it, counted off the training betas the way the
+    source counts them.
     """
     zero_snr = records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
-    zero_snr_tail = zero_snr and kind in ("DPMSolverMultistep", "UniPCMultistep",
-                                          "EulerDiscrete", "EulerAncestralDiscrete")
+    zero_snr_tail = zero_snr and family != "tabulated"
     limit = value("lambda_min_clipped", -float("inf"))
     if limit == -float("inf"):
         return zero_snr_tail, 0
@@ -508,8 +505,7 @@ def _lambda_clipping(kind: str, value: Control, betas: np.ndarray) -> tuple[bool
                                               records.number(limit, "lambda_min_clipped")))
 
 
-def _flow_shift(kind: str, value: Control, transform: Transform,
-                algorithm: Algorithm) -> float | None:
+def _flow_shift(value: Control, transform: Transform, algorithm: Algorithm) -> float | None:
     """`flow_shift` under an active `use_flow_sigmas`, and None without it.
 
     The source reaches its flow branch only when no sigma transformation is
@@ -521,8 +517,8 @@ def _flow_shift(kind: str, value: Control, transform: Transform,
     if transform != "none":
         raise ValueError("use_flow_sigmas under a Karras, exponential or beta grid walks the "
                          "beta table's sigmas on the flow path; the source refuses neither")
-    clean = (algorithm in ("dpmsolver++", "sde-dpmsolver++") if kind == "DPMSolverMultistep"
-             else records.boolean(value("predict_x0"), "predict_x0"))
+    clean = (algorithm in ("dpmsolver++", "sde-dpmsolver++")
+             and records.boolean(value("predict_x0", absent=True), "predict_x0"))
     if not clean:
         raise ValueError("The source converts flow velocity to a clean prediction only; "
                          "use_flow_sigmas needs a dpmsolver++ algorithm or predict_x0")
@@ -538,13 +534,15 @@ def _resolve(kind: str, source: _Class, value: Control,
     declared, family = source.fields, source.family
     train_steps = records.integer(value("num_train_timesteps"), "num_train_timesteps")
     transform = _sigma_transform(family, declared, value)
-    algorithm = _algorithm(kind, family, declared, value)
+    algorithm = _algorithm(source, value)
     spacing: Spacing = named_choice(value("timestep_spacing", "linspace"), "timestep_spacing",
                                _SPACINGS)
     terminal = _final_sigma(family, declared, value, algorithm)
-    variance = _variance_type(kind, value)
-    clip, threshold = _x0_limit(kind, declared, value)
-    zero_snr_tail, lambda_clipped = _lambda_clipping(kind, value, betas)
+    # A learned variance is a second model output, refused rather than approximated.
+    if value("variance_type") in ("learned", "learned_range"):
+        raise ValueError("Native source scheduling does not implement learned variance")
+    clip, threshold = _x0_limit(kind, source, value)
+    zero_snr_tail, lambda_clipped = _lambda_clipping(family, value, betas)
     original_steps = records.integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
@@ -556,45 +554,51 @@ def _resolve(kind: str, source: _Class, value: Control,
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
     order = records.integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
-    flow_shift = _flow_shift(kind, value, transform, algorithm)
+    flow_shift = _flow_shift(value, transform, algorithm)
     policy = SourcePolicy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
         offset=records.integer(value("steps_offset", 0), "steps_offset"),
         transform=transform,
-        karras_round=(kind in _KARRAS_ROUNDS
-                      or (kind == "DPMSolverMultistep"
-                          and value("beta_schedule") != "squaredcos_cap_v2")),
+        karras_round=source.karras_round(value),
         terminal=terminal,
-        grid_terminal=kind in ("DEISMultistep", "UniPCMultistep"),
+        grid_terminal=source.grid_terminal,
         zero_snr_tail=zero_snr_tail, lambda_clipped=lambda_clipped,
         sigma_min=None if sigma_min is None else records.number(sigma_min, "sigma_min"),
         sigma_max=None if sigma_max is None else records.number(sigma_max, "sigma_max"),
         sigma_data=records.number(value("sigma_data", 0.5), "sigma_data"),
         rho=records.number(value("rho", 7.0), "rho"),
-        stride=kind in ("DDIM", "PNDM"),
-        clean_terminal=(kind == "DDPM"
-                        or records.boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one")),
+        stride=source.stride,
+        clean_terminal=records.boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one"),
         clip=clip, threshold=threshold,
-        recompute_epsilon=(kind in ("DDPM", "DEISMultistep")
-                           or (family == "lambda" and algorithm in ("dpmsolver", "sde-dpmsolver"))),
-        distilled=kind in ("LCM", "TCD"),
+        recompute_epsilon=source.recompute_epsilon or algorithm in ("dpmsolver", "sde-dpmsolver"),
+        distilled="original_inference_steps" in declared,
         original_steps=original_steps,
         timestep_scaling=records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow, flow_shift=flow_shift)
-    controls = _Controls(kind, value, order, algorithm, terminal, variance, disabled)
-    return policy, _SOURCES[kind].solver(controls)
+    return policy, source.solver(_Controls(value, order, algorithm, terminal, disabled))
 
 
 def _dpm_multistep(controls: _Controls) -> Solver:
     return DPMSolverMultistep(controls.order, controls.algorithm,
-                              _solver_type(controls.kind, controls.value, ("midpoint", "heun")),
+                              _solver_type(controls.value, ("midpoint", "heun")),
                               controls.flag("lower_order_final"), controls.flag("euler_at_final"))
 
 
 def _deis(controls: _Controls) -> Solver:
-    _solver_type(controls.kind, controls.value, ("logrho",))
+    # DEIS rewrites the two DPM-Solver names to its own and refuses the rest;
+    # its native integrator carries neither control.
+    algorithm = controls.value("algorithm_type")
+    named_choice("deis" if algorithm in ("dpmsolver", "dpmsolver++") else algorithm, "algorithm_type",
+                 ("deis",))
+    _solver_type(controls.value, ("logrho",))
     return DEIS(controls.order, controls.flag("lower_order_final"))
+
+
+def _ddpm(controls: _Controls) -> Solver:
+    mode = named_choice(controls.value("variance_type"), "variance_type",
+                        ("fixed_small", "fixed_small_log", "fixed_large"))
+    return DDPM("large" if mode == "fixed_large" else "small")
 
 
 def _optional_seed(value: Control) -> int | None:
@@ -602,7 +606,7 @@ def _optional_seed(value: Control) -> int | None:
     return None if seed is None else records.integer(seed, "noise_sampler_seed")
 
 
-def _prediction_transform(policy: SourcePolicy, prediction: str) -> PredictionTransform:
+def _prediction_transform(policy: SourcePolicy, prediction: str, source: _Class) -> PredictionTransform:
     """What the model predicts on this class's grid, with the class's own input
     scaling and its own limit on x_0."""
     if policy.family == "flow":
@@ -621,6 +625,6 @@ def _prediction_transform(policy: SourcePolicy, prediction: str) -> PredictionTr
     if policy.clip is not None or policy.threshold is not None:
         inner = SourceLimitedPrediction(inner, clip=policy.clip, threshold=policy.threshold,
                                         recompute_epsilon=policy.recompute_epsilon)
-    if policy.kind == "LCM":
+    if source.boundary:
         return ConsistencyBoundary(inner, policy.timestep_scaling)
     return inner
