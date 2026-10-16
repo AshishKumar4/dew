@@ -4,6 +4,7 @@ of squares of the terms its final sums add, carried into it, and nothing behind 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.ad_checkpoint import checkpoint_name
 from reference_error import float64_terms
 
 
@@ -57,3 +58,38 @@ def test_a_sum_of_one_sign_has_its_own_size_and_an_update_its_steps_terms():
     np.testing.assert_allclose(trace_terms, np.sqrt((0.81 + 1) * energy), rtol=1e-12)
     # The weight moved by 0.1 of each step's momentum; the value it started at carries none.
     np.testing.assert_allclose(moved_terms, np.sqrt(0.01 * (1 + 0.81 + 1) * energy), rtol=1e-12)
+
+
+def test_a_recomputed_body_sums_its_own_terms():
+    """A body under jax.checkpoint, as a recomputed norm's, is the computation's own: a key bias's
+    gradient computed inside one sums the same cancelling terms as outside it, not its own near-zero
+    size."""
+    rng = np.random.default_rng(0)
+    query, keys, values = (rng.normal(size=shape) for shape in ((2, 4), (2, 6, 4), (2, 6, 3)))
+    gradient = jax.grad(lambda bias: loss_of(keys + bias, query, values))
+
+    with jax.enable_x64(new_val=True):
+        _, plain = float64_terms(gradient, jnp.zeros(4))
+        _, recomputed = float64_terms(jax.checkpoint(gradient), jnp.zeros(4))
+    np.testing.assert_allclose(recomputed, plain, rtol=1e-12)
+    assert np.all(recomputed > 1e-3)
+
+
+def test_a_named_sum_carries_its_terms_through_a_residual_add():
+    """A block names its projection's output for a remat policy
+    (`checkpoint_name`) before the residual add. The name moves the sum, so
+    the stream's terms are the projection's whatever the stream holds: an
+    entry where the add cancels keeps the projection's terms, not its own
+    near-zero size (FrontDamselfly, MiMo's vision tower)."""
+    rng = np.random.default_rng(2)
+    x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
+
+    def block(stream, x, weight):
+        return stream + checkpoint_name(x @ weight, "down_proj")
+
+    with jax.enable_x64(new_val=True):
+        stream = -(x @ weight)
+        stream[0, 0] += 1e-9
+        value, terms = float64_terms(block, stream, x, weight)
+    np.testing.assert_allclose(terms, np.sqrt(np.square(x) @ np.square(weight)), rtol=1e-12)
+    assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
