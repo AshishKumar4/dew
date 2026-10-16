@@ -7,21 +7,26 @@ sampled ids (vLLM's `return_tokens_as_token_ids` renders them into the
 logprob tokens, SGLang's `return_token_ids` lists them on the choice) and one
 reported log-probability per sampled token. The safetensors reload writes a
 real Qwen2 export that `Pretrained.load` reads back, and posts the reload
-calls to a real local HTTP endpoint in order.
+calls to a real local HTTP endpoint in order. The NCCL push posts its calls
+to the same endpoints and drives a recording stand-in for its NCCL library.
 """
 
+import base64
+import itertools
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inference import OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
+from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
 from dew.interop import Pretrained
 from dew.sampling import Sampling
 
@@ -118,16 +123,22 @@ def test_sglang_ids_are_read_without_likelihoods():
     assert result.tokens == ((3, 5),) and result.log_probs == (None,)
 
 
+ORDER = itertools.count()
+"""One clock for the engines' requests and the recorded collectives, so their order can be compared."""
+
+
 class Engine(BaseHTTPRequestHandler):
     """Records every request's path, query and body and answers like the engine it stands for.
 
     Like vLLM v0.30.0, `/pause` and `/resume` answer a status,
     `/reset_prefix_cache` answers 200 with `{"success": true}`, and
-    `/update_weight_version` answers `{"success": true}`. Like SGLang
-    v0.5.20, a weight update answers `success` in its body and flushes the
-    radix cache unless the request says otherwise. Every replica is its own
-    server, so each keeps its own record, and a path in its `refuses` answers
-    500, as a failed engine call does.
+    `/update_weight_version` answers `{"success": true}`. A replica of one
+    worker answers `/get_world_size` with 1, and the NCCL weight-transfer
+    calls with success. Like SGLang v0.5.20, a weight update answers
+    `success` in its body and flushes the radix cache unless the request says
+    otherwise. Every replica is its own server, so each keeps its own record,
+    with each request's tick of `ORDER` in `order`, and a path in its
+    `refuses` answers 500, as a failed engine call does.
     """
 
     def answer(self, status, body):
@@ -136,12 +147,22 @@ class Engine(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
 
+    def recorded(self, body):
+        path, _, query = self.path.partition("?")
+        self.server.seen.append((path, query, body))
+        self.server.order.append(next(ORDER))
+        return path
+
+    def do_GET(self):
+        if self.recorded(None) == "/get_world_size":
+            return self.answer(200, {"world_size": 1})
+        return self.answer(404, {"error": "unknown"})
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         body = json.loads(raw) if raw else None
-        path, _, query = self.path.partition("?")
-        self.server.seen.append((path, query, body))
+        path = self.recorded(body)
         if path in self.server.refuses:
             return self.answer(500, {"error": f"{path} failed"})
         if path in ("/pause", "/resume"):
@@ -150,7 +171,8 @@ class Engine(BaseHTTPRequestHandler):
             return self.answer(200, [None])
         if path == "/update_weight_version":
             return self.answer(200, {"success": True, "new_version": body["new_version"]})
-        if path == "/reset_prefix_cache":
+        if path in ("/reset_prefix_cache", "/init_weight_transfer_engine", "/start_weight_update",
+                    "/update_weights", "/finish_weight_update"):
             return self.answer(200, {"success": True})
         self.server.flushed.append(body.get("flush_cache", True))
         self.answer(
@@ -164,13 +186,13 @@ class Engine(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def replicas():
-    """Start local engine stand-ins on demand; each has `url`, `seen`, `flushed` and `refuses`."""
+    """Start local engine stand-ins on demand, each with `url`, `seen`, `order`, `flushed` and `refuses`."""
     started = []
 
     def start(count):
         for _ in range(count):
             server = HTTPServer(("127.0.0.1", 0), Engine)
-            server.seen, server.flushed, server.refuses = [], [], ()
+            server.seen, server.order, server.flushed, server.refuses = [], [], [], ()
             server.url = f"http://127.0.0.1:{server.server_port}"
             threading.Thread(target=server.serve_forever, daemon=True).start()
             started.append(server)
@@ -229,6 +251,75 @@ def test_a_vllm_replica_that_fails_to_reload_holds_every_replica_paused(tmp_path
         push(doubled(source), 5)
     for server in engines:
         assert paths(server) == ["/pause", "/collective_rpc"]
+
+
+class Collectives:
+    """A recording stand-in for the NCCL library a push drives, which `NCCLPush` builds only when it
+    holds none: each open makes the next numbered group, and each call is logged with its `ORDER`
+    tick, group, element count and dtype, moving no data."""
+
+    def __init__(self):
+        self.calls, self.groups = [], 0
+
+    def unique_id(self):
+        return SimpleNamespace(internal=bytes(128))
+
+    def open(self, uid, rank, world):
+        self.groups += 1
+        self.calls.append((next(ORDER), "open", self.groups, rank, world))
+        return self.groups
+
+    def all_reduce(self, comm, pointer, count, dtype):
+        self.calls.append((next(ORDER), "all_reduce", comm, count, dtype))
+
+    def broadcast(self, comm, pointer, count, dtype):
+        self.calls.append((next(ORDER), "broadcast", comm, count, dtype))
+
+    def synchronize(self):
+        self.calls.append((next(ORDER), "synchronize", None, None, None))
+
+    def abort(self, comm):
+        self.calls.append((next(ORDER), "abort", comm, None, None))
+
+
+def test_an_nccl_push_makes_the_calls_its_replicas_and_groups_expect(replicas):
+    """Two one-worker vLLM replicas behind a recording NCCL library. Each
+    replica is asked its world size and joins its group once, then pauses,
+    starts the update, takes the listing of every tensor, finishes the update
+    under the version, resets its prefix cache and resumes. Each group opens
+    with the sender at rank 0 of two and warms up with one float32, then
+    receives every listed tensor in the listing's order. Every broadcast
+    comes after every replica started the update and before any finished it,
+    and no group is aborted."""
+    source = Pretrained.load(FIXTURE, dtype="float32")
+    engines = replicas(2)
+    collectives = Collectives()
+    push = NCCLPush(source, tuple(server.url for server in engines), library=__file__)
+    push._library = collectives
+    push(doubled(source), 3)
+
+    listings = []
+    for server in engines:
+        assert paths(server) == ["/get_world_size", "/init_weight_transfer_engine", "/pause",
+                                 "/start_weight_update", "/update_weights", "/finish_weight_update",
+                                 "/reset_prefix_cache", "/resume"]
+        world, joined, paused, _, update, finished, _, _ = server.seen
+        assert world[1] == "include_dp=true" and paused[1] == "mode=wait"
+        assert joined[2] == {"init_info": {"nccl_unique_id_b64": base64.b64encode(bytes(128)).decode(),
+                                           "rank_offset": 1, "world_size": 2, "packed": False}}
+        assert finished[2] == {"weight_version": "3"}
+        listings.append(update[2]["update_info"])
+    listing = listings[0]
+    assert listings[1] == listing and listing["names"] == sorted(listing["names"])
+    assert [call[1:] for call in collectives.calls if call[1] in ("open", "all_reduce")] == [
+        ("open", 1, 0, 2), ("all_reduce", 1, 1, "float32"),
+        ("open", 2, 0, 2), ("all_reduce", 2, 1, "float32")]
+    assert [call[2:] for call in collectives.calls if call[1] == "broadcast"] == [
+        (group, math.prod(shape), dtype)
+        for shape, dtype in zip(listing["shapes"], listing["dtype_names"], strict=True) for group in (1, 2)]
+    sent = [call[0] for call in collectives.calls if call[1] == "broadcast"]
+    assert all(server.order[3] < min(sent) and max(sent) < server.order[5] for server in engines)
+    assert not [call for call in collectives.calls if call[1] == "abort"]
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
