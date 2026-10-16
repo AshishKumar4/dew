@@ -76,6 +76,30 @@ _LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
 _GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
+_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\]')
+_BITS = re.compile(r'(\d+)')
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+"""The HLO ops that move data between devices. XLA runs some as an async
+pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
+computation that holds the op itself."""
+
+
+def collective(op: str) -> str | None:
+    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
+    kind = op.removesuffix('-start').removesuffix('-done')
+    return kind if kind in COLLECTIVES else None
+
+
+def _buffers(shape: str) -> tuple[int, ...]:
+    """The bytes of each array an instruction's result holds, a tuple's every
+    element: its element type's width (`pred` a byte) by its dimensions."""
+    found = []
+    for element, dims in _ARRAY.findall(shape):
+        bits = 8 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
+        found.append(bits * math.prod(int(d) for d in dims.split(',') if d) // 8)
+    return tuple(found)
+
+
 _CUSTOM_CALLS = (
     ("gemm", re.compile(r'^__cublas')),
     ("convolution", re.compile(r'^__cudnn\$conv')),
@@ -100,6 +124,8 @@ class _Instruction:
     traced: tuple[str, ...] = ()
     """Its metadata's `op_name source_file:line`, interned: a module repeats
     each a great many times."""
+    buffers: tuple[int, ...] = ()
+    """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
 
 
 @dataclass
@@ -185,8 +211,9 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         attributes, metadata = _without_metadata(attributes)
         traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
                        for op_name, file, line in _TRACED.findall(metadata) if op_name)
+        buffers = _buffers(match.group('shape')) if collective(match.group('op')) else ()
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced)
+                                                      recomputed, traced, buffers)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -365,6 +392,9 @@ class HloInstruction:
     runs: float
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
+    buffers: tuple[int, ...]
+    """A collective's result, each array's bytes: an async pair's `-done` holds
+    what moved, its `-start` what it read as well. Empty for any other op."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -417,7 +447,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads, flops, weights.get(called_as, 0.0))
+                                         reads, flops, weights.get(called_as, 0.0), instruction.buffers)
     computations.clear()
     return found
 
