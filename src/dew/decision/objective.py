@@ -97,7 +97,7 @@ class Encoding:
     none_of_the_above: float = 0.0
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
-                 tokens: Sequence[int] | None = None) -> Batch:
+                 tokens: np.ndarray | None = None) -> Batch:
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
             names = [names[int(index)] for index in rng.permutation(len(names))]
@@ -127,7 +127,7 @@ class Encoding:
             else None
         )
         rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=tokens)
+                                tokens=None if tokens is None else tokens.tolist())
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -202,8 +202,9 @@ class FittedRow:
     names: tuple[str, ...]
     length: int
     truncated: bool
-    tokens: tuple[int, ...]
-    """The state's tokens, which the encoding lays out again."""
+    tokens: np.ndarray
+    """The state's tokens, which the encoding lays out again, as int32: a read
+    held in memory keeps them for every example."""
 
 
 @dataclass(frozen=True)
@@ -220,11 +221,12 @@ class Fit(pygrain.MapTransform):
         if not labels:
             return Rejected("unlabelled")
         asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        tokens = self.layout.state(self.tokenizer, self.specials, example.state)
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=tokens)
+        state = self.layout.state(self.tokenizer, self.specials, example.state)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
         if not all(map(self.layout.fits, laid)):
             return Rejected("unfit")
         self.head.validate_rows(laid)
+        tokens = np.asarray(state, np.int32)
         fitted = tuple(
             FittedRow(
                 example,
