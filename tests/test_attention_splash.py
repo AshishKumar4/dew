@@ -522,25 +522,31 @@ def vjp_of(attend):
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
-def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, split):
-    """Splash over rows split two ways, or query heads split two ways with the key heads they read,
-    runs per shard (`sharded.assert_runs_per_shard`) under pallas's interpreter: the output and the
-    three input gradients within the float64 gate of one device's, and no operand moved between
-    devices."""
+@pytest.mark.parametrize("axis, key_heads, packed",
+                         [("data", 2, True), ("tensor", 2, False), ("tensor", 1, False)],
+                         ids=["packed-rows", "heads", "heads-past-the-keys"])
+def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
+    """Splash over packed rows split two ways, query heads split two ways with the key heads they read,
+    or query heads split past their one key head, which each shard then holds a copy of, runs per shard
+    (`sharded.assert_runs_per_shard`) under pallas's interpreter: the output and the three input
+    gradients within the float64 gate of one device's, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
     query, _, _ = qkv((2, 256, 4, 64), jnp.float32)
-    _, key, value = qkv((2, 256, 2, 64), jnp.float32, seed=1)
+    _, key, value = qkv((2, 256, key_heads, 64), jnp.float32, seed=1)
     cotangent = qkv((2, 256, 4, 64), jnp.float32, seed=2)[0]
+    structure = {"causal": True, "segment_ids": packed_ids((100, 156), (30, 226)) if packed else None}
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent)]
-        truth = jax.tree.map(np.asarray, vjp_of(lambda q, k, v: exact_attention(q, k, v, causal=True))(*wide))
-    spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
+        truth = jax.tree.map(np.asarray, vjp_of(lambda q, k, v: exact_attention(q, k, v, **structure))(*wide))
+    rows, heads = PartitionSpec(axis), PartitionSpec(None, None, axis)
+    queries = rows if axis == "data" else heads
+    keys = rows if axis == "data" else heads if key_heads > 1 else PartitionSpec()
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    splash = functools.partial(scaled_dot_product_attention, implementation='tpu', causal=True)
-    assert_runs_per_shard(vjp_of(splash), (query, key, value, cotangent), [spec] * 4, mesh, truth)
+    splash = functools.partial(scaled_dot_product_attention, implementation='tpu', **structure)
+    assert_runs_per_shard(vjp_of(splash), (query, key, value, cotangent), [queries, keys, keys, queries],
+                          mesh, truth)
 
 
 @pytest.mark.mesh(devices=4)
