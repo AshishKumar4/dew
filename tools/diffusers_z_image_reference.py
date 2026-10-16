@@ -86,12 +86,9 @@ def rounded_timestep_embedding(t, dim, max_period=10000):
 def rounded_frequency_table():
     from diffusers.models.transformers import transformer_z_image
 
-    original = transformer_z_image.TimestepEmbedder.timestep_embedding
-    transformer_z_image.TimestepEmbedder.timestep_embedding = staticmethod(rounded_timestep_embedding)
-    try:
+    with replaced((transformer_z_image.TimestepEmbedder, "timestep_embedding",
+                   staticmethod(rounded_timestep_embedding))):
         yield
-    finally:
-        transformer_z_image.TimestepEmbedder.timestep_embedding = original
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
