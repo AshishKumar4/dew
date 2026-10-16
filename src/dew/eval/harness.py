@@ -175,7 +175,7 @@ class DewLM(TemplateLM):
         return DEFAULT_CONTEXT if declared is None else declared
 
     def tok_encode(self, string: str, add_special_tokens: bool | None = None,
-                   left_truncate_len: int | None = None, **kwargs: object) -> list[int]:
+                   left_truncate_len: int | None = None, **kwargs: int | None) -> list[int]:
         """Encode `string` with the run's own tokenizer into one row of ids, as `HFLM.tok_encode` does.
 
         The run's processor adds the special tokens it added in training.
@@ -207,7 +207,7 @@ class DewLM(TemplateLM):
 
     def _loglikelihood_tokens(self, requests: Sequence[TokenRequest],
                               disable_tqdm: bool = False,
-                              **kwargs: object) -> list[tuple[float, bool]]:
+                              **kwargs: int | None) -> list[tuple[float, bool]]:
         """Return each pair's summed continuation log-probability, and whether
         greedy decoding of the context would have produced the continuation.
 

@@ -855,12 +855,14 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
     partitions, of whole `[..., vocab]` logits, in fp32 or wider (a float64
     reference's), as the tiled head sums, and over `temperature`, with column
-    `excluded` given no mass. The row reduction is the tiled head's own
-    (`_row_terms`)."""
+    `excluded` given no mass."""
     logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
-    log_z, top, _ = _row_terms(logits, predict)
-    return log_z - _target_logits(logits, targets), None if top is None else top[1], log_z
+    # Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, which
+    # the tiled head's own backward never needs, and these losses are
+    # differentiated (a distilled student's prediction, a whole-logit model).
+    log_z = jax.nn.logsumexp(logits, axis=-1)
+    return log_z - _target_logits(logits, targets), jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
 @overload
