@@ -284,15 +284,21 @@ LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, f
 """The port's own launches, each a tuner KernelOp."""
 
 
+@pytest.fixture(scope="module")
+def tiles_case():
+    """The tiles case's operands, the port as a function of them, fla's outputs and gradients, and
+    float64 truth with its terms (`float64_truth`), which every launch's tiles are held to."""
+    inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
+    return inputs, run, fla_side(inputs, cuts, jnp.bfloat16), *float64_truth(inputs, cuts)
+
+
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("launch", LAUNCHES, ids=lambda kind: kind.__name__)
-def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch):
+def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch, tiles_case):
     """Every tile in the space of each of the port's own launches on this GPU (tests/tuned.py's
     `each_config`), pinned (`tuning.pinned`), keeps each output and gradient as near the float64
     recurrence as fla's own, at a partial last chunk."""
-    inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
-    theirs = fla_side(inputs, cuts, jnp.bfloat16)
-    truth, terms = float64_truth(inputs, cuts)
+    inputs, run, theirs, truth, terms = tiles_case
     for tiles in each_config(launch, run, *inputs[:-2]):
         with tuning.pinned({launch: tiles}):
             mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
