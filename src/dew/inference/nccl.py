@@ -18,10 +18,11 @@ it base64-encoded (`nccl_unique_id_b64`), and both sides enter
 The workers' communicator then runs a one-element all-reduce, which this side
 matches before its first broadcast.
 
-A push pauses each replica with `mode=wait` and posts `/update_weights`, which
-returns once every tensor has landed, while this side broadcasts them; it then
-sets the version, resets the prefix cache and resumes, with the pause and
-failure rules of `SafetensorsReload`. Every process of a pool calls the push,
+A push runs the vLLM publication lifecycle `SafetensorsReload` runs: it pauses
+each replica with `mode=wait`, delivers, resets the prefix cache and resumes,
+and stops at a phase that fails on any replica. Its delivery starts the update,
+posts `/update_weights`, which returns once every tensor has landed, while this
+side broadcasts them, and finishes the update under the version. Every process of a pool calls the push,
 and the policy is gathered to process 0 as `SafetensorsReload` gathers it, in
 groups of at most `dew.coordination.GATHER_BYTES`.
 """
@@ -32,7 +33,8 @@ import base64
 import ctypes
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -48,7 +50,7 @@ from dew.objectives.base import Variables
 from dew.records import JSON
 from dew.telemetry.devices import primary_context
 
-from .rollouts import _post, _served
+from .rollouts import _on_every, _post, _served, _vllm_publication
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
@@ -219,9 +221,28 @@ class NCCLPush:
         self.timings["export"] = time.perf_counter() - began
         library = self._opened(target, ordinal)
         began = time.perf_counter()
-        for root in self.engines:
-            _post(root, "/pause?mode=wait", None, self.timeout)
+        _vllm_publication(self.engines, version, self.timeout,
+                          lambda: self._deliver(library, target, names, tensors, version), stamped=True)
+        self.timings["send"] = time.perf_counter() - began
+
+    def _deliver(self, library: _Library, target: SingleDeviceSharding, names: Sequence[str],
+                 tensors: Sequence[np.ndarray], version: int) -> Mapping[str, BaseException]:
+        """Load `tensors` into every paused replica over its group and finish the update under `version`.
+
+        Each replica's `/update_weights` waits for the broadcast this side
+        runs meanwhile. A failed broadcast, or a replica that did not take the
+        tensors, closes the groups, since a group whose broadcast or replica
+        failed cannot deliver the next version.
+        """
+        def start(root: str) -> None:
             _post(root, "/start_weight_update", None, self.timeout)
+
+        def finish(root: str) -> None:
+            _post(root, "/finish_weight_update", {"weight_version": str(version)}, self.timeout)
+
+        failures = _on_every(self.engines, start)
+        if failures:
+            return failures
         listing: JSON = {
             "update_info": {
                 "names": list(names),
@@ -229,33 +250,20 @@ class NCCLPush:
                 "shapes": [[int(size) for size in tensor.shape] for tensor in tensors],
             }
         }
-        failures: list[BaseException] = []
-
-        def receive(root: str) -> None:
+        with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
+            receives = [(root, pool.submit(_post, root, "/update_weights", listing, self.timeout))
+                        for root in self.engines]
             try:
-                _post(root, "/update_weights", listing, self.timeout)
-            except BaseException as failure:
-                failures.append(failure)
-
-        receivers = [threading.Thread(target=receive, args=(root,)) for root in self.engines]
-        for receiver in receivers:
-            receiver.start()
-        try:
-            self._broadcast(library, target, tensors)
-        except BaseException:
-            self.close()
-            raise
-        finally:
-            for receiver in receivers:
-                receiver.join()
+                self._broadcast(library, target, tensors)
+            except BaseException:
+                self.close()
+                raise
+        failures = {root: failure for root, receive in receives
+                    if (failure := receive.exception()) is not None}
         if failures:
             self.close()
-            raise RuntimeError(f"version {version} did not reach every replica") from failures[0]
-        for root in self.engines:
-            _post(root, "/finish_weight_update", {"weight_version": str(version)}, self.timeout)
-            _post(root, "/reset_prefix_cache", None, self.timeout, reports=True)
-            _post(root, "/resume", None, self.timeout)
-        self.timings["send"] = time.perf_counter() - began
+            return failures
+        return _on_every(self.engines, finish)
 
     def _opened(self, target: SingleDeviceSharding, ordinal: int) -> _Library:
         """The library bound to the sending device, CUDA `ordinal`, with a group open to every replica."""

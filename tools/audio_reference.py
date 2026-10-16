@@ -9,6 +9,7 @@ input gradients and one SGD update. No pretrained weights are downloaded.
 """
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -93,8 +94,9 @@ def to_arrays(state):
 
 
 def write_reference(root):
-    if transformers.__version__ != "5.16.1":
-        raise RuntimeError("Reference fixtures require Transformers 5.16.1")
+    from reference_releases import require
+
+    require("transformers")
     torch.set_num_threads(2)
     sounds = waveforms()
     for kind in ("gemma3n", "gemma4"):
@@ -109,6 +111,15 @@ def write_reference(root):
         output = model(features, ~mask if kind == "gemma3n" else mask)
         valid = ~output.audio_mel_mask if kind == "gemma3n" else output.attention_mask
         hidden = output.last_hidden_state
+        # Gemma 4's tower in bf16, its clip bounds bf16 buffers as torch.clamp reads them. Its float32
+        # output is the truth the bf16 tower is held to: the tower widens its queries, keys and values
+        # to float32 (modeling_gemma4.py:314-316), so it runs in no wider precision.
+        lowered = {}
+        if kind == "gemma4":
+            with torch.no_grad():
+                tower = copy.deepcopy(model).to(torch.bfloat16)
+                encoded = tower(features.detach().to(torch.bfloat16), mask).last_hidden_state
+                lowered["encoded_bf16"] = encoded.float().numpy()
         soft = projector(inputs_embeds=hidden)
         coefficient = torch.linspace(-1, 1, soft.numel()).reshape_as(soft)
         loss = torch.mean(soft * coefficient)
@@ -120,7 +131,7 @@ def write_reference(root):
         np.savez(directory / "reference.npz", input_features=features.detach().numpy(),
                  input_features_mask=mask.numpy(), encoded=hidden.detach().numpy(), valid=valid.numpy(),
                  projected=soft.detach().numpy(), input_gradient=features.grad.detach().numpy(),
-                 coefficient=coefficient.numpy(), loss=loss.detach().numpy())
+                 coefficient=coefficient.numpy(), loss=loss.detach().numpy(), **lowered)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.add_(parameter.grad, alpha=-LEARNING_RATE)

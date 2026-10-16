@@ -338,8 +338,9 @@ def write_attention() -> None:
 
 
 def main() -> None:
-    if transformers.__version__ != "5.16.1":
-        raise SystemExit(f"the fixtures pin transformers 5.16.1, got {transformers.__version__}")
+    from reference_releases import require
+
+    require("transformers")
     for name in DECODERS:
         write_decoder(name)
     write_workflow()

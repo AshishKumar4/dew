@@ -115,33 +115,32 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
     return max(rank - 2, 0)
 
 
-def _language_layout(name: str, text_name: str, tensor: np.ndarray,
-                     config, model_type: str, variables: Mapping[str, object],
-                     component: str | None = None) -> WeightLayout | None:
-    """Return the leaves the text family maps a source tensor to and the
-    storage operations that rebuild it from them; a `packed` tensor is built
-    from the layouts of its parts."""
+def _reading_layout(name: str, reading: decoder_parts.Reading, config, model_type: str,
+                    variables: Mapping[str, object], component: str | None = None) -> WeightLayout | None:
+    """The binding of the stored tensor `name` that the text family reads as `reading`
+    (`DecoderFamily.readings`): the leaves its parts fill and the storage operations that rebuild
+    it from them, a `packed` tensor's from the layouts of its parts; None where no leaf takes it."""
     family = decoders.families()[model_type]
-    packing = family.packing(text_name)
-    if packing is None:
-        return _leaf_layout(name, text_name, tensor, family, config, variables, component)
-    parts = [_leaf_layout(part, part, value, family, config, variables, component)
-             for part, value in packing.split(text_name, tensor, config).items()]
+    if reading.packing is None:
+        # The tensor as stored, which `prepare` may have reshaped for the tree.
+        stored = reading.parts[0]._replace(tensor=reading.stored)
+        return _leaf_layout(name, stored, family, variables, component)
+    parts = [_leaf_layout(part.name, part, family, variables, component) for part in reading.parts]
     if any(part is None for part in parts):
         raise ValueError(f"packed tensor {name!r} has no parameter path")
-    return packing.layout(name, [part for part in parts if part is not None], config)
+    return reading.packing.layout(name, [part for part in parts if part is not None], config)
 
 
-def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_parts.DecoderFamily,
-                 config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
+def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.DecoderFamily,
+                 variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    path = family.source_path(text_name, config)
-    if path is None:
+    tensor = part.tensor
+    if part.path is None:
         return None
-    path, expert_index = _stacked_expert(path)
+    path, expert_index = _stacked_expert(part.path)
     paths = (nested(path),)
     if path[-1] == "kernel" and tensor.ndim == 2:
         lead = _leading_axes(variables, paths[0], expert_index)
@@ -149,16 +148,20 @@ def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_
     # A floating weight is written in its leaf's dtype; an index table
     # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
-    padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
+    padded = tensor.shape[0] if part.name.endswith(family.zero_padded) else None
     return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 
 
-def _wrapper_layouts(tensors, record, variables):
+def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading]):
     """Return one `WeightLayout` per wrapper source tensor.
 
     Each layout keeps the source's own tensor name and points at the leaf path
-    the loader built, so an export writes the names the source shipped.
+    the loader built, so an export writes the names the source shipped. The
+    language model's tensors bind through the readings its load placed
+    (`language`, by its local names), an alias of a local name through the
+    same one.
     """
+    readings = {reading.name: reading for reading in language}
     from dew.nn import vision
     from dew.nn.vision.common import projector_weight_path
 
@@ -169,8 +172,8 @@ def _wrapper_layouts(tensors, record, variables):
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
         if group == "language_model":
-            layout = _language_layout(name, local, tensor, record["text"], record["text_model_type"],
-                                      variables, "language_model")
+            layout = _reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
+                                     record["text_model_type"], variables, "language_model")
             if layout is None:
                 retained[name] = tensor
             else:
@@ -370,11 +373,14 @@ class Pretrained:
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        # A run over a source's own processor records its source, and the bundle writes its files.
+        source = declaration.get('processor')
+        processor = None if source is None else load_processor(text(source, 'processor'), model)
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
-            bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
-                                                   generation_config=generation)
+            bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
+                                                          generation_config=generation), processor=processor)
             if objectives[kind] is objectives['masked_diffusion']:
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
@@ -384,7 +390,7 @@ class Pretrained:
             from dew.interop import diffusion_gemma
             block = from_record(DiffusionGemma, model)
             bundle = PretrainedBlockDecoder(
-                block, variables, None, diffusion_gemma.published_config(block), None,
+                block, variables, processor, diffusion_gemma.published_config(block), None,
                 model_config.fields, {}, export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
@@ -871,16 +877,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if not (directory / "model_index.json").is_file():
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json")
-    with open(directory / "model_index.json") as handle:
-        index = json.load(handle)
+    index = json.loads((directory / "model_index.json").read_text())
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
     if variables is None:
         skipped = () if text else text_components(
             pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
-        # Both fetches at the commit the metadata resolved to.
-        directory = sources.snapshot(checkpoint, directory.name, weights=tuple(
-            name for name in index if component_present(index, name) and name not in skipped))
+        directory = _pipeline_weights(checkpoint, directory, index, skipped)
     if size is not None:
         if len(size) not in (2, 3):
             raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
@@ -888,12 +891,36 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         if len(size) == 3:
             index["dew_frames"] = size[0]
     streaming = variables is None and (mesh is not None or layout is not None)
+    return _assembled_pipeline(
+        directory, index, None if os.path.isdir(checkpoint) else directory.name,
+        lambda values: place(values, mesh, layout) if streaming else values, streaming=streaming,
+        dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype, variables=variables, text=text)
+
+
+def _pipeline_weights(name_or_dir: str | Path, directory: Path, index: Mapping[str, object],
+                      skipped: tuple[str, ...] = ()) -> Path:
+    """The snapshot with the weights of every component `index` declares but
+    `skipped`, fetched at the commit the metadata fetch returned as
+    `directory`, so the weights come from that commit even if the requested
+    branch moves."""
+    return sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
+        name for name in index if component_present(index, name) and name not in skipped))
+
+
+def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
+                        placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
+                        attention_impl: str, param_dtype: str, variables: Variables | None = None,
+                        text: bool = True) -> PretrainedPipeline:
+    """The pipeline `index` describes, assembled from the directory its
+    source resolved to (a snapshot, a single file's conversion or a DDUF
+    file's unpacking), its variables `placed` and `commit` its revision.
+    `streaming` reads the weights as `SourceLeaf`s for `placed` to place one
+    leaf at a time; `variables` and `text` are as `assemble_pipeline` takes
+    them."""
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text))
-    if streaming:
-        loaded = replace(loaded, variables=place(loaded.variables, mesh, layout))
-    return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
+    return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
@@ -973,8 +1000,10 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     fixture without processor files tokenizes text only.
 
     `source` names the local directory or the Hub repo at the commit the
-    loader resolved. Only the media branch keeps it: a task's recorded text
-    tokenizer already identifies its text preprocessing.
+    loader resolved, the identity a run records to reload the processor
+    (`load_processor`). A GGUF file's text processor keeps none, since the
+    source alone does not name the file it read. Only the media branch reads media
+    files from its directory and keeps the wrapper's translated `record`.
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -987,23 +1016,24 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                      else load_tokenizer(str(directory), local_files_only=True))
         if not hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
-        return Processor(tokenizer, config, record, model.vocab_size,
-                         source=source if media else None, directory=directory if media else None)
+        return Processor(tokenizer, config, record if media else {}, model.vocab_size,
+                         source=source if media or gguf_path is None else None,
+                         directory=directory if media else None)
     return None
 
 
 def load_processor(source: str, model: nn.Module) -> Processor | None:
-    """Reload the recorded media processor from its source, beside `model`.
+    """Reload the recorded processor from its source, beside `model`.
 
     A saved task keeps the local directory or `repo@commit` the processor's
-    files came from, not its translated fields or the task's tokenizer.
-    Reading that source's config and translating its wrapper derives the
-    media geometry again without loading the model's weights.
+    files came from, not its translated fields. Reading that source's config
+    and translating its wrapper derives a media processor's geometry again
+    without loading the model's weights.
     """
     name, revision = split_revision(source)
     directory = sources.snapshot(name, revision, weights=False)
     config, _ = _source_config(name, directory, revision, None)
-    record = decoders.translate_wrapper_config(config)
+    record = decoders.translate_wrapper_config(config) if _media_wrapper(config) else {}
     return source_processor(directory, config, record, model, source=source)
 
 
@@ -1037,12 +1067,9 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     """
 
     def pipeline(directory: Path) -> PretrainedPipeline:
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
-            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-            lazy=streaming))
-        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+        index = json.loads((directory / "model_index.json").read_text())
+        return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
+                                   attention_impl=attention_impl, param_dtype=param_dtype)
 
     if single_file is not None and dduf_file is not None:
         raise ValueError(f"single_file={single_file!r} and dduf_file={dduf_file!r} each name a whole "
@@ -1062,12 +1089,8 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        # The metadata fetch returns its commit directory, so the weights
-        # come from that commit even if the requested branch moves.
-        return pipeline(sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
-            name for name in index if component_present(index, name))))
+        return pipeline(_pipeline_weights(name_or_dir, directory,
+                                          json.loads((directory / "model_index.json").read_text())))
     return None
 
 
@@ -1167,14 +1190,18 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     return scheme.apply(model), {**variables, QUANTIZATION: held}
 
 
-def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
-                     variables: Variables) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
-    """Each source tensor's binding into the tree, and the tensors none binds."""
+def _decoder_layouts(readings: Sequence[decoder_parts.Reading], record: decoder_parts.DecoderFields,
+                     family: str, variables: Variables
+                     ) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+    """Each source tensor's binding into the tree, from the readings the load placed, and the
+    tensors none binds."""
     bindings, retained = [], {}
-    for name, tensor in tensors.items():
-        binding = _language_layout(name, name, tensor, record, family, variables)
+    for reading in readings:
+        if reading.stored is None:
+            continue
+        binding = _reading_layout(reading.name, reading, record, family, variables)
         if binding is None:
-            retained[name] = tensor
+            retained[reading.name] = reading.stored
         else:
             bindings.append(binding)
     return tuple(bindings), retained
@@ -1199,7 +1226,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    parts, language = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
     for fields in (text_fields, record['text']):
         decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
@@ -1208,7 +1235,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
-    layouts, retained = _wrapper_layouts(tensors, record, variables)
+    layouts, retained = _wrapper_layouts(tensors, record, variables, language)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
 
@@ -1244,8 +1271,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    variables = decoders.with_constants(decoders.translate_weights(
-        tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
+    placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy)
+    variables = decoders.with_constants(placed, record, directory)
     decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
@@ -1259,7 +1286,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     entry = decoders.families()[family]
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
-        layouts, retained = _decoder_layouts(tensors, record, family, variables)
+        layouts, retained = _decoder_layouts(readings, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
 

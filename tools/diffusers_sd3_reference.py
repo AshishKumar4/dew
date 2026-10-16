@@ -31,15 +31,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-import transformers.utils as transformers_utils
-
-# Diffusers 0.34.0's pipeline modules import two names Transformers dropped
-# after 4.x. The pipelines under test compute the sigma preparation this tool
-# records, so the names are restored rather than that preparation copied.
-for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
-                      ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
-    if not hasattr(transformers_utils, _name):
-        setattr(transformers_utils, _name, _value)
+from diffusers_reference_helpers import restore_transformers_names
 
 BASE = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2, attention_head_dim=8,
             num_attention_heads=2, joint_attention_dim=12, caption_projection_dim=16,
@@ -188,10 +180,13 @@ def flow_record(name: str, config: dict) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
+    # The pipelines under test compute the sigma preparation this tool records.
+    restore_transformers_names()
     import diffusers
 
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Requires diffusers==0.34.0")
+    from reference_releases import require
+
+    require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)

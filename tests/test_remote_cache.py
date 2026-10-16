@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from typing import ClassVar
 
 import remote_cache
 
@@ -130,3 +131,83 @@ for index in range(20):
     server.shutdown()
     assert done.returncode == 0, done.stderr[-2000:]
     assert time.monotonic() - began < 15
+
+
+class Counted(http.server.BaseHTTPRequestHandler):
+    """A remote that fails every request at once, but answers a GET of a `slow` program once
+    `released` is set; it counts the requests that reach it."""
+
+    requests: ClassVar[list[str]] = []
+    released: ClassVar[threading.Event] = threading.Event()
+
+    def log_message(self, *args):
+        pass
+
+    def answer(self):
+        Counted.requests.append(f"{self.command} {self.path}")
+        if self.command == "PUT":
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.command == "GET" and "/slow-" in self.path:
+            Counted.released.wait(60)
+            body = entry(2)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(500)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = do_PUT = answer
+
+
+def counted() -> tuple[http.server.ThreadingHTTPServer, str]:
+    Counted.requests = []
+    Counted.released = threading.Event()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Counted)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_a_remote_given_up_sends_none_of_the_uploads_still_queued():
+    """Twenty uploads queued behind a remote that fails each: once `FAILURES`
+    have failed, the ones still queued are dropped unsent, beyond those the
+    two upload threads had already begun."""
+    server, url = counted()
+    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    for index in range(20):
+        cache.put(f"jit_step-{index}", entry(2))
+    cache.drain()
+    server.shutdown()
+    assert not cache.available
+    assert remote_cache.FAILURES <= len(Counted.requests) <= remote_cache.FAILURES + 1
+    assert all(cache.base.get(f"jit_step-{index}") == entry(2) for index in range(20))
+
+
+def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_back():
+    """A fetch under way while other requests fail the remote: its answer is
+    kept, but the remote stays given up, and no request reaches it after."""
+    server, url = counted()
+    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    cache.names = {"slow", "fail"}
+    fetched = []
+    slow = threading.Thread(target=lambda: fetched.append(cache.get("slow-1")))
+    slow.start()
+    try:
+        while not Counted.requests:
+            time.sleep(0.01)
+        for index in range(remote_cache.FAILURES):
+            assert cache.get(f"fail-{index}") is None
+        assert not cache.available
+    finally:
+        # The slow answer arrives only once the remote was given up.
+        Counted.released.set()
+    slow.join()
+    sent = len(Counted.requests)
+    assert cache.get("fail-late") is None
+    cache.put("fail-late", entry(2))
+    cache.drain()
+    server.shutdown()
+    assert fetched == [entry(2)] and not cache.available and len(Counted.requests) == sent

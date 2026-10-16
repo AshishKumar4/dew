@@ -157,3 +157,20 @@ def test_a_payload_selector_is_refused_where_the_fallback_reads_the_repos_own_we
     payload, so it is refused rather than dropped."""
     with pytest.raises(ValueError):
         Pretrained.load(source[0], fallback="torchax", dtype="float32", **{selector: "model.bin"})
+
+
+def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_arrive_in(source, tokens):
+    """In a bf16 forward the head multiplies bf16 states by the bf16 weight and
+    rounds the logits to bf16. The output table carries that compute dtype,
+    so states handed to it in fp32, as a loss may hold them, score as the
+    forward's own logits do: bf16 values, each within one bf16 step of the
+    forward's, which sums the same products in another order."""
+    loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
+    table = loaded.model.apply(loaded.variables, method="output_table")
+    hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
+    logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
+    scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
+    np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
+    # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
+    apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
+    assert np.abs(apart).max() <= 1

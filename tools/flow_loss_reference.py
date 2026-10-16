@@ -38,6 +38,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from reference_source import fetched, selected, simple_statements
+from torch_precision import float_as, replaced
 
 from dew.diffusion import presets
 
@@ -66,21 +67,6 @@ def velocity(weights, x, timestep):
             + torch.cos(x) * time * weights[2] + time * weights[3])
 
 
-class Precision:
-    """`.float()` reads as the run's own precision."""
-
-    def __init__(self, dtype):
-        self.dtype = dtype
-
-    def __enter__(self):
-        self.kept = torch.Tensor.float
-        torch.Tensor.float = lambda tensor, *args, **kwargs: tensor.to(self.dtype)
-        return self
-
-    def __exit__(self, *_):
-        torch.Tensor.float = self.kept
-
-
 def main() -> None:
     noising, loss_lines = published()
     generator = np.random.default_rng(13)
@@ -106,7 +92,7 @@ def main() -> None:
                      "args": types.SimpleNamespace(weighting_scheme="logit_normal"),
                      "model_input": torch.tensor(x, dtype=dtype), "noise": torch.tensor(noise, dtype=dtype),
                      "sigmas": torch.tensor(sigmas, dtype=dtype).reshape(-1, 1, 1, 1)}
-            with Precision(dtype):
+            with replaced(float_as(dtype)):
                 exec(noising, scope)
                 scope["model_pred"] = velocity(parameters, scope["noisy_model_input"],
                                                scope["sigmas"].flatten() * 1000)
