@@ -252,6 +252,13 @@ CONVERGES_ON = {
 """The cases a solver that integrates any Gaussian process reaches the data
 on, where that takes its own model or table."""
 
+REFUSES = {
+    # PNDM's transfer is DDIM's for a variance-preserving process: with alpha 1
+    # its eps term vanishes, and with flow's rates it is another process's.
+    "pndm": ("karras", "flow"),
+}
+"""The families a solver that reaches its data by `CONVERGES_ON` refuses."""
+
 
 def assert_reaches_its_data(case, solver, steps=100):
     build, shape, reaches = PROCESS_CASES[case]
@@ -267,7 +274,7 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
     integrated = INTEGRATES.get(name)
     for case in integrated or CONVERGES_ON.get(name, GAUSSIAN):
         assert_reaches_its_data(case, solver)
-    refused = () if integrated is None else sorted(set(FAMILIES) - set(integrated))
+    refused = REFUSES.get(name, ()) if integrated is None else sorted(set(FAMILIES) - set(integrated))
     for case in refused:
         build, shape, _ = PROCESS_CASES[case]
         with pytest.raises(ValueError):
