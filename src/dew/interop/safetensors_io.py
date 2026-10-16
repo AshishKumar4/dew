@@ -27,7 +27,6 @@ from dew.records import JSON
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
-INDEX_FILE = "model.safetensors.index.json"
 CONFIG_FILE = "config.json"
 MAX_SHARD_SIZE = "5GB"
 """The shard size an export writes at most, as huggingface_hub's splitter
@@ -346,25 +345,31 @@ class LazyTensors(Mapping[str, np.ndarray]):
         return len(self.specs)
 
 
-def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None) -> None:
-    """Publish `model.safetensors.index.json` naming each tensor's shard file."""
+def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None,
+                stem: str = "model") -> None:
+    """Publish `<stem>.safetensors.index.json` naming each tensor's shard file."""
     metadata = {} if total_size is None else {"total_size": total_size}
-    write_atomically(directory / INDEX_FILE,
+    write_atomically(directory / f"{stem}.safetensors.index.json",
                      json.dumps({"metadata": metadata, "weight_map": dict(weight_map)}, indent=2))
 
 
-_REPLACED = re.compile(r"model\.safetensors|model-(?:[0-9a-f]{8}-)?\d{5}-of-\d{5}\.safetensors")
-"""The weight files an export replaces: the single file, and shards named as
-`save_sharded` (`model-<token>-00001-of-00002`) and transformers'
-`save_pretrained` (`model-00001-of-00002`) name them."""
+def _replaced(stem: str) -> re.Pattern[str]:
+    """The weight files an export under `stem` replaces: the single file, and shards named as
+    `save_sharded` (`<stem>-<token>-00001-of-00002`) and transformers' and diffusers'
+    `save_pretrained` (`<stem>-00001-of-00002`) name them."""
+    escaped = re.escape(stem)
+    return re.compile(rf"{escaped}\.safetensors|{escaped}-(?:[0-9a-f]{{8}}-)?\d{{5}}-of-\d{{5}}\.safetensors")
 
 
 def save_sharded(
-    tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE
+    tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE,
+    stem: str = "model",
 ) -> None:
-    """Write `tensors` as `model.safetensors`, or as numbered shards and their
+    """Write `tensors` as `<stem>.safetensors`, or as numbered shards and their
     index when they exceed `max_shard_size`, reading one shard's tensors at a
-    time.
+    time. `stem` is transformers' `model` or a diffusers model's
+    `diffusion_pytorch_model` (`WEIGHT_STEMS`), as each library names its
+    weights and reads them back.
 
     huggingface_hub's splitter plans the shards from sizes alone, so a
     `LazyTensors` table builds each shard's tensors as that shard is written
@@ -377,9 +382,9 @@ def save_sharded(
     An export replaces the one `directory` held without a moment at which a
     loader reads a mix of the two. Each shard takes a name no earlier export
     can hold, so no file an old index names is overwritten; the index (or,
-    unsharded, `model.safetensors`) is published last, in one rename, and
+    unsharded, `<stem>.safetensors`) is published last, in one rename, and
     commits the export. Only then are the earlier weight files removed: the
-    names `_REPLACED` matches that this export did not write, read off the
+    names `_replaced` matches that this export did not write, read off the
     directory's own listing. An old index's contents name nothing to
     delete, so one that names a path outside the directory, or a file of
     another name, removes nothing. transformers reads a local `model.safetensors`
@@ -395,19 +400,19 @@ def save_sharded(
              else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
     split = split_state_dict_into_shards_factory(
         dict(specs), get_storage_size=lambda spec: math.prod(spec.shape) * np.dtype(spec.dtype).itemsize,
-        filename_pattern="model{suffix}.safetensors", max_shard_size=max_shard_size)
-    old_index = folder / INDEX_FILE
+        filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)
+    old_index = folder / f"{stem}.safetensors.index.json"
     # An interrupted export may leave both an index and a single file.
-    replaced = {name for name in _listing(folder) if _REPLACED.fullmatch(name)}
+    replaced = {name for name in _listing(folder) if _replaced(stem).fullmatch(name)}
     token = secrets.token_hex(4)
-    names = {filename: (filename.replace("model-", f"model-{token}-", 1) if split.is_sharded else filename)
+    names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if split.is_sharded else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
         _publish(lambda members=members: {name: tensors[name] for name in members},
                  folder / names[filename], {"format": "pt"})
     if split.is_sharded:
         write_index(folder, {name: names[filename] for name, filename in split.tensor_to_filename.items()},
-                    split.metadata["total_size"])
+                    split.metadata["total_size"], stem)
     else:
         old_index.unlink(missing_ok=True)
     for name in replaced - set(names.values()):

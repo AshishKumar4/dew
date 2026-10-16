@@ -387,6 +387,14 @@ class SavedTask(Protocol):
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
 
 
+@runtime_checkable
+class ReleasedTask(SavedTask, Protocol):
+    """A saved task that publishes its run as a released checkpoint of its own layout
+    (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
+
+    def save_pretrained(self, directory: str) -> None: ...
+
+
 class Omitted(enum.Enum):
     """A keyword the caller left out, where None is a value of its own.
 

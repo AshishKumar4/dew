@@ -326,6 +326,34 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
         np.testing.assert_array_equal(np.asarray(ours_leaf), np.asarray(theirs_leaf))
 
 
+def test_an_adapter_names_the_model_it_was_bound_to_and_peft_reloads_it_there(decoder, reference, tmp_path):
+    """`Pretrained.adapt` binds the adapter to the source it was loaded from, and `save` names that
+    source and its revision in PEFT's config (none for a local directory). PEFT, from the adapter's
+    config, loads its base from that name and computes the logits Dew computes, and Dew's
+    own reload of the directory keeps the name, so a resave names it too."""
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    adapted = decoder.adapt(LoRA(rank=3, modules=("q_proj", "v_proj")), key=0)
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, adapted.variables)
+    adapted.adapter.save(variables, tmp_path)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert (config["base_model_name_or_path"], config["revision"]) == (str(LLAMA), None)
+    tokens = np.asarray(reference["input_ids"])
+    ours = np.asarray(adapted.model.apply(variables, jnp.asarray(tokens)))
+    base = AutoModelForCausalLM.from_pretrained(config["base_model_name_or_path"],
+                                                revision=config["revision"])
+    with torch.no_grad():
+        peft = PeftModel.from_pretrained(base, tmp_path).eval()
+        theirs = peft(torch.as_tensor(tokens)).logits.numpy()
+    np.testing.assert_allclose(ours, theirs, atol=2e-5)
+    reloaded = LoRA.load(decoder.model, decoder.variables, tmp_path, layouts=decoder.layouts)
+    assert reloaded.base == (str(LLAMA), None)
+
+
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
     """PEFT's target_modules: a suffix names every projection under it; B
     starts at zero so the adapted forward is the base forward; A is drawn
