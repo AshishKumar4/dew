@@ -90,8 +90,13 @@ class StoredJointHead:
         config = records.record(json.loads((root / HEAD_CONFIG).read_text()), HEAD_CONFIG)
         if records.number(config.get("dropout", 0.0), "dropout"):
             raise ValueError("the stored head drops out at a rate Dew's head does not train with")
-        head = JointSchemaHead.rebuilt(records.integer(config["hidden_size"], "hidden_size"), config,
-                                       dtype=dtype, attention_impl=attention_impl)
+        def size(name: str) -> int:
+            return records.integer(config[name], name)
+
+        head = JointSchemaHead(hidden_size=size("hidden_size"), width=size("width"),
+                               routing_layers=size("routing_layers"), layers=size("layers"),
+                               heads=size("heads"), feedforward=size("feedforward"), dtype=dtype,
+                               attention_impl=attention_impl)
         tensors = split_packed(read_file(root / HEAD_WEIGHTS)[0], IN_PROJ)
         flat = translate_parameters(tensors, _path, param_dtype)
         return cls(head, _shaped(head, flat))

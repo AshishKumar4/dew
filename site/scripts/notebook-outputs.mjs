@@ -94,3 +94,16 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 	return html.map(oneLine).join('\n');
 }
 
+// The site's aggregates after a render: the tutorial listing (`listing`, by slug) and the outputs
+// other pages quote (`outputs`, by notebook stem). The notebooks it rendered replace what the last
+// render left of them, the others keep it, and a notebook no longer among `stems` is dropped.
+export function inventory(previous, rendered, stems) {
+	const kept = new Set(stems.map((stem) => `tutorials/${stem}`));
+	const fresh = new Set(rendered.listing.map((entry) => entry.slug));
+	const listing = [...previous.listing.filter((entry) => kept.has(entry.slug) && !fresh.has(entry.slug)), ...rendered.listing]
+		.sort((a, b) => a.slug.localeCompare(b.slug));
+	const outputs = Object.fromEntries(
+		Object.entries({ ...previous.outputs, ...rendered.outputs }).filter(([stem]) => kept.has(`tutorials/${stem}`)),
+	);
+	return { listing, outputs };
+}

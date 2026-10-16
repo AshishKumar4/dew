@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 from common import kernel_summary, trimmed_kernels
 
+from dew.accuracy import rms
+
 FACTOR = 2.0
 CONDITIONS = ("batch", "seq", "schedule_steps", "data_sha256", "lr_peak", "lr_init", "lr_end", "warmup",
               "b1", "b2", "eps", "weight_decay", "clip")
@@ -55,10 +57,6 @@ def load(path: str) -> dict:
     if rows.is_file() and "profiled_steps" in profile:
         record["profile"] = {**profile, **kernel_summary(trimmed_kernels(rows), profile["profiled_steps"])}
     return record
-
-
-def rms(values: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.square(values)))) if values.size else math.nan
 
 
 def conditions(records: dict[str, dict]) -> list[str]:

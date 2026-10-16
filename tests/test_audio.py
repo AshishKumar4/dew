@@ -17,9 +17,10 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
-from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
+from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import Gemma3nProjectorModule, Gemma4ProjectorModule
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_weights
 from dew.nn.vision.gemma4 import translate_gemma4_projector_weights
@@ -78,6 +79,17 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
             variables["constants"])
         changed = jax.jit(model.apply)({**variables, "constants": bounds}, **features)
         assert np.max(np.abs(np.asarray(changed.features) - data["encoded"])) > 1e-3
+        # The loaded FP32 bounds clamp in the operand's dtype, as torch.clamp
+        # does, so a bf16 tower stays bf16 through every clipped map, and its
+        # output is as near the float32 tower's as the reference's bf16 tower.
+        lowered, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
+            variables, **features, capture_intermediates=lambda module, _: isinstance(module, AudioLinear)))(
+            variables)
+        assert {leaf.dtype for leaf in jax.tree.leaves(state["intermediates"])} == {jnp.dtype(jnp.bfloat16)}
+        real = np.asarray(data["valid"], bool)
+        truth = np.asarray(data["encoded"], np.float64)[real]
+        assert_as_exact_as_the_reference(np.asarray(lowered.features, np.float32)[real],
+                                         data["encoded_bf16"][real], truth, "bf16 encoded")
 
 
 @on_gpu

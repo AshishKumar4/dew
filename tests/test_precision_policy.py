@@ -1,6 +1,7 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
 import json
+from fractions import Fraction
 from importlib import import_module
 from pathlib import Path
 
@@ -379,6 +380,67 @@ def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
     assert np.float64(high) + np.float64(low) == exact
 
 
+@pytest.mark.parametrize("bit_split,subtract,barrier", [(False, False, False), (True, False, True),
+                                                       (True, True, False)],
+                         ids=["projection", "norm", "division"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_a_two_float_product_keeps_the_exact_float64_residual(bit_split, subtract, barrier, compiled):
+    """Split boundaries, product ties, both signs and 80 binades, with normal residuals.
+    Float64 represents each fp32 product exactly; neither half admits any error."""
+    from dew.nn.precision import two_product
+
+    mantissas = np.array([0, 1, 0xfff, 0x1000, 0x1001, 0x3fffff, 0x400000, 0x7ffffe, 0x7fffff], np.uint32)
+    significands = (np.uint32(127 << 23) | mantissas).view(np.float32)
+    values = np.ldexp(significands[:, None], [-40, 0, 40]).reshape(-1)
+    rng = np.random.default_rng(411)
+    random = np.ldexp(rng.uniform(1, 2, 128).astype(np.float32), rng.integers(-40, 41, 128))
+    values = np.concatenate([values, -values, random, -random, np.array([0.0, -0.0], np.float32)])
+    # Equal-shaped operands isolate the scalar law from XLA's broadcast fusion;
+    # the quantizer's composed division below exercises its broadcast arithmetic.
+    left, right = (np.array(x) for x in np.broadcast_arrays(values[:, None], values[None, :]))
+
+    def product(a, b):
+        return two_product(a, b, bit_split=bit_split, subtract=subtract,
+                           rounding=jax.lax.optimization_barrier if barrier else None)
+
+    operands = jnp.asarray(left), jnp.asarray(right)
+    high, low = (np.asarray(x) for x in (jax.jit(product) if compiled else product)(*operands))
+    truth = left.astype(np.float64) * right.astype(np.float64)
+    np.testing.assert_array_equal(high.view(np.uint32), truth.astype(np.float32).view(np.uint32))
+    np.testing.assert_array_equal(low.astype(np.float64), truth - high.astype(np.float64))
+
+
+def test_a_two_float_product_preserves_float64_projection_arithmetic():
+    from dew.nn.precision import two_product
+
+    mantissas = np.array([0, 1, (1 << 27) - 1, 1 << 27, (1 << 27) + 1, (1 << 52) - 1], np.uint64)
+    significands = (np.uint64(1023 << 52) | mantissas).view(np.float64)
+    values = np.ldexp(significands[:, None], [-400, 0, 400]).reshape(-1)
+    left = np.concatenate([values, -values])
+    right = np.roll(left[::-1], 7)
+    nearest = left * right
+    residual = np.array([float(Fraction(a) * Fraction(b) - Fraction(high))
+                         for a, b, high in zip(left, right, nearest, strict=True)])
+    with jax.enable_x64(new_val=True):
+        high, low = (np.asarray(x) for x in jax.jit(two_product)(left, right))
+    np.testing.assert_array_equal(high.view(np.uint64), nearest.view(np.uint64))
+    np.testing.assert_array_equal(low, residual)
+
+
+@pytest.mark.parametrize("barrier,subtract", [(True, False), (False, True)])
+def test_a_bit_split_keeps_large_factors_finite(barrier, subtract):
+    from dew.nn.precision import two_product
+
+    left = np.array([1.0000001, -1.9999999, 1.5, -1.0002443], np.float32) * np.float32(2.0 ** 120)
+    right = np.array([1.9999999, 1.0000001, -1.3333334, -1.0002443], np.float32) * np.float32(2.0 ** -100)
+    high, low = jax.jit(lambda a, b: two_product(
+        a, b, bit_split=True, subtract=subtract,
+        rounding=jax.lax.optimization_barrier if barrier else None))(left, right)
+    truth = left.astype(np.float64) * right.astype(np.float64)
+    np.testing.assert_array_equal(high, truth.astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
@@ -415,3 +477,19 @@ def test_the_gpu_divides_fp32_to_the_nearest_float():
     quotient = np.asarray(jax.jit(jnp.divide)(numerator, denominator))
     nearest = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
     np.testing.assert_array_equal(quotient, nearest)
+
+
+def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
+    from dew.nn.fake_quant import correctly_rounded_divide
+
+    rng = np.random.default_rng(411)
+    denominator = rng.uniform(1e-4, 10, (1, 16384)).astype(np.float32)
+    quotient = rng.uniform(-16, 16, denominator.shape).astype(np.float32)
+    midpoint = (quotient.astype(np.float64)
+                + np.nextafter(quotient, np.float32(np.inf)).astype(np.float64)) * 0.5
+    numerator = (midpoint * denominator.astype(np.float64)).astype(np.float32)
+    numerator = np.concatenate([np.nextafter(numerator, np.float32(-np.inf)), numerator,
+                                np.nextafter(numerator, np.float32(np.inf))])
+    expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+    actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
+    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))

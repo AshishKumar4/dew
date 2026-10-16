@@ -299,8 +299,6 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
-    from unittest.mock import patch
-
     from diffusers_wan_reference import float64
 
     model.config._attn_implementation = 'eager'
@@ -341,16 +339,7 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
         losses = torch.nn.functional.cross_entropy(
             full[:, :-1].transpose(1, 2), torch.from_numpy(ids[:, 1:]).long(), reduction='none')
         np.save(directory / 'losses.npy', losses.numpy())
-    tensor, full = torch.tensor, torch.full
-
-    def wide_tensor(*args, dtype=None, **kwargs):
-        return tensor(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
-
-    def wide_full(*args, dtype=None, **kwargs):
-        return full(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
-
-    with (float64(), patch.object(torch, 'tensor', wide_tensor),
-          patch.object(torch, 'full', wide_full), torch.no_grad()):
+    with float64(), torch.no_grad():
         # Rebuild frequency/sinusoidal buffers in float64 rather than
         # widening an already-rounded fp32 table. Parameters remain the
         # same checkpoint values, loaded into the wider reference model.
@@ -390,8 +379,9 @@ def write_minimax_m2() -> None:
     import transformers
     from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
 
-    if transformers.__version__ != '5.18.0':
-        raise ValueError('MiniMax-M2 requires transformers 5.18.0 (rotary fix PR 48486)')
+    from reference_releases import require
+
+    require("minimax-m2")
     torch.manual_seed(0)
     model = MiniMaxM2ForCausalLM(MiniMaxM2Config(
         vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,

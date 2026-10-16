@@ -172,8 +172,9 @@ def torch_record(scheduler, grid, *, source=False):
 
 
 def main():
-    if diffusers.__version__ != "0.34.0" or mp.__version__ != "1.3.0":
-        raise RuntimeError("Requires diffusers==0.34.0 and mpmath==1.3.0")
+    from reference_releases import require
+
+    require("diffusers-limits")
     arrays = {}
     configs = {}
 
