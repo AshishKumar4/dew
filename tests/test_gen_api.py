@@ -6,7 +6,9 @@ the next unit's names too. site/scripts/gen_api.py reads `src/dew` with griffe
 and imports neither JAX nor Dew; CI runs this beside `gen_api.py --check`.
 """
 
+import ast
 import json
+import re
 
 import pytest
 from tool_support import load
@@ -90,3 +92,68 @@ def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
     without = gen_api.undocumented(package, {path: held for path, held in pages.items() if path != page},
                                    {name: path for name, path in home.items() if path != page})
     assert f"{page} declares __all__ but has no API page; add it to the groups" in without
+
+
+@pytest.fixture
+def reference_package(gen_api, tmp_path, monkeypatch):
+    source = tmp_path / "src" / "example"
+    source.mkdir(parents=True)
+    package = gen_api.Package("example", tmp_path, "https://example.org/", [("API", ["example"])],
+                              overview="overview.md", usage=["overview.md"])
+    monkeypatch.setattr(gen_api, "P", package)
+    monkeypatch.setattr("sys.argv", ["gen_api.py"])
+    return source / "__init__.py", tmp_path / package.overview
+
+
+@pytest.mark.parametrize("control,field", [("steps", "updates"), ("tokens", "compute")])
+def test_source_changes_reach_overview_signatures_fields_and_return_types(
+        gen_api, reference_package, control, field):
+    source, overview = reference_package
+    code = f"""from collections.abc import Callable
+from dataclasses import dataclass
+
+@dataclass
+class State:
+    step: int
+    {field}: int = 0
+
+class Trainer:
+    def fit(self, dataset, /, *, {control}: int | None = None) -> State: ...
+
+CompiledStep = Callable[[State, dict], tuple[State, float, dict, bool, bool, dict | None]]
+"""
+    source.write_text(code)
+    marker = "<!-- api: example.Trainer.fit example.State example.CompiledStep -->"
+    before, after = "# Overview\n\nContracts.\n\n", "\n\nUsage.\n"
+    overview.write_text(before + marker + after)
+    gen_api.main()
+    prefix, block, suffix = re.split(r"```text\n(.*?)\n```", overview.read_text(), maxsplit=1, flags=re.S)
+    assert prefix == before
+    assert suffix.startswith(after)
+    fit, state, compiled = block.split("\n\n")
+    rendered_fit = ast.parse(fit.replace("def Trainer.fit(", "def fit(") + ":\n    pass").body[0]
+    rendered_state = ast.parse(state.replace("class State(", "def State(") + ":\n    pass").body[0]
+    tree = ast.parse(code)
+    state_source, trainer_source, compiled_source = tree.body[2:]
+    fit_source = trainer_source.body[0]
+    fit_source.args.posonlyargs.pop(0)
+    assert ast.dump(rendered_fit.args) == ast.dump(fit_source.args)
+    assert ast.dump(rendered_fit.returns) == ast.dump(fit_source.returns)
+    assert [(arg.arg, ast.dump(arg.annotation)) for arg in rendered_state.args.args] == [
+        (held.target.id, ast.dump(held.annotation)) for held in state_source.body]
+    assert [ast.dump(value) for value in rendered_state.args.defaults] == [
+        ast.dump(held.value) for held in state_source.body if held.value is not None]
+    assert ast.dump(ast.parse(compiled).body[0]) == ast.dump(compiled_source)
+
+
+@pytest.mark.parametrize("reference", ["example.removed", "example.Model.removed", "example"])
+def test_check_rejects_an_unresolvable_or_nondeclaration_reference(
+        gen_api, reference_package, monkeypatch, reference):
+    source, overview = reference_package
+    source.write_text("class Model:\n    def fit(self): ...\n")
+    overview.write_text(f"# Overview\n\n<!-- api: {reference} -->\n")
+    monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
+    with pytest.raises(SystemExit) as stopped:
+        gen_api.main()
+    assert stopped.value.code == 1
+    assert not (source.parents[2] / gen_api.P.content).exists()

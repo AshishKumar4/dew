@@ -41,7 +41,7 @@ from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor, recorded_tokenizer
+from dew.inference.tasks import Processor, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
@@ -671,6 +671,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     saved_task = TextGeneration
+    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'sampling', 'tokenizer', 'processor'})
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
@@ -788,7 +789,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             segments = None if documents is None else documents[:, :span]
             if documents is not None:
                 admitted &= segments == documents[:, depth:depth + span]
-            scored = scored_targets(np, tokens, self.pad_id, mask, documents, depth)
+            scored = self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
 
@@ -801,7 +802,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""
         tokens, mask, documents = self._token_geometry(batch)
-        return np.sum(scored_targets(np, tokens, self.pad_id, mask, documents, depth), axis=-1,
+        return np.sum(self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth), axis=-1,
                       dtype=np.int64)
 
     def __init__(
@@ -903,7 +904,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return TextGeneration(self.model, params, sampling=sampling)
 
     def task_record(self) -> Mapping[str, JSON]:
-        """The decoder's row length, preview budget, sampling policy and tokenizer."""
+        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
         from dew.registry import to_record
         samples = self.samples
         return {
@@ -911,6 +912,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             'max_new_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': to_record(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
+            'processor': recorded_processor(self.processor),
         }
 
     def build_task(self, variables: Variables, *,
@@ -1065,17 +1067,21 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 f"text_roles has shape {tuple(roles.shape)} for "
                 f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
                 "tokens, one per token")
-        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                              documents_of(fields), roles=roles,
-                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
+        return self._scored(jnp, prepared.tokens, fields.get("attention_mask"), documents_of(fields),
+                            roles).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
         fields = prepared.token_fields
-        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                              documents_of(fields), depth, roles=roles,
-                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
+        return self._scored(jnp, prepared.tokens, fields.get("attention_mask"), documents_of(fields), roles,
+                            depth).astype(dtype)
+
+    def _scored(self, xp, tokens, mask, documents, roles, depth: int = 0):
+        """The targets this objective scores at `depth` (`scored_targets`), its `loss_role`'s alone,
+        in `xp`: the loss's weights on the device and the FLOP count's on the host read one rule."""
+        return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
+                              role=None if self.loss_role is None else int(self.loss_role))
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.
@@ -1160,9 +1166,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
 
-    def _batch_roles(self, batch):
-        """Read the batch's `text_roles` column, or None on a run that counts
-        every target.
+    def _batch_roles(self, batch, xp=jnp):
+        """Read the batch's `text_roles` column as an `xp` array, or None on a
+        run that counts every target.
 
         A `loss_role` run on a batch without the column raises, naming it.
         """
@@ -1173,7 +1179,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 f"loss_role={self.loss_role.name} counts only "
                 f"{self.loss_role.name.lower()} targets, but the batch carries "
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
-        return jnp.asarray(batch[ROLES_KEY])
+        return xp.asarray(batch[ROLES_KEY])
 
     def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark every real query whose router statistics and indexer KL count.

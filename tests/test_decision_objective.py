@@ -369,7 +369,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     checkpoints.wait()
     live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
 
-    assert source.processor is not None and source.processor.source is None
+    assert source.processor is not None
     assert objective.inference_record()["processor"] is None
     assert isinstance(reloaded.tokenizer, ByteTokenizer)
     assert reloaded.processor is None
@@ -411,6 +411,50 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
         for questions in ({"pick": pick, "score": score}, {"score": score, "flag": Noul("x")}):
             with pytest.raises(ValueError):
                 task("first", questions)
+
+
+def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
+    """A head configured apart from its backbone, here computing in bfloat16
+    over float32 states at jax's highest matmul precision, is recorded with its
+    numerics, so the reloaded task answers as the live one rather than in the
+    dtype the backbone would give a fresh head."""
+    from dew.decision import DecisionHead
+
+    head = DecisionHead(32, layers=1, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST)
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=head)
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(reloaded("charged twice!", asked)["team"].probabilities,
+                                  live("charged twice!", asked)["team"].probabilities)
+
+
+@pytest.mark.parametrize("precision", [jax.lax.Precision.HIGHEST, jax.lax.DotAlgorithmPreset.F32_F32_F32,
+                                       "tensorfloat32", None], ids=str)
+def test_a_head_records_the_matmul_precision_it_computes_at(precision):
+    """A head's precision, a jax enum, a dot algorithm preset or a name, is written
+    into the run's JSON record as a name and read back as the same precision."""
+    from dew.decision.head import DecisionHead, Head
+    from dew.nn.precision import precision_names
+
+    record = json.loads(json.dumps(DecisionHead(32, layers=1, precision=precision).record()))
+    assert precision_names(Head.from_record(record, 32).precision) == precision_names(precision)
+
+
+@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
+                         ids=["unnamed", "flat"])
+def test_a_head_record_names_its_head_and_holds_its_fields(record):
+    """A run records a head as its name and its fields (`Head.record`); a
+    record of another shape is refused rather than read as Laya's head."""
+    from dew.decision.head import Head
+
+    with pytest.raises(ValueError):
+        Head.from_record(record, 32)
 
 
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):

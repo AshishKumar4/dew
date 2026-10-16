@@ -19,6 +19,7 @@ from flax import linen as nn
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
+from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Loader
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
@@ -60,6 +61,7 @@ from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTr
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
+from dew.objectives.lm.objective import batch_text
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
@@ -334,6 +336,28 @@ def test_prediction_depth_work_excludes_pad_holes_and_unscored_document_boundari
     assert objective.model_flops(None, batch) == desired
     assert desired < (model.model_flops(lengths) + model.logits_flops(np.array([3]))
                       + model.prediction_flops(lengths))
+
+
+def test_an_assistant_only_run_counts_the_assistant_targets_its_loss_scores_at_every_depth():
+    """With `loss_role`, the targets the FLOP count reads at each depth are the ones the loss weighs
+    on the device: an assistant target, its document's, past no pad hole. The others are no work the
+    loss trains."""
+    model = decoder(num_nextn_predict_layers=2)
+    objective = LMObjective(model, seq_len=6, pad_id=0, mtp_weight=1.0, loss_role=Role.ASSISTANT)
+    ids = np.array([[1, 2, 3, 4, 5, 6, 0], [1, 2, 3, 4, 5, 6, 7]], np.int32)
+    roles = np.zeros(ids.shape, np.int8)
+    roles[:, 3:6] = Role.ASSISTANT
+    batch = {"text": ModelInputs(ids, token_fields={"attention_mask": ids != 0}), ROLES_KEY: roles}
+    prepared = batch_text(batch)
+    for depth in range(3):
+        weights = (objective._row_weights(prepared, jnp.asarray(roles), jnp.float32) if depth == 0 else
+                   objective._depth_weights(prepared, jnp.asarray(roles), jnp.float32, depth))
+        np.testing.assert_array_equal(objective._prediction_lengths(batch, depth),
+                                      np.sum(np.asarray(weights), axis=-1))
+    rows = objective._prediction_rows(model, batch)
+    assert [int(np.sum(scored)) for _, scored in rows] == [
+        int(np.sum(objective._depth_weights(prepared, jnp.asarray(roles), jnp.float32, depth)))
+        for depth in (1, 2)]
 
 
 @pytest.mark.mesh(devices=2)

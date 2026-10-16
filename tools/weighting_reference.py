@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch_precision import replaced
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 REPOS = {
@@ -77,15 +78,13 @@ def guided_diffusion(name: str, directory: Path):
 
 def weights(module, betas: np.ndarray, mean: str, options: dict, exact: bool) -> np.ndarray:
     """The authors' weight at every step of `betas`, read off `terms["mse"]`."""
-    original = module._extract_into_tensor
-    if exact:
-        def keep_float64(array, timesteps, shape):
-            result = torch.from_numpy(array)[timesteps]
-            while result.dim() < len(shape):
-                result = result[..., None]
-            return result.expand(shape)
-        module._extract_into_tensor = keep_float64
-    try:
+    def keep_float64(array, timesteps, shape):
+        result = torch.from_numpy(array)[timesteps]
+        while result.dim() < len(shape):
+            result = result[..., None]
+        return result.expand(shape)
+
+    with replaced(*[(module, "_extract_into_tensor", keep_float64)] if exact else []):
         diffusion = module.GaussianDiffusion(
             betas=betas, model_mean_type=module.ModelMeanType[mean],
             model_var_type=module.ModelVarType.FIXED_SMALL, loss_type=module.LossType.MSE, **options)
@@ -94,8 +93,6 @@ def weights(module, betas: np.ndarray, mean: str, options: dict, exact: bool) ->
         zero = torch.zeros((len(betas), 1, 1, 1), dtype=dtype)
         terms = diffusion.training_losses(lambda x, t, **_: torch.ones_like(x), zero, steps, noise=zero)
         return terms["mse"].double().numpy()
-    finally:
-        module._extract_into_tensor = original
 
 
 def main() -> None:

@@ -413,6 +413,7 @@ class DecisionObjective(Objective[Ratio]):
     """
 
     saved_task = Decide
+    inference_fields = frozenset({"head", "layout", "specials", "tokenizer", "processor"})
     _held_parts = True
 
     counts_tokens = True
@@ -665,7 +666,9 @@ class DecisionObjective(Objective[Ratio]):
             },
             "specials": to_record(self.specials, Specials),
             "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
-            "processor": None if self.image_processor is None else self.image_processor.source,
+            # A decision task reads text through its own tokenizer, so only a media processor is kept.
+            "processor": (None if self.image_processor is None or self.image_processor.directory is None
+                          else self.image_processor.source),
         }
 
     def pipeline(

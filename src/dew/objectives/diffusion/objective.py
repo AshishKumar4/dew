@@ -236,6 +236,8 @@ class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
     saved_task = TextToImage
+    inference_fields = frozenset({'process', 'inputs', 'autoencoder', 'solver', 'guidance', 'sampling_steps',
+                                  'end_to_end'})
     # A pipeline's own sampling policy, else DDIM, CFG(3.0) and `_DEFAULT_STEPS`.
     resolved = ("solver", "guidance", "steps")
 
@@ -650,9 +652,9 @@ class DiffusionObjective(Objective[Ratio]):
             raise ValueError(f"the model has no submodule {self.alignment.layer!r} to align")
         return kept["__call__"][0]
 
-    def model_variables(self, params) -> Variables:
+    def model_variables(self, variables: Variables) -> Variables:
         """Return the model's own collections (`model_part`)."""
-        return model_part(params)
+        return model_part(variables)
 
     def encoded_conditions(self, params, batch) -> dict:
         """Encode each condition's own batch field with the tree's frozen towers."""
