@@ -119,11 +119,11 @@ class _Controls(NamedTuple):
         return records.boolean(self.value(key), key)
 
 
-def _keeps(value: Control) -> bool:
+def _never_rounds(value: Control) -> bool:
     return False
 
 
-def _rounds(value: Control) -> bool:
+def _always_rounds(value: Control) -> bool:
     return True
 
 
@@ -162,7 +162,7 @@ class _Class:
     schedules: tuple[str, ...] = ("linear", "scaled_linear", "squaredcos_cap_v2")
     predictions: tuple[str, ...] = _ALL_PREDICTIONS
     algorithms: tuple[Algorithm, ...] = ()
-    karras_round: Callable[[Control], bool] = _keeps
+    karras_round: Callable[[Control], bool] = _never_rounds
     flow_sigmas: bool = False
     grid_terminal: bool = False
     stride: bool = False
@@ -199,10 +199,11 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                             clip_sample_range=1.0),
                            lambda c: Heun(), ("linear", "scaled_linear", "squaredcos_cap_v2", "exp")),
     "KDPM2Discrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
-                            lambda c: KDPM2(ancestral=False), predictions=_NO_SAMPLE, karras_round=_rounds),
+                            lambda c: KDPM2(ancestral=False), predictions=_NO_SAMPLE,
+                            karras_round=_always_rounds),
     "KDPM2AncestralDiscrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
                                      lambda c: KDPM2(ancestral=True), predictions=_NO_SAMPLE,
-                                     karras_round=_rounds),
+                                     karras_round=_always_rounds),
     "DPMSolverSDE": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS,
                                             noise_sampler_seed=None),
                            lambda c: DPMSolverSDE(seed=_optional_seed(c.value)), predictions=_NO_SAMPLE),
@@ -222,11 +223,11 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                                             ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
                                       _solver_type(c.value, ("midpoint", "heun")),
                                       c.flag("lower_order_final") or c.terminal == "zero"),
-                                  algorithms=_DPM_ALGORITHMS, karras_round=_rounds),
+                                  algorithms=_DPM_ALGORITHMS, karras_round=_always_rounds),
     "DEISMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                               solver_order=2, algorithm_type="deis",
                                               solver_type="logrho", lower_order_final=True),
-                            lambda c: _deis(c), karras_round=_rounds, grid_terminal=True,
+                            lambda c: _deis(c), karras_round=_always_rounds, grid_terminal=True,
                             recompute_epsilon=True),
     "UniPCMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                                solver_order=2, predict_x0=True, solver_type="bh2",
@@ -235,7 +236,7 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                                rescale_betas_zero_snr=False),
                              lambda c: UniPC(c.order, _solver_type(c.value, ("bh2", "bh1")),
                                              c.flag("predict_x0"), c.flag("lower_order_final"), c.corrector),
-                             karras_round=_rounds, flow_sigmas=True, grid_terminal=True),
+                             karras_round=_always_rounds, flow_sigmas=True, grid_terminal=True),
     "EDMDPMSolverMultistep": _Class("edm", _fields(
         _THRESHOLD, num_train_timesteps=1000, prediction_type="epsilon", sigma_min=0.002,
         sigma_max=80.0, sigma_data=0.5, sigma_schedule="karras", rho=7.0, solver_order=2,
