@@ -62,7 +62,8 @@ def _colors(theme: str) -> str:
 
 
 STYLE = "".join([
-    f".dew-figure{{{_colors('light')};--fig-sans:var(--sl-font,{SANS});--fig-mono:var(--sl-font-mono,{MONO})}}",
+    f".dew-figure{{{_colors('light')};--fig-sans:var(--sl-font,{SANS});"
+    f"--fig-mono:var(--sl-font-mono,{MONO})}}",
     f"@media (prefers-color-scheme:dark){{.dew-figure{{{_colors('dark')}}}}}",
     *(f"{','.join(f'{page} .dew-figure' for page in PAGES[theme])}{{{_colors(theme)}}}" for theme in PAGES),
     "@media (prefers-reduced-motion:reduce){.dew-figure *{animation:none!important}}",
@@ -72,6 +73,10 @@ It only names `.dew-figure`, since a figure inlined in a page shares the page's 
 
 RESET = 0.6
 """Seconds at the end of each loop in which an animated shape eases back to its first state."""
+
+WIDE, TEXT, SMALL = 520, 15, 14
+"""The charts' default width and their text sizes. A phone's column, about 350 px, shows a chart
+this wide at two thirds of its size, which keeps this text near 10 px."""
 
 
 def _number(x: float) -> str:
@@ -110,9 +115,10 @@ class Figure:
 
     def add(self, tag: str, attributes: Mapping[str, float | str], style: Mapping[str, str] | None = None,
             text: str = "") -> Shape:
-        """Add an element with these attributes (numbers rounded to hundredths) to the open group."""
-        shape = Shape(tag, {name: x if isinstance(x, str) else _number(float(x)) for name, x in attributes.items()},
-                      dict(style or {}), text)
+        """Add an element with these attributes (numbers rounded to hundredths) and this text, which
+        the markup escapes, to the open group."""
+        values = {name: x if isinstance(x, str) else _number(float(x)) for name, x in attributes.items()}
+        shape = Shape(tag, values, dict(style or {}), text)
         self._into[-1].append(shape)
         return shape
 
@@ -120,9 +126,11 @@ class Figure:
              rx: float = 6, width: float = 1) -> Shape:
         """A rectangle with corners rounded by `rx`, outlined `width` wide."""
         return self.add("rect", {"x": x, "y": y, "width": w, "height": h, "rx": rx},
-                        {"fill": self.palette[fill], "stroke": self.palette[stroke], "stroke-width": _number(width)})
+                        {"fill": self.palette[fill], "stroke": self.palette[stroke],
+                         "stroke-width": _number(width)})
 
-    def circle(self, cx: float, cy: float, r: float, *, fill: Role = "accent", stroke: Role = "none") -> Shape:
+    def circle(self, cx: float, cy: float, r: float, *, fill: Role = "accent",
+               stroke: Role = "none") -> Shape:
         """A circle of radius `r` centred on (cx, cy)."""
         return self.add("circle", {"cx": cx, "cy": cy, "r": r},
                         {"fill": self.palette[fill], "stroke": self.palette[stroke]})
@@ -145,7 +153,8 @@ class Figure:
         path = " L".join(f"{_number(x)},{_number(y)}" for x, y in points)
         return self.add("path", {"d": f"M{path}"}, style)
 
-    def arrow(self, x1: float, y1: float, x2: float, y2: float, *, color: Role = "muted", width: float = 1.25) -> Shape:
+    def arrow(self, x1: float, y1: float, x2: float, y2: float, *, color: Role = "muted",
+              width: float = 1.25) -> Shape:
         """A line from (x1, y1) with a filled head at (x2, y2)."""
         with self.group() as arrow:
             self.line(x1, y1, x2, y2, color=color, width=width)
@@ -158,12 +167,13 @@ class Figure:
                                    f"L{_number(b[0])},{_number(b[1])} z"}, {"fill": self.palette[color]})
         return arrow
 
-    def text(self, x: float, y: float, words: str, *, size: float = 13, color: Role = "text", mono: bool = False,
-             anchor: str = "start", weight: int = 400) -> Shape:
+    def text(self, x: float, y: float, words: str, *, size: float = 13, color: Role = "text",
+             mono: bool = False, anchor: str = "start", weight: int = 400) -> Shape:
         """`words` on one line, anchored at (x, y) by `anchor`: "start", "middle" or "end"."""
-        return self.add("text", {"x": x, "y": y, "font-size": size, "font-weight": weight, "text-anchor": anchor},
-                        {"fill": self.palette[color], "font-family": "var(--fig-mono)" if mono else "var(--fig-sans)"},
-                        _escape(words))
+        family = "var(--fig-mono)" if mono else "var(--fig-sans)"
+        return self.add("text", {"x": x, "y": y, "font-size": size, "font-weight": weight,
+                                 "text-anchor": anchor},
+                        {"fill": self.palette[color], "font-family": family}, words)
 
     def image(self, x: float, y: float, size: float, pixels: np.ndarray) -> Shape:
         """A uint8 image, [H, W] or [H, W, C], as a PNG drawn `size` wide, with its pixels kept sharp."""
@@ -173,7 +183,8 @@ class Figure:
         Image.fromarray(pixels).save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode()
         return self.add("image", {"x": x, "y": y, "width": size, "height": size,
-                                  "href": f"data:image/png;base64,{encoded}"}, {"image-rendering": "pixelated"})
+                                  "href": f"data:image/png;base64,{encoded}"},
+                        {"image-rendering": "pixelated"})
 
     @contextmanager
     def group(self, x: float = 0, y: float = 0) -> Iterator[Shape]:
@@ -186,7 +197,8 @@ class Figure:
         finally:
             self._into.pop()
 
-    def animate(self, shape: Shape, keys: Mapping[float, Mapping[str, str | float]], *, origin: str = "") -> Shape:
+    def animate(self, shape: Shape, keys: Mapping[float, Mapping[str, str | float]], *,
+                origin: str = "") -> Shape:
         """Give `shape` these CSS properties at these seconds of the loop, eased in between.
 
         Before the first key the shape holds the first key's state; after the last it holds the
@@ -196,12 +208,13 @@ class Figure:
         times = sorted(keys)
         hold = self.seconds - RESET
         if not times or times[0] < 0 or times[-1] > hold:
-            raise ValueError(f"keys must lie within [0, {hold:g}] s of a {self.seconds:g} s loop, got {times}")
+            raise ValueError(f"keys must lie within [0, {hold:g}] s of a {self.seconds:g} s loop, "
+                             f"got {times}")
         steps = [(0.0, keys[times[0]]), *((t, keys[t]) for t in times), (hold, keys[times[-1]]),
                  (self.seconds, keys[times[0]])]
-        shape.keyframes = "".join(
-            f"{_number(100 * t / self.seconds)}%{{{';'.join(f'{name}:{css}' for name, css in state.items())}}}"
-            for t, state in steps)
+        declarations = [";".join(f"{name}:{css}" for name, css in state.items()) for _, state in steps]
+        shape.keyframes = "".join(f"{_number(100 * t / self.seconds)}%{{{block}}}"
+                                  for (t, _), block in zip(steps, declarations, strict=True))
         shape.style.update({name: str(css) for name, css in keys[times[-1]].items()})
         if origin:
             shape.style.update({"transform-box": "fill-box", "transform-origin": origin})
@@ -217,31 +230,30 @@ class Figure:
         shape.style["stroke-dasharray"] = "1"
         return self.animate(shape, {start: {"stroke-dashoffset": 1}, end: {"stroke-dashoffset": 0}})
 
-    def show_in_turn(self, shapes: Sequence[Shape], times: Sequence[float], fade: float = 0.3) -> None:
-        """Show each of `shapes` from its time in `times` until the next one's, the last until the loop ends."""
-        for index, (shape, at) in enumerate(zip(shapes, times)):
+    def show_in_turn(self, shapes: Sequence[Shape], times: Sequence[float], fade: float = 0.15) -> None:
+        """Show each of `shapes` from its time in `times` until the next one's, the last until the
+        loop ends. One fades out before the next fades in, so shapes drawn in one place, such as
+        a frame's caption, never show together."""
+        for index, (shape, at) in enumerate(zip(shapes, times, strict=True)):
+            keys: dict[float, Mapping[str, str | float]] = {at: {"opacity": 0}, at + fade: {"opacity": 1}}
             if index + 1 < len(shapes):
                 until = times[index + 1]
-                keys = {at: {"opacity": 1}, until: {"opacity": 1}, until + fade: {"opacity": 0}}
-                if index:
-                    keys |= {at - fade: {"opacity": 0}}
-                self.animate(shape, keys)
-            elif index:
-                self.animate(shape, {at - fade: {"opacity": 0}, at: {"opacity": 1}})
+                keys |= {until - fade: {"opacity": 1}, until: {"opacity": 0}}
+            self.animate(shape, keys)
 
     def svg(self) -> str:
         """The figure as one SVG element, its stylesheet and keyframes inside."""
         animated = [shape for shape in _walk(self.shapes) if shape.keyframes]
-        uid = hashlib.sha1(repr((self.width, self.height, self.seconds, self.shapes)).encode()).hexdigest()[:8]
+        drawn = repr((self.width, self.height, self.seconds, self.shapes))
+        uid = hashlib.sha1(drawn.encode()).hexdigest()[:8]
         names = {id(shape): f"f{uid}-{index}" for index, shape in enumerate(animated)}
         keyframes = "".join(f"@keyframes {names[id(shape)]}{{{shape.keyframes}}}" for shape in animated)
         body = "".join(_markup(shape, names, self.seconds) for shape in self.shapes)
         label = f'<title>{_escape(self.label)}</title>' if self.label else ""
-        # --fig-width lets a page keep the figure's text readable on a narrow screen.
-        return (f'<svg xmlns="http://www.w3.org/2000/svg" class="dew-figure" viewBox="0 0 {_number(self.width)} '
-                f'{_number(self.height)}" width="{_number(self.width)}" height="{_number(self.height)}" '
-                f'style="--fig-width:{_number(self.width)}px" role="img"'
-                f'{f" aria-label={chr(34)}{_escape(self.label)}{chr(34)}" if self.label else ""}>'
+        width, height = _number(self.width), _number(self.height)
+        named = f' aria-label="{_escape(self.label)}"' if self.label else ""
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" class="dew-figure" viewBox="0 0 {width} {height}" '
+                f'width="{width}" height="{height}" role="img"{named}>'
                 f'{label}<style>{STYLE}{keyframes}</style>{body}</svg>')
 
     def save(self, path: str | Path) -> None:
@@ -268,30 +280,34 @@ def _markup(shape: Shape, names: Mapping[int, str], seconds: float) -> str:
     attributes = "".join(f' {name}="{_escape(css)}"' for name, css in shape.attributes.items())
     if style:
         attributes += f' style="{_escape(";".join(f"{name}:{css}" for name, css in style.items()))}"'
-    inside = shape.text + "".join(_markup(child, names, seconds) for child in shape.children)
+    inside = _escape(shape.text) + "".join(_markup(child, names, seconds) for child in shape.children)
     return f"<{shape.tag}{attributes}>{inside}</{shape.tag}>" if inside else f"<{shape.tag}{attributes}/>"
 
 
 def _ticks(low: float, high: float, count: int = 4) -> np.ndarray:
-    """About `count` round values from `low` to `high`, for an axis."""
+    """About `count` round values from `low` to `high`, for an axis; `low` alone when they are equal."""
     span = high - low
+    if span <= 0:
+        return np.array([low])
     step = 10 ** np.floor(np.log10(span / count))
     step *= next(factor for factor in (1, 2, 2.5, 5, 10) if span / (step * factor) <= count)
     return np.arange(np.ceil(low / step) * step, high + step / 2, step)
 
 
 def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
-          y_range: tuple[float, float] | None = None, smooth: int = 1, width: float = 680,
-          height: float = 280, seconds: float = 8.0) -> Figure:
+          y_range: tuple[float, float] | None = None, smooth: int = 1, width: float = WIDE,
+          height: float = 290, seconds: float = 8.0) -> Figure:
     """Lines over steps that draw themselves, one per entry of `series`, the first in the accent color.
 
     With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` steps over it.
     """
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
-    left, right, top, bottom = 56, 20, 34, 44
+    left, right, top, bottom = 50, 20, 38, 48
     values = {name: np.asarray(ys, float) for name, ys in series.items()}
     every = np.concatenate(list(values.values()))
     low, high = y_range or (float(every.min()), float(every.max()))
+    if high <= low:
+        low, high = low - 0.5, high + 0.5
     steps = max(len(ys) for ys in values.values())
 
     def at(step: float, y: float) -> tuple[float, float]:
@@ -301,39 +317,41 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     for tick in _ticks(low, high):
         _, y = at(0, tick)
         figure.line(left, y, width - right, y, color="rule", width=1)
-        figure.text(left - 8, y + 4, f"{tick:g}", size=12, color="muted", anchor="end")
-    for tick in _ticks(0, steps - 1, 5):
+        figure.text(left - 8, y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+    for tick in _ticks(0, steps - 1, 4):
         x, _ = at(tick, low)
-        figure.text(x, height - bottom + 18, f"{tick:g}", size=12, color="muted", anchor="middle")
-    figure.text((left + width - right) / 2, height - 6, x_label, size=13, color="muted", anchor="middle")
-    figure.text(left, 18, y_label, size=13, color="muted")
+        figure.text(x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+    figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
+    figure.text(left, 20, y_label, size=TEXT, color="muted")
     colors: tuple[Role, ...] = ("accent", "warm", "muted", "text")
     for index, (name, ys) in enumerate(values.items()):
         color = colors[index % len(colors)]
         if len(values) > 1:
-            x = width - right - 130 * (len(values) - index)
-            figure.line(x, 14, x + 18, 14, color=color, width=2.5)
-            figure.text(x + 24, 18, name, size=13, color=color)
+            x = width - right - 140 * (len(values) - index)
+            figure.line(x, 15, x + 18, 15, color=color, width=2.5)
+            figure.text(x + 24, 20, name, size=TEXT, color=color)
+        window = min(smooth, len(ys))
         lines = [(ys, 2.25)]
-        if smooth > 1:
-            mean = np.convolve(ys, np.ones(smooth) / smooth, mode="valid")
-            lines = [(ys, 1.0), (np.concatenate([np.full(smooth - 1, np.nan), mean]), 2.5)]
+        if window > 1:
+            mean = np.convolve(ys, np.ones(window) / window, mode="valid")
+            lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
             points = [at(step, y) for step, y in enumerate(drawn) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke)
-            if smooth > 1 and stroke < 2:
+            if window > 1 and stroke < 2:
                 line.style["opacity"] = "0.35"
             figure.draw(line, 0.4, seconds * 0.55)
-        last = float(ys[-smooth:].mean())
+        last = float(ys[-window:].mean())
         x, y = at(steps - 1, last)
-        figure.appear(figure.text(x - 4, y - 10, f"{last:.2f}", size=13, color=color, weight=600, anchor="end"),
-                      seconds * 0.55)
+        end = figure.text(x - 4, y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+        figure.appear(end, seconds * 0.55)
     return figure
 
 
 def _captions(figure: Figure, captions: Sequence[str], times: Sequence[float], x: float, y: float) -> None:
     """Each frame's caption, right-aligned at (x, y), shown while its frame is."""
-    shapes = [figure.text(x, y, caption, size=13, color="muted", mono=True, anchor="end") for caption in captions]
+    shapes = [figure.text(x, y, caption, size=SMALL, color="muted", mono=True, anchor="end")
+              for caption in captions]
     figure.show_in_turn(shapes, times)
 
 
@@ -343,7 +361,7 @@ def _frame_times(count: int, seconds: float) -> list[float]:
 
 
 def bars(frames: Sequence[Sequence[float]], *, labels: Sequence[str], captions: Sequence[str] = (),
-         colors: Sequence[Role] = (), y_max: float = 1.0, y_label: str = "", width: float = 680,
+         colors: Sequence[Role] = (), y_max: float = 1.0, y_label: str = "", width: float = WIDE,
          height: float = 260, seconds: float = 8.0) -> Figure:
     """Bars that move from frame to frame: `frames[t][k]` is bar `k`'s height in frame `t`.
 
@@ -353,55 +371,58 @@ def bars(frames: Sequence[Sequence[float]], *, labels: Sequence[str], captions: 
     heights = np.asarray(frames, float)
     count, bins = heights.shape
     figure = Figure(width, height, seconds=seconds, label=f"{y_label}: {', '.join(labels)}")
-    left, right, top, bottom = 24, 24, 44, 40
+    left, right, top, bottom = 16, 16, 48, 40
     slot = (width - left - right) / bins
     floor, tall = height - bottom, height - top - bottom
     times = _frame_times(count, seconds)
     figure.line(left, floor, width - right, floor, color="rule")
     if y_label:
-        figure.text(left, 18, y_label, size=13, color="muted")
+        figure.text(left, 20, y_label, size=TEXT, color="muted")
     for k in range(bins):
         x = left + k * slot + slot * 0.18
-        bar = figure.rect(x, top, slot * 0.64, tall, fill=colors[k] if colors else "accent", stroke="none", rx=3)
-        figure.animate(bar, {t: {"transform": f"scaleY({_number(min(h / y_max, 1))})"}
-                             for t, h in zip(times, heights[:, k])}, origin="50% 100%")
-        figure.text(x + slot * 0.32, floor + 20, labels[k], size=13, mono=True, anchor="middle")
-        numbers = [figure.text(x + slot * 0.32, floor - tall * min(h / y_max, 1) - 7, f"{h:.2f}", size=12,
-                               color="muted", anchor="middle") for h in heights[:, k]]
-        figure.show_in_turn(numbers, times, fade=0.15)
+        column = figure.rect(x, top, slot * 0.64, tall, fill=colors[k] if colors else "accent",
+                             stroke="none", rx=3)
+        figure.animate(column, {t: {"transform": f"scaleY({_number(min(h / y_max, 1))})"}
+                                for t, h in zip(times, heights[:, k], strict=True)},
+                       origin="50% 100%")
+        figure.text(x + slot * 0.32, floor + 22, labels[k], size=TEXT, mono=True, anchor="middle")
+        numbers = [figure.text(x + slot * 0.32, floor - tall * min(h / y_max, 1) - 8, f"{h:.2f}",
+                               size=SMALL, color="muted", anchor="middle") for h in heights[:, k]]
+        figure.show_in_turn(numbers, times)
     if captions:
-        _captions(figure, captions, times, width - right, 18)
+        _captions(figure, captions, times, width - right, 20)
     return figure
 
 
 def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str], columns: Sequence[str],
             captions: Sequence[str] = (), x_label: str = "", y_label: str = "",
-            marks: Sequence[tuple[int, int]] = (), cell: float = 26, seconds: float = 8.0) -> Figure:
+            marks: Sequence[tuple[int, int]] = (), cell: float = 28, seconds: float = 8.0) -> Figure:
     """A grid whose cells fade from frame to frame: `frames[t][r][c]`, from 0 to 1, is cell (r, c)'s
     strength in frame `t`. `marks` outlines cells, such as the ones the values should move to."""
     values = np.clip(np.asarray(frames, float), 0, 1)
     count, height_cells, width_cells = values.shape
-    left, top = 64, 56
+    left, top = 44, 64
     width, height = left + width_cells * cell + 24, top + height_cells * cell + 24
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} by {x_label}")
     times = _frame_times(count, seconds)
-    figure.text(left, 18, x_label, size=13, color="muted")
-    figure.text(8, top - 10, y_label, size=13, color="muted")
+    figure.text(left, 20, f"{y_label} ↓   {x_label} →", size=TEXT, color="muted")
     for c, name in enumerate(columns):
-        figure.text(left + c * cell + cell / 2, top - 8, name, size=12, mono=True, color="muted", anchor="middle")
+        figure.text(left + c * cell + cell / 2, top - 10, name, size=SMALL, mono=True, color="muted",
+                    anchor="middle")
     for r, name in enumerate(rows):
-        figure.text(left - 10, top + r * cell + cell / 2 + 4, name, size=12, mono=True, color="muted",
+        figure.text(left - 10, top + r * cell + cell / 2 + 5, name, size=SMALL, mono=True, color="muted",
                     anchor="end")
         for c in range(width_cells):
             x, y = left + c * cell, top + r * cell
             figure.rect(x + 1, y + 1, cell - 2, cell - 2, fill="surface", stroke="rule", rx=3)
             square = figure.rect(x + 1, y + 1, cell - 2, cell - 2, fill="accent", stroke="none", rx=3)
-            figure.animate(square, {t: {"fill-opacity": _number(v)} for t, v in zip(times, values[:, r, c])})
+            figure.animate(square, {t: {"fill-opacity": _number(v)}
+                                    for t, v in zip(times, values[:, r, c], strict=True)})
     for r, c in marks:
-        figure.rect(left + c * cell + 1, top + r * cell + 1, cell - 2, cell - 2, fill="none", stroke="warm",
+        figure.rect(left + c * cell + 1, top + r * cell + 1, cell - 2, cell - 2, fill="none", stroke="text",
                     rx=3, width=1.75)
     if captions:
-        _captions(figure, captions, times, width - 24, 18)
+        _captions(figure, captions, times, width - 24, 42)
     return figure
 
 
@@ -411,23 +432,23 @@ def tokens(rows: Sequence[Sequence[str]], *, fills: Sequence[Sequence[Role]], no
     `notes[i]` beside row i. With `seconds`, the rows appear one after another."""
     longest = max(len(row) for row in rows)
     left, top, gap = 12, 34 if header else 12, 6
-    note_x = left + longest * cell + 18
-    width = note_x + (max(len(note) for note in notes) * 8.2 if notes else 0) + 12
+    note_x = left + longest * cell + 16
+    width = note_x + (max(len(note) for note in notes) * 8.6 if notes else 0) + 12
     height = top + len(rows) * (cell + gap) + 6
     figure = Figure(width, height, seconds=seconds, label="token rows")
     if header:
-        figure.text(note_x, 20, header, size=12, color="muted", mono=True)
+        figure.text(note_x, 20, header, size=SMALL, color="muted", mono=True)
     for i, row in enumerate(rows):
         with figure.group() as group:
             y = top + i * (cell + gap)
             for j, token in enumerate(row):
                 fill = fills[i][j]
-                figure.rect(left + j * cell, y, cell - 4, cell, fill=fill, stroke="rule" if fill == "none" else "none",
-                            rx=4)
-                figure.text(left + j * cell + (cell - 4) / 2, y + cell / 2 + 5, token, size=14, mono=True,
+                outline: Role = "rule" if fill == "none" else "none"
+                figure.rect(left + j * cell, y, cell - 4, cell, fill=fill, stroke=outline, rx=4)
+                figure.text(left + j * cell + (cell - 4) / 2, y + cell / 2 + 5, token, size=TEXT, mono=True,
                             anchor="middle", color="muted" if fill == "none" else "text")
             if notes:
-                figure.text(note_x, y + cell / 2 + 5, notes[i], size=13, mono=True)
+                figure.text(note_x, y + cell / 2 + 5, notes[i], size=SMALL, mono=True)
         if seconds:
             figure.appear(group, 0.3 + i * min(0.5, seconds * 0.5 / len(rows)))
     return figure
