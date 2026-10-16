@@ -14,9 +14,13 @@ from .activations import UNGATED, Activation
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .gemma3n import gaussian_topk
-from .moe import GatedActivation, Situ, gated_product
+from .joined import joined_dense, joins
+from .moe import GatedActivation, Situ, gated_product, packed_gated_product
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
+
+PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
+"""The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
 
 
 @logical_axes({
@@ -41,8 +45,12 @@ class GatedMLP(nn.Module):
     activation. `packed` keeps the gate and up projections in one
     `gate_up_proj` from init on, as DeepSeek-V4.1's vision tower stores them,
     and `linear` is the projections' module (Gemma 4's vision tower clips
-    theirs). `dropout_rate` drops the activated hidden units before the down
-    projection while training, as T5's `T5DenseActDense` does.
+    theirs). Where the generation's kernel row measured it faster
+    ('gate_up': 'joined'), separate gate and up projections run as one GEMM
+    over their kernels joined per call (`dew.nn.joined`). The product reads a
+    packed or joined output in place (`packed_gated_product`). `dropout_rate`
+    drops the activated hidden units before the down projection while
+    training, as T5's `T5DenseActDense` does.
     """
     hidden_features: int
     out_features: int
@@ -105,13 +113,18 @@ class GatedMLP(nn.Module):
         # down_proj's sum returns to the residual placement in the block.
         activation = self._activation()
         if not isinstance(activation, (str, Situ)):
-            up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-            hidden = self.dropout(activation(up), deterministic=not train)
-            return checkpoint_name(self.down_proj(hidden), 'down_proj')
-        if self._packed():
-            gate, up = self._group().split(self.gate_up_proj(x))
-        else:
-            gate, up = self.gate_proj(x), self.up_proj(x)
+            return self._down(activation(checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')),
+                              train)
+        # A SiTU, the clamp and the gate's top-k take the halves apart.
+        if isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity:
+            gate_up = self._gate_up(x)
+            if gate_up is not None:
+                # Both names on the one output: a remat policy that keeps either keeps it whole.
+                gate_up = checkpoint_name(checkpoint_name(constrain(gate_up, PACKED_HIDDEN), 'gate_proj'),
+                                          'up_proj')
+                return self._down(packed_gated_product(activation, axes=MLP_HIDDEN)(gate_up), train)
+        gate, up = self._group().split(self.gate_up_proj(x)) if self._packed() else (
+            self.gate_proj(x), self.up_proj(x))
         gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
         up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
@@ -120,9 +133,21 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        product = gated_product(activation, axes=MLP_HIDDEN, packed=self._packed())
-        hidden = self.dropout(product(gate, up), deterministic=not train)
+        return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+
+    def _down(self, hidden, train: bool):
+        hidden = self.dropout(hidden, deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
+
+    def _gate_up(self, x):
+        """The gate and up projections as one `[..., 2, H]` output: the packed
+        projection's, or both kernels joined per call where the generation
+        measured that faster (`joins`), else None."""
+        if self._packed():
+            return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
+        if joins('gate_up', (self.gate_proj, self.up_proj)):
+            return joined_dense(x, (self.gate_proj, self.up_proj), axis=-2)
+        return None
 
     def _activation(self) -> GatedActivation | Activation:
         """The gated product's activation (a name `gated_product` reads, or Situ), else the
