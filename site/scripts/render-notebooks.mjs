@@ -165,7 +165,8 @@ for (const file of files) {
 	notebookOutputs[stem] = outputsByCell;
 }
 
-const previous = only.length === 0 ? { listing: [], outputs: {} } : await lastRender();
+// A check writes nothing, so it needs no earlier render to merge into.
+const previous = only.length === 0 || checkOnly ? { listing: [], outputs: {} } : await lastRender();
 const stems = notebooks.map((file) => file.replace(/\.ipynb$/, ''));
 const tutorials = inventory(previous, { listing, outputs: notebookOutputs }, stems);
 
