@@ -551,6 +551,34 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):
+    """SLOP008: a first-party module's member or table replaced in a test is reported through an
+    alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
+    named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
+    boundaries a test may replace."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = {}\n",
+        "tests/test_graph.py": (
+            "import time\n"
+            "import sparx.graph as g\n"
+            "from sparx import graph\n"
+            "def test_alias(monkeypatch):\n"
+            "    monkeypatch.setattr(g, 'narrowed_paths', dict)\n"
+            "def test_table(monkeypatch):\n"
+            "    monkeypatch.setitem(graph.EDGES, 'edge', 1)\n"
+            "    monkeypatch.delitem(g.EDGES, 'edge')\n"
+            "def test_local(monkeypatch):\n"
+            "    from sparx.graph import EDGES as edges\n"
+            "    monkeypatch.setitem(edges, 'edge', 1)\n"
+            "    monkeypatch.delattr(graph, 'narrowed_paths')\n"
+            "def test_boundaries(monkeypatch):\n"
+            "    monkeypatch.setattr(time, 'sleep', lambda seconds: None)\n"
+            "    monkeypatch.setattr(graph, 'snapshot', lambda: None)\n"
+            "    monkeypatch.setattr('sparx.graph.subprocess.run', print)\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
+
+
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
     """SLOP011: `match=` on pytest's raise, a read of a function's source and a
     test that names a source file each prove text, not behaviour, however the

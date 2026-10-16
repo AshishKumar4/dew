@@ -11,7 +11,6 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import getpass
-import os
 import re
 import shlex
 import subprocess
@@ -29,6 +28,7 @@ from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 #: States a create never recovers from.
 DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
 READY_TIMEOUT = 1800
+POLL_SECONDS = 10
 
 #: What a job name may contain: it is a directory under ~/dew-runs.
 JOB_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -194,8 +194,7 @@ def _worker_table(node: Node | None) -> None:
 
 
 def _wait_ready(tpu: Tpu) -> Node | None:
-    """Poll until the TPU answers READY, every DEW_TPU_POLL_SECONDS (10 by default).
-    Returns the node it saw."""
+    """Poll until the TPU answers READY. Returns the node it saw."""
     if tpu.gcloud.dry_run:
         return None
     deadline = time.monotonic() + READY_TIMEOUT
@@ -209,7 +208,7 @@ def _wait_ready(tpu: Tpu) -> Node | None:
         if time.monotonic() >= deadline:
             raise SystemExit(f"{tpu.name} is still {state} after {READY_TIMEOUT}s")
         emit(f"{tpu.name} is {state}")
-        time.sleep(float(os.environ.get("DEW_TPU_POLL_SECONDS", "10")))
+        time.sleep(POLL_SECONDS)
 
 
 def _git_root() -> Path:

@@ -544,6 +544,18 @@ def _patched(node: ast.Call, table: dict[str, str]) -> str:
     return ""
 
 
+def _seam(target: str) -> bool:
+    """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
+    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
+    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?"""
+    words = [word for word in re.split(r"[._]", target.lower()) if word]
+    for seam in SEAMS:
+        parts = [word for word in re.split(r"[._]", seam) if word]
+        if any(words[start:start + len(parts)] == parts for start in range(len(words))):
+            return True
+    return False
+
+
 def mocks(module: Module) -> Iterator[Finding]:
     """SLOP008: a first-party module, or a table or registry it holds, replaced
     instead of a seam taken."""
@@ -553,7 +565,7 @@ def mocks(module: Module) -> Iterator[Finding]:
         target = _patched(node, dict(table))
         if not target.startswith(f"{module.package}."):
             continue
-        if any(seam in target.lower() for seam in SEAMS):
+        if _seam(target):
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
