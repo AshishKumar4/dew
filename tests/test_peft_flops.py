@@ -13,9 +13,10 @@ from dew.inputs import Field, InputSpec
 from dew.lora import LoRA
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops
+from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops, ssd_flops
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.mixers.mamba2 import Mamba2
 from dew.objectives.base import FROZEN
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -117,6 +118,25 @@ def test_residual_streams_separate_learned_work_from_mixing_for_peft(fields):
     assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
     complete = adapted.model.model_flops(lengths) + adapted.model.logits_flops(lengths)
     assert complete == forward_products(adapted.model.apply, adapted.variables, tokens)
+
+
+def test_mamba2_layers_learn_their_maps_and_conv_and_not_their_scan():
+    """A Mamba-2 mixer's learned work is its maps and conv, the scan's state
+    contractions apart, so an adapted Mamba-2 decoder charges its frozen maps
+    twice their forward work, its scan three times and its factors three."""
+    lengths = np.array([4])
+    mixer = Mamba2(8, 2, 4, state_size=3, chunk_size=1)
+    assert mixer.model_flops(lengths) - mixer.parameter_flops(lengths) == ssd_flops(lengths, 2, 3, 4)
+    model = decoder(mixer={"class": "mamba2", "fields": {"state_size": 3, "chunk_size": 1}},
+                    attention_impl="reference")
+    tokens = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(413), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("in_proj",)).apply(model, variables, key=513)
+    native, learned = model.model_flops(lengths), model.parameter_flops(lengths)
+    assert 0 < learned < native
+    factors = adapted.model.parameter_flops(lengths) - learned
+    assert factors > 0
+    assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
 
 
 def test_altup_adapter_router_is_used_for_both_prediction_and_correction():
