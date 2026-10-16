@@ -314,8 +314,9 @@ class Pretrained:
     None for a local directory.
     """
     origin: str | None = None
-    """The Hub id or local directory `load` read, which an adapter's PEFT config names as its base
-    (`AdapterBase`); None for a model trained in Dew."""
+    """The Hub id `load` resolved to `revision`, which an adapter's PEFT config names as its base
+    (`AdapterBase`); None for a local directory or a model trained in Dew, which no other machine
+    resolves."""
     adapter: Adapter | None = None
     """The low-rank adapter that `adapt` attached to the model, or None for the source as published.
 
@@ -521,7 +522,8 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        loaded = replace(loaded, origin=str(name_or_dir))
+        if loaded.revision is not None:
+            loaded = replace(loaded, origin=str(name_or_dir))
         if not weights:
             loaded = replace(loaded, variables=jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))

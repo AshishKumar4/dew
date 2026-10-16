@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
-from typing import ClassVar, NamedTuple, Protocol, TypedDict, runtime_checkable
+from typing import ClassVar, NamedTuple, NotRequired, Protocol, TypedDict, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -248,9 +248,10 @@ class LoRA:
 
 
 class AdapterBase(NamedTuple):
-    """The published model an adapter was bound to: its Hub id or local directory, and the commit
-    the Hub resolved it to (None for a local directory). PEFT's config names them
-    (`base_model_name_or_path`, `revision`), so a reader loads the adapter onto the same weights."""
+    """The published model an adapter was bound to: its Hub id and the commit the Hub resolved it
+    to. PEFT's config names them (`base_model_name_or_path`, `revision`), so a reader on any machine
+    loads the adapter onto the same weights. A config another tool wrote may name a base without a
+    commit, which is read and written back as it is."""
 
     name: str
     revision: str | None
@@ -977,7 +978,10 @@ class PeftConfig(TypedDict):
     It holds the defaults every target uses and the per-module exceptions.
     `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are fixed
     because Dew builds its adapters one way. Nothing here reads those four back;
-    they are written so that a PEFT reader finds the keys it expects.
+    they are written so that a PEFT reader finds the keys it expects. An adapter
+    bound to a Hub model names it and its commit (`AdapterBase`), which PEFT
+    loads the base from; one bound to a local directory or a model built from
+    its class names none, since no other machine resolves it.
     """
 
     peft_type: str
@@ -992,8 +996,8 @@ class PeftConfig(TypedDict):
     bias: str
     init_lora_weights: bool
     inference_mode: bool
-    base_model_name_or_path: str | None
-    revision: str | None
+    base_model_name_or_path: NotRequired[str]
+    revision: NotRequired[str]
 
 
 def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
@@ -1005,7 +1009,7 @@ def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
     alphas = [target.alpha for target in named.values()]
     rank = max(set(ranks), key=ranks.count)
     alpha = max(set(alphas), key=alphas.count)
-    return {
+    config: PeftConfig = {
         "peft_type": "LORA",
         "r": rank,
         "lora_alpha": alpha,
@@ -1018,9 +1022,12 @@ def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
         "bias": "none",
         "init_lora_weights": True,
         "inference_mode": True,
-        "base_model_name_or_path": None if lora.base is None else lora.base.name,
-        "revision": None if lora.base is None else lora.base.revision,
     }
+    if lora.base is not None:
+        config["base_model_name_or_path"] = lora.base.name
+        if lora.base.revision is not None:
+            config["revision"] = lora.base.revision
+    return config
 
 
 # --------------------------------------------------------------------------
