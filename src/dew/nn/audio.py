@@ -280,26 +280,46 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     return content + relative[..., :chunk * context].reshape(batch, heads, blocks, chunk, context)
 
 
+def _chunked_attention(query, key, value, positional, valid, chunk: int, left: int, right: int, *,
+                       cap: float, window: Callable[[jax.Array], jax.Array], fill: float,
+                       precision: PrecisionLike = None):
+    """Chunked local attention with relative positions: `[B, T, H * D]`.
+
+    Each chunk of the `[B, T, H, D]` queries scores its block of context
+    (`_block_context`) and the relative positions `positional` holds
+    (`_relative_logits`), soft-capped at `cap`. A key counts where it is
+    valid and `window` holds for its query-minus-key distance; the rest take
+    `fill`. Here the families differ in those two alone: Gemma 3n's window
+    includes both boundaries and fills with the logits' lowest value, Gemma
+    4's excludes them and fills with `attention_invalid_logits_value`. Both
+    references take the softmax in float32 and hand it on in the values'
+    dtype (modeling_gemma3n.py:523, modeling_gemma4.py:348).
+    """
+    batch, length, heads, dim = query.shape
+    query = _queries(query, chunk)
+    key, value = (_block_context(z, chunk, left, right) for z in (key, value))
+    logits = _relative_logits(query, key, positional, precision)
+    logits = jnp.tanh(logits / cap) * cap
+    distance = left + jnp.arange(chunk)[:, None] - jnp.arange(chunk + left + right)[None, :]
+    allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
+    logits = jnp.where(allowed, logits, fill)
+    probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
+    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=precision)
+    return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
+
+
 class Gemma3nRelativePosition(nn.Module):
     config: Gemma3nAudio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, queries, keys):
+    def __call__(self, queries):
         cfg = self.config
         positions = jnp.arange(cfg.conf_attention_context_left - 1,
                                -cfg.conf_attention_context_right - 1, -1)
         signal = _position_signal(cfg.hidden_size, positions, queries.dtype)
-        projected = nn.Dense(
-            cfg.hidden_size,
-            use_bias=False,
-            dtype=self.dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(cfg.initializer_range),
-            name="pos_proj",
-        )(signal)
-        return _relative_logits(queries, keys, projected, self.precision)
+        return _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="pos_proj")(signal)
 
 
 class Gemma3nAttention(nn.Module):
@@ -311,36 +331,21 @@ class Gemma3nAttention(nn.Module):
     def __call__(self, x, valid):
         cfg = self.config
         heads, dim = cfg.conf_num_attention_heads, cfg.hidden_size // cfg.conf_num_attention_heads
-        projected = [
-            nn.Dense(
-                cfg.hidden_size,
-                use_bias=False,
-                dtype=self.dtype,
-                precision=self.precision,
-                kernel_init=nn.initializers.normal(cfg.initializer_range),
-                name=name,
-            )(x).reshape(*x.shape[:2], heads, dim)
-            for name in ("q_proj", "k_proj", "v_proj")
-        ]
+        dense = _dense(cfg, self.dtype, self.precision)
+        projected = [dense(cfg.hidden_size, name=name)(x).reshape(*x.shape[:2], heads, dim)
+                     for name in ("q_proj", "k_proj", "v_proj")]
         query, key, value = projected
         per_dim = self.param("per_dim_scale", nn.initializers.zeros, (dim,), jnp.float32)
         query = query * jnp.asarray(dim ** -0.5 / math.log(2), query.dtype)
         query = query * jax.nn.softplus(per_dim).astype(query.dtype)
-        chunk, left, right = (cfg.conf_attention_chunk_size, cfg.conf_attention_context_left - 1,
-                              cfg.conf_attention_context_right)
-        query = _queries(query, chunk)
-        key, value = (_block_context(z, chunk, left, right) for z in (key, value))
-        logits = Gemma3nRelativePosition(cfg, dtype=self.dtype, precision=self.precision,
-                                         name="relative_position_embedding")(query, key)
-        cap = jnp.asarray(cfg.conf_attention_logit_cap, logits.dtype)
-        logits = jnp.tanh(logits / cap) * cap
-        indices = jnp.arange(chunk + left + right)[None, :] - jnp.arange(chunk)[:, None]
-        local = (indices >= 0) & (indices <= left + right)
-        allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & local[None, None, None]
-        logits = jnp.where(allowed, logits, jnp.finfo(logits.dtype).min)
-        probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-        out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=self.precision)
-        return out.transpose(0, 2, 3, 1, 4).reshape(x.shape[0], -1, heads, dim)[:, :x.shape[1]]
+        left, right = cfg.conf_attention_context_left - 1, cfg.conf_attention_context_right
+        positional = Gemma3nRelativePosition(cfg, dtype=self.dtype, precision=self.precision,
+                                             name="relative_position_embedding")(query)
+        return _chunked_attention(
+            query, key, value, positional, valid, cfg.conf_attention_chunk_size, left, right,
+            cap=cfg.conf_attention_logit_cap,
+            window=lambda distance: (distance >= -right) & (distance <= left),
+            fill=float(jnp.finfo(query.dtype).min), precision=self.precision)
 
 
 class Gemma4Attention(nn.Module):
@@ -361,38 +366,16 @@ class Gemma4Attention(nn.Module):
         per_dim = self.param("per_dim_scale", nn.initializers.zeros, (dim,), jnp.float32)
         query = query * (dim ** -0.5 / math.log(2)) * jax.nn.softplus(per_dim)
         key = key * (math.log(1 + math.e) / math.log(2))
-        chunk, left, right = (
-            cfg.attention_chunk_size,
-            cfg.attention_context_left - 1,
-            cfg.attention_context_right,
-        )
-        context = chunk + left + right
-        position = _position_signal(cfg.hidden_size, jnp.arange(context // 2, -1, -1), x.dtype)
-        position = nn.Dense(
-            cfg.hidden_size,
-            use_bias=False,
-            dtype=self.dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(cfg.initializer_range),
-            name="relative_k_proj",
-        )(position).astype(jnp.float32)
-        query = _queries(query, chunk)
-        key, value = (_block_context(z, chunk, left, right) for z in (key, value))
-        logits = _relative_logits(query, key, position, self.precision)
-        logits = jnp.tanh(logits / cfg.attention_logit_cap) * cfg.attention_logit_cap
-        indices = jnp.arange(context)[None, :] - jnp.arange(chunk)[:, None]
-        allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :]
-        # Gemma 4 excludes both window boundaries; Gemma 3n includes them.
-        distance = left - indices
-        local = ((distance >= 0) & (distance < left)) | ((distance < 0) & (-distance < right))
-        allowed = allowed & local[None, None, None]
-        query_real = _queries(jnp.ones(valid.shape, jnp.bool_), chunk)
-        allowed = allowed & query_real[:, None, :, :, None]
-        probabilities = jax.nn.softmax(
-            jnp.where(allowed, logits, cfg.attention_invalid_logits_value), axis=-1
-        )
-        out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=self.precision)
-        out = out.transpose(0, 2, 3, 1, 4).reshape(x.shape[0], -1, cfg.hidden_size)[:, :x.shape[1]]
+        chunk, left, right = (cfg.attention_chunk_size, cfg.attention_context_left - 1,
+                              cfg.attention_context_right)
+        signal = _position_signal(cfg.hidden_size, jnp.arange((chunk + left + right) // 2, -1, -1), x.dtype)
+        positional = _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="relative_k_proj")(signal)
+        out = _chunked_attention(
+            query, key, value, positional.astype(jnp.float32), valid, chunk, left, right,
+            cap=cfg.attention_logit_cap,
+            window=lambda distance: (((distance >= 0) & (distance < left))
+                                     | ((distance < 0) & (distance > -right))),
+            fill=cfg.attention_invalid_logits_value, precision=self.precision)
         return linear(cfg.hidden_size, name="post")(out.astype(x.dtype))
 
 
@@ -457,14 +440,7 @@ class Gemma3nConformerAttention(nn.Module):
         residual, cfg = x, self.config
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="pre_attn_norm")(_clip(x, cfg.gradient_clipping))
         x = Gemma3nAttention(cfg, dtype=self.dtype, precision=self.precision, name="attn")(x, valid)
-        x = nn.Dense(
-            cfg.hidden_size,
-            use_bias=False,
-            dtype=self.dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(cfg.initializer_range),
-            name="post",
-        )(x.reshape(x.shape[0], x.shape[1], cfg.hidden_size))
+        x = _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="post")(x)
         return residual + RMSNorm(epsilon=1e-6, dtype=self.dtype, name="post_norm")(
             _clip(x, cfg.gradient_clipping)
         )
