@@ -85,6 +85,8 @@ const parser = unified().use(remarkParse).use(remarkGfm);
 // A notebook embeds a figure (dew.figures) by its raw GitHub URL on the branch the site builds,
 // which is what Colab can load. The page gets the checkout's file inline instead, since an SVG
 // in the page's own markup follows the theme toggle and an <img> follows only the system setting.
+// A figure drawn again for a phone, <name>-narrow.svg beside it, comes along, and the page shows
+// the one that fits (theme.css).
 const rawRoot = `${repository.url.replace('https://github.com/', 'https://raw.githubusercontent.com/')}/${repository.branch}/`;
 
 /** The figure an image paragraph names by raw URL, as an HTML block, or undefined for any other paragraph. */
@@ -96,11 +98,18 @@ async function inlineFigure(paragraph, sourcePath) {
 	}
 	const file = path.join(repoRoot, image.url.slice(rawRoot.length));
 	if (!existsSync(file)) throw new Error(`${sourcePath}: broken figure: ${image.url} (no ${path.relative(repoRoot, file)})`);
-	const svg = (await readFile(file, 'utf8')).trim();
-	if (!svg.startsWith('<svg') || svg.includes('\n')) throw new Error(`${sourcePath}: ${image.url} is not a one-line SVG from dew.figures`);
 	// The alt text describes the figure where it stands, so it replaces the figure's own label.
 	const label = image.alt.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-	return `<div class="nb-figure">${svg.replace(/ aria-label="[^"]*"/, '').replace('<svg ', `<svg aria-label="${label}" `)}</div>`;
+	const inline = async (svgFile) => {
+		const svg = (await readFile(svgFile, 'utf8')).trim();
+		if (!svg.startsWith('<svg') || svg.includes('\n')) {
+			throw new Error(`${sourcePath}: ${path.relative(repoRoot, svgFile)} is not a one-line SVG from dew.figures`);
+		}
+		return svg.replace(/ aria-label="[^"]*"/, '').replace('<svg ', `<svg aria-label="${label}" `);
+	};
+	const narrow = file.replace(/\.svg$/, '-narrow.svg');
+	if (!existsSync(narrow)) return `<div class="nb-figure">${await inline(file)}</div>`;
+	return `<div class="nb-figure nb-figure-pair"><div class="nb-figure-wide">${await inline(file)}</div><div class="nb-figure-narrow">${await inline(narrow)}</div></div>`;
 }
 
 /**
