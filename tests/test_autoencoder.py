@@ -130,7 +130,9 @@ def _published(kind: str, directory: Path):
         "qwen_image": ("qwen_image_vae.tar.xz", ""),
     }[kind]
     source = extract_fixture(fixtures / archive, directory) / inside
-    autoencoder = PretrainedAutoencoder(modelname=str(source), dtype="float32").build()
+    # A scalar normalization takes a run's own statistics, which its record must keep.
+    overrides = {"latent_shift": 0.25, "latent_scale": 0.5} if kind == "dc_ae" else {}
+    autoencoder = PretrainedAutoencoder(modelname=str(source), dtype="float32", **overrides).build()
     return autoencoder, autoencoder.params
 
 

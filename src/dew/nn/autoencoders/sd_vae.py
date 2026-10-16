@@ -6,6 +6,13 @@ from .kl import AutoencoderKL
 from .vae import load_pretrained_vae
 
 
+def published_normalization(config: dict) -> tuple[float, float]:
+    """An AutoencoderKL config's latent shift and scale: its `shift_factor`
+    (0 where absent or null) and `scaling_factor` (SD1's 0.18215 where absent),
+    read alike by a standalone load and a pipeline's (`load_kl_vae`)."""
+    return config.get("shift_factor") or 0.0, config.get("scaling_factor", 0.18215)
+
+
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
 
@@ -33,8 +40,9 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
             config = pretrained["config"]
             params = pretrained["params"]
             model = AutoencoderKL.from_diffusers(config, dtype)
-            latent_shift = (config.get("shift_factor") or 0.0) if latent_shift is None else latent_shift
-            latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
+            shift, scale = published_normalization(config)
+            latent_shift = shift if latent_shift is None else latent_shift
+            latent_scale = scale if latent_scale is None else latent_scale
         if params is None:
             raise ValueError("A native autoencoder requires explicit parameters")
         super().__init__(model, params)
