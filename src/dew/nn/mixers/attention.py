@@ -26,6 +26,7 @@ from dew.nn.attention import (
     chunk_mask,
     combined_attention_mask,
     cudnn_runs,
+    cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
     open_kv_cache,
@@ -625,25 +626,24 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
-    def _mask_kernel(self, query, decode: bool) -> str:
+    def _mask_kernel(self, query, key, decode: bool) -> str:
         """The kernel a call that builds its mask runs: xla
         (`kernel_for_materialized_mask`), except a cache call over several
-        queries (a prefill, a verified draft) under 'auto' or 'cudnn' where
-        `cudnn_runs` (which also keeps the deterministic-ops lane off it); an
-        explicit 'xla' stays xla. That call runs
+        queries (a prefill, a verified draft) where cuDNN takes the mask
+        (`cudnn_takes_mask`); an explicit 'xla' stays xla. That call runs
         forward only, where cuDNN takes the mask as its additive bias with
         none of the backward's refusals: 8 prompts of 256 at Qwen3-0.6B's
         widths took 4.0 against xla's 6.2 ms over 28 layers on an RTX 4080.
         It rounds elsewhere, so the prefill is not bitwise xla's: its RMS
         distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
         1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
-        only at bf16 near-ties (docs/performance.md). cuDNN cannot honor
-        attention sinks, so a sink layer keeps xla, which takes them."""
+        only at bf16 near-ties (docs/performance.md)."""
         masked = kernel_for_materialized_mask(
-            self.ctx.attention_impl, query, dtype=self.ctx.dtype, precision=self.ctx.precision,
+            self.ctx.attention_impl, query, key, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax)
-        if (decode and query.shape[1] > 1 and masked == 'xla' and self.ctx.attention_impl in ('auto', 'cudnn')
-                and not self.ctx.attention_sinks and cudnn_runs(query, self.ctx.attn_logit_softcap)):
+        if decode and query.shape[1] > 1 and masked == 'xla' and cudnn_takes_mask(
+                self.ctx.attention_impl, query, softcap=self.ctx.attn_logit_softcap,
+                sinks=self.ctx.attention_sinks):
             return 'cudnn'
         return masked
 
@@ -670,7 +670,6 @@ class CausalSelfAttention(nn.Module):
         B, S = query.shape[:2]
         causal, mask, documents = self.ctx.causal, None, None
         implementation = self.ctx.attention_impl
-        masked = self._mask_kernel(query, decode)
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -719,6 +718,8 @@ class CausalSelfAttention(nn.Module):
             # them per block, and every other kernel builds the document mask
             # from them (`attention_kernel`).
             documents = segment_ids
+        # Over the keys the call reads, the cache's or the prefix's joined.
+        masked = self._mask_kernel(query, key, decode)
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
             # A decode step's cache mask already holds the rows' validity; only
             # image groups add to it there.
@@ -892,7 +893,7 @@ class CausalSelfAttention(nn.Module):
         prefilled = scaled_dot_product_attention(
             queries, keys, values, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-            implementation=self._mask_kernel(queries, decode=True), causal=False, mask=keep,
+            implementation=self._mask_kernel(queries, keys, decode=True), causal=False, mask=keep,
             softcap=self.ctx.attn_logit_softcap)
         return jnp.concatenate([decoded.reshape(1, rows, *decoded.shape[2:]),
                                 prefilled.reshape(1, -1, *prefilled.shape[2:])], axis=1)
