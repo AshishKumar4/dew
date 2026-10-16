@@ -1,4 +1,4 @@
-"""Chained training: pretraining, SFT, then preference or online RL, one model.
+"""A recipe chains pretraining, SFT, preference and online RL stages over one model.
 
 A `Recipe` is an ordered sequence of `Stage`s sharing one built decoder.
 Each stage trains its own data with its own objective in its own checkpoint
@@ -151,6 +151,8 @@ class Recipe:
             raise ValueError("a recipe links at least one stage")
 
     def run(self) -> list[TrainState]:
+        # An objective takes its starting tree when it is built, so each stage
+        # is built again at its turn; this pass initializes no parameters.
         for stage in self.stages:
             self._build(stage, None)
         states: list[TrainState] = []
