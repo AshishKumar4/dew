@@ -12,7 +12,9 @@ Pass that file as --work to the reference runner at the same global shape.
 """
 
 import argparse
+import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,8 @@ from flax import linen as nn
 from dew.objectives.base import Batch, Objective
 from dew.registry import to_record
 from dew.telemetry.workload import WorkloadWork
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def measure(objective: Objective, batch: Batch) -> WorkloadWork:
@@ -75,6 +79,19 @@ def qwen35(args) -> WorkloadWork:
     return measure(BackboneLoss(model, None, projection, sequence), {"tokens": rows})
 
 
+def case(args) -> WorkloadWork:
+    """A framework parity case (`benchmark_cases.parity_case`), built and fed as tools/benchmark_step.py
+    builds and feeds it, with the torch side's --batch-size and --vocab-size."""
+    from benchmark_cases import parity_case
+    from benchmark_models import build_objective, global_batch
+
+    chosen = parity_case(args.model, args.size)
+    config = chosen.config if args.vocab_size is None else {**chosen.config, "vocab_size": args.vocab_size}
+    chosen = dataclasses.replace(chosen, config=config, dtype=args.dtype,
+                                 batch_size=args.batch_size or chosen.batch_size)
+    return measure(build_objective(chosen, args.attention), global_batch(chosen))
+
+
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     workloads = parser.add_subparsers(required=True)
@@ -92,7 +109,13 @@ def arguments(argv=None):
     backbone = workloads.add_parser("qwen35")
     backbone.add_argument("--smoke", action="store_true")
     backbone.set_defaults(count=qwen35)
-    for workload in (language, image, backbone):
+    parity = workloads.add_parser("case")
+    parity.add_argument("--model", required=True, choices=("causal_transformer", "simple_dit", "unet"))
+    parity.add_argument("--size", default="small", choices=("small", "large"))
+    parity.add_argument("--batch-size", type=int, default=None)
+    parity.add_argument("--vocab-size", type=int, default=None)
+    parity.set_defaults(count=case)
+    for workload in (language, image, backbone, parity):
         workload.add_argument("--out", required=True)
         workload.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
         workload.add_argument("--attention", default="auto")

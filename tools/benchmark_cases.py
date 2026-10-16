@@ -334,3 +334,25 @@ def small_cases(dtype: str) -> list[Case]:
     return [dataclasses.replace(case, dtype=dtype) for case in cases]
 
 
+def parity_case(model: str, size: str) -> Case:
+    """The case the framework parity study steps (tools/benchmark_torch.py, research/benchmark-parity.md).
+
+    `size="small"` is `small_cases`' case of `model` at 64-pixel images,
+    the size the torch command line reports even for its token-only case;
+    `size="large"` is the larger, compute-dominated case, which the U-Net
+    lacks. The dtype is left for the caller.
+    """
+    if model not in ("causal_transformer", "simple_dit", "unet"):
+        raise ValueError(f"the parity study steps causal_transformer, simple_dit and unet, not {model}")
+    if size == "small":
+        case = next(case for case in small_cases("bfloat16") if case.architecture == model)
+        return dataclasses.replace(case, image_size=64, dtype=None)
+    if model == "causal_transformer":
+        return Case(model, {"vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12,
+                            "mlp_features": 3072, "max_seq_len": 1024},
+                    batch_size=8, seq_len=1024, image_size=64)
+    if model == "simple_dit":
+        return Case(model, {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
+                            "mlp_ratio": 4},
+                    batch_size=32, image_size=64)
+    raise ValueError("the unet has no large parity case")
