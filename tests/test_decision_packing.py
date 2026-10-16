@@ -130,10 +130,22 @@ def rows_of(batch) -> list[tuple[int, int]]:
             for row in range(1, int(segments.max()) + 1)]
 
 
-def apart(batch) -> dict:
+def at_offset(batch, window: int, row: int) -> dict:
+    """Row `row` of window `window` alone where the window packed it: its tokens at their places and
+    the window's others segment-0 padding, its question slots first."""
+    mine = batch["segments"][window] == row
+    asked = np.flatnonzero(owners(batch)[window] == row)
+    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
+    one |= {name: np.where(mine.reshape(-1, *(1,) * (batch[name].ndim - 2)), batch[name][window], 0)[None]
+            for name in ("tokens", "positions", "slots") if name in batch}
+    return one | {"segments": mine.astype(np.int32)[None]}
+
+
+def apart(batch, laid=alone) -> dict:
     """Each row of the batch's windows in a window of its own, as the packer lays out a window that
     holds one row: the row, then segment-0 padding to the window's length, and its question slots
-    first. Every row's window has one shape, so the rows alone run as one batch."""
+    first; or, `laid` `at_offset`, the row where its window packed it. Every row's window has one
+    shape, so the rows alone run as one batch."""
     length, questions = batch["tokens"].shape[1], batch["kinds"].shape[1]
 
     def widened(name, value):
@@ -143,7 +155,7 @@ def apart(batch) -> dict:
 
     ones = []
     for window, row in rows_of(batch):
-        one = {name: widened(name, value) for name, value in alone(batch, window, row).items()
+        one = {name: widened(name, value) for name, value in laid(batch, window, row).items()
                if name not in ("option_slots", "slotted")}
         if "option_slots" in batch:
             slots, real = compacted(one["options"][0], batch["option_slots"].shape[1])
@@ -253,9 +265,11 @@ def asked(batch, logits) -> np.ndarray:
 
 
 def rows_alone(objective, variables, batch):
-    """The logits and gradients of `batch`'s rows each in a window of its own (`apart`), the logits
-    at their questions' options."""
-    rows = apart(batch)
+    """The logits and gradients of `batch`'s rows each alone in a window of its own where its window
+    packed it (`apart`, `at_offset`), the logits at their questions' options: the packed run's own
+    arithmetic, the rule's chunks and attention's row length as the window's, so the two differ only
+    where another row enters."""
+    rows = apart(batch, at_offset)
     logits, grads = decided(objective, variables, rows, objective.bounds.segments)
     return np.asarray(logits)[rows["options"]], grads
 
