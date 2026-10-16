@@ -29,6 +29,10 @@ Scope is per rule, because the rules are not all about the same thing:
   fewer, since its block refuses a call that sets any other.
 - SLOP015 is about the suite. A test imports its own package, so an import
   the package breaks fails the suite instead of skipping it.
+- SLOP016 is about `src/<package>`: a choice keyed on which device runs (its
+  hardware generation) lives in one table, `nn/kernels/generation.py`'s
+  `TARGETS`; any other module reads that table's facts, a library's support
+  rule the compute capability, and a launch config the autotuner.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -56,7 +60,7 @@ import io
 import re
 import sys
 import tokenize
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -943,7 +947,86 @@ def calls(module: Module) -> Iterator[Finding]:
                           f"{cls.name} reads {', '.join(sorted(unknown))}, which no call sets")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls)
+# Where the device's hardware generation comes from, and the one module that keys choices on it.
+GENERATION = "{package}.nn.kernels.generation"
+GENERATION_CALLS = ("device_generation",)
+TARGET_CALLS = ("gpu_target",)
+
+
+def _generations(function: ast.AST, tables: Mapping[int, Mapping[str, str]], package: str
+                 ) -> tuple[set[str], set[str]]:
+    """The names `function`'s own body binds to the device's generation, `device_generation()` or a
+    `gpu_target()`'s `.generation`, and those it binds to a `gpu_target()`, in statement order."""
+    owner = GENERATION.format(package=package)
+    targets: set[str] = set()
+    generations: set[str] = set()
+    for node in scopes.own(function):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        name, value, table = node.targets[0].id, node.value, tables.get(id(node), {})
+        if isinstance(value, ast.Call) and scopes.resolved(value.func, table) in {
+                f"{owner}.{call}" for call in TARGET_CALLS}:
+            targets.add(name)
+        elif _generation(value, table, owner, generations, targets):
+            generations.add(name)
+    return generations, targets
+
+
+def _generation(node: ast.expr, table: Mapping[str, str], owner: str, generations: set[str],
+                targets: set[str]) -> bool:
+    """Is `node` the device's generation: a call of `device_generation`, a name bound to one, or
+    `.generation` of a `gpu_target()` call or a name bound to one?"""
+    if isinstance(node, ast.Name):
+        return node.id in generations
+    if isinstance(node, ast.Call):
+        return scopes.resolved(node.func, table) in {f"{owner}.{call}" for call in GENERATION_CALLS}
+    if isinstance(node, ast.Attribute) and node.attr == "generation":
+        target = node.value
+        return ((isinstance(target, ast.Name) and target.id in targets)
+                or (isinstance(target, ast.Call)
+                    and scopes.resolved(target.func, table) in {f"{owner}.{call}" for call in TARGET_CALLS}))
+    return False
+
+
+def _spelled(node: ast.expr) -> bool:
+    """Is `node` a string written in the source, or a collection of them?"""
+    if isinstance(node, ast.Tuple | ast.List | ast.Set):
+        return bool(node.elts) and all(map(_spelled, node.elts))
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def authorities(module: Module) -> Iterator[Finding]:
+    """SLOP016: a choice keyed on which device runs, outside the table that owns them: the device's
+    generation compared with or prefix-matched against one the source spells, cut up, or used as a
+    table's key. Comparing it with a recorded one, the generation a measurement was taken on, is a
+    measurement's provenance and not reported."""
+    owner = GENERATION.format(package=module.package)
+    if module.relative == f"src/{owner.replace('.', '/')}.py":
+        return
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
+    functions = [module.tree, *(node for node in ast.walk(module.tree)
+                                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda))]
+    for function in functions:
+        generations, targets = _generations(function, tables, module.package)
+        for node in scopes.own(function):
+            device = functools.partial(_generation, table=tables.get(id(node), {}), owner=owner,
+                                       generations=generations, targets=targets)
+            operands = (node.left, *node.comparators) if isinstance(node, ast.Compare) else ()
+            keyed = (
+                (any(map(device, operands)) and any(map(_spelled, operands)))
+                or (isinstance(node, ast.Subscript) and (device(node.value) or device(node.slice)))
+                or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and ((node.func.attr in ("startswith", "endswith") and device(node.func.value))
+                         or (node.func.attr == "get" and bool(node.args) and device(node.args[0])))))
+            if keyed:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
+                              "chooses by the device's generation; read the target table's fact "
+                              "(`gpu_target()`), a library's rule the compute capability (`capability`), "
+                              "a launch config the autotuner")
+
+
+CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls, authorities)
 UNIVERSAL_RULES = (swallowed, comments, size)
 
 
