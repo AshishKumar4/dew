@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import logging
 from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -36,6 +37,23 @@ def assumed(generation: str | None) -> Iterator[None]:
         yield
     finally:
         ASSUMED.reset(token)
+
+
+CHOSEN: contextvars.ContextVar[Mapping[str, str]] = contextvars.ContextVar("chosen_kernels",
+                                                                       default=MappingProxyType({}))
+"""The kernels `chosen` names, empty outside it."""
+
+
+@contextlib.contextmanager
+def chosen(**kernels: str) -> Iterator[None]:
+    """Within the block, a choice named in `kernels` runs that kernel whatever the generation's row
+    measured, for an A/B of two kernels or a test of a kernel this device's row does not name.
+    Nested blocks keep the outer block's other choices and restore its choices on exit."""
+    token = CHOSEN.set({**CHOSEN.get(), **kernels})
+    try:
+        yield
+    finally:
+        CHOSEN.reset(token)
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
@@ -227,7 +245,9 @@ def device_generation() -> str:
 
 
 def measured_kernel(choice: str, default: str) -> str:
-    """The kernel `KERNELS` names for `choice` on the default device's generation, else `default`."""
+    """The kernel `chosen` names for `choice`, else `KERNELS` on this generation, else `default`."""
+    if (kernel := CHOSEN.get().get(choice)) is not None:
+        return kernel
     return gpu_target(device_generation()).kernels.get(choice, default)
 
 
@@ -237,13 +257,12 @@ _logged: set[tuple[str, str, str]] = set()
 
 def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
     """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
-    generation, `fastest` or else the one `KERNELS` names, turned it down for `refusal`. The first such
-    call in a process for each kernel and refusal is logged at INFO naming both, so a change that sends
-    calls off the measured kernel shows in a run's log, not only in its step time; it is the dispatch's
-    own choice, which a user has nothing to act on. A generation without a measurement, or a call that
-    runs the measured kernel, logs nothing."""
+    generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`.
+    The first such call in a process for each kernel and refusal is logged at INFO naming both. Calls off
+    the measured kernel show in a run's log as well as its step time; the dispatch owns this choice.
+    A generation without a measurement, or a call that runs the measured kernel, logs nothing."""
     generation = device_generation()
-    measured = fastest or gpu_target(generation).kernels.get(choice)
+    measured = fastest or CHOSEN.get().get(choice) or gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
         _log.info("%s runs %r, not %r, the kernel measured fastest on %s: %s",

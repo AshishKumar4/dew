@@ -96,16 +96,18 @@ def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
 
 @dataclasses.dataclass(frozen=True)
 class PackingPlan:
-    """The plan a generation publishes for `pack`, which places its documents
-    whole: a chunk step in the cached prefix cuts them first."""
+    """The plan a generation publishes for `pack`, placing its documents whole
+    unless `cut_documents` publishes cuts for a reader with a chunk step."""
 
     pack: Pack
+    cut_documents: bool = False
 
     def __call__(self, generation: Generation) -> Mapping[str, np.ndarray]:
         lengths = generation.source().lengths()
         if lengths is None:
             raise ValueError("published packing needs certified per-document lengths")
-        refuse_overlong(lengths, self.pack, generation.url)
+        if not self.cut_documents:
+            refuse_overlong(lengths, self.pack, generation.url)
         planned = plan_windows(lengths, self.pack)
         return {plan_name(self.pack, field): value for field, value in planned.items()}
 

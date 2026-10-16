@@ -21,7 +21,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
-from dew.training import Trainer, rungs
+from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -175,7 +175,13 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     free(monkeypatch, LIMIT)
     again = lm()
     counted = []
-    monkeypatch.setattr(rungs, "step_flops", lambda executable: counted.append(executable))
+    as_text = jax.stages.Compiled.as_text
+
+    def read_text(executable, *args, **kwargs):
+        counted.append(executable)
+        return as_text(executable, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Compiled, "as_text", read_text)
     trained(again, steps=0)
     assert [probe["split"] for probe in again.plan["probes"]] == [first.plan["split"]]
     # The executable is the one the first run counted, so its FLOPs are the record's, its text unread.

@@ -5,6 +5,7 @@ import hashlib
 import io
 import itertools
 import json
+import os
 import pickle
 import shutil
 import tarfile
@@ -1041,43 +1042,39 @@ def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
 def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
     arrayrecord_paths, monkeypatch, fail, retire
 ):
+    import grain.python as grain
+
     from dew.data.sources import records
 
     source = records.ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
     entered = threading.Barrier(3)
     released = [threading.Event(), threading.Event()]
-    readers = []
+    first_reader = []
+    underlying_read = grain.ArrayRecordDataSource.__getitem__
 
-    class HeldReader(records.ArrayRecords):
-        def __init__(self, urls, *args, **kwargs):
-            super().__init__(urls, *args, **kwargs)
-            self.active = self.closes = 0
-            self.closed_while_reading = False
-            self.held = not readers
-            self.read_lock = threading.Lock()
-            readers.append(self)
+    def descriptors(path):
+        with os.scandir("/proc/self/fd") as opened:
+            return {int(entry.name) for entry in opened if os.readlink(entry.path) == path}
 
-        def __getitem__(self, index):
-            with self.read_lock:
-                self.active += 1
-            try:
-                if self.held and index < 2:
-                    entered.wait(timeout=5)
-                    assert released[index].wait(timeout=5)
-                    if fail:
-                        raise ValueError("failed child read")
-                return super().__getitem__(index)
-            finally:
-                with self.read_lock:
-                    self.active -= 1
+    def blocked_read(reader, index):
+        if not first_reader:
+            first_reader.append(id(reader))
+        held = id(reader) == first_reader[0]
+        payload = underlying_read(reader, index)
+        # A failed read's traceback must not keep the external reader alive after Dew closes it.
+        del reader
+        if held and index < 2:
+            entered.wait(timeout=5)
+            assert released[index].wait(timeout=5)
+            if fail:
+                raise ValueError("failed child read")
+        return payload
 
-        def close(self):
-            self.closed_while_reading |= self.active > 0
-            self.closes += 1
-            super().close()
-
-    monkeypatch.setattr(records, "ArrayRecords", HeldReader)
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
     try:
+        assert source[2] == b"0:2"
+        held = descriptors(arrayrecord_paths[0])
+        assert held
         with ThreadPoolExecutor(2) as pool:
             pending = [pool.submit(source.__getitem__, index) for index in range(2)]
             try:
@@ -1087,11 +1084,12 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
                         assert source[8 * shard] == f"{shard}:0".encode()
                 else:
                     source.close()
-                held = readers[0]
-                assert held.closes == 0
+                assert descriptors(arrayrecord_paths[0]) == held
                 # Close retires the busy reader; eviction keeps it and retires an idle one.
                 assert source[2] == b"0:2"
-                replacement = readers[-1]
+                path = arrayrecord_paths[-1] if retire == "eviction" else arrayrecord_paths[0]
+                replacement = descriptors(path) - held
+                assert replacement
                 for index, future in enumerate(pending):
                     released[index].set()
                     if fail:
@@ -1099,14 +1097,15 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
                             future.result(timeout=5)
                     else:
                         assert future.result(timeout=5) == f"0:{index}".encode()
-                    assert held.closes == (1 if retire == "close" and index == 1 else 0)
-                    assert replacement.closes == 0
-                assert not held.closed_while_reading
+                    still_open = descriptors(arrayrecord_paths[0])
+                    assert held & still_open == (set() if retire == "close" and index == 1 else held)
+                    assert replacement <= descriptors(path)
             finally:
                 for release in released:
                     release.set()
     finally:
         source.close()
+    assert all(not descriptors(path) for path in arrayrecord_paths)
 
 
 def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):

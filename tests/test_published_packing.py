@@ -60,13 +60,10 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
         np.stack([first, second], axis=1).reshape(whole.shape), whole), shares[0], shares[1], expected)
 
 
-def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tmp_path, monkeypatch):
+def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tmp_path):
     """Without a chunk step before it, a first-fit pack refuses a document longer than its
-    window where a memory read packs it and where its plan is published; a plan published
-    before packs placed documents whole, which cut them, is read only with the chunk step
-    that cuts them alike."""
-    from dew.data import packing
-
+    window where a memory read packs it and where its plan is published; a plan explicitly
+    published with cuts is read only with the chunk step that cuts them alike."""
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
     prefix = Pipeline(source).map(Tokenize())
     with pytest.raises(ValueError):
@@ -77,9 +74,8 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
 
     with pytest.raises(ValueError):
         publish(prefix.pack(9, bins=3), cache("refused"), read="indexed", loading=READ)
-    monkeypatch.setattr(packing, "refuse_overlong", lambda *arguments: None)
-    generation = publish(prefix.pack(9, bins=3), cache("cut"), read="indexed", loading=READ)
-    monkeypatch.undo()
+    generation = publish(prefix.pack(9, bins=3), cache("cut"), read="indexed", loading=READ,
+                         cut_documents=True)
     with pytest.raises(ValueError):
         compile(Pipeline(source).cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
                 loading=READ)
