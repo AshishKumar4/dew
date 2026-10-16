@@ -4,6 +4,7 @@ of squares of the terms its final sums add, carried into it, and nothing behind 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.ad_checkpoint import checkpoint_name
 from reference_error import float64_terms
 
 
@@ -72,3 +73,23 @@ def test_a_recomputed_body_sums_its_own_terms():
         _, recomputed = float64_terms(jax.checkpoint(gradient), jnp.zeros(4))
     np.testing.assert_allclose(recomputed, plain, rtol=1e-12)
     assert np.all(recomputed > 1e-3)
+
+
+def test_a_named_sum_carries_its_terms_through_a_residual_add():
+    """A block names its projection's output for a remat policy
+    (`checkpoint_name`) before the residual add. The name moves the sum, so
+    the stream's terms are the projection's whatever the stream holds: an
+    entry where the add cancels keeps the projection's terms, not its own
+    near-zero size (FrontDamselfly, MiMo's vision tower)."""
+    rng = np.random.default_rng(2)
+    x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
+
+    def block(stream, x, weight):
+        return stream + checkpoint_name(x @ weight, "down_proj")
+
+    with jax.enable_x64(new_val=True):
+        stream = -(x @ weight)
+        stream[0, 0] += 1e-9
+        value, terms = float64_terms(block, stream, x, weight)
+    np.testing.assert_allclose(terms, np.sqrt(np.square(x) @ np.square(weight)), rtol=1e-12)
+    assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
