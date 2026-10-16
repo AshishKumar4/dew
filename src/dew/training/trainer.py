@@ -115,10 +115,13 @@ from dew.training.distributed import (
     device_mesh,
     explicit_axes,
     link_bandwidth,
+    link_figures,
+    link_topology,
     microbatch,
     microbatch_shapes,
     placed_bytes,
     prefetched_bytes,
+    resumed_link_figures,
     ruled,
     shard_batch,
     split_fields,
@@ -512,6 +515,7 @@ class Trainer(Generic[Loss, Effects]):
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
+        self._resumed_links: dict[str, float] = {}
         # The microbatches a step's batch is read in, once decided (`split`,
         # 1 where `whole`, a pooling state's window, or the first plan), which
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
@@ -769,9 +773,11 @@ class Trainer(Generic[Loss, Effects]):
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`_rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
-        (`batch_layout`). The split is the state's (`window_size`)."""
+        (`batch_layout`). The split is the state's (`window_size`), and its
+        link figures by placement (`link_figures`), a resume's own there."""
         base = self._rung() if self._base_rung is None else self._base_rung[3]
-        return {**base, 'shapes': dict(self._shape_rungs)}
+        links = link_figures(self._bandwidths)
+        return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
 
     def _resume_rung(self, rung: JSON) -> None:
         """Take a checkpoint's rung (`_checkpoint_rung`): the objective climbs
@@ -779,6 +785,7 @@ class Trainer(Generic[Loss, Effects]):
         its own when it is compiled (`_at_base_rung`). A rung recorded before
         shapes had their own names none, so every shape starts at it."""
         self._climb_to(rung)
+        self._resumed_links = {} if rung is None else resumed_link_figures(rung)
         if rung is not None:
             shapes = record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
             self._resumed_shapes = {name: json_value(shape, f'rung of {name}')
@@ -957,11 +964,14 @@ class Trainer(Generic[Loss, Effects]):
         return model_batch(batch)
 
     def _model_shapes(self, batch: Batch) -> Batch:
-        """`_model_batch`'s output, traced only where device steps change it: a
-        traced copy of the batch would lose the shardings its leaves carry."""
+        """`_model_batch`'s output, traced only where device steps change it,
+        each leaf of an Explicit axis typed as the step reads it (which
+        `jax.eval_shape` drops on a mesh whose other axes are Auto)."""
         if not self._device:
             return model_batch(batch)
-        return jax.eval_shape(self._model_batch, batch)
+        return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
+            aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
+            weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
 
     def _loss_shape(self, state: TrainState, batch: Batch):
         batch = self._model_shapes(batch)
@@ -1047,8 +1057,9 @@ class Trainer(Generic[Loss, Effects]):
             if mesh.shape.get(axis, 1) == 1:
                 continue
             if (mesh, axis) not in self._bandwidths:
-                self._bandwidths[mesh, axis] = (
-                    None if platform == 'cpu' or peak is None else link_bandwidth(mesh, axis))
+                # A resumed run takes the figure its checkpoint traced with, on this very placement.
+                self._bandwidths[mesh, axis] = None if platform == 'cpu' or peak is None else (
+                    self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
             links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
         return links
 
@@ -1537,7 +1548,8 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     # The objective reads the batch its device steps make (`_model_batch`).
-                    checked = self._model_shapes(device) if self._device else device
+                    with jax.set_mesh(self.device_mesh):
+                        checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
