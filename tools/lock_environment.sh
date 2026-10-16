@@ -10,14 +10,16 @@
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
-# Dew's own FlashAttention wheels resolve as they stood when 0.3.0 was published; nothing else moves.
-FLASH=2026-10-13T17:00:00Z
+# Dew's own FlashAttention wheels resolve as they stood when 0.3.2 was published, past the pins the
+# locks hold (-P); nothing else moves.
+FLASH=2026-10-15T14:04:04Z
 lock() {
   name=$1
   shift
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
-    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
+    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
+    --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
 lock cpu --universal --torch-backend cpu
 gpu="--python-platform x86_64-manylinux_2_35"
