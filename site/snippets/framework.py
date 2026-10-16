@@ -346,7 +346,7 @@ def offline(out):
                 shutil.copytree(source, cached / "snapshots" / snapshot, dirs_exist_ok=True)
             else:
                 shutil.copy(source, cached / "snapshots" / snapshot / source.name)
-        (cached / "refs").mkdir()
+        (cached / "refs").mkdir(exist_ok=True)
         for ref in ("main", snapshot):
             (cached / "refs" / ref).write_text(snapshot)
 
