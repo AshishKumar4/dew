@@ -345,3 +345,14 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     counted = load("cluster_vs_gpu").collectives(text)
     assert {kind: (entry["ops"], entry["bytes"]) for kind, entry in counted.items()} == {
         "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
+
+
+def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
+    """An XLA dump's all-gather of int4 arrays: one per byte unpacked, a scalar's included, and two per
+    byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    module = """ENTRY %main () -> (s4[3], u4[], s4[3]) {
+  %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
+}"""
+    assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)
