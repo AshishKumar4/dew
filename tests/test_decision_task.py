@@ -309,6 +309,15 @@ def test_an_example_refuses_an_answer_its_question_cannot_give():
                     "answers": {"department": "legal"}})
 
 
+def test_an_example_refuses_a_target_for_a_question_it_does_not_ask():
+    """A row's target, like its answer, names a question the row asks; one
+    naming another question is refused rather than dropped, which would
+    train the row as asked and unscored."""
+    with pytest.raises(ValueError):
+        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
+                    "targets": {"unasked": [0.5, 0.5]}})
+
+
 def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     """`save_pretrained` writes what `from_pretrained` reads: Laya's tensors
     under Laya's names (all but the action head and the unused temperature

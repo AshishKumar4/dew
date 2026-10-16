@@ -189,8 +189,10 @@ class Decide:
         record, step = run_record(directory, step)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
-        model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
-                                                         width, dtype=head_dtype))
+        head = Head.from_record(records.json_value(record["head"], "head"), width, dtype=head_dtype)
+        # The head computes in the dtype it recorded, or as a fresh head over
+        # the backbone would where the caller overrides the compute dtype.
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(record["layout"], "layout")
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
                            records.json_value(laid["fields"], "layout.fields"))
