@@ -541,7 +541,7 @@ class CausalSelfAttention(nn.Module):
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
                 kv_store[self.ctx.kv_store_key] = (key, value, positions)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
-            attention = self._mixed_attended(query, key, value, positions, attention_metadata.admitted)
+            attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value)
         sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
                  if self.ctx.attention_sinks else None)
@@ -840,11 +840,21 @@ class CausalSelfAttention(nn.Module):
                                      jnp.where(prompt, filled, -1).reshape(-1)])
         return positions[None]
 
-    def _mixed_attended(self, query, key, value, positions, admitted: Admitted):
+    def _mixed_attended(self, query, key, value, positions, metadata: AttentionMetadata):
         """A mixed call's attention: every valid token's keys and values go
         into its row of the cache, then each decoding row's query reads its
         row as a decode step does, and each prompt's queries read their row
-        up to their own slot."""
+        up to their own slot. Its rows' caches are its whole visibility, so a
+        call that also carries a pairwise mask, key positions or a position
+        bias is refused by name rather than run without them."""
+        carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
+                                            ("key positions", metadata.key_positions),
+                                            ("a position bias", metadata.position_bias)) if given is not None]
+        if carried:
+            raise ValueError(f"{self.name}: a serving step's mixed call reads each row's cache as a decode "
+                             f"step does, and takes no {' or '.join(carried)}")
+        admitted = metadata.admitted
+        assert admitted is not None
         index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
         store = KVStore.open(self, self.ctx.kv_cache, index.value.shape[0], self.ctx.max_seq_len,
                              self.ctx.num_kv_heads, self.ctx.head_dim, key.dtype, value_dim=self.value_dim)
@@ -923,15 +933,16 @@ class CausalSelfAttention(nn.Module):
         """Whether a decode step may read a paged pool through its device's
         paged kernel (`KVStore.decode`) rather than the gathered rows. The
         paged kernels read keys and values of one width, so narrower values
-        take the gathered rows, which the attention core widens."""
-        if self.value_dim != self.ctx.head_dim:
+        take the gathered rows, which the attention core widens. Neither
+        device's paged kernel performs what only the reference path does
+        (`reference_only`), so such a step takes the gathered rows, where an
+        explicit kernel refuses it by name."""
+        if self.value_dim != self.ctx.head_dim or reference_only(
+                query, self.ctx.dtype, self.ctx.precision, self.ctx.force_fp32_for_softmax):
             return False
         if backend() != 'gpu':
             return self.ctx.attention_impl in ('auto', 'tpu')
-        return (self.ctx.attention_impl in ('auto', 'cudnn')
-                and cudnn_runs(query, self.ctx.attn_logit_softcap)
-                and not reference_only(query, self.ctx.dtype, self.ctx.precision,
-                                       self.ctx.force_fp32_for_softmax))
+        return self.ctx.attention_impl in ('auto', 'cudnn') and cudnn_runs(query, self.ctx.attn_logit_softcap)
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.
