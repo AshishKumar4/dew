@@ -220,11 +220,15 @@ class TCD:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        alpha_s, _ = process.rates(t_next, like=x)
+        alpha_s, sigma_s = process.rates(t_next, like=x)
         alpha_mid, sigma_mid = process.rates((1 - self.eta) * t_next, like=x)
         noised = alpha_mid * denoised + sigma_mid * eps
         if self.eta == 0:
             return noised, state
         ratio = alpha_s / alpha_mid
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
-        return ratio * noised + jnp.sqrt(1 - ratio ** 2) * noise, state
+        # The forward process's q(x_s | x_mid). The reference's 1 - ratio^2 is
+        # its variance on a variance-preserving table only: with alpha 1 it adds
+        # no noise, and a variance-exploding walk collapsed to zero.
+        spread = jnp.sqrt(jnp.maximum(sigma_s ** 2 - (ratio * sigma_mid) ** 2, 0.0))
+        return ratio * noised + spread * noise, state
