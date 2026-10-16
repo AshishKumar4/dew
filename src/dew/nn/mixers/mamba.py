@@ -149,6 +149,11 @@ class Mamba(nn.Module):
                 + conv_flops(lengths, inner, inner, self.conv_kernel, groups=inner)
                 + ssd_flops(lengths, 1, self.state_size, inner))
 
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Frozen learned maps and conv, excluding the scan's state write and read (`ssd_flops`)."""
+        return self.model_flops(lengths) - ssd_flops(lengths, 1, self.state_size, self.intermediate_size)
+
     def setup(self):
         if self.conv_kernel < 2:
             raise ValueError(
