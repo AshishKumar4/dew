@@ -1,7 +1,9 @@
 """Build Dew objectives, trainers and fixed host batches for benchmark cases."""
 
+import contextlib
 import dataclasses
-from collections.abc import Iterator, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -48,6 +50,8 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
 from dew.training import Layout, MeshSpec, Trainer
+from dew.training.distributed import DevicePrefetchIterator
+from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
@@ -386,3 +390,54 @@ def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
         yield mine
 
 
+Step = Callable[[TrainState], tuple[TrainState, jax.Array, jax.Array]]
+"""One measured training step: the next state, the loss and whether it was finite."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CompiledStep:
+    """A case's trainer step compiled on its first placed batch.
+
+    `state` is the placed initial state, `step` runs one compiled step, and
+    `compile_seconds` is what compiling it took.
+    """
+
+    state: TrainState
+    step: Step
+    compile_seconds: float
+
+
+@contextlib.contextmanager
+def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
+    """Place the case's state as the trainer would, compile its step on the first placed batch, and yield it.
+
+    Each step reads the next placed batch, or with `fixed_batch` the first
+    one again. The batches stay placed until the block ends.
+    """
+    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
+        abstract = jax.eval_shape(trainer.initial_state)
+        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+        first = next(source)
+        jax.block_until_ready((state, first))
+        start = time.perf_counter()
+        compiled = trainer.compile(state, first)
+        compile_seconds = time.perf_counter() - start
+
+        def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
+            state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))
+            return state, loss, finite
+
+        yield CompiledStep(state, step, compile_seconds)
+
+
+def timed_steps(step: Step, state: TrainState, steps: int
+                ) -> tuple[TrainState, jax.Array, jax.Array, float]:
+    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end.
+
+    Returns the last state, loss and finiteness, and the seconds the window took.
+    """
+    start = time.perf_counter()
+    for _ in range(steps):
+        state, loss, finite = step(state)
+    loss.block_until_ready()
+    return state, loss, finite, time.perf_counter() - start

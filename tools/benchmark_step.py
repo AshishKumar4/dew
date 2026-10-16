@@ -64,7 +64,6 @@ from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Trainer
-from dew.training.distributed import DevicePrefetchIterator
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
@@ -82,14 +81,15 @@ from benchmark_cases import (
 )
 from benchmark_models import (
     Batch as Batch,
-    batches,
     build_objective as build_objective,
     build_trainer,
+    compiled_step,
     decoder_objective as decoder_objective,
     global_batch as global_batch,
     image_tokens as image_tokens,
     media_row as media_row,
     media_values as media_values,
+    timed_steps,
     trainer_mesh,
 )
 from trace_window import device_events, kernel_category, length, overlap, union, window_split
@@ -375,34 +375,12 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     trainer = build_trainer(case, config.attention_impl)
 
-    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
-        abstract = jax.eval_shape(trainer.initial_state)
-        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-
-
-        initial_batch = next(source)
-        jax.block_until_ready((state, initial_batch))
-        compile_start = time.perf_counter()
-        compiled = trainer.compile(state, initial_batch)
-        compile_seconds = time.perf_counter() - compile_start
-
-        def step(state):
-            batch = initial_batch if config.fixed_batch else next(source)
-            state, loss, _, finite, _, _ = compiled(state, batch)
-            return state, loss, finite
-
+    with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
+        state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
         # At least one warm step, so the first dispatch of the executable is
         # outside the timed window.
-        state, loss, is_finite = step(state)
-        for _ in range(config.warmup - 1):
-            state, loss, is_finite = step(state)
-        loss.block_until_ready()
-
-        start = time.perf_counter()
-        for _ in range(config.steps):
-            state, loss, is_finite = step(state)
-        loss.block_until_ready()
-        elapsed = time.perf_counter() - start
+        state, loss, is_finite, _ = timed_steps(step, state, max(config.warmup, 1))
+        state, loss, is_finite, elapsed = timed_steps(step, state, config.steps)
 
         # A second window of the same length, waiting on every step, for the
         # spread. The loop above dispatches asynchronously on purpose, as a run
