@@ -650,9 +650,9 @@ class DiffusionObjective(Objective[Ratio]):
             raise ValueError(f"the model has no submodule {self.alignment.layer!r} to align")
         return kept["__call__"][0]
 
-    def model_variables(self, params) -> Variables:
+    def model_variables(self, variables: Variables) -> Variables:
         """Return the model's own collections (`model_part`)."""
-        return model_part(params)
+        return model_part(variables)
 
     def encoded_conditions(self, params, batch) -> dict:
         """Encode each condition's own batch field with the tree's frozen towers."""

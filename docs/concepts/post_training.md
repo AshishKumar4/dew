@@ -143,7 +143,7 @@ Trained 4 steps in 0:00:04: first step after 3.76 s, then 13.0 step/s
 
 Each prompt produces four completions, and `SampledRollout.decode` turns each one into the text the reward reads. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. `beta` sets the coefficient of the KL term against the frozen reference. In one Colab run, 20 such steps trained a TinyStories decoder ([Language models](language_models.md)) with a reward of 1 for a completion that mentions a dog. Before training, 3 of 128 sampled completions mentioned a dog; after the 20 steps, all 128 did.
 
-[`recipes/chain.py`](../../recipes/chain.py) connects SFT, DPO and GRPO stages ([Stage chains](#stage-chains)).
+[`recipes/chain.py`](../../recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages ([Stage chains](#stage-chains)).
 
 ## Supervised fine-tuning
 
@@ -598,11 +598,27 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 
 ## Stage chains
 
-`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective: `Chat` trains SFT, `Preferences` trains DPO and `Prompts` trains GRPO. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
+`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective (`recipes.chain.LOSSES`):
 
-In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
+| Stage data | Objective | Rollout |
+| --- | --- | --- |
+| `TextData` | `LMObjective`, every token (pretraining) | none |
+| `ChatData` | `LMObjective(loss_role=Role.ASSISTANT)` (SFT) | none |
+| `PreferenceData` | `DPOObjective` | none |
+| `PromptData` | `GRPOObjective` | `SampledRollout` |
+| `RecordsData` of `task_id` rows | `PPOObjective` | `PPORollout` over an `EpisodeRollout` |
 
-A `Stage` sets `steps` (default 100); `beta` (`None` picks 0.1 for DPO and 0.0 for GRPO, and an SFT stage refuses a `beta`); `reward` (required for GRPO); and `groups`, `max_new_tokens` and `estimator`. It does not expose the rollout's `decode` or `sampling`, so its reward reads token-ID text. For rewards on decoded text or for stop tokens, build `SampledRollout` and `Trainer` directly. The [LM recipe](../recipes.md) trains the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files, and it does not run an SFT, DPO and GRPO chain from the command line.
+A pretraining or SFT stage with a `teacher` trains `DistillationObjective` over that objective instead. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
+
+In new stage directories, each stage starts a fresh optimizer and step counter from the model's part of the previous stage's final variables (`Objective.model_variables`): the policy without the critic after PPO, and the student without the teacher after distillation. DPO, GRPO and PPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` builds every stage's objective and rollout before the first stage trains, so a setting they refuse, such as a PPO budget that does not fit, fails before any training. It returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
+
+A `Stage` sets `steps` (default 100) and `beta` (`None` picks 0.1 for DPO and 0.0 for GRPO and PPO; a pretraining or SFT stage refuses a `beta`). `groups` and `max_new_tokens` size the GRPO and PPO samples, `estimator` sets the GRPO advantage, and `sampling` sets the decoding policy of both.
+
+- A GRPO stage requires a `reward`. The reward reads completions decoded by the `PromptData` tokenizer, and sampling stops at that tokenizer's EOS where `sampling` names no EOS of its own.
+- A PPO stage requires `episodes`, an `Episodes(environment, verifier, critic, max_prompt_tokens, max_turns, gamma, lam)`. Its `sampling` must name the EOS that ends an action. The critic, such as `ValueHead` over a decoder, starts from its key in each PPO stage.
+- `teacher` is a `Teacher(model, alpha, temperature)`. Its `model` is a loaded model with its weights over the decoder's vocabulary, such as `Pretrained.load`'s or `Pretrained.from_run`'s. The chain does not set feature-pair distillation; build `DistillationObjective` and `Trainer` directly for it.
+
+The [LM recipe](../recipes.md) trains the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files, and it does not run a chain from the command line.
 
 ## Scope and numerical checks
 
