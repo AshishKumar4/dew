@@ -13,10 +13,23 @@ import os
 import re
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from jax.profiler import ProfileEvent
+
+class KernelEvent(Protocol):
+    """The fields read from JAX's native, untyped ProfileEvent objects."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def start_ns(self) -> int: ...
+    @property
+    def end_ns(self) -> int: ...
+    @property
+    def duration_ns(self) -> int: ...
+    @property
+    def stats(self) -> Iterable[tuple[str, object]]: ...
+
 
 # NCCL names its kernels after the collective it runs:
 # `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
@@ -63,7 +76,7 @@ KERNEL_CATEGORIES = (
 )
 
 
-def device_events(directory: str | Path) -> tuple[dict[str, list[ProfileEvent]], list[str]]:
+def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], list[str]]:
     """The kernel events of the newest JAX trace under `directory`, by device
     plane (`/device:GPU:0`) in the trace's order, and the names of every
     device line.
@@ -78,7 +91,7 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[ProfileEvent]],
     traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
     if not traces:
         raise FileNotFoundError(f"no xplane.pb under {directory}")
-    planes: dict[str, list[ProfileEvent]] = {}
+    planes: dict[str, list[KernelEvent]] = {}
     lines = set()
     for plane in ProfileData.from_file(str(traces[-1])).planes:
         match = re.match(r"/device:(GPU|TPU):\d+", plane.name)
@@ -194,22 +207,20 @@ def window_split[Time: (int, float)](events: Sequence[tuple[str, Time, Time]]) -
     if not events:
         raise ValueError("no device kernels to split")
     ordered = sorted(events, key=lambda event: event[1])
-    figures: dict[str, Time] = {
-        "window": 0, "busy": 0, "compute": 0, "communication": 0, "exposed_communication": 0,
-        "idle_input": 0, "idle_host": 0}
+    idle: dict[str, list[tuple[Time, Time]]] = {"idle_input": [], "idle_host": []}
     high = ordered[0][2]
     for name, start, end in ordered[1:]:
         if start > high:
-            figures["idle_input" if _host_to_device(name) else "idle_host"] += start - high
+            idle["idle_input" if _host_to_device(name) else "idle_host"].append((high, start))
         high = max(high, end)
-    figures["window"] = high - ordered[0][1]
-    figures["busy"] = busy_time([(start, end) for _, start, end in ordered])
     collectives = [(name, start, end) for name, start, end in ordered if "nccl" in name.lower()]
     compute = union([(start, end) for name, start, end in ordered if "nccl" not in name.lower()])
     every = union([(start, end) for _, start, end in collectives])
-    figures["compute"] = length(compute)
-    figures["communication"] = length(every)
-    figures["exposed_communication"] = length(every) - overlap(every, compute)
+    figures = {
+        "window": high - ordered[0][1], "busy": busy_time([(start, end) for _, start, end in ordered]),
+        "compute": length(compute), "communication": length(every),
+        "exposed_communication": length(every) - overlap(every, compute),
+        **{key: length(spans) for key, spans in idle.items()}}
     for kind in COLLECTIVES:
         figures[kind] = length(union([
             (start, end) for name, start, end in collectives
@@ -228,7 +239,7 @@ def window_totals[Time: (int, float)](
     return totals
 
 
-def hlo_collective(event: ProfileEvent) -> str | None:
+def hlo_collective(event: KernelEvent) -> str | None:
     """The HLO collective an NCCL kernel ran for, from XLA's hlo_op stat."""
     for name, value in event.stats:
         if name == "hlo_op" and isinstance(value, str):
@@ -237,7 +248,7 @@ def hlo_collective(event: ProfileEvent) -> str | None:
     return None
 
 
-def communication_totals(devices: Sequence[Sequence[ProfileEvent]]) -> dict[str, int]:
+def communication_totals(devices: Sequence[Sequence[KernelEvent]]) -> dict[str, int]:
     """Per-device window totals and the busy and exposed time of each HLO collective."""
     kernels = [[(event.name, event.start_ns, event.end_ns) for event in events] for events in devices]
     totals = window_totals(kernels)

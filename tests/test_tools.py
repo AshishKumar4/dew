@@ -520,14 +520,14 @@ def test_trace_reports_keep_global_busy_time_separate_from_per_device_averages()
     assert timeline["device_busy_percent"] == pytest.approx(100 * 60 / 130)
     assert timeline["kernels_per_step"] == 4
     assert timeline["kernel_ms_by_category"] == pytest.approx(
-        {"collective": 20, "elementwise": 7.5, "gemm": 7, "copy": 0.5})
+        {"collective": 20, "elementwise": 7.5, "gemm": 7, "other": 0.5})
     assert dict(timeline["top_kernels"])["gemm_fusion_dot"] == pytest.approx(7)
     assert reference["device_busy_ms_per_step"] == pytest.approx(15)
     assert reference["device_window_ms_per_step"] == pytest.approx(20)
     assert reference["device_busy_percent"] == pytest.approx(75)
     assert reference["kernels_per_step"] == 2
     assert reference["kernel_ms_by_category"] == pytest.approx(
-        {"collective": 10, "elementwise": 3.75, "gemm": 3.5, "copy": 0.25})
+        {"collective": 10, "elementwise": 3.75, "gemm": 3.5, "other": 0.25})
     gemm = next(row for row in reference["top_kernels"] if row["name"] == "gemm_fusion_dot")
     assert (gemm["ms_per_step"], gemm["calls_per_step"]) == pytest.approx((3.5, 0.5))
     assert communication["traced_devices"] == reference["devices"] == 2
