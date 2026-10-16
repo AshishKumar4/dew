@@ -450,9 +450,9 @@ def rlvr_advantage_figure():
 def rlvr_clip_figure():
     """PPO's clipped objective against the ratio, from dew.rl's terms, with its flat stretches shaded."""
     ratios = np.linspace(0.02, 3.5, 351)
-    svg = Figure(720, 290, seconds=9, label="The clipped objective against the ratio for a positive and a "
+    svg = Figure(720, 304, seconds=9, label="The clipped objective against the ratio for a positive and a "
                  "negative advantage. Where it is flat the token gets no gradient.")
-    svg.rect(0.5, 0.5, 719, 289, fill="surface", rx=10)
+    svg.rect(0.5, 0.5, 719, 303, fill="surface", rx=10)
     for panel, advantage in enumerate((1.0, -1.0)):
         left, top, wide, high = 52 + panel * 352, 58, 300, 170
 
@@ -494,7 +494,7 @@ def rlvr_clip_figure():
         name.attributes["transform"] = f"rotate(-90 {left - 12} {top + high / 2})"
         line = svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5)
         svg.draw(line, 0.4, 3.2)
-    svg.appear(svg.text(360, 280, "shaded: the objective is flat, so the token gets no gradient", size=12,
+    svg.appear(svg.text(360, 292, "shaded: the objective is flat, so the token gets no gradient", size=12,
                         color="warm", anchor="middle"), 4.0)
     svg.save(HERE / "rlvr-clip.svg")
 
