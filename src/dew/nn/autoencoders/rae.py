@@ -458,6 +458,7 @@ def load_rae(
     subfolder: str = "",
     param_dtype: str = "float32",
     params: Variables | None = None,
+    lazy: bool = False,
 ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
@@ -465,7 +466,8 @@ def load_rae(
     declares must be published, in the shape it declares.
 
     Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
+    placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderRAE":
         raise ValueError(
@@ -478,7 +480,7 @@ def load_rae(
         lambda bound: RAEAutoencoder(model=model, params=bound, latents_mean=config.get("latents_mean"),
                                      latents_std=config.get("latents_std"),
                                      scaling_factor=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, inputs=(image,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,))
 
 
 def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
