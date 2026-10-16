@@ -409,14 +409,14 @@ class CompiledStep:
 
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
-    """Place the case's state as the trainer would, compile its step on the first placed batch, and yield it.
+    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch,
+    and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.
     """
     with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
-        abstract = jax.eval_shape(trainer.initial_state)
-        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+        state, _, _ = trainer.place()
         first = next(source)
         jax.block_until_ready((state, first))
         start = time.perf_counter()
