@@ -2,7 +2,7 @@
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
 float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's plain decay
-prefix where fla cannot run (`plain_prefix`)."""
+prefix and formula in the portable math where fla cannot run (`plain_prefix`, `port_formula`)."""
 
 import itertools
 import os
@@ -230,3 +230,17 @@ def plain_prefix(g, chunk: int = CHUNKED):
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
+
+
+def port_formula(query, key, value, g, beta, state=None, *, starts=None):
+    """`linear.fla_rule`'s formula in the portable math: each packed document's first token decays by
+    `linear.FORGET`, and every range is the difference of two plain fp32 prefixes per row-aligned
+    chunk (`plain_prefix`), as the port takes them. A second rounding sample of the port's own
+    formula, where fla, which restarts a varlen sequence's prefix, cannot run."""
+    if starts is not None:
+        forget = jnp.asarray(starts, bool).reshape(*starts.shape, *(1,) * (g.ndim - 2))
+        g = g + jnp.where(forget, linear.FORGET, 0.0)
+    group = value.shape[2] // key.shape[2]
+    query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    decay = plain_prefix(g).reshape(*value.shape[:3], -1)
+    return linear.chunk_delta_rule(query, key, value, decay, beta, state)
