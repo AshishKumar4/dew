@@ -74,6 +74,28 @@ def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactl
         resumed.close()
 
 
+@pytest.mark.mesh
+def test_the_device_steps_jitter_rows_an_explicit_mesh_axis_types():
+    """A run whose data axis is Explicit (`MeshSpec(explicit=("data",))`) places its rows typed
+    by that axis; the compiled device steps crop, flip and jitter them into the pictures the
+    unplaced batch makes, within one uint8 code of a compilation's rounding."""
+    from dew.training.distributed import MeshSpec, shard_batch, split_fields
+
+    data = loader(spec(crop_scale=(0.5, 0.9)), batch=8, read="memory", seed=5, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        staged, _ = split_fields(next(stream))
+    finally:
+        stream.close()
+    expected = augmented(data, staged)
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    with jax.set_mesh(mesh):
+        placed = shard_batch(mesh, staged)
+        found = jax.jit(lambda rows: augmented(data, rows))(placed)
+    difference = np.asarray(found["image"], np.int32) - np.asarray(expected["image"], np.int32)
+    assert found["image"].shape == (8, 12, 12, 3) and np.abs(difference).max() <= 1
+
+
 @pytest.mark.parametrize("order", list(itertools.permutations(range(3))))
 @pytest.mark.parametrize("crop", [(0, 0, 17, 21), (3, 4, 9, 11), (16, 20, 1, 1)])
 def test_supplied_parameters_match_opencv_at_highest_precision(order, crop):
