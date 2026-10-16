@@ -505,9 +505,10 @@ _whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
 
 def chunked_tile() -> tuple[int, int]:
     """The chunked head's `(tokens, columns)` tile on the pool's hardware
-    generation: its target row's (`GpuTarget.head_tile`), else 1024 x 8192, read
-    off global device 0 (`gpu_target`), which every process sees alike, so a
-    pool's processes agree on the tile and compile one program.
+    generation: its target row's (`GpuTarget.head_tile`), else 1024 x 8192. The
+    generation is `device_generation`'s, the assumed one's or the placed
+    platform's where a call sets one, else global device 0's, which every process
+    sees alike, so a pool's processes agree on the tile and compile one program.
 
     A100 and Ada rows name 4096 x 8192, measured to beat the default. On one
     A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide, 4096 tokens, bf16)
