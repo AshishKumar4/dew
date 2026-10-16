@@ -490,9 +490,11 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
     items = ci.gangs(source)
 
     def collected(*select: str) -> set[str]:
+        # As a gang's rank collects it: the file skips itself outside a gang.
         done = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p",
                                "no:cacheprovider", str(source), *select],
-                              cwd=ROOT, capture_output=True, text=True, check=True)
+                              cwd=ROOT, capture_output=True, text=True, check=True,
+                              env={**os.environ, "ARMADA_WORLD": "4", "ARMADA_RANK": "0"})
         return {line for line in done.stdout.splitlines() if "::" in line}
 
     every = collected()

@@ -532,16 +532,18 @@ class DiffusionObjective(Objective[Ratio]):
         return jax.tree.map(lambda blank, value: blank.astype(value.dtype),
                             self.encode(params["encoders"]), like)
 
-    def held_variables(self) -> Variables:
+    def held_variables(self, *, beside: Variables | None = None) -> Variables:
         """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers.
 
         A text tower and a VAE are released weights of hundreds of megabytes, which a
         trace without arguments would compile into the state executable as
         constants. The loss's frozen networks ride beside a starting tree without them.
         This is one mapping, so an objective that starts from more than the towers
-        extends both this and `init`.
+        extends both this and `init`. A part `beside` holds, a caller's own, is
+        taken as given and not built: LPIPS's published weights are not fetched for
+        a caller that brings its own.
         """
-        held: dict[str, Any] = dict(self.variables or {})
+        held: dict[str, Any] = {**(self.variables or {}), **(beside or {})}
         if "params" not in held:
             # Parts a draw goes beside: the towers they leave out are the built ones.
             held.setdefault("encoders", self.encoder_params())
@@ -584,12 +586,17 @@ class DiffusionObjective(Objective[Ratio]):
         drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                 **conditions)
         state = {**drawn, "encoders": held["encoders"]}
+        built: Variables | None = None
         for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR, TEACHER):
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
             # A caller holding only some towers takes the rest as built, and
             # a pretrained discriminator and a teacher ride in the same way.
-            value = held[frozen] if frozen in held else self.held_variables().get(frozen)
+            if frozen in held:
+                value = held[frozen]
+            else:
+                built = self.held_variables(beside=held) if built is None else built
+                value = built.get(frozen)
             if value is not None:
                 state[frozen] = value
         return state
@@ -914,8 +921,8 @@ class FlowDistillationObjective(DiffusionObjective):
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         self.model, self.teacher = modules
 
-    def held_variables(self) -> Variables:
-        return {**super().held_variables(), TEACHER: self.teacher_variables}
+    def held_variables(self, *, beside: Variables | None = None) -> Variables:
+        return {**super().held_variables(beside=beside), TEACHER: self.teacher_variables}
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Start the student as the tree's teacher and add the loss's `network`, unless the tree holds it."""
