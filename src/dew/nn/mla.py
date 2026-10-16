@@ -364,6 +364,7 @@ class MultiHeadLatentAttention(nn.Module):
 
     def make_indexer(self) -> nn.Module:
         """The indexer beside the attention, built in `setup`: V3.2's lightning indexer."""
+        assert self.index_n_heads is not None and self.index_head_dim is not None
         return SparseIndexer(
             n_heads=self.index_n_heads, head_dim=self.index_head_dim,
             rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,

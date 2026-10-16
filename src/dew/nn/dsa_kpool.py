@@ -230,6 +230,8 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     consecutive keys, with no mask or bias to narrow them."""
 
     rotary: bool = False
+    norm_eps: float = 1e-5
+    """The latent norms' epsilon, the model's rms_norm_eps (configuration_glm5_next.py's 1e-5)."""
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
     force_fp32_for_softmax: bool = True
@@ -237,22 +239,26 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     def setup(self):
         if self.qk_rope_head_dim or self.rotary:
             raise ValueError("the k-pool layer has no rope head: qk_rope_head_dim=0 and rotary=False")
-        if self.q_lora_rank is None or None in (self.index_n_heads, self.index_head_dim, self.index_topk):
+        if not self.causal or self.yarn is not None or self.output_gate or self.index_shared:
+            raise ValueError(
+                "the k-pool layer attends causally, with no rope to scale, no output gate and an "
+                "indexer of its own: causal=True, yarn=None, output_gate=False and index_shared=False")
+        heads, width = self.index_n_heads, self.index_head_dim
+        if self.q_lora_rank is None or heads is None or width is None or self.index_topk is None:
             raise ValueError(
                 "the k-pool layer's queries are low rank and its indexer selects: q_lora_rank, "
                 "index_n_heads, index_head_dim and index_topk have to be set")
-        if self.index_n_heads < 1 or self.index_head_dim < 1:
-            raise ValueError(
-                "the indexer needs heads of a positive width, got "
-                f"{self.index_n_heads} of {self.index_head_dim}")
+        if heads < 1 or width < 1:
+            raise ValueError(f"the indexer needs heads of a positive width, got {heads} of {width}")
         super().setup()
 
     def make_indexer(self) -> nn.Module:
-        """The k-pool indexer, by GLM-5.3-Flash's fields."""
+        """The k-pool indexer, by GLM-5.3-Flash's fields (`setup` refused any unset)."""
+        heads, width, top_k = self.index_n_heads, self.index_head_dim, self.index_topk
+        assert heads is not None and width is not None and top_k is not None
         return KPoolIndexer(
-            emb_features=self.emb_features, n_heads=self.index_n_heads, head_dim=self.index_head_dim,
-            top_k=self.index_topk, kpool=self.index_kpool,
-            always_select_tail=self.index_kpool_always_select_tail,
+            emb_features=self.emb_features, n_heads=heads, head_dim=width, top_k=top_k,
+            kpool=self.index_kpool, always_select_tail=self.index_kpool_always_select_tail,
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @nn.compact
@@ -271,7 +277,7 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
                 raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
         row_valid = jnp.ones((batch, length), bool) if valid is None else valid
         # The latent attention's own projections, with no rope head.
-        place = down_projection(x, self.q_lora_rank + self.kv_lora_rank)
+        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank)
         query, q_resid = self._queries(x, place)
         key, value = self._expand(*self._latents(x, place))
         packed = self.indexer.packed(x, row_valid)
@@ -292,7 +298,8 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             if prediction_phase != "ordinary" or self.has_variable("cache", "selection_position"):
                 if prediction_phase == "draft" and length != 1:
                     raise ValueError("draft index reuse accepts one candidate per row")
-                count = min(self.index_topk // self.index_kpool, -(-self.max_seq_len // self.index_kpool))
+                pools = (self.index_topk or 0) // self.index_kpool
+                count = min(pools, -(-self.max_seq_len // self.index_kpool))
                 width = count * self.index_kpool + (
                     self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
                 )
