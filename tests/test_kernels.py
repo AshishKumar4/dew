@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, distance
+from test_attention_splash import attention_terms
 
 from dew.nn import kernels
 from dew.nn.attention import (
@@ -188,15 +189,7 @@ def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
     group = query.shape[1] // key.shape[1]
     key, value = jnp.repeat(key, group, axis=1), jnp.repeat(value, group, axis=1)
     logits = jnp.einsum('qhd,khd->hqk', query, key) / np.sqrt(query.shape[-1])
-    offset = jnp.arange(key.shape[0])[None, :] - jnp.arange(query.shape[0])[:, None]
-    kept = jnp.ones(offset.shape, bool)
-    if causal:
-        kept &= offset <= 0
-    if window[0] >= 0:
-        kept &= offset >= -window[0]
-    if window[1] >= 0:
-        kept &= offset <= window[1]
-    logits = jnp.where(kept, logits, -jnp.inf)
+    logits = jnp.where(window_kept(query.shape[0], key.shape[0], causal, window), logits, -jnp.inf)
     if sinks is None:
         weights = jax.nn.softmax(logits, axis=-1)
     else:
@@ -205,6 +198,26 @@ def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
         exponents = jnp.exp(logits - top)
         weights = exponents / (jnp.sum(exponents, axis=-1, keepdims=True) + jnp.exp(sink - top))
     return jnp.einsum('hqk,khd->qhd', weights, value)
+
+
+def window_kept(q_len, k_len, causal, window=(-1, -1)):
+    """The keys each of `q_len` queries keeps, `[q, k]`: `float64_attention`'s causality and window."""
+    offset = np.arange(k_len)[None, :] - np.arange(q_len)[:, None]
+    kept = np.ones(offset.shape, bool)
+    if causal:
+        kept &= offset <= 0
+    if window[0] >= 0:
+        kept &= offset >= -window[0]
+    if window[1] >= 0:
+        kept &= offset <= window[1]
+    return kept
+
+
+def window_terms(query, key, value, cotangent, causal, window=(-1, -1), sinks=None):
+    """`attention_terms` of `float64_attention`'s output and gradients for `[S, H, D]` arrays."""
+    terms = attention_terms(query[None], key[None], value[None], cotangent[None],
+                            window_kept(query.shape[0], key.shape[0], causal, window)[None, None], sinks)
+    return [x[0] for x in terms]
 
 
 def output_and_gradients(attend, cotangent, *arrays):
@@ -257,12 +270,15 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
                 wide[3], *wide[:3], wide[4])
         dense_sinks.append(dense[4])
         true_sinks.append(truth[4])
-        for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed[:4]),
-                                           dense[:4], truth[:4], strict=True):
+        terms = window_terms(*pieces, cotangent[begin:end], causal, window, logits if sunk else None)
+        documents = (x[begin:end] for x in packed[:4])
+        for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), documents, dense[:4], truth[:4],
+                                                   terms, strict=True):
             if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
                 np.testing.assert_array_equal(got, theirs)
             else:
-                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
+                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}",
+                                                 terms=summed)
     if sunk:
         assert_as_exact_as_the_reference(packed[4], np.sum(dense_sinks, axis=0), np.sum(true_sinks, axis=0),
                                          "dsinks")
@@ -370,8 +386,10 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
         wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
         truth = output_and_gradients(functools.partial(float64_attention, causal=True), wide[3],
                                      *wide[:3])
-    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused, reference, truth, strict=True):
-        assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
+    terms = window_terms(query[0], key[0], value[0], cotangent[0], causal=True)
+    for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), fused, reference, truth, terms,
+                                               strict=True):
+        assert_as_exact_as_the_reference(got[0], theirs[0], want, name, terms=summed)
 
 
 @on_gpu
@@ -409,9 +427,10 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         truth = output_and_gradients(
             lambda q, k, v, s: float64_attention(q, k, v, causal, sides, s if sinks else None),
             wide[3], *wide[:3], wide_sinks)
-    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused[:4], reference[:4], truth[:4],
-                                       strict=True):
-        assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
+    terms = window_terms(query[0], key[0], value[0], cotangent[0], causal, sides, logits if sinks else None)
+    for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), fused[:4], reference[:4], truth[:4],
+                                               terms, strict=True):
+        assert_as_exact_as_the_reference(got[0], theirs[0], want, name, terms=summed)
     if sinks:
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
@@ -453,6 +472,7 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
     sides = (-1, -1) if window is None else (window - 1, 0)
     truth = [np.zeros_like(x) for x in fused]
+    terms = [np.zeros_like(x) for x in fused[:4]]
     with jax.enable_x64(new_val=True):
         for row in range(2):
             begin = 0
@@ -466,12 +486,18 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
                     wide[3], *wide[:3], jnp.asarray(np.asarray(logits, np.float64)))
                 for whole, part in zip(truth[:4], exact[:4], strict=True):
                     whole[row, piece] = part
+                for whole, part in zip(terms, window_terms(
+                        *(x[row, piece] for x in (query, key, value, cotangent)), causal=True, window=sides,
+                        sinks=logits if sinks else None), strict=True):
+                    whole[row, piece] = part
                 truth[4] += exact[4]
                 begin += length
     for name, index in (("o", 0), ("dq", 1)):
-        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
+        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name,
+                                         terms=terms[index][real])
     for name, index in (("dk", 2), ("dv", 3)):
-        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name,
+                                         terms=terms[index])
     if sinks:
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
