@@ -58,9 +58,14 @@ anyio==4.15.1
     # via
     #   httpx
     #   httpx2
+    #   jupyter-server
     #   mlflow-skinny
     #   openai
     #   starlette
+argon2-cffi==25.1.0
+    # via jupyter-server
+argon2-cffi-bindings==26.1.0
+    # via argon2-cffi
 array-record==0.8.4
     # via
     #   dewml (pyproject.toml)
@@ -68,6 +73,8 @@ array-record==0.8.4
     #   tensorflow-datasets
 arro3-core==0.9.0
     # via deltalake
+arrow==1.4.0
+    # via isoduration
 astroid==4.3.4
     # via pylint
 asttokens==3.0.2
@@ -82,6 +89,10 @@ attrs==26.1.0
     #   referencing
 aws-xray-sdk==2.15.0
     # via moto
+beautifulsoup4==4.15.0
+    # via nbconvert
+bleach==6.4.0
+    # via nbconvert
 blinker==1.9.0
     # via flask
 boto3==1.43.106
@@ -103,7 +114,9 @@ certifi==2026.7.22
     #   httpx
     #   requests
 cffi==2.1.1
-    # via cryptography
+    # via
+    #   argon2-cffi-bindings
+    #   cryptography
 cfn-lint==1.57.2
     # via moto
 chardet==6.0.0.post1
@@ -131,7 +144,9 @@ colorama==0.4.6
 colorlog==6.12.0
     # via optuna
 comm==0.2.3
-    # via ipykernel
+    # via
+    #   ipykernel
+    #   ipywidgets
 compressed-tensors==0.17.1
     # via dewml (pyproject.toml)
 contourpy==1.4.0
@@ -169,7 +184,9 @@ decorator==5.3.1
     #   gcsfs
     #   moviepy
 defusedxml==0.7.1
-    # via nltk
+    # via
+    #   nbconvert
+    #   nltk
 deltalake==1.6.6
     # via dewml (pyproject.toml)
 deprecated==3.0.0
@@ -248,6 +265,8 @@ flax==0.12.10
     #   qwix
 fonttools==4.66.1
     # via matplotlib
+fqdn==1.6.0
+    # via jsonschema
 frozenlist==1.8.0
     # via
     #   aiohttp
@@ -377,6 +396,7 @@ idna==3.20
     #   anyio
     #   httpx
     #   httpx2
+    #   jsonschema
     #   requests
     #   yarl
 imageio==2.38.1
@@ -398,9 +418,15 @@ iniconfig==2.3.1
 ipykernel==7.4.0
     # via dewml (pyproject.toml)
 ipython==9.17.1
-    # via ipykernel
+    # via
+    #   ipykernel
+    #   ipywidgets
 ipython-pygments-lexers==1.1.1
     # via ipython
+ipywidgets==8.1.9
+    # via dewml (pyproject.toml)
+isoduration==20.11.0
+    # via jsonschema
 isort==9.0.2
     # via pylint
 itsdangerous==2.2.0
@@ -435,7 +461,9 @@ jinja2==3.1.6
     # via
     #   dewml (pyproject.toml)
     #   flask
+    #   jupyter-server
     #   lm-eval
+    #   nbconvert
     #   torch
 jiter==0.17.0
     # via openai
@@ -455,9 +483,12 @@ jsonpatch==1.35
 jsonpath-ng==1.10.0
     # via moto
 jsonpointer==3.2.1
-    # via jsonpatch
+    # via
+    #   jsonpatch
+    #   jsonschema
 jsonschema==4.26.0
     # via
+    #   jupyter-events
     #   nbformat
     #   openapi-schema-validator
     #   openapi-spec-validator
@@ -470,15 +501,34 @@ jsonschema-specifications==2025.9.1
 jupyter-client==8.10.0
     # via
     #   ipykernel
+    #   jupyter-kernel-gateway
+    #   jupyter-server
     #   nbclient
 jupyter-core==5.9.1
     # via
     #   ipykernel
     #   jupyter-client
+    #   jupyter-kernel-gateway
+    #   jupyter-server
     #   nbclient
+    #   nbconvert
     #   nbformat
+jupyter-events==0.12.1
+    # via jupyter-server
+jupyter-kernel-gateway==3.0.1
+    # via dewml (pyproject.toml)
+jupyter-server==2.21.1
+    # via jupyter-kernel-gateway
+jupyter-server-terminals==0.5.4
+    # via jupyter-server
+jupyterlab-pygments==0.3.0
+    # via nbconvert
+jupyterlab-widgets==3.0.17
+    # via ipywidgets
 kiwisolver==1.5.1
     # via matplotlib
+lark==1.3.1
+    # via rfc3987-syntax
 lazy-object-proxy==1.12.0
     # via openapi-spec-validator
 lm-eval==0.4.13
@@ -498,6 +548,7 @@ markupsafe==3.0.4
     #   flask
     #   jinja2
     #   mako
+    #   nbconvert
     #   werkzeug
 matplotlib==3.11.2
     # via
@@ -518,6 +569,8 @@ mccabe==0.7.0
     #   pylint
 mdurl==0.1.2
     # via markdown-it-py
+mistune==3.3.4
+    # via nbconvert
 ml-dtypes==0.6.0
     # via
     #   jax
@@ -558,11 +611,17 @@ mypy-extensions==1.1.0
 narwhals==2.27.1
     # via scikit-learn
 nbclient==0.11.0
-    # via dewml (pyproject.toml)
+    # via
+    #   dewml (pyproject.toml)
+    #   nbconvert
+nbconvert==7.17.1
+    # via jupyter-server
 nbformat==5.11.1
     # via
     #   dewml (pyproject.toml)
+    #   jupyter-server
     #   nbclient
+    #   nbconvert
 nest-asyncio2==1.7.4
     # via ipykernel
 networkx==3.7
@@ -724,9 +783,12 @@ packaging==26.3
     #   evaluate
     #   huggingface-hub
     #   ipykernel
+    #   jupyter-events
+    #   jupyter-server
     #   matplotlib
     #   mlflow-skinny
     #   mlflow-tracing
+    #   nbconvert
     #   optuna
     #   peft
     #   pytest
@@ -741,6 +803,8 @@ pandas==3.0.6
     #   datasets
     #   evaluate
     #   mlflow
+pandocfilters==1.5.1
+    # via nbconvert
 parso==0.8.7
     # via
     #   cosmic-ray
@@ -778,7 +842,9 @@ prettytable==3.18.0
 proglog==0.1.12
     # via moviepy
 prometheus-client==0.26.0
-    # via orbax-checkpoint
+    # via
+    #   jupyter-server
+    #   orbax-checkpoint
 promise==2.3
     # via tensorflow-datasets
 prompt-toolkit==3.0.53
@@ -820,7 +886,9 @@ psutil==7.2.2
     #   portpicker
     #   tensorflow-datasets
 ptyprocess==0.7.0
-    # via pexpect
+    # via
+    #   pexpect
+    #   terminado
 pure-eval==0.2.4
     # via stack-data
 py-partiql-parser==0.6.3
@@ -865,6 +933,7 @@ pygments==2.21.0
     # via
     #   ipython
     #   ipython-pygments-lexers
+    #   nbconvert
     #   pytest
     #   rich
 pylint==4.1.3
@@ -884,6 +953,7 @@ pytest-xdist==3.8.0
 python-dateutil==2.9.0.post0
     # via
     #   aiobotocore
+    #   arrow
     #   botocore
     #   graphene
     #   jupyter-client
@@ -895,6 +965,8 @@ python-dotenv==1.2.4
     #   mlflow-skinny
     #   moviepy
     #   pydantic-settings
+python-json-logger==4.2.0
+    # via jupyter-events
 pytz==2026.5
     # via typepy
 pyyaml==6.0.3
@@ -907,6 +979,7 @@ pyyaml==6.0.3
     #   gguf
     #   huggingface-hub
     #   jsonschema-path
+    #   jupyter-events
     #   mlflow-skinny
     #   moto
     #   optuna
@@ -919,6 +992,7 @@ pyzmq==27.2.0
     # via
     #   ipykernel
     #   jupyter-client
+    #   jupyter-server
 qwix==0.1.8
     # via
     #   dewml (pyproject.toml)
@@ -928,6 +1002,7 @@ referencing==0.37.0
     #   jsonschema
     #   jsonschema-path
     #   jsonschema-specifications
+    #   jupyter-events
     #   openapi-schema-validator
 regex==2026.9.29
     # via
@@ -947,6 +1022,7 @@ requests==2.34.2
     #   gguf
     #   google-api-core
     #   google-cloud-storage
+    #   jupyter-kernel-gateway
     #   mlflow-skinny
     #   moto
     #   opentelemetry-exporter-http-transport
@@ -960,7 +1036,16 @@ requests-oauthlib==2.0.0
 responses==0.26.3
     # via moto
 rfc3339-validator==0.1.4
-    # via openapi-schema-validator
+    # via
+    #   jsonschema
+    #   jupyter-events
+    #   openapi-schema-validator
+rfc3986-validator==0.1.1
+    # via
+    #   jsonschema
+    #   jupyter-events
+rfc3987-syntax==1.1.0
+    # via jsonschema
 rich==15.0.0
     # via
     #   dewml (pyproject.toml)
@@ -1002,6 +1087,8 @@ scipy==1.18.1
     #   mlflow
     #   scikit-learn
     #   skops
+send2trash==2.1.0
+    # via jupyter-server
 setuptools==84.0.0
     # via
     #   pytablewriter
@@ -1030,6 +1117,8 @@ smmap==5.0.3
     # via gitdb
 sniffio==1.3.1
     # via openai
+soupsieve==2.10
+    # via beautifulsoup4
 sqlalchemy==2.1.4
     # via
     #   alembic
@@ -1079,8 +1168,14 @@ termcolor==3.3.0
     # via
     #   fire
     #   tensorflow-datasets
+terminado==0.18.1
+    # via
+    #   jupyter-server
+    #   jupyter-server-terminals
 threadpoolctl==3.7.0
     # via scikit-learn
+tinycss2==1.5.1
+    # via bleach
 tokamax==0.0.15
     # via
     #   -c constraints.txt
@@ -1109,6 +1204,9 @@ tornado==6.5.10
     # via
     #   ipykernel
     #   jupyter-client
+    #   jupyter-kernel-gateway
+    #   jupyter-server
+    #   terminado
 tqdm==4.70.1
     # via
     #   datasets
@@ -1128,10 +1226,15 @@ traitlets==5.16.1
     # via
     #   ipykernel
     #   ipython
+    #   ipywidgets
     #   jupyter-client
     #   jupyter-core
+    #   jupyter-events
+    #   jupyter-kernel-gateway
+    #   jupyter-server
     #   matplotlib-inline
     #   nbclient
+    #   nbconvert
     #   nbformat
 transformers==5.16.1
     # via
@@ -1163,6 +1266,7 @@ typing-extensions==4.16.0
     #   aiosignal
     #   alembic
     #   anyio
+    #   beautifulsoup4
     #   cfn-lint
     #   etils
     #   fastapi
@@ -1198,6 +1302,10 @@ typing-inspection==0.4.4
     #   pydantic-settings
 tyro==1.0.16
     # via dewml (pyproject.toml)
+tzdata==2026.5
+    # via arrow
+uri-template==1.3.0
+    # via jsonschema
 urllib3==2.8.0
     # via
     #   dewml (pyproject.toml)
@@ -1222,6 +1330,14 @@ wcwidth==0.9.2
     #   ftfy
     #   prettytable
     #   prompt-toolkit
+webcolors==25.10.0
+    # via jsonschema
+webencodings==0.6.1
+    # via
+    #   bleach
+    #   tinycss2
+websocket-client==1.9.2
+    # via jupyter-server
 websockets==17.1
     # via dewml (pyproject.toml)
 werkzeug==3.1.9
@@ -1231,6 +1347,8 @@ werkzeug==3.1.9
     #   moto
     #   tensorboard
     #   xprof
+widgetsnbextension==4.0.16
+    # via ipywidgets
 word2number==1.1
     # via lm-eval
 wrapt==2.5.0
