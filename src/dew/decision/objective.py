@@ -85,7 +85,8 @@ class Encoding:
     answer. That teaches the model to say
     that no option fits instead of picking the nearest wrong one. Each scored
     slot's target is its gold distribution (`Example.distribution`) in the
-    order the row shows the options.
+    order the row shows the options. A reader passes the state's `tokens` it
+    fitted the example with (`Fit`), which the row lays out again.
     """
 
     layout: Layout
@@ -95,7 +96,8 @@ class Encoding:
     shuffle: bool = True
     none_of_the_above: float = 0.0
 
-    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
+    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
+                 tokens: Sequence[int] | None = None) -> Batch:
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
             names = [names[int(index)] for index in rng.permutation(len(names))]
@@ -124,7 +126,8 @@ class Encoding:
             if rng is not None and self.shuffle
             else None
         )
-        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders)
+        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
+                                tokens=tokens)
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -199,6 +202,8 @@ class FittedRow:
     names: tuple[str, ...]
     length: int
     truncated: bool
+    tokens: tuple[int, ...]
+    """The state's tokens, which the encoding lays out again."""
 
 
 @dataclass(frozen=True)
@@ -215,7 +220,8 @@ class Fit(pygrain.MapTransform):
         if not labels:
             return Rejected("unlabelled")
         asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
+        tokens = self.layout.state(self.tokenizer, self.specials, example.state)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=tokens)
         if not all(map(self.layout.fits, laid)):
             return Rejected("unfit")
         self.head.validate_rows(laid)
@@ -225,6 +231,7 @@ class Fit(pygrain.MapTransform):
                 tuple(question.name for question in row.questions),
                 len(row.tokens),
                 row.state_kept < row.state_tokens,
+                tokens,
             )
             for row in laid
         )
@@ -275,7 +282,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng)
+        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens)
 
 
 @dataclass(frozen=True)
@@ -284,7 +291,7 @@ class EvaluateRows(pygrain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, None)
+        return self.encoding(fitted.example, fitted.names, None, fitted.tokens)
 
 
 @dataclass(frozen=True)
