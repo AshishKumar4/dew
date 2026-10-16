@@ -402,7 +402,7 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
     values = np.clip(np.asarray(frames, float), 0, 1)
     count, height_cells, width_cells = values.shape
     left, top = 44, 64
-    width, height = left + width_cells * cell + 24, top + height_cells * cell + 24
+    width, height = left + width_cells * cell + 24, top + height_cells * cell + 40
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} by {x_label}")
     times = _frame_times(count, seconds)
     figure.text(left, 20, f"{y_label} ↓   {x_label} →", size=TEXT, color="muted")
@@ -422,7 +422,7 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
         figure.rect(left + c * cell + 1, top + r * cell + 1, cell - 2, cell - 2, fill="none", stroke="text",
                     rx=3, width=1.75)
     if captions:
-        _captions(figure, captions, times, width - 24, 42)
+        _captions(figure, captions, times, width - 24, height - 12)
     return figure
 
 
