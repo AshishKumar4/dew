@@ -30,7 +30,6 @@ from dew.data.chat import Role
 from dew.data.text import tokenizer_for
 from dew.objectives import DistillationObjective
 from dew.objectives.base import OMITTED, Objective, Omitted, Source, Variables
-from dew.objectives.distillation import Weight
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import (
     DPOObjective,
@@ -43,8 +42,7 @@ from dew.objectives.rl import (
     Verifier,
 )
 from dew.objectives.rl.rollout import Reward
-from dew.sampling import Sampling
-from dew.sampling.text import with_ids_of
+from dew.sampling import Sampling, with_ids_of
 from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 
 LOSSES = ((TextData, "pretraining"), (ChatData, "sft"), (PreferenceData, "dpo"), (PromptData, "grpo"),
@@ -58,14 +56,14 @@ class Teacher:
 
     `model` is a loaded model with its weights, such as `Pretrained.load`'s
     or `Pretrained.from_run`'s, over the decoder's vocabulary. `alpha` and
-    `temperature` are `DistillationObjective`'s: alpha weights the KL
-    against the stage's own loss, and the temperature softens both
-    distributions.
+    `temperature` are `DistillationObjective`'s, each a constant or a
+    schedule of the step: alpha weights the KL against the stage's own
+    loss, and the temperature softens both distributions.
     """
 
     model: Source
-    alpha: Weight
-    temperature: Weight
+    alpha: float | optax.Schedule
+    temperature: float | optax.Schedule
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, Source):

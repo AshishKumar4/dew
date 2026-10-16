@@ -140,11 +140,11 @@ def test_a_ppo_stage_acts_in_its_environment_and_hands_on_its_policy(tmp_path):
         Stage(name="ppo", data=tasks, steps=1, beta=.03, groups=GROUPS, max_new_tokens=RESPONSE,
               sampling=SAMPLING, episodes=episodes),
         Stage(name="aligned", data=pairs(), steps=1),
-    ), str(tmp_path / "chain"), batch=2, layout=LAYOUT)
+    ), str(tmp_path / "chain"), batch=8, layout=LAYOUT)
 
     states = recipe.run()
 
-    assert len(harness.opened) == 2 * GROUPS and harness.calls
+    assert len(harness.opened) == 8 * GROUPS and harness.calls
     assert raw(part(states[1].ema, "policy")) == raw(states[0].variables)
     policy = part(states[1].variables, "policy")
     assert raw(policy) != raw(states[0].variables)
