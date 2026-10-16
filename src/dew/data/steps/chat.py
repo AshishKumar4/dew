@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.chat import Conversation, render_conversation
+from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
 from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _ids, _mask
@@ -49,6 +49,51 @@ class RenderChat(grain.MapTransform):
         ids, roles = render_conversation(self.vocabulary.tokenizer, conversation, self.tokenizer)
         kept = {key: value for key, value in element.items() if key not in (self.column, "prompt", "tools")}
         return {**kept, "text": ids, "text_roles": roles}
+
+
+@dataclasses.dataclass(frozen=True)
+class ResponseCanvases:
+    """One block-diffusion row per assistant turn of a rendered conversation.
+
+    The row's `text` is everything before the turn, `pad_id`-padded to
+    `prompt_length`, then the turn's completion over `count` canvases of
+    `canvas_size`: `eos_id` fills the rest of its last canvas, `pad_id` the
+    canvases after it, and `canvas_mask` marks the filled canvases, as the
+    reference's `CanvasChunker` lays a response out (gemma bf0b49901,
+    `diffusion/hackable_diffusion_adapter/data/data.py`). A longer prompt
+    keeps its last ids, which hold the turn's header; a longer completion
+    keeps its first, as the reference cuts it. Either cut marks the row
+    truncated.
+    """
+
+    prompt_length: int
+    canvas_size: int
+    count: int
+    eos_id: int
+    pad_id: int = 0
+
+    def __post_init__(self) -> None:
+        if min(self.prompt_length, self.canvas_size, self.count) < 1:
+            raise ValueError("response canvases need a positive prompt_length, canvas_size and count")
+
+    def flat_map(self, element: Batch) -> Sequence[Batch]:
+        ids = np.asarray(element["text"], np.int32)
+        assistant = (np.asarray(element[ROLES_KEY]) == Role.ASSISTANT).astype(np.int8)
+        edges = np.flatnonzero(np.diff(assistant, prepend=0, append=0))
+        capacity = self.count * self.canvas_size
+        kept = {key: value for key, value in element.items() if key not in ("text", ROLES_KEY)}
+        rows = []
+        for start, end in zip(edges[::2], edges[1::2], strict=True):
+            response = ids[start:min(end, start + capacity)]
+            filled = -(-len(response) // self.canvas_size) * self.canvas_size
+            text = np.full(self.prompt_length + capacity, self.pad_id, np.int32)
+            text[:min(start, self.prompt_length)] = ids[max(0, start - self.prompt_length):start]
+            text[self.prompt_length:self.prompt_length + filled] = self.eos_id
+            text[self.prompt_length:self.prompt_length + len(response)] = response
+            cut = start > self.prompt_length or end - start > capacity
+            rows.append({**kept, "text": text, "canvas_mask": np.arange(capacity) < filled,
+                         **({"_dew_truncated": True} if cut else {})})
+        return rows
 
 
 @dataclasses.dataclass(frozen=True)

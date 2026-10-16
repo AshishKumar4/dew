@@ -24,7 +24,7 @@ from tool_support import load
 
 from dew import Checkpoints
 from dew.artifacts import uint8_pixels
-from dew.data.dataset import Loader
+from dew.data.dataset import DataPartition, Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
@@ -264,6 +264,40 @@ def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_p
     assert len((tmp_path / "samples.txt").read_text().splitlines()) == 2
 
 
+def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_path):
+    """The example's rows, as its objective reads them: one per assistant
+    turn, the template's render of the conversation before the turn as the
+    clean prompt (its tail, past `prompt_tokens`), and the turn's completion
+    then EOS as the only canvas targets. Packed windows split at a fixed
+    prompt length put user and template ids on the canvases and cut turns
+    apart."""
+    from transformers import AutoTokenizer
+
+    example = load("sft_diffusion_gemma", "examples")
+    config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
+    _, objective = example.adapted_objective(config)
+    train, _, _ = example.chat_rows(config, objective).pipelines()
+    rows = list(train.iterate())
+    template = AutoTokenizer.from_pretrained(config.model)
+    expected = []
+    for turns in example.CONVERSATIONS:
+        for index in range(1, len(turns), 2):
+            prompt = template.apply_chat_template(turns[:index], add_generation_prompt=True,
+                                                  tokenize=True, return_dict=False)
+            whole = template.apply_chat_template(turns[:index + 1], tokenize=True, return_dict=False)
+            expected.append((prompt[-objective.prompt_length:], whole[len(prompt):]))
+
+    batch = {name: np.stack([row[name] for row in rows]) for name in ("text", "canvas_mask")}
+    _, tokens, response, _, valid, targets, _ = objective._row(batch)
+    assert len(rows) == len(expected) == 4
+    for row, (prompt, completion) in enumerate(expected):
+        head = np.asarray(tokens[row, :objective.prompt_length])
+        assert head[np.asarray(valid[row, :objective.prompt_length])].tolist() == prompt
+        scored = np.asarray(response[row])[np.asarray(targets[row])].tolist()
+        closing = -len(completion) % objective.canvas_size
+        assert scored == completion + [template.eos_token_id] * closing
+
+
 def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     """Full-weight SFT over packed conversations: the run record `dew.pipeline`
     reads, and the Hugging Face directory `Pretrained.from_run(...).save(...)` writes beside it."""
@@ -277,6 +311,35 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert objective["name"] == "dew.objectives.lm.objective:LMObjective"
     assert (export / "tokenizer_config.json").is_file()
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
+
+
+def test_sft_gemma4_validates_on_conversations_it_never_trains_on(tmp_path):
+    """The run's validation windows hold the first `held_out` conversations,
+    and no training window holds an id of theirs: the canned conversations
+    share no word, so a shared id would be a shared conversation. Validation
+    used to read the training split again and score what the run trained on."""
+    from transformers import AutoTokenizer
+
+    from dew.config.data import loader
+
+    example = load("sft_gemma4", "examples")
+    config, tokenizer, chat = example.smoke_config(example.Config(smoke=True, out=tmp_path))
+    run = example.run_config(config, tokenizer, chat)
+    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, provision=run.provision,
+                  loading=run.loading, validation_records=run.validation_records)
+    vocabulary = AutoTokenizer.from_pretrained(tokenizer)
+    words = [{token for turn in turns
+              for token in vocabulary.encode(turn["content"], add_special_tokens=False)}
+             for turns in example.SMOKE_CONVERSATIONS]
+    held, kept = set().union(*words[:config.held_out]), set().union(*words[config.held_out:])
+
+    def read(batches) -> set[int]:
+        return {int(token) for batch in batches for token in np.asarray(batch["text"]).ravel()}
+
+    assert data.val is not None
+    assert read(data.val(DataPartition())) & (held | kept) == held
+    trained = read(itertools.islice(data.train(DataPartition()), 4 * (data.steps_per_epoch or 1)))
+    assert trained & (held | kept) and trained & held == set()
 
 
 def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
@@ -296,7 +359,7 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     finished = subprocess.run(
         [sys.executable, str(REPO_ROOT / "examples/sft_gemma4.py"), "--model", str(model),
          "--dataset", str(chat), "--sequence-length", "15", "--batch-size", "2",
-         "--accumulation", "2", "--steps", "2", "--out", str(tmp_path / "run")],
+         "--accumulation", "2", "--steps", "2", "--held-out", "2", "--out", str(tmp_path / "run")],
         cwd=REPO_ROOT, env=single_device(), capture_output=True, text=True, timeout=900)
 
     assert finished.returncode == 0, finished.stderr[-3000:]
