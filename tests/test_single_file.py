@@ -23,11 +23,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.interop import Pretrained
+from dew.interop import Pretrained, single_file
 from dew.interop.safetensors_io import read_file, write_file
 
 pytest.importorskip("diffusers", reason="single-file conversion runs diffusers' own key maps")
-single_file = pytest.importorskip("dew.interop.single_file")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "single_file"
 WEIGHTS = {"unet": "diffusion_pytorch_model.safetensors", "vae": "diffusion_pytorch_model.safetensors",

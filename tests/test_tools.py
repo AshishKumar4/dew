@@ -555,6 +555,24 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
+    """SLOP015: a test that reaches its own package through `pytest.importorskip`,
+    however it imports the skip, turns an import the package breaks into a skip; an
+    optional dependency's skip, or a package that only shares the prefix, is not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": ("import pytest\n"
+                                "from pytest import importorskip\n"
+                                "graph = pytest.importorskip('sparx.graph')\n"
+                                "sparx = importorskip('sparx')\n"
+                                "torch = pytest.importorskip('torch')\n"
+                                "near = pytest.importorskip('sparxish')\n"
+                                "named = pytest.importorskip(modname='sparx.graph')\n"
+                                "optional = pytest.importorskip(modname='torch')\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP015") for line in (3, 4, 7)]
+
+
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
     """SLOP011: `match=` on pytest's raise, a read of a function's source and a
     test that names a source file each prove text, not behaviour, however the
