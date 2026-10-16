@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
-from typing import ClassVar, NamedTuple, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -247,11 +247,13 @@ class LoRA:
         return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""))
 
 
-class AdapterBase(NamedTuple):
+@dataclass(frozen=True)
+class AdapterBase:
     """The published model an adapter was bound to: its Hub id and the commit the Hub resolved it
     to. PEFT's config names them (`base_model_name_or_path`, `revision`), so a reader on any machine
     loads the adapter onto the same weights. A config another tool wrote may name a base without a
-    commit, which is read and written back as it is."""
+    commit, which is read and written back as it is. A run's record holds it (`AdapterRecord`), as
+    it holds each target's binding."""
 
     name: str
     revision: str | None

@@ -341,7 +341,15 @@ for name, directory in (("dew/llama-tiny", sys.argv[1]), (sys.argv[3], sys.argv[
     adapted.adapter.save(variables, directory)
     tokens = np.load(sys.argv[3] + "/input_ids.npy")
     np.save(directory + "/logits.npy", np.asarray(adapted.model.apply(variables, tokens)))
-    print(json.dumps(LoRA.load(source.model, source.variables, directory, layouts=source.layouts).base))
+    base = LoRA.load(source.model, source.variables, directory, layouts=source.layouts).base
+    print(json.dumps(None if base is None else [base.name, base.revision]))
+    # The run's record of the adapter keeps its base through JSON.
+    from dew.lora import AdapterRecord
+    from dew.registry import from_record, to_record, wrapper_layers
+
+    record = wrapper_layers(type(adapted.model))[1][0]._dew_wrapper()
+    kept = from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord))))
+    print(json.dumps(kept.base == record.base))
 """
 
 
@@ -380,7 +388,7 @@ def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_ther
         return done.stdout.split("\n")
 
     reloaded = [json.loads(line) for line in run(_HUB_ADAPTER, hub, local, LLAMA) if line]
-    assert reloaded == [["dew/llama-tiny", commit], None]
+    assert reloaded == [["dew/llama-tiny", commit], True, None, True]
     config = json.loads((hub / "adapter_config.json").read_text())
     assert (config["base_model_name_or_path"], config["revision"]) == ("dew/llama-tiny", commit)
     written = json.loads((local / "adapter_config.json").read_text())
