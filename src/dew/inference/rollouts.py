@@ -351,19 +351,21 @@ class SafetensorsReload:
         agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
 
     def _publish(self, version: int) -> None:
+        def reload(root: str) -> None:
+            _post(root, "/collective_rpc", {"method": "reload_weights"}, self.timeout)
+
+        def load(root: str) -> None:
+            _post(root, "/update_weights_from_disk", {
+                "model_path": str(Path(self.directory).resolve()), "flush_cache": True,
+                "abort_all_requests": False, "weight_version": str(version)}, self.timeout, reports=True)
+
         if self.engine == "vllm":
-            reload: JSON = {"method": "reload_weights"}
-            _vllm_publication(self.engines, version, self.timeout, lambda: _on_every(
-                self.engines, lambda root: _post(root, "/collective_rpc", reload, self.timeout)))
-            return
-        load: JSON = {"model_path": str(Path(self.directory).resolve()), "flush_cache": True,
-                      "abort_all_requests": False, "weight_version": str(version)}
-        _refused(version, self.engines, _on_every(
-            self.engines, lambda root: _post(root, "/update_weights_from_disk", load, self.timeout,
-                                             reports=True)))
+            _vllm_publication(self.engines, version, self.timeout, lambda: _on_every(self.engines, reload))
+        else:
+            _refused(version, self.engines, _on_every(self.engines, load))
 
 
-def _on_every(engines: Sequence[str], call: Callable[[str], object]) -> dict[str, BaseException]:
+def _on_every(engines: Sequence[str], call: Callable[[str], None]) -> dict[str, BaseException]:
     """Run `call` on every replica root at once, and return each failure by its replica."""
     failures: dict[str, BaseException] = {}
     with ThreadPoolExecutor(max_workers=max(1, len(engines)), thread_name_prefix="dew-weight-push") as pool:
