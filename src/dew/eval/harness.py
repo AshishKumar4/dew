@@ -179,17 +179,18 @@ class DewLM(TemplateLM):
         """Encode `string` with the run's own tokenizer into one row of ids, as `HFLM.tok_encode` does.
 
         The run's processor adds the special tokens it added in training.
-        With `add_special_tokens=False`, or with None and a string that
-        already starts with the prefix token's text, the BOS the processor
-        adds is left off, so no row starts with two. `left_truncate_len`
+        Where it inserts a BOS, the BOS is left off with
+        `add_special_tokens=False`, and with None when the text already
+        starts with the BOS's own text, which the tokenizer reads as a
+        second BOS, so no such row starts with two. `left_truncate_len`
         keeps that many of the last ids. Any other option raises TypeError,
         since `HFLM` reads none.
         """
         if kwargs:
             raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
         ids = self._encoded(string)
-        if self._adds_bos and (add_special_tokens is False or (
-                add_special_tokens is None and string.startswith(self.tok_decode([self.prefix_token_id])))):
+        if self._inserts_bos and (add_special_tokens is False
+                                  or (add_special_tokens is None and ids[1:2] == ids[:1])):
             ids = ids[1:]
         return ids[-left_truncate_len:] if left_truncate_len else ids
 
@@ -197,10 +198,14 @@ class DewLM(TemplateLM):
         return [int(token) for token in np.asarray(self._processor([string]).tokens)[0]]
 
     @functools.cached_property
-    def _adds_bos(self) -> bool:
-        """Whether the run's processor starts every encoding with BOS, as Llama's tokenizer does."""
+    def _inserts_bos(self) -> bool:
+        """Whether the run's processor starts an encoding with the BOS it declares, as Llama's does.
+
+        GPT-2's declares one and inserts none. The probe is one letter,
+        since a processor refuses an empty row.
+        """
         bos = self._processor.bos_id
-        return bos is not None and self._encoded("") == [bos]
+        return bos is not None and self._encoded("a")[:1] == [bos]
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
