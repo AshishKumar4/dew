@@ -1051,6 +1051,7 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
     released = [threading.Event(), threading.Event()]
     first_reader = []
     underlying_read = grain.ArrayRecordDataSource.__getitem__
+    failed_read = ValueError("failed child read")
 
     def descriptors(path):
         with os.scandir("/proc/self/fd") as opened:
@@ -1067,7 +1068,7 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
             entered.wait(timeout=5)
             assert released[index].wait(timeout=5)
             if fail:
-                raise ValueError("failed child read")
+                raise failed_read
         return payload
 
     monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
@@ -1093,8 +1094,9 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
                 for index, future in enumerate(pending):
                     released[index].set()
                     if fail:
-                        with pytest.raises(ValueError):
+                        with pytest.raises(ValueError) as raised:
                             future.result(timeout=5)
+                        assert raised.value is failed_read
                     else:
                         assert future.result(timeout=5) == f"0:{index}".encode()
                     still_open = descriptors(arrayrecord_paths[0])
