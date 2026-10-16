@@ -76,6 +76,35 @@ _LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
 _GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
+_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\](\{[^}]*\})?')
+_PACKED = re.compile(r'E\((\d+)\)')
+_BITS = re.compile(r'(\d+)')
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+"""The HLO ops that move data between devices. XLA runs some as an async
+pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
+computation that holds the op itself."""
+
+
+def collective(op: str) -> str | None:
+    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
+    kind = op.removesuffix('-start').removesuffix('-done')
+    return kind if kind in COLLECTIVES else None
+
+
+def _buffers(shape: str) -> tuple[int, ...]:
+    """The bytes of each array an instruction's result holds, a tuple's every
+    element, as XLA sizes it (`ShapeUtil::ByteSizeOfElements`): its layout's
+    element size where it packs one (`E(4)`), else its type's width rounded up
+    to whole bytes (`pred` and `s4` one byte each), by its elements, rounded up."""
+    found = []
+    for element, dims, layout in _ARRAY.findall(shape):
+        packed = _PACKED.search(layout)
+        width = 1 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
+        bits = int(packed.group(1)) if packed else -(-width // 8) * 8
+        found.append(-(-bits * math.prod(int(d) for d in dims.split(',') if d) // 8))
+    return tuple(found)
+
+
 _CUSTOM_CALLS = (
     ("gemm", re.compile(r'^__cublas')),
     ("convolution", re.compile(r'^__cudnn\$conv')),
@@ -100,6 +129,8 @@ class _Instruction:
     traced: tuple[str, ...] = ()
     """Its metadata's `op_name source_file:line`, interned: a module repeats
     each a great many times."""
+    buffers: tuple[int, ...] = ()
+    """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
 
 
 @dataclass
@@ -185,8 +216,9 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         attributes, metadata = _without_metadata(attributes)
         traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
                        for op_name, file, line in _TRACED.findall(metadata) if op_name)
+        buffers = _buffers(match.group('shape')) if collective(match.group('op')) else ()
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced)
+                                                      recomputed, traced, buffers)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -365,6 +397,9 @@ class HloInstruction:
     runs: float
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
+    buffers: tuple[int, ...]
+    """A collective's result, each array's bytes: an async pair's `-done` holds
+    what moved, its `-start` what it read as well. Empty for any other op."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -417,7 +452,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads, flops, weights.get(called_as, 0.0))
+                                         reads, flops, weights.get(called_as, 0.0), instruction.buffers)
     computations.clear()
     return found
 
@@ -637,10 +672,7 @@ def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     gives, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
-    if text is None:
-        return None
-    model, hardware = hlo_flops(text, recomputed=False), hlo_flops(text)
-    return None if model is None or hardware is None else StepFlops(model, hardware)
+    return None if text is None else hlo_flops(text)
 
 
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
@@ -649,22 +681,24 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     return None if flops is None else flops.hardware
 
 
-def hlo_flops(text: str, *, recomputed: bool = True) -> float | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module;
-    without the forward a remat recomputes where `recomputed` is False."""
+def hlo_flops(text: str) -> StepFlops | None:
+    """Matmul and convolution FLOPs of one call of an optimized HLO module,
+    parsed and weighted once: the forward a remat recomputes counted once in
+    `model` and each time it runs in `hardware`."""
     computations, entry = _parse(text)
     if entry is None:
         return None
     weights = _weights(computations, entry)
-    total = 0.0
+    model = hardware = 0.0
     for name, computation in computations.items():
-        instructions = sum(_instruction_flops(instruction, computation.shapes)
-                           for instruction in computation.instructions.values()
-                           if recomputed or not instruction.recomputed)
-        if not instructions or not weights[name]:
+        counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+                   for instruction in computation.instructions.values()]
+        ran = sum(flops for flops, _ in counted)
+        if not ran or not weights[name]:
             continue
-        total += weights[name] * instructions
-    return total if math.isfinite(total) else None
+        hardware += weights[name] * ran
+        model += weights[name] * sum(flops for flops, recomputed in counted if not recomputed)
+    return StepFlops(model, hardware) if math.isfinite(model) and math.isfinite(hardware) else None
 
 
 def model_flops_utilization(

@@ -6,6 +6,9 @@
     python3 tools/armada/ci.py durations VERDICT...
     python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
+    python3 tools/armada/ci.py coverage report DIR
+    python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -51,9 +54,21 @@ marked to run on a GPU, from which `gpu-tier` names the files that take
 another path on a GPU (all of them daily, the marked ones per batch). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's.
+
+`coverage` measures src/dew's branch coverage over the suite, on demand and never
+per batch: `items` prints the plan's tasks for the oldest Python as armada map
+items, each running its files under coverage.py (pyproject.toml's
+[tool.coverage.run], the Python processes its tests start included) with the
+test cache off, since a reused row covers nothing, and writing its data among
+the task's artifacts; a traced task records nothing in the cache either.
+`report` combines the artifacts' data under DIR and writes DIR/coverage.json and
+DIR/coverage.md, a module a line, the least covered first:
+
+    armada map --artifacts=DIR --items=ITEMS -- bash -lc {item}
 """
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import hashlib
@@ -436,21 +451,29 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
+CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+              "HF_ENDPOINT": "http://127.0.0.1:9"}
+"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`-m "not network"`):
+the libraries offline, and the Hub's address a closed port for any that would ask it regardless. A
+test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
-         grace: float = 60.0) -> int:
+         grace: float = 60.0, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
     killing them `grace` seconds after that.
 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
-    at 300 seconds ran a median of 392."""
+    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
+    file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them.
-    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {})
+    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage)
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool, grace: float,
-           common: str, environ: Mapping[str, str]) -> int:
+           common: str, environ: Mapping[str, str], coverage: Path | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's."""
     began = time.monotonic()
     rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
@@ -467,8 +490,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
     # log holds every test that finished when a task is cut short.
-    command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
-               "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
+    # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
+    # its data where COVERAGE_FILE says.
+    measured = [] if coverage is None else ["-m", "coverage", "run"]
+    environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
+    command = [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", "-m", "not network",
+               "-rfE", "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
                "-p", "executed", f"--junitxml={report}", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
@@ -478,7 +505,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True,
-                            env={**os.environ, **environ, "PYTHONPATH": path,
+                            env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
                                  "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
@@ -531,7 +558,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}})
     out.write_text(json.dumps({"rows": rows + ran}))
-    record(python, ran, executed_report, common)
+    if coverage is None:
+        # A traced run's rows, timed under tracing, are no rows to reuse.
+        record(python, ran, executed_report, common)
     return 0
 
 
@@ -719,6 +748,66 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
     return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
 
 
+ARTIFACTS = "/armada/task/artifacts"
+"""Where an armada task's files are kept for `armada map --artifacts`."""
+
+
+def coverage_items(target: float, timings: dict) -> list[str]:
+    """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
+    with the test cache off, its rows and data among its artifacts."""
+    return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
+            f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
+            f"--coverage={ARTIFACTS}"
+            for entry in plan(target, timings) if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT]
+
+
+def coverage_report(directory: Path) -> int:
+    """Combine the coverage data `coverage_items`' tasks left under `directory` and write its report:
+    coverage.py's own JSON, and a table a module a line, the least covered first. It runs where the
+    artifacts were downloaded, under this interpreter, which must have coverage.py."""
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        print(f"coverage.py is not importable from {sys.executable}; install the test extra", file=sys.stderr)
+        return 1
+    python = sys.executable
+    data = directory / ".coverage"
+    parts = sorted(str(path) for path in directory.glob("*/.coverage.*"))
+    if not parts:
+        print(f"no coverage data under {directory}", file=sys.stderr)
+        return 1
+    subprocess.run([python, "-m", "coverage", "combine", "--keep", f"--data-file={data}", *parts], check=True)
+    report = directory / "coverage.json"
+    subprocess.run([python, "-m", "coverage", "json", f"--data-file={data}", "-o", str(report)], check=True)
+    files = json.loads(report.read_text())["files"]
+    rows = sorted((measured["summary"]["percent_covered"], name, measured["summary"])
+                  for name, measured in files.items())
+    lines = ["| module | statements | missed | branches | partial | covered |", "|---|---|---|---|---|---|"]
+    lines += [f"| {name} | {summary['num_statements']} | {summary['missing_lines']} "
+              f"| {summary['num_branches']} | {summary['num_partial_branches']} | {percent:.1f}% |"
+              for percent, name, summary in rows]
+    (directory / "coverage.md").write_text("\n".join(lines) + "\n")
+    print(f"{len(rows)} modules from {len(parts)} data files: {directory / 'coverage.md'}")
+    return 0
+
+
+GANG = 4
+"""Ranks of each multi-host gang: four containers, one host each."""
+
+
+def gangs(source: Path = Path("tests/test_multihost.py")) -> list[dict]:
+    """The multi-host gangs CI runs side by side, as armada map items: one a model of `source`'s
+    MODELS, for its layouts across hosts, and one for every other test, so each case runs in
+    exactly one of them and a model added there is a gang of its own. Read from the source, as
+    the CI runner has no Dew to import it."""
+    models = next(ast.literal_eval(node.value) for node in ast.parse(source.read_text()).body
+                  if isinstance(node, ast.Assign) and [target.id for target in node.targets
+                                                       if isinstance(target, ast.Name)] == ["MODELS"])
+    own = [f"layouts and {model}" for model in models]
+    return [{"gang": GANG, "select": select} for select in own] + [
+        {"gang": GANG, "select": " and ".join(f"not ({select})" for select in own)}]
+
+
 def pythons(*, check: bool) -> int:
     """Print the tested versions, one a line; with `check`, refuse the files that name them apart."""
     if not check:
@@ -753,6 +842,15 @@ def main() -> int:
         help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
+    running.add_argument("--coverage", type=Path, default=None,
+                         help="run the files under coverage.py, its data file in this directory")
+    measuring = operations.add_parser("coverage")
+    stages = measuring.add_subparsers(dest="stage", required=True)
+    itemizing = stages.add_parser("items")
+    itemizing.add_argument("--target", type=float, required=True)
+    itemizing.add_argument("--timings", type=Path, required=True)
+    reporting = stages.add_parser("report")
+    reporting.add_argument("directory", type=Path)
     choosing = operations.add_parser("gpu-tier")
     choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
     choosing.add_argument("--marked", action="store_true",
@@ -764,6 +862,7 @@ def main() -> int:
     lane.add_argument("--cache", choices=("on", "off"), required=True)
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
+    operations.add_parser("gangs")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
@@ -773,6 +872,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
+    if args.operation == "gangs":
+        print(json.dumps(gangs()))
+        return 0
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
@@ -793,13 +895,20 @@ def main() -> int:
     if args.operation == "gpu-lane":
         return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache == "on",
                         processes=args.processes, deadline=args.deadline)
+    if args.operation == "coverage":
+        if args.stage == "report":
+            return coverage_report(args.directory)
+        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
+        print(json.dumps(coverage_items(args.target, timings)))
+        return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache == "on")
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache == "on",
+                coverage=args.coverage)
 
 
 if __name__ == "__main__":

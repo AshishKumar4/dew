@@ -4,11 +4,12 @@ projector tensor table.
 """
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 from flax import linen as nn
 
 from dew import records
+from dew.interop.decoder_parts import read_rope_theta
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -143,11 +144,54 @@ def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     return records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
 
-def _image_size(value: object, field: str) -> int:
-    """A square image size as one side: an int, or a pair with equal sides."""
+def _side(value: object, field: str) -> int:
+    """A square image or patch size as one side: an int, or a pair with equal sides."""
     if isinstance(value, (list, tuple)):
         if len(value) != 2 or value[0] != value[1]:
             raise ValueError(
                 f"{field} {list(value)!r} is not square, this trunk tiles squares")
         value = value[0]
     return records.integer(value, field)
+
+
+def trunk_geometry(vision: Mapping[str, object]) -> dict[str, int]:
+    """The width, MLP width, depth and head count a ViT config states, under
+    the trunk fields of the families that share the reference's names."""
+    return {
+        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
+    }
+
+
+def activation_name(config: Mapping[str, object], runs: Collection[str], default: str,
+                    fields: tuple[str, ...] = ("hidden_act",)) -> str:
+    """The activation the first of `fields` that `config` states names, else
+    the family's `default`; a name outside `runs`, the activations its trunk
+    computes, refuses."""
+    name = str(next((config[field] for field in fields if field in config), default))
+    if name not in runs:
+        raise ValueError(f"{fields[0]} {name!r} is not expressible: this trunk runs {', '.join(runs)}")
+    return name
+
+
+def refuse_dropout(vision: Mapping[str, object], *fields: str) -> None:
+    """Refuse a nonzero dropout among `fields`: the trunks run eval."""
+    for field in fields:
+        if records.number(vision.get(field, 0.0), field):
+            raise ValueError(f"{field} is training-time; this trunk runs eval")
+
+
+def rope_base(vision: Mapping[str, object], default: float) -> float:
+    """A trunk's plain rotary base: `rope_parameters`' rope_theta, else the
+    flat field, else the family's `default`. A scaled rope refuses, as any
+    rope does where only plain rotary has a place (`read_rope_theta`), and so
+    does the decoders' 'none' alias: the towers dispatch any type but
+    'default' to Transformers' rope initializers, which name no 'none'
+    (modeling_gemma4.py:716-719)."""
+    entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    if entry.get("rope_type", entry.get("type")) == "none":
+        raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
+    theta = read_rope_theta(entry, "rope_parameters")
+    return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta

@@ -44,9 +44,11 @@ from dew.interop.decoder_parts import (
     AudioFields,
     DecoderFamily,
     DecoderFields,
+    Reading,
     WrapperFields,
     _refuse_drafter,
     _unread,
+    held_parts,
     hf_activation,
     record_float,
     record_int,
@@ -473,20 +475,34 @@ def translate_wrapper_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map wrapper weights into language, tower, projector and audio trees.
+    """Map wrapper weights into language, tower, projector and audio trees:
+    `read_wrapper`'s."""
+    return read_wrapper(hf_tensors, record, param_dtype=param_dtype, lazy=lazy)[0]
 
+
+def read_wrapper(
+    hf_tensors: Mapping[str, np.ndarray],
+    record: WrapperFields,
+    *,
+    param_dtype: str = "float32",
+    lazy: bool = False,
+) -> tuple[Variables, tuple[Reading, ...]]:
+    """Map wrapper weights into language, tower, projector and audio trees,
+    and return them with the language model's readings (`read_decoder`),
+    named as the language model reads them (`wrapper_route`'s local names).
     Each name routes by prefix (`wrapper_route`). The language half rides
     the text family's own map, including the top-level tied head copy, and
     the tower and projector halves ride theirs. `lazy` leaves the language
-    model's leaves unread (`translate_weights`); the towers and projectors
-    are small and read whole.
+    model's leaves unread; the towers and projectors are small and read
+    whole.
     """
     sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
+    language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
+                                      lazy=lazy)
     variables = {
-        "language_model": translate_weights(tables["language_model"], record["text"],
-                                            param_dtype=param_dtype, lazy=lazy),
+        "language_model": language,
         "tower": vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"], param_dtype),
         "projector": {"params": vision_nn.projector_variables(
             _kind_name(record, "projector"), tables["projector"], param_dtype)},
@@ -501,7 +517,7 @@ def translate_wrapper_weights(
         )
         variables["audio_projector"] = {"params": vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
-    return variables
+    return variables, readings
 
 
 def _stack_experts(params: LazyTree) -> None:
@@ -575,11 +591,26 @@ def translate_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
+    default: `read_decoder`'s tree."""
+    return read_decoder(hf_tensors, config, model_type, param_dtype=param_dtype, lazy=lazy)[0]
 
-    Each tensor goes through its family's `prepare_weights` and `weight_path`. A
-    2-D kernel is transposed from torch's [out, in] to Dense's [in, out], and
-    per-expert tensors are stacked on an expert axis.
+
+def read_decoder(
+    hf_tensors: Mapping[str, np.ndarray],
+    config: DecoderFields,
+    model_type: str | None = None,
+    *,
+    param_dtype: str = "float32",
+    lazy: bool = False,
+) -> tuple[Variables, tuple[Reading, ...]]:
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
+    default, and return it with the readings it placed (`DecoderFamily.readings`),
+    which the source's bindings are built from.
+
+    Each tensor goes through its family's `prepare` and `packed` split and
+    `weight_path`. A 2-D kernel is transposed from torch's [out, in] to
+    Dense's [in, out], and per-expert tensors are stacked on an expert axis.
 
     A tied checkpoint also stores lm_head.weight as a copy of the embedding
     (Qwen3-0.6B does). The copy is checked and dropped, because the tree has one
@@ -591,8 +622,8 @@ def translate_weights(
     keep their own dtype. Each leaf is converted before its layout copy.
 
     With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
-    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
-    whole here.
+    and cast only when it is placed (`dew.interop.streaming`); `prepare` and an
+    interleaved split still run here. Otherwise each leaf is read whole here.
 
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
@@ -608,16 +639,16 @@ def translate_weights(
     # second tensor for a filled leaf is refused where it is placed.
     copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
                                                  _tied_names(family, config, hf_tensors))}
-
+    readings = family.readings(hf_tensors, config)
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
-    for name, tensor in family.prepare_weights(hf_tensors, config).items():
-        path = family.source_path(name, config)
+    for name, part in held_parts(readings).items():
+        path = part.path
         if path is None or name in copies:
             continue
-        stored = np.asarray(tensor)
+        stored = np.asarray(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
@@ -628,7 +659,7 @@ def translate_weights(
             name,
         )
     _stack_experts(params)
-    return variables if lazy else materialize(variables)
+    return (variables if lazy else materialize(variables)), readings
 
 
 def translate_denoiser_weights(

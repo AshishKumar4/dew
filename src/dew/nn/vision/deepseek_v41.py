@@ -15,7 +15,7 @@ from dew import records
 from dew.nn.activations import gelu_exact
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path, rope_base
 from .vit import VisionTransformer, ViTLayout
 
 
@@ -155,7 +155,7 @@ def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Rec
         "num_attention_heads": heads,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "rope_theta": records.number(vision.get("rope_theta", 10000.0), "rope_theta"),
+        "rope_theta": rope_base(vision, 10000.0),
     }}
 
 

@@ -35,6 +35,7 @@ from dew.objectives.base import (
     Step,
     TrainingScalar,
     Variables,
+    recorded_name,
 )
 
 from .distributed import MeshSpec, shard_batch, split_fields, with_host
@@ -531,13 +532,6 @@ class MetricScores[Statistics, Additions](Mapping):
         self.scores = scores
 
     def __getitem__(self, metric):
-        split = 'val'
-        if isinstance(metric, tuple):
-            split, metric = metric
-        if isinstance(metric, TrainingScalar):
-            if metric.owner is not self.objective:
-                raise KeyError("training score belongs to another objective")
-            return self.scores[f'train/{metric.name}']
         if (
             isinstance(metric, types.MethodType)
             and metric.__name__ == "loss"
@@ -549,10 +543,10 @@ class MetricScores[Statistics, Additions](Mapping):
                    for declared in self.metrics):
                 raise KeyError("index declared evaluation scores by metric object")
             return self.scores[metric]
-        for declared in self.metrics:
-            if declared is metric:
-                return self.scores[f'{split}/{declared.name}']
-        raise KeyError("the score refers to a metric not passed to fit")
+        named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
+        if not isinstance(named, TrainingScalar) and not any(declared is named for declared in self.metrics):
+            raise KeyError("the score refers to a metric not passed to fit")
+        return self.scores[recorded_name(metric, self.scores, self.objective)]
 
     def __iter__(self):
         for name in self.scores:

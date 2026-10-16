@@ -248,7 +248,8 @@ def check_grids(directory, grids, case=None):
     source = bundle(directory)
     given, null = conditions(source)
     errors = {}
-    cases = (case,) if case else ("pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler")
+    cases = (case,) if case else sorted(name.removesuffix(".config") for name in oracle.files
+                                        if name.endswith(".config"))
     for name in cases:
         schedule = SourceSchedule.from_config(json.loads(str(oracle[name + ".config"])))
         process, times = schedule.sampling(4)

@@ -233,22 +233,8 @@ class Metrics(Mapping):
         self._values = values
 
     def __getitem__(self, key):
-        from dew.objectives.base import Metric, TrainingScalar
-        if isinstance(key, str):
-            return self._values[key]
-        if isinstance(key, TrainingScalar):
-            return self._values[f'train/{key.name}']
-        if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], Metric):
-            return self._values[f'{key[0]}/{key[1].name}']
-        if isinstance(key, Metric):
-            names = [name for name in self._values if not name.startswith('checkpoint/')
-                     and (name == key.name or name.endswith('/' + key.name))]
-            if len(names) != 1:
-                raise KeyError(
-                    f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)"
-                )
-            return self._values[names[0]]
-        raise KeyError(key)
+        from dew.objectives.base import recorded_name
+        return self._values[key if isinstance(key, str) else recorded_name(key, self._values)]
 
     def __iter__(self):
         return iter(self._values)

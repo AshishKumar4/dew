@@ -1,43 +1,45 @@
 # Core API
 
-This page describes the main interfaces and the contracts between them, grouped by task. Every public module also has a page generated from its docstrings, listed at the [end of this page](#all-modules) and in the sidebar. The [Quickstart](../getting-started.md) uses the core interfaces in one script.
+This page describes the main interfaces and the contracts between them, grouped by task. The site generates the signature and field blocks below from source. Every public module also has a page generated from its docstrings, listed at the [end of this page](#all-modules) and in the sidebar. The [Quickstart](../getting-started.md) uses the core interfaces in one script.
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation. `dew.Supervised(model, loss, metrics=(), *, inputs)` trains any Flax model on a per-example `loss(outputs, batch)` without a subclass ([Custom objectives](../concepts/objectives.md#supervised)).
+Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation. `dew.Supervised` trains any Flax model on a per-example `loss(outputs, batch)` without a subclass ([Custom objectives](../concepts/objectives.md#supervised)).
+
+<!-- api: dew.objectives.Objective.init dew.objectives.Objective.loss dew.objectives.Objective.reduce_loss dew.objectives.Objective.with_gradients dew.objectives.Objective.apply_effects dew.objectives.Objective.evaluate dew.objectives.Objective.preview dew.objectives.Objective.optimizer dew.objectives.Objective.averages dew.objectives.Objective.scalar_loss dew.Supervised -->
 
 | Member | Contract |
 |---|---|
-| `init(key, variables=None)` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it once for shapes and once for values. `variables` is a held tree the caller supplies, which is how the trainer passes it as data; with `None` the objective uses its own (`DiffusionObjective.held_variables`, for example). An objective that holds nothing ignores it. |
-| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Ratio(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
-| `reduce_loss(statistics)` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
-| `with_gradients(stats, gradients, params)` | Return `stats` whose derivative in `params` is `gradients`, for a loss that states its own gradient rule. |
-| `apply_effects(variables, effects)` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
-| `evaluate(variables, batch, step)` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |
-| `preview(variables, batch, step, *, scored=None)` | Return display artifacts for a tracker, or `None`. The base method reuses `scored`, the first scoring artifacts. |
+| `init` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it once for shapes and once for values. `variables` is a held tree the caller supplies, which is how the trainer passes it as data; with `None` the objective uses its own (`DiffusionObjective.held_variables`, for example). An objective that holds nothing ignores it. |
+| `loss` | Return additive statistics and `Aux`. Use `Ratio(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
+| `reduce_loss` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
+| `with_gradients` | Return `stats` whose derivative in `params` is `gradients`, for a loss that states its own gradient rule. |
+| `apply_effects` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
+| `evaluate` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |
+| `preview` | Return display artifacts for a tracker, or `None`. The base method reuses `scored`, the first scoring artifacts. |
 | `ema` | Optional `EMASpec`; the base objective uses `None`. |
-| `optimizer(tx, *, accumulation)` | Return the optimizer `Trainer` steps `params` with, from the one it was handed; the base method returns `tx`. Per-network optimizers use `optax.multi_transform` and `optax.conditionally_mask`. |
-| `averages(update)` | Return whether the update after `update` committed ones moves the EMA; the base method averages every update. |
+| `optimizer` | Return the optimizer `Trainer` steps `params` with, from the one it was handed; the base method returns `tx`. Per-network optimizers use `optax.multi_transform` and `optax.conditionally_mask`. |
+| `averages` | Return whether the update after `update` committed ones moves the EMA; the base method averages every update. |
+
+<!-- api: dew.objectives.Step dew.objectives.Aux -->
 
 `Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 
-`Aux(metrics, variables=None, qk_stats=None, effects=None)` holds training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies the effects once per supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
+`Aux` holds training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies the effects once per supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
 ### Collections and EMA selection
 
 A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).
 
-`EMASpec(decay, select=everything)` comes from `dew.objectives.base`. `decay` maps completed optimizer-update count to a scalar. `select` accepts a tuple of keys naming a leaf; `under("params", "context_encoder")` selects that subtree, and `everything` selects all leaves. EMA arithmetic uses at least fp32 and preserves explicit fp64, then rounds each result to the initialized EMA leaf dtype. Unit decay selects the frozen leaf exactly. Router bias updates also retain the initialized bias dtype; integer load comparisons avoid converting large counts to floats.
+<!-- api: dew.objectives.base.EMASpec -->
+
+`EMASpec` comes from `dew.objectives.base`. `decay` maps completed optimizer-update count to a scalar. `select` accepts a tuple of keys naming a leaf; `under("params", "context_encoder")` selects that subtree, and `everything` selects all leaves. EMA arithmetic uses at least fp32 and preserves explicit fp64, then rounds each result to the initialized EMA leaf dtype. Unit decay selects the frozen leaf exactly. Router bias updates also retain the initialized bias dtype; integer load comparisons avoid converting large counts to floats.
 
 ### Input descriptions
 
 Import `Field`, `Condition`, and `InputSpec` from `dew.inputs` or `dew`.
 
-```text
-Field(key, shape)
-Condition(encoder, field="text", unconditional="")
-InputSpec(sample, conditions={}, mask=None)
-```
+<!-- api: dew.inputs.Field dew.inputs.Condition dew.inputs.InputSpec -->
 
 `Field.shape` is the shape of one sample, excluding batch. A `Condition` connects a condition encoder to its tokenized batch field. `InputSpec.conditions` maps the model keyword, such as `textcontext`, to a `Condition`. Each condition must read a distinct batch field. `mask` is an optional `Field` for a binary image mask, used for explicit masked-image latent conditioning. `InputSpec.tokenize(captions)` returns tokenized fields for the conditions whose encoder reads captions (`reads_captions`); an empty condition mapping returns no fields. An encoder of another modality, such as `HFAudio`, reads the field its dataset writes. Encoders define tokenization, parameters, and encoded output types.
 
@@ -45,11 +47,7 @@ InputSpec(sample, conditions={}, mask=None)
 
 Import these from `dew.training`:
 
-```text
-MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, explicit=())
-Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=(), data_axes=())
-MeshSpec(...).build(devices=None)
-```
+<!-- api: dew.training.MeshSpec dew.training.Layout dew.training.MeshSpec.build -->
 
 `MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(microbatches=...)` sets a pipelined step's microbatches, a positive multiple of a stage axis above 1; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
 
@@ -68,12 +66,7 @@ MeshSpec(...).build(devices=None)
 
 Import `Trainer` from `dew` or `dew.training`.
 
-```text
-Trainer(objective, optimizer, *, key,
-        mesh=MeshSpec(), layout=Layout(), microbatches=None, accumulation=1,
-        dynamic_scale=False, checkpoints=None, tracker=None,
-        step=None, rollout=None, profile=None)
-```
+<!-- api: dew.training.Trainer -->
 
 `objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh`, a `MeshSpec` or a native `jax.sharding.Mesh`, and `layout` describe placement; `microbatches` is how many a pipelined step feeds through the mesh's stage axis, one a stage when unset. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
@@ -85,10 +78,7 @@ A custom `step(objective, optimizer)` factory is responsible for the accepted an
 
 ### Train
 
-```text
-fit(dataset, *, steps, log_every=100, eval_every=None,
-    checkpoint_every=None, metrics=(), preview=False) -> TrainState
-```
+<!-- api: dew.training.Trainer.fit -->
 
 - `dataset` is a `Dataset`.
 - `steps` is the final target, including a restored step count.
@@ -108,24 +98,21 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
 
-`compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
+<!-- api: dew.training.Trainer.initial_state dew.training.Trainer.place dew.training.Trainer.compile dew.training.trainer.CompiledStep -->
+
+`compile` returns a callable whose type is `CompiledStep`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The final value carries transaction commit telemetry, or `None` for a custom step. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
 
 ## TrainState
 
 Import `TrainState` from `dew.training`.
 
-| Field | Meaning |
-|---|---|
-| `step` | Completed attempted batches, including rejected work |
-| `microstep` | Accepted microbatches, including finite zero-support slots |
-| `updates` | Committed supported optimizer updates |
-| `variables` | Complete Flax variables, including the inner `params` collection |
-| `opt_state` | Underlying optimizer state, advanced only on commits |
-| `ema` | Selected moving-average variables or `None` |
-| `key` | Immutable root training key |
-| `scale` | Dynamic loss scaler with finite-history state, or `None` |
-| `window_size` | Persisted accumulation length, checked on restore |
-| `accumulation` | Actual partial gradient/statistic/effect/replay state, or `None` |
+<!-- api: dew.training.TrainState -->
+
+`step` counts completed attempted batches, including rejected work. `microstep` counts accepted microbatches, including finite zero-support slots. `updates` counts committed supported optimizer updates.
+
+`variables` holds the complete Flax variables, including the inner `params` collection. `opt_state` is the underlying optimizer state, advanced only on commits. `ema` holds selected moving-average variables or `None`, and `key` is the immutable root training key.
+
+`scale` is the dynamic loss scaler with finite-history state, or `None`. `window_size` is the persisted accumulation length, checked on restore. `accumulation` holds the actual partial gradient/statistic/effect/replay state, or `None`.
 
 `state.averaged` overlays EMA leaves onto `state.variables` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
@@ -133,18 +120,7 @@ Import `TrainState` from `dew.training`.
 
 Import stores, chains, `load` and `Loading` from `dew.data`, `compile` from `dew.data.compile`, and run specs and `loader` from `dew.config.data`. `Loader` and `DataPartition` are in `dew.data.dataset`.
 
-```text
-load(name_or_dataset, *, batch, tokenizer=None, seq_len=None, read=None,
-     provision=True, seed=0, loading=None) -> Loader
-loader(spec_or_alias, *, batch, read="indexed", provision=False, cache=None,
-     objective=None, validation_records=None, seed=0, loading=Loading(workers="auto"), host=())
-spec.load(**options)  # loader(spec, **options)
-compile(train, *, validation=None, host=(), objective=None, read=None,
-        provision=False, loading=None, seed=0) -> Loader
-Loader(train, val, records, batch, ramp=None)
-DataPartition(index=0, count=1, readers=1, reader=0)
-Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
-```
+<!-- api: dew.data.load.load dew.config.data.loader dew.data.compile.compile dew.data.dataset.Loader dew.data.dataset.DataPartition dew.data.Loading -->
 
 `load("hf/<repo>")` and `load("tfds/<builder>")` read a dataset by name: packed language-model rows where `tokenizer=` or `seq_len=` asks for them, batched records otherwise. Text holds out 1% of document identities before tokenization; records hold out the first 256. `hf/<repo>@<revision>` pins a Hub revision and `tfds/<builder>:<version>` a TFDS version. A `Dataset` is also accepted. Other source locations use `Hub()`, `TFDS()` or `Files()`.
 
@@ -184,9 +160,11 @@ The prefetch worker owns iteration, restore and finalization. A timeout leaves c
 
 Import `Checkpoints` from `dew`.
 
-`Checkpoints(directory, *, keep=2, local_directory=None, local_every=None)` configures persistent storage and optional local emergency checkpoints. Local directory and cadence must be specified together. The object opens storage on use.
+<!-- api: dew.Checkpoints dew.Checkpoints.save dew.Checkpoints.wait dew.Checkpoints.restore dew.Checkpoints.path -->
 
-`save(step, state, saved, metrics=None, *, share=None)` schedules a persistent save. `saved` is the iterator position as bytes, or `None`, and `share` is the `DataPartition` that the stream read; a position requires a share. `wait()` waits for pending writes, and `latest` reports the newest eligible checkpoint. `restore(template=None, step=None, *, share=None)` returns the restored state data and the iterator position that the reader of `share` resumes from, or `None` for the position when no share is given. A template controls structure and placement. `path(step)` gives the persistent checkpoint location.
+`Checkpoints` configures persistent storage and optional local emergency checkpoints. Local directory and cadence must be specified together. The object opens storage on use.
+
+`save` schedules a persistent save. `saved` is the iterator position as bytes, or `None`, and `share` is the `DataPartition` that the stream read; a position requires a share. `wait()` waits for pending writes, and `latest` reports the newest eligible checkpoint. `restore` returns the restored state data and the iterator position that the reader of `share` resumes from, or `None` for the position when no share is given. A template controls structure and placement. `path(step)` gives the persistent checkpoint location.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
@@ -194,13 +172,7 @@ This object does not write `run.json`; run configuration saving is separate. Use
 
 Import `LMObjective` from `dew.objectives.lm`.
 
-```text
-LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_tile=None,
-            samples=None, variables=None, balance_rate=None, aux_loss_alpha=None,
-            seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, router_z_loss=0.0,
-            qk_stats=False, indexer=None, token_accuracy=True, processor=None)
-IndexerTraining(phase, weight=1.0)
-```
+<!-- api: dew.objectives.lm.LMObjective dew.objectives.lm.IndexerTraining -->
 
 `model` may be a decoder bundle that `Pretrained.load` returned. The objective then reads the bundle's model, initial variables and processor, and `pipeline` decodes with that processor; passing `variables=` or `processor=` as well overrides that part. An adapted bundle (`bundle.adapt(LoRA(...), key=)`) trains only the adapter's factors, and its `save` and `export` merge them into the kernels. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `output_table()`, returning the `OutputTable` (the stored vocabulary matrix and its orientation, bias, softcap and precision) that its logits contract (`dew.nn.protocols`). Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
@@ -210,13 +182,7 @@ IndexerTraining(phase, weight=1.0)
 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
-```text
-generate(model, params, inputs, max_new_tokens, *, key=None,
-         sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
-Sampling(temperature=1.0, top_k=None, eos_token_ids=None, pad_token_id=None, top_p=1.0, min_p=0.0,
-         repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
-         no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
-```
+<!-- api: dew.sampling.generate dew.sampling.Sampling -->
 
 `params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. `key` is an integer seed or a JAX key; `key=n` is `jax.random.key(n)`.
 
@@ -252,12 +218,7 @@ A prompt's key is its global row key. Continuation zero draws with that key, so 
 
 Decoding has three extension points: logits transforms, stopping criteria and strategies. Import the protocols from `dew.sampling` and the built-ins from `dew.sampling.decoding`.
 
-```text
-LogitsTransform: (StepState, logits[rows, vocab]) -> logits[rows, vocab]
-Stopping:        (StepState, drawn_tokens[rows]) -> finished[rows]
-Strategy:        (DecoderState, StepState, DecodeOps, transform, stopping, budget, n) -> Draws
-StepState(tokens, valid, step, active, keys, prompt_width)
-```
+<!-- api: dew.sampling.LogitsTransform.__call__ dew.sampling.Stopping.__call__ dew.sampling.Strategy.__call__ dew.sampling.decoding.StepState -->
 
 `StepState` is everything a transform or a criterion receives. `tokens` is the fixed-capacity buffer of the prompt followed by the slots for generated tokens, `[rows, prompt_width + max_new_tokens]`. `valid` marks the slots that hold a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` returns the prompt region, and `total()` returns the real token count. A transform never sees model parameters or cache internals.
 
@@ -356,11 +317,7 @@ An active row can be drawn from only when every score is finite or `-inf` and at
 
 #### Strategies
 
-```text
-Sample(grammar=None)
-Beam(width=1, length_penalty=1.0, early_stopping=False, stop_ids=1)
-Speculative(block=4, confidence=0.0)
-```
+<!-- api: dew.sampling.Sample dew.sampling.Beam dew.sampling.Speculative -->
 
 `Sample` draws every row independently, and a request without a strategy runs it. A `grammar` from `dew.sampling.guided` (`regex` or `json_schema`) keeps every draw inside the grammar.
 
@@ -458,60 +415,23 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 
 Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`. `dew.pipeline` is the same function. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
-```text
-pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
-         revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
-Objective.pipeline(state, *, ema=None, processor=OMITTED) -> the objective's task (build_task) over
-    state.averaged or state.variables; processor omitted keeps the objective's own, None clears it
-Objective.build_task(variables, *, processor=OMITTED) -> TextGeneration (LM, GRPO, PPO's actor),
-    MaskedGeneration (MDLM), BlockGeneration (block SFT), TextToImage (diffusion, which takes no processor)
-TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
-               max_length=None, n=1, logits=None, stopping=(), strategy=None)
-task(request, max_new_tokens=None, *, key=None, n=None, sampling=None,
-     images=None, logits=None, stopping=None, strategy=None) -> Generation
-task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
-task.quantized(spec, example=((0,),)) -> TextGeneration
-TextGeneration.from_run / BlockGeneration.from_run / MaskedGeneration.from_run
-    (directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
-TextGeneration.from_pretrained / BlockGeneration.from_pretrained / MaskedGeneration.from_pretrained
-    (repo_id, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
-BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
-                max_new_tokens=None, max_length=None, n=1)
-task(request, max_new_tokens=None, *, key=None, n=None, process=None,
-     images=None) -> CanvasGeneration
-Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, attention_impl="auto",
-                max_seq_len=None, revision=None, gguf_file=None, single_file=None, dduf_file=None,
-                mesh=None, layout=None, fallback=None) -> the kind it is called on, or the kind the source is
-PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
-PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
-PretrainedBlockDecoder.block_generation() -> BlockGeneration
-PretrainedPipeline.text_to_image() -> TextToImage
-Pretrained.adapt(lora, *, key) -> the same kind, with the bound adapter as `adapter`
-LoRA(rank, modules, alpha=None, rslora=False, dropout=0.0)
-LoRA.apply(model, variables, *, key, layouts=None) -> Adapter
-LoRA.load(model, variables, path, *, layouts=None) -> Adapter
-Adapter.from_run(directory, *, step=None, ema=None) -> Adapter
-Adapter.merge(variables) -> variables;  Adapter.save(variables, path)
-Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
-Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
-TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
-            solver=DDIM(), grid=None, final_denoise=True, finish=None)
-TextToImage.from_objective(objective, variables) -> TextToImage
-TextToImage.from_run(directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
-                     param_dtype=None)
-TextToImage.from_pretrained(repo_id, *, ema=None, mesh=None, layout=None, dtype=None,
-                            param_dtype=None)
-LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
-image_task.bind(variables) -> TextToImage
-image_task.quantized(spec) -> TextToImage
-image_task.prepare(prompts, *, key=None, steps=None, unconditional=None,
-                   image=None, image_latents=None, mask=None, noise=None, initial=None,
-                   times=None, encode_key=None) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=None, guidance=<default>, solver=None, key=None, decode=True) -> Images
-RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
-Server.from_task(task, *, slots, capacity, admission=None, kv_cache=None, chunk=None,
-                 prefix_cache=False, decode_steps=1) -> Server
-```
+<!-- api: dew.inference.pipeline.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
+
+`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor.
+
+<!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_pretrained -->
+
+<!-- api: dew.inference.BlockGeneration dew.inference.BlockGeneration.__call__ dew.inference.BlockGeneration.from_run dew.inference.BlockGeneration.from_pretrained dew.inference.MaskedGeneration.from_run dew.inference.MaskedGeneration.from_pretrained -->
+
+<!-- api: dew.interop.Pretrained.load dew.interop.PretrainedDecoder.text_generation dew.interop.PretrainedMaskedDecoder.text_generation dew.interop.PretrainedBlockDecoder.block_generation dew.interop.PretrainedPipeline.text_to_image dew.interop.Pretrained.adapt dew.interop.Pretrained.save dew.interop.Pretrained.push_to_hub -->
+
+`Pretrained.load` returns the kind it is called on, or the kind the source is. `adapt` returns the same kind, with the bound adapter as `adapter`.
+
+<!-- api: dew.lora.LoRA dew.lora.LoRA.apply dew.lora.LoRA.load dew.lora.Adapter.from_run dew.lora.Adapter.merge dew.lora.Adapter.save -->
+
+<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_pretrained dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
+
+`RunProcessor` adapts a run's `ByteTokenizer` or `HFTokenizer` as a task processor.
 
 A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
 
@@ -573,15 +493,7 @@ A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_m
 
 ## Diffusion and JEPA objectives
 
-```text
-DiffusionObjective(model, process, inputs, *, autoencoder=None,
-                   unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
-                   guidance=CFG(3.0), steps=200, variables=None, uncertainty=None,
-                   alignment=None, end_to_end=None)
-JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
-              momentum_steps=100000, label_key="label", encoder_variables=None,
-              predictor_variables=None)
-```
+<!-- api: dew.objectives.diffusion.DiffusionObjective dew.objectives.jepa.JepaObjective -->
 
 Import `DiffusionObjective` from `dew.objectives.diffusion`. `model` may be a pipeline bundle, as in `DiffusionObjective(pipe)`. The objective then reads the bundle's denoiser, process, conditions, autoencoder, initial variables and sampling policy, and any keyword you pass overrides that part. `JepaObjective`'s `encoder_variables` and `predictor_variables` are the trees each module starts from, which can be a pretrained or adapted encoder's. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `solver`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
