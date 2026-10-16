@@ -62,6 +62,7 @@ from kimi_k3_reference import (
     fixture_batch,
     greedy,
     record_orders,
+    record_picks,
     remote_modules,
     scatter,
     sgd_step,
@@ -206,6 +207,7 @@ def main() -> None:
              logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
