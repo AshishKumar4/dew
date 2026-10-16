@@ -1209,8 +1209,8 @@ class Trainer(Generic[Loss, Effects]):
         """The step reading `batch` in `split` microbatches, lowered at the
         objective's current rung, with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which
-        settle their configs without the lowering `tune` reads them from, unless
-        the run measures configs (`tune_kernels`)."""
+        settle their configs before it lowers; otherwise, or where the run
+        measures configs (`tune_kernels`), its lowering records them (`tune`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
@@ -1226,12 +1226,13 @@ class Trainer(Generic[Loss, Effects]):
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, prepared, batch, part)
-        # The lowering after either reads the launch configs they settled.
         if launches is None or self.tune_kernels:
-            launches = tuning.tune(lower, measure=self.tune_kernels)
+            lowered, launches = tuning.tune(lower, measure=self.tune_kernels)
         else:
+            # The lowering reads the launch configs the record settled.
             tuning.settled(launches)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lower(), launches)
+            lowered = lower()
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
