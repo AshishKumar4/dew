@@ -188,7 +188,8 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
 @pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
 def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key):
-    """The port's gradients of each packed token's query, key and decay (`linear.fla_rule`, a row of
+    """The port's output at each packed token and its gradients of the token's query, key and decay
+    (`linear.fla_rule`, a row of
     documents as one sequence, each document's first token forgetting the memory by `linear.FORGET`)
     as near the float64 recurrence run document by document as the port's formula in the portable
     math (`port_formula`) on the same row, its every range two plain fp32 base-2 prefixes apart as
@@ -212,8 +213,10 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key
     def taken(rule):
         def run(q, k, g):
             def loss(q, k, g):
-                return jnp.sum(rule(q, k, v.astype(q.dtype), g, beta.astype(q.dtype))[0] * do.astype(q.dtype))
-            return dict(zip(("q", "k", "g"), jax.grad(loss, argnums=(0, 1, 2))(q, k, g), strict=True))
+                out = rule(q, k, v.astype(q.dtype), g, beta.astype(q.dtype))[0]
+                return jnp.sum(out * do.astype(q.dtype)), out
+            (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(q, k, g)
+            return {"out": out, **dict(zip(("q", "k", "g"), grads, strict=True))}
         return run
 
     def packed(rule):

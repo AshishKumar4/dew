@@ -232,6 +232,14 @@ def plain_prefix(g, chunk: int = CHUNKED):
     return g + jax.lax.stop_gradient(recut - g)
 
 
+DECAY_SUMS = ("['A_log']", "['dt_bias']", "['in_proj_a']")
+"""A delta rule layer's decay parameters and the projection to its decay: each gradient sums every
+token's decay gradient over a layer's few heads, and with it every token's prefix rounding on the
+port, two draws of which no ratio holds (on an A100 they sat 0.4 to 3 times the port's formula's);
+each token's is held by test_linear_attention's
+test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does."""
+
+
 def port_formula(query, key, value, g, beta, state=None, *, starts=None):
     """`linear.fla_rule`'s formula in the portable math: each packed document's first token decays by
     `linear.FORGET`, and every range is the difference of two plain fp32 prefixes per row-aligned

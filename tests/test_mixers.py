@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import port_formula
+from delta_rule_support import DECAY_SUMS, port_formula
 from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
@@ -257,12 +257,6 @@ def embedded(module, tokens):
 
 DELTA_RULES = frozenset({"gated_delta_net", "kimi_delta_attention"})
 """The registry's kinds on the delta rule, which a GPU runs on its port (`linear.fla_rule`)."""
-
-DECAY_SUMS = ("['A_log']", "['dt_bias']")
-"""A delta rule layer's per-head decay parameters: each gradient sums every token's decay gradient,
-and so its prefix rounding, over a few heads, two draws of which no ratio holds; each token's is held
-by test_linear_attention's test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does."""
-
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_no_token_reaches_another_document(kind, monkeypatch):
