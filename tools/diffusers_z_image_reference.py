@@ -40,6 +40,7 @@ from diffusers_reference_helpers import (
     saved_pipeline,
     tiny_qwen3_encoder,
 )
+from torch_precision import replaced
 
 DIFFUSERS = "0.40.0"
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
