@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, NAMES, fla_decay_terms, fla_side, recurrence, through
+from delta_rule_support import CHUNKED, NAMES, fla_decay_terms, fla_side, plain_prefix, recurrence, through
 from kernel_compile import compile_kernels, failures
 from reference_error import (
     assert_as_exact_as_the_reference,
@@ -65,19 +65,6 @@ def math(q, k, v, g, beta, h0, starts=None):
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
     starts = None if starts is None else jnp.asarray(starts)
     return linear.chunk_delta_rule(q, k, v, g, beta, h0, starts=starts)
-
-
-def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from fla's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`), each chunk of `chunk`
-    tokens from the row's start: each token's decay the difference of its prefix and the one before,
-    so the portable rule, rebuilding the prefixes, takes every range as the difference of two plain
-    prefixes, as fla and the port do. Its gradient passes to `g` unchanged."""
-    batch, length = g.shape[:2]
-    padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
-    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2)
-    earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
-    recut = (prefix - earlier).reshape(padded.shape)[:, :length]
-    return g + jax.lax.stop_gradient(recut - g)
 
 
 def fla_math(q, k, v, g, beta, h0):
