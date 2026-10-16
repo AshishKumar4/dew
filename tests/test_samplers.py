@@ -142,6 +142,21 @@ def endpoint_process():
     return Process(schedule, DirectPredictionTransform()), EndpointOracle(schedule=schedule)
 
 
+class VEEndpointOracle(nn.Module):
+    """EndpointOracle on the variance-exploding path, x_0 = x s / sqrt(s^2 +
+    sigma^2), read at c_noise = log(sigma) / 4."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        sigma = expand(jnp.exp(4.0 * temb), x)
+        return x * DATA_STD / jnp.sqrt(DATA_STD**2 + sigma**2)
+
+
+def ve_endpoint_process():
+    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
+    return Process(schedule, DirectPredictionTransform()), VEEndpointOracle()
+
+
 def linear_process():
     schedule = LinearNoiseScheduler(1000)
     return Process(schedule, EpsilonPredictionTransform()), LinearVPOracle(schedule=schedule)
@@ -192,6 +207,7 @@ PROCESS_CASES = {
     "linear": (linear_process, IMAGE, assert_gaussian_stats),
     "endpoint": (endpoint_process, IMAGE, assert_gaussian_stats),
     "karras": (karras_process, IMAGE, assert_gaussian_stats),
+    "ve_endpoint": (ve_endpoint_process, IMAGE, assert_gaussian_stats),
     "flow": (flow_process, IMAGE, assert_gaussian_stats),
     "masked": (masked_process, (16,), assert_token_frequencies),
 }
@@ -200,6 +216,10 @@ model, the sample shape, and the check a walk's samples pass."""
 
 GAUSSIAN = ("vp", "karras")
 """The cases a solver that integrates any Gaussian process samples."""
+
+FAMILIES = ("vp", "karras", "flow")
+"""One case of each continuous process family: variance preserving,
+variance exploding, rectified flow."""
 
 INTEGRATES = {
     # Each integrates dx/dsigma = eps, which only holds when alpha is 1. On a
@@ -212,11 +232,15 @@ INTEGRATES = {
     "unmask": ("masked",),
 }
 """The cases a solver that integrates one process family samples; it refuses
-every other continuous case."""
+every other family's (FAMILIES)."""
 
 CONVERGES_ON = {
     # A consistency model is distilled to the endpoint (EndpointOracle).
-    "consistency": ("endpoint",),
+    "consistency": ("endpoint", "ve_endpoint"),
+    # From a posterior mean, TCD's intermediate point at (1 - eta) t_next
+    # reaches the data on the VP table at eta 0.3; on the Karras grid that
+    # time is far lower in sigma, and the samples narrow to std 0.24.
+    "tcd": ("vp",),
     # PNDM's transfer scales x by alpha_s / alpha_t, which is 316 over the
     # first of a hundred intervals on the cosine table from its capped end
     # (alpha 4.9e-5 at index 999, against 2.1 from the index 990 Diffusers'
@@ -243,7 +267,7 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
     integrated = INTEGRATES.get(name)
     for case in integrated or CONVERGES_ON.get(name, GAUSSIAN):
         assert_reaches_its_data(case, solver)
-    refused = () if integrated is None else sorted(set(PROCESS_CASES) - {*integrated, "masked"})
+    refused = () if integrated is None else sorted(set(FAMILIES) - set(integrated))
     for case in refused:
         build, shape, _ = PROCESS_CASES[case]
         with pytest.raises(ValueError):
@@ -259,6 +283,7 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
     ("vp", DPMSolverSinglestep(3, lower_order_final=True), 100),
     ("vp", TCD(eta=0.0), 100),
     ("endpoint", TCD(eta=1.0), 8),
+    ("ve_endpoint", TCD(eta=1.0), 8),
     ("linear", PNDM(skip_prk_steps=True), 100),
     ("karras", KDPM2(ancestral=True), 100),
     ("karras", DPMSolverMultistep(lower_order_final=False), 100),
@@ -268,7 +293,9 @@ def test_a_solvers_settings_reach_the_data(case, solver, steps):
     DDPM over its whole table, the other DPM-Solver algorithms and orders,
     TCD at its two ends, PLMS without the Runge-Kutta warmup, KDPM2's
     ancestral step. At eta 1 TCD goes through the schedule's clean end and
-    is the consistency walk up to that end's residual noise."""
+    is the consistency walk up to that end's residual noise, on a variance
+    exploding grid too, where re-noising by 1 - ratio^2 added none (TCD at
+    eta 0.3 drew std 0.0 against 0.3 on the Karras grid)."""
     assert_reaches_its_data(case, solver, steps)
 
 
