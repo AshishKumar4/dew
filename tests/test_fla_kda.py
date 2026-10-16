@@ -9,18 +9,20 @@ the training shape, with grouped value heads, padded and packed.
 """
 
 import functools
-import os
-import subprocess
-import tempfile
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, recurrence, through
+from delta_rule_support import CHUNKED, NAMES, factorised_decay_terms, fla_side, recurrence, through
 from kernel_compile import compile_kernels, failures
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    distance,
+    float64_terms,
+    widened,
+)
 from sharded import boundary_copies
 from tuned import each_config
 
@@ -56,11 +58,31 @@ def operands(batch, length, key_heads, value_heads, width, columns, dtype, *, se
     return q, k, v, g, beta, h0, do, dht
 
 
-def math(q, k, v, g, beta, h0):
-    """The portable rule, value heads reading their key head."""
+def math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule, value heads reading their key head, a row's packed documents starting at
+    `starts` (`[B, T]`), as the port runs them."""
     group = v.shape[2] // q.shape[2]
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    return linear.chunk_delta_rule(q, k, v, g, beta, h0)
+    return linear.chunk_delta_rule(q, k, v, g, beta, h0, starts=starts)
+
+
+def plain_prefix(g, chunk: int = CHUNKED):
+    """`g` re-cut from fla's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`), each chunk of `chunk`
+    tokens from the row's start: each token's decay the difference of its prefix and the one before,
+    so the portable rule, rebuilding the prefixes, takes every range as the difference of two plain
+    prefixes, as fla and the port do. Its gradient passes to `g` unchanged."""
+    batch, length = g.shape[:2]
+    padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
+    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2)
+    earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
+    recut = (prefix - earlier).reshape(padded.shape)[:, :length]
+    return g + jax.lax.stop_gradient(recut - g)
+
+
+def fla_math(q, k, v, g, beta, h0):
+    """The portable rule on fla's plain prefix (`plain_prefix`): a float32 sample of the formula the
+    port runs, which it is held to on the host, where fla does not run."""
+    return math(q, k, v, plain_prefix(g), beta, h0)
 
 
 @ON_A_GPU
@@ -73,14 +95,23 @@ def math(q, k, v, g, beta, h0):
 def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
     """`fla_rule` with a decay per key dimension, the port as a GPU runs it: padded to the kernels'
     blocks, through every kernel and the custom VJP, its output, final memory and six gradients as near
-    the float64 recurrence as the portable math, up to fp32 rounding of a chunk's sums."""
+    the float64 recurrence as the portable math on fla's plain prefix (`fla_math`), up to fp32
+    rounding of a chunk's sums, each sized by the portable math's float64 terms and the decay's
+    gradient by fla's factorised ones too."""
     *inputs, do, dht = operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=11)
     got = through(fla_rule, do, dht)(*inputs)
-    want = through(math, do, dht)(*inputs)
+    want = through(fla_math, do, dht)(*inputs)
     with jax.enable_x64(new_val=True):
         operands64 = widened((*inputs, do, dht))
         truth = through(recurrence, *operands64[6:])(*operands64[:6])
-    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED)
+        _, terms = float64_terms(through(math, *operands64[6:]), *operands64[:6])
+        # The port's decay gradient is fla's factorised one, whose terms the math's pairs never add.
+        # Each value head's own gradients, before a key head's are summed over the heads it serves.
+        group = value_heads // key_heads
+        q, k = (jnp.repeat(x, group, axis=2) for x in operands64[:2])
+        dq, dk = through(recurrence, *operands64[6:])(q, k, *operands64[2:6])[2:4]
+        terms = (*terms[:5], np.maximum(terms[5], factorised_decay_terms(q, k, dq, dk)), *terms[6:])
+    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED, terms=terms)
 
 
 @pytest.mark.gpu(reason="the layer runs the port where the GPU's own target row names it")
@@ -166,74 +197,58 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
     assert boundary_copies(text) == []
 
 
-FLA_SIDE = '''
-import sys, numpy as np, torch
-from fla.ops.kda import chunk_kda
-given, dtype = np.load(sys.argv[1]), getattr(torch, sys.argv[3])
-load = lambda name, as_dtype: torch.from_numpy(given[name]).to("cuda", as_dtype)
-q, k, v, do, beta = (load(n, dtype) for n in ("q", "k", "v", "do", "beta"))
-g, h0, dht = (load(n, torch.float32) for n in ("g", "h0", "dht"))
-cu_seqlens = load("cu_seqlens", torch.long) if "cu_seqlens" in given else None
-leaves = [x.requires_grad_() for x in (q, k, v, g, beta, h0)]
-o, final = chunk_kda(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True,
-                     cu_seqlens=cu_seqlens)
-torch.autograd.backward((o, final), (do, dht))
-np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
-                         zip(sys.argv[4:], (o, final, *(leaf.grad for leaf in leaves)), strict=True)})
-'''
-"""fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda` on the
-operands of an npz, its outputs and gradients into another under the names it is given (`NAMES`);
-packed documents as its varlen sequences, each with a memory of its own."""
-
-NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
-"""The outputs and gradients each side gives, in `through`'s order."""
-
-
-def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
-    """fla's outputs and gradients on `inputs` (one row), run in a process of its own. Packed into
-    documents at `cuts`, the row's memory is its first document's and its final memory and cotangent
-    its last's: the others start from zero and give theirs no cotangent."""
-    python = os.environ.get("DEW_FLA_PYTHON")
-    if not python:
-        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the GPU tier's reference")
-    given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
-                     (np.asarray(x, np.float32) for x in inputs), strict=True))
-    if cuts is not None:
-        others = np.zeros((len(cuts) - 1, *given["h0"].shape[1:]), np.float32)
-        given["h0"] = np.concatenate([given["h0"], others])
-        given["dht"] = np.concatenate([others, given["dht"]])
-        given["cu_seqlens"] = np.asarray([*cuts, given["q"].shape[1]], np.int64)
-    with tempfile.TemporaryDirectory() as root:
-        np.savez(Path(root) / "in.npz", **given)
-        subprocess.run([python, "-c", FLA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz",
-                        jnp.dtype(dtype).name, *NAMES], check=True)
-        found = np.load(Path(root) / "out.npz")
-        theirs = {name: found[name].astype(np.float64) for name in NAMES}
-    theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
-    return [theirs[name] for name in NAMES]
-
-
-def float64_truth(inputs, cuts) -> list[np.ndarray]:
+def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
-    so a head's backward fits, each key head's gradients summed over the value heads it serves."""
+    so a head's backward fits, and each one's float64 terms: what the sums of Dew's portable math add
+    on the whole row, its documents from their starts as the port runs them (`float64_terms`),
+    evaluated op by op on the host, `HEADS` value heads at a time, and for the
+    decay's gradient fla's factorised terms besides (`factorised_decay_terms`). A key head's gradients
+    and terms are summed over the value heads it serves."""
     q, k, v, g, beta, h0, do, dht = inputs
     group = v.shape[2] // q.shape[2]
+    rows = None if cuts is None else (cuts,)
+    host = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True):
-        rows = None if cuts is None else (cuts,)
         run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
             functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
-        heads = []
+        heads, decay = [], []
         for head in range(v.shape[2]):
             keyed = slice(head // group, head // group + 1)
             valued = slice(head, head + 1)
-            sliced = (q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
-                      h0[:, valued], do[:, :, valued], dht[:, valued])
-            heads.append([np.asarray(x) for x in run(*widened(sliced))])
-    found = [np.concatenate([leaves[i] for leaves in heads], axis=axis)
-             for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+            sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
+                              beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
+            heads.append([np.asarray(x) for x in run(*sliced)])
+            decay.append(factorised_decay_terms(*sliced[:2], *heads[-1][2:4]))
+        sizes = []
+        starts = None
+        if cuts is not None:
+            starts = jnp.zeros(q.shape[:2], bool).at[0, list(cuts[1:])].set(True)
+        step, packed = max(1, HEADS // group), functools.partial(math, starts=starts)
+        with jax.default_device(host):
+            for first in range(0, q.shape[2], step):
+                keyed, valued = slice(first, first + step), slice(first * group, (first + step) * group)
+                block = jax.device_put(widened((
+                    q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
+                    h0[:, valued], do[:, :, valued], dht[:, valued])), host)
+                _, terms = float64_terms(through(packed, *block[6:]), *block[:6])
+                sizes.append([np.asarray(x) for x in terms])
+
+    def joined(leaves):
+        return [np.concatenate([each[i] for each in leaves], axis=axis)
+                for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+
+    def grouped(x):
+        return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
+
+    found, terms = joined(heads), joined(sizes)
     for i in (2, 3):
-        found[i] = found[i].reshape(*found[i].shape[:2], q.shape[2], group, -1).sum(axis=3)
-    return found
+        found[i] = grouped(found[i])
+    return found, terms
+
+
+HEADS = 8
+"""The value heads `float64_truth` evaluates the portable math's terms over at once: fewer operations
+dispatched one by one, at a few GB of host memory a block for Kimi's decay per key dimension."""
 
 
 GPU_CASES = {
@@ -263,8 +278,8 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
     inputs, run, cuts = gpu_case(case, dtype)
     mine = [np.asarray(x, np.float64) for x in run(*inputs[:-2])]
     theirs = fla_side(inputs, cuts, dtype)
-    for name, dew, fla, value in zip(NAMES, mine, theirs, float64_truth(inputs, cuts), strict=True):
-        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}")
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, cuts), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}", terms=summed)
 
 
 LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
@@ -272,20 +287,27 @@ LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, f
 """The port's own launches, each a tuner KernelOp."""
 
 
+@pytest.fixture(scope="module")
+def tiles_case():
+    """The tiles case's operands, the port as a function of them, fla's outputs and gradients, and
+    float64 truth with its terms (`float64_truth`), which every launch's tiles are held to."""
+    inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
+    return inputs, run, fla_side(inputs, cuts, jnp.bfloat16), *float64_truth(inputs, cuts)
+
+
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("launch", LAUNCHES, ids=lambda kind: kind.__name__)
-def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch):
+def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch, tiles_case):
     """Every tile in the space of each of the port's own launches on this GPU (tests/tuned.py's
     `each_config`), pinned (`tuning.pinned`), keeps each output and gradient as near the float64
     recurrence as fla's own, at a partial last chunk."""
-    inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
-    theirs = fla_side(inputs, cuts, jnp.bfloat16)
-    truth = float64_truth(inputs, cuts)
+    inputs, run, theirs, truth, terms = tiles_case
     for tiles in each_config(launch, run, *inputs[:-2]):
         with tuning.pinned({launch: tiles}):
             mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
-        for name, dew, fla, value in zip(NAMES, mine, theirs, truth, strict=True):
-            assert_as_exact_as_the_reference(dew, fla, value, f"{launch.__name__}/{tiles}/{name}")
+        for name, dew, fla, value, summed in zip(NAMES, mine, theirs, truth, terms, strict=True):
+            label = f"{launch.__name__}/{tiles}/{name}"
+            assert_as_exact_as_the_reference(dew, fla, value, label, terms=summed)
 
 
 def gpu_case(case, dtype):
