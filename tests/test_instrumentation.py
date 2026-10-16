@@ -24,8 +24,9 @@ from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
 from dew.objectives.lm import LMObjective
 from dew.registry import models
+from dew.telemetry import instrumentation
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
-from dew.training import Trainer, trainer as trainer_module
+from dew.training import Trainer
 from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -239,7 +240,7 @@ def test_a_kernel_the_hlo_does_not_size_makes_the_hardware_count_a_named_lower_b
     under the names of a complete count."""
     flops = hlo_flops(UNSIZED)
     assert (flops.model, flops.hardware, flops.unsized) == (2 * 8 * 16 * 4, 2 * 8 * 16 * 4, 2)
-    monkeypatch.setattr(trainer_module, "model_flops_utilization", lambda counted, seconds: counted / seconds)
+    monkeypatch.setattr(instrumentation, "model_flops_utilization", lambda counted, seconds: counted / seconds)
     trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
     whole = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0))
     bounded = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0, 3.0))
