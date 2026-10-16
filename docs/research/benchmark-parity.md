@@ -49,6 +49,8 @@ A multiply-add is two FLOPs. Model FLOPs include the model forward and backward.
 
 The formulas count the full attention square for causal attention. They do not halve it for the triangular mask. The same formula is used for JAX and PyTorch.
 
+Correction (2026-10-16): these formulas were this study's numerator, and the tables below use them. `tools/benchmark_torch.py` no longer carries them. It reads Dew's own count of the case, the objective's `training_flops` on real tokens with causal attention halved, from the record `tools/reference_runs/work.py case` writes (`--work`). The trainer logs the same count as `train/mfu`, so a new torch row's MFU and a Dew row's share one numerator.
+
 ### Causal transformer
 
 Let `B` be batch, `S` sequence length, `T = B S`, `d` width, `f` MLP width, `L` layers, and `V` vocabulary. The tied input embedding gather costs zero matmul FLOPs. The tied output head is one `d by V` matrix.
@@ -355,12 +357,17 @@ nvidia-smi --query-compute-apps=pid --format=csv,noheader
 .venv/bin/python /tmp/benchmark-parity/dew_bench.py --arch causal_transformer \
   --fixed-batch --attention cudnn --warmup 20 --steps 100 --profile
 
-# PyTorch rows. Use one process per case.
+# PyTorch rows. Use one process per case. Dew's environment writes each case's count first.
+PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
+  --model simple_dit --out /tmp/benchmark-parity/dit-small.json
+PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
+  --model causal_transformer --out /tmp/benchmark-parity/lm-small.json
 /tmp/torchbench/bin/python tools/benchmark_torch.py --model simple_dit \
-  --mode compile --attention reference --warmup 20 --steps 100 --profile
+  --mode compile --attention reference --warmup 20 --steps 100 --profile \
+  --work /tmp/benchmark-parity/dit-small.json
 /tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer \
   --mode max-autotune --attention sdpa --sdpa-backend cudnn \
-  --warmup 20 --steps 100 --profile
+  --warmup 20 --steps 100 --profile --work /tmp/benchmark-parity/lm-small.json
 ```
 
 JAX profile files are parsed with `jax.profiler.ProfileData`. PyTorch profiles use `torch.profiler`. Both summaries take the union of GPU event intervals for busy time. Raw logs, HLO, profiles, ceiling samples, and JSON rows remain under `/tmp/benchmark-parity`.

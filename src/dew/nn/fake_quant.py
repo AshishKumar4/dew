@@ -14,6 +14,8 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
+from .precision import two_product
+
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
 by codes 0-7, then their negatives with the sign in bit 3, -0 included. The
@@ -154,24 +156,11 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     intermediates normal; dense and midpoint checks hold the result to
     NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
     """
-    def product_error(a, b, product):
-        ah = jax.lax.bitcast_convert_type(
-            jax.lax.bitcast_convert_type(a, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
-        bh = jax.lax.bitcast_convert_type(
-            jax.lax.bitcast_convert_type(b, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
-        al, bl = a - ah, b - bh
-        remainder = product - ah * bh
-        remainder = remainder - al * bh
-        remainder = remainder - ah * bl
-        return al * bl - remainder
-
     quotient = numerator / denominator
-    product = quotient * denominator
-    error = product_error(quotient, denominator, product)
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     residual = (numerator - product) - error
     quotient = quotient + residual / denominator
-    product = quotient * denominator
-    error = product_error(quotient, denominator, product)
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     difference = numerator - product
     high = difference - error
     recovered = high - difference

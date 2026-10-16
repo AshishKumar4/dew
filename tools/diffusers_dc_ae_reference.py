@@ -41,8 +41,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_vjp import recorded_vjp
+from reference_releases import RELEASES, require
 
-DIFFUSERS = "0.34.0"
+DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 COMMON = {"in_channels": 3, "latent_channels": 8, "attention_head_dim": 8,
           "encoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
           "decoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
@@ -129,8 +130,7 @@ def bundle(directory: str, destination: str) -> None:
 def main(destination: str) -> None:
     import diffusers
 
-    if diffusers.__version__ != DIFFUSERS:
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
+    require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)

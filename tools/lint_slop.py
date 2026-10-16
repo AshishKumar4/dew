@@ -27,6 +27,8 @@ Scope is per rule, because the rules are not all about the same thing:
   reads every call argument it takes, and a token mixer's `reads` names the
   `MIXING` fields (`src/<package>/nn/inputs.py`) it reads, no more and no
   fewer, since its block refuses a call that sets any other.
+- SLOP015 is about the suite. A test imports its own package, so an import
+  the package breaks fails the suite instead of skipping it.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -817,6 +819,18 @@ def wording(module: Module) -> Iterator[Finding]:
                           f"names {node.value}; test what the code does, not its source")
 
 
+def skips(module: Module) -> Iterator[Finding]:
+    """SLOP015: a test that skips when its own package fails to import."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if not (isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.importorskip"):
+            continue
+        named = [*node.args[:1], *(keyword.value for keyword in node.keywords if keyword.arg == "modname")]
+        if (named and isinstance(named[0], ast.Constant) and isinstance(name := named[0].value, str)
+                and (name == module.package or name.startswith(f"{module.package}."))):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP015",
+                          f"skips when {name} fails to import; import it, so a broken import fails")
+
+
 def patches(module: Module) -> Iterator[Finding]:
     """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
@@ -969,7 +983,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    rules = (*rules, mocks, wording) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
@@ -988,14 +1002,24 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
             yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 
 
+def default_roots(package: str) -> list[str]:
+    """What the gate reads when it names no roots: the package's source and every script."""
+    return [f"src/{package}", "tests", "tools", "recipes", "examples"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
                         "package's source, tests, tools, recipes and examples")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
+    parser.add_argument("--print-roots", action="store_true",
+                        help="print the roots it reads by default; tools/pre-commit lints their staged files")
     args = parser.parse_args(argv)
-    roots = args.roots or [f"src/{args.package}", "tests", "tools", "recipes", "examples"]
+    if args.print_roots:
+        print(" ".join(default_roots(args.package)))
+        return 0
+    roots = args.roots or default_roots(args.package)
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
     models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
