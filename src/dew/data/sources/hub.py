@@ -177,14 +177,20 @@ class Hub(Dataset):
                 for url in (*urls, *indexes)}
 
     def _listed(self, revision: str) -> list[str]:
-        """Every file of the repo at `revision`, as the Hub last answered (`dew.cache.hub_answer`):
-        a commit's files never change, so its answer stands for it."""
+        """Every file of the repo at `revision`, as the Hub last answered (`dew.cache.hub_answer`),
+        asked once per source: a commit's files never change, so its answer stands for it."""
         from huggingface_hub import HfApi
 
-        return hub_answer(
-            ("dataset files", self.repo, revision),
-            lambda: HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision),
-        ).value
+        if revision not in self._listings:
+            self._listings[revision] = hub_answer(
+                ("dataset files", self.repo, revision),
+                lambda: HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision),
+            ).value
+        return self._listings[revision]
+
+    @cached_property
+    def _listings(self) -> dict[str, list[str]]:
+        return {}
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
         paths = self._listed(revision)
