@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, factorised_decay_terms, fla_side, recurrence, rule_math, through
+from delta_rule_support import NAMES, fla_decay_terms, fla_side, recurrence, rule_math, through
 from jax.core import ShapedArray
 from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
 from sharded import assert_runs_per_shard, boundary_copies
@@ -436,7 +436,7 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
     """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s output,
     final memory and gradients, through every kernel and the custom VJP, as near the float64
     recurrence as fla 0.5.2's own on the same operands, each sized by the portable math's float64
-    terms and Kimi's decay gradient by fla's factorised ones too. Both take each range as the
+    terms and Kimi's decay gradient by those of the parts its port sums too. Both take each range as the
     difference of two fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5.
     A decay per key dimension (Kimi's delta attention) is the same in each, the pair in one 16-token
     sub-chunk, its diagonal block."""
@@ -464,9 +464,8 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
         truth = widened(through(recurrence, *operands[6:])(*operands[:6]))
         _, terms = float64_terms(through(math, *operands[6:]), *operands[:6])
         if per_key:
-            # Kimi's port takes fla's factorised decay gradient, whose terms the math's pairs never add.
-            decay = factorised_decay_terms(*operands[:2], *truth[2:4])
-            terms = (*terms[:5], np.maximum(terms[5], decay), *terms[6:])
+            # Kimi's port sums its decay's gradient from parts the math's pairs never add.
+            terms = (*terms[:5], np.maximum(terms[5], fla_decay_terms(*operands)), *terms[6:])
     for name, dew, fla, value, summed in zip(NAMES, got, theirs, truth, terms, strict=True):
         assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name, terms=np.asarray(summed))
 
