@@ -74,9 +74,9 @@ It only names `.dew-figure`, since a figure inlined in a page shares the page's 
 RESET = 0.6
 """Seconds at the end of each loop in which an animated shape eases back to its first state."""
 
-WIDE, TEXT, SMALL = 520, 15, 14
-"""The charts' default width and their text sizes. A phone's column, about 350 px, shows a chart
-this wide at two thirds of its size, which keeps this text near 10 px."""
+WIDE, TEXT, SMALL = 460, 15, 14
+"""The charts' default width and their text sizes. A phone's column, about 340 px inside a notebook
+output, shows a chart this wide at three quarters of its size, which keeps this text near 11 px."""
 
 
 def _number(x: float) -> str:
@@ -427,7 +427,7 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
 
 
 def tokens(rows: Sequence[Sequence[str]], *, fills: Sequence[Sequence[Role]], notes: Sequence[str] = (),
-           header: str = "", cell: float = 30, seconds: float = 0.0) -> Figure:
+           header: str = "", cell: float = 27, seconds: float = 0.0) -> Figure:
     """Rows of token boxes, `fills[i][j]` filling token j of row i ("none" leaves it an outline), with
     `notes[i]` beside row i. With `seconds`, the rows appear one after another."""
     longest = max(len(row) for row in rows)
