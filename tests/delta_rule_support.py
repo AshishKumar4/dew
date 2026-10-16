@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from dew.nn import linear
+from dew.nn.kernels import fla_gdn
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -123,15 +124,16 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from fla's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`), each chunk of `chunk`
-    tokens from the row's start: each token's decay the difference of its prefix and the one before,
-    so the portable rule, rebuilding the prefixes, takes every range as the difference of two plain
-    prefixes, as fla and the port do. Its gradient passes to `g` unchanged."""
+    """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
+    of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
+    token's decay the difference of its prefix and the one before carried back to natural log. The
+    portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
+    of two rounded base-2 prefixes. Its gradient passes to `g` unchanged."""
     batch, length = g.shape[:2]
     padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
-    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2)
+    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2) * fla_gdn.RCP_LN2
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
-    recut = (prefix - earlier).reshape(padded.shape)[:, :length]
+    recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
 
 

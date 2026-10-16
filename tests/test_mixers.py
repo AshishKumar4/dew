@@ -258,15 +258,17 @@ DELTA_RULES = frozenset({"gated_delta_net", "kimi_delta_attention"})
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
-def test_no_token_reaches_another_document(kind):
+def test_no_token_reaches_another_document(kind, monkeypatch):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
     logits, the parameters' gradients of a loss on them alone and its gradient at the second's
     embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
     information crossing a document boundary. The delta rule's port runs a row as one sequence, each
-    document's decay prefix shifted by the one before (`linear.FORGET`), so there the second
-    document's values move by that prefix's rounding: they are held to float64 within the unchanged
-    row's own distance, which a token crossing the boundary would miss by orders of magnitude.
+    document's decay prefix shifted by the one before (`linear.FORGET`), so a document's values carry
+    the previous one's rounding, not its information: where a target row names the port, the layer
+    is held here with its rule on the portable math, and the port's own documents are held apart
+    against float64 run document by document in test_fla_gdn's packed-documents test and against
+    fla's own distance in test_fla_kda's packed case.
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -298,13 +300,11 @@ def test_no_token_reaches_another_document(kind):
             variables, inputs)
         return logits, grads, at_inputs[:, first:first + second]
 
+    measured = linear.measured_kernel
+    if kind in DELTA_RULES:
+        monkeypatch.setattr(linear, "measured_kernel", lambda choice, default: (
+            "xla" if choice == "gated_delta_rule" else measured(choice, default)))
     moved, unchanged = second_document(model, variables, changed), second_document(model, variables, tokens)
-    if kind in DELTA_RULES and linear.measured_kernel("gated_delta_rule", "xla") == "fla":
-        with jax.enable_x64(new_val=True):
-            widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-            truth = second_document(model.clone(dtype=jnp.float64), widened, tokens)
-        assert_leaves_as_exact(moved, unchanged, truth)
-        return
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(unchanged),
                                     strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
