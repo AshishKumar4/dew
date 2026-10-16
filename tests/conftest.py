@@ -56,11 +56,11 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
-def own_rung_records(monkeypatch, tmp_path):
+def own_rung_records(monkeypatch, tmp_path_factory):
     """Each test keeps its own rung records (`dew.training.rungs`). The suite
     shares one compilation cache, beside which a run records its step's
     rung, and a rung one test forces would be another's floor."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
 
 
 @pytest.fixture(autouse=True, scope="module")
