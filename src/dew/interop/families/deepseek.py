@@ -261,7 +261,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     ropes = read_rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
         ramps=('yarn',), per_kind=False)
-    config = base_config(hf_config, used, rope=Ropes(ropes.theta))
+    config = base_config(hf_config, used, rope=ropes)
     layer_types = records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
@@ -337,7 +337,6 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'qk_rope_head_dim': rope,
             'v_head_dim': records.integer(v_dim, 'v_head_dim'),
             'rope_interleave': bool(interleave),
-            'yarn': ropes.scaling,
             'index_topk': None if index is None else index['index_topk'],
             'index_n_heads': None if index is None else index['index_n_heads'],
             'index_head_dim': (None if index is None
@@ -615,7 +614,7 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
     ramp = {key: value for key, value in entry.items()
             if key != 'partial_rotary_factor'}
     ramp.setdefault('original_max_position_embeddings', max_pos)
-    return theta, yarn_record(dict(ramp, rope_theta=theta), field, theta, max_pos)
+    return theta, yarn_record(ramp, field, max_pos)
 
 
 def _v4_compress_rates(hf_config: Mapping[str, object], layer_types: tuple[str, ...],

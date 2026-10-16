@@ -706,6 +706,29 @@ def test_a_request_continues_into_its_response_by_each_fields_meaning():
     same(jax.jit(lambda inputs: inputs.extended(response))(request), extended)
 
 
+def test_a_packed_rows_padding_continues_nothing():
+    """Segment 0 pads a packed row as a mask does (`real_slots`), and a
+    caller's mask still narrows a row its segments leave whole: a row padded
+    by segment 0, one padded by its mask, and one whose last document follows
+    another continue their positions and document from their last real
+    token, each as that row's real tokens alone do."""
+    response = jnp.full((3, 2), 3, jnp.int32)
+    packed = ModelInputs(jnp.asarray([[5, 6, 7, 0, 0], [0, 5, 6, 7, 0], [9, 5, 6, 7, 0]], jnp.int32), {
+        "attention_mask": jnp.asarray([[1, 1, 1, 1, 1], [0, 1, 1, 1, 0], [1, 1, 1, 1, 1]], bool),
+        "positions": jnp.asarray([[0, 1, 2, 0, 0], [0, 0, 1, 2, 0], [0, 0, 1, 2, 0]], jnp.int32),
+        "segment_ids": jnp.asarray([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 2, 2, 2, 0]], jnp.int32)})
+    alone = ModelInputs(jnp.asarray([[5, 6, 7]] * 3, jnp.int32), {
+        "positions": jnp.asarray([[0, 1, 2]] * 3, jnp.int32),
+        "segment_ids": jnp.asarray([[1, 1, 1], [1, 1, 1], [2, 2, 2]], jnp.int32)})
+    continued, expected = packed.extended(response).token_fields, alone.extended(response).token_fields
+    for name in ("positions", "segment_ids"):
+        same(continued[name][:, 5:], expected[name][:, 3:])
+    # Only the segments mark the padding when the request carries no mask.
+    unmasked = dataclasses.replace(packed, token_fields={
+        name: value for name, value in packed.token_fields.items() if name != "attention_mask"})
+    same(unmasked.extended(response).token_fields["positions"][::2, 5:], expected["positions"][::2, 3:])
+
+
 def test_a_field_with_no_extension_rule_is_refused_and_a_named_rule_extends_it():
     """A routing replay has no value for slots the model has not routed, so
     extending it is refused until the caller names a rule, which also

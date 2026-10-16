@@ -16,6 +16,7 @@ output scale, which is the distance the cudnn parity in tests/test_kernels.py
 pins between two correct kernels.
 """
 
+import functools
 from types import SimpleNamespace
 
 import jax
@@ -390,22 +391,20 @@ def test_splash_keeps_packed_documents_apart_by_their_segment_ids(dtype, sliding
     assert_agrees(value_and_grads('tpu', query, key, value, **structure), expected, dtype)
 
 
-def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False, sliding_window=None,
-                          mask=None, segment_ids=None, softcap=None):
-    """`value_and_grads`' output and gradients in float64, from attention
-    written out here apart from every Dew path: the logits of query head h
-    against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`,
-    then the keys `kept` keeps, a softmax whose denominator a sink joins, and
-    the values. A query that keeps no key reads nothing: its output is zero."""
-    def attention(q, k, v, s):
-        group = jnp.arange(q.shape[2]) // (q.shape[2] // k.shape[2])
-        keep = kept(q.shape[1], k.shape[1], causal=causal, sliding_window=sliding_window, mask=mask,
-                    segment_ids=segment_ids)
-        weights, _ = _float64_weights(q, k, keep, s, softcap)
-        return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
+def exact_attention(q, k, v, s=None, *, softcap=None, **structure):
+    """Attention written out apart from every Dew path, in the inputs' dtype: the logits of query
+    head h against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`, then the keys
+    `kept` keeps by `structure`, a softmax whose denominator a sink joins, and the values. A query
+    that keeps no key reads nothing: its output is zero."""
+    group = jnp.arange(q.shape[2]) // (q.shape[2] // k.shape[2])
+    weights, _ = _float64_weights(q, k, kept(q.shape[1], k.shape[1], **structure), s, softcap)
+    return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
 
+
+def exact_value_and_grads(query, key, value, sinks=None, live=None, softcap=None, **structure):
+    """`value_and_grads`' output and gradients in float64 (`exact_attention`)."""
     def loss(q, k, v, s):
-        out = attention(q, k, v, s)
+        out = exact_attention(q, k, v, s, softcap=softcap, **structure)
         if live is not None:
             out = jnp.where(np.asarray(live)[:, :, None, None], out, 0)
         return jnp.sum(out ** 2), out
@@ -511,3 +510,73 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
                 _, grads = run(*inputs, sinks)
                 measured.append(distance(grads[-1], truth[-1]))
         assert_as_exact_over_orders(*distances, f"{case} {ordered}")
+
+
+def vjp_of(attend):
+    """`attend`'s output and its three input gradients against the cotangent `do`."""
+    def run(q, k, v, do):
+        out, pull = jax.vjp(attend, q, k, v)
+        return out, *pull(do)
+
+    return run
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis, key_heads, packed",
+                         [("data", 2, True), ("tensor", 2, False), ("tensor", 1, False)],
+                         ids=["packed-rows", "heads", "heads-past-the-keys"])
+def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
+    """Splash over packed rows split two ways, query heads split two ways with the key heads they read,
+    or query heads split past their one key head, which each shard then holds a copy of, runs per shard
+    (`sharded.assert_runs_per_shard`) under pallas's interpreter: the output and the three input
+    gradients within the float64 gate of one device's, and no operand moved between devices."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    query, _, _ = qkv((2, 256, 4, 64), jnp.float32)
+    _, key, value = qkv((2, 256, key_heads, 64), jnp.float32, seed=1)
+    cotangent = qkv((2, 256, 4, 64), jnp.float32, seed=2)[0]
+    structure = {"causal": True, "segment_ids": packed_ids((100, 156), (30, 226)) if packed else None}
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent)]
+        truth = jax.tree.map(np.asarray, vjp_of(lambda q, k, v: exact_attention(q, k, v, **structure))(*wide))
+    rows, heads = PartitionSpec(axis), PartitionSpec(None, None, axis)
+    queries = rows if axis == "data" else heads
+    keys = rows if axis == "data" else heads if key_heads > 1 else PartitionSpec()
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    splash = functools.partial(scaled_dot_product_attention, implementation='tpu', **structure)
+    assert_runs_per_shard(vjp_of(splash), (query, key, value, cotangent), [queries, keys, keys, queries],
+                          mesh, truth)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("axes", [{"data": 2}, {"tensor": 2}, {"data": 2, "tensor": 2}],
+                         ids=["rows", "heads", "rows-and-heads"])
+@pytest.mark.parametrize("kernel", ["splash", "flash"])
+def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axes, kernel):
+    """jax refuses to lower a Mosaic kernel the partitioner would have to split ("Mosaic kernels
+    cannot be automatically partitioned"), so on a v6e mesh splitting rows, heads or both, each
+    kernel of attention_impl 'tpu', splash and the flash kernel a bias sends a call to, lowers
+    forward and backward as each shard's rows and heads (`sharded.tpu_lowering`); sinks and a bias
+    split with their heads."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    from sharded import tpu_lowering, tpu_mesh
+
+    mesh = tpu_mesh(**axes)
+    rows, heads = ("data" if "data" in axes else None), ("tensor" if "tensor" in axes else None)
+
+    def placed(shape, dtype, *spec):
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, PartitionSpec(*spec)))
+
+    query = placed((4, 256, 4, 128), jnp.bfloat16, rows, None, heads)
+    key = placed((4, 256, 2, 128), jnp.bfloat16, rows, None, heads)
+    extra = (placed((4,), jnp.float32, heads) if kernel == "splash"
+             else placed((1, 4, 256, 256), jnp.float32, None, heads))
+
+    def loss(q, k, v, extra):
+        call = {"sinks": extra} if kernel == "splash" else {"bias": extra}
+        out = scaled_dot_product_attention(q, k, v, implementation='tpu', causal=True, **call)
+        return jnp.sum(out.astype(jnp.float32) ** 2)
+
+    lowered = tpu_lowering(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, extra), mesh)
+    assert "tpu_custom_call" in lowered

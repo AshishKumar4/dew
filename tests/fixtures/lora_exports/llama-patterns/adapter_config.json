@@ -22,5 +22,6 @@
   "fan_in_fan_out": false,
   "bias": "none",
   "init_lora_weights": true,
-  "inference_mode": true
+  "inference_mode": true,
+  "base_model_name_or_path": "tests/fixtures/hf/llama-tiny"
 }

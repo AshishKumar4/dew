@@ -143,12 +143,12 @@ from transformers.models.llama4.modeling_llama4 import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from deepseek_v4_reference import (  # noqa: E402
+from deepseek_v4_reference import (
     DEEPSEEK_V4_SEED, tiny_deepseek_v4, write_deepseek_v4_config, write_deepseek_v4_source,
     write_deepseek_v4_mtp_reference,
 )
-from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
-from hf_reference import (  # noqa: E402
+from gpt_oss_reference import tiny_gpt_oss
+from hf_reference import (
     DEEPSEEK_YARN,
     FIXTURES,
     write_config,
@@ -158,8 +158,8 @@ from hf_reference import (  # noqa: E402
 )
 from dew.interop.safetensors_io import write_file
 from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
-from moe_reference import expert_tensors  # noqa: E402
-from qwen_mtp_reference import QwenMTP  # noqa: E402
+from moe_reference import expert_tensors
+from qwen_mtp_reference import QwenMTP
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:

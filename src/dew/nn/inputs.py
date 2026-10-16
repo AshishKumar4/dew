@@ -230,7 +230,9 @@ class ModelInputs:
         each token field continued by its rule in `rules` or `RESPONSE_FIELDS`.
 
         A field with no rule raises ValueError rather than take a guessed
-        value; the conditioning stays as it is. Works inside JIT.
+        value; the conditioning stays as it is. The rules read the prompt's
+        real slots (`real_slots`), so a packed row's padding continues
+        nothing. Works inside JIT.
         """
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
@@ -239,7 +241,7 @@ class ModelInputs:
         if unruled:
             raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
                              "name one in `rules`")
-        valid = jnp.asarray(self.token_fields.get(VALIDITY_FIELD, jnp.ones(self.tokens.shape, bool)), bool)
+        valid = real_slots(self.token_fields, self.tokens.shape)
         width = tokens.shape[1]
         return replace(
             self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
@@ -506,6 +508,18 @@ VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
 
+def real_slots(fields: Mapping[str, jax.Array | np.ndarray], shape: tuple[int, ...], *, xp=jnp):
+    """Which of a request's `shape` `[B, S]` slots hold a real token: those its
+    validity field marks, every one where it has none, less the padding a
+    packed row numbers 0 in `segment_ids` (`Coordinates.segments`). Samplers
+    select, place and continue a row by these, so a row padded either way
+    reads as the row alone; a caller's mask is narrowed, never replaced. `xp`
+    is the array module."""
+    valid = xp.asarray(fields[VALIDITY_FIELD], bool) if VALIDITY_FIELD in fields else xp.ones(shape, bool)
+    segments = fields.get("segment_ids")
+    return valid if segments is None else valid & (xp.asarray(segments) != 0)
+
+
 def valid_order(valid: jax.Array, *, xp=jnp) -> tuple[jax.Array, jax.Array]:
     """Each row's real slots first, in order, then its padding slots: the
     physical slot behind each compact column `[rows, slots]`, and how many
@@ -562,6 +576,20 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "image_groups": _response_text,
 }
 """How each token field Dew's processors write continues into a response."""
+
+
+def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
+    """Each row's logical position after its last real token `[B]`, its
+    response's first by `RESPONSE_FIELDS`: one past the largest coordinate a
+    real token holds on any axis of its `rotary_positions`, else one past its
+    last real token's `positions`, which a document reset may have lowered
+    below an earlier one. None where the request gives neither, and a cache's
+    cursor counts each row on. `valid` is its real slots (`real_slots`)."""
+    rotary = fields.get("rotary_positions")
+    if rotary is not None:
+        return _response_coordinates(rotary, valid, 1).reshape(rotary.shape[0], -1)[:, 0]
+    positions = fields.get("positions")
+    return None if positions is None else _response_positions(positions, valid, 1)[:, 0]
 
 
 def validity_sites(tree: InputTree) -> list[ModelInputs]:

@@ -138,7 +138,7 @@ def _wide() -> bool:
     the targets do not list takes the 99 KB picks, which every Triton GPU's block holds, and a CPU's
     interpretation an A100's."""
     target = generation.gpu_target()
-    if not target.generation.startswith("sm"):
+    if generation.capability(target.generation) is None:
         return True
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
 
