@@ -660,9 +660,11 @@ def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
 
 def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_table(tmp_path):
     """SLOP016: the device's generation, `device_generation()` or a `gpu_target()`'s `.generation`,
-    however imported or bound, compared with or prefix-matched against one the source spells, cut up,
-    or used as a table's key, is reported outside nn/kernels/generation.py. Comparing it with a
-    recorded generation, reading a fact off the target, or passing it to a function is not."""
+    however imported, and through a name bound to it in the function, its module or a class body,
+    compared with or prefix-matched against one the source spells, matched against a spelled case,
+    cut up, or used as a table's key or attribute name, is reported outside nn/kernels/generation.py.
+    Comparing it with a recorded generation, reading a fact off the target, passing it to a function,
+    and a name rebound to something else or shadowed by a parameter or a comprehension are not."""
     found = _linted(tmp_path, {
         "src/sparx/nn/kernels/generation.py": (
             "def device_generation():\n"
@@ -685,9 +687,30 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
             "    return named.startswith('sm8') or int(named[2:]) > 89 or named in ('sm86', 'sm89')\n"
             "def measured(on):\n"
             "    named = device_generation()\n"
-            "    return named != on and gpu_target().shared_limit and gpu_target(named) and print(named)\n"),
+            "    return named != on and gpu_target().shared_limit and gpu_target(named) and print(named)\n"
+            "GENERATION = device_generation()\n"
+            "def later():\n"
+            "    return lambda: GENERATION == 'sm90' or getattr(TILES, GENERATION)\n"
+            "class Launch:\n"
+            "    PICK = TILES[device_generation()]\n"
+            "def matched():\n"
+            "    named: str = device_generation()\n"
+            "    match named:\n"
+            "        case 'sm90' | 'sm100':\n"
+            "            return 0\n"
+            "    return 1\n"
+            "def relabeled(record):\n"
+            "    named = device_generation()\n"
+            "    named = record.label\n"
+            "    return named == 'label' or [named == 'sm80' for named in record.names]\n"
+            "def shadowed(GENERATION):\n"
+            "    return GENERATION == 'sm80'\n"
+            "def listed(record):\n"
+            "    named = device_generation()\n"
+            "    return [named == 'sm80' for named in record.names] and named == 'sm90'\n"),
     })
-    assert found == [("src/sparx/tiles.py", line, "SLOP016") for line in (5, 8, 11, 11, 11)]
+    assert found == [("src/sparx/tiles.py", line, "SLOP016")
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):

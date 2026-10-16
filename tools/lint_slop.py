@@ -60,8 +60,8 @@ import io
 import re
 import sys
 import tokenize
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -949,44 +949,80 @@ def calls(module: Module) -> Iterator[Finding]:
 
 # Where the device's hardware generation comes from, and the one module that keys choices on it.
 GENERATION = "{package}.nn.kernels.generation"
-GENERATION_CALLS = ("device_generation",)
-TARGET_CALLS = ("gpu_target",)
 
 
-def _generations(function: ast.AST, tables: Mapping[int, Mapping[str, str]], package: str
-                 ) -> tuple[set[str], set[str]]:
-    """The names `function`'s own body binds to the device's generation, `device_generation()` or a
-    `gpu_target()`'s `.generation`, and those it binds to a `gpu_target()`, in statement order."""
-    owner = GENERATION.format(package=package)
-    targets: set[str] = set()
-    generations: set[str] = set()
-    for node in scopes.own(function):
-        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)):
-            continue
-        name, value, table = node.targets[0].id, node.value, tables.get(id(node), {})
-        if isinstance(value, ast.Call) and scopes.resolved(value.func, table) in {
-                f"{owner}.{call}" for call in TARGET_CALLS}:
-            targets.add(name)
-        elif _generation(value, table, owner, generations, targets):
-            generations.add(name)
-    return generations, targets
+@dataclass
+class _Hardware:
+    """What one scope's names hold of the device's hardware, as SLOP016 reads it: the names bound to
+    its generation and those bound to its target (`gpu_target()`), and how each node resolves names."""
 
+    owner: str
+    tables: Mapping[int, Mapping[str, str]]
+    generations: frozenset[str] = frozenset()
+    targets: frozenset[str] = frozenset()
 
-def _generation(node: ast.expr, table: Mapping[str, str], owner: str, generations: set[str],
-                targets: set[str]) -> bool:
-    """Is `node` the device's generation: a call of `device_generation`, a name bound to one, or
-    `.generation` of a `gpu_target()` call or a name bound to one?"""
-    if isinstance(node, ast.Name):
-        return node.id in generations
-    if isinstance(node, ast.Call):
-        return scopes.resolved(node.func, table) in {f"{owner}.{call}" for call in GENERATION_CALLS}
-    if isinstance(node, ast.Attribute) and node.attr == "generation":
-        target = node.value
-        return ((isinstance(target, ast.Name) and target.id in targets)
-                or (isinstance(target, ast.Call)
-                    and scopes.resolved(target.func, table) in {f"{owner}.{call}" for call in TARGET_CALLS}))
-    return False
+    def called(self, node: ast.expr, name: str) -> bool:
+        return (isinstance(node, ast.Call)
+                and scopes.resolved(node.func, self.tables.get(id(node), {})) == f"{self.owner}.{name}")
+
+    def generation(self, node: ast.expr) -> bool:
+        """Is `node` the device's generation: `device_generation()`, a name bound to it, or the
+        `.generation` of `gpu_target()` or of a name bound to that?"""
+        if isinstance(node, ast.Name):
+            return node.id in self.generations
+        if isinstance(node, ast.Attribute) and node.attr == "generation":
+            return ((isinstance(node.value, ast.Name) and node.value.id in self.targets)
+                    or self.called(node.value, "gpu_target"))
+        return self.called(node, "device_generation")
+
+    def bound(self, node: ast.AST) -> _Hardware:
+        """This scope's names after `node` binds one: to the generation, the target, or anything else,
+        which a generation or target name then no longer holds."""
+        if isinstance(node, ast.Assign | ast.AnnAssign):
+            names = node.targets if isinstance(node, ast.Assign) else [node.target]
+            plain = [name.id for name in names if isinstance(name, ast.Name)]
+            rest = self.without(plain)
+            if len(names) != 1 or len(plain) != 1 or node.value is None:
+                return rest
+            if self.generation(node.value):
+                return replace(rest, generations=rest.generations | set(plain))
+            if self.called(node.value, "gpu_target"):
+                return replace(rest, targets=rest.targets | set(plain))
+            return rest
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            return self.without([node.id])
+        return self
+
+    def without(self, names: Iterable[str]) -> _Hardware:
+        """These names but `names`, which hold something else here."""
+        held = set(names)
+        return replace(self, generations=self.generations - held, targets=self.targets - held)
+
+    def inside(self, scope: ast.AST) -> _Hardware:
+        """These names as a nested scope sees them: less its parameters."""
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            return self.without(argument.arg for argument in scopes.arguments(scope))
+        return self
+
+    def keyed(self, node: ast.AST) -> bool:
+        """Does `node` choose by the generation: compare it with one the source spells, match its
+        prefix or a spelled case, cut it up, or key a table with it?"""
+        if isinstance(node, ast.Compare):
+            operands = (node.left, *node.comparators)
+            return any(map(self.generation, operands)) and any(map(_spelled, operands))
+        if isinstance(node, ast.Subscript):
+            return self.generation(node.value) or self.generation(node.slice)
+        if isinstance(node, ast.Match):
+            spelled = any(_spelled_pattern(case.pattern) for case in node.cases)
+            return self.generation(node.subject) and spelled
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Attribute):
+            return ((node.func.attr in ("startswith", "endswith") and self.generation(node.func.value))
+                    or (node.func.attr == "get" and bool(node.args) and self.generation(node.args[0])))
+        builtin = (isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                   and "getattr" not in self.tables.get(id(node), {}))
+        return builtin and len(node.args) > 1 and self.generation(node.args[1])
 
 
 def _spelled(node: ast.expr) -> bool:
@@ -996,36 +1032,56 @@ def _spelled(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
+def _spelled_pattern(pattern: ast.pattern) -> bool:
+    """Is a match case's `pattern` a string the source spells, or several?"""
+    if isinstance(pattern, ast.MatchOr):
+        return any(map(_spelled_pattern, pattern.patterns))
+    return isinstance(pattern, ast.MatchValue) and _spelled(pattern.value)
+
+
+def _hardware_choices(scope: ast.AST, hardware: _Hardware) -> Iterator[ast.expr | ast.stmt]:
+    """Each node of `scope` and the scopes in it that chooses by the device's generation (`keyed`),
+    reading names in statement order. A class body runs where it stands; a function or lambda reads
+    its enclosing scope's names as they stand once that scope has bound them all, as a closure does.
+    A comprehension's targets are its own: they hide a name inside it and leave it alone outside."""
+    nodes = list(scopes.own(scope))
+    # Bound with their statement (`_Hardware.bound`), or by a comprehension, inside it alone.
+    handled = {id(name) for node in nodes if isinstance(node, ast.Assign | ast.AnnAssign)
+               for name in (node.targets if isinstance(node, ast.Assign) else [node.target])}
+    hidden: dict[int, set[str]] = {}
+    for node in nodes:
+        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+            names = [name for generator in node.generators for name in ast.walk(generator.target)
+                     if isinstance(name, ast.Name)]
+            handled |= {id(name) for name in names}
+            for inner in ast.walk(node):
+                hidden.setdefault(id(inner), set()).update(name.id for name in names)
+    final = hardware
+    for node in nodes:
+        final = final if id(node) in handled else final.bound(node)
+    for node in nodes:
+        if isinstance(node, scopes.SCOPES):
+            enclosing = hardware if isinstance(node, ast.ClassDef) else final
+            yield from _hardware_choices(node, enclosing.inside(node))
+            continue
+        if isinstance(node, ast.expr | ast.stmt) and hardware.without(hidden.get(id(node), ())).keyed(node):
+            yield node
+        hardware = hardware if id(node) in handled else hardware.bound(node)
+
+
 def authorities(module: Module) -> Iterator[Finding]:
     """SLOP016: a choice keyed on which device runs, outside the table that owns them: the device's
-    generation compared with or prefix-matched against one the source spells, cut up, or used as a
-    table's key. Comparing it with a recorded one, the generation a measurement was taken on, is a
-    measurement's provenance and not reported."""
+    generation compared with or prefix-matched against one the source spells, matched against a
+    spelled case, cut up, or used as a table's key or attribute name. Comparing it with a recorded
+    one, the generation a measurement was taken on, is a measurement's provenance and not reported."""
     owner = GENERATION.format(package=module.package)
     if module.relative == f"src/{owner.replace('.', '/')}.py":
         return
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
-    functions = [module.tree, *(node for node in ast.walk(module.tree)
-                                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda))]
-    for function in functions:
-        generations, targets = _generations(function, tables, module.package)
-        for node in scopes.own(function):
-            if not isinstance(node, ast.Compare | ast.Subscript | ast.Call):
-                continue
-            device = functools.partial(_generation, table=tables.get(id(node), {}), owner=owner,
-                                       generations=generations, targets=targets)
-            operands = (node.left, *node.comparators) if isinstance(node, ast.Compare) else ()
-            keyed = (
-                (any(map(device, operands)) and any(map(_spelled, operands)))
-                or (isinstance(node, ast.Subscript) and (device(node.value) or device(node.slice)))
-                or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and ((node.func.attr in ("startswith", "endswith") and device(node.func.value))
-                         or (node.func.attr == "get" and bool(node.args) and device(node.args[0])))))
-            if keyed:
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
-                              "chooses by the device's generation; read the target table's fact "
-                              "(`gpu_target()`), a library's rule the compute capability (`capability`), "
-                              "a launch config the autotuner")
+    for node in _hardware_choices(module.tree, _Hardware(owner, tables)):
+        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
+                      "chooses by the device's generation; read the target table's fact (`gpu_target()`), "
+                      "a library's rule the compute capability (`capability`), a launch config the autotuner")
 
 
 CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls, authorities)
