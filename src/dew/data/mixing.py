@@ -433,17 +433,29 @@ class _PrimeReads:
 
 
 class _PrimedRead(pygrain.DatasetIterator[Batch]):
+    """One corpus of a mix. The mix captures every corpus's position for each
+    record it gives (a packer captures it before each record), and only the
+    corpus that gave the record moved, so a corpus captures its position again
+    only after it reads or is restored."""
+
     def __init__(self, group: _PrimeReads, index: int):
         super().__init__(group.parents[index])
         self._group, self._index = group, index
+        self._state: Mapping[str, object] | None = None
 
     def __next__(self) -> Batch:
+        self._state = None
         return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
-        return self._group.before.get(self._index, self._group.parents[self._index].get_state())
+        if self._state is None:
+            before = self._group.before
+            self._state = (before[self._index] if self._index in before
+                           else self._group.parents[self._index].get_state())
+        return self._state
 
     def set_state(self, state: Mapping[str, object]) -> None:
+        self._state = None
         self._group.parents[self._index].set_state(state)
         self._group.pending.pop(self._index, None)
         self._group.before.pop(self._index, None)
