@@ -55,7 +55,7 @@ class TokenizerSpecials(Protocol):
 
 
 class _Same:
-    """An encoder as a cache key, one per encoder (`_same`), so a tokenizer need not hash."""
+    """An encoder as a cache key (`_same`), so a tokenizer need not hash."""
 
     __slots__ = ("__weakref__", "encoder")
 
@@ -79,8 +79,8 @@ def _same(encoder: Tokenizer) -> _Same:
 def _piece(encoder: _Same, text: str) -> tuple[int, ...]:
     """`text`'s tokens under `encoder`, without specials. A layout writes the
     same templates, instructions and options into every row of a corpus, so
-    the 16,384 texts it wrote last are kept, and a text the corpus repeats is
-    tokenized again only once it has dropped out of them."""
+    the last 16,384 texts it wrote are kept, and a text the corpus repeats is
+    read back while it is among them."""
     return tuple(encoder.encoder.encode(text, add_special_tokens=False))
 
 
