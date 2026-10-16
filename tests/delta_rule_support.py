@@ -1,11 +1,17 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
-grouped value heads and packed documents over it (`recurrence`), and the gradient harness every rule
-is run through (`through`)."""
+grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
+is run through (`through`), and fla's own outputs and gradients, the ports' reference (`fla_side`)."""
 
 import itertools
+import os
+import subprocess
+import tempfile
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -61,3 +67,53 @@ def through(rule, do, dht):
         return out, final, *grads
 
     return run
+
+
+FLA_SIDE = '''
+import sys, numpy as np, torch
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.kda import chunk_kda
+given, dtype = np.load(sys.argv[1]), getattr(torch, sys.argv[3])
+load = lambda name, as_dtype: torch.from_numpy(given[name]).to("cuda", as_dtype)
+q, k, v, do, beta = (load(n, dtype) for n in ("q", "k", "v", "do", "beta"))
+g, h0, dht = (load(n, torch.float32) for n in ("g", "h0", "dht"))
+cu_seqlens = load("cu_seqlens", torch.long) if "cu_seqlens" in given else None
+leaves = [x.requires_grad_() for x in (q, k, v, g, beta, h0)]
+rule = chunk_kda if g.dim() == 4 else chunk_gated_delta_rule
+o, final = rule(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True,
+                cu_seqlens=cu_seqlens)
+torch.autograd.backward((o, final), (do, dht))
+np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
+                         zip(sys.argv[4:], (o, final, *(leaf.grad for leaf in leaves)), strict=True)})
+'''
+"""fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda`, or
+`chunk_gated_delta_rule` for a decay per head, on the operands of an npz, its outputs and gradients
+into another under the names it is given (`NAMES`); packed documents as its varlen sequences, each
+with a memory of its own."""
+
+NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
+"""The outputs and gradients each side gives, in `through`'s order."""
+
+
+def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
+    """fla's outputs and gradients on `inputs` (one row), run in a process of its own. Packed into
+    documents at `cuts`, the row's memory is its first document's and its final memory and cotangent
+    its last's: the others start from zero and give theirs no cotangent."""
+    python = os.environ.get("DEW_FLA_PYTHON")
+    if not python:
+        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the GPU tier's reference")
+    given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
+                     (np.asarray(x, np.float32) for x in inputs), strict=True))
+    if cuts is not None:
+        others = np.zeros((len(cuts) - 1, *given["h0"].shape[1:]), np.float32)
+        given["h0"] = np.concatenate([given["h0"], others])
+        given["dht"] = np.concatenate([others, given["dht"]])
+        given["cu_seqlens"] = np.asarray([*cuts, given["q"].shape[1]], np.int64)
+    with tempfile.TemporaryDirectory() as root:
+        np.savez(Path(root) / "in.npz", **given)
+        subprocess.run([python, "-c", FLA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz",
+                        jnp.dtype(dtype).name, *NAMES], check=True)
+        found = np.load(Path(root) / "out.npz")
+        theirs = {name: found[name].astype(np.float64) for name in NAMES}
+    theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
+    return [theirs[name] for name in NAMES]
