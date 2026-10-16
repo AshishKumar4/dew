@@ -3,7 +3,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -82,14 +82,48 @@ export async function rewriteTarget(target, sourcePath, pagePath, { html = false
 
 const parser = unified().use(remarkParse).use(remarkGfm);
 
+// A notebook embeds a figure (dew.figures) by its raw GitHub URL on the branch the site builds,
+// which is what Colab can load. The page gets the checkout's file inline instead, since an SVG
+// in the page's own markup follows the theme toggle and an <img> follows only the system setting.
+const rawRoot = `${repository.url.replace('https://github.com/', 'https://raw.githubusercontent.com/')}/${repository.branch}/`;
+
+/** The figure an image paragraph names by raw URL, as an HTML block, or undefined for any other paragraph. */
+async function inlineFigure(paragraph, sourcePath) {
+	const [image, ...rest] = paragraph.children;
+	if (image?.type !== 'image' || !image.url.startsWith(rawRoot) || !image.url.endsWith('.svg')) return undefined;
+	if (rest.some((node) => node.type !== 'text' || node.value.trim())) {
+		throw new Error(`${sourcePath}: a figure stands alone in its paragraph: ${image.url}`);
+	}
+	const file = path.join(repoRoot, image.url.slice(rawRoot.length));
+	if (!existsSync(file)) throw new Error(`${sourcePath}: broken figure: ${image.url} (no ${path.relative(repoRoot, file)})`);
+	const svg = (await readFile(file, 'utf8')).trim();
+	if (!svg.startsWith('<svg') || svg.includes('\n')) throw new Error(`${sourcePath}: ${image.url} is not a one-line SVG from dew.figures`);
+	// The alt text describes the figure where it stands, so it replaces the figure's own label.
+	const label = image.alt.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+	return `<div class="nb-figure">${svg.replace(/ aria-label="[^"]*"/, '').replace('<svg ', `<svg aria-label="${label}" `)}</div>`;
+}
+
 /**
  * Rewrite every link, image and definition target in a Markdown string,
  * editing the source text in place so the rest of the Markdown stays as written.
+ * A paragraph that is one figure by raw URL becomes that figure, inline.
  */
 export async function rewriteMarkdown(markdown, sourcePath, pagePath) {
 	const tree = parser.parse(markdown);
 	const edits = [];
+	const paragraphs = [];
+	visit(tree, 'paragraph', (node) => {
+		paragraphs.push(node);
+	});
+	const inlined = new Set();
+	for (const paragraph of paragraphs) {
+		const block = await inlineFigure(paragraph, sourcePath);
+		if (block === undefined) continue;
+		inlined.add(paragraph.children[0]);
+		edits.push({ from: paragraph.position.start.offset, to: paragraph.position.end.offset, text: block });
+	}
 	visit(tree, ['link', 'image', 'definition'], (node) => {
+		if (inlined.has(node)) return;
 		const { start, end } = node.position;
 		const text = markdown.slice(start.offset, end.offset);
 		// Autolinks (<https://...>) and bare URLs carry no separate target to rewrite.
@@ -108,8 +142,8 @@ export async function rewriteMarkdown(markdown, sourcePath, pagePath) {
 	edits.sort((a, b) => b.from - a.from);
 	let out = markdown;
 	for (const edit of edits) {
-		const url = await rewriteTarget(edit.url, sourcePath, pagePath, { html: edit.html });
-		out = out.slice(0, edit.from) + url + out.slice(edit.to);
+		const text = edit.text ?? (await rewriteTarget(edit.url, sourcePath, pagePath, { html: edit.html }));
+		out = out.slice(0, edit.from) + text + out.slice(edit.to);
 	}
 	return out;
 }
