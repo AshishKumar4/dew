@@ -1015,6 +1015,58 @@ def placed_bytes(tree) -> int:
                for leaf in jax.tree.leaves(tree))
 
 
+def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
+                      mesh: Mesh) -> tuple[Held, Held]:
+    """A copy of `held` on `mesh` as two trees, each None where the other holds
+    an array: the arrays a state of `variables` placed by `shardings` takes
+    over, each where the state keeps the variable of its path and shape
+    (`Objective.held_variables`), and the rest, replicated, which no output of
+    the state takes.
+
+    Handed to the state's JIT as they are, the arrays land below the state it
+    builds and leave a hole the checkpoint's size once freed, which splits
+    the free memory a step's temporaries need in one block
+    (`step_headroom`). Placed where the state keeps them and donated
+    (`taking_over`), they become the state's buffers. The copy leaves the
+    objective's own arrays alone."""
+    kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
+        jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
+    replicated = NamedSharding(mesh, P())
+
+    def variable(path, leaf) -> NamedSharding | None:
+        # An initializer binds the checkpoint as `variables`
+        # (`Objective.initializer`), so a leaf's path below that keyword
+        # is its variable's.
+        keys = [key.key if isinstance(key, jax.tree_util.DictKey) else None for key in path]
+        sharding, shape = kept.get(path[keys.index('variables') + 1:] if 'variables' in keys else (),
+                                   (None, None))
+        return sharding if shape == np.shape(leaf) else None
+
+    # A copy of an array already on the devices: device_put can reuse a
+    # buffer the target shares with the source, which donation would free.
+    owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, held)
+    placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
+        lambda path, leaf: variable(path, leaf) or replicated, held))
+    taken = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: None if variable(path, leaf) is None else leaf, placed)
+    return taken, jax.tree.map(lambda one, leaf: leaf if one is None else None, taken, placed,
+                               is_leaf=lambda leaf: leaf is None)
+
+
+def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], taken: Held, kept: Held,
+                              shardings: Placement[Result]) -> Callable[[jax.Array], Result]:
+    """`function` jitted onto `shardings` over the held tree `placed_held`
+    splits: `taken` donated, for the outputs to take its buffers over, and
+    `kept` not, as no output takes those and JAX only warns of a donation it
+    cannot use. They are freed as the caller drops them."""
+
+    def joined(taken: Held, kept: Held, key: jax.Array) -> Result:
+        return function(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
+                                     is_leaf=lambda leaf: leaf is None), key)
+
+    return functools.partial(jax.jit(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
+
+
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
     """Return the bytes a device holds of the batches `fit` places while a step runs.
 

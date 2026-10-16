@@ -24,6 +24,7 @@ the largest difference over the largest value, 1e-5. Observed: prompt states
 3.2e-7, final latents 2.8e-6, decoded frames 2.7e-6.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -33,7 +34,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact
+from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_wan_weights, wan_fields
@@ -85,14 +86,22 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, n
     context = jnp.asarray(arrays[f"{name}.context"])
     probe = channels_last(arrays[f"{name}.probe"])
 
-    def flow(params, latents, context):
-        return model.apply({"params": params}, latents, times, DenoisingCondition(context))
+    def flow_and_gradients(model, params, latents, context):
+        def flow(params, latents, context):
+            return model.apply({"params": params}, latents, times, DenoisingCondition(context))
 
-    output = flow(params, latents, context)
-    grad_params, grad_latents, grad_context = jax.grad(
-        lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(params, latents, context)
+        return flow(params, latents, context), *jax.grad(
+            lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(params, latents, context)
+
+    output, grad_params, grad_latents, grad_context = flow_and_gradients(model, params, latents, context)
+    # Dew's own path in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, (output_terms, *gradient_terms) = float64_terms(
+            functools.partial(flow_and_gradients, model.clone(dtype=jnp.float64)),
+            *widened((params, latents, context)))
     assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1), arrays[f"{name}.fp32.output"],
-                                     arrays[f"{name}.fp64.output"], f"{name} flow")
+                                     arrays[f"{name}.fp64.output"], f"{name} flow",
+                                     terms=np.moveaxis(output_terms, -1, 1))
 
     def source_order(precision: str) -> np.ndarray:
         leaves = [arrays[f"{name}.{precision}.grad_latents"], arrays[f"{name}.{precision}.grad_context"]]
@@ -100,11 +109,14 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, n
                    for layout in layouts]
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
-    native = [np.moveaxis(np.asarray(grad_latents), -1, 1), np.asarray(grad_context)]
-    native += [layout.export({"params": grad_params}) for layout in layouts]
-    native_order = np.concatenate([np.ravel(leaf) for leaf in native])
-    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
-                                     f"{name} gradients")
+    def native_order(grad_params, grad_latents, grad_context) -> np.ndarray:
+        native = [np.moveaxis(np.asarray(grad_latents), -1, 1), np.asarray(grad_context)]
+        native += [layout.export({"params": grad_params}) for layout in layouts]
+        return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in native])
+
+    assert_as_exact_as_the_reference(native_order(grad_params, grad_latents, grad_context),
+                                     source_order("fp32"), source_order("fp64"), f"{name} gradients",
+                                     terms=native_order(*gradient_terms))
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -148,7 +160,7 @@ def streamed(walk):
     return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
 
 
-def assert_walked_as_the_source(walked, arrays, rows: int) -> None:
+def assert_walked_as_the_source(walked, arrays, rows: int, task) -> None:
     """Each row's final latent and decoded frames by tests/reference_error.py's
     rule, against the source pipeline's float32 walk and its float64 one.
 
@@ -161,11 +173,17 @@ def assert_walked_as_the_source(walked, arrays, rows: int) -> None:
     rounds 2.07 times as far from float64 as torch's SDPA does on the same
     call (its math and flash backends both measure 1.0)."""
     frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    # Each frame entry's terms, what the decode's own sums add over the walk's latents in float64 on the
+    # CPU (`float64_terms`), halved as the frame halves the decoded image.
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        operands = widened((task.variables["autoencoder"], np.asarray(walked.latents)))
+        _, decoded_terms = float64_terms(task.autoencoder.decode, *operands)
+    frame_terms = np.asarray(decoded_terms) / 2
     for row in range(rows):
         latent = (channels_last(arrays[name][None])[0] for name in (f"latents.{row}", f"latents_f64.{row}"))
         assert_as_exact_as_the_reference(np.asarray(walked.latents)[row], *latent, f"latent {row}")
         assert_as_exact_as_the_reference(frames[row], arrays[f"frames.{row}"], arrays[f"frames_f64.{row}"],
-                                         f"frames {row}")
+                                         f"frames {row}", terms=frame_terms[row])
 
 
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk):
@@ -199,7 +217,7 @@ def test_pipeline_walk_matches_the_source(load, walk, request):
     assert pipeline.inputs.sample.shape == (record["frames"], record["height"], record["width"], 3)
     walked = task(task.prepare(record["prompts"], initial=channels_last(arrays["x_T"]), key=0,
                                steps=record["steps"]), key=jax.random.PRNGKey(0)).host()
-    assert_walked_as_the_source(walked, arrays, len(record["prompts"]))
+    assert_walked_as_the_source(walked, arrays, len(record["prompts"]), task)
 
 
 def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk):
@@ -221,7 +239,7 @@ def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk
     negative = DenoisingCondition(jnp.asarray(arrays[f"context.{rows}"][None]))
     prepared = task.prepare(conditions={"conditioning": given}, unconditional={"conditioning": negative},
                             initial=channels_last(arrays["x_T"]), key=0, steps=record["steps"])
-    assert_walked_as_the_source(task(prepared, key=jax.random.PRNGKey(0)).host(), arrays, rows)
+    assert_walked_as_the_source(task(prepared, key=jax.random.PRNGKey(0)).host(), arrays, rows, task)
 
 
 class Replay(nn.Module):

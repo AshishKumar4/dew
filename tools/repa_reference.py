@@ -48,13 +48,14 @@ import numpy as np
 import torch
 from reference_source import definitions
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from reference_error import ORDERS, distance
+from residual_orders import orders
+
 REPA = "https://raw.githubusercontent.com/sihyun-yu/REPA/67f714503e3892f993844aab088ffc5791c92613/"
 IREPA = "https://raw.githubusercontent.com/End2End-Diffusion/iREPA/99ad4ac234efe8de52ce157120f72856e836d09f/ldm/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "repa"
 BATCH, SIDE, WIDTH, FEATURES, HIDDEN = 2, 4, 12, 10, 16
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from reference_error import ORDERS, distance  # noqa: E402
-from residual_orders import orders  # noqa: E402
 
 GAMMA = 0.6
 
