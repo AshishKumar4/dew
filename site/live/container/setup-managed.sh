@@ -11,8 +11,8 @@ apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
 # One pass under the suite's lock (tools/lock_environment.sh), which pins every package the live,
-# streaming and profile extras reach, so the container runs the versions CI tests and nothing resolves
-# on its own.
+# streaming and profile extras reach, so the container runs the versions CI tests and no package it
+# runs resolves on its own (pip's build tools for Dew's own tarball are outside the lock).
 /opt/venv/bin/pip install --no-cache-dir \
     "dewml[streaming,live,profile] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
     -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/locks/cpu.txt"
