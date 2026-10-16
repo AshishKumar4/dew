@@ -613,8 +613,12 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         weights.unlink()
     restored = TextToImage.from_run(str(run))
     assert DISCRIMINATOR not in restored.variables["params"]
-    for got, want in zip(jax.tree.leaves(restored.variables["autoencoder"]),
+    restored_tuned = restored.variables["autoencoder"]
+    for got, want in zip(jax.tree.leaves(restored_tuned[TUNED_WEIGHTS]),
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    for got, want in zip(jax.tree.leaves(restored_tuned[LATENT_STATS]),
+                         jax.tree.leaves(state.variables[LATENT_STATS]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
