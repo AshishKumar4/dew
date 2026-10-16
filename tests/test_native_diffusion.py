@@ -147,22 +147,28 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
 
 def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved_pipelines, tmp_path):
     """Saved with a shard bound below its components' sizes, a pipeline writes each component's
-    weights as shards and an index under the stem its library reads (the denoiser's and the VAE's
-    `diffusion_pytorch_model`, the text encoder's `model`), no single file beside them, and loads
-    back to the same tensors."""
+    weights as shards and an index under the stem and shard names its library reads (the
+    denoiser's and the VAE's `diffusion_pytorch_model`, the text encoder's `model`), which
+    Diffusers' Hub download keeps, no single file beside them, and loads back to the same
+    tensors."""
     import json
 
     import numpy as np
+    from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
 
     from dew.interop import Pretrained
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
     source.save(destination, max_shard_size=20_000)
+    # What Diffusers downloads of the export, published as `push_to_hub` stages it.
+    downloaded, _ = variant_compatible_siblings(
+        [path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()])
     for component, stem in (("unet", "diffusion_pytorch_model"), ("vae", "diffusion_pytorch_model"),
                             ("text_encoder", "model")):
         index = json.loads((destination / component / f"{stem}.safetensors.index.json").read_text())
-        assert len(set(index["weight_map"].values())) > 1
+        shards = {f"{component}/{name}" for name in index["weight_map"].values()}
+        assert len(shards) > 1 and shards <= set(downloaded)
         assert not (destination / component / f"{stem}.safetensors").exists()
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
     for layout in reloaded.weight_layouts:

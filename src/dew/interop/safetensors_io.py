@@ -379,11 +379,15 @@ def save_sharded(
     GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
-    An export replaces the one `directory` held without a moment at which a
-    loader reads a mix of the two. Each shard takes a name no earlier export
-    can hold, so no file an old index names is overwritten; the index (or,
-    unsharded, `<stem>.safetensors`) is published last, in one rename, and
-    commits the export. Only then are the earlier weight files removed: the
+    Each shard takes its library's own name, `<stem>-00001-of-00003.safetensors`,
+    the only one Diffusers' Hub download keeps (`variant_compatible_siblings`,
+    pipeline_loading_utils.py:239-289, 0.34.0), so an export written to a
+    fresh directory, as `push_to_hub` stages one, publishes as its libraries
+    name theirs. An export replaces the one `directory` held without a moment
+    at which a loader reads a mix of the two. Where an earlier export holds
+    those names, this one's carry a token instead, so no file an old index
+    names is overwritten; the index (or, unsharded, `<stem>.safetensors`) is
+    published last, in one rename, and commits the export. Only then are the earlier weight files removed: the
     names `_replaced` matches that this export did not write, read off the
     directory's own listing. An old index's contents name nothing to
     delete, so one that names a path outside the directory, or a file of
@@ -403,9 +407,11 @@ def save_sharded(
         filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)
     old_index = folder / f"{stem}.safetensors.index.json"
     # An interrupted export may leave both an index and a single file.
-    replaced = {name for name in _listing(folder) if _replaced(stem).fullmatch(name)}
+    listing = _listing(folder)
+    replaced = {name for name in listing if _replaced(stem).fullmatch(name)}
     token = secrets.token_hex(4)
-    names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if split.is_sharded else filename)
+    taken = split.is_sharded and not listing.isdisjoint(split.filename_to_tensors)
+    names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if taken else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
         _publish(lambda members=members: {name: tensors[name] for name in members},
