@@ -790,9 +790,10 @@ def wording(module: Module) -> Iterator[Finding]:
 def skips(module: Module) -> Iterator[Finding]:
     """SLOP015: a test that skips when its own package fails to import."""
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if (isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.importorskip"
-                and node.args and isinstance(node.args[0], ast.Constant)
-                and isinstance(name := node.args[0].value, str)
+        if not (isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.importorskip"):
+            continue
+        named = [*node.args[:1], *(keyword.value for keyword in node.keywords if keyword.arg == "modname")]
+        if (named and isinstance(named[0], ast.Constant) and isinstance(name := named[0].value, str)
                 and (name == module.package or name.startswith(f"{module.package}."))):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP015",
                           f"skips when {name} fails to import; import it, so a broken import fails")
@@ -969,14 +970,24 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
             yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 
 
+def default_roots(package: str) -> list[str]:
+    """What the gate reads when it names no roots: the package's source and every script."""
+    return [f"src/{package}", "tests", "tools", "recipes", "examples"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
                         "package's source, tests, tools, recipes and examples")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
+    parser.add_argument("--print-roots", action="store_true",
+                        help="print the roots it reads by default; tools/pre-commit lints their staged files")
     args = parser.parse_args(argv)
-    roots = args.roots or [f"src/{args.package}", "tests", "tools", "recipes", "examples"]
+    if args.print_roots:
+        print(" ".join(default_roots(args.package)))
+        return 0
+    roots = args.roots or default_roots(args.package)
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
     models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))

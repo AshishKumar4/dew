@@ -562,9 +562,11 @@ def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
                                 "graph = pytest.importorskip('sparx.graph')\n"
                                 "sparx = importorskip('sparx')\n"
                                 "torch = pytest.importorskip('torch')\n"
-                                "near = pytest.importorskip('sparxish')\n"),
+                                "near = pytest.importorskip('sparxish')\n"
+                                "named = pytest.importorskip(modname='sparx.graph')\n"
+                                "optional = pytest.importorskip(modname='torch')\n"),
     })
-    assert found == [("tests/test_graph.py", 3, "SLOP015"), ("tests/test_graph.py", 4, "SLOP015")]
+    assert found == [("tests/test_graph.py", line, "SLOP015") for line in (3, 4, 7)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):

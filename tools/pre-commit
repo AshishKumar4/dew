@@ -1,9 +1,10 @@
 #!/bin/sh
 # The fast half of the lint gate, on the Python files this commit stages:
 # ruff and tools/lint_slop.py over the staged files among the paths CI lints
-# with each (tools/lint_inputs.sh). Pyright and the tests stay in CI. Install
-# it as CONTRIBUTING.md says; `git commit --no-verify` skips it once. It lints
-# the files as they are in the working tree.
+# with each (tools/lint_inputs.sh, and tools/lint_slop.py's own roots).
+# Pyright and the tests stay in CI. Install it as CONTRIBUTING.md says;
+# `git commit --no-verify` skips it once. It lints the files as they are in
+# the working tree.
 set -f
 . tools/lint_inputs.sh
 # The staged Python files under `paths`, NUL-separated; Git's `*` crosses directories.
@@ -15,4 +16,4 @@ staged() {
     git diff --cached --name-only --diff-filter=ACMR -z -- "$@"
 }
 staged $ruff_inputs | xargs -0r python -m ruff check --quiet || exit 1
-staged $slop_inputs | JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
+staged $(python tools/lint_slop.py --print-roots) | JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
