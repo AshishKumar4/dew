@@ -104,8 +104,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "dpo.npz")
     out = parser.parse_args(argv).out
-    if trl.__version__ != TRL:
-        raise RuntimeError(f"run with trl {TRL}, not {trl.__version__}")
+    from reference_releases import require
+
+    require("trl")
     torch.set_num_threads(1)
     arrays = batch()
     fp32 = trl_loss(arrays, torch.float32)

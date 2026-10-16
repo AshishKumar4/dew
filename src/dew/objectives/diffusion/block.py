@@ -152,6 +152,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """
 
     saved_task = BlockGeneration
+    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process'})
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
@@ -219,12 +220,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
     def task_record(self) -> Mapping[str, JSON]:
-        """The sequence length, canvas budget, tokenizer, block process and pad id: the task's own."""
+        """The sequence length, canvas budget, tokenizer or source processor, block process and pad id:
+        the task's own."""
         from dew.diffusion.block import BlockProcess
-        from dew.inference.tasks import recorded_tokenizer
+        from dew.inference.tasks import recorded_processor, recorded_tokenizer
         from dew.registry import to_record
         return {'seq_len': self.sequence_length, 'max_new_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
+                'processor': recorded_processor(self.processor),
                 'process': to_record(self._process(), BlockProcess), 'pad_token_id': self.pad_token_id}
 
     def build_task(self, variables: Variables, *,

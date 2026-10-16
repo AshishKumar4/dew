@@ -99,10 +99,16 @@ context only beside no other JAX call."""
 
 KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
 """Whether a traced kernel launch carries tokamax's description of itself
-(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only the
-lowering `tune` reads its launches from carries it: jaxlib 0.11.2 writes a
-compiled program holding it to the persistent cache and cannot read it back
-("Invalid metadata payload id")."""
+(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a
+lowering made to read its launches out of carries it, never a step's: jaxlib
+0.11.2 writes a compiled program holding it to the persistent cache and cannot
+read it back ("Invalid metadata payload id")."""
+
+KERNEL_SEEN = jax.make_user_context(default_value=None)
+"""The collection a lowering records its kernel launches into as it traces them
+(`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
+trace cached before traces, and records, again. The program is the same, and so
+is its key in the persistent cache, which reads no user context."""
 
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this

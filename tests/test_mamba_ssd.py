@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_leaves_as_exact, ieee_fixture, widened
+from reference_error import assert_leaves_as_exact, float64_terms, ieee_fixture, widened
 from sharded import assert_runs_per_shard
 from tuned import each_config
 
@@ -68,40 +68,6 @@ def through(chunk: int, starts, dy, dfinal):
     return run
 
 
-def summed_terms(operands, starts, dy, dfinal, chunk: int) -> dict[str, float]:
-    """The terms of the two leaves that sum their cotangents over every token (`assert_leaves_as_exact`'s
-    `terms`), each the RMS over heads of its terms' absolute sum, in float64: `D`'s
-    terms are `dy x`; `A`'s are each step's log-decay gradient times its step, a document's first token
-    (whose decay is the reset) taking none, the gradient read from the XLA scan, which takes the decay
-    `A dt` per step (`xla_chunk_scan`)."""
-    x, dt, A, B, C, _, h0 = widened(operands)
-    batch, length, heads, width = x.shape
-    with jax.enable_x64(new_val=True):
-        pad = -length % chunk
-        padded = [np.pad(t, [(0, 0), (0, pad)] + [(0, 0)] * (t.ndim - 2))
-                  for t in (x * dt[..., None], np.repeat(B, heads // B.shape[2], axis=2),
-                            np.repeat(C, heads // C.shape[2], axis=2), dt)]
-
-        def chunked(t):
-            return jnp.moveaxis(t.reshape(batch, -1, chunk, *t.shape[2:]), 1, 0)
-
-        def loss(a):
-            a = jnp.pad(a, ((0, 0), (0, pad), (0, 0)))
-            if starts is not None:
-                a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], mamba2.RESET_DECAY, a)
-            x_c, b_c, c_c = (chunked(t) for t in padded[:3])
-            y, final = mamba2.xla_chunk_scan(x_c, b_c, c_c, jnp.moveaxis(chunked(a), 3, 2), h0)
-            y = jnp.moveaxis(y, 0, 1).reshape(batch, -1, heads, width)[:, :length]
-            return jnp.sum(y * np.asarray(dy, np.float64)) + jnp.sum(final * np.asarray(dfinal, np.float64))
-
-        decay = np.asarray(jax.grad(loss)(A * dt)) * dt
-    if starts is not None:
-        decay = np.where(np.asarray(starts)[..., None], 0.0, decay)
-    skip = np.abs(np.asarray(dy, np.float64) * x).sum(axis=(0, 1, 3))
-    return {"A": float(np.sqrt(np.mean(np.abs(decay).sum(axis=(0, 1)) ** 2))),
-            "D": float(np.sqrt(np.mean(skip ** 2)))}
-
-
 # tools/mamba_ssd_reference.py's cases: bf16 and fp32 operands over packed documents, a ragged last chunk
 # and groups of three heads; fp32 over whole chunks and one group; fp32 at a state wider than one
 # 128-wide product, as Falcon-H1's 256. The summing kernels also take two heads a program, a group's
@@ -120,9 +86,9 @@ CASES = [
 def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     """mamba_ssm's own numbers at IEEE products (tools/mamba_ssd_reference.py, its kernels on a GPU):
     the port's output, final state and every gradient each within the float64 gate of mamba_ssm's
-    distance from the same scan in float64, `A` and `D`, which sum their cotangents over every token,
-    with those terms' absolute sums their floors. With `heads` the kernels that sum a group's heads take
-    that many a program."""
+    distance from the same scan in float64, each entry sized by its own float64 terms, and `A` and `D`,
+    which sum their cotangents over every token, held to the rounding of as many terms. With `heads` the
+    kernels that sum a group's heads take that many a program."""
     stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
     fixture = {name.removeprefix(f"{case}."): value
                for name, value in stored.items() if name.startswith(f"{case}.")}
@@ -152,14 +118,19 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         assert all(pin in each_config(kernel, run, *narrow) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         ported = jax.tree.map(np.asarray, jax.jit(run)(*narrow))
+    # The scan in float64 and each entry's terms, the XLA scan's own sums (`float64_terms`).
     with jax.enable_x64(new_val=True):
         cotangents = widened((fixture["dy"], fixture["dfinal"]))
-        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, *cotangents))(*widened(inputs)))
+        truth, terms = jax.tree.map(np.asarray, float64_terms(through(chunk, starts, *cotangents),
+                                                              *widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
-    summed = summed_terms(inputs, starts, fixture["dy"], fixture["dfinal"], chunk)
-    terms = {name: np.full_like(leaf, summed[name]) if name in summed else leaf
-             for name, leaf in truth.items()}
-    assert_leaves_as_exact(ported, reference, truth, reductions=chunk, terms=terms)
+    # A chunk's entries sum within it; `A` and `D` sum every token's, in another order than mamba_ssm's.
+    batch, length = inputs[0].shape[:2]
+    everywhere = {"A", "D"}
+    for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
+        mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
+                                      for tree in (ported, reference, truth, terms))
+        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])

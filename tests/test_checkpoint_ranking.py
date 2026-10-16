@@ -14,10 +14,11 @@ import pytest
 from affine_run import Counting, dataset, val_batches
 
 from dew.artifacts import TokenScores
-from dew.checkpoints import Checkpoints, Keep, Ranking
+from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
 from dew.training import Trainer
+from dew.training.evaluation import MetricScores
 from dew.training.trainer import Best, Plateau
 
 
@@ -70,6 +71,24 @@ def trainer(path, keep=1):
     return Trainer(
         Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep)
     )
+
+
+def test_a_score_object_names_one_recorded_score_live_and_in_a_checkpoint():
+    """`best=` and `stop=` read a run's live scores, and a predicate a checkpoint's kept ones, by one
+    rule: a metric is its validation split's, `(split, metric)` that split's and a training scalar
+    the training split's. A metric with no validation score, recorded under another split alone, is
+    refused in both until its split is named, never resolved by guessing which split was meant."""
+    objective = Overfit()
+    metric, other = Value('value', Shown(better='lower')), Value('other', Shown(better='lower'))
+    scores = {'val/value': 1.0, 'test/value': 2.0, 'test/other': 3.0, 'train/loss': 4.0}
+    live, kept = MetricScores([metric, other], scores, objective), Metrics(scores)
+    for read in (live, kept):
+        assert read[metric] == 1.0 and read[('test', metric)] == 2.0 and read[('test', other)] == 3.0
+        assert read[objective.scalars.loss] == 4.0
+        with pytest.raises(KeyError):
+            read[other]
+    with pytest.raises(KeyError):
+        live[Overfit().scalars.loss]
 
 
 def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):

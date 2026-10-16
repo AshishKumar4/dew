@@ -187,8 +187,7 @@ def _mamba2_lowered(generation: str):
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        tuning.tune(lower)
-        return lower()
+        return tuning.tune(lower)[0]
 
 
 @pytest.mark.parametrize("generation", GPUS)

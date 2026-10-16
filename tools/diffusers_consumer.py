@@ -33,9 +33,11 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
-# Also restores the two transformers names Diffusers 0.34.0's pipeline
-# modules import (tools/diffusers_wan_reference.py).
+from tools.diffusers_reference_helpers import restore_transformers_names
 from tools.diffusers_wan_reference import float64
+
+# Diffusers' own classes read what Dew wrote, through its pipeline modules.
+restore_transformers_names()
 
 DENOISERS = ("unet", "transformer")
 

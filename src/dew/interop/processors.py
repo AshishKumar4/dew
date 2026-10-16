@@ -201,10 +201,10 @@ class Processor:
     algorithms. Calling it with text, and optionally `images`, `audio` or
     `videos`, returns `ModelInputs`.
 
-    A media processor's `source` is the local directory or `repo@commit`
-    its files came from. That identity reloads the processor and derives
-    its media geometry from the source config, independently of a task's
-    text tokenizer. A tokenizer-backed processor has no media source.
+    `source` is the local directory or `repo@commit` its files came from.
+    That identity reloads the processor (`load_processor`), and a media
+    processor's geometry from the source config, independently of a task's
+    text tokenizer. Only a media processor reads files from `directory`.
     """
 
     reference: HostProcessor

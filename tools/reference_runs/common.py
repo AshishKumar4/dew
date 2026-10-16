@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from trace_window import device_events, kernel_category, window_split
+from trace_window import device_events, kernel_category, kernel_totals, window_totals
 
 EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
@@ -138,20 +138,12 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     if not kernels:
         raise ValueError("the trace holds no device kernels")
     devices = sorted({device for *_, device in kernels})
-    figures: dict[str, float] = {}
-    for device in devices:
-        for key, value in window_split([(name, start, end) for name, start, end, owner in kernels
-                                        if owner == device]).items():
-            figures[key] = figures.get(key, 0.0) + value
+    figures = window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
+                             for device in devices])
     scale = 1e-6 / steps / len(devices)
-    by_category: dict[str, float] = {}
-    by_name: dict[str, list[float]] = {}
-    for name, start, end, _ in kernels:
-        category = kernel_category(name)
-        by_category[category] = by_category.get(category, 0.0) + (end - start)
-        entry = by_name.setdefault(name, [0.0, 0])
-        entry[0] += end - start
-        entry[1] += 1
+    records = [(name, start, end) for name, start, end, _ in kernels]
+    by_category, _ = kernel_totals(records, kernel_category)
+    by_name, counts = kernel_totals(records)
     return {
         "profiled_steps": steps,
         "devices": len(devices),
@@ -166,8 +158,8 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
                                   sorted(by_category.items(), key=lambda item: -item[1])},
         "top_kernels": [
             {"name": name[:160], "category": kernel_category(name), "ms_per_step": total * scale,
-             "calls_per_step": count / steps / len(devices)}
-            for name, (total, count) in sorted(by_name.items(), key=lambda item: -item[1][0])[:25]],
+             "calls_per_step": counts[name] / steps / len(devices)}
+            for name, total in sorted(by_name.items(), key=lambda item: -item[1])[:25]],
     }
 
 

@@ -77,7 +77,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.interpreters.ad import JVPTracer
 
-from ..precision import at_least_fp32, compensated_add, rounded_to
+from ..precision import at_least_fp32, compensated_add, rounded_to, two_product
 from ..sharding import logical_spec, manual_map
 from . import generation, tuning
 from .generation import first_refusal
@@ -189,19 +189,7 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
             }""", constraints="=f,f,f,f", args=(left, right, high),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    barrier = jax.lax.optimization_barrier
-    # Split significands in half by bits, avoiding splitter*value overflow.
-    def split(value):
-        bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
-        high = jax.lax.bitcast_convert_type(bits, jnp.float32)
-        return high, barrier(value - high)
-    lh, ll = split(left)
-    rh, rl = split(right)
-    product = barrier(left * right)
-    lost = barrier(barrier(lh * rh) - product)
-    lost = barrier(lost + barrier(lh * rl))
-    lost = barrier(lost + barrier(ll * rh))
-    return product, barrier(lost + barrier(ll * rl))
+    return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
 
 
 def _selected(choice: str, implementation: str, refusal: str | None) -> str:
@@ -336,12 +324,16 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
 
 
 def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """A gated norm's fp32 gate `act(gate)` and its derivative, for 'silu' or 'sigmoid'."""
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+
+    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
+    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
     sigmoid = jax.nn.sigmoid(gate)
+    slope = sigmoid * (1.0 - sigmoid)
     if activation == 'sigmoid':
-        return sigmoid, sigmoid * (1.0 - sigmoid)
-    activated = gate * sigmoid
-    return activated, activated * (1.0 - sigmoid) + sigmoid
+        return sigmoid, slope
+    return gate * sigmoid, sigmoid + gate * slope
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
@@ -684,10 +676,9 @@ def _product(gate, up, dtype, interpret: bool):
 
 
 def _gradients(gate, up, dy):
-    """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate."""
-    sigmoid = jax.nn.sigmoid(gate)
-    activated = gate * sigmoid
-    return dy * (activated * (1.0 - sigmoid) + sigmoid) * up, dy * activated
+    """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate (`_activated`)."""
+    activated, slope = _activated(gate, 'silu')
+    return dy * slope * up, dy * activated
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
