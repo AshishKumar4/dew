@@ -33,6 +33,18 @@ from dew.nn.kernels import bf16_dot_runs
 pytestmark = pytest.mark.kernel
 
 
+def test_a_flash_wheel_holds_code_for_its_architectures_major_from_their_minor_up():
+    """A CUDA binary for X.Y runs on X.Z from Z = Y up (`flash_built_for`): a wheel built for sm80 and
+    sm90 serves an A10, an L4 and an RTX 4080 with sm80's code and an H100 its own, and no Blackwell,
+    no part below its minor, and no device that is not a GPU."""
+    from dew.nn.attention import flash_built_for
+
+    built = ("sm80", "sm90")
+    assert [flash_built_for(device, built) for device in ("sm80", "sm86", "sm89", "sm90")] == [True] * 4
+    other = ("sm75", "sm100", "sm120", "cpu", "v6e")
+    assert [flash_built_for(device, built) for device in other] == [False] * len(other)
+    assert not flash_built_for("sm86", ("sm89",))
+
 def on_gpu(test):
     """Mark `test` for a cuda device of sm80 or later, cuDNN's bf16 floor."""
     reason = "needs a cuda device of sm80 or later, cuDNN's bf16 floor"

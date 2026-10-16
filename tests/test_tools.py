@@ -658,6 +658,38 @@ def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     assert found == [("tests/test_graph.py", line, "SLOP015") for line in (3, 4, 7)]
 
 
+def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_table(tmp_path):
+    """SLOP016: the device's generation, `device_generation()` or a `gpu_target()`'s `.generation`,
+    however imported or bound, compared with or prefix-matched against one the source spells, cut up,
+    or used as a table's key, is reported outside nn/kernels/generation.py. Comparing it with a
+    recorded generation, reading a fact off the target, or passing it to a function is not."""
+    found = _linted(tmp_path, {
+        "src/sparx/nn/kernels/generation.py": (
+            "def device_generation():\n"
+            "    return 'sm80'\n"
+            "def gpu_target(name=None):\n"
+            "    return name\n"
+            "def wide():\n"
+            "    return device_generation().startswith('sm')\n"),
+        "src/sparx/tiles.py": (
+            "from sparx.nn.kernels import generation as hardware\n"
+            "from sparx.nn.kernels.generation import device_generation, gpu_target\n"
+            "TILES = {'sm80': 4096}\n"
+            "def tile():\n"
+            "    return TILES.get(device_generation(), 1024)\n"
+            "def held():\n"
+            "    target = hardware.gpu_target()\n"
+            "    return 0 if target.generation == 'sm90' else 1\n"
+            "def narrow():\n"
+            "    named = device_generation()\n"
+            "    return named.startswith('sm8') or int(named[2:]) > 89 or named in ('sm86', 'sm89')\n"
+            "def measured(on):\n"
+            "    named = device_generation()\n"
+            "    return named != on and gpu_target().shared_limit and gpu_target(named) and print(named)\n"),
+    })
+    assert found == [("src/sparx/tiles.py", line, "SLOP016") for line in (5, 8, 11, 11, 11)]
+
+
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
     """SLOP011: `match=` on pytest's raise, a read of a function's source and a
     test that names a source file each prove text, not behaviour, however the
