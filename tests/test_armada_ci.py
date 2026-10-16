@@ -118,6 +118,13 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
 
 
+def install_compiler(directory: Path) -> None:
+    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
+    directory.mkdir()
+    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
+    (directory / "ptxas").chmod(0o755)
+
+
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
     """A task keeps, beside each green file's key, where its run read the
@@ -188,10 +195,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     }
     for name, source in files.items():
         (tmp_path / "tests" / name).write_text(source)
-    # A kernel's compiler, as the CUDA toolkit installs it.
-    (tmp_path / "tests/compiler").mkdir()
-    (tmp_path / "tests/compiler/ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
-    (tmp_path / "tests/compiler/ptxas").chmod(0o755)
+    install_compiler(tmp_path / "tests/compiler")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
