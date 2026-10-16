@@ -1,7 +1,8 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
-is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), and
-the port's formula in the portable math where fla cannot run (`port_formula`)."""
+is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
+float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's formula in
+the portable math where fla cannot run (`port_formula`)."""
 
 import itertools
 import os
