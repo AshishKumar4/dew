@@ -8,6 +8,7 @@ importing the FLOP accounting.
 import importlib.metadata
 import os
 import sys
+from collections.abc import Callable
 
 import jax
 
@@ -19,6 +20,33 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+def hub_answer[Answer](question: str, ask: Callable[[], Answer]) -> Answer:
+    """The Hub's answer to `question`, a path under where answers are recorded (DEW_HUB_ANSWERS
+    when set, else `hub/` in Dew's cache): `ask`'s, recorded there as `<question>.json`, or with
+    the Hub offline, where `ask` raises OfflineModeIsEnabled as every Hub call does under
+    HF_HUB_OFFLINE, the answer last recorded. What an online run pinned (a revision's commit, a
+    commit's files) so resolves the same offline; a question never answered online raises the
+    offline error."""
+    import json
+
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew.files import write_atomically
+
+    answers = os.environ.get("DEW_HUB_ANSWERS") or os.path.join(dew_cache_dir(), "hub")
+    record = os.path.join(answers, f"{question}.json")
+    try:
+        answer = ask()
+    except OfflineModeIsEnabled:
+        if not os.path.isfile(record):
+            raise
+        with open(record) as recorded:
+            return json.load(recorded)
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    write_atomically(record, json.dumps(answer))
+    return answer
 
 
 def default_compilation_cache_dir() -> str:
