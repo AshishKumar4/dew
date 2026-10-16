@@ -81,7 +81,7 @@ from dew.objectives.base import (
     Variables,
     select,
 )
-from dew.records import JSON, boolean, json_value, record
+from dew.records import JSON, boolean, json_value, number, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
     StepFlops,
@@ -115,6 +115,7 @@ from dew.training.distributed import (
     device_mesh,
     explicit_axes,
     link_bandwidth,
+    link_topology,
     microbatch,
     microbatch_shapes,
     placed_bytes,
@@ -513,6 +514,8 @@ class Trainer(Generic[Loss, Effects]):
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
+        # A checkpoint's link figures, by the placement each was measured on (`link_topology`).
+        self._resumed_links: dict[str, float] = {}
         # The microbatches a step's batch is read in, once decided (`split`,
         # 1 where `whole`, a pooling state's window, or the first plan), which
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
@@ -770,9 +773,13 @@ class Trainer(Generic[Loss, Effects]):
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`_rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
-        (`batch_layout`). The split is the state's (`window_size`)."""
+        (`batch_layout`). The split is the state's (`window_size`). Under
+        `links`, each link figure a trace decided from, by the placement it
+        was measured on: a run resumed on that placement decides alike."""
         base = self._rung() if self._base_rung is None else self._base_rung[3]
-        return {**base, 'shapes': dict(self._shape_rungs)}
+        links: dict[str, JSON] = {link_topology(mesh, axis): figure
+                                  for (mesh, axis), figure in self._bandwidths.items() if figure is not None}
+        return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
 
     def _resume_rung(self, rung: JSON) -> None:
         """Take a checkpoint's rung (`_checkpoint_rung`): the objective climbs
@@ -784,6 +791,9 @@ class Trainer(Generic[Loss, Effects]):
             shapes = record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
             self._resumed_shapes = {name: json_value(shape, f'rung of {name}')
                                     for name, shape in shapes.items()}
+            links = record(record(rung, 'rung').get('links', {}), 'rung links')
+            self._resumed_links = {topology: number(figure, f'link of {topology}')
+                                   for topology, figure in links.items()}
 
     def _at_base_rung(self, batch: Batch) -> JSON:
         """Put the objective at the rung a newly met shape starts from, and
@@ -1056,8 +1066,11 @@ class Trainer(Generic[Loss, Effects]):
             if mesh.shape.get(axis, 1) == 1:
                 continue
             if (mesh, axis) not in self._bandwidths:
+                # A resumed run takes the figure its checkpoint traced with, on this very placement.
+                resumed = self._resumed_links.get(link_topology(mesh, axis))
                 self._bandwidths[mesh, axis] = (
-                    None if platform == 'cpu' or peak is None else link_bandwidth(mesh, axis))
+                    None if platform == 'cpu' or peak is None
+                    else resumed if resumed is not None else link_bandwidth(mesh, axis))
             links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
         return links
 
