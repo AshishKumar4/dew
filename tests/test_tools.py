@@ -640,6 +640,70 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
+    """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
+    `typing.cast` however it was imported, and a warning filter whose action is
+    "ignore" are each reported. A string that spells a comment, a function of the
+    file's own named `cast`, a filter that makes warnings errors, and an import kept
+    for the registry entry it makes are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "import warnings\n"
+            "from typing import cast as as_type\n"
+            "import pytest\n"
+            "import sparx.plugins  # noqa: F401  (registers the kind)\n"
+            "WIDTH = 1  # noqa: E501\n"
+            "SPELLED = 'x = 1  # noqa: E501'\n"
+            "def cast(value):\n"
+            "    return value\n"
+            "@pytest.mark.filterwarnings('ignore::DeprecationWarning')\n"
+            "def test_quiet():\n"
+            "    warnings.simplefilter('ignore')\n"
+            "    with warnings.catch_warnings(action='ignore'):\n"
+            "        assert as_type(int, cast(1))\n"
+            "@pytest.mark.filterwarnings('error')\n"
+            "def test_loud():\n"
+            "    warnings.filterwarnings(action='error')\n"
+            "@pytest.mark.filterwarnings('error', 'ignore::DeprecationWarning')\n"
+            "def test_quiet_after_all():\n"
+            "    pass\n"),
+        "tools/report.py": ("from typing_extensions import cast\n"
+                            "COUNT: int = '1'  # type: ignore[assignment]\n"
+                            "WIDTH = cast(int, COUNT)\n"),
+    })
+    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13, 17)),
+                     ("tools/report.py", 2, "SLOP003"), ("tools/report.py", 3, "SLOP003")]
+
+
+def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):
+    """SLOP008: a first-party module's member or table replaced in a test is reported through an
+    alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
+    named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
+    boundaries a test may replace."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = {}\n",
+        "tests/test_graph.py": (
+            "import time\n"
+            "import sparx.graph as g\n"
+            "from sparx import graph\n"
+            "def test_alias(monkeypatch):\n"
+            "    monkeypatch.setattr(g, 'narrowed_paths', dict)\n"
+            "def test_table(monkeypatch):\n"
+            "    monkeypatch.setitem(graph.EDGES, 'edge', 1)\n"
+            "    monkeypatch.delitem(g.EDGES, 'edge')\n"
+            "def test_local(monkeypatch):\n"
+            "    from sparx.graph import EDGES as edges\n"
+            "    monkeypatch.setitem(edges, 'edge', 1)\n"
+            "    monkeypatch.delattr(graph, 'narrowed_paths')\n"
+            "def test_boundaries(monkeypatch):\n"
+            "    monkeypatch.setattr(time, 'sleep', lambda seconds: None)\n"
+            "    monkeypatch.setattr(graph, 'snapshot', lambda: None)\n"
+            "    monkeypatch.setattr('sparx.graph.subprocess.run', print)\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
+
+
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an

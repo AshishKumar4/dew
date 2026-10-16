@@ -7,7 +7,6 @@ and distance over the populations a validation pass consumes.
 
 import functools
 import logging
-import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
@@ -58,41 +57,23 @@ def _extractor(weights: str | None):
             jax.tree.map(jnp.asarray, load_params(path)))
 
 
-def _sqrtm(product):
-    """Take `sqrtm` without its singularity warning. A singular product is the
-    case the finiteness check in `frechet_distance` handles."""
-    from scipy import linalg
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", linalg.LinAlgWarning)
-        return linalg.sqrtm(product)
-
-
-def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
+def frechet_distance(mu_a, sigma_a, mu_b, sigma_b) -> float:
     """Return the Frechet distance between two multivariate gaussians.
 
-    It runs on the host through scipy, once per validation pass, because the
-    matrix square root of the covariance product has no JAX equivalent. When
-    the covariance product is singular, `eps` is added to both diagonals, as
-    the reference implementations do.
+    The trace of the covariance product's square root is the sum of the square
+    roots of the product's eigenvalues, as torchmetrics computes it
+    (`_compute_fid`), on the host through NumPy once per validation pass. A
+    singular product, as from a population with fewer images than features,
+    adds its zero eigenvalues and needs no offset. An eigenvalue that rounding
+    leaves negative or complex adds the real part of its root, the part
+    pytorch-fid keeps of scipy's `sqrtm`.
     """
 
     mu_a, mu_b = np.atleast_1d(mu_a), np.atleast_1d(mu_b)
     sigma_a, sigma_b = np.atleast_2d(sigma_a), np.atleast_2d(sigma_b)
-
-    # sqrtm's result is complex when rounding leaves the product with a
-    # negative eigenvalue; the imaginary part is rounding noise.
-    covmean = _sqrtm(sigma_a.dot(sigma_b))
-    if not np.isfinite(covmean).all():
-        # Singular product covariance. Nudge the diagonal as the reference
-        # implementations do.
-        offset = np.eye(sigma_a.shape[0]) * eps
-        covmean = _sqrtm((sigma_a + offset).dot(sigma_b + offset))
-    if np.iscomplexobj(covmean):
-        covmean = np.real(covmean)
-
+    root_trace = np.real(np.sqrt(np.linalg.eigvals(sigma_a @ sigma_b).astype(np.complex128))).sum()
     diff = mu_a - mu_b
-    return float(diff.dot(diff) + np.trace(sigma_a) + np.trace(sigma_b) - 2 * np.trace(covmean))
+    return float(diff.dot(diff) + np.trace(sigma_a) + np.trace(sigma_b) - 2 * root_trace)
 
 
 @dataclass

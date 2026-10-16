@@ -11,6 +11,7 @@ weights loader reads arrays alone, by a pinned digest.
 """
 
 import json
+import warnings
 from pathlib import Path
 
 import jax
@@ -67,6 +68,23 @@ def test_the_extractor_gives_pytorch_fids_features_and_distance_on_the_published
                                rtol=0, atol=1e-4)
     assert FID().score(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
 
+
+
+def test_the_distance_of_pytorch_fids_own_features_is_its_fid_with_no_warning():
+    """Eight images a set leave rank-7 covariances of 2048 features, a singular
+    product whose square root scipy's `sqrtm` warns about; the distance takes
+    its trace from the product's eigenvalues instead, with no warning raised,
+    to pytorch-fid's own FID within the 1e-5 relative the extractor test holds."""
+    from dew.eval import frechet_distance
+
+    reference = np.load(PYTORCH_FID)
+    stats = [(features.mean(0), np.cov(features, rowvar=False))
+             for features in (reference["features_a"].astype(np.float64),
+                              reference["features_b"].astype(np.float64))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        distance = frechet_distance(*stats[0], *stats[1])
+    assert distance == pytest.approx(float(reference["fid"]), rel=1e-5)
 
 def fid_sets():
     """Sixteen uint8 images of 32x32, and the same pixels brightened by 40."""
