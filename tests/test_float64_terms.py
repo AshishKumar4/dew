@@ -93,3 +93,21 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
         value, terms = float64_terms(block, stream, x, weight)
     np.testing.assert_allclose(terms, np.sqrt(np.square(x) @ np.square(weight)), rtol=1e-12)
     assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
+
+
+def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
+    """An expert layer's grouped matmul (`jax.lax.ragged_dot`) and its kernel's gradient sum their
+    rows' products within each group: their terms are each group's dense dot's, not their own
+    near-zero sizes where the rows cancel (the MoE layout case's expert kernels)."""
+    rng = np.random.default_rng(3)
+    rows, groups = rng.normal(size=(6, 4)), np.array([2, 4], np.int32)
+    kernel = rng.normal(size=(2, 4, 3))
+    with jax.enable_x64(new_val=True):
+        _, terms = float64_terms(lambda x, w: jax.lax.ragged_dot(x, w, jnp.asarray(groups)), rows, kernel)
+        _, gradient_terms = float64_terms(jax.grad(lambda w, x, probe: jnp.sum(
+            jax.lax.ragged_dot(x, w, jnp.asarray(groups)) * probe)), kernel, rows, -np.ones((6, 3)))
+    dense = np.split(rows, np.cumsum(groups)[:-1])
+    np.testing.assert_allclose(terms, np.concatenate([
+        np.sqrt(np.square(part) @ np.square(kernel[group])) for group, part in enumerate(dense)]), rtol=1e-12)
+    np.testing.assert_allclose(gradient_terms, np.stack([
+        np.sqrt(np.square(part).T @ np.ones((len(part), 3))) for part in dense]), rtol=1e-12)
