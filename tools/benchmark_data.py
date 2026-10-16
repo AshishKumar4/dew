@@ -43,12 +43,12 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import tyro
 from absl import flags
 
+from dew.data import Loading
+from dew.data.dataset import Forwarding
+from dew.registry import datasets
+
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
-
-from dew.data import Loading  # noqa: E402
-from dew.data.dataset import Forwarding  # noqa: E402
-from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     from dew.config.data import RunData

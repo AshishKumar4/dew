@@ -15,8 +15,9 @@ Scope is per rule, because the rules are not all about the same thing:
   SLOP008 will not see patched).
 - `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
   names and annotations are local, so the contract rules (SLOP001, SLOP002,
-  SLOP004, SLOP005) do not run there. A swallowed exception, a narration
-  comment and an unsplittable function are defects anywhere, so those do.
+  SLOP004, SLOP005) do not run there. A suppression, a swallowed exception, a
+  narration comment and an unsplittable function are defects anywhere, so
+  those do.
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
@@ -60,9 +61,10 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes  # noqa: E402
+import lint_scopes as scopes
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
@@ -98,8 +100,13 @@ NARRATION = re.compile(
     r"|loop over|iterate|call |return the|set the|get the|create (a|the)|initialize|init )",
     re.IGNORECASE)
 MARKERS = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
-SUPPRESSIONS = re.compile(r"(?P<hit>typing\.cast\(|(?<![\w.])cast\(|# *type: *ignore"
-                          r"|# *pyright: *ignore|# *noqa)")
+# What a comment says to make a checker look away.
+SUPPRESSIONS = re.compile(r"\b(noqa|type: *ignore|pyright: *ignore)\b")
+# `typing.cast`, which typing_extensions re-exports.
+CASTS = {"typing.cast", "typing_extensions.cast"}
+# The calls that set a warning aside: each ignores one when its action is "ignore".
+WARNING_FILTERS = {"warnings.simplefilter", "warnings.filterwarnings", "warnings.catch_warnings",
+                   "pytest.mark.filterwarnings"}
 # A probe that asks a library or the environment what it supports, not a probe
 # that asks one of our own values whether it kept its contract.
 PROBE_ROOTS = {"jax", "jnp", "np", "numpy", "environ", "os", "sys", "flags", "importlib"}
@@ -297,21 +304,44 @@ def contracts(module: Module) -> Iterator[Finding]:
 
 
 def suppressions(module: Module) -> Iterator[Finding]:
-    """SLOP003: a cast or an ignore comment is evidence nobody produced."""
-    for number, text in enumerate(module.lines, start=1):
-        code, _, comment = text.partition("#")
+    """SLOP003: a cast, an ignore comment or an ignored warning is evidence nobody
+    produced. Comments are read as Python tokenizes them, so a string that spells
+    one is not one; `typing.cast` and the warning filters through each scope's
+    imports, so a function of the file's own named `cast` is not one either."""
+    for token in tokenize.generate_tokens(io.StringIO(module.source).readline):
+        if token.type != tokenize.COMMENT or (match := SUPPRESSIONS.search(token.string)) is None:
+            continue
+        line, col = token.start
+        code = module.lines[line - 1][:col]
         # One sanctioned inline suppression: an import kept for the registry
         # entry it makes, which is a side effect ruff has no way to see. The
         # name may stand on an import line or inside a parenthesized block.
         imported = (code.lstrip().startswith(("import ", "from "))
                     or re.fullmatch(r"\s*[\w.]+ *,? *", code) is not None)
-        registration = imported and "F401" in comment and "registers" in comment
-        for match in SUPPRESSIONS.finditer(text):
-            hit = match.group("hit")
-            if registration and hit.lstrip().startswith("#"):
-                continue
-            yield Finding(module.relative, number, match.start() + 1, "SLOP003",
-                          f"{hit.strip()} asserts what the code did not prove")
+        if imported and "F401" in token.string and "registers" in token.string:
+            continue
+        yield Finding(module.relative, line, col + match.start() + 1, "SLOP003",
+                      f"# {match.group(1)} asserts what the code did not prove")
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if not isinstance(node, ast.Call):
+            continue
+        called = scopes.resolved(node.func, table)
+        if called in CASTS:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          "cast() asserts what the code did not prove")
+        elif called in WARNING_FILTERS and _ignores(called, node):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
+                          f"{called} ignores a warning; fix what raises it")
+
+
+def _ignores(called: str, call: ast.Call) -> bool:
+    """Does a warning filter's call set its warnings aside: a warnings call whose
+    action, the first argument or `action=`, is "ignore", or a pytest mark any of
+    whose filters, each argument, starts with it?"""
+    actions = [*(call.args if called == "pytest.mark.filterwarnings" else call.args[:1]),
+               *(keyword.value for keyword in call.keywords if keyword.arg == "action")]
+    return any(isinstance(action, ast.Constant) and isinstance(action.value, str)
+               and action.value.split(":")[0] == "ignore" for action in actions)
 
 
 def probes(module: Module) -> Iterator[Finding]:
@@ -521,21 +551,53 @@ def _labels(module: Module, line: int, word: str) -> bool:
     return False
 
 
+def _patched(node: ast.Call, table: dict[str, str]) -> str:
+    """What a patching call replaces, as a dotted path: `mock.patch("a.b")`'s
+    string; `patch.object(owner, "b")`'s and `monkeypatch.setattr(owner, "b",
+    ...)`'s or `monkeypatch.setattr("a.b", ...)`'s attribute, its owner read
+    through the scope's imports (`scopes.resolved`), however it was imported or
+    aliased; `monkeypatch.setitem(mapping, ...)`'s and `delitem`'s mapping,
+    which a module's table or registry is. "" for any other call."""
+    name = _named(node.func)
+    first = node.args[0]
+    spelled = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+    if name.endswith(("mock.patch", ".patch")) or name == "patch":
+        return spelled or ""
+    if name.endswith(("patch.object", "monkeypatch.setattr", "monkeypatch.delattr")):
+        if spelled is not None:
+            return spelled
+        attribute = node.args[1] if len(node.args) > 1 else None
+        attribute_name = (attribute.value if isinstance(attribute, ast.Constant)
+                          and isinstance(attribute.value, str) else "*")
+        owner = scopes.resolved(first, table)
+        return f"{owner}.{attribute_name}" if owner else ""
+    if name.endswith(("monkeypatch.setitem", "monkeypatch.delitem")):
+        return scopes.resolved(first, table)
+    return ""
+
+
+def _seam(target: str) -> bool:
+    """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
+    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
+    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?"""
+    words = [word for word in re.split(r"[._]", target.lower()) if word]
+    for seam in SEAMS:
+        parts = [word for word in re.split(r"[._]", seam) if word]
+        if any(words[start:start + len(parts)] == parts for start in range(len(words))):
+            return True
+    return False
+
+
 def mocks(module: Module) -> Iterator[Finding]:
-    """SLOP008: a first-party module replaced instead of a seam taken."""
-    for node in ast.walk(module.tree):
+    """SLOP008: a first-party module, or a table or registry it holds, replaced
+    instead of a seam taken."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.Call) or not node.args:
             continue
-        name = _named(node.func)
-        target = ""
-        if name.endswith(("mock.patch", "patch", "patch.object")):
-            target = node.args[0].value if isinstance(node.args[0], ast.Constant) else ""
-        elif name.endswith("monkeypatch.setattr"):
-            target = (node.args[0].value if isinstance(node.args[0], ast.Constant)
-                      else _named(node.args[0]))
-        if not isinstance(target, str) or not target.startswith(f"{module.package}."):
+        target = _patched(node, dict(table))
+        if not target.startswith(f"{module.package}."):
             continue
-        if any(seam in target.lower() for seam in SEAMS):
+        if _seam(target):
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
@@ -943,8 +1005,8 @@ def calls(module: Module) -> Iterator[Finding]:
                           f"{cls.name} reads {', '.join(sorted(unknown))}, which no call sets")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names, imports, calls)
-UNIVERSAL_RULES = (swallowed, comments, size)
+CONTRACT_RULES = (contracts, probes, names, imports, calls)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:

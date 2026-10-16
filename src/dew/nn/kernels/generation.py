@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -36,6 +36,33 @@ def assumed(generation: str | None) -> Iterator[None]:
         yield
     finally:
         ASSUMED.reset(token)
+
+
+CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
+                     'attention_window', 'delta_gates', 'gate_up', 'gated_delta_rule', 'grouped_matmul',
+                     'narrow_copies', 'rms_norm', 'ssd', 'swiglu'})
+"""The choices `measured_kernel` answers, and so the ones `chosen` may name."""
+
+
+def _named(choices: Iterable[str]) -> None:
+    """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
+    if unknown := set(choices) - CHOICES:
+        raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
+                         f"the choices are {', '.join(sorted(CHOICES))}")
+
+
+@contextlib.contextmanager
+def chosen(**kernels: str) -> Iterator[None]:
+    """Within the block, a choice named in `kernels` runs that kernel whatever the generation's row
+    measured, for an A/B of two kernels or a test of a kernel this device's row does not name.
+    Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
+    trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
+    outside the block traces again within it."""
+    from dew import cache
+
+    _named(kernels)
+    with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
+        yield
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
@@ -227,7 +254,12 @@ def device_generation() -> str:
 
 
 def measured_kernel(choice: str, default: str) -> str:
-    """The kernel `KERNELS` names for `choice` on the default device's generation, else `default`."""
+    """The kernel `chosen` names for `choice`, else `KERNELS` on this generation, else `default`."""
+    from dew import cache
+
+    _named((choice,))
+    if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
+        return kernel
     return gpu_target(device_generation()).kernels.get(choice, default)
 
 
@@ -237,17 +269,19 @@ _logged: set[tuple[str, str, str]] = set()
 
 def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
     """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
-    generation, `fastest` or else the one `KERNELS` names, turned it down for `refusal`. The first such
-    call in a process for each kernel and refusal is logged at INFO naming both, so a change that sends
-    calls off the measured kernel shows in a run's log, not only in its step time; it is the dispatch's
-    own choice, which a user has nothing to act on. A generation without a measurement, or a call that
-    runs the measured kernel, logs nothing."""
+    generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`.
+    The first such call in a process for each kernel and refusal is logged at INFO naming both. Calls off
+    the measured kernel show in a run's log as well as its step time; the dispatch owns this choice.
+    A generation without a measurement, or a call that runs the measured kernel, logs nothing."""
+    from dew import cache
+
     generation = device_generation()
-    measured = fastest or gpu_target(generation).kernels.get(choice)
+    picked = None if fastest else dict(cache.KERNEL_CHOICES.value).get(choice)
+    measured = fastest or picked or gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
-        _log.info("%s runs %r, not %r, the kernel measured fastest on %s: %s",
-                  choice, kernel, measured, generation, refusal)
+        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
+        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, refusal)
     return kernel
 
 

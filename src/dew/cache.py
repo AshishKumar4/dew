@@ -114,6 +114,11 @@ KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
 
+KERNEL_CHOICES = jax.make_user_context(())
+"""The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
+this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
+choice traces again within it."""
+
 
 def keeps_picks() -> bool:
     """Whether this process reads and stores GPU picks, XLA's and the

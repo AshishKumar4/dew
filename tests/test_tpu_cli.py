@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -171,7 +172,8 @@ def fake(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("DEW_FAKE_CALLS", str(tmp_path / "calls.jsonl"))
     monkeypatch.setenv("DEW_FAKE_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(tpu_cli, "POLL_SECONDS", 0)
+    # The CLI polls a TPU through the clock, which the fake answers at once.
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
     tpu_config.save(CONFIG)
     return Fake(tmp_path)
 

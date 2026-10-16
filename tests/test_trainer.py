@@ -1288,6 +1288,53 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
     jax.tree.map(np.testing.assert_array_equal, state.variables, weights)
 
 
+
+@pytest.mark.mesh
+def test_only_the_held_arrays_an_output_takes_over_are_donated():
+    """`placed_held` splits a held tree into the copies a state takes over,
+    each placed as its variable, and the rest, replicated: an array beside
+    the variables and one whose shape is not its variable's. `taking_over`
+    donates the first alone, so JAX finds every donation usable and warns of
+    none, the state takes those buffers over, and the rest stay alive until
+    their holder drops them, as donated they were freed only as the call
+    returned."""
+    import warnings
+
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from jax.tree_util import Partial
+
+    from dew.training.distributed import placed_held, taking_over
+
+    mesh = Mesh(np.array(jax.devices()), ("fsdp",))
+    rows = 8 * jax.device_count()
+    sharded, replicated = NamedSharding(mesh, P("fsdp")), NamedSharding(mesh, P())
+
+    def initialize(key, *, variables, table):
+        params = variables["params"]
+        return {"params": {"kernel": params["kernel"] * 2, "bias": jnp.pad(params["bias"], (0, 4))},
+                "count": table.sum()}
+
+    kernel, bias, table = jnp.arange(rows * 4.0).reshape(rows, 4), jnp.ones(4), jnp.arange(5.0)
+    held = Partial(initialize, variables={"params": {"kernel": kernel, "bias": bias}}, table=table)
+    variables = {"params": {"kernel": jax.ShapeDtypeStruct((rows, 4), jnp.float32),
+                            "bias": jax.ShapeDtypeStruct((8,), jnp.float32)}}
+    shardings = {"params": {"kernel": sharded, "bias": replicated}, "count": replicated}
+    taken, kept = placed_held(held, variables, {"params": shardings["params"]}, mesh)
+    copy = taken.keywords["variables"]["params"]["kernel"]
+    assert copy.sharding == sharded
+    assert taken.keywords["variables"]["params"]["bias"] is None and taken.keywords["table"] is None
+    assert kept.keywords["variables"]["params"]["kernel"] is None
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", "Some donated buffers were not usable")
+        state = taking_over(lambda initializer, key: initializer(key), taken, kept, shardings)(
+            jax.random.key(0))
+    assert copy.is_deleted()
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(kept))
+    assert not any(leaf.is_deleted() for leaf in (kernel, bias, table))
+    np.testing.assert_array_equal(state["params"]["kernel"], kernel * 2)
+    np.testing.assert_array_equal(state["params"]["bias"], [1, 1, 1, 1, 0, 0, 0, 0])
+    assert float(state["count"]) == 10.0
+
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     """Compiling reads the parameters', optimizer state's and key's shapes
     and shardings, not their values, so a run compiles its step ahead of
