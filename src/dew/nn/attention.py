@@ -13,7 +13,7 @@ import importlib
 import importlib.util
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple, get_args
+from typing import Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .documents import CrossDocuments, document_ids, document_offsets, with_documents
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
@@ -177,38 +178,6 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
         positions = positions[None, :]
     distance = positions[:, :, None] - jnp.arange(kv_len)[None, None, :]
     return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
-
-
-class CrossDocuments(NamedTuple):
-    """The packed documents of a call whose keys are not its queries
-    (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
-    reading the keys of its own document, 0 as padding, which reads nothing
-    and is read by nothing. FlashAttention runs each row's documents as its
-    packed sequences, which needs them in ascending id order in the queries
-    and in the keys alike, padding after them."""
-
-    query: jax.Array
-    key: jax.Array
-
-
-def document_ids(segment_ids) -> tuple[jax.Array, jax.Array]:
-    """The query's and the key's ids of `segment_ids`, one `[B, S]` array of a
-    call's own documents or a `CrossDocuments`."""
-    if isinstance(segment_ids, CrossDocuments):
-        return jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
-    return jnp.asarray(segment_ids), jnp.asarray(segment_ids)
-
-
-def document_mask(segment_ids) -> jax.Array:
-    """Keep each packed document to itself: `[B, Q, K]` boolean.
-
-    A query sees a key when they carry the same segment id (`document_ids`).
-    Segment 0 is padding, which sees nothing and is seen by nothing. This is
-    the mask every kernel but splash and the pallas flash kernel reads for
-    `segment_ids`; those two compare the ids per block.
-    """
-    queries, keys = document_ids(segment_ids)
-    return (queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0)
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -1208,18 +1177,6 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
                                        ("activation_batch", None)))
 
 
-def document_offsets(segment_ids, max_segments: int) -> jax.Array:
-    """FlashAttention's cumulative offsets, `[B * (max_segments + 1) + 1]`, of
-    packed rows `segment_ids` `[B, S]` whose documents run in ascending id
-    order with padding (0) after them: each row's documents 1 to
-    `max_segments` in turn, then its padding, a document the row lacks an
-    empty sequence. The queries and the keys of `CrossDocuments` so give one
-    sequence each for every document, in the same order."""
-    ids = jnp.arange(1, max_segments + 2) % (max_segments + 1)
-    counts = jnp.sum(segment_ids[:, None, :] == ids[None, :, None], axis=-1, dtype=jnp.int32)
-    return jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts.reshape(-1), dtype=jnp.int32)])
-
-
 def triton_attention(query, key, value, causal: bool):
     """tokamax's Pallas-Triton flash kernel over `[B, S, H, D]` arrays, at
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
@@ -1432,12 +1389,6 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                 and at_least_fp32(dtype or query.dtype) == jnp.float32),
         qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
         attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
-
-
-def with_documents(mask, segment_ids):
-    """`mask` narrowed to each packed document's own keys, `[B, 1, Q, K]`."""
-    inside = document_mask(segment_ids)[:, None]
-    return inside if mask is None else jnp.logical_and(mask, inside)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,
