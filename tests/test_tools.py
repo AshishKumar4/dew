@@ -664,11 +664,16 @@ def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_s
             "        assert as_type(int, cast(1))\n"
             "@pytest.mark.filterwarnings('error')\n"
             "def test_loud():\n"
-            "    warnings.filterwarnings(action='error')\n"),
-        "tools/report.py": "COUNT: int = '1'  # type: ignore[assignment]\n",
+            "    warnings.filterwarnings(action='error')\n"
+            "@pytest.mark.filterwarnings('error', 'ignore::DeprecationWarning')\n"
+            "def test_quiet_after_all():\n"
+            "    pass\n"),
+        "tools/report.py": ("from typing_extensions import cast\n"
+                            "COUNT: int = '1'  # type: ignore[assignment]\n"
+                            "WIDTH = cast(int, COUNT)\n"),
     })
-    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13)),
-                     ("tools/report.py", 1, "SLOP003")]
+    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13, 17)),
+                     ("tools/report.py", 2, "SLOP003"), ("tools/report.py", 3, "SLOP003")]
 
 
 def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):

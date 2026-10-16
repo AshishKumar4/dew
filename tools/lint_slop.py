@@ -102,6 +102,8 @@ NARRATION = re.compile(
 MARKERS = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
 # What a comment says to make a checker look away.
 SUPPRESSIONS = re.compile(r"\b(noqa|type: *ignore|pyright: *ignore)\b")
+# `typing.cast`, which typing_extensions re-exports.
+CASTS = {"typing.cast", "typing_extensions.cast"}
 # The calls that set a warning aside: each ignores one when its action is "ignore".
 WARNING_FILTERS = {"warnings.simplefilter", "warnings.filterwarnings", "warnings.catch_warnings",
                    "pytest.mark.filterwarnings"}
@@ -324,18 +326,20 @@ def suppressions(module: Module) -> Iterator[Finding]:
         if not isinstance(node, ast.Call):
             continue
         called = scopes.resolved(node.func, table)
-        if called == "typing.cast":
+        if called in CASTS:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
                           "cast() asserts what the code did not prove")
-        elif called in WARNING_FILTERS and _ignores(node):
+        elif called in WARNING_FILTERS and _ignores(called, node):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP003",
                           f"{called} ignores a warning; fix what raises it")
 
 
-def _ignores(call: ast.Call) -> bool:
-    """Does a warning filter's call set its warnings aside: its action, the first
-    argument or `action=`, "ignore", or a pytest mark's filter that starts with it?"""
-    actions = [*call.args[:1], *(keyword.value for keyword in call.keywords if keyword.arg == "action")]
+def _ignores(called: str, call: ast.Call) -> bool:
+    """Does a warning filter's call set its warnings aside: a warnings call whose
+    action, the first argument or `action=`, is "ignore", or a pytest mark any of
+    whose filters, each argument, starts with it?"""
+    actions = [*(call.args if called == "pytest.mark.filterwarnings" else call.args[:1]),
+               *(keyword.value for keyword in call.keywords if keyword.arg == "action")]
     return any(isinstance(action, ast.Constant) and isinstance(action.value, str)
                and action.value.split(":")[0] == "ignore" for action in actions)
 
