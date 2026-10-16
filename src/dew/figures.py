@@ -335,9 +335,11 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         figure.text(x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
-    colors: tuple[Role, ...] = ("accent", "warm", "muted", "text")
+    # Neutral colors only, since warm means wrong; past three series the lines are dashed.
+    colors: tuple[Role, ...] = ("accent", "text", "muted")
     for index, (name, ys) in enumerate(values.items()):
         color = colors[index % len(colors)]
+        dash = "6 4" if index >= len(colors) else None
         window = min(smooth, len(ys))
         lines = [(ys, 2.25)]
         if window > 1:
@@ -345,10 +347,13 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
             points = [at(step, y) for step, y in enumerate(drawn) if np.isfinite(y)]
-            line = figure.polyline(points, color=color, width=stroke)
-            if window > 1 and stroke < 2:
-                line.style["opacity"] = "0.35"
-            figure.draw(line, 0.4, seconds * 0.55)
+            line = figure.polyline(points, color=color, width=stroke, dash=dash)
+            shade = 0.35 if window > 1 and stroke < 2 else 1
+            if dash:
+                figure.animate(line, {0.4: {"opacity": 0}, seconds * 0.5: {"opacity": shade}})
+            else:
+                figure.draw(line, 0.4, seconds * 0.55)
+                line.style["opacity"] = str(shade)
         # The last value: beside the series' name in a legend, or else at the line's end.
         last = float(ys[-window:].mean())
         if legend:
