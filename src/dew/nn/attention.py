@@ -2066,6 +2066,46 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
         flash_attention(q, k, v, ab=combined, segment_ids=segments, causal=causal), -3, -2)
 
 
+def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias: bool = True,
+                    dtype: Dtype | None = None, precision: PrecisionLike = None,
+                    norm: Callable[[jax.Array], jax.Array] | None = None, across_heads: bool = False
+                    ) -> jax.Array:
+    """`x` `[..., C]` projected by the matrix `name` to `[..., heads, head_dim]`
+    in the calling module, then normalized by `norm`.
+
+    `flat` stores the matrix as the published diffusion and vision attentions
+    do, `[C, heads * head_dim]`, and splits its product into heads; otherwise
+    it is `[C, heads, head_dim]` (`nn.DenseGeneral`), Dew's own, whose heads a
+    tensor axis splits. A checkpoint's reader maps one layout or the other, so
+    each attention keeps its own. `norm` normalizes each head's channels, or
+    with `across_heads` each token's whole projection before it splits, as
+    Wan's `rms_norm_across_heads` does: another function, not another order.
+    """
+    width = heads * head_dim
+    if flat:
+        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+    else:
+        projected = nn.DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
+                                    name=name)(x)
+    if norm is not None and across_heads:
+        projected = norm(projected.reshape(*x.shape[:-1], width))
+    projected = projected.reshape(*x.shape[:-1], heads, head_dim)
+    return norm(projected) if norm is not None and not across_heads else projected
+
+
+def projected_output(attended, name: str, features: int, *, flat: bool, bias: bool = True,
+                     dtype: Dtype | None = None, precision: PrecisionLike = None) -> jax.Array:
+    """Heads `[..., heads, head_dim]` joined by the matrix `name` to `[..., features]`
+    in the calling module, the matrix stored as `projected_heads` stores its
+    own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
+    if flat:
+        # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
+        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+            attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
+    return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
+                           name=name)(attended)
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2117,32 +2157,13 @@ class NormalAttention(nn.Module):
                 + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
-    def setup(self):
-        maps = self.projections()
-        dense = functools.partial(
-            nn.DenseGeneral,
-            features=[self.heads, maps['to_q'][1] // self.heads],
-            axis=-1,
+    def _heads(self, name: str, x, norm: str | None = None):
+        projected = projected_heads(
+            x, name, self.heads, self.dim_head, flat=False,
+            bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
             precision=self.precision,
-            use_bias=self.use_bias if self.qkv_bias is None else self.qkv_bias,
-            dtype=self.dtype
-        )
-        self.query = dense(name="to_q")
-        self.key = dense(name="to_k")
-        self.value = dense(name="to_v")
-
-        if self.qk_norm:
-            self.q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="q_norm")
-            self.k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="k_norm")
-
-        self.proj_attn = nn.DenseGeneral(
-            maps['to_out_0'][1],
-            axis=(-2, -1),
-            precision=self.precision,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            name="to_out_0",
-        )
+            norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
+        return constrain(projected, HEADS)
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None):
@@ -2156,13 +2177,10 @@ class NormalAttention(nn.Module):
         # [B, S, heads, head_dim], column-parallel under a tensor axis; a
         # context's positions split over a sequence axis where its link pays
         # for it (`split_positions`).
-        query = constrain(self.query(x), HEADS)
-        key, value = split_positions(
-            context, (self.heads, self.dim_head),
-            lambda tokens: (constrain(self.key(tokens), HEADS), constrain(self.value(tokens), HEADS)))
-        if self.qk_norm:
-            query = self.q_norm(query)
-            key = self.k_norm(key)
+        query = self._heads("to_q", x, "q_norm")
+        key, value = split_positions(context, (self.heads, self.dim_head),
+                                     lambda tokens: (self._heads("to_k", tokens, "k_norm"),
+                                                     self._heads("to_v", tokens)))
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
             query = rotate(query, freqs_cos, freqs_sin)
@@ -2173,7 +2191,8 @@ class NormalAttention(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
         )
-        proj = self.proj_attn(constrain(hidden_states, HEADS))
+        proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
+                                bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
 
