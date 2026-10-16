@@ -276,7 +276,9 @@ def test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them()
     state = trainer.fit(data, steps=2, log_every=1)
     assert int(state.step) == 2
     staged, _ = split_fields(next(iter(data.train(DataPartition()))))
-    image = trainer._model_shapes(shard_batch(trainer.device_mesh, staged))["image"]
+    # Under the run's mesh, where the step and its checks trace.
+    with jax.set_mesh(trainer.device_mesh):
+        image = trainer._model_shapes(shard_batch(trainer.device_mesh, staged))["image"]
     assert image.shape == (8, 12, 12, 3)
     assert image.sharding is not None and image.sharding.spec[0] == "data"
 
