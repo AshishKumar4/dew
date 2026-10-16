@@ -58,11 +58,12 @@ def operands(batch, length, key_heads, value_heads, width, columns, dtype, *, se
     return q, k, v, g, beta, h0, do, dht
 
 
-def math(q, k, v, g, beta, h0):
-    """The portable rule, value heads reading their key head."""
+def math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule, value heads reading their key head, a row's packed documents starting at
+    `starts` (`[B, T]`), as the port runs them."""
     group = v.shape[2] // q.shape[2]
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    return linear.chunk_delta_rule(q, k, v, g, beta, h0)
+    return linear.chunk_delta_rule(q, k, v, g, beta, h0, starts=starts)
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
@@ -199,7 +200,8 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
 def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
     so a head's backward fits, and each one's float64 terms: what the sums of Dew's portable math add
-    (`float64_terms`), evaluated op by op on the host, `HEADS` value heads at a time, and for the
+    on the whole row, its documents from their starts as the port runs them (`float64_terms`),
+    evaluated op by op on the host, `HEADS` value heads at a time, and for the
     decay's gradient fla's factorised terms besides (`factorised_decay_terms`). A key head's gradients
     and terms are summed over the value heads it serves."""
     q, k, v, g, beta, h0, do, dht = inputs
@@ -218,15 +220,17 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
             heads.append([np.asarray(x) for x in run(*sliced)])
             decay.append(factorised_decay_terms(*sliced[:2], *heads[-1][2:4]))
         sizes = []
-        chunked = functools.partial(recurrence, cuts=rows, rule=linear.chunk_delta_rule)
-        step = max(1, HEADS // group)
+        starts = None
+        if cuts is not None:
+            starts = jnp.zeros(q.shape[:2], bool).at[0, list(cuts[1:])].set(True)
+        step, packed = max(1, HEADS // group), functools.partial(math, starts=starts)
         with jax.default_device(host):
             for first in range(0, q.shape[2], step):
                 keyed, valued = slice(first, first + step), slice(first * group, (first + step) * group)
                 block = jax.device_put(widened((
                     q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
                     h0[:, valued], do[:, :, valued], dht[:, valued])), host)
-                _, terms = float64_terms(through(chunked, *block[6:]), *block[:6])
+                _, terms = float64_terms(through(packed, *block[6:]), *block[:6])
                 sizes.append([np.asarray(x) for x in terms])
 
     def joined(leaves):
@@ -237,7 +241,6 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
         return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
 
     found, terms = joined(heads), joined(sizes)
-    terms[5] = np.maximum(terms[5], np.concatenate(decay, axis=2))
     for i in (2, 3):
         found[i] = grouped(found[i])
     return found, terms
