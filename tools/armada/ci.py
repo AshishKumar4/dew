@@ -432,6 +432,13 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
+CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+              "HF_ENDPOINT": "http://127.0.0.1:9"}
+"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`-m "not network"`):
+the libraries offline, and the Hub's address a closed port for any that would ask it regardless. A
+test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
          grace: float = 60.0) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
@@ -474,7 +481,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True,
-                            env={**os.environ, **environ, "PYTHONPATH": path,
+                            env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
                                  "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
