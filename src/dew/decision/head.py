@@ -235,6 +235,19 @@ def _gathered(values: jax.Array, indices: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, indices.reshape(*indices.shape, *(1,) * (values.ndim - 2)), axis=1)
 
 
+def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> jax.Array:
+    """Each question's `values` `[B, Q, F]` at its option slots, `[B, P, F]`: on the grid a question's
+    `width` slots repeat it, a broadcast whose transpose sums them, and compacted slots gather by their
+    `owners`. A gather's transpose is a scatter, which XLA's deterministic GPU scatter sorts: the
+    joint head's three [8, 75, 1024] reads at [8, 7500, 1024] slots took 3.99 ms forward and backward
+    on an A100 40GB as gathers, 0.18 as broadcasts."""
+    if inputs.option_slots is not None:
+        return _gathered(values, owners)
+    batch, count, width = inputs.options.shape
+    return jnp.broadcast_to(values[:, :, None], (batch, count, width, *values.shape[2:])).reshape(
+        batch, count * width, *values.shape[2:])
+
+
 def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Per-slot `values` `[B, P, ...]` back on the `[B, Q, K, ...]` grid, zero
     where no real option is: the grid itself where the inputs compact nothing."""
@@ -366,7 +379,7 @@ class JointSchemaHead(Head):
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
-                   + _gathered(self.option_question_projection(questions), owners))
+                   + _per_slot(self.option_question_projection(questions), owners, inputs))
         # A slot reads its own row's tokens and questions, and a padding slot every one of them, so
         # each query has a key. The masks are [B, 1, queries, keys], one for every head.
         read = _gathered(own, owners)[:, None]
@@ -387,11 +400,11 @@ class JointSchemaHead(Head):
             fields = layer(fields, memory, asked, own[:, None])
         fields = self.field_norm(fields)
 
-        anchor = _gathered(l2_normalized(questions + last_state, 1e-12), owners)
+        anchor = _per_slot(l2_normalized(questions + last_state, 1e-12), owners, inputs)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
                  * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
-        repeated = _gathered(fields, owners)
+        repeated = _per_slot(fields, owners, inputs)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
