@@ -63,6 +63,7 @@ import ast
 import functools
 import hashlib
 import io
+import json
 import re
 import sys
 import tokenize
@@ -1226,12 +1227,20 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     yield from sorted(findings, key=lambda finding: (finding.line, finding.col, finding.code))
 
 
-RECORDED = {"site/src/data/hero.py": "f7e0cf0918a8c8b973c17f4eb266a58c7b6678254bb70ca7f87c3d449d6e88e5"}
-"""Python files whose bytes a recording pins, each by its sha256: the landing hero's script, which
-site/src/data/capture.json's script_sha256 names and the site's build checks it against
+RECORDED = {"site/src/data/hero.py": "site/src/data/capture.json"}
+"""Python files whose bytes a recording pins, each with the recording that names their sha256
+(`meta.script_sha256`): the landing hero's script, whose capture the site's build checks it against
 (site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
-fast as the recording's. The gate reads such a file only once its bytes are no longer the recorded ones,
-which an edit makes them."""
+fast as the recording's (user, 2026-10-16: the 60 s recording stays). The gate reads such a file only
+once its bytes are no longer the recorded ones, which an edit makes them."""
+
+
+def recorded(checkout: Path, relative: str, path: Path) -> bool:
+    """Are `path`'s bytes still the ones the recording `RECORDED` names for `relative` pins?"""
+    if relative not in RECORDED:
+        return False
+    capture = json.loads((checkout / RECORDED[relative]).read_text())
+    return capture["meta"]["script_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
@@ -1245,7 +1254,7 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
             relative = path.relative_to(checkout).as_posix()
             if "/stubs/" in f"/{relative}" or "/node_modules/" in f"/{relative}":
                 continue
-            if RECORDED.get(relative) == hashlib.sha256(path.read_bytes()).hexdigest():
+            if recorded(checkout, relative, path):
                 continue
             yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 
