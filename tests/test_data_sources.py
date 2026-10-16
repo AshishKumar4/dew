@@ -961,6 +961,61 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
     assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
 
 
+
+def test_a_hub_split_prepared_online_reads_the_same_rows_with_the_hub_offline(tmp_path, monkeypatch):
+    """A Hub split prepared online reads the same rows with the Hub offline (HF_HUB_OFFLINE): its
+    commit is the answer the Hub gave online (`dew.cache.hub_answer`), and its Arrow is the cache
+    `datasets` prepared at that commit, which `datasets` itself cannot find offline."""
+    import datasets
+    from hub_support import hub_split, offline
+
+    from dew.data import Hub
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    rows = datasets.Dataset.from_dict({"id": list(range(16))})
+    cache = str(tmp_path / "hub" / "cache")
+
+    def read():
+        pipeline = Pipeline(Hub("acme/records", cache_dir=cache)).batch(4)
+        reader = compile(pipeline, read="indexed", loading=Loading(workers=0), provision=True).train(
+            DataPartition())
+        try:
+            return [int(value) for _ in range(4) for value in next(reader)["id"]]
+        finally:
+            reader.close()
+
+    with pytest.MonkeyPatch.context() as online:
+        hub_split(online, tmp_path / "hub", "acme/records", {"train": rows}, commit)
+        answered = read()
+    offline(monkeypatch)
+    assert Hub("acme/records", cache_dir=cache).commit == commit
+    assert read() == answered
+    assert sorted(answered) == list(range(16))
+
+
+def test_a_hub_shards_identity_is_the_same_with_the_hub_offline(moving_hub_conversion, monkeypatch):
+    """A Hub split's streamed shards keep the identity they had online with the Hub offline: the
+    commit, the commit's files and each shard's facts are the Hub's answers, recorded, so the plan
+    a compiled cache is keyed by matches. A repo never answered online raises the offline error."""
+    from hub_support import offline
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Hub
+
+    def plan():
+        return compile(Pipeline(Hub("owner/data")).batch(2), read="streamed", loading=Loading(workers=0)).plan
+
+    answered = plan().record()
+    offline(monkeypatch)
+    plan().check(answered)
+    with pytest.raises(OfflineModeIsEnabled):
+        assert Hub("owner/elsewhere").commit
+
+
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
     manifest = export(
