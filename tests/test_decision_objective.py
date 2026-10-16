@@ -369,7 +369,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     checkpoints.wait()
     live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
 
-    assert source.processor is not None and source.processor.source is None
+    assert source.processor is not None
     assert objective.inference_record()["processor"] is None
     assert isinstance(reloaded.tokenizer, ByteTokenizer)
     assert reloaded.processor is None

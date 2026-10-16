@@ -41,7 +41,7 @@ from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor, recorded_tokenizer
+from dew.inference.tasks import Processor, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
@@ -671,6 +671,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     saved_task = TextGeneration
+    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'sampling', 'tokenizer', 'processor'})
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
@@ -903,7 +904,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return TextGeneration(self.model, params, sampling=sampling)
 
     def task_record(self) -> Mapping[str, JSON]:
-        """The decoder's row length, preview budget, sampling policy and tokenizer."""
+        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
         from dew.registry import to_record
         samples = self.samples
         return {
@@ -911,6 +912,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             'max_new_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': to_record(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
+            'processor': recorded_processor(self.processor),
         }
 
     def build_task(self, variables: Variables, *,

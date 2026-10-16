@@ -366,11 +366,14 @@ class Pretrained:
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        # A run over a source's own processor records its source, and the bundle writes its files.
+        source = declaration.get('processor')
+        processor = None if source is None else load_processor(text(source, 'processor'), model)
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
-            bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
-                                                   generation_config=generation)
+            bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
+                                                          generation_config=generation), processor=processor)
             if objectives[kind] is objectives['masked_diffusion']:
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
@@ -380,7 +383,7 @@ class Pretrained:
             from dew.interop import diffusion_gemma
             block = from_record(DiffusionGemma, model)
             bundle = PretrainedBlockDecoder(
-                block, variables, None, diffusion_gemma.published_config(block), None,
+                block, variables, processor, diffusion_gemma.published_config(block), None,
                 model_config.fields, {}, export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
@@ -957,8 +960,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     fixture without processor files tokenizes text only.
 
     `source` names the local directory or the Hub repo at the commit the
-    loader resolved. Only the media branch keeps it: a task's recorded text
-    tokenizer already identifies its text preprocessing.
+    loader resolved, the identity a run records to reload the processor
+    (`load_processor`). Only the media branch reads media files from its
+    directory.
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -971,18 +975,18 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                      else load_tokenizer(str(directory), local_files_only=True))
         if not hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
-        return Processor(tokenizer, config, record, model.vocab_size,
-                         source=source if media else None, directory=directory if media else None)
+        return Processor(tokenizer, config, record, model.vocab_size, source=source,
+                         directory=directory if media else None)
     return None
 
 
 def load_processor(source: str, model: nn.Module) -> Processor | None:
-    """Reload the recorded media processor from its source, beside `model`.
+    """Reload the recorded processor from its source, beside `model`.
 
     A saved task keeps the local directory or `repo@commit` the processor's
-    files came from, not its translated fields or the task's tokenizer.
-    Reading that source's config and translating its wrapper derives the
-    media geometry again without loading the model's weights.
+    files came from, not its translated fields. Reading that source's config
+    and translating its wrapper derives a media processor's geometry again
+    without loading the model's weights.
     """
     name, revision = split_revision(source)
     directory = sources.snapshot(name, revision, weights=False)
