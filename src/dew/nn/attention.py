@@ -33,6 +33,7 @@ from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import (
     bf16_dot_runs,
+    capability,
     device_generation,
     first_refusal,
     gpu_placed,
@@ -1007,8 +1008,8 @@ def cudnn_max_head_dim() -> int:
     """The widest heads cuDNN's fused bf16/fp16 kernel takes on this GPU: 256 on Hopper and later, 128
     before (jax's `check_is_flash_attention`, jax/_src/cudnn/fused_attention_stablehlo.py, which
     raises past it)."""
-    generation = device_generation()
-    return 256 if generation.startswith('sm') and int(generation[2:]) >= 90 else 128
+    named = capability(device_generation())
+    return 256 if named is not None and named >= (9, 0) else 128
 
 
 def cudnn_runs(query, softcap=None) -> bool:
@@ -1071,10 +1072,13 @@ def flash_architectures() -> tuple[str, ...] | None:
     return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
-def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
-    """Whether a wheel built for `architectures` holds code `generation` runs: its own, or sm80's on
-    any 8.x part, which runs it."""
-    return generation in architectures or (generation.startswith('sm8') and 'sm80' in architectures)
+def flash_built_for(device: str, architectures: tuple[str, ...]) -> bool:
+    """Whether a wheel built for `architectures` holds code the generation `device` runs: a CUDA
+    binary for X.Y runs on X.Z from Z = Y up, so its own, or sm80's on any 8.x part."""
+    own = capability(device)
+    built = [capability(architecture) for architecture in architectures]
+    return own is not None and any(named is not None and named[0] == own[0] and named[1] <= own[1]
+                                   for named in built)
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
@@ -1091,8 +1095,10 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
-    narrow = generation.startswith('sm8') and generation != 'sm80'
-    widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
+    named = capability(generation)
+    # FlashAttention's own rule (`is_sm8x`): an 8.x part past 8.0 takes no wider backward.
+    widest = (FLASH_MAX_BACKWARD_HEAD_DIM if named is not None and named[0] == 8 and named[1] > 0
+              else FLASH_MAX_HEAD_DIM)
     return first_refusal(
         (gpu_placed() and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
