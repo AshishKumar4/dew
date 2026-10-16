@@ -249,9 +249,12 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     assert not over, "\n".join(over)
 
 
-SUMS = frozenset({"dot_general", "reduce_sum", "conv_general_dilated", "cumsum", "scatter-add"})
+SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
+                  "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
-taken at their float64 values (`float64_terms`)."""
+taken at their float64 values (`float64_terms`). A ragged dot, an expert
+layer's grouped matmul, sums as a dot does within each group, and its
+transpose, which the kernel's gradient runs, is one too."""
 
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
