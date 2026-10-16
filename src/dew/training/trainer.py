@@ -1346,7 +1346,8 @@ class Trainer(Generic[Loss, Effects]):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, *stepped = outcome(current, *body(current, model_batch(batch), 0), batch, 1)
+                advanced, loss, aux, committed = body(current, model_batch(batch), 0)
+                advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
                 return transfer(advanced, placement), *stepped
