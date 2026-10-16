@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 # `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
 # with `ncclKernel_` before NCCL 2.19.
 COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+
+# XLA's hlo_op stat distinguishes the all-to-all and collective-permute
+# operations that NCCL runs as the same SendRecv kernel.
+HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter", "all-reduce")
+
+# The decode report groups movement and reductions separately from training's
+# kernel categories, and keeps random-number generation visible.
+DECODE_CATEGORIES = {
+    "attention": r"fmha|flash|cudnn|attention",
+    "gemm": r"gemm|cutlass|cublas|xmma|matmul|_dot",
+    "movement": r"memcpy|copy|scatter|gather|transpose|concatenate",
+    "reduction": r"reduce|argmax|topk|sort",
+    "random": r"random|threefry|philox",
+}
 
 # A kernel's category from the tokens of its name, first match wins: XLA
 # names its fusions after the ops they hold (`loop_convert_fusion`,
@@ -95,8 +109,35 @@ def kernel_category(name: str) -> str:
     return "other"
 
 
-def union(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
+def decode_category(name: str) -> str:
+    return next((kind for kind, pattern in DECODE_CATEGORIES.items()
+                 if re.search(pattern, name, re.I)), "other")
+
+
+def kernel_totals[Time: (int, float)](
+    events: Iterable[tuple[str, Time, Time]], classify: Callable[[str], str] = str,
+) -> tuple[dict[str, Time], dict[str, int]]:
+    """Summed kernel durations and calls by name or category, including overlapping streams."""
+    durations: dict[str, Time] = {}
+    counts: dict[str, int] = {}
+    for name, start, end in events:
+        kind = classify(name)
+        durations[kind] = durations.get(kind, 0) + (end - start)
+        counts[kind] = counts.get(kind, 0) + 1
+    return durations, counts
+
+
+def program_times(rows: Sequence[dict]) -> dict[str, float]:
+    """XProf's summed self time in microseconds, by program id."""
+    programs: dict[str, float] = {}
+    for row in rows:
+        program = str(row.get("program_id"))
+        programs[program] = programs.get(program, 0.0) + float(row["total_self_time"])
+    return programs
+
+
+def union[Time: (int, float)](intervals: Sequence[tuple[Time, Time]]) -> list[tuple[Time, Time]]:
+    merged: list[tuple[Time, Time]] = []
     for start, end in sorted(intervals):
         if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
@@ -105,8 +146,8 @@ def union(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def overlap(first: list[tuple[int, int]], second: list[tuple[int, int]]) -> int:
-    """Nanoseconds two disjoint, sorted interval lists share."""
+def overlap[Time: (int, float)](first: list[tuple[Time, Time]], second: list[tuple[Time, Time]]) -> Time:
+    """Time two disjoint, sorted interval lists share."""
     shared, i, j = 0, 0, 0
     while i < len(first) and j < len(second):
         start, end = max(first[i][0], second[j][0]), min(first[i][1], second[j][1])
@@ -118,8 +159,13 @@ def overlap(first: list[tuple[int, int]], second: list[tuple[int, int]]) -> int:
     return shared
 
 
-def length(intervals: list[tuple[int, int]]) -> int:
+def length[Time: (int, float)](intervals: list[tuple[Time, Time]]) -> Time:
     return sum(end - start for start, end in intervals)
+
+
+def busy_time[Time: (int, float)](intervals: Sequence[tuple[Time, Time]]) -> Time:
+    """Time covered by at least one kernel, counting overlapping streams once."""
+    return length(union(intervals))
 
 
 def _host_to_device(name: str) -> bool:
@@ -128,9 +174,10 @@ def _host_to_device(name: str) -> bool:
     return "memcpyh2d" in lowered or "htod" in lowered
 
 
-def window_split(events: Sequence[tuple[str, int, int]]) -> dict[str, int]:
-    """One device's traced window, in nanoseconds, from its `(name, start_ns,
-    end_ns)` kernels.
+def window_split[Time: (int, float)](events: Sequence[tuple[str, Time, Time]]) -> dict[str, Time]:
+    """One device's traced window from its `(name, start, end)` kernels.
+
+    Times keep the input unit, JAX nanoseconds or torch microseconds.
 
     `window` runs from the first kernel's start to the last one's end and
     `busy` is the union of every kernel. A kernel is a collective when NCCL
@@ -147,15 +194,16 @@ def window_split(events: Sequence[tuple[str, int, int]]) -> dict[str, int]:
     if not events:
         raise ValueError("no device kernels to split")
     ordered = sorted(events, key=lambda event: event[1])
-    figures = {"window": 0, "busy": 0, "compute": 0, "communication": 0, "exposed_communication": 0,
-               "idle_input": 0, "idle_host": 0}
+    figures: dict[str, Time] = {
+        "window": 0, "busy": 0, "compute": 0, "communication": 0, "exposed_communication": 0,
+        "idle_input": 0, "idle_host": 0}
     high = ordered[0][2]
     for name, start, end in ordered[1:]:
         if start > high:
             figures["idle_input" if _host_to_device(name) else "idle_host"] += start - high
         high = max(high, end)
     figures["window"] = high - ordered[0][1]
-    figures["busy"] = length(union([(start, end) for _, start, end in ordered]))
+    figures["busy"] = busy_time([(start, end) for _, start, end in ordered])
     collectives = [(name, start, end) for name, start, end in ordered if "nccl" in name.lower()]
     compute = union([(start, end) for name, start, end in ordered if "nccl" not in name.lower()])
     every = union([(start, end) for _, start, end in collectives])
@@ -167,3 +215,40 @@ def window_split(events: Sequence[tuple[str, int, int]]) -> dict[str, int]:
             (start, end) for name, start, end in collectives
             if f"_{kind.lower()}_" in f"_{name.lower()}_".replace("(", "_")]))
     return figures
+
+
+def window_totals[Time: (int, float)](
+    devices: Iterable[Sequence[tuple[str, Time, Time]]],
+) -> dict[str, Time]:
+    """Sum each device's window split; device averaging belongs to the report."""
+    totals: dict[str, Time] = {}
+    for events in devices:
+        for key, value in window_split(events).items():
+            totals[key] = totals.get(key, 0) + value
+    return totals
+
+
+def hlo_collective(event: ProfileEvent) -> str | None:
+    """The HLO collective an NCCL kernel ran for, from XLA's hlo_op stat."""
+    for name, value in event.stats:
+        if name == "hlo_op" and isinstance(value, str):
+            spelled = value.replace("_", "-")
+            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
+    return None
+
+
+def communication_totals(devices: Sequence[Sequence[ProfileEvent]]) -> dict[str, int]:
+    """Per-device window totals and the busy and exposed time of each HLO collective."""
+    kernels = [[(event.name, event.start_ns, event.end_ns) for event in events] for events in devices]
+    totals = window_totals(kernels)
+    for events, records in zip(devices, kernels, strict=True):
+        compute = union([(start, end) for name, start, end in records if "nccl" not in name.lower()])
+        ops = [hlo_collective(event) for event in events]
+        for op in HLO_COLLECTIVES:
+            spans = union([(start, end) for (_, start, end), of in zip(records, ops, strict=True)
+                           if of == op])
+            key = op.replace("-", "_")
+            total = length(spans)
+            totals[key] = totals.get(key, 0) + total
+            totals[f"{key}_exposed"] = totals.get(f"{key}_exposed", 0) + (total - overlap(spans, compute))
+    return totals
