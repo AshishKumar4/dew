@@ -179,7 +179,7 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
 
 
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
-def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone():
+def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
     by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
     reading nothing. Each packed row's logits and the gradients are the row's alone within the
