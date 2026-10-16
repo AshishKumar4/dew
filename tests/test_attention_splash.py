@@ -32,7 +32,8 @@ from reference_error import (
 )
 from residual_orders import orders
 
-from dew.nn.attention import document_mask, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.documents import document_mask
 
 on_tpu = pytest.mark.skipif(jax.default_backend() != 'tpu',
                             reason="needs a TPU; the interpreter covers the rest here")

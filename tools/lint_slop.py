@@ -13,7 +13,8 @@ Scope is per rule, because the rules are not all about the same thing:
   package checks itself with `--root` (its checkout) and `--package` (its
   name, so `src/<package>` is the contract and its own modules are the ones
   SLOP008 will not see patched).
-- `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
+- `tests`, `tools`, `recipes`, `examples`, `site`, `docs/assets` and
+  `kernels` are scripts, proofs and the packages beside Dew's. Their
   names and annotations are local, so the contract rules (SLOP001, SLOP002,
   SLOP004, SLOP005) do not run there. A suppression, a swallowed exception, a
   narration comment and an unsplittable function are defects anywhere, so
@@ -60,7 +61,9 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
+import hashlib
 import io
+import json
 import re
 import sys
 import tokenize
@@ -1224,27 +1227,48 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     yield from sorted(findings, key=lambda finding: (finding.line, finding.col, finding.code))
 
 
+RECORDED = {"site/src/data/hero.py": "site/src/data/capture.json"}
+"""Python files whose bytes a recording pins, each with the recording that names their sha256
+(`meta.script_sha256`): the landing hero's script, whose capture the site's build checks it against
+(site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
+fast as the recording's (user, 2026-10-16: the 60 s recording stays). The gate reads such a file only
+once its bytes are no longer the recorded ones, which an edit makes them."""
+
+
+def recorded(checkout: Path, relative: str, path: Path) -> bool:
+    """Are `path`'s bytes still the ones the recording `RECORDED` names for `relative` pins?"""
+    if relative not in RECORDED:
+        return False
+    capture = json.loads((checkout / RECORDED[relative]).read_text())
+    return capture["meta"]["script_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
     """Every Python file under the named roots of `checkout`, or the root
-    itself when it names a file, skipping stub-only trees."""
+    itself when it names a file, skipping stub-only trees, the site's
+    installed npm packages (node-gyp ships Python) and a file whose bytes
+    are still those a recording pins (`RECORDED`)."""
     for root in roots:
         named = checkout / root
         for path in [named] if named.is_file() else sorted(named.rglob("*.py")):
             relative = path.relative_to(checkout).as_posix()
-            if "/stubs/" in f"/{relative}":
+            if "/stubs/" in f"/{relative}" or "/node_modules/" in f"/{relative}":
+                continue
+            if recorded(checkout, relative, path):
                 continue
             yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 
 
 def default_roots(package: str) -> list[str]:
-    """What the gate reads when it names no roots: the package's source and every script."""
-    return [f"src/{package}", "tests", "tools", "recipes", "examples"]
+    """What the gate reads when it names no roots: the package's source and every script, the site's
+    and the docs' generators and kernel packages among them."""
+    return [f"src/{package}", "tests", "tools", "recipes", "examples", "site", "docs/assets", "kernels"]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
-                        "package's source, tests, tools, recipes and examples")
+                        "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
     parser.add_argument("--print-roots", action="store_true",

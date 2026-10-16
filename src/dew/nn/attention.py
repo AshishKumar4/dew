@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .documents import CrossDocuments, document_ids, document_offsets, with_documents
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
@@ -179,19 +180,6 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
 
 
-def document_mask(segment_ids) -> jax.Array:
-    """Keep each packed document to itself: `[B, S, S]` boolean.
-
-    Two positions see each other when they carry the same segment id.
-    Segment 0 is padding, which sees nothing and is seen by nothing. This is
-    the mask every kernel but splash and the pallas flash kernel reads for
-    `segment_ids`; those two compare the ids per block.
-    """
-    segment_ids = jnp.asarray(segment_ids)
-    return ((segment_ids[:, :, None] == segment_ids[:, None, :])
-            & (segment_ids[:, :, None] != 0))
-
-
 def chunk_mask(query_positions, key_positions, chunk_size: int):
     """Boolean `[.., 1, T, S]` keeping keys in the query's chunk, both absolute.
 
@@ -235,7 +223,17 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     row from its index; an explicit mask is reduced over its keys, folded
     with them (`combined_attention_mask`).
     """
-    if mask is not None or (segment_ids is not None and key_value_seq_lengths is not None):
+    if isinstance(segment_ids, CrossDocuments) and mask is None and key_value_seq_lengths is None:
+        # A query of another sequence's documents sees a key where its document holds one: the
+        # keys' ids run in ascending order, padding after them, so each query's id is searched in
+        # its row's keys rather than compared with every key.
+        queries, keys = document_ids(segment_ids)
+        ordered = jnp.where(keys == 0, jnp.iinfo(keys.dtype).max, keys)
+        held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
+                        - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
+        return ((held > 0) & (queries != 0))[:, :, None, None]
+    if (mask is not None or isinstance(segment_ids, CrossDocuments)
+            or (segment_ids is not None and key_value_seq_lengths is not None)):
         visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
         if segment_ids is not None:
             visible = with_documents(visible, segment_ids)
@@ -1150,19 +1148,33 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
-    def local(query, key, value, sinks=None, segment_ids=None):
+    def local(query, key, value, sinks=None, segment_ids=None, key_segment_ids=None):
         if segment_ids is None or max_segments is None:
             return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
         rows, length = segment_ids.shape
-        changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-        begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-        offsets = cu_seqlens(begins, rows * (max_segments + 1))
-        out = flash.flash_mha_varlen(*(x.reshape(rows * length, *x.shape[2:]) for x in (query, key, value)),
-                                     offsets, length, is_causal=causal, window_size=window, sinks=sinks)
+        flat = (query.reshape(rows * length, *query.shape[2:]),
+                *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
+        if key_segment_ids is None:
+            # A call's own documents are its runs, whatever their ids.
+            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
+            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+        else:
+            # Another sequence's documents pair with the queries' by id, sequence i each side's
+            # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
+            # has none of.
+            offsets, key_offsets = (document_offsets(ids, max_segments)
+                                    for ids in (segment_ids, key_segment_ids))
+            own_keys = {"key_cu_seqlens": key_offsets, "key_max_seqlen": max(1, key_segment_ids.shape[1])}
+        out = flash.flash_mha_varlen(*flat, offsets, length, is_causal=causal, window_size=window,
+                                     sinks=sinks, **own_keys)
         return out.reshape(rows, length, *out.shape[1:])
 
+    queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
     return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
-                      segment_ids=(segment_ids, ("activation_batch", None)))
+                      segment_ids=(queries, ("activation_batch", None)),
+                      key_segment_ids=(keys if isinstance(segment_ids, CrossDocuments) else None,
+                                       ("activation_batch", None)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1270,7 +1282,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
-                                 dropout_rng=None, deterministic=True):
+                                 dropout_rng=None, deterministic=True, key_segment_ids=None):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
     `implementation` names the kernel (`AttentionImpl`, dispatched by
@@ -1289,6 +1301,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
+    `key_segment_ids` `[B, K]` are the keys' own where they are not the
+    queries (`CrossDocuments`): each query reads its document's keys, with
+    no causal mask or window, whose positions the two sides do not share.
     `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding.
@@ -1302,6 +1317,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     shards = sequence_shards()
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
+    if key_segment_ids is not None:
+        if segment_ids is None or causal or sliding_window is not None:
+            raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids, and "
+                             "a call between two sequences' documents takes no causal mask or window")
+        segment_ids = CrossDocuments(segment_ids, key_segment_ids)
     if dropout_rate and not deterministic:
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
@@ -1369,12 +1389,6 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                 and at_least_fp32(dtype or query.dtype) == jnp.float32),
         qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
         attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
-
-
-def with_documents(mask, segment_ids):
-    """`mask` narrowed to each packed document's own keys, `[B, 1, S, S]`."""
-    inside = document_mask(segment_ids)[:, None]
-    return inside if mask is None else jnp.logical_and(mask, inside)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,
@@ -1961,7 +1975,7 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
         head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
     segments = (None if segment_ids is None
-                else splash_attention_kernel.SegmentIds(segment_ids, segment_ids))
+                else splash_attention_kernel.SegmentIds(*document_ids(segment_ids)))
 
     def example(q, k, v, ids):
         return kernel(q, k, v, segment_ids=ids, sinks=sinks)
@@ -2085,7 +2099,7 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
             jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
             (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
         combined = seated if combined is None else combined + seated
-    segments = None if segment_ids is None else SegmentIds(segment_ids, segment_ids)
+    segments = None if segment_ids is None else SegmentIds(*document_ids(segment_ids))
     return jnp.moveaxis(
         flash_attention(q, k, v, ab=combined, segment_ids=segments, causal=causal), -3, -2)
 
@@ -2147,7 +2161,10 @@ class NormalAttention(nn.Module):
     `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
     each query may read. `key_value_seq_lengths` `[B]` ends each row's keys
     instead, for a right-padded context, which a fused kernel skips rather
-    than reading as a dense bias per head.
+    than reading as a dense bias per head. `segment_ids` `[B, S]` keeps each
+    query to its packed document's keys, `key_segment_ids` `[B, S_context]`
+    numbering the context's (`CrossDocuments`), at most `max_segments` a
+    row, which a fused kernel runs as packed sequences rather than a mask.
     """
     query_dim: int
     heads: int = 4
@@ -2190,7 +2207,8 @@ class NormalAttention(nn.Module):
         return constrain(projected, HEADS)
 
     @nn.compact
-    def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None):
+    def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,
+                 segment_ids=None, key_segment_ids=None, max_segments=None):
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
@@ -2214,6 +2232,7 @@ class NormalAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
+            segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
         proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
                                 bias=self.use_bias, dtype=self.dtype, precision=self.precision)

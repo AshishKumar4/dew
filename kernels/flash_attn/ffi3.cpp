@@ -45,65 +45,71 @@ XLA_FFI_Buffer EmptyBuffer(XLA_FFI_DataType dtype) {
   return XLA_FFI_Buffer{XLA_FFI_Buffer_STRUCT_SIZE, nullptr, dtype, nullptr, 1, &kNone};
 }
 
-// A batch has no offsets: `starts` is null, and the lengths are the arrays' own.
+// A batch has no offsets: `starts` and `key_starts` are null, and the lengths are the arrays' own.
+// Packed, sequence i holds queries starts[i] to starts[i + 1] and keys key_starts[i] to
+// key_starts[i + 1], none longer than `longest` and `key_longest`.
 ffi::Error Forward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device, ffi::AnyBuffer q,
-                   ffi::AnyBuffer k, ffi::AnyBuffer v, const ffi::AnyBuffer* starts, int64_t longest,
-                   double scale, bool causal, int64_t left, int64_t right, Out out, Out lse, Out out_accum,
-                   Out lse_accum) {
+                   ffi::AnyBuffer k, ffi::AnyBuffer v, const ffi::AnyBuffer* starts,
+                   const ffi::AnyBuffer* key_starts, int64_t longest, int64_t key_longest, double scale,
+                   bool causal, int64_t left, int64_t right, Out out, Out lse, Out out_accum, Out lse_accum) {
   XLA_FFI_Buffer like_q = EmptyBuffer(static_cast<XLA_FFI_DataType>(q.element_type()));
   XLA_FFI_Buffer ints = EmptyBuffer(XLA_FFI_DataType_S32);
   XLA_FFI_Buffer floats = EmptyBuffer(XLA_FFI_DataType_F32);
   ffi::AnyBuffer none_q(&like_q), none_int(&ints), none_float(&floats);
   ffi::AnyBuffer offsets = starts ? *starts : none_int;
-  return mha_fwd_impl(stream, std::move(scratch), device, q, k, v, none_q, none_q, none_q, offsets, offsets,
-                      none_int, none_int, none_int, none_int, none_int, none_int, none_q, none_q, none_int,
-                      none_float, none_float, none_float, none_int, longest, true, longest, true, scale, true,
-                      false, false, causal, left, right, 0, 0.0, false, 1, 0, out, lse, out_accum, lse_accum);
+  ffi::AnyBuffer key_offsets = key_starts ? *key_starts : none_int;
+  return mha_fwd_impl(stream, std::move(scratch), device, q, k, v, none_q, none_q, none_q, offsets,
+                      key_offsets, none_int, none_int, none_int, none_int, none_int, none_int, none_q, none_q,
+                      none_int, none_float, none_float, none_float, none_int, longest, true, key_longest, true,
+                      scale, true, false, false, causal, left, right, 0, 0.0, false, 1, 0, out, lse, out_accum,
+                      lse_accum);
 }
 
 ffi::Error Backward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device, ffi::AnyBuffer dout,
                     ffi::AnyBuffer q, ffi::AnyBuffer k, ffi::AnyBuffer v, ffi::AnyBuffer out, ffi::AnyBuffer lse,
-                    const ffi::AnyBuffer* starts, int64_t longest, double scale, bool causal, int64_t left,
-                    int64_t right, Out dq, Out dk, Out dv, Out softmax_d, Out lse_log2) {
+                    const ffi::AnyBuffer* starts, const ffi::AnyBuffer* key_starts, int64_t longest,
+                    int64_t key_longest, double scale, bool causal, int64_t left, int64_t right, Out dq, Out dk,
+                    Out dv, Out softmax_d, Out lse_log2) {
   XLA_FFI_Buffer ints = EmptyBuffer(XLA_FFI_DataType_S32);
   ffi::AnyBuffer none_int(&ints);
   ffi::AnyBuffer offsets = starts ? *starts : none_int;
-  return mha_bwd_impl(stream, std::move(scratch), device, dout, q, k, v, out, lse, offsets, offsets, none_int,
-                      none_int, longest, true, longest, true, scale, true, causal, left, right, 0.0, false, 0,
-                      dq, dk, dv, softmax_d, lse_log2);
+  ffi::AnyBuffer key_offsets = key_starts ? *key_starts : none_int;
+  return mha_bwd_impl(stream, std::move(scratch), device, dout, q, k, v, out, lse, offsets, key_offsets,
+                      none_int, none_int, longest, true, key_longest, true, scale, true, causal, left, right,
+                      0.0, false, 0, dq, dk, dv, softmax_d, lse_log2);
 }
 
 ffi::Error DenseForward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device, ffi::AnyBuffer q,
                         ffi::AnyBuffer k, ffi::AnyBuffer v, double scale, bool causal, int64_t left,
                         int64_t right, Out out, Out lse, Out out_accum, Out lse_accum) {
   // The port reads max_seqlen for packed calls only; a batch's lengths are its arrays'.
-  return Forward(stream, std::move(scratch), device, q, k, v, nullptr, 0, scale, causal, left, right, out, lse,
-                 out_accum, lse_accum);
+  return Forward(stream, std::move(scratch), device, q, k, v, nullptr, nullptr, 0, 0, scale, causal, left,
+                 right, out, lse, out_accum, lse_accum);
 }
 
 ffi::Error PackedForward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device, ffi::AnyBuffer q,
-                         ffi::AnyBuffer k, ffi::AnyBuffer v, ffi::AnyBuffer starts, int64_t longest,
-                         double scale, bool causal, int64_t left, int64_t right, Out out, Out lse,
-                         Out out_accum, Out lse_accum) {
-  return Forward(stream, std::move(scratch), device, q, k, v, &starts, longest, scale, causal, left, right, out,
-                 lse, out_accum, lse_accum);
+                         ffi::AnyBuffer k, ffi::AnyBuffer v, ffi::AnyBuffer starts, ffi::AnyBuffer key_starts,
+                         int64_t longest, int64_t key_longest, double scale, bool causal, int64_t left,
+                         int64_t right, Out out, Out lse, Out out_accum, Out lse_accum) {
+  return Forward(stream, std::move(scratch), device, q, k, v, &starts, &key_starts, longest, key_longest, scale,
+                 causal, left, right, out, lse, out_accum, lse_accum);
 }
 
 ffi::Error DenseBackward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device, ffi::AnyBuffer dout,
                          ffi::AnyBuffer q, ffi::AnyBuffer k, ffi::AnyBuffer v, ffi::AnyBuffer out,
                          ffi::AnyBuffer lse, double scale, bool causal, int64_t left, int64_t right, Out dq,
                          Out dk, Out dv, Out softmax_d, Out lse_log2) {
-  return Backward(stream, std::move(scratch), device, dout, q, k, v, out, lse, nullptr, 0, scale, causal, left,
-                  right, dq, dk, dv, softmax_d, lse_log2);
+  return Backward(stream, std::move(scratch), device, dout, q, k, v, out, lse, nullptr, nullptr, 0, 0, scale,
+                  causal, left, right, dq, dk, dv, softmax_d, lse_log2);
 }
 
 ffi::Error PackedBackward(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device,
                           ffi::AnyBuffer dout, ffi::AnyBuffer q, ffi::AnyBuffer k, ffi::AnyBuffer v,
-                          ffi::AnyBuffer out, ffi::AnyBuffer lse, ffi::AnyBuffer starts, int64_t longest,
-                          double scale, bool causal, int64_t left, int64_t right, Out dq, Out dk, Out dv,
-                          Out softmax_d, Out lse_log2) {
-  return Backward(stream, std::move(scratch), device, dout, q, k, v, out, lse, &starts, longest, scale, causal,
-                  left, right, dq, dk, dv, softmax_d, lse_log2);
+                          ffi::AnyBuffer out, ffi::AnyBuffer lse, ffi::AnyBuffer starts, ffi::AnyBuffer key_starts,
+                          int64_t longest, int64_t key_longest, double scale, bool causal, int64_t left,
+                          int64_t right, Out dq, Out dk, Out dv, Out softmax_d, Out lse_log2) {
+  return Backward(stream, std::move(scratch), device, dout, q, k, v, out, lse, &starts, &key_starts, longest,
+                  key_longest, scale, causal, left, right, dq, dk, dv, softmax_d, lse_log2);
 }
 
 }  // namespace
@@ -127,7 +133,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     dew_flash3_mha_varlen_fwd, PackedForward,
     DEW_FLASH3_CONTEXT.Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
-        .Attr<int64_t>("max_seqlen").Attr<double>("softmax_scale").Attr<bool>("is_causal")
+        .Arg<ffi::AnyBuffer>()
+        .Attr<int64_t>("max_seqlen").Attr<int64_t>("max_seqlen_k").Attr<double>("softmax_scale")
+        .Attr<bool>("is_causal")
         .Attr<int64_t>("window_size_left").Attr<int64_t>("window_size_right")
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>());
 
@@ -143,8 +151,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     dew_flash3_mha_varlen_bwd, PackedBackward,
     DEW_FLASH3_CONTEXT.Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
-        .Attr<int64_t>("max_seqlen").Attr<double>("softmax_scale").Attr<bool>("is_causal")
+        .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
+        .Attr<int64_t>("max_seqlen").Attr<int64_t>("max_seqlen_k").Attr<double>("softmax_scale")
+        .Attr<bool>("is_causal")
         .Attr<int64_t>("window_size_left").Attr<int64_t>("window_size_right")
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>());
