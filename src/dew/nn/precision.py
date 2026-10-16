@@ -140,6 +140,44 @@ def _two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
+                rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
+    """Dekker's rounded product and its residual, with a Veltkamp significand split.
+
+    Guidance keeps the multiply split, which also supports float64. `bit_split`
+    truncates fp32 significands instead, avoiding splitter overflow in norm
+    interpretation and quantizer division; near underflow the splits differ.
+    `subtract` keeps division's subtractive residual order and its signed zeros.
+    Norm interpretation passes `optimization_barrier` as `rounding` to keep each
+    product and residual step separate; the other callers allow fusion.
+    The residual is exact where the intermediates neither overflow nor underflow.
+    """
+    def rounded(value):
+        return value if rounding is None else rounding(value)
+
+    def split(value):
+        if bit_split:
+            bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
+            high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+        else:
+            splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
+            scaled = value * splitter
+            high = scaled - (scaled - value)
+        return high, rounded(value - high)
+
+    lh, ll = split(left)
+    rh, rl = split(right)
+    product = rounded(left * right)
+    head = rounded(lh * rh)
+    lost = rounded(product - head if subtract else head - product)
+    cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
+    for first, second in cross:
+        term = rounded(first * second)
+        lost = rounded(lost - term if subtract else lost + term)
+    tail = rounded(ll * rl)
+    return product, rounded(tail - lost if subtract else lost + tail)
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
