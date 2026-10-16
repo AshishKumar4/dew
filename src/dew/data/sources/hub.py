@@ -155,7 +155,28 @@ class Hub(Dataset):
             )
         revision, paths, format = selection
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in paths)
-        return Files(urls, format=format, columns=self.columns)
+        return Files(urls, format=format, columns=self.columns, file_info=self._facts(revision, paths))
+
+    def _facts(self, revision: str, paths: tuple[str, ...]) -> Mapping[str, Mapping[str, object]]:
+        """Each shard's size, and the sha256 of its content where the Hub states one (an LFS
+        file's), else its git blob id, at `revision`, as the Hub last answered
+        (`dew.cache.hub_answer`). `Files` takes them as the shards' own facts, so the shards keep
+        their identity offline."""
+        from huggingface_hub import HfFileSystem
+
+        def ask() -> Mapping[str, Mapping[str, object]]:
+            hub = HfFileSystem()
+            facts = {}
+            for path in paths:
+                stated = hub.info(f"datasets/{self.repo}@{revision}/{path}")
+                stored = stated.get("lfs")
+                sha256 = stored.get("sha256") if isinstance(stored, Mapping) else None
+                facts[path] = {"bytes": stated["size"],
+                               **({"sha256": sha256} if sha256 else {"ETag": stated["blob_id"]})}
+            return facts
+
+        answered = hub_answer(f"datasets/{self.repo}/facts/{revision}/{self.split}", ask)
+        return {f"hf://datasets/{self.repo}@{revision}/{path}": answered[path] for path in paths}
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
         from huggingface_hub import HfApi
