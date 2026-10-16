@@ -1,5 +1,6 @@
 """Decision rows packed into windows: each row decides as it does alone, and a run is one program."""
 
+import collections
 import copy
 import itertools
 from dataclasses import replace
@@ -14,6 +15,7 @@ from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.config.data import loader
+from dew.data import Loading
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -296,6 +298,38 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
     assert float(loss.mass) == questions and float(loss.total) == 0
     probabilities = objective.evaluate(variables, batch, step).probabilities
     np.testing.assert_array_equal(np.asarray(probabilities)[batch["options"]], np.ones(questions))
+
+
+class Counting(ByteTokenizer):
+    """The byte vocabulary, counting the texts it tokenizes."""
+
+    def __init__(self):
+        super().__init__()
+        self.texts: collections.Counter[str] = collections.Counter()
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        self.texts[text] += 1
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
+@pytest.mark.parametrize("arm", ["joint", "marker"])
+def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
+    """A reader lays each record out twice, to fit it and to train on it, and
+    every record asks its questions over options in a fresh order, yet each
+    text is tokenized once: each template, instruction and option once for
+    the run, and each record's state once."""
+    layout, _, head = ARMS[arm]
+    tokenizer = Counting()
+    objective = DecisionObjective(attending(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
+                                  layout=layout, head=head(), loss=LogLoss())
+    data = loader(Decisions(EXAMPLES), batch=2, read="memory", objective=objective.data(),
+                  loading=Loading(workers=0))
+    reader = data.train(DataPartition())
+    try:
+        assert len(list(itertools.islice(reader, 4))) == 4
+    finally:
+        reader.close()
+    assert tokenizer.texts and set(tokenizer.texts.values()) == {1}
 
 
 def test_a_packed_loss_counts_only_real_scored_questions():

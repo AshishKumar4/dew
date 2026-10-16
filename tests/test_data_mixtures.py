@@ -15,6 +15,7 @@ of what a loader learns about the pool. `tests/test_multiprocess.py` runs
 the same claims in real processes with a real checkpoint between them.
 """
 
+import collections
 import dataclasses
 import itertools
 import json
@@ -424,6 +425,68 @@ def test_weighted_packed_corpora_resume_on_another_process_count(tmp_path):
     state = stopped.get_state()
     for processes in (1, 4):
         assert pooled(open_stream, processes, 4, state, rows=windows_of) == whole[2:]
+
+
+class Asked(pygrain.IterDataset):
+    """Corpus `tag` as its stages read it, counting in `gave` the documents it
+    gives and in `asked` how often a reader asks its position."""
+
+    def __init__(self, parent: pygrain.IterDataset, tag: int, gave: collections.Counter,
+                 asked: collections.Counter):
+        super().__init__(parent)
+        self.tag, self.gave, self.asked = tag, gave, asked
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _Asked(iter(self._parent), self)
+
+
+class _Asked(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator, corpus: Asked):
+        super().__init__(parent)
+        self.corpus = corpus
+
+    def __next__(self):
+        self.corpus.gave[self.corpus.tag] += 1
+        return next(self._parent)
+
+    def get_state(self):
+        self.corpus.asked[self.corpus.tag] += 1
+        return self._parent.get_state()
+
+    def set_state(self, state):
+        self._parent.set_state(state)
+
+
+def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_reads():
+    """A packer notes the stream's position before each document, and a
+    mixture's position is every corpus's own. Only the corpus that gave the
+    document moved, so each corpus is asked about once per document it gives
+    (and twice as the stream opens), not once per document of the mixture;
+    the stream still resumes where it stopped."""
+    gave, asked = collections.Counter(), collections.Counter()
+
+    def corpus(tag: int) -> Pipeline:
+        documents = Memory([{"text": np.full(3, tag * 100 + index, np.int32)} for index in range(40)])
+        return Pipeline(documents).read("streamed").shuffle(tag, window=8).repeat().grain(
+            lambda dataset: Asked(dataset, tag, gave, asked), identity=f"asked-{tag}")
+
+    run = compile(mix([corpus(tag) for tag in range(1, 7)], weights=[1] * 6).pack(8, bins=2).batch(2),
+                  read="streamed", loading=READ)
+    stream = run.train(DataPartition())
+    try:
+        packed_rows(stream, 8)
+        state = stream.get_state()
+        rest = packed_rows(stream, 4)
+    finally:
+        stream.close()
+    assert set(gave) == set(range(1, 7))
+    assert all(asked[tag] <= gave[tag] + 2 for tag in gave)
+    resumed = run.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert packed_rows(resumed, 4) == rest
+    finally:
+        resumed.close()
 
 
 def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):

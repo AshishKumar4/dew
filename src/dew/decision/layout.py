@@ -16,6 +16,7 @@ one row, each option a span of its own.
 """
 
 import dataclasses
+import functools
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +51,23 @@ class TokenizerSpecials(Protocol):
     def pad_token_id(self) -> int | None: ...
 
     def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
+
+
+@functools.lru_cache(maxsize=1 << 14)
+def _piece(encoder: Tokenizer, text: str) -> tuple[int, ...]:
+    """`text`'s tokens under `encoder`, without specials. A layout writes the
+    same templates, instructions and options into every row of a corpus, so
+    each is tokenized once."""
+    return tuple(encoder.encode(text, add_special_tokens=False))
+
+
+@functools.lru_cache(maxsize=1 << 10)
+def _state_tokens(encoder: Tokenizer, text: str) -> tuple[int, ...]:
+    """A state's tokens under `encoder`, without specials. A reader lays a
+    record out to fit it and again to train on it a few records later, so the
+    last states read are kept; unlike `_piece`'s texts, a state rarely
+    returns after that."""
+    return tuple(encoder.encode(text, add_special_tokens=False))
 
 
 @dataclass(frozen=True)
@@ -269,8 +287,7 @@ class QuestionLayout(Layout):
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
-        text = render(state).replace(specials.marker_text, " ")
-        return tuple(encoder.encode(text, add_special_tokens=False))
+        return _state_tokens(encoder, render(state).replace(specials.marker_text, " "))
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None,
@@ -293,9 +310,9 @@ class QuestionLayout(Layout):
         texts = self.options(question)
         slots = _slots(len(texts), order)
         instructions = render(question.instructions).replace(specials.marker_text, " ")
-        head = encoder.encode(f"{question.kind} question: {instructions}", add_special_tokens=False)
-        whole = [encoder.encode(" " + texts[slot].replace(specials.marker_text, " "),
-                                add_special_tokens=False) for slot in slots]
+        head = list(_piece(encoder, f"{question.kind} question: {instructions}"))
+        whole = [list(_piece(encoder, " " + texts[slot].replace(specials.marker_text, " ")))
+                 for slot in slots]
         options = [option[:self.option_tokens] for option in whole]
         # Each option's budget counts its marker.
         budget = self.head_max_len - sum(len(option) + 1 for option in options)
@@ -429,7 +446,7 @@ class JointLayout(Layout):
              *, orders: Mapping[str, Sequence[int]] | None = None,
              media: Sequence[int] = ()) -> list[Encoded]:
         def tokens(text: str) -> list[int]:
-            return encoder.encode(text, add_special_tokens=False)
+            return list(_piece(encoder, text))
 
         schema = tokens("\n\nSCHEMA FIELDS:\n")
         laid = []
@@ -459,7 +476,7 @@ class JointLayout(Layout):
         opening = tokens(f"<|im_start|>system\n{JOINT_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
         prefix = opening + list(media)
         suffix = tokens("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
-        state_ids = tokens(_compact(state))
+        state_ids = list(_state_tokens(encoder, _compact(state)))
         whole = len(state_ids)
         if self.max_state_tokens is not None:
             state_ids = state_ids[:self.max_state_tokens]
