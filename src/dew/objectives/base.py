@@ -1134,7 +1134,7 @@ class Metric(Protocol[S]):
         ...
 
 
-def recorded_name(key, names: Collection[str], owner: object = None) -> str:
+def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
     """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
     live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
     `owner` where it is given, by identity), a `Metric` the validation split's ('val'), and a
