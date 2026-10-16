@@ -332,7 +332,9 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
         whole = jax.lax.all_gather(gathered, "data", tiled=True)
         return whole, jax.lax.psum(summed, "data")
 
-    mapped = jax.shard_map(step, mesh=mesh, in_specs=(P("data"), P("data")), out_specs=(P(), P()))
+    # The gathered whole is the same on every device, which shard_map cannot infer of an all_gather.
+    mapped = jax.shard_map(step, mesh=mesh, in_specs=(P("data"), P("data")), out_specs=(P(), P()),
+                           check_vma=False)
     gathered = jax.device_put(jnp.ones((64, 32), jnp.bfloat16), NamedSharding(mesh, P("data")))
     summed = jax.device_put(jnp.ones((8, 16), jnp.float32), NamedSharding(mesh, P("data")))
     text = jax.jit(mapped).lower(gathered, summed).compile().as_text()
