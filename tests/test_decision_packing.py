@@ -168,18 +168,51 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason=(
-    "packing is the same plumbing on every device; a GPU's own kernels keep documents apart in "
-    "test_mixers::test_no_token_reaches_another_document"))
-@pytest.mark.parametrize("arm", sorted(ARMS))
+def asked(batch, logits) -> np.ndarray:
+    """A packed batch's logits at each row's questions' options, in the order `apart` lays the rows."""
+    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
+    return np.concatenate([np.asarray(logits)[window][slots][batch["options"][window][slots]]
+                           for (window, _), slots in zip(rows_of(batch), order, strict=True)])
+
+
+def assert_packed_as_exact(objective, variables, batch, packed, reference):
+    """`packed`, a packed batch's logits and gradients (`decided`), as near the float64 rows in
+    windows of their own as `reference`, within the float64 gate. Each gradient leaf's terms are in
+    float64: a key bias's and the scorer's shared bias gradients cancel (q.b shifts every key's
+    logit alike; the residual gate shifts every option's), and a scalar scale sums every option's
+    terms, so their terms, not their near-zero sizes, are their rounding's scale
+    (tests/reference_error.py)."""
+    rows, segments = apart(batch), objective.bounds.segments
+    with jax.enable_x64(new_val=True):
+        wide = copy.copy(objective)
+        wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
+                         objective.model.head.clone(dtype=jnp.float64)))
+        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
+        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
+    (packed_logits, packed_grads), (logits, grads) = packed, reference
+    assert_leaves_as_exact({"logits": packed_logits, "grads": packed_grads},
+                           {"logits": logits, "grads": grads}, {"logits": truth, "grads": truth_grads},
+                           reductions=objective.layout.max_len, terms={"logits": truth, "grads": terms})
+
+
+ON_THE_PORT = pytest.mark.skipif(jax.default_backend() != "cpu", reason=(
+    "Qwen3.5's delta rule runs on the port on a GPU, where "
+    "test_the_port_runs_a_packed_window_by_its_own_formula holds a packed window and "
+    "test_mixers::test_no_token_reaches_another_document its documents apart"))
+"""The arms over Qwen3.5, whose packing contract runs on the host: packing is the same plumbing on
+every device, and the delta rule's port runs a window as one sequence, its rows' decay prefixes
+shifted by those before them (`linear.FORGET`)."""
+
+
+@pytest.mark.parametrize("arm", [pytest.param("joint", marks=ON_THE_PORT),
+                                 pytest.param("marker", marks=ON_THE_PORT), "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives in a window of its own, through
     Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within the
     float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64. On a GPU the delta rule's port runs a
-    window as one sequence, its rows' decay prefixes shifted by those before them
-    (`linear.FORGET`), which `test_the_port_runs_a_packed_window_by_its_own_formula` holds."""
+    truth is the rows in windows of their own in float64."""
     objective = objective_for(arm)
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
@@ -190,26 +223,10 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     assert int(np.max(laid.segments)) <= laid.max_segments == segments
     variables = objective.init(jax.random.key(0))
     packed_logits, packed_grads = decided(objective, variables, batch, segments)
-    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
-    packed = np.concatenate([np.asarray(packed_logits)[window][asked][batch["options"][window][asked]]
-                             for (window, _), asked in zip(rows_of(batch), order, strict=True)])
     rows = apart(batch)
     logits, grads = decided(objective, variables, rows, segments)
-    with jax.enable_x64(new_val=True):
-        wide = copy.copy(objective)
-        wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
-                         objective.model.head.clone(dtype=jnp.float64)))
-        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        # Each gradient leaf's terms in float64: a key bias's and the scorer's shared bias
-        # gradients cancel (q.b shifts every key's logit alike; the residual gate shifts every
-        # option's), and a scalar scale sums every option's terms, so their terms, not their
-        # near-zero sizes, are their rounding's scale (tests/reference_error.py).
-        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
-        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
-    logits = np.asarray(logits)[rows["options"]]
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
-                           terms={"logits": truth, "grads": terms})
+    assert_packed_as_exact(objective, variables, batch, (asked(batch, packed_logits), packed_grads),
+                           (np.asarray(logits)[rows["options"]], grads))
 
 
 @pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
@@ -228,24 +245,8 @@ def test_the_port_runs_a_packed_window_by_its_own_formula(arm, monkeypatch):
     with monkeypatch.context() as patched:
         patched.setattr(linear, "fla_rule", port_formula)
         logits, grads = decided(objective, variables, batch, segments)
-    rows = apart(batch)
-    with jax.enable_x64(new_val=True):
-        wide = copy.copy(objective)
-        wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
-                         objective.model.head.clone(dtype=jnp.float64)))
-        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
-        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
-    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
-
-    def asked(logits):
-        return np.concatenate([np.asarray(logits)[window][slots][batch["options"][window][slots]]
-                               for (window, _), slots in zip(rows_of(batch), order, strict=True)])
-
-    assert_leaves_as_exact({"logits": asked(packed_logits), "grads": packed_grads},
-                           {"logits": asked(logits), "grads": grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
-                           terms={"logits": truth, "grads": terms})
+    assert_packed_as_exact(objective, variables, batch, (asked(batch, packed_logits), packed_grads),
+                           (asked(batch, logits), grads))
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
