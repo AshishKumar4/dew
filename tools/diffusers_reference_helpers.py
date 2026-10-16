@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -12,7 +13,9 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-from torch_precision import replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from torch_precision import replaced  # noqa: E402
 
 
 def restore_transformers_names() -> None:
