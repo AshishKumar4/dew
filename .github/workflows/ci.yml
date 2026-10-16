@@ -188,8 +188,9 @@ jobs:
     # across four containers of an armada gang, one host each, which reach
     # each other through armada's relay: collectives, the coordinator and
     # local checkpoints cross separate machines, as no one-host test does.
-    # Three gangs run side by side, the two models' layout parity and the
-    # rest (each about 5 min). A commit proven on another push is not run
+    # Its gangs run side by side, one a model's layout parity and one the
+    # rest (each about 5 min), as `ci.py gangs` reads them from the test's
+    # MODELS, so every case runs in one. A commit proven on another push is not run
     # again. One run's armada jobs at a time (`armada`, queued in order): two
     # runs' suites fill the deployment's fleet, and the gangs, which need
     # four containers at once, then wait out their deadline (armada#49).
@@ -218,9 +219,9 @@ jobs:
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
         if [ -z "$PROVEN" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
-          echo '[{"gang": 4, "select": "layouts and dense"}, {"gang": 4, "select": "layouts and moe"},
-                {"gang": 4, "select": "not layouts"}]' \
-            | setsid $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
+          items=$(python3 tools/armada/ci.py gangs)
+          echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
+            --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
             --deadline=1800 --gang-start-timeout=300 \
             --label="${{ github.ref_name }}" -- ".venv-$(tr -d '\n' < .python-version)/bin/python" -m pytest -q \
             -m "not network" -k "{select}" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py \
