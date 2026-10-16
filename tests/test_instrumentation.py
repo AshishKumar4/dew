@@ -321,8 +321,7 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     """A step over eight devices that gathers a bf16 array whole and sums an f32 one across them:
     the shared parser names both collectives (`collective`) and the bytes each result holds, and
     the cluster diagnostic counts each once, an async pair by its `-done`, with those bytes."""
-    from jax.sharding import Mesh, NamedSharding
-    from jax.sharding import PartitionSpec as P
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tool_support import load
 
     from dew.telemetry.instrumentation import collective, hlo_instructions
