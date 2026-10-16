@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_side, recurrence, rule_math, through
+from jax.core import ShapedArray
 from reference_error import assert_as_exact_as_the_reference, equations, widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
@@ -656,9 +657,9 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
     assert calls
     for call in calls:
         query, key, value = [operand.aval for operand in call.invars[1:4]]
-        assert isinstance(query, jax.core.ShapedArray)
-        assert isinstance(key, jax.core.ShapedArray)
-        assert isinstance(value, jax.core.ShapedArray)
+        assert isinstance(query, ShapedArray)
+        assert isinstance(key, ShapedArray)
+        assert isinstance(value, ShapedArray)
         assert key.shape[-1] == 256
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
