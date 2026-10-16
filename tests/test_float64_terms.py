@@ -4,7 +4,9 @@ of squares of the terms its final sums add, carried into it, and nothing behind 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import float64_terms
 
 
@@ -111,3 +113,22 @@ def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
         np.sqrt(np.square(part) @ np.square(kernel[group])) for group, part in enumerate(dense)]), rtol=1e-12)
     np.testing.assert_allclose(gradient_terms, np.stack([
         np.sqrt(np.square(part).T @ np.ones((len(part), 3))) for part in dense]), rtol=1e-12)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_per_device_program_sums_its_terms_and_its_devices_add_them():
+    """A shard_map's program is evaluated op by op on each device's rows, as an
+    expert layer's dispatch runs (`dew.nn.moe`): its dot has the dense dot's
+    terms, and its kernel's gradient, each device's rows summed and the map's
+    transpose adding them across devices (`psum`), has every row's, as one
+    device summing them all would, not its own size."""
+    rng = np.random.default_rng(5)
+    rows, kernel, probe = rng.normal(size=(8, 4)), rng.normal(size=(4, 3)), rng.normal(size=(8, 3))
+    mapped = jax.shard_map(jnp.matmul, mesh=Mesh(np.array(jax.devices()[:2]), ("data",)),
+                           in_specs=(P("data"), P()), out_specs=P("data"), check_vma=False)
+
+    with jax.enable_x64(new_val=True):
+        _, terms = float64_terms(mapped, rows, kernel)
+        _, gradient_terms = float64_terms(jax.grad(lambda w, x: jnp.sum(mapped(x, w) * probe)), kernel, rows)
+    np.testing.assert_allclose(terms, np.sqrt(np.square(rows) @ np.square(kernel)), rtol=1e-12)
+    np.testing.assert_allclose(gradient_terms, np.sqrt(np.square(rows).T @ np.square(probe)), rtol=1e-12)
