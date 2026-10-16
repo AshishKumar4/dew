@@ -336,12 +336,16 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
 
 
 def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """A gated norm's fp32 gate `act(gate)` and its derivative, for 'silu' or 'sigmoid'."""
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+
+    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
+    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
     sigmoid = jax.nn.sigmoid(gate)
+    slope = sigmoid * (1.0 - sigmoid)
     if activation == 'sigmoid':
-        return sigmoid, sigmoid * (1.0 - sigmoid)
-    activated = gate * sigmoid
-    return activated, activated * (1.0 - sigmoid) + sigmoid
+        return sigmoid, slope
+    return gate * sigmoid, sigmoid + gate * slope
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
@@ -684,10 +688,9 @@ def _product(gate, up, dtype, interpret: bool):
 
 
 def _gradients(gate, up, dy):
-    """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate."""
-    sigmoid = jax.nn.sigmoid(gate)
-    activated = gate * sigmoid
-    return dy * (activated * (1.0 - sigmoid) + sigmoid) * up, dy * activated
+    """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate (`_activated`)."""
+    activated, slope = _activated(gate, 'silu')
+    return dy * slope * up, dy * activated
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
