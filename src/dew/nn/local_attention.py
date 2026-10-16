@@ -13,7 +13,7 @@ from .attention import (
     attention_kernel,
     chunk_mask,
     combined_attention_mask,
-    cudnn_runs,
+    cudnn_takes_mask,
     kernel_for_materialized_mask,
     resolve_implementation,
     scaled_dot_product_attention,
@@ -90,9 +90,10 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     # asked for 10.0 GiB at 8192). Flash takes no mask, so where 'auto' chose
     # it for the window, a masked call still goes to cudnn.
     on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and resolved == 'flash'
-                                       and sinks is None and cudnn_runs(query, softcap))
+                                       and cudnn_takes_mask(implementation, query, softcap=softcap,
+                                                            sinks=sinks is not None))
     masked = 'cudnn' if on_cudnn else kernel_for_materialized_mask(
-        implementation, query, dtype=dtype, precision=precision,
+        implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax)
     if window is not None and valid is None:
         # An explicit 'tpu' at a length splash cannot tile would reach the

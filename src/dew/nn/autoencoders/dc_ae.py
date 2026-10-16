@@ -503,8 +503,8 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-               subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None
-               ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
+               subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None,
+               lazy: bool = False) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published DC-AE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo holding its config.json and
     weights, such as `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers` (the root)
@@ -512,7 +512,8 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     the module declares must be published, in the shape it declares.
 
     Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
+    placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderDC":
         raise ValueError(f"{directory} holds a {config.get('_class_name')}, not an AutoencoderDC")
@@ -523,4 +524,4 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
         directory, "vae", config, model, dc_ae_path,
         lambda bound: DCAutoencoder(model=model, params=bound,
                                     latent_scale=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, inputs=(frame,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))

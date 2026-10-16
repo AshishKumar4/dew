@@ -8,6 +8,7 @@
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
+    python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -67,6 +68,7 @@ DIR/coverage.md, a module a line, the least covered first:
 """
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import hashlib
@@ -449,6 +451,13 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
+CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+              "HF_ENDPOINT": "http://127.0.0.1:9"}
+"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`-m "not network"`):
+the libraries offline, and the Hub's address a closed port for any that would ask it regardless. A
+test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
          grace: float = 60.0, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
@@ -496,7 +505,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True,
-                            env={**os.environ, **environ, "PYTHONPATH": path,
+                            env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
                                  "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
@@ -782,6 +791,23 @@ def coverage_report(directory: Path) -> int:
     return 0
 
 
+GANG = 4
+"""Ranks of each multi-host gang: four containers, one host each."""
+
+
+def gangs(source: Path = Path("tests/test_multihost.py")) -> list[dict]:
+    """The multi-host gangs CI runs side by side, as armada map items: one a model of `source`'s
+    MODELS, for its layouts across hosts, and one for every other test, so each case runs in
+    exactly one of them and a model added there is a gang of its own. Read from the source, as
+    the CI runner has no Dew to import it."""
+    models = next(ast.literal_eval(node.value) for node in ast.parse(source.read_text()).body
+                  if isinstance(node, ast.Assign) and [target.id for target in node.targets
+                                                       if isinstance(target, ast.Name)] == ["MODELS"])
+    own = [f"layouts and {model}" for model in models]
+    return [{"gang": GANG, "select": select} for select in own] + [
+        {"gang": GANG, "select": " and ".join(f"not ({select})" for select in own)}]
+
+
 def pythons(*, check: bool) -> int:
     """Print the tested versions, one a line; with `check`, refuse the files that name them apart."""
     if not check:
@@ -836,6 +862,7 @@ def main() -> int:
     lane.add_argument("--cache", choices=("on", "off"), required=True)
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
+    operations.add_parser("gangs")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
@@ -845,6 +872,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
+    if args.operation == "gangs":
+        print(json.dumps(gangs()))
+        return 0
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")

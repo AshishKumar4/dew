@@ -24,9 +24,12 @@ from .common import (
     ProjectorBase,
     TowerBase,
     TowerGeometry,
-    _image_size,
+    _side,
     _vision_section,
+    activation_name,
     head_width,
+    refuse_dropout,
+    trunk_geometry,
 )
 
 
@@ -205,28 +208,15 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     name, and a nonzero dropout refuses as training-only.
     """
     vision = _vision_section(hf_config)
-    hidden = records.integer(vision["hidden_size"], "hidden_size")
-    patch = vision.get("patch_size", 16)
-    if isinstance(patch, (list, tuple)):
-        patch = patch[0]
-    activation = str(vision.get("hidden_act", vision.get("hidden_activation",
-                                                         "gelu_pytorch_tanh")))
-    if activation not in ("gelu_pytorch_tanh", "gelu"):
-        raise ValueError(
-            f"hidden_act {activation!r} is not expressible: this trunk runs tanh or "
-            "exact gelu")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout"):
-        raise ValueError("attention_dropout is training-time; this trunk runs eval")
+    refuse_dropout(vision, "attention_dropout")
     return {
         "class": "siglip", "fields": {
-        "hidden_size": hidden,
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": _image_size(vision.get("image_size", 224), "image_size"),
-        "patch_size": records.integer(patch, "patch_size"),
+        **trunk_geometry(vision),
+        "image_size": _side(vision.get("image_size", 224), "image_size"),
+        "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "hidden_act": activation,
+        "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
+                                      ("hidden_act", "hidden_activation")),
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
 
