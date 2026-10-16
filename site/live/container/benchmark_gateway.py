@@ -72,9 +72,9 @@ def collect(client, message, timeout=30):
             return stdout
 
 
+# A cell's caps hold from the cell after the one that installs them (live_training.install).
+CAPS = "import live_training\nlive_training.install()"
 TRAINING_PROBE = """
-import live_training
-live_training.install()
 for score in ("-1000", "-999", "0"):
     try:
         with open("/proc/self/oom_score_adj", "w") as file:
@@ -153,6 +153,7 @@ def training():
     client.start_channels()
     try:
         ready(client)
+        execute(client, CAPS)
         lines = execute(client, TRAINING_PROBE).splitlines()
         assert lines[0] == "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.", lines
         assert lines[1] == ("Live run: steps 1000 -> 20, log_every 100 -> 5, "
@@ -181,9 +182,10 @@ def cells():
 
 
 def cell(name, code):
-    # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py);
-    # the last line, printed only when the cell finished, is what the run kept resident.
-    code = ("import live_training\nlive_training.install()\n" + code + "\nimport resource\n"
+    # The bridge installs the caps in every training context first, as a cell of its own (PRELOAD,
+    # shared_bridge.py); the last line, printed only when the cell finished, is what the run kept
+    # resident.
+    code = (code + "\nimport resource\n"
             "print('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n")
     kernel = request("/api/kernels", {"name": "dew-train"})
     client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
@@ -192,6 +194,7 @@ def cell(name, code):
     started = time.perf_counter()
     try:
         ready(client)
+        execute(client, CAPS)
         output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
     except Exception as error:
         raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
@@ -335,8 +338,7 @@ def measured(kernels, count):
     with concurrent.futures.ThreadPoolExecutor(len(kernels)) as pool:
         futures = [pool.submit(run, kernel, range(index, count, len(kernels)))
                    for index, kernel in enumerate(kernels)]
-        rows = [row for future in futures for row in future.result()]
-    return rows
+        return [row for future in futures for row in future.result()]
 
 
 def report(kernels, rows, count):

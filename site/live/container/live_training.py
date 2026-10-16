@@ -1,17 +1,21 @@
 """Bounds a live training cell to a couple of minutes on a shared 4-vCPU host.
 
 A training context runs Dew itself, not the stand-ins of model_client.
-`install` has IPython run each cell with its own calls capped (`Capped`): a
-`load` or `loader` call's batch, a dataset's or a recipe's (whose `load` reads
-its batch through `dew.config.data.loader`), at BATCH, and a `fit` call's steps
-at STEPS, logging at least four times. Each cap prints what it changed before
-the run's own output, so the cell's first lines say how this run differs from
-the code on the page.
+`install` has IPython run each cell with its calls that name a batch, steps
+or log_every, or unpack keywords, passed through `capped`: a Dew `load` or
+`loader` (a dataset's or a recipe's, whose `load` reads its batch through
+`dew.config.data.loader`) reads batches of at most BATCH, and a Dew `fit` runs
+at most STEPS steps, logging at least four times. Each cap prints what it
+changed before the run's own output, so the cell's first lines say how this
+run differs from the code on the page.
 """
 
 import ast
+import inspect
 
 BATCH, STEPS = 8, 20
+CAPPED = ("batch", "steps", "log_every")
+"""The keywords a call names that `Capped` sends through `capped`, beside any `**` it unpacks."""
 
 
 def batch(asked):
@@ -22,7 +26,7 @@ def batch(asked):
     return asked
 
 
-def fitted(steps, log_every=100):
+def fitted(steps, log_every):
     """A `fit` call's steps and log_every: more than STEPS steps lowered to STEPS, logging at least four
     times."""
     changed, cut = [], steps > STEPS
@@ -38,31 +42,36 @@ def fitted(steps, log_every=100):
     return {"steps": steps, "log_every": log_every}
 
 
-def _here(name: str) -> ast.expr:
-    """This module's `name`, as a cell reaches it without binding a name of its own."""
-    module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("live_training")], [])
-    return ast.Attribute(module, name, ast.Load())
+def capped(call, /, *args, **options):
+    """`call(*args, **options)`, its keywords capped where `call` is Dew's: a `load` or `loader`'s batch
+    (`batch`), a `fit`'s steps and log_every, the latter its own default where the cell names none
+    (`fitted`). Whatever name the cell calls it by, and however it passes the keywords."""
+    if (getattr(call, "__module__", None) or "").split(".")[0] == "dew":
+        name = getattr(call, "__name__", "")
+        if name in ("load", "loader") and "batch" in options:
+            options["batch"] = batch(options["batch"])
+        elif name == "fit" and "steps" in options:
+            default = inspect.signature(call).parameters["log_every"].default
+            options.update(fitted(options["steps"], options.get("log_every", default)))
+    return call(*args, **options)
 
 
 class Capped(ast.NodeTransformer):
-    """A cell with its `load` and `loader` calls' batch passed through `batch`, and its `fit` calls' steps
-    and log_every through `fitted`, as IPython runs every cell of a training context (`install`)."""
+    """A cell with each call that names one of `CAPPED` or unpacks keywords made through `capped`, as
+    IPython runs every cell of a training context (`install`)."""
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         self.generic_visit(node)
-        callee = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        named = {keyword.arg: keyword for keyword in node.keywords if keyword.arg is not None}
-        if callee in ("load", "loader") and "batch" in named:
-            named["batch"].value = ast.Call(_here("batch"), [named["batch"].value], [])
-        if callee == "fit" and "steps" in named:
-            fitting = ("steps", "log_every")
-            capped = [named[name].value for name in fitting if name in named]
-            node.keywords = [keyword for keyword in node.keywords if keyword.arg not in fitting]
-            node.keywords.append(ast.keyword(None, ast.Call(_here("fitted"), capped, [])))
-        return node
+        if not any(keyword.arg is None or keyword.arg in CAPPED for keyword in node.keywords):
+            return node
+        # This module, as a cell reaches it without binding a name of its own.
+        module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("live_training")], [])
+        return ast.Call(ast.Attribute(module, "capped", ast.Load()), [node.func, *node.args], node.keywords)
 
 
 def install():
+    """Cap every later cell of this kernel: IPython transforms a cell before it runs any of it, so the
+    cell that installs this is not one of them."""
     from IPython import get_ipython
 
     get_ipython().ast_transformers.append(Capped())

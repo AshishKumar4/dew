@@ -310,26 +310,30 @@ def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
 
 def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps(tmp_path):
     """In a training context (live_training.install), a cell's bare source through dew.data.load, a
-    recipe through its loader and a recipe's own load each read batches of BATCH rows, and its fit
-    runs STEPS steps logging four times, each saying so first: IPython runs the cell with its calls
-    capped, and Dew's own functions are untouched."""
+    recipe through its loader and a recipe's own load each read batches of BATCH rows, and its fit,
+    called by another name with its steps unpacked, trains STEPS steps, each saying so first: IPython
+    runs the cell with its calls capped, and Dew's own functions are untouched."""
     import numpy as np
 
     np.arange(400, dtype=np.uint16).tofile(tmp_path / "train.bin")
     np.arange(400, dtype=np.uint16).tofile(tmp_path / "val.bin")
     cell = f"""
+from dew import Trainer
+from dew.config import OptimConfig
 from dew.config.data import TextData, loader
 from dew.data import Loading, Memory, load
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective
 windows = TextData(source={str(tmp_path)!r}, seq_len=4, stride=1)
 options = dict(read="memory", loading=Loading(workers=0), validation_records=32)
 bare = load(Memory([{{"id": index}} for index in range(320)]), batch=64, provision=False,
             loading=Loading(workers=0))
 batches = [bare.batch, loader(windows, batch=64, **options).batch, windows.load(batch=64, **options).batch]
-class Fitting:
-    def fit(self, data, *, steps, log_every=100):
-        return steps, log_every
-fits = [Fitting().fit(bare, steps=1000), Fitting().fit(bare, steps=3, log_every=1)]
-print(json.dumps([batches, fits, load is dew.data.load]))
+model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
+                          max_seq_len=4)
+run = Trainer(LMObjective(model, seq_len=4), OptimConfig(learning_rate=1e-3), key=0).fit
+state = run(windows.load(batch=64, **options), **dict(steps=1000))
+print("ran", json.dumps([batches, int(state.step), load is dew.data.load]))
 """
     code = f"""
 import json, sys
@@ -344,9 +348,10 @@ shell.run_cell({cell!r}).raise_error()
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
-    *said, ran = done.stdout.strip().splitlines()
-    assert json.loads(ran) == [[8, 8, 8], [[20, 5], [3, 1]], True]
-    assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3 + [
+    lines = done.stdout.strip().splitlines()
+    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8], 20, True]
+    assert [line for line in lines if line.startswith("Live run:")] == [
+        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 4 + [
         "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
 
 
