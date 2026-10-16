@@ -305,14 +305,11 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
 
 def link_topology(mesh: Mesh, axis: str) -> str:
     """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
-    order, and its devices in the mesh's order, each by id, process, kind, slice and, where the
-    platform reports them, coordinates and core. Two meshes of one shape over other devices, or over
-    the same devices grouped otherwise along the axis, are other links; one built again over the same
-    placement is the same."""
-    devices = [[device.id, device.process_index, device.device_kind, _slice(device),
-                list(device.coords) if hasattr(device, "coords") else None,
-                device.core_on_chip if hasattr(device, "core_on_chip") else None]
-               for device in mesh.devices.flat]
+    order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
+    its place in its system, so two meshes of one shape over other devices, or over the same devices
+    grouped otherwise along the axis, are other links; one built again over the same placement is the
+    same."""
+    devices = [[device.id, device.process_index, device.device_kind, _slice(device)] for device in mesh.devices.flat]
     return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
 
 
