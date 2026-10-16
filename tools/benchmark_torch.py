@@ -845,7 +845,7 @@ def main():
         vocab_size=case.config.get('vocab_size'), params=n_params,
         warmup=args.warmup, warmup_s=round(warmup_s, 1), steps=args.steps,
         ms_per_step=step_s * 1e3, samples_per_sec=case.batch_size / step_s,
-        tokens_per_sec=work.tokens_per_step / step_s,
+        tokens_per_sec=work.tokens_per_step / step_s if work.tokens_per_step else None,
         event_ms_median=float(np.median(per_step)), event_ms_p10=float(np.percentile(per_step, 10)),
         event_ms_p90=float(np.percentile(per_step, 90)),
         inter_step_gap_ms_median=float(np.median(gaps)) if len(gaps) else None,

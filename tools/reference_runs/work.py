@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.flops import MissingFlopsCount
 from dew.objectives.base import Batch, Objective
 from dew.registry import to_record
 from dew.telemetry.workload import WorkloadWork
@@ -28,11 +29,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def measure(objective: Objective, batch: Batch) -> WorkloadWork:
-    """Use the trainer's objective assembly on the complete host batch."""
+    """Use the trainer's objective assembly on the complete host batch.
+
+    A model with no token geometry, a U-Net's convolutions, counts 0 tokens.
+    """
     model = objective.program_key()[0].module
+    try:
+        tokens = int(np.sum(objective.real_lengths(batch)))
+    except MissingFlopsCount:
+        tokens = 0
     return WorkloadWork(
         training_flops_per_step=objective.training_flops(None, batch),
-        tokens_per_step=int(np.sum(objective.real_lengths(batch))),
+        tokens_per_step=tokens,
         basis="analytic, real tokens, causal half where applicable, objective training rule",
         model_identity=json.dumps(to_record(model, nn.Module), sort_keys=True),
         batch_shape=np.shape(batch[objective.inputs.sample.key]))
