@@ -69,8 +69,8 @@ LAYERS = {
         qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, **policy),
     "kpool": lambda **policy: KPoolSparseAttention(
         emb_features=32, num_heads=4, max_seq_len=32, q_lora_rank=8, kv_lora_rank=8,
-        qk_nope_head_dim=8, v_head_dim=8, index_n_heads=2, index_head_dim=8, index_topk=4,
-        index_kpool=2, **policy),
+        qk_nope_head_dim=8, qk_rope_head_dim=0, v_head_dim=8, index_n_heads=2, index_head_dim=8,
+        index_topk=4, index_kpool=2, **policy),
 }
 
 

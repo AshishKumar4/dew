@@ -34,11 +34,9 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 
 from .attention import (
     LayerNorm,
-    RMSNorm,
     cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
@@ -47,9 +45,9 @@ from .attention import (
 )
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import MixerBase, MixerContext
-from .mla import INDEXER, latent_refusals, open_mla_cache
+from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
 from .precision import at_least_fp32
-from .sharding import RESIDUAL, constrain, down_projection
+from .sharding import down_projection
 from .sparse_selection import index_scores, selection_mask, top_k_selection
 
 
@@ -206,16 +204,18 @@ class KPoolIndexer(nn.Module):
 
 
 # The latent projections and norms carry MLA's declarations under the same names.
-class KPoolSparseAttention(nn.Module):
+class KPoolSparseAttention(MultiHeadLatentAttention):
     """GLM-5.3-Flash's `deepseek_sparse_attention` layer
-    (`Glm5NextTextAttention`, modeling_glm5_next.py:1064-1256).
+    (`Glm5NextTextAttention`, modeling_glm5_next.py:1064-1256): the latent
+    attention (`MultiHeadLatentAttention`) with no rope head
+    (`qk_rope_head_dim=0`, `rotary=False`), its projections, latent norms,
+    expansion and output, under the k-pool indexer's selection.
 
-    Low-rank queries (`q_a_proj`, `q_a_layernorm`, `q_b_proj`) and a latent the
-    keys and values expand from (`kv_a_proj_with_mqa`, `kv_a_layernorm`,
-    `kv_b_proj`), the logits scaled by `qk_nope_head_dim`. Each query attends its
-    `KPoolIndexer` selection through an fp32 softmax over the reference's eager
-    boolean mask; the indexer folds causality and row validity in, and an
-    invalid query's selection is blank (modeling_glm5_next.py:801, 875).
+    Each query attends its `KPoolIndexer` selection through an fp32 softmax
+    over the reference's eager boolean mask; the indexer folds causality and
+    row validity in, and an invalid query's selection is blank
+    (modeling_glm5_next.py:801, 875). The logits scale by `qk_nope_head_dim`,
+    the whole query width.
 
     decode=True runs against a `max_seq_len`-slot cache of expanded keys,
     values and packed indexer state, causality read off the slots. Packed
@@ -229,55 +229,27 @@ class KPoolSparseAttention(nn.Module):
     """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): its pools read each document's own
     consecutive keys, with no mask or bias to narrow them."""
 
-    emb_features: int
-    num_heads: int
-    max_seq_len: int
-    q_lora_rank: int
-    kv_lora_rank: int
-    qk_nope_head_dim: int
-    v_head_dim: int
-    index_n_heads: int
-    index_head_dim: int
-    index_topk: int
-    index_kpool: int
+    rotary: bool = False
+    index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
-    norm_eps: float = 1e-5
-    scale_offset: bool = False
-    scale_after_cast: bool = False
-    attention_bias: bool = False
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
 
     def setup(self):
-        if self.qk_nope_head_dim < 1 or self.v_head_dim < 1:
+        if self.qk_rope_head_dim or self.rotary:
+            raise ValueError("the k-pool layer has no rope head: qk_rope_head_dim=0 and rotary=False")
+        if self.q_lora_rank is None or None in (self.index_n_heads, self.index_head_dim, self.index_topk):
             raise ValueError(
-                "the nope head dim and the value head dim must be positive, "
-                f"got {self.qk_nope_head_dim} and {self.v_head_dim}")
+                "the k-pool layer's queries are low rank and its indexer selects: q_lora_rank, "
+                "index_n_heads, index_head_dim and index_topk have to be set")
         if self.index_n_heads < 1 or self.index_head_dim < 1:
             raise ValueError(
                 "the indexer needs heads of a positive width, got "
                 f"{self.index_n_heads} of {self.index_head_dim}")
-        dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        # The reference's low-rank second halves take no bias, whatever
-        # attention_bias says (modeling_glm5_next.py:1105-1121).
-        self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
-        self.q_a_layernorm = norm(name='q_a_layernorm')
-        self.q_b_proj = nn.Dense(
-            self.num_heads * self.qk_nope_head_dim, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name='q_b_proj')
-        self.kv_a_proj_with_mqa = dense(self.kv_lora_rank, name='kv_a_proj_with_mqa')
-        self.kv_a_layernorm = norm(name='kv_a_layernorm')
-        self.kv_b_proj = nn.Dense(
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), use_bias=False,
-            dtype=self.dtype, precision=self.precision, name='kv_b_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj')
-        self.indexer = KPoolIndexer(
+        super().setup()
+
+    def make_indexer(self) -> nn.Module:
+        """The k-pool indexer, by GLM-5.3-Flash's fields."""
+        return KPoolIndexer(
             emb_features=self.emb_features, n_heads=self.index_n_heads, head_dim=self.index_head_dim,
             top_k=self.index_topk, kpool=self.index_kpool,
             always_select_tail=self.index_kpool_always_select_tail,
@@ -298,19 +270,10 @@ class KPoolSparseAttention(nn.Module):
             if valid.shape != (batch, length):
                 raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
         row_valid = jnp.ones((batch, length), bool) if valid is None else valid
-        # The projections carry the names a remat policy saves or offloads
-        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
-        # The latents project the residual down where `down_projection` places
-        # them: on each tensor shard's own tokens where the link pays for
-        # gathering them back for the head-split up-projections.
+        # The latent attention's own projections, with no rope head.
         place = down_projection(x, self.q_lora_rank + self.kv_lora_rank)
-        q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
-        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
-            batch, length, self.num_heads, self.qk_nope_head_dim)
-        latent = constrain(self.kv_a_layernorm(self.kv_a_proj_with_mqa(constrain(x, place))), place)
-        kv = checkpoint_name(self.kv_b_proj(constrain(latent, RESIDUAL)), 'kv_proj').reshape(
-            batch, length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        key, value = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
+        query, q_resid = self._queries(x, place)
+        key, value = self._expand(*self._latents(x, place))
         packed = self.indexer.packed(x, row_valid)
         implementation = self.attention_impl
         if decode:
@@ -374,7 +337,7 @@ class KPoolSparseAttention(nn.Module):
         mask = jnp.logical_and(selected, row_valid[:, :, None])[:, None]
         # The per-head maxima the QK-Clip reads, over the selected keys,
         # with the nope width the clip splits the latent projections by.
-        if not self.is_initializing() and self.is_mutable_collection("qk"):
+        if self._qk_open():
             self.sow("qk", "max_logits", max_attention_logits(query, key, mask=mask))
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
@@ -388,8 +351,7 @@ class KPoolSparseAttention(nn.Module):
         unselected = jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
         uniform = jnp.mean(value.astype(jnp.float32), axis=1, keepdims=True).astype(attention.dtype)
         attention = jnp.where(unselected, uniform, attention)
-        return checkpoint_name(self.o_proj(checkpoint_name(attention, 'context').reshape(
-            batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
+        return self._output(attention, x)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -435,6 +397,7 @@ class KPoolSparseAttentionMixer(MixerBase):
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
             qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=0,
             v_head_dim=self.v_head_dim,
             index_n_heads=self.index_n_heads,
             index_head_dim=self.index_head_dim,
