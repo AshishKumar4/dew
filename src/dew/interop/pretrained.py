@@ -115,33 +115,32 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
     return max(rank - 2, 0)
 
 
-def _language_layout(name: str, text_name: str, tensor: np.ndarray,
-                     config, model_type: str, variables: Mapping[str, object],
-                     component: str | None = None) -> WeightLayout | None:
-    """Return the leaves the text family maps a source tensor to and the
-    storage operations that rebuild it from them; a `packed` tensor is built
-    from the layouts of its parts."""
+def _reading_layout(name: str, reading: decoder_parts.Reading, config, model_type: str,
+                    variables: Mapping[str, object], component: str | None = None) -> WeightLayout | None:
+    """The binding of the stored tensor `name` that the text family reads as `reading`
+    (`DecoderFamily.readings`): the leaves its parts fill and the storage operations that rebuild
+    it from them, a `packed` tensor's from the layouts of its parts; None where no leaf takes it."""
     family = decoders.families()[model_type]
-    packing = family.packing(text_name)
-    if packing is None:
-        return _leaf_layout(name, text_name, tensor, family, config, variables, component)
-    parts = [_leaf_layout(part, part, value, family, config, variables, component)
-             for part, value in packing.split(text_name, tensor, config).items()]
+    if reading.packing is None:
+        # The tensor as stored, which `prepare` may have reshaped for the tree.
+        stored = reading.parts[0]._replace(tensor=reading.stored)
+        return _leaf_layout(name, stored, family, variables, component)
+    parts = [_leaf_layout(part.name, part, family, variables, component) for part in reading.parts]
     if any(part is None for part in parts):
         raise ValueError(f"packed tensor {name!r} has no parameter path")
-    return packing.layout(name, [part for part in parts if part is not None], config)
+    return reading.packing.layout(name, [part for part in parts if part is not None], config)
 
 
-def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_parts.DecoderFamily,
-                 config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
+def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.DecoderFamily,
+                 variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    path = family.source_path(text_name, config)
-    if path is None:
+    tensor = part.tensor
+    if part.path is None:
         return None
-    path, expert_index = _stacked_expert(path)
+    path, expert_index = _stacked_expert(part.path)
     paths = (nested(path),)
     if path[-1] == "kernel" and tensor.ndim == 2:
         lead = _leading_axes(variables, paths[0], expert_index)
@@ -149,16 +148,20 @@ def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_
     # A floating weight is written in its leaf's dtype; an index table
     # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
-    padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
+    padded = tensor.shape[0] if part.name.endswith(family.zero_padded) else None
     return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 
 
-def _wrapper_layouts(tensors, record, variables):
+def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading]):
     """Return one `WeightLayout` per wrapper source tensor.
 
     Each layout keeps the source's own tensor name and points at the leaf path
-    the loader built, so an export writes the names the source shipped.
+    the loader built, so an export writes the names the source shipped. The
+    language model's tensors bind through the readings its load placed
+    (`language`, by its local names), an alias of a local name through the
+    same one.
     """
+    readings = {reading.name: reading for reading in language}
     from dew.nn import vision
     from dew.nn.vision.common import projector_weight_path
 
@@ -169,8 +172,8 @@ def _wrapper_layouts(tensors, record, variables):
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
         if group == "language_model":
-            layout = _language_layout(name, local, tensor, record["text"], record["text_model_type"],
-                                      variables, "language_model")
+            layout = _reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
+                                     record["text_model_type"], variables, "language_model")
             if layout is None:
                 retained[name] = tensor
             else:
@@ -1157,14 +1160,18 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     return scheme.apply(model), {**variables, QUANTIZATION: held}
 
 
-def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
-                     variables: Variables) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
-    """Each source tensor's binding into the tree, and the tensors none binds."""
+def _decoder_layouts(readings: Sequence[decoder_parts.Reading], record: decoder_parts.DecoderFields,
+                     family: str, variables: Variables
+                     ) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+    """Each source tensor's binding into the tree, from the readings the load placed, and the
+    tensors none binds."""
     bindings, retained = [], {}
-    for name, tensor in tensors.items():
-        binding = _language_layout(name, name, tensor, record, family, variables)
+    for reading in readings:
+        if reading.stored is None:
+            continue
+        binding = _reading_layout(reading.name, reading, record, family, variables)
         if binding is None:
-            retained[name] = tensor
+            retained[reading.name] = reading.stored
         else:
             bindings.append(binding)
     return tuple(bindings), retained
@@ -1189,7 +1196,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    parts, language = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
     for fields in (text_fields, record['text']):
         decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
@@ -1198,7 +1205,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
-    layouts, retained = _wrapper_layouts(tensors, record, variables)
+    layouts, retained = _wrapper_layouts(tensors, record, variables, language)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
 
@@ -1234,8 +1241,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    variables = decoders.with_constants(decoders.translate_weights(
-        tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
+    placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy)
+    variables = decoders.with_constants(placed, record, directory)
     decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
@@ -1249,7 +1256,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     entry = decoders.families()[family]
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
-        layouts, retained = _decoder_layouts(tensors, record, family, variables)
+        layouts, retained = _decoder_layouts(readings, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
 
