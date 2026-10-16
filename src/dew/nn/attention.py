@@ -2080,8 +2080,9 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     in the calling module, the matrix stored as `projected_heads` stores its
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
+        # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
         return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
-            attended.reshape(*attended.shape[:-2], -1))
+            attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
                            name=name)(attended)
 
