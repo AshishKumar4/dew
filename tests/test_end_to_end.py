@@ -35,8 +35,10 @@ from dew.objectives.diffusion.end_to_end import (
     AUTOENCODER,
     LATENT_STATS,
     PERCEPTUAL,
+    TUNED_WEIGHTS,
     EndToEnd,
     PatchDiscriminator,
+    TunedAutoEncoder,
 )
 from dew.objectives.diffusion.objective import DISCRIMINATOR
 from dew.sampling import Euler, TextToImage
@@ -147,11 +149,28 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     published = TextToImage.from_objective(task, state.variables)
     assert AUTOENCODER not in published.variables["params"] and LATENT_STATS not in published.variables
     assert DISCRIMINATOR not in published.variables["params"]
-    for got, want in zip(jax.tree.leaves(published.variables["autoencoder"]),
+    tuned = published.variables["autoencoder"]
+    for got, want in zip(jax.tree.leaves(tuned[TUNED_WEIGHTS]),
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    np.testing.assert_allclose(np.asarray(published.autoencoder.latent_scale),
-                               1 / np.sqrt(np.asarray(after["var"])), rtol=1e-6)
+    # A later publication, its statistics moved on, is the same static autoencoder: a compiled
+    # decode is reused, and each decodes by its own statistics, none kept as the first's constants.
+    moved = {"mean": after["mean"] + 1.0, "var": 4.0 * after["var"]}
+    later = TextToImage.from_objective(task, {**state.variables, LATENT_STATS: moved})
+    assert later.autoencoder == published.autoencoder
+    assert hash(later.autoencoder) == hash(published.autoencoder)
+    decode = jax.jit(lambda autoencoder, params, z: autoencoder.decode(params, z), static_argnums=0)
+    z = jax.random.normal(jax.random.PRNGKey(4), (1, *task.latent_shape))
+    for publication, statistics in ((published, after), (later, moved)):
+        shift = np.asarray(statistics["mean"])
+        scale = 1 / np.sqrt(np.asarray(statistics["var"]))
+        np.testing.assert_allclose(np.asarray(publication.autoencoder.normalization(
+            publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
+        weights = tuned[TUNED_WEIGHTS]
+        expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
+        decoded = decode(publication.autoencoder, publication.variables["autoencoder"], z)
+        np.testing.assert_allclose(np.asarray(decoded), np.asarray(expected), rtol=1e-5, atol=1e-6)
+    assert decode._cache_size() == 1
 
 
 SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT, DISCRIMINATOR_WIDTH = 32, 4, 2, 12, 6, 10, 0.1, 8
@@ -484,10 +503,11 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
     np.testing.assert_array_equal(STEPPED["latents/latents_bias_f64"], STEPPED["bn/running_mean_f64"])
     np.testing.assert_allclose(STEPPED["latents/latents_scale_f64"],
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
-    decoder, _ = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
-    assert decoder is not None
-    np.testing.assert_array_equal(np.asarray(decoder.latent_shift), np.asarray(statistics["mean"]))
-    np.testing.assert_allclose(np.asarray(decoder.latent_scale, np.float64),
+    decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
+    assert isinstance(decoder, TunedAutoEncoder)
+    shift, scale = decoder.normalization(decoding["autoencoder"])
+    np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
+    np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
 
 
