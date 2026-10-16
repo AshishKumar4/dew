@@ -289,13 +289,12 @@ class YarnScaling:
 
     Both released DeepSeek configs carry this spelling (rope_type yarn,
     factor 40 off 4096 base positions), so the record keeps the reference's
-    names and a translation renames nothing. `rope_theta` repeats the
-    mixer's own base, and the two must agree, so the scaling is configured
-    once (the mscale is applied in the attention as a query pre-scale).
+    names and a translation renames nothing. The ramp transforms the base of
+    the layer it rides on (`MixerContext.rope_theta`), which it does not
+    repeat; the mscale is applied in the attention as a query pre-scale.
     """
 
     rope_type: str = 'yarn'
-    rope_theta: float = 10000.0
     factor: float = 40.0
     original_max_position_embeddings: int = 4096
     beta_fast: float = 32.0

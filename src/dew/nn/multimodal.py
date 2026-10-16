@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates
+from dew.nn.inputs import Coordinates, next_position
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -390,16 +390,18 @@ class MultimodalTransformer(nn.Module):
             tokens = jnp.where(placeholder, self.pad_token_id, tokens)
         if decode:
             allocated = self.has_variable("cache", "next_position")
-            next_position = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
+            cursor = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
             valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
-            logical = rotary_positions if rotary_positions is not None else positions
-            if logical is None:
-                logical = next_position.value[:, None] + jnp.cumsum(valid, axis=1) - 1
-                positions = logical
-            mask = valid if logical.ndim == 2 else valid[..., None]
-            maximum = jnp.max(jnp.where(mask, logical, -1), axis=tuple(range(1, logical.ndim)))
+            if rotary_positions is None and positions is None:
+                positions = cursor.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+            # The response's rule (`next_position`): past the last real token's position, or past
+            # the largest coordinate of a multi-axis one.
+            fields = {name: value for name, value in (("rotary_positions", rotary_positions),
+                                                      ("positions", positions)) if value is not None}
+            following = next_position(fields, valid)
+            assert following is not None
             if allocated:
-                next_position.value = jnp.where(valid.any(axis=1), maximum + 1, next_position.value)
+                cursor.value = jnp.where(valid.any(axis=1), following, cursor.value)
         if conditioning is None and self.is_initializing():
             self.conditioner.initialize_parameters()
             if self.audio is not None:

@@ -42,7 +42,7 @@ python examples/sft_diffusion_gemma.py \
 JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 ```
 
-`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations. [`Chat`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. The smoke run writes three canned conversations as JSONL and renders them with the fixture tokenizer's own template.
+`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations. [`ChatCanvasData`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. Each assistant turn becomes one row: the conversation before it, padded to `--prompt-tokens`, is the clean prompt, and the turn alone fills the canvases the denoiser scores, with EOS closing its last canvas. The smoke run writes three canned conversations, one of them two turns long, as JSONL and renders them with the fixture tokenizer's own template.
 
 ## Full-weight SFT of a Gemma 4 decoder
 
@@ -59,7 +59,7 @@ python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemm
 JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 ```
 
-The script binds `--dataset` to a Hub Source and gives it to a Chat recipe. A local JSONL or Parquet file uses its path directly. The recipe renders each conversation with the checkpoint's chat template; the source selects `train[:N]` when `--rows N` is set. The smoke run writes canned JSONL conversations and fine-tunes the committed tiny Gemma 4 for two steps.
+The script binds `--dataset` to a Hub Source and gives it to a Chat recipe. A local JSONL or Parquet file uses its path directly. The recipe renders each conversation with the checkpoint's chat template; the source selects `train[:N]` when `--rows N` is set. The first `--held-out` conversations (512) are the validation set the final perplexity scores, and training reads only the rest. The smoke run writes canned JSONL conversations and fine-tunes the committed tiny Gemma 4 for two steps.
 
 ## GRPO with verifiable rewards
 
