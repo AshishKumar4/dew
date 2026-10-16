@@ -20,23 +20,27 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
+from test_t5_encoders import TOLERANCE as T5_TOLERANCE
+from test_text_encoders import TOLERANCE as CLIP_TOLERANCE
+from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
 
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
-# The existing family parity contracts, not bounds fitted to a CI CPU:
-# test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
+# The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
+# to a CI CPU: test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
 # test_t5_encoders.py (tiny hidden states), test_vae_16ch.py (raw encode/decode).
 MOE_OUTPUTS = {
-    "mixtral.npz": {"router_weights": 1e-6, "block_output": 2e-5},
-    "deepseek.npz": {"router_weights": 1e-6, "block_output": 2e-5},
-    "deepseek_v2.npz": {"router_weights": 1e-6},
-    "deepseek_v4.npz": {"router_weights": 1e-6, "experts_output": 2e-5},
+    "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
+    "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
+    "deepseek_v2.npz": {"router_weights": ROUTER_TOLERANCE},
+    "deepseek_v4.npz": {"router_weights": ROUTER_TOLERANCE, "experts_output": OUTPUT_TOLERANCE},
 }
 CLIP_OUTPUTS = dict.fromkeys(
-    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), 1e-4)
-T5_OUTPUTS = {"last_hidden_state": 1e-4}
-VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
+    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), CLIP_TOLERANCE)
+T5_OUTPUTS = {"last_hidden_state": T5_TOLERANCE}
+VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
 def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
