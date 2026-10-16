@@ -9,11 +9,10 @@ that reads the backbone's output table says so with `reads_table`, and is
 given it as `[V, D]` rows.
 """
 
-import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar, NamedTuple, Self
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +34,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
+from dew.registry import dtype_name, from_record, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -47,8 +47,8 @@ class Head(nn.Module):
     """What every decision head offers: its call, whether it reads the output
     table, and the record a run keeps of it.
 
-    A run records a head's own fields but not its width, which is the
-    backbone's, nor its numerics, which the run's model config gives.
+    A run records a head's fields, its numerics among them, but not its
+    width, which is the backbone's.
     """
 
     reads_table: ClassVar[bool] = False
@@ -67,29 +67,22 @@ class Head(nn.Module):
 
     def record(self) -> JSON:
         """Return the head's name and the fields a run records."""
-        kept: dict[str, JSON] = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
-                                 if field.name not in (*_NUMERICS, self.width_field)}
-        return {"name": type(self).__name__, "fields": kept}
+        fields = record_fields(self, type(self))
+        del fields[self.width_field]
+        return {"name": type(self).__name__, "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int, *, dtype: Dtype | None = None,
-                    attention_impl: str = "auto") -> "Head":
-        """Rebuild the head a run recorded, reading states `width` wide."""
+    def from_record(record: JSON, width: int, *, dtype: Dtype | None = None) -> "Head":
+        """Rebuild the head a run recorded, reading states `width` wide. A
+        record written before heads recorded their numerics computes in
+        `dtype`, the backbone's, as that run's head did."""
         held = records.record(record, "head")
-        name = records.text(held.get("name", "DecisionHead"), "head.name")
+        name = records.text(held.get("name"), "head.name")
         if name not in HEADS:
             raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = records.record(held.get("fields", held), "head.fields")
-        return HEADS[name].rebuilt(width, fields, dtype=dtype, attention_impl=attention_impl)
-
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        """Return the head of these recorded `fields`, reading states `width` wide."""
-        raise NotImplementedError
-
-
-_NUMERICS = ("parent", "name", "dtype", "precision", "attention_impl")
+        fields = {"dtype": None if dtype is None else dtype_name(dtype),
+                  **records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
+        return from_record(HEADS[name], fields)
 
 
 class DecisionHead(Head):
@@ -126,13 +119,6 @@ class DecisionHead(Head):
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
         return (self.layers * per_layer + projection_flops(options, self.features, self.features)
                 + projection_flops(options, self.features, 1))
-
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        return cls(features=width, layers=records.integer(fields.get("layers", 2), "head.layers"),
-                   dropout_rate=records.number(fields.get("dropout_rate", 0.0), "head.dropout_rate"),
-                   dtype=dtype, attention_impl=attention_impl)
 
     def setup(self):
         heads = max(1, self.features // 64)
@@ -343,16 +329,6 @@ class JointSchemaHead(Head):
         pooling = 2 * hidden * np.sum(length * (question + 2 * option))
         return float(count + pooling + self.routing_layers * evidence
                      + self.layers * fields + scorer + summaries)
-
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        def size(name: str) -> int:
-            return records.integer(fields[name], f"head.{name}")
-
-        return cls(hidden_size=width, width=size("width"), routing_layers=size("routing_layers"),
-                   layers=size("layers"), heads=size("heads"), feedforward=size("feedforward"), dtype=dtype,
-                   attention_impl=attention_impl)
 
     def setup(self):
         def dense(features: int, name: str) -> nn.Dense:

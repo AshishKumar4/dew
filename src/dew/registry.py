@@ -407,6 +407,10 @@ def to_record(value, annotation) -> JSON:
     if isinstance(value, np.dtype) or (isinstance(value, type)
                                        and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes')):
         return dtype_name(value)
+    if isinstance(value, jax.lax.Precision | jax.lax.DotAlgorithmPreset):
+        # A matmul precision as the name jax reads back as it: a dot algorithm
+        # preset's own ('F32_F32_F32'), a precision's alias ('highest').
+        return value.name if isinstance(value, jax.lax.DotAlgorithmPreset) else value.name.lower()
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
             if isinstance(value, nn.Module) and id(value) in written:

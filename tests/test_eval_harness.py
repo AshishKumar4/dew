@@ -42,14 +42,17 @@ def adapter(run):
 
 
 BOS = 1
-"""The byte `\\x01` doubles as BOS in the BOS-vocabulary case; no test text holds it."""
+"""The byte `\\x01` doubles as BOS in the BOS-vocabulary case; only the text that starts with the
+prefix token on purpose holds it."""
 
 
-def _byte_tokenizer(bos: bool):
+def _byte_tokenizer(bos: str):
     """Dew's `ByteTokenizer` as a transformers tokenizer: one id per utf-8 byte,
-    id = byte value, EOS 255, which is what `HFLM` needs to be handed. With
-    `bos`, every encoding starts with BOS, as Llama, Mistral and Gemma
-    vocabularies do, and `HFLM` conditions first tokens on it."""
+    id = byte value, EOS 255, which is what `HFLM` needs to be handed. `bos`
+    is "none"; "inserted", where every encoding starts with BOS, as Llama,
+    Mistral and Gemma vocabularies do, and `HFLM` conditions first tokens on
+    it; or "declared", a BOS the tokenizer names but never inserts, as
+    GPT-2's."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
     from transformers import PreTrainedTokenizerFast
     from transformers.convert_slow_tokenizer import bytes_to_unicode
@@ -59,18 +62,22 @@ def _byte_tokenizer(bos: bool):
     tokenizer = Tokenizer(models.BPE(vocab=vocabulary, merges=[]))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
     tokenizer.decoder = decoders.ByteLevel()
-    if not bos:
+    if bos == "none":
         return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single=f"{symbols[BOS]} $A", special_tokens=[(symbols[BOS], BOS)])
+    if bos == "inserted":
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single=f"{symbols[BOS]} $A", special_tokens=[(symbols[BOS], BOS)])
     return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255],
                                    bos_token=symbols[BOS])
 
 
-def _pair(max_length: int, bos_directory=None):
+def _pair(max_length: int, directory=None, *, bos: str = "none", source: bool = False):
     """The same weights behind `DewLM` and behind lm-eval's `HFLM`, both
-    scoring windows of `max_length` ids. With `bos_directory`, both read the
-    BOS vocabulary: Dew as the run's `HFTokenizer` over the saved files."""
+    scoring windows of `max_length` ids and reading the `_byte_tokenizer(bos)`
+    vocabulary. Dew reads it as a run does, through a `RunProcessor` over
+    `ByteTokenizer` or, with a BOS, over the files saved in `directory`; or,
+    with `source`, as a loaded checkpoint does, through the tokenizer's own
+    `dew.interop.Processor`."""
     import torch
     from lm_eval.models.huggingface import HFLM
     from transformers import LlamaForCausalLM
@@ -78,17 +85,20 @@ def _pair(max_length: int, bos_directory=None):
     from dew.data.text import ByteTokenizer, HFTokenizer
     from dew.inference.pipeline import RunProcessor
     from dew.interop.pretrained import Pretrained
+    from dew.interop.processors import Processor
     from dew.sampling import Sampling
 
-    reference = _byte_tokenizer(bos_directory is not None)
-    if bos_directory is None:
-        run_tokenizer = ByteTokenizer()
+    reference = _byte_tokenizer(bos)
+    if source:
+        processor = Processor(reference, {}, {}, 256)
+    elif bos == "none":
+        processor = RunProcessor(ByteTokenizer())
     else:
-        reference.save_pretrained(str(bos_directory))
-        run_tokenizer = HFTokenizer(str(bos_directory), local_files_only=True)
+        reference.save_pretrained(str(directory))
+        processor = RunProcessor(HFTokenizer(str(directory), local_files_only=True))
     loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
-    ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
+    ours = DewLM(TextGeneration(loaded.model, loaded.variables, processor,
                                 sampling=Sampling(eos_token_ids=255)), batch_size=2)
     model = LlamaForCausalLM.from_pretrained(LLAMA, dtype=torch.float32).eval()
     theirs = HFLM(pretrained=model, tokenizer=reference, max_length=max_length, batch_size=2)
@@ -126,7 +136,7 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
     """`HFLM.prefix_token_id` is the tokenizer's BOS when it has one. An empty
     context and a rolling window's first token are conditioned on it, so a
     BOS vocabulary is scored after BOS, not after EOS."""
-    ours, theirs = _pair(16, tmp_path)
+    ours, theirs = _pair(16, tmp_path, bos="inserted")
     assert ours.prefix_token_id == theirs.prefix_token_id == BOS
     requests = [instance("", "empty context"), instance("the ", "quick")]
     for (score, greedy), (reference, reference_greedy) in zip(
@@ -136,6 +146,35 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
     text = [instance(_text(40), request_type="loglikelihood_rolling")]
     assert ours.loglikelihood_rolling(text) == pytest.approx(theirs.loglikelihood_rolling(text),
                                                              rel=RELATIVE)
+
+
+@pytest.mark.parametrize("source", [False, True])
+@pytest.mark.parametrize("bos", ["none", "inserted", "declared"])
+def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, source, tmp_path):
+    """`add_special_tokens` and `left_truncate_len` encode as `HFLM.tok_encode`
+    does, through a run's processor and a loaded checkpoint's, over a
+    vocabulary without BOS, one that inserts it and one that names it
+    without inserting it: the inserted BOS left off when the caller asks for
+    no special tokens, or when the text already starts with the prefix
+    token's text, and the last ids kept."""
+    ours, theirs = _pair(16, tmp_path, bos=bos, source=source)
+    prefix = theirs.tokenizer.decode([theirs.prefix_token_id])
+    for text in ("the quick", prefix + "the quick"):
+        for special in (None, True, False):
+            for keep in (None, 3):
+                assert (ours.tok_encode(text, add_special_tokens=special, left_truncate_len=keep)
+                        == theirs.tok_encode(text, add_special_tokens=special, left_truncate_len=keep))
+
+
+def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
+    """A torch `--device`, and options `HFLM` does not read, raise instead of being dropped."""
+    with pytest.raises(ValueError):
+        DewLM.create_from_arg_string(f"run={run}", {"device": "cuda:0"})
+    assert DewLM.create_from_arg_string(f"run={run},batch_size=2", {"device": None}).batch_size == 2
+    with pytest.raises(TypeError):
+        adapter.tok_encode("the", truncation=True)
+    with pytest.raises(TypeError):
+        adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])

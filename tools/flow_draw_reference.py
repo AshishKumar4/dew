@@ -37,6 +37,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from reference_source import CACHE, selected, simple_statements, verified
+from torch_precision import replaced
 
 from dew.diffusion.presets import Flow
 
@@ -88,13 +89,9 @@ def statements(text: str) -> tuple[str, str]:
 @contextlib.contextmanager
 def drawn(base: np.ndarray):
     """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values."""
-    normal, rand = torch.normal, torch.rand
-    torch.normal = lambda mean, std, size, **_: mean + std * torch.from_numpy(base)
-    torch.rand = lambda size, **_: torch.from_numpy(base)
-    try:
+    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * torch.from_numpy(base)),
+                  (torch, "rand", lambda size, **_: torch.from_numpy(base))):
         yield
-    finally:
-        torch.normal, torch.rand = normal, rand
 
 
 def scheduler(name: str) -> FlowMatchEulerDiscreteScheduler:

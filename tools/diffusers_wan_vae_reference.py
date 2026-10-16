@@ -37,8 +37,9 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
 from reference_vjp import recorded_vjp
+from reference_releases import RELEASES, require
 
-DIFFUSERS = "0.34.0"
+DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 CONFIG = {"base_dim": 8, "z_dim": 4, "dim_mult": [1, 2, 2, 2], "num_res_blocks": 2, "attn_scales": [],
           "temperal_downsample": [False, True, True], "dropout": 0.0}
 BATCH, FRAMES = 2, 9
@@ -110,8 +111,7 @@ def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
 def main(destination: str) -> None:
     import diffusers
 
-    if diffusers.__version__ != DIFFUSERS:
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
+    require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
@@ -131,8 +131,7 @@ if __name__ == "__main__":
     elif len(sys.argv) > 3 and sys.argv[1] == "bfloat16":
         import diffusers
 
-        if diffusers.__version__ != DIFFUSERS:
-            raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
+        require("diffusers")
         torch.set_num_threads(2)
         np.savez_compressed(sys.argv[3], **bfloat16_walk(Path(sys.argv[2])))
     else:

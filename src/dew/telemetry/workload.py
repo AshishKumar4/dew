@@ -19,10 +19,11 @@ class WorkloadWork:
 
     The model's native config names the counted geometry. The batch shape
     includes the LM target column or the image's channels; tokens count the
-    real model inputs (patches for images).
+    real model inputs (patches for images), and are None for a model with no
+    token geometry, a U-Net's convolutions.
     """
     training_flops_per_step: float
-    tokens_per_step: int
+    tokens_per_step: int | None
     basis: str
     model_identity: str
     batch_shape: tuple[int, ...]
