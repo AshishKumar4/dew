@@ -57,6 +57,7 @@ import numpy as np
 import torch
 from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
+from torch_precision import float_as, replaced
 
 STYLEGAN_T = ("https://raw.githubusercontent.com/autonomousvision/stylegan-t/"
               "36ab80ce76237fefe03e65e9b3161c040ae888e3/")
@@ -66,22 +67,6 @@ SETTINGS = {"batch": 4, "side": 4, "channels": 3, "width": 6, "cmap_dim": 8, "ti
             "student_times": [1.0, 0.75, 0.5, 0.25], "renoise_times": [1.0, 1.0], "distillation_weight": 2.5,
             "r1_weight": 0.5, "layers": ["layer_a", "layer_b"], "key": 5}
 """R1's weight is far above ADD's 1e-5, so its term moves the loss."""
-
-
-class Precision:
-    """`.float()` reads as the run's own precision, as `torch.float32` does
-    in the scopes the published code runs in."""
-
-    def __init__(self, dtype):
-        self.dtype = dtype
-
-    def __enter__(self):
-        self.kept = torch.Tensor.float
-        torch.Tensor.float = lambda tensor, *args, **kwargs: tensor.to(self.dtype)
-        return self
-
-    def __exit__(self, *_):
-        torch.Tensor.float = self.kept
 
 
 class Network(torch.nn.Module):
@@ -201,7 +186,7 @@ def step(dtype, pixels, draws, student, teacher, heads_state) -> dict[str, np.nd
     level = torch.sigmoid(mean + std * torch.as_tensor(draws["level"], dtype=dtype))
     s = level.reshape(-1, 1, 1, 1)
 
-    with Precision(dtype):
+    with replaced(float_as(dtype)):
         noisy = (1 - t) * x + t * noise
         velocity, _ = net(noisy, t.flatten() * 1000)
         clean = noisy - t * velocity
