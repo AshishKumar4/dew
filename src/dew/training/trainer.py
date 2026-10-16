@@ -959,10 +959,18 @@ class Trainer(Generic[Loss, Effects]):
 
     def _model_shapes(self, batch: Batch) -> Batch:
         """`_model_batch`'s output, traced only where device steps change it: a
-        traced copy of the batch would lose the shardings its leaves carry."""
+        traced copy of the batch would lose the shardings its leaves carry.
+        Each leaf keeps the type its trace gives it where the mesh has an
+        Explicit axis: `jax.eval_shape` drops it on a mesh whose other axes
+        are Auto, and the step itself reads the rows split."""
         if not self._device:
             return model_batch(batch)
-        return jax.eval_shape(self._model_batch, batch)
+
+        def shape(aval) -> jax.ShapeDtypeStruct:
+            typed = aval.sharding if aval.sharding.mesh.explicit_axes else None
+            return jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=typed, weak_type=aval.weak_type)
+
+        return jax.tree.map(shape, jax.jit(self._model_batch).trace(batch).out_avals)
 
     def _loss_shape(self, state: TrainState, batch: Batch):
         batch = self._model_shapes(batch)
