@@ -313,6 +313,9 @@ class Pretrained:
 
     None for a local directory.
     """
+    origin: str | None = None
+    """The Hub id or local directory `load` read, which an adapter's PEFT config names as its base
+    (`AdapterBase`); None for a model trained in Dew."""
     adapter: Adapter | None = None
     """The low-rank adapter that `adapt` attached to the model, or None for the source as published.
 
@@ -479,6 +482,12 @@ class Pretrained:
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
                              "tier 3 through transformers' PyTorch forward")
+        selected = [name for name, given in (("gguf_file", gguf_file), ("single_file", single_file),
+                                             ("dduf_file", dduf_file)) if given is not None]
+        if fallback is not None and selected:
+            raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
+                             f"and weights describe, and {' and '.join(selected)} selects another payload; "
+                             "load it without fallback")
         streaming = mesh is not None or layout is not None
         if streaming and not weights:
             raise ValueError("a source loaded without its weights has nothing to place; the restore that "
@@ -512,6 +521,7 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        loaded = replace(loaded, origin=str(name_or_dir))
         if not weights:
             loaded = replace(loaded, variables=jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
@@ -547,7 +557,10 @@ class Pretrained:
         """
         if self.adapter is not None:
             raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
-        adapter = lora.apply(self.model, self.variables, key=key, layouts=self._adaptable)
+        from dew.lora import AdapterBase
+
+        adapter = lora.apply(self.model, self.variables, key=key, layouts=self._adaptable,
+                             base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
@@ -794,7 +807,8 @@ class PretrainedPipeline(Pretrained):
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write each component's tensors and config in the diffusers layout.
+        """Write each component's tensors and config in the diffusers layout,
+        its weights in shards of at most `max_shard_size` where they exceed it.
 
         An adapted bundle's factors are merged into the denoiser's kernels (PEFT's
         `merge_and_unload`), from its variables or a trainer's split of them;
@@ -807,7 +821,7 @@ class PretrainedPipeline(Pretrained):
         values = self.variables if variables is None else variables
         if self.adapter is not None:
             values = self.adapter.merge(values)
-        diffusion.save_source(self, values, Path(directory))
+        diffusion.save_source(self, values, Path(directory), max_shard_size)
 
     def _text_encoder(self, needed: str) -> None:
         """Refuse an operation the text encoder's weights take, on a pipeline
