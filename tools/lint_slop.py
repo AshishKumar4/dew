@@ -975,23 +975,19 @@ class _Hardware:
                     or self.called(node.value, "gpu_target"))
         return self.called(node, "device_generation")
 
-    def bound(self, node: ast.AST) -> _Hardware:
-        """This scope's names after `node` binds one: to the generation, the target, or anything else,
-        which a generation or target name then no longer holds."""
-        if isinstance(node, ast.Assign | ast.AnnAssign):
-            names = node.targets if isinstance(node, ast.Assign) else [node.target]
-            plain = [name.id for name in names if isinstance(name, ast.Name)]
-            rest = self.without(plain)
-            if len(names) != 1 or len(plain) != 1 or node.value is None:
-                return rest
-            if self.generation(node.value):
-                return replace(rest, generations=rest.generations | set(plain))
-            if self.called(node.value, "gpu_target"):
-                return replace(rest, targets=rest.targets | set(plain))
+    def assigned(self, targets: Sequence[ast.expr], value: ast.expr | None) -> _Hardware:
+        """These names after `targets` take `value`: one name taking the generation or the target holds
+        it, and every other name they bind no longer holds either."""
+        names = [name.id for target in targets for name in ast.walk(target)
+                 if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)]
+        rest = self.without(names)
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or value is None:
             return rest
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
-            return self.without([node.id])
-        return self
+        if self.generation(value):
+            return replace(rest, generations=rest.generations | {targets[0].id})
+        if self.called(value, "gpu_target"):
+            return replace(rest, targets=rest.targets | {targets[0].id})
+        return rest
 
     def without(self, names: Iterable[str]) -> _Hardware:
         """These names but `names`, which hold something else here."""
@@ -1020,8 +1016,7 @@ class _Hardware:
         if isinstance(node.func, ast.Attribute):
             return ((node.func.attr in ("startswith", "endswith") and self.generation(node.func.value))
                     or (node.func.attr == "get" and bool(node.args) and self.generation(node.args[0])))
-        builtin = (isinstance(node.func, ast.Name) and node.func.id == "getattr"
-                   and "getattr" not in self.tables.get(id(node), {}))
+        builtin = scopes.resolved(node.func, self.tables.get(id(node), {})) == "builtins.getattr"
         return builtin and len(node.args) > 1 and self.generation(node.args[1])
 
 
@@ -1039,34 +1034,78 @@ def _spelled_pattern(pattern: ast.pattern) -> bool:
     return isinstance(pattern, ast.MatchValue) and _spelled(pattern.value)
 
 
-def _hardware_choices(scope: ast.AST, hardware: _Hardware) -> Iterator[ast.expr | ast.stmt]:
-    """Each node of `scope` and the scopes in it that chooses by the device's generation (`keyed`),
-    reading names in statement order. A class body runs where it stands; a function or lambda reads
-    its enclosing scope's names as they stand once that scope has bound them all, as a closure does.
-    A comprehension's targets are its own: they hide a name inside it and leave it alone outside."""
-    nodes = list(scopes.own(scope))
-    # Bound with their statement (`_Hardware.bound`), or by a comprehension, inside it alone.
-    handled = {id(name) for node in nodes if isinstance(node, ast.Assign | ast.AnnAssign)
-               for name in (node.targets if isinstance(node, ast.Assign) else [node.target])}
-    hidden: dict[int, set[str]] = {}
-    for node in nodes:
-        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
-            names = [name for generator in node.generators for name in ast.walk(generator.target)
-                     if isinstance(name, ast.Name)]
-            handled |= {id(name) for name in names}
-            for inner in ast.walk(node):
-                hidden.setdefault(id(inner), set()).update(name.id for name in names)
-    final = hardware
-    for node in nodes:
-        final = final if id(node) in handled else final.bound(node)
-    for node in nodes:
-        if isinstance(node, scopes.SCOPES):
-            enclosing = hardware if isinstance(node, ast.ClassDef) else final
-            yield from _hardware_choices(node, enclosing.inside(node))
-            continue
-        if isinstance(node, ast.expr | ast.stmt) and hardware.without(hidden.get(id(node), ())).keyed(node):
-            yield node
-        hardware = hardware if id(node) in handled else hardware.bound(node)
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _scope_choices(body: Sequence[ast.stmt], hardware: _Hardware, closure: _Hardware | None,
+                   found: list[ast.expr | ast.stmt]) -> _Hardware:
+    """Read a scope's `body` in statement order (`_choices`) from `hardware`, its names on entry. A
+    function or the module (`closure` None) hands the functions in it its names as they stand once it
+    has bound them all, as a closure reads them; a class body hands on its enclosing scope's, as its
+    namespace reaches no function in it."""
+    if closure is None:
+        closure = hardware
+        for statement in body:
+            closure = _choices(statement, closure, closure, None)
+    for statement in body:
+        hardware = _choices(statement, hardware, closure, found)
+    return hardware
+
+
+def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
+             found: list[ast.expr | ast.stmt] | None) -> _Hardware:
+    """Append to `found` each node under `node` that chooses by the device's generation (`keyed`),
+    reading `hardware`'s names; return them once `node` has bound its own. A value is read before its
+    targets take it, and a comprehension's first iterable before its targets hide a name inside it.
+    With `found` None, only the names: nested scopes are not read."""
+    def read(child: ast.AST | None, names: _Hardware, inherited: _Hardware = closure) -> _Hardware:
+        return names if child is None else _choices(child, names, inherited, found)
+
+    if isinstance(node, ast.Lambda):
+        for child in (*node.args.defaults, *node.args.kw_defaults):
+            hardware = read(child, hardware)
+        if found is not None:
+            read(node.body, closure.inside(node), closure.inside(node))
+        return hardware
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        for child in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
+            hardware = read(child, hardware)
+        if found is not None:
+            _scope_choices(node.body, closure.inside(node), None, found)
+        return hardware.without([node.name])
+    if isinstance(node, ast.ClassDef):
+        for child in (*node.decorator_list, *node.bases, *node.keywords):
+            hardware = read(child, hardware)
+        if found is not None:
+            _scope_choices(node.body, hardware, closure, found)
+        return hardware.without([node.name])
+    if isinstance(node, COMPREHENSIONS):
+        first = node.generators[0]
+        read(first.iter, hardware)
+        names = [name.id for generator in node.generators for name in ast.walk(generator.target)
+                 if isinstance(name, ast.Name)]
+        inner, inherited = hardware.without(names), closure.without(names)
+        for generator in node.generators:
+            for child in (*([] if generator is first else [generator.iter]), *generator.ifs):
+                read(child, inner, inherited)
+        for child in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
+            read(child, inner, inherited)
+        return hardware
+    if found is not None and isinstance(node, ast.expr | ast.stmt) and hardware.keyed(node):
+        found.append(node)
+    if isinstance(node, ast.Assign | ast.AnnAssign | ast.NamedExpr):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        hardware = read(node.value, hardware)
+        for target in targets:
+            hardware = read(target, hardware)
+        return hardware.assigned(targets, node.value)
+    for child in ast.iter_child_nodes(node):
+        hardware = read(child, hardware)
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+        return hardware.without([node.id])
+    if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name is not None:
+        return hardware.without([node.name])
+    return hardware
 
 
 def authorities(module: Module) -> Iterator[Finding]:
@@ -1077,8 +1116,11 @@ def authorities(module: Module) -> Iterator[Finding]:
     owner = GENERATION.format(package=module.package)
     if module.relative == f"src/{owner.replace('.', '/')}.py":
         return
-    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
-    for node in _hardware_choices(module.tree, _Hardware(owner, tables)):
+    builtins = {"getattr": "builtins.getattr"}
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, builtins, _parent(module))}
+    found: list[ast.expr | ast.stmt] = []
+    _scope_choices(module.tree.body, _Hardware(owner, tables), None, found)
+    for node in found:
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
                       "chooses by the device's generation; read the target table's fact (`gpu_target()`), "
                       "a library's rule the compute capability (`capability`), a launch config the autotuner")
