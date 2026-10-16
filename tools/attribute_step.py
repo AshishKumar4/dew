@@ -49,7 +49,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from dew.nn.kernels.generation import gpu_target
-from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import HloInstruction, collective, custom_call_kind, hlo_instructions
 from dew.telemetry.profile import report_table
 
 PARTS = (
@@ -70,9 +70,6 @@ PARTS = (
 )
 CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "attention": "attention", "triton": "pallas"}
 """A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton calls."""
-COLLECTIVES = {"all-reduce", "all-gather", "reduce-scatter", "collective-permute", "all-to-all",
-               "all-reduce-start", "all-gather-start", "collective-permute-start", "all-reduce-done",
-               "all-gather-done", "collective-permute-done"}
 FUSED_KINDS = (
     ("gemm", {"dot", "convolution"}),
     ("gather_scatter", {"gather", "scatter"}),
@@ -119,7 +116,7 @@ def kind_of(row: dict, ops: dict[str, HloInstruction] | None = None) -> str:
         fused = frozenset(re.sub(r"\.\d+$", "", name).split("_")) if op == "fusion" else frozenset()
     else:
         op, target, fused = known.op, known.target, known.fused
-    if op in COLLECTIVES:
+    if collective(op) is not None:
         return "collective"
     if op == "custom-call":
         if not target and name.startswith("pallas_call"):

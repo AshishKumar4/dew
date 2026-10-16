@@ -58,7 +58,7 @@ import tyro
 
 from dew.files import write_atomically
 from dew.registry import models
-from dew.telemetry.instrumentation import model_flops_utilization
+from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.memory import recompute_record
@@ -299,8 +299,6 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
 # an all-to-all and a collective-permute as the same SendRecv kernel, so a
 # sequence exchange's Ulysses all-to-alls and a ring's or a Mamba-2 state's
 # shifts are told apart only here.
-HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter",
-                   "all-reduce")
 
 
 def _hlo_collective(event) -> str | None:
@@ -308,7 +306,7 @@ def _hlo_collective(event) -> str | None:
     for name, value in event.stats:
         if name == "hlo_op" and isinstance(value, str):
             spelled = value.replace("_", "-")
-            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
+            return next((op for op in COLLECTIVES if spelled.startswith(op)), None)
     return None
 
 
@@ -320,7 +318,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`HLO_COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
@@ -337,7 +335,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
         figures = window_split(events)
         figures.pop("busy")  # device_timeline's, over every device
         compute = union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
-        for op in HLO_COLLECTIVES:
+        for op in COLLECTIVES:
             spans = union([(start, end) for (_, start, end), of in zip(events, ops, strict=True)
                            if of == op])
             key = op.replace("-", "_")
