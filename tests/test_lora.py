@@ -356,11 +356,19 @@ def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_ther
     import subprocess
     import sys
 
+    from huggingface_hub._tree_cache import TREE_CACHE_FORMAT_VERSION
+
+    # The cache a download leaves: the snapshot, the branch's commit, and the commit's tree listing.
     commit = "0123456789abcdef0123456789abcdef01234567"
     repo = tmp_path / "hub" / "models--dew--llama-tiny"
     shutil.copytree(LLAMA, repo / "snapshots" / commit)
     (repo / "refs").mkdir()
     (repo / "refs" / "main").write_text(commit)
+    (repo / "trees").mkdir()
+    (repo / "trees" / f"{commit}.json").write_text(json.dumps({
+        "format_version": TREE_CACHE_FORMAT_VERSION,
+        "files": {path.name: {"size": path.stat().st_size, "blob_id": f"{index:040x}"}
+                  for index, path in enumerate(sorted(LLAMA.iterdir())) if path.is_file()}}))
     hub, local = tmp_path / "hub-adapter", tmp_path / "local-adapter"
     env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
            "PYTHONPATH": str(ROOT / "src")}
