@@ -233,10 +233,11 @@ def test_a_function_jitted_before_a_choice_traces_again_within_it():
         return x + (measured_kernel("ssd", "xla") == "pallas")
 
     x = jnp.zeros((), jnp.int32)
-    assert ported(x) == 0
-    with kernel_choices(ssd="pallas"):
-        assert ported(x) == 1
-    assert ported(x) == 0
+    with kernel_choices(ssd="xla"):
+        assert ported(x) == 0
+        with kernel_choices(ssd="pallas"):
+            assert ported(x) == 1
+        assert ported(x) == 0
 
 
 def test_a_choice_no_dispatch_reads_is_refused_by_name():
