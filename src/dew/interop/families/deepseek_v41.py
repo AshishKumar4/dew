@@ -171,8 +171,8 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
         if not isinstance(scaling, Mapping) or scaling.get('rope_type', scaling.get('type')) != 'yarn':
             refuse('rope_scaling', "V4.1's compressed layers rotate under YaRN or plainly (v41:369-389)")
         entry = {key: value for key, value in scaling.items() if key != 'type'}
-        entry.update(rope_type='yarn', rope_theta=compress_theta, attention_factor=1.0)
-        ramp = yarn_record(entry, 'rope_scaling', compress_theta,
+        entry.update(rope_type='yarn', attention_factor=1.0)
+        ramp = yarn_record(entry, 'rope_scaling',
                             record_int(text, 'max_position_embeddings', DEFAULT_MAX_SEQ_LEN))
     index = {'index_topk': record_int(text, 'index_topk'),
              'index_n_heads': record_int(text, 'index_n_heads'),

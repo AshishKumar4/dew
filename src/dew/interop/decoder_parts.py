@@ -436,12 +436,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
             ),
         )
     if rope_type == 'yarn' and yarn_max_pos is not None:
-        # The base an entry names, or the shared default until `_at_base`
-        # stamps in the one the entry's layers resolved to: a released
-        # config states it once beside rope_scaling, not inside it.
-        entry_theta = theta if theta is not None else 10000.0
-        return _Rope(theta, yarn_record(dict(entry, rope_theta=entry_theta), field,
-                                         entry_theta, yarn_max_pos))
+        return _Rope(theta, yarn_record(entry, field, yarn_max_pos))
     if rope_type not in ('default', 'none'):
         refuse(f"{field} (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta, "
@@ -498,19 +493,6 @@ class Ropes:
     local_theta: float | None = None
     local_scaling: Ramp | None = None
     full_only: bool = False
-
-
-def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
-    """Return a ramp record at the base the layers it rides on rotate at.
-
-    A YaRN record repeats that base (the mixer's `YarnScaling.rope_theta`),
-    and a released config states it once beside `rope_scaling` rather than
-    inside it, so the resolved base is stamped in here. The llama3 ramp
-    names no base and passes through.
-    """
-    if scaling is None or scaling['rope_type'] != 'yarn':
-        return scaling
-    return NativeFields(YarnScaling, {**scaling, 'rope_theta': theta})
 
 
 @dataclass(frozen=True)
@@ -600,13 +582,13 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
         refuse(full_field, 'this family reads one rotary record for every layer')
     full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
-    full_ramp = _at_base(full.scaling, theta)
+    full_ramp = full.scaling
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
     local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
-    sliding_ramp = _at_base(local.scaling, sliding_theta)
+    sliding_ramp = local.scaling
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
                   None if sliding_ramp == full_ramp else sliding_ramp,
                   full_only=full.scaling is not None and local.scaling is None)
@@ -652,8 +634,9 @@ def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
     return kinds
 
 
+# A rope entry's rope_theta is the base of the layers the ramp rides on, which they read beside it.
 _YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)) | {
-    'type', 'partial_rotary_factor'}
+    'type', 'partial_rotary_factor', 'rope_theta'}
 
 
 # vLLM's spelling of a YaRN attention scale, which DeepSeek-R1-0528-Qwen3-8B
@@ -665,8 +648,7 @@ _YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)
 _YARN_INERT = frozenset({'attn_factor'})
 
 
-def yarn_record(entry: Mapping[str, object], field: str, theta: float,
-                 max_pos: int) -> YarnRamp:
+def yarn_record(entry: Mapping[str, object], field: str, max_pos: int) -> YarnRamp:
     """Read a YaRN rope entry into the mixer's yarn record.
 
     Keeps the reference's names; the mixer's YarnScaling is built from these
@@ -691,7 +673,6 @@ def yarn_record(entry: Mapping[str, object], field: str, theta: float,
         )
     return native_fields(YarnScaling)(
         rope_type="yarn",
-        rope_theta=theta,
         factor=records.number(factor, f"{field} factor"),
         original_max_position_embeddings=records.integer(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
