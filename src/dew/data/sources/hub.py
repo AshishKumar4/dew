@@ -38,12 +38,48 @@ class Hub(Dataset):
 
     @cached_property
     def commit(self) -> str:
-        from huggingface_hub import HfApi
+        """The commit `revision` names, the default branch's where None: the Hub's answer, or with
+        the Hub offline (`HF_HUB_OFFLINE`) the commit the split was prepared at (`prepared`)."""
+        from huggingface_hub import HfApi, constants
 
+        if constants.HF_HUB_OFFLINE:
+            return self.prepared.name
         commit = HfApi().dataset_info(self.repo, revision=self.revision).sha
         if commit is None:
             raise ValueError(f"HF {self.repo!r} did not resolve to a commit")
         return commit
+
+    @cached_property
+    def prepared(self) -> Path:
+        """With the Hub offline, where `provision` prepared this split's Arrow: the directory
+        `datasets` keeps it in, `<owner>___<name>/<configuration>/<version>/<commit>` under its
+        cache, of this configuration (`name`, else the default) and holding this split, at
+        `revision` where that names a commit, else the latest prepared, as `datasets` reads its
+        cache offline. `datasets` itself does not find it offline: it names the directory by the
+        configuration and its data files' hash, and looks for the plain configuration."""
+        import json
+
+        from datasets import config
+        from datasets.naming import camelcase_to_snakecase
+
+        *owner, name = self.repo.split("/")
+        root = Path(self.cache_dir or config.HF_DATASETS_CACHE,
+                    "___".join([*owner, camelcase_to_snakecase(name)]))
+        found = []
+        for described in root.glob("*/*/*/dataset_info.json"):
+            facts = json.loads(described.read_text())
+            if (facts.get("config_name") == (self.name or "default")
+                    and self.split in (facts.get("splits") or {})):
+                found.append(described.parent)
+        if self.revision is not None:
+            found = [directory for directory in found if directory.name == self.revision]
+        if not found:
+            raise FileNotFoundError(
+                f"HF {self.repo!r} split {self.split!r} has no Arrow prepared under {root} at "
+                f"{self.revision or 'any commit'}, and the Hub is offline (HF_HUB_OFFLINE): "
+                "provision it online first"
+            )
+        return max(found, key=lambda directory: directory.stat().st_mtime)
 
     @cached_property
     def builder(self):
@@ -51,7 +87,15 @@ class Hub(Dataset):
             from datasets import load_dataset_builder
         except ImportError as error:
             raise ImportError("HF Arrow reads need pip install 'dewml[streaming]'") from error
+        from huggingface_hub import constants
 
+        if constants.HF_HUB_OFFLINE:
+            from datasets.packaged_modules.cache.cache import Cache
+
+            # `datasets`' own builder of a prepared cache, at the directory `prepared` found.
+            configuration, version, commit = self.prepared.parts[-3:]
+            return Cache(cache_dir=self.cache_dir, repo_id=self.repo, dataset_name=self.repo.split("/")[-1],
+                         config_name=configuration, version=version, hash=commit)
         pinned = {"name": self.name, "revision": self.commit, "cache_dir": self.cache_dir}
         whole = load_dataset_builder(self.repo, **pinned)
         # Only this split's own files, as the dataset's own configuration resolves
