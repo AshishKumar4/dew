@@ -189,8 +189,11 @@ tensorboard = ["tensorboard"]
 hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
-# The live site's container (site/live/container/setup-managed.sh): its bridge's WebSocket release.
-live = ["websockets==17.1"]
+# The live site's container (site/live/container/setup-managed.sh), beside the streaming and profile
+# extras: its bridge's WebSocket release, the kernel gateway and IPython kernel its contexts run, and
+# ipywidgets, without which tqdm warns in a kernel that it falls back to text bars. The test extra
+# holds it, so locks/cpu.txt, which the container installs under, pins every one.
+live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
 delta = ["deltalake>=1.0"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
