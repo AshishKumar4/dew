@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -479,3 +480,28 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+
+
+def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
+    """`ci.py gangs` reads the models from test_multihost.py: each gang's -k selects a part of the
+    file's collected cases, the parts are disjoint and cover every case, and a model added to
+    MODELS makes a gang of its own."""
+    source = ROOT / "tests/test_multihost.py"
+    items = ci.gangs(source)
+
+    def collected(*select: str) -> set[str]:
+        done = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p",
+                               "no:cacheprovider", str(source), *select],
+                              cwd=ROOT, capture_output=True, text=True, check=True)
+        return {line for line in done.stdout.splitlines() if "::" in line}
+
+    every = collected()
+    parts = [collected("-k", item["select"]) for item in items]
+    assert all(item["gang"] == 4 for item in items) and all(parts)
+    assert sum(len(part) for part in parts) == len(every) and set().union(*parts) == every
+    grown = tmp_path / "test_multihost.py"
+    grown.write_text(source.read_text().replace('MODELS = ("dense", "moe")',
+                                                'MODELS = ("dense", "moe", "hybrid")'))
+    assert [item["select"] for item in ci.gangs(grown)] == [
+        "layouts and dense", "layouts and moe", "layouts and hybrid",
+        "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]

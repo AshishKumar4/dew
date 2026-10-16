@@ -35,6 +35,8 @@ test_the_mesh_covers_every_process_in_the_pool = single.test_the_mesh_covers_eve
 two_processes = single.two_processes
 
 RANK, WORLD = int(os.environ.get("ARMADA_RANK", "0")), int(os.environ.get("ARMADA_WORLD", "1"))
+MODELS = ("dense", "moe")
+"""The models whose layouts cross hosts, each in a gang of CI's own (tools/armada/ci.py gangs)."""
 if WORLD < 2:
     pytest.skip("runs across the containers of an armada gang", allow_module_level=True)
 
@@ -204,7 +206,7 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     return ran.stdout
 
 @pytest.mark.distributed
-@pytest.mark.parametrize("model", ["dense", "moe"])
+@pytest.mark.parametrize("model", MODELS)
 def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
     """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
     the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
