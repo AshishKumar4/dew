@@ -637,10 +637,7 @@ def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     gives, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
-    if text is None:
-        return None
-    model, hardware = hlo_flops(text, recomputed=False), hlo_flops(text)
-    return None if model is None or hardware is None else StepFlops(model, hardware)
+    return None if text is None else hlo_flops(text)
 
 
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
@@ -649,22 +646,24 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     return None if flops is None else flops.hardware
 
 
-def hlo_flops(text: str, *, recomputed: bool = True) -> float | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module;
-    without the forward a remat recomputes where `recomputed` is False."""
+def hlo_flops(text: str) -> StepFlops | None:
+    """Matmul and convolution FLOPs of one call of an optimized HLO module,
+    parsed and weighted once: the forward a remat recomputes counted once in
+    `model` and each time it runs in `hardware`."""
     computations, entry = _parse(text)
     if entry is None:
         return None
     weights = _weights(computations, entry)
-    total = 0.0
+    model = hardware = 0.0
     for name, computation in computations.items():
-        instructions = sum(_instruction_flops(instruction, computation.shapes)
-                           for instruction in computation.instructions.values()
-                           if recomputed or not instruction.recomputed)
-        if not instructions or not weights[name]:
+        counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+                   for instruction in computation.instructions.values()]
+        ran = sum(flops for flops, _ in counted)
+        if not ran or not weights[name]:
             continue
-        total += weights[name] * instructions
-    return total if math.isfinite(total) else None
+        hardware += weights[name] * ran
+        model += weights[name] * sum(flops for flops, recomputed in counted if not recomputed)
+    return StepFlops(model, hardware) if math.isfinite(model) and math.isfinite(hardware) else None
 
 
 def model_flops_utilization(
