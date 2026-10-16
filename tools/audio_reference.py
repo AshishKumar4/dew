@@ -93,8 +93,9 @@ def to_arrays(state):
 
 
 def write_reference(root):
-    if transformers.__version__ != "5.16.1":
-        raise RuntimeError("Reference fixtures require Transformers 5.16.1")
+    from reference_releases import require
+
+    require("transformers")
     torch.set_num_threads(2)
     sounds = waveforms()
     for kind in ("gemma3n", "gemma4"):

@@ -395,9 +395,9 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
-    version = __import__("diffusers").__version__
-    if version != "0.34.0":
-        raise RuntimeError("Requires diffusers==0.34.0")
+    from reference_releases import require
+
+    require("diffusers")
     FIXTURES.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
