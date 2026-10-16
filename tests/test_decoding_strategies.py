@@ -166,7 +166,7 @@ def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(mod
         chain = (decoding.RepetitionPenalty(scale), decoding.PromptRepetitionPenalty(scale),
                  decoding.FrequencyPenalty(scale - 1), decoding.PresencePenalty(scale - 1),
                  decoding.MinLength(budget + 1, eos), decoding.MinNewTokens(budget - 2, eos),
-                 decoding.BeginSuppressTokens(eos, budget - 3), decoding.ForcedBOS(budget),
+                 decoding.BeginSuppressTokens(eos, forced_bos=True), decoding.ForcedBOS(budget),
                  decoding.ExponentialDecayLengthPenalty(budget - 2, 1 + scale / 10, eos),
                  decoding.ForcedEOS(eos, 3 + budget), decoding.Typical(1 / scale),
                  decoding.EpsilonCutoff(1e-4 * scale), decoding.EtaCutoff(1e-4 * scale),
