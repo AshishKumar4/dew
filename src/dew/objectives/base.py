@@ -1001,7 +1001,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         variables = Checkpoints(directory).variables(
             step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
             param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return cls._model_tree(variables)
+
+    @classmethod
+    def _model_tree(cls, variables: Variables) -> Variables:
+        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
+
+    def model_variables(self, variables: Variables) -> Variables:
+        """Return the model's own tree out of `variables`, a tree this objective trains.
+
+        That is the tree the model applies with, and another objective over
+        the same model starts from it. It is the whole tree, or the model's
+        part, trained and frozen collections together, of an objective that
+        nests the model beside other networks or frozen ones.
+        """
+        return self._model_tree(variables)
 
     def task_record(self) -> Mapping[str, JSON] | None:
         """Return the task settings a saved step records beside its model, or
