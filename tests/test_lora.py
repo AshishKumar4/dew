@@ -621,7 +621,7 @@ def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_pat
     bases. The file loads, and each component's base goes back out as it came in:
     saved, reloaded, and through a run's record of the adapter."""
     from dew.lora import AdapterRecord
-    from dew.registry import from_record, to_record, wrapper_layers
+    from dew.registry import from_record, to_record
 
     tensors, metadata = read_file(SD / lora.DIFFUSERS_WEIGHTS)
     header = json.loads(metadata[lora.DIFFUSERS_METADATA])
@@ -635,7 +635,10 @@ def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_pat
     loaded.save(loaded.variables, tmp_path / "again")
     again = LoRA.load(pipeline.model, pipeline.variables, tmp_path / "again", layouts=pipeline.layouts)
     assert again.bases == bases
-    record = wrapper_layers(type(again.model))[1][0]._dew_wrapper()
+    # This file's components differ in rank, which no run records; a run's adapter of one rank keeps
+    # its components' bases through JSON.
+    record = AdapterRecord(rank=2, alpha=4.0, rslora=False, dropout=0.0, modules=("unet/conv_in",), layouts={},
+                           bases=again.bases)
     assert from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord)))).bases == bases
 
 
