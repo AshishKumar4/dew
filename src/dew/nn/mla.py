@@ -239,9 +239,9 @@ class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
-    `segment_ids` behave as there. `yarn` replaces the rope base with the YaRN
-    ramp (the mixer's `rope_theta` must equal the record's) and its mscale
-    pre-scales the query. The two latent norms are the model's RMSNorm, as the
+    `segment_ids` behave as there. `yarn`, the layer's YaRN ramp, transforms
+    `rope_theta`, the layer's base, and its mscale pre-scales the query; the
+    mixer resolves both through `MixerContext`. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
 
     `index_n_heads` and `index_head_dim` put the indexer beside the attention
@@ -727,8 +727,8 @@ class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
-    translation renames nothing; `yarn` is the rope-scaling record. The rope base
-    is the model's `rope_theta`, transformed by the ramp. The context's GQA
+    translation renames nothing. The rope base and its YaRN ramp are the layer's
+    (`MixerContext.rope_theta` and `yarn`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a
@@ -743,7 +743,6 @@ class MLAMixer(MixerBase):
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     rope_interleave: bool = True
-    yarn: YarnScaling | None = None
     index_topk: int | None = None
     index_n_heads: int | None = None
     index_head_dim: int | None = None
@@ -766,11 +765,6 @@ class MLAMixer(MixerBase):
                    "the latent attention scales by its head dims and the yarn mscale, rotates its rope head "
                    "whole, attends the whole sequence with an fp32 softmax and norms its latents, not its "
                    "values")
-        if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
-            raise ValueError(
-                f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
-                f"the layer's ({ctx.rope_theta}) disagree; the rope base is "
-                "configured once, on the model")
         if ctx.kv_shared and not self.sparse:
             raise ValueError(
                 "a sharing mla layer attends the selection of an earlier "
@@ -789,7 +783,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            yarn=self.yarn,
+            yarn=ctx.yarn,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,

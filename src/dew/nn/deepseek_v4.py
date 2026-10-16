@@ -900,10 +900,6 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError(
                 "the deepseek_v4 mixer keeps its own compressed cache; it takes no kv_cache layout"
             )
-        if ctx.yarn is not None and ctx.yarn.rope_theta != ctx.rope_theta:
-            raise ValueError(
-                f"the yarn record's rope_theta ({ctx.yarn.rope_theta}) and the layer's "
-                f"({ctx.rope_theta}) disagree; the rope base is configured once, on the kind")
         ctx.refuse("deepseek_v4", ctx.policies(),
                    "its attention keeps sinks of its own, softmaxes in fp32 and projects out through "
                    "grouped low-rank heads, without a softcap, value scale, bias or dropout")
