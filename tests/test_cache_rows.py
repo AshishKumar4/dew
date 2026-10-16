@@ -127,5 +127,6 @@ def test_a_multimodal_cache_continues_each_row_where_its_response_does():
     positions = jnp.asarray([[5, 6, 7, 0], [0, 1, 2, 3]], jnp.int32)
     variables = model.init(jax.random.key(0), tokens, decode=True)
     _, state = model.apply(variables, tokens, positions=positions, decode=True, mutable=["cache"])
-    response = ModelInputs(tokens, positions=positions).extended(jnp.zeros((2, 1), jnp.int32))
-    np.testing.assert_array_equal(state["cache"]["next_position"], np.asarray(response.positions)[:, -1])
+    response = ModelInputs(tokens, {"positions": positions}).extended(jnp.zeros((2, 1), jnp.int32))
+    np.testing.assert_array_equal(state["cache"]["next_position"],
+                                  np.asarray(response.token_fields["positions"])[:, -1])
