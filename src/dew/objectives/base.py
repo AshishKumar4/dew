@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -1132,6 +1132,27 @@ class Metric(Protocol[S]):
     def finalize(self, accumulated: S, /) -> float:
         """Return the scalar for the completed pass."""
         ...
+
+
+def recorded_name(key, names: Collection[str], owner: Objective | None = None) -> str:
+    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
+    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of `owner` where it
+    is given), a `Metric` the validation split's ('val'), and a `(split, metric)` pair that split's. A
+    metric its split did not record raises with the splits that did."""
+    split = "val"
+    if isinstance(key, tuple) and len(key) == 2:
+        split, key = key
+    if isinstance(key, TrainingScalar):
+        if owner is not None and key.owner is not owner:
+            raise KeyError("training score belongs to another objective")
+        return f"train/{key.name}"
+    if isinstance(key, Metric):
+        if f"{split}/{key.name}" in names:
+            return f"{split}/{key.name}"
+        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
+        raise KeyError(f"metric {key.name!r} has no {split} score" + (
+            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
+    raise KeyError(key)
 
 
 def merge_totals(accumulated: tuple[float, float],
