@@ -41,6 +41,7 @@ from diffusers_reference_helpers import (
     tiny_qwen3_encoder,
 )
 from reference_releases import RELEASES, require
+from torch_precision import replaced
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
@@ -87,12 +88,9 @@ def rounded_timestep_embedding(t, dim, max_period=10000):
 def rounded_frequency_table():
     from diffusers.models.transformers import transformer_z_image
 
-    original = transformer_z_image.TimestepEmbedder.timestep_embedding
-    transformer_z_image.TimestepEmbedder.timestep_embedding = staticmethod(rounded_timestep_embedding)
-    try:
+    with replaced((transformer_z_image.TimestepEmbedder, "timestep_embedding",
+                   staticmethod(rounded_timestep_embedding))):
         yield
-    finally:
-        transformer_z_image.TimestepEmbedder.timestep_embedding = original
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:

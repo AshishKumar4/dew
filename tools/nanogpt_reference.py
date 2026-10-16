@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import definitions, fetched
+from torch_precision import replaced
 
 NANOGPT = "https://raw.githubusercontent.com/karpathy/nanoGPT/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/"
 SHAKESPEARE = ("https://raw.githubusercontent.com/karpathy/char-rnn/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e"
@@ -58,11 +59,8 @@ def main() -> None:
             ix.append(value.numpy().copy())
             return value
 
-        torch.randint = recording
-        try:
+        with replaced((torch, "randint", recording)):
             batches = [read(split) for _ in range(BATCHES)]
-        finally:
-            torch.randint = published
         arrays[f"{split}/ix"] = np.stack(ix)
         arrays[f"{split}/x"] = np.stack([x.numpy() for x, _ in batches])
         arrays[f"{split}/y"] = np.stack([y.numpy() for _, y in batches])

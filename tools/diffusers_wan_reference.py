@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import default_dtype, wide  # noqa: E402
+from torch_precision import default_dtype, dtype_widened, float_as, replaced, wide, widened_to  # noqa: E402
 from reference_releases import RELEASES, require  # noqa: E402
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
@@ -129,43 +129,25 @@ def widened():
     # meta-device init (transformers' from_pretrained) would make arange's
     # tensors on the CPU beside the meta ones; so it is built first.
     _device_constructors()
-    float_, to, type_ = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type
-    arange, tensor, full = torch.arange, torch.tensor, torch.full
+    type_ = torch.Tensor.type
 
-    def widened_to(self, *args, **kwargs):
-        if "dtype" in kwargs:
-            kwargs["dtype"] = wide(kwargs["dtype"])
-        return to(self, *(wide(arg) if isinstance(arg, torch.dtype) else arg for arg in args), **kwargs)
+    def widened_type(self, dtype=None, *args, **kwargs):
+        return type_(self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
 
-    torch.Tensor.float = lambda self, *args, **kwargs: self.double()
-    torch.Tensor.to = widened_to
-    torch.Tensor.type = lambda self, dtype=None, *args, **kwargs: type_(
-        self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
-    torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
-    torch.tensor = lambda *args, dtype=None, **kwargs: tensor(*args, dtype=wide(dtype), **kwargs)
-    torch.full = lambda *args, dtype=None, **kwargs: full(*args, dtype=wide(dtype), **kwargs)
-    try:
-        with default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
-            yield
-    finally:
-        torch.Tensor.float, torch.Tensor.to, torch.Tensor.type = float_, to, type_
-        torch.arange, torch.tensor, torch.full = arange, tensor, full
+    with (replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
+                   (torch.Tensor, "type", widened_type), (torch, "arange", dtype_widened(torch.arange)),
+                   (torch, "tensor", dtype_widened(torch.tensor)),
+                   (torch, "full", dtype_widened(torch.full))),
+          default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np))):
+        yield
 
 
 @contextlib.contextmanager
 def widened_softmax():
     """`softmax(..., dtype=torch.float32)`, the pin transformers' eager
     attention and routers carry, in float64."""
-    softmax = torch.nn.functional.softmax
-
-    def wide(*args, dtype=None, **kwargs):
-        return softmax(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
-
-    torch.nn.functional.softmax = wide
-    try:
+    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
         yield
-    finally:
-        torch.nn.functional.softmax = softmax
 
 
 @contextlib.contextmanager
