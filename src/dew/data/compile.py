@@ -1042,11 +1042,8 @@ def publish(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
-    cut_documents: bool = False,
 ):
-    """Fill and seal a deterministic prefix, then publish its certified generation.
-    A terminal pack places documents whole unless `cut_documents` publishes a
-    plan that cuts them; reading that plan needs a matching chunk step before its pack."""
+    """Fill and seal a deterministic prefix, then publish its certified generation."""
     from dew.data.cache import Cache
 
     if not isinstance(cache, Cache):
@@ -1061,7 +1058,7 @@ def publish(
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
-        builder = PackingPlan(packing, cut_documents=cut_documents)
+        builder = PackingPlan(packing)
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source

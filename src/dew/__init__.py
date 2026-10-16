@@ -20,9 +20,10 @@ fixes it where JAX would run on the CPU: no CUDA build of JAX installed, or
 none this driver runs (docs/installation.md, "Which CUDA build").
 `JAX_PLATFORMS=cpu` asks for the CPU and is not stopped.
 
-`import dew` also makes the two JAX user contexts the kernel autotuner keys
-traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`): JAX makes one only
-beside no other JAX call, so before any thread starts.
+`import dew` also makes the JAX user contexts the kernel autotuner and kernel
+choices key traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`,
+`KERNEL_CHOICES`): JAX makes one only beside no other JAX call, so before any
+thread starts.
 """
 
 from collections.abc import Callable

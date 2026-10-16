@@ -13,8 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import logging
-from collections.abc import Iterator, Mapping
-from types import MappingProxyType
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -39,21 +38,31 @@ def assumed(generation: str | None) -> Iterator[None]:
         ASSUMED.reset(token)
 
 
-CHOSEN: contextvars.ContextVar[Mapping[str, str]] = contextvars.ContextVar("chosen_kernels",
-                                                                       default=MappingProxyType({}))
-"""The kernels `chosen` names, empty outside it."""
+CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
+                     'attention_window', 'delta_gates', 'gate_up', 'gated_delta_rule', 'grouped_matmul',
+                     'narrow_copies', 'rms_norm', 'ssd', 'swiglu'})
+"""The choices `measured_kernel` answers, and so the ones `chosen` may name."""
+
+
+def _named(choices: Iterable[str]) -> None:
+    """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
+    if unknown := set(choices) - CHOICES:
+        raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
+                         f"the choices are {', '.join(sorted(CHOICES))}")
 
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
     """Within the block, a choice named in `kernels` runs that kernel whatever the generation's row
     measured, for an A/B of two kernels or a test of a kernel this device's row does not name.
-    Nested blocks keep the outer block's other choices and restore its choices on exit."""
-    token = CHOSEN.set({**CHOSEN.get(), **kernels})
-    try:
+    Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
+    trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
+    outside the block traces again within it."""
+    from dew import cache
+
+    _named(kernels)
+    with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
-    finally:
-        CHOSEN.reset(token)
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
@@ -246,7 +255,10 @@ def device_generation() -> str:
 
 def measured_kernel(choice: str, default: str) -> str:
     """The kernel `chosen` names for `choice`, else `KERNELS` on this generation, else `default`."""
-    if (kernel := CHOSEN.get().get(choice)) is not None:
+    from dew import cache
+
+    _named((choice,))
+    if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
         return kernel
     return gpu_target(device_generation()).kernels.get(choice, default)
 
@@ -261,12 +273,15 @@ def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = Non
     The first such call in a process for each kernel and refusal is logged at INFO naming both. Calls off
     the measured kernel show in a run's log as well as its step time; the dispatch owns this choice.
     A generation without a measurement, or a call that runs the measured kernel, logs nothing."""
+    from dew import cache
+
     generation = device_generation()
-    measured = fastest or CHOSEN.get().get(choice) or gpu_target(generation).kernels.get(choice)
+    picked = None if fastest else dict(cache.KERNEL_CHOICES.value).get(choice)
+    measured = fastest or picked or gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
-        _log.info("%s runs %r, not %r, the kernel measured fastest on %s: %s",
-                  choice, kernel, measured, generation, refusal)
+        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
+        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, refusal)
     return kernel
 
 
