@@ -1,4 +1,8 @@
-"""Draw the docs' figures, each in a light and a dark variant.
+"""Draw the docs' and the tutorials' figures.
+
+The docs' figures come in a light and a dark variant. The tutorials' figures
+are one file each, whose colors follow the theme of the page that shows them
+(dew.figures), and most of them animate.
 
 The sharding and diffusion figures are computed by Dew itself: the mesh
 figure reads the placements `MeshSpec.build`, `Layout` and `batch_shardings`
@@ -9,14 +13,13 @@ training-step figures draw the order of calls in `Trainer.fit`
 (src/dew/training/transaction.py).
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
-        python docs/assets/figures.py
+        python docs/assets/figures.py [NAME_PREFIX ...]
 """
 
 from __future__ import annotations
 
-import base64
-import io
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -27,78 +30,19 @@ import numpy as np
 from PIL import Image
 
 from dew.diffusion.presets import Cosine, Flow
+from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
-SANS = "Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
-MONO = "'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace"
-
-# The site's own colors (site/src/styles/theme.css).
-THEMES = {
-    "dark": dict(text="#d8e5e2", muted="#93aba7", rule="#243639", fill="#0f191c",
-                 raised="#131f23", accent="#2fb8a8", accent_fill="#0b3531",
-                 tints=["#12433d", "#1d3a52", "#3f3358", "#4f3a22"]),
-    "light": dict(text="#16282b", muted="#4d6763", rule="#c9d9d5", fill="#f2f6f5",
-                  raised="#ffffff", accent="#0b7d71", accent_fill="#d3f1ec",
-                  tints=["#cdeee8", "#d6e6f5", "#e6ddf3", "#f5e6cf"]),
-}
 
 
-class Svg:
-    def __init__(self, width: int, height: int, theme: dict):
-        self.t, self.parts = theme, []
-        self.head = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-                     f'width="{width}" height="{height}" role="img">')
-
-    def rect(self, x, y, w, h, fill=None, stroke=None, rx=6):
-        self.parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
-                          f'fill="{fill or self.t["fill"]}" stroke="{stroke or self.t["rule"]}" '
-                          'stroke-width="1"/>')
-
-    def text(self, x, y, s, size=13, color=None, mono=False, anchor="start", weight=400):
-        s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        self.parts.append(f'<text x="{x}" y="{y}" font-family="{MONO if mono else SANS}" '
-                          f'font-size="{size}" font-weight="{weight}" fill="{color or self.t["text"]}" '
-                          f'text-anchor="{anchor}">{s}</text>')
-
-    def arrow(self, x1, y1, x2, y2, color=None):
-        c = color or self.t["muted"]
-        self.parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{c}" stroke-width="1.25"/>')
-        # A small filled head at (x2, y2), pointing along the line.
-        d = np.array([x2 - x1, y2 - y1], float)
-        d /= np.linalg.norm(d)
-        n = np.array([-d[1], d[0]])
-        tip = np.array([x2, y2])
-        a, b = tip - 7 * d + 3.5 * n, tip - 7 * d - 3.5 * n
-        self.parts.append(f'<path d="M{tip[0]:.1f},{tip[1]:.1f} L{a[0]:.1f},{a[1]:.1f} '
-                          f'L{b[0]:.1f},{b[1]:.1f} z" fill="{c}"/>')
-
-    def polyline(self, points, color, width=1.75, dash=None):
-        pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-        dashed = f' stroke-dasharray="{dash}"' if dash else ""
-        self.parts.append(f'<polyline points="{pts}" fill="none" stroke="{color}" '
-                          f'stroke-width="{width}"{dashed}/>')
-
-    def image(self, x, y, size, pixels: np.ndarray):
-        buffer = io.BytesIO()
-        Image.fromarray(pixels).save(buffer, format="PNG")
-        data = base64.b64encode(buffer.getvalue()).decode()
-        self.parts.append(f'<image x="{x}" y="{y}" width="{size}" height="{size}" '
-                          f'style="image-rendering:pixelated" href="data:image/png;base64,{data}"/>')
-
-    def write(self, name: str, variant: str):
-        (HERE / f"{name}-{variant}.svg").write_text("\n".join([self.head, *self.parts, "</svg>"]) + "\n")
-
-
-def box(svg: Svg, x, y, w, h, title, lines=(), accent=False):
-    t = svg.t
-    svg.rect(x, y, w, h, fill=t["accent_fill"] if accent else t["fill"],
-             stroke=t["accent"] if accent else t["rule"])
+def box(svg: Figure, x, y, w, h, title, lines=(), accent=False):
+    svg.rect(x, y, w, h, fill="accent_fill" if accent else "surface", stroke="accent" if accent else "rule")
     svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
     for i, line in enumerate(lines):
-        svg.text(x + 12, y + 45 + 19 * i, line, size=13, color=t["muted"])
+        svg.text(x + 12, y + 45 + 19 * i, line, size=13, color="muted")
 
 
 def mesh_figure():
@@ -126,34 +70,34 @@ def mesh_figure():
     kernel_blocks = holders(kernel, kernel_shape)
 
     for variant, t in THEMES.items():
-        svg = Svg(760, 540, t)
+        svg = Figure(760, 540, palette=t)
         # The mesh: data picks the panel, fsdp the row, tensor the column.
         svg.text(24, 30, "MeshSpec(fsdp=2, tensor=2) on 8 devices", size=14, weight=600)
-        svg.text(24, 50, "data takes the rest: 8 / (2 × 2) = 2", size=13, color=t["muted"])
+        svg.text(24, 50, "data takes the rest: 8 / (2 × 2) = 2", size=13, color="muted")
         for d in range(2):
             ox, oy = 24 + d * 172, 80
-            svg.text(ox, oy - 8, f"data {d}", size=13, color=t["muted"])
+            svg.text(ox, oy - 8, f"data {d}", size=13, color="muted")
             for f in range(2):
                 for k in range(2):
                     device = next(i for i, c in coords.items() if c == (d, f, k))
                     x, y = ox + k * 80, oy + f * 64
-                    svg.rect(x, y, 74, 56, fill=t["tints"][2 * f + k], stroke=t["rule"])
+                    svg.rect(x, y, 74, 56, fill=f"tint{2 * f + k}", stroke="rule")
                     svg.text(x + 37, y + 25, f"device {device}", size=13, mono=True, anchor="middle", weight=600)
-                    svg.text(x + 37, y + 44, f"f{f} t{k}", size=12, color=t["muted"], anchor="middle")
-        svg.text(24, 228, "f = fsdp index, t = tensor index", size=13, color=t["muted"])
+                    svg.text(x + 37, y + 44, f"f{f} t{k}", size=12, color="muted", anchor="middle")
+        svg.text(24, 228, "f = fsdp index, t = tensor index", size=13, color="muted")
 
         # The batch: rows split over data and fsdp; tensor pairs hold the same rows.
         bx, by = 400, 80
         svg.text(bx, 30, "batch: text (16, 65) int32", size=14, weight=600)
-        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=13, color=t["muted"])
+        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=13, color="muted")
         for (rows, _), devices in sorted(batch_blocks.items()):
             y = by + rows[0] * 8
             f = coords[devices[0]][1]
-            svg.rect(bx, y, 336, 29, fill=t["tints"][2 * f], rx=3)
+            svg.rect(bx, y, 336, 29, fill=f"tint{2 * f}", rx=3)
             svg.text(bx + 12, y + 20, f"rows {rows[0]}–{rows[1] - 1}", size=13, mono=True)
             svg.text(bx + 324, y + 20, "devices " + ", ".join(map(str, sorted(devices))), size=13,
-                     color=t["muted"], anchor="end")
-        svg.text(bx, 228, "Both devices of a tensor pair hold the same rows.", size=13, color=t["muted"])
+                     color="muted", anchor="end")
+        svg.text(bx, 228, "Both devices of a tensor pair hold the same rows.", size=13, color="muted")
 
         # The kernel: (embed, mlp) split fsdp × tensor; each block on one device per data index.
         kx, ky = 24, 300
@@ -162,24 +106,24 @@ def mesh_figure():
         for (rows, cols), devices in sorted(kernel_blocks.items()):
             f, k = coords[devices[0]][1], coords[devices[0]][2]
             x, y = kx + (cols[0] // 512) * 216, ky + (rows[0] // 128) * 76
-            svg.rect(x, y, 208, 70, fill=t["tints"][2 * f + k], rx=3)
+            svg.rect(x, y, 208, 70, fill=f"tint{2 * f + k}", rx=3)
             svg.text(x + 12, y + 26, f"[{rows[0]}:{rows[1]}, {cols[0]}:{cols[1]}]", size=13, mono=True)
             svg.text(x + 12, y + 50, "devices " + ", ".join(map(str, sorted(devices))), size=13,
-                     color=t["muted"])
-        svg.text(476, 326, "Rows (embed) split over fsdp,", size=13, color=t["muted"])
-        svg.text(476, 346, "columns (mlp) over tensor.", size=13, color=t["muted"])
-        svg.text(476, 376, "Each block is held by one", size=13, color=t["muted"])
-        svg.text(476, 396, "device of each data index.", size=13, color=t["muted"])
+                     color="muted")
+        svg.text(476, 326, "Rows (embed) split over fsdp,", size=13, color="muted")
+        svg.text(476, 346, "columns (mlp) over tensor.", size=13, color="muted")
+        svg.text(476, 376, "Each block is held by one", size=13, color="muted")
+        svg.text(476, 396, "device of each data index.", size=13, color="muted")
         svg.text(24, 500, "Placements read from MeshSpec.build, Layout().shardings and batch_shardings",
-                 size=13, color=t["muted"])
-        svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color=t["muted"])
-        svg.write("mesh", variant)
+                 size=13, color="muted")
+        svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color="muted")
+        svg.save(HERE / f"mesh-{variant}.svg")
 
 
 def training_step_figure():
     """The order of work in Trainer.fit and in one compiled step."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 610, t)
+        svg = Figure(760, 610, palette=t)
         svg.text(24, 30, "Trainer.fit(dataset, steps=...)", size=15, mono=True, weight=600)
         box(svg, 24, 50, 224, 86, "Trainer.place()", ["init or restore TrainState,", "placed on the mesh"])
         box(svg, 24, 162, 224, 86, "dataset.train(partition)", ["this process's rows of", "every global batch"])
@@ -188,8 +132,8 @@ def training_step_figure():
         svg.arrow(136, 248, 136, 272)
 
         # The compiled step.
-        svg.rect(272, 50, 464, 360, fill=t["raised"], stroke=t["accent"], rx=10)
-        svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color=t["accent"])
+        svg.rect(272, 50, 464, 360, fill="raised", stroke="accent", rx=10)
+        svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color="accent")
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
             ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
@@ -209,16 +153,16 @@ def training_step_figure():
         for i, (name, what) in enumerate(rows):
             box(svg, 24 + i * 242, 462, 228, 66, name, [what])
         svg.text(24, 568, "TrainState holds params, opt_state, ema, key and three counters:", size=13,
-                 color=t["muted"])
+                 color="muted")
         svg.text(24, 588, "step counts attempts, microstep accepted microbatches, updates optimizer updates.",
-                 size=13, color=t["muted"])
-        svg.write("training-loop", variant)
+                 size=13, color="muted")
+        svg.save(HERE / f"training-loop-{variant}.svg")
 
 
 def data_figure():
     """A Dataset's iterators, the process's share and the global batch."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 390, t)
+        svg = Figure(760, 390, palette=t)
         box(svg, 24, 24, 280, 104, "Dataset", ["train(partition) → iterator", "val(partition) → one pass",
                                                "records, batch"])
         box(svg, 456, 24, 280, 104, "DataPartition", ["index, count: which share of", "every global batch",
@@ -230,15 +174,15 @@ def data_figure():
         svg.arrow(304, 76, 454, 76)
         svg.arrow(456, 128, 306, 196)
         svg.arrow(304, 248, 454, 248)
-        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
-        svg.text(400, 170, "next(train(partition))", size=12, mono=True, color=t["muted"])
-        svg.text(380, 238, "shard_batch", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color="muted", anchor="middle")
+        svg.text(400, 170, "next(train(partition))", size=12, mono=True, color="muted")
+        svg.text(380, 238, "shard_batch", size=12, mono=True, color="muted", anchor="middle")
         svg.text(24, 336, "One process: DataPartition() reads every row; the host batch is the global batch.",
-                 size=13, color=t["muted"])
+                 size=13, color="muted")
         svg.text(24, 358, "Several processes: each reads B / count rows of every step, and", size=13,
-                 color=t["muted"])
-        svg.text(24, 378, "jax.make_array_from_process_local_data joins them.", size=13, color=t["muted"])
-        svg.write("data-pipeline", variant)
+                 color="muted")
+        svg.text(24, 378, "jax.make_array_from_process_local_data joins them.", size=13, color="muted")
+        svg.save(HERE / f"data-pipeline-{variant}.svg")
 
 
 def diffusion_figure():
@@ -255,7 +199,7 @@ def diffusion_figure():
         return alpha, sigma, np.clip((x + 1) * 127.5, 0, 255).astype(np.uint8)
 
     for variant, t in THEMES.items():
-        svg = Svg(760, 700, t)
+        svg = Figure(760, 700, palette=t)
         for row, (name, schedule) in enumerate([("Cosine()", cosine), ("Flow()", flow)]):
             y = 30 + row * 200
             svg.text(24, y, f"{name}, T = {schedule.T:g}", size=14, mono=True, weight=600)
@@ -264,27 +208,27 @@ def diffusion_figure():
                 x = 24 + i * 120
                 svg.image(x, y + 12, 112, image)
                 svg.text(x + 56, y + 146, f"t = {fraction * schedule.T:g}", size=13, mono=True, anchor="middle")
-                svg.text(x + 56, y + 165, f"α {alpha:.2f}  σ {sigma:.2f}", size=12, color=t["muted"],
+                svg.text(x + 56, y + 165, f"α {alpha:.2f}  σ {sigma:.2f}", size=12, color="muted",
                          anchor="middle")
 
         # alpha_t and sigma_t against t / T for both presets.
         px, py, pw, ph = 24, 444, 280, 220
         svg.text(px, py - 14, "α and σ against t / T", size=14, weight=600)
-        svg.rect(px, py, pw, ph, fill=t["raised"], rx=4)
+        svg.rect(px, py, pw, ph, fill="raised", rx=4)
         grid = np.linspace(0, 1, 101)
         for schedule, dash in [(cosine, None), (flow, "5 4")]:
             rates = np.array([[float(v) for v in schedule.rates(jnp.asarray(g * schedule.T))] for g in grid])
-            for column, color in [(0, t["accent"]), (1, t["muted"])]:
+            for column, color in [(0, "accent"), (1, "muted")]:
                 svg.polyline([(px + g * pw, py + ph - r * ph) for g, r in zip(grid, rates[:, column])],
-                             color, dash=dash)
-        svg.text(px, py + ph + 20, "0", size=12, color=t["muted"])
-        svg.text(px + pw, py + ph + 20, "1", size=12, color=t["muted"], anchor="end")
+                             color=color, dash=dash)
+        svg.text(px, py + ph + 20, "0", size=12, color="muted")
+        svg.text(px + pw, py + ph + 20, "1", size=12, color="muted", anchor="end")
         legend = ["α: accent, σ: grey", "solid: Cosine(), dashed: Flow()", "",
                   "Each image is α x₀ + σ ε with the same ε,", "at the rates schedule.rates(t) returns.",
                   "", "x₀ is a 64 × 64 image sampled from a model", "trained with Dew, scaled to [-1, 1]."]
         for i, line in enumerate(legend):
-            svg.text(340, py + 20 + 22 * i, line, size=13, color=t["muted"])
-        svg.write("diffusion-forward", variant)
+            svg.text(340, py + 20 + 22 * i, line, size=13, color="muted")
+        svg.save(HERE / f"diffusion-forward-{variant}.svg")
 
 
 def moe_routing_figure():
@@ -303,28 +247,28 @@ def moe_routing_figure():
         layers.append((indices, chosen / chosen.sum(-1, keepdims=True)))
     shown = 22
     for variant, t in THEMES.items():
-        svg = Svg(760, 490, t)
+        svg = Figure(760, 490, palette=t)
         svg.text(20, 30, 'mixture={"experts": 4, "top_k": 2}, layer 0', size=14, mono=True, weight=600)
         svg.text(20, 52, f"The router's choices for the first {shown} of 64 tokens.", size=13,
-                 color=t["muted"])
+                 color="muted")
         indices, weights = layers[0]
         cell, x0, y0 = 28, 100, 70
         for expert in range(4):
             svg.text(x0 - 10, y0 + expert * (cell + 4) + 19, f"expert {expert}", size=12, mono=True,
-                     anchor="end", color=t["muted"])
+                     anchor="end", color="muted")
             for token in range(shown):
                 x, y = x0 + token * cell, y0 + expert * (cell + 4)
                 hit = np.nonzero(indices[token] == expert)[0]
                 if hit.size:
-                    svg.rect(x, y, cell - 2, cell, fill=t["tints"][expert], rx=3)
+                    svg.rect(x, y, cell - 2, cell, fill=f"tint{expert}", rx=3)
                     svg.text(x + (cell - 2) / 2, y + 19, f"{weights[token, hit[0]]:.2f}"[1:], size=12,
                              mono=True, anchor="middle")
                 else:
-                    svg.rect(x, y, cell - 2, cell, fill=t["fill"], rx=3)
+                    svg.rect(x, y, cell - 2, cell, fill="surface", rx=3)
         for token in range(0, shown, 4):
             svg.text(x0 + token * cell + (cell - 2) / 2, y0 + 4 * (cell + 4) + 16, str(token), size=12,
-                     mono=True, anchor="middle", color=t["muted"])
-        svg.text(x0, y0 + 4 * (cell + 4) + 36, "token position", size=12, color=t["muted"])
+                     mono=True, anchor="middle", color="muted")
+        svg.text(x0, y0 + 4 * (cell + 4) + 36, "token position", size=12, color="muted")
 
         # Tokens per expert over all 64 tokens, per layer.
         by, bh = 300, 80
@@ -336,22 +280,22 @@ def moe_routing_figure():
             for expert, count in enumerate(counts):
                 h = bh * count / 64
                 x = lx + expert * 60
-                svg.rect(x, by + bh - h, 44, h, fill=t["tints"][expert], rx=3)
+                svg.rect(x, by + bh - h, 44, h, fill=f"tint{expert}", rx=3)
                 svg.text(x + 22, by + bh - h - 6, str(int(count)), size=13, mono=True, anchor="middle")
                 svg.text(x + 22, by + bh + 18, f"e{expert}", size=12, mono=True, anchor="middle",
-                         color=t["muted"])
+                         color="muted")
             svg.text(lx, by + bh + 42, f"layer {layer}", size=13, mono=True)
         svg.text(20, 455, "Cell numbers: the token's normalized routing weight for that expert.",
-                 size=13, color=t["muted"])
+                 size=13, color="muted")
         svg.text(20, 476, "Read from the 'router' collection of a fresh init: random weights and tokens, "
-                 "so the load is uneven.", size=13, color=t["muted"])
-        svg.write("moe-routing", variant)
+                 "so the load is uneven.", size=13, color="muted")
+        svg.save(HERE / f"moe-routing-{variant}.svg")
 
 
 def post_training_figure():
     """The data each post-training objective reads, from dew.data, dew.objectives.rl and pack."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 372, t)
+        svg = Figure(760, 372, palette=t)
         lanes = [
             ("SFT", "Chat", ["conversations, rendered by", "the chat template"],
              "text, text_roles", ["[B, L + 1]"], "LMObjective", ["loss_role=Role.ASSISTANT"]),
@@ -371,17 +315,20 @@ def post_training_figure():
             svg.arrow(270, y + 42, 288, y + 42)
             svg.arrow(500, y + 42, 518, y + 42)
         # GRPO samples with the policy it trains.
-        svg.polyline([(630, 312), (630, 336), (395, 336)], t["muted"], width=1.25)
+        svg.polyline([(630, 312), (630, 336), (395, 336)], color="muted", width=1.25)
         svg.arrow(395, 336, 395, 314)
-        svg.text(512, 360, "the current policy samples the next batch", size=13, color=t["muted"],
+        svg.text(512, 360, "the current policy samples the next batch", size=13, color="muted",
                  anchor="middle")
-        svg.write("post-training", variant)
+        svg.save(HERE / f"post-training-{variant}.svg")
+
+
+FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
+           "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
+           "post-training": post_training_figure}
 
 
 if __name__ == "__main__":
-    mesh_figure()
-    training_step_figure()
-    data_figure()
-    diffusion_figure()
-    moe_routing_figure()
-    post_training_figure()
+    prefixes = tuple(sys.argv[1:]) or ("",)
+    for name, draw in FIGURES.items():
+        if name.startswith(prefixes):
+            draw()
