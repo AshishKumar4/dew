@@ -1509,8 +1509,9 @@ def _held_twice(name: str, part: str, held, value) -> None:
 
 
 class Part(NamedTuple):
-    """One tensor the path map reads: a stored tensor, or one part of a packed one, as a view of it,
-    and the leaf it fills (`DecoderFamily.source_path`), None where the tree has no leaf for it."""
+    """One tensor the path map reads: a stored tensor as `prepare` leaves it, or one part of a packed
+    one (`Packed.split`), and the leaf it fills (`DecoderFamily.source_path`), None where the tree
+    has no leaf for it."""
 
     name: str
     tensor: np.ndarray
@@ -1673,19 +1674,23 @@ class DecoderFamily:
     def readings(self, tensors: Mapping[str, np.ndarray],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:
         """The checkpoint's tensors as the path map reads them, in its order:
-        `prepare`'s, each `packed` one split into views of its parts, and the
-        leaf each part fills. Loading places them (`hf_decoders.read_decoder`,
-        each part once, `held_parts`), and the bindings that adapters, the
-        export and input quantization resolve source names through
+        `prepare`'s, each `packed` one split into its parts (`Packed.split`:
+        views, or copies where parts interleave in runs), and the leaf each
+        part fills. Loading places them (`hf_decoders.read_decoder`, each part
+        once, `held_parts`), and the bindings that adapters, the export and
+        input quantization resolve source names through
         (`Pretrained.weight_layouts`) are built from the same readings, so
         the two directions read one plan. A quantized copy reaches this
         decoded at the load's storage dtype (`Pretrained.load`), so a dense
         copy beside it must hold the decoded values in that dtype."""
+        # One read of each tensor: a lazy mapping builds a tensor on every access
+        # (`LazyTensors`), and `prepare` and the stored tensors share these.
+        stored = dict(tensors)
         readings = []
-        for name, tensor in self.prepare(tensors, config).items():
+        for name, tensor in self.prepare(stored, config).items():
             packing = self.packing(name)
             parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-            readings.append(Reading(name, tensors.get(name), packing, tuple(
+            readings.append(Reading(name, stored.get(name), packing, tuple(
                 Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
         return tuple(readings)
 

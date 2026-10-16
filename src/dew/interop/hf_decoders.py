@@ -622,8 +622,8 @@ def read_decoder(
     keep their own dtype. Each leaf is converted before its layout copy.
 
     With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
-    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
-    whole here.
+    and cast only when it is placed (`dew.interop.streaming`); `prepare` and an
+    interleaved split still run here. Otherwise each leaf is read whole here.
 
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
