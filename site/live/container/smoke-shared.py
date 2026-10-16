@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from shared_bridge import DEADLINE_HEADER, available, load, resident
+from shared_bridge import DEADLINE_HEADER, available, load, processes, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -40,12 +40,9 @@ except MemoryError:
 
 
 def model_process():
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            if b"model_service.py" in (proc / "cmdline").read_bytes():
-                return proc.name
-        except OSError:
-            pass
+    for pid, _, command in processes():
+        if b"model_service.py" in command:
+            return str(pid)
     raise AssertionError("the model process is not running")
 
 

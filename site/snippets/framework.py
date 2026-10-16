@@ -12,7 +12,6 @@ small offline fixtures.
 import argparse
 import json
 import os
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -324,18 +323,35 @@ SECTIONS = {function.__name__: function for function in
 
 
 def offline(out):
-    """Serve the Hub names the cells read from small fixtures, without the network."""
+    """Serve the Hub names the cells read from small fixtures, without the network: the models from a
+    Hub cache as a download leaves one, the datasets from prepared builders."""
+    import shutil
+
+    # Read when huggingface_hub is first imported, which is below.
+    hub = out / "hub"
+    os.environ["HF_HUB_CACHE"], os.environ["HF_HUB_OFFLINE"] = str(hub), "1"
+    decoder, words = ROOT / "tests/fixtures/hf/qwen3-tiny", ROOT / "tests/fixtures/hf/qwen35-native-tiny"
+    # The decoder fixture beside a tokenizer whose 256 word ids fit it, with distinct targets in the
+    # fixture corpus, for each decoder a cell names; Laya's tiny release as it is.
+    served = {"Qwen/Qwen3-0.6B": [decoder, words / "tokenizer.json", words / "tokenizer_config.json"],
+              "convaiinnovations/laya": [ROOT / "tests/fixtures/laya/tiny"]}
+    served["HuggingFaceTB/SmolLM2-135M-Instruct"] = served["Qwen/Qwen3-0.6B"]
+    commit = "0" * 40
+    for repo, sources in served.items():
+        cached = hub / f"models--{repo.replace('/', '--')}"
+        for source in sources:
+            if source.is_dir():
+                shutil.copytree(source, cached / "snapshots" / commit, dirs_exist_ok=True)
+            else:
+                shutil.copy(source, cached / "snapshots" / commit / source.name)
+        (cached / "refs").mkdir()
+        (cached / "refs" / "main").write_text(commit)
+
     from types import SimpleNamespace
 
     import datasets
-    import huggingface_hub
     from huggingface_hub import HfApi
     from PIL import Image
-
-    from dew.data import ByteTokenizer
-    from dew.decision import Decide
-    from dew.inference import RunProcessor
-    from dew.interop import PretrainedDecoder
 
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
     images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
@@ -360,27 +376,6 @@ def offline(out):
         ["train.parquet"] if repo in builders else listing(self, repo, **options))
     datasets.load_dataset_builder = lambda repo, **options: (
         builders[repo] if repo in builders else builder(repo, **options))
-    decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
-    # Its 256 word ids fit the decoder fixture, with distinct targets in the fixture corpus.
-    tokenizer_files = ROOT / "tests/fixtures/hf/qwen35-native-tiny"
-    model_info, snapshot = HfApi.model_info, huggingface_hub.snapshot_download
-    HfApi.model_info = lambda self, repo, **options: (
-        SimpleNamespace(sha="offline-fixture") if repo in decoders else model_info(self, repo, **options))
-    huggingface_hub.snapshot_download = lambda repo, **options: (
-        str(tokenizer_files) if repo in decoders else snapshot(repo, **options))
-    load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
-
-    def tiny(cls, name, **options):
-        fixture = ROOT / "tests/fixtures/hf/qwen3-tiny"
-        return load(cls, fixture if name in decoders else name, **options)
-
-    # The fixture has no tokenizer of its own.
-    def byte_text(self, **options):
-        return replace(generation(self, **options), processor=RunProcessor(ByteTokenizer()))
-
-    PretrainedDecoder.load, PretrainedDecoder.text_generation = classmethod(tiny), byte_text
-    laya, tiny_laya = Decide.from_pretrained.__func__, ROOT / "tests/fixtures/laya/tiny"
-    Decide.from_pretrained = classmethod(lambda cls, name, **options: laya(cls, tiny_laya, **options))
 
 
 def main():

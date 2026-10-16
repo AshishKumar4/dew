@@ -640,6 +640,21 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
+    """With no roots named, the gate reads the site's scripts, the docs' figure generators and the
+    kernel packages beside the package's source and the scripts, and none of the Python an npm
+    install leaves under the site."""
+    lint = load("lint_slop")
+    roots = lint.default_roots("dew")
+    found = {module.relative for module in lint.collect(roots, REPO_ROOT, "dew")}
+    assert {"site/scripts/gen_api.py", "docs/assets/figures.py",
+            "kernels/flash_attn/dew_flash_attn/__init__.py"} <= found
+    for relative in ("site/scripts/build.py", "site/node_modules/node-gyp/gyp/pylib/gyp/common.py"):
+        (tmp_path / relative).parent.mkdir(parents=True)
+        (tmp_path / relative).write_text("WIDTH = 1  # noqa: E501\n")
+    assert [module.relative for module in lint.collect(roots, tmp_path, "dew")] == ["site/scripts/build.py"]
+
+
 def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
     """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
     `typing.cast` however it was imported, and a warning filter whose action is
