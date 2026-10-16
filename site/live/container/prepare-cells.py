@@ -6,11 +6,11 @@ must be there already. Running a cell puts there exactly the files it reads;
 every cell reads them before `Trainer.fit`, so the run stops there (`FETCH`),
 and the build stays inside its 15-minute alarm (preparer.ts). A cell whose
 data names no read would stream its Hub shards at training, which an offline
-context cannot, so its data is prepared for the indexed read instead
-(`read="indexed", provision=True`, Dew's own arguments): the context then
-finds that split prepared and reads it by index. The context smoke then runs
-each cell whole (benchmark_gateway.py). setup-managed.sh hands /opt/train to
-root afterwards; contexts write only to their own overlays.
+context cannot, so it is prepared to be read from memory (`read="memory",
+provision=True`, Dew's own arguments), which prepares its Hub split's Arrow:
+the context's read, which Dew then chooses, is that Arrow's. The context smoke
+then runs each cell whole (benchmark_gateway.py). setup-managed.sh hands
+/opt/train to root afterwards; contexts write only to their own overlays.
 """
 
 import os
@@ -34,7 +34,7 @@ for name in ("JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME
              "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "XLA_FLAGS"):
     env.pop(name, None)
 # A cell's program, run until its first Trainer.fit, its data that names no read prepared to be
-# read by index.
+# read from memory.
 FETCH = """import ast, sys
 from dew.training import Trainer
 class Fetched(Exception):
@@ -44,7 +44,7 @@ def fit(*args, **options):
 Trainer.fit = fit
 def prepared(call, /, *args, **options):
     if getattr(call, "__module__", "") in ("dew.data.load", "dew.config.data") and "read" not in options:
-        options.update(read="indexed", provision=True)
+        options.update(read="memory", provision=True)
     return call(*args, **options)
 class Preparing(ast.NodeTransformer):
     def visit_Call(self, node):
