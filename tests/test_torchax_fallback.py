@@ -150,6 +150,15 @@ def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     assert np.abs(logits - torch_logits(reloaded, tokens)).max() <= LOGITS
 
 
+@pytest.mark.parametrize("selector", ["gguf_file", "single_file", "dduf_file"])
+def test_a_payload_selector_is_refused_where_the_fallback_reads_the_repos_own_weights(source, selector):
+    """The fallback builds the transformers model the repo's config.json and
+    weights describe. A GGUF, single-file or DDUF selector names another
+    payload, so it is refused rather than dropped."""
+    with pytest.raises(ValueError):
+        Pretrained.load(source[0], fallback="torchax", dtype="float32", **{selector: "model.bin"})
+
+
 def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_arrive_in(source, tokens):
     """In a bf16 forward the head multiplies bf16 states by the bf16 weight and
     rounds the logits to bf16. The output table carries that compute dtype,

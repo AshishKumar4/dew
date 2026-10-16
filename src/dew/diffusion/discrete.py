@@ -34,7 +34,16 @@ from flax import linen as nn
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
+from dew.nn.inputs import (
+    RESPONSE_FIELDS,
+    ModelInputs,
+    Request,
+    continuation_keys,
+    coordinates,
+    local_rows,
+    mesh_of,
+    real_slots,
+)
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
@@ -320,16 +329,20 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
 def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[ModelInputs, jax.Array]:
     """`inputs` extended by `width` masked slots, and which slots may change.
 
-    The prompt's validity and logical positions are written out first, so
-    the response's continue from them (`ModelInputs.extended`): its slots
-    are real in the rows that hold a prompt, the only rows whose slots may
-    change, and count on from the prompt's last real token.
+    The prompt's real slots (`real_slots`) and logical positions are written
+    out first, so the response's continue from them (`ModelInputs.extended`):
+    its slots are real in the rows that hold a prompt, the only rows whose
+    slots may change, and count on from the prompt's last real token. The
+    positions are the ones the model reads (`Coordinates.places`): the given
+    ones, else each real token's place in its packed document, else its rank
+    among its row's real tokens.
     """
     batch, prompt = inputs.tokens.shape
-    valid = jnp.asarray(inputs.token_fields.get("attention_mask", jnp.ones((batch, prompt), bool)), bool)
-    positions = inputs.token_fields.get("positions", jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
-    written = replace(inputs, token_fields={**inputs.token_fields, "positions": positions,
-                                            "attention_mask": valid})
+    fields = inputs.token_fields
+    valid = real_slots(fields, (batch, prompt))
+    positions = coordinates((batch, prompt), segments=fields.get("segment_ids"), valid=valid,
+                            positions=fields.get("positions")).places()
+    written = replace(inputs, token_fields={**fields, "positions": positions, "attention_mask": valid})
     extended = written.extended(jnp.full((batch, width), mask_id, jnp.int32))
     return extended, extended.token_fields["attention_mask"] & (jnp.arange(prompt + width) >= prompt)
 
