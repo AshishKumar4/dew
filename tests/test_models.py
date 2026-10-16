@@ -19,7 +19,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.backbones.joint import DoubleStreamBlock
+from dew.nn.backbones.joint import DoubleStreamBlock, JointAttention
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.unet import Unet
 from dew.nn.conv import Conv
@@ -384,6 +384,18 @@ def test_the_second_attention_of_a_dual_block_takes_its_dropout():
 
     assert not jnp.array_equal(run(1), run(2))
     assert jnp.array_equal(run(), run())
+
+
+def test_a_joint_attention_over_an_empty_context_attends_as_the_image_alone():
+    """A context of no tokens joins no keys, so the image attends as it does
+    with no context at all, and the context's output is as empty as it is."""
+    attention = JointAttention(2, 4, attention_impl="reference")
+    image, context = jax.random.normal(jax.random.key(0), (1, 3, 8)), jnp.zeros((1, 0, 8))
+    variables = attention.init(jax.random.key(1), image, jnp.ones((1, 2, 8)))
+    joined, added = attention.apply(variables, image, context)
+    alone, _ = attention.apply(variables, image)
+    assert added.shape == (1, 0, 8)
+    np.testing.assert_array_equal(joined, alone)
 
 
 def test_mmdit_is_dual_stream(rng):
