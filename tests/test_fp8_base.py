@@ -266,9 +266,12 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
 
 
 def test_a_record_runs_on_the_generation_it_was_measured_on_alone():
+    """A record measured on this process's generation runs here, and is refused by name on any
+    other: an A100's record on an H100, anything else's on an A100."""
     _, fp8 = adapters()
     jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    with assumed("sm80"), pytest.raises(ValueError):
+    measured = device_generation()
+    with assumed("sm90" if measured == "sm80" else "sm80"), pytest.raises(ValueError, match=f"on {measured}"):
         jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
 
 
