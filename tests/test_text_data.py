@@ -992,6 +992,34 @@ def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_p
     assert resolved == [("acme/tokenizer", None)]
 
 
+def test_a_release_whose_remote_tokenizer_renames_qwen2s_loads_as_qwen2s_without_its_code(tmp_path):
+    """Dream's release names its tokenizer DreamTokenizer, remote code that is
+    transformers' Qwen2Tokenizer renamed (`RENAMED_TOKENIZERS`). A Qwen2
+    tokenizer's files under that config load without the release's code, which
+    a plain load refuses to run, and encode and decode as the Qwen2 tokenizer
+    itself, special tokens included."""
+    from transformers import AutoTokenizer
+
+    from dew.data.text import load_tokenizer
+
+    source = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
+    released = tmp_path / "dream"
+    released.mkdir()
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(source / name, released / name)
+    config = json.loads((released / "tokenizer_config.json").read_text())
+    config.update(tokenizer_class="DreamTokenizer",
+                  auto_map={"AutoTokenizer": ["tokenization_dream.DreamTokenizer", None]})
+    (released / "tokenizer_config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        AutoTokenizer.from_pretrained(str(released), local_files_only=True)
+    loaded = load_tokenizer(str(released), local_files_only=True)
+    plain = load_tokenizer(str(source), local_files_only=True)
+    text = "<|im_start|>user\nThe Cascade Range: which volcano? ünïcödé\t12345<|im_end|>"
+    assert loaded.encode(text) == plain.encode(text)
+    assert loaded.decode(loaded.encode(text)) == plain.decode(plain.encode(text))
+
+
 def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):
     """Each host of a pool reads its own copy of a token corpus, mounted where it was put: the
     copies' readers agree on what they read, and a copy that holds other tokens does not."""
