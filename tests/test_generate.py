@@ -49,6 +49,28 @@ def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
 
 
+def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
+    """The cache continues a prompt's logical positions by the rule its
+    response does (`ModelInputs.extended`): from its last real token's, which
+    a document reset lowered below an earlier one in the first row, and past
+    a left-padded row's offset ones in the second. The greedy decode is then
+    a fresh full forward over the request extended token by token."""
+    from dew.nn.inputs import ModelInputs
+
+    model = tiny()
+    prompt = ModelInputs(jax.random.randint(rng, (2, 5), 0, VOCAB), {
+        "positions": jnp.asarray([[0, 1, 2, 0, 1], [0, 3, 4, 5, 6]], jnp.int32),
+        "attention_mask": jnp.asarray([[1, 1, 1, 1, 1], [0, 1, 1, 1, 1]], bool)})
+    params = model.init(rng, prompt.tokens)
+    generated = generate(model, params, prompt, 6, key=jax.random.PRNGKey(0),
+                         sampling=Sampling(temperature=0))
+    walked = prompt
+    for _ in range(6):
+        logits = model.apply(params, walked.tokens, **walked.kwargs())[:, -1]
+        walked = walked.extended(jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32))
+    np.testing.assert_array_equal(generated.tokens, walked.tokens)
+
+
 def test_sampling_stays_in_the_vocab_and_reacts_to_the_rng(rng):
     model = tiny()
     prompt = jax.random.randint(rng, (4, 4), 0, VOCAB)
