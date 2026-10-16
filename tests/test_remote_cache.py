@@ -134,10 +134,11 @@ for index in range(20):
 
 
 class Counted(http.server.BaseHTTPRequestHandler):
-    """A remote that fails every request at once, but answers a GET of a `slow` program after a
-    second; it counts the requests that reach it."""
+    """A remote that fails every request at once, but answers a GET of a `slow` program once
+    `released` is set; it counts the requests that reach it."""
 
     requests: ClassVar[list[str]] = []
+    released: ClassVar[threading.Event] = threading.Event()
 
     def log_message(self, *args):
         pass
@@ -147,7 +148,7 @@ class Counted(http.server.BaseHTTPRequestHandler):
         if self.command == "PUT":
             self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.command == "GET" and "/slow-" in self.path:
-            time.sleep(1)
+            Counted.released.wait(60)
             body = entry(2)
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -163,6 +164,7 @@ class Counted(http.server.BaseHTTPRequestHandler):
 
 def counted() -> tuple[http.server.ThreadingHTTPServer, str]:
     Counted.requests = []
+    Counted.released = threading.Event()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Counted)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -193,10 +195,15 @@ def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_b
     fetched = []
     slow = threading.Thread(target=lambda: fetched.append(cache.get("slow-1")))
     slow.start()
-    while not Counted.requests:
-        time.sleep(0.01)
-    for index in range(remote_cache.FAILURES):
-        assert cache.get(f"fail-{index}") is None
+    try:
+        while not Counted.requests:
+            time.sleep(0.01)
+        for index in range(remote_cache.FAILURES):
+            assert cache.get(f"fail-{index}") is None
+        assert not cache.available
+    finally:
+        # The slow answer arrives only once the remote was given up.
+        Counted.released.set()
     slow.join()
     sent = len(Counted.requests)
     assert cache.get("fail-late") is None
