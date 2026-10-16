@@ -29,6 +29,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from interop_support import extract_fixture, hub_cache
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from test_joined import row_joins
@@ -37,8 +38,8 @@ from dew import lora
 from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
-from dew.interop.safetensors_io import read_file
-from dew.lora import Adapter, LoRA, Target
+from dew.interop.safetensors_io import read_file, write_file
+from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -326,6 +327,111 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
         np.testing.assert_array_equal(np.asarray(ours_leaf), np.asarray(theirs_leaf))
 
 
+_HUB_ADAPTER = """
+import json, sys
+import jax, numpy as np
+from dew.interop.pretrained import Pretrained
+from dew.lora import LoRA
+
+for name, directory in (("dew/llama-tiny", sys.argv[1]), (sys.argv[3], sys.argv[2])):
+    source = Pretrained.load(name, dtype="float32", attention_impl="reference")
+    adapted = source.adapt(LoRA(rank=3, modules=("q_proj", "v_proj")), key=0)
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, adapted.variables)
+    adapted.adapter.save(variables, directory)
+    tokens = np.load(sys.argv[3] + "/input_ids.npy")
+    np.save(directory + "/logits.npy", np.asarray(adapted.model.apply(variables, tokens)))
+    base = LoRA.load(source.model, source.variables, directory, layouts=source.layouts).bases.get("")
+    print(json.dumps(None if base is None else [base.name, base.revision]))
+    # The run's record of the adapter keeps its base through JSON.
+    from dew.lora import AdapterRecord
+    from dew.registry import from_record, to_record, wrapper_layers
+
+    record = wrapper_layers(type(adapted.model))[1][0]._dew_wrapper()
+    kept = from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord))))
+    print(json.dumps(kept.bases == record.bases))
+"""
+
+
+def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_there(tmp_path):
+    """An adapter bound to a model loaded from the Hub names it and the commit the Hub resolved it
+    to in PEFT's config, and PEFT, reading only that config and the cache, loads the same base and
+    computes the logits Dew computes; Dew's own reload keeps the name. One bound to a local
+    directory names none, since no other machine resolves it. The process runs offline over a Hub
+    cache holding the tiny Llama at one commit."""
+    commit = hub_cache(tmp_path / "hub", "dew/llama-tiny", LLAMA)
+    hub, local = tmp_path / "hub-adapter", tmp_path / "local-adapter"
+
+    def run(script, *arguments):
+        return offline(tmp_path / "hub", script, *arguments)
+
+    reloaded = [json.loads(line) for line in run(_HUB_ADAPTER, hub, local, LLAMA) if line]
+    assert reloaded == [["dew/llama-tiny", commit], True, None, True]
+    config = json.loads((hub / "adapter_config.json").read_text())
+    assert (config["base_model_name_or_path"], config["revision"]) == ("dew/llama-tiny", commit)
+    written = json.loads((local / "adapter_config.json").read_text())
+    assert not {"base_model_name_or_path", "revision"} & set(written)
+    run(_PEFT_READS, hub, LLAMA / "input_ids.npy")
+    np.testing.assert_allclose(np.load(hub / "peft.npy"), np.load(hub / "logits.npy"), atol=2e-5)
+
+
+def offline(cache: Path, script: str, *arguments) -> list[str]:
+    """`script`'s output lines, run in a fresh process that resolves the Hub from `cache` alone."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "HF_HUB_CACHE": str(cache), "HF_HUB_OFFLINE": "1", "PYTHONPATH": str(ROOT / "src")}
+    done = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], env=env, check=False,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return done.stdout.split("\n")
+
+
+_HUB_PIPELINE_ADAPTER = """
+import json, sys
+from dew.interop.pretrained import load_diffusion_source
+from dew.interop.safetensors_io import read_file
+from dew.lora import DIFFUSERS_METADATA, DIFFUSERS_WEIGHTS, LoRA
+
+source = load_diffusion_source("dew/sd-tiny", dtype="float32", attention_impl="reference")
+adapted = source.adapt(LoRA(rank=2, modules=("to_q", "to_v")), key=0)
+adapted.adapter.save(adapted.variables, sys.argv[1])
+_, metadata = read_file(sys.argv[1] + "/" + DIFFUSERS_WEIGHTS)
+header = json.loads(metadata[DIFFUSERS_METADATA])
+print(json.dumps({key: value for key, value in header.items()
+                  if key.endswith((".base_model_name_or_path", ".revision"))}))
+"""
+
+
+def test_a_pipeline_a_run_reads_off_the_hub_names_it_as_its_adapters_base(tmp_path):
+    """The loader a diffusion run reads its pipeline with (`load_diffusion_source`),
+    offline over a Hub cache holding the tiny SD pipeline at one commit, binds an
+    adapter whose Diffusers file names that pipeline and commit as the denoiser's
+    base, as an adapter of `Pretrained.load`'s source does."""
+    source = extract_fixture(ROOT / "tests/fixtures/tiny_diffusers.tar.xz", tmp_path / "fixtures") / "sd"
+    commit = hub_cache(tmp_path / "hub", "dew/sd-tiny", source)
+    [named] = [json.loads(line) for line in offline(tmp_path / "hub", _HUB_PIPELINE_ADAPTER,
+                                                    tmp_path / "adapter") if line]
+    assert named == {"unet.base_model_name_or_path": "dew/sd-tiny", "unet.revision": commit}
+
+
+_PEFT_READS = """
+import json, sys
+import numpy as np, torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+directory = sys.argv[1]
+config = json.load(open(directory + "/adapter_config.json"))
+base = AutoModelForCausalLM.from_pretrained(config["base_model_name_or_path"], revision=config["revision"])
+with torch.no_grad():
+    logits = PeftModel.from_pretrained(base, directory).eval()(torch.as_tensor(np.load(sys.argv[2]))).logits
+np.save(directory + "/peft.npy", logits.numpy())
+"""
+
+
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
     """PEFT's target_modules: a suffix names every projection under it; B
     starts at zero so the adapted forward is the base forward; A is drawn
@@ -506,6 +612,33 @@ def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_
         if key.startswith("merged/"):
             np.testing.assert_allclose(layouts[key.removeprefix("merged/")].export(merged), sd_reference[key],
                                        atol=1e-6, rtol=0)
+
+
+def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_path):
+    """Diffusers writes each component's PEFT config apart, and the tool that bound
+    each names the model it bound it to, so a file's components may name different
+    bases. The file loads, and each component's base goes back out as it came in:
+    saved, reloaded, and through a run's record of the adapter."""
+    from dew.lora import AdapterRecord
+    from dew.registry import from_record, to_record
+
+    tensors, metadata = read_file(SD / lora.DIFFUSERS_WEIGHTS)
+    header = json.loads(metadata[lora.DIFFUSERS_METADATA])
+    bases = {"unet": AdapterBase("org/sd", "a" * 40), "text_encoder": AdapterBase("org/clip", None)}
+    named = {**header, "unet.revision": "a" * 40,
+             **{f"{component}.base_model_name_or_path": base.name for component, base in bases.items()}}
+    write_file(tensors, tmp_path / lora.DIFFUSERS_WEIGHTS,
+               {**metadata, lora.DIFFUSERS_METADATA: json.dumps(named)})
+    loaded = LoRA.load(pipeline.model, pipeline.variables, tmp_path, layouts=pipeline.layouts)
+    assert loaded.bases == bases
+    loaded.save(loaded.variables, tmp_path / "again")
+    again = LoRA.load(pipeline.model, pipeline.variables, tmp_path / "again", layouts=pipeline.layouts)
+    assert again.bases == bases
+    # This file's components differ in rank, which no run records; a run's adapter of one rank keeps
+    # its components' bases through JSON.
+    record = AdapterRecord(rank=2, alpha=4.0, rslora=False, dropout=0.0, modules=("unet/conv_in",),
+                           layouts={}, bases=again.bases)
+    assert from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord)))).bases == bases
 
 
 def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
