@@ -597,23 +597,15 @@ def widened(model_module):
     model.py and the stand-ins widened, which are their `.float()` casts, the
     MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
     and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
-    from torch_precision import default_dtype, wide
+    from torch_precision import default_dtype, dtype_widened, float_as, replaced
 
-    float_, zeros_like, new_zeros, arange = (torch.Tensor.float, torch.zeros_like,
-                                             torch.Tensor.new_zeros, torch.arange)
-    torch.Tensor.float = lambda self, *args, **kwargs: self.double()
-    torch.zeros_like = lambda x, *args, dtype=None, **kwargs: zeros_like(
-        x, *args, dtype=wide(dtype), **kwargs)
-    torch.Tensor.new_zeros = lambda self, *size, dtype=None, **kwargs: new_zeros(
-        self, *size, dtype=wide(dtype), **kwargs)
-    torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
     model_module.precompute_freqs_cis.cache_clear()
     try:
-        with default_dtype(torch.float64):
+        with replaced(float_as(torch.float64), (torch, "zeros_like", dtype_widened(torch.zeros_like)),
+                      (torch.Tensor, "new_zeros", dtype_widened(torch.Tensor.new_zeros)),
+                      (torch, "arange", dtype_widened(torch.arange))), default_dtype(torch.float64):
             yield
     finally:
-        torch.Tensor.float, torch.zeros_like, torch.Tensor.new_zeros, torch.arange = (
-            float_, zeros_like, new_zeros, arange)
         model_module.precompute_freqs_cis.cache_clear()
 
 

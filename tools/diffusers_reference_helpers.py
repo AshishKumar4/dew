@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -12,6 +13,23 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from torch_precision import replaced  # noqa: E402
+
+
+def restore_transformers_names() -> None:
+    """Put back the two names diffusers 0.34.0's pipeline modules import from
+    `transformers.utils`, which transformers 5 dropped (`FLAX_WEIGHTS_NAME`,
+    `WEIGHTS_INDEX_NAME`), so a tool walking those pipelines under
+    transformers 5 can import them. A tool calls it before its first pipeline
+    import; nothing it would compute is copied in their place."""
+    import transformers.utils
+
+    for name, value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
+                        ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
+        if not hasattr(transformers.utils, name):
+            setattr(transformers.utils, name, value)
 
 
 def frequency_exponent(half: int, shift: float, max_period: float) -> torch.Tensor:
@@ -51,12 +69,8 @@ def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
 def rounded_frequency_table():
     from diffusers.models import embeddings
 
-    original = embeddings.get_timestep_embedding
-    embeddings.get_timestep_embedding = rounded_timestep_embedding
-    try:
+    with replaced((embeddings, "get_timestep_embedding", rounded_timestep_embedding)):
         yield
-    finally:
-        embeddings.get_timestep_embedding = original
 
 
 def step_noise(shape: tuple[int, ...], count: int,
@@ -92,14 +106,14 @@ def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[list[int
         yield taken
 
 
-def recording(destination: str, version: str) -> Path:
+def recording(destination: str, cohort: str) -> Path:
     """The directory a generator records into, refused unless the installed
-    diffusers is `version`, the one its fixtures were recorded against, with
-    torch on the two threads they were recorded on."""
-    import diffusers
+    releases are `cohort`'s, the ones its fixtures were recorded against
+    (`reference_releases.require`), with torch on the two threads they were
+    recorded on."""
+    from reference_releases import require
 
-    if diffusers.__version__ != version:
-        raise RuntimeError(f"recorded against diffusers {version}, not {diffusers.__version__}")
+    require(cohort)
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)

@@ -27,6 +27,7 @@ import jax
 import numpy as np
 import torch
 import transformers
+from torch_precision import replaced
 from transformers.generation.utils import _speculative_sampling
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "decoding" / "speculative.npz"
@@ -44,28 +45,25 @@ def uniforms() -> np.ndarray:
 def verified(target, draft, candidates, drawn, dtype) -> tuple[int, np.ndarray]:
     """`_speculative_sampling` on one row, its uniforms `drawn`."""
     recorded = []
-    kept = torch.rand_like, torch.multinomial
-    torch.rand_like = lambda like: torch.as_tensor(drawn, dtype=like.dtype)
 
     def multinomial(probs, num_samples=1, **_):
         recorded.append(probs.detach().clone())
         return torch.zeros((probs.shape[0], num_samples), dtype=torch.long)
 
-    torch.multinomial = multinomial
-    try:
+    with replaced((torch, "rand_like", lambda like: torch.as_tensor(drawn, dtype=like.dtype)),
+                  (torch, "multinomial", multinomial)):
         ids = torch.as_tensor(np.concatenate([[0], candidates]), dtype=torch.long)[None]
         _, matches = _speculative_sampling(ids, torch.as_tensor(draft, dtype=dtype)[None], BLOCK - 1,
                                            torch.as_tensor(target, dtype=dtype)[None],
                                            is_done_candidate=False)
-    finally:
-        torch.rand_like, torch.multinomial = kept
     (probs,) = recorded
     return int(matches), probs[0].to(torch.float64).numpy()
 
 
 def main() -> None:
-    if transformers.__version__ != "5.16.1":
-        raise SystemExit(f"the fixture pins transformers 5.16.1, got {transformers.__version__}")
+    from reference_releases import require
+
+    require("transformers")
     generator = np.random.default_rng(7)
     target = (generator.standard_normal((ROWS, BLOCK + 1, VOCAB)) * 1.5).astype(np.float32)
     unrelated = generator.standard_normal((ROWS, BLOCK, VOCAB)) * 1.5

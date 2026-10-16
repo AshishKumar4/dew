@@ -348,6 +348,56 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+    """A decoder fine-tuned from a checkpoint encodes text with the processor the
+    checkpoint ships; its run records that processor's source, so the reloaded task
+    encodes as the trained one does rather than loading as weights that take ids."""
+    import shutil
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+
+    fixtures = Path(__file__).parent / "fixtures" / "hf"
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("config.json", "model.safetensors"):
+        shutil.copyfile(fixtures / "qwen3-tiny" / name, source / name)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, source / name)
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
+    objective = LMObjective(loaded, 8)
+    batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
+    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
+                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+
+    task = dew.pipeline(str(run))
+    assert loaded.text_processor is not None and task.processor is not None
+    assert type(task.processor) is type(loaded.text_processor)
+    np.testing.assert_array_equal(np.asarray(task.processor("the cat sat").tokens),
+                                  np.asarray(loaded.text_processor("the cat sat").tokens))
+
+
+def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
+    """An LM run records its decoder's task settings (`LMObjective.inference_fields`); a
+    record holding another, as a sampling temperature no LM run writes, is refused rather
+    than loaded with the field ignored."""
+    _, state = make_lm_run(tmp_path)
+    checkpoints = Checkpoints(str(tmp_path), keep=2)
+    record = checkpoints.artifact()
+    assert isinstance(record, dict)
+    dew.pipeline(str(tmp_path))
+    checkpoints.save(int(state.step) + 1, state, artifact={**record, "temperature": 0.5})
+    checkpoints.wait()
+    with pytest.raises(ValueError):
+        dew.pipeline(str(tmp_path))
+
+
+
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
     """A Hub repository holding a run, as `HfApi().upload_folder` publishes
     it, loads as that run: pulled whole at the commit its metadata resolved

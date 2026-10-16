@@ -573,7 +573,7 @@ class MultiHeadLatentAttention(nn.Module):
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
             implementation = kernel_for_materialized_mask(
-                implementation, query, dtype=self.dtype, precision=self.precision)
+                implementation, query, key, dtype=self.dtype, precision=self.precision)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
         # The per-head maxima the QK-Clip reads, with the nope width the

@@ -18,7 +18,17 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section, head_width
+from .common import (
+    ProjectorBase,
+    TowerBase,
+    TowerGeometry,
+    _side,
+    _vision_section,
+    head_width,
+    refuse_dropout,
+    rope_base,
+    trunk_geometry,
+)
 
 
 def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
@@ -249,12 +259,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"vision_feature_layer {vision.get('vision_feature_layer')!r} reads a "
             "middle layer this trunk never returns")
-    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
-    theta = records.number(rope.get("rope_theta", vision.get("rope_theta", 10000.0)), "rope_theta")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(
-        vision.get("projector_dropout", 0.0), "projector_dropout"
-    ):
-        raise ValueError("attention_dropout/projector_dropout is training-time")
+    refuse_dropout(vision, "attention_dropout", "projector_dropout")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
     output_dim = records.integer(
@@ -266,17 +271,14 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
             f"({vision.get('projector_output_dim')}), the adapter's width")
     return {
         "class": "llama4", "fields": {
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": _image_size(vision.get("image_size", 336), "image_size"),
+        **trunk_geometry(vision),
+        "image_size": _side(vision.get("image_size", 336), "image_size"),
         "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "layer_norm_eps": records.number(
             vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
         ),
-        "rope_theta": theta,
+        "rope_theta": rope_base(vision, 10000.0),
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
         "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),

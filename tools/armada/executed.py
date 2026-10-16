@@ -29,10 +29,11 @@ from ci import MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
-TOOLS = {"git", "nvidia-smi", "uname", "file"}
-"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs)
-and uname and file (the `platform` module's answers). Any other start, a shell's or a launcher's
-included, may run the checkout's code."""
+TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
+"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs),
+uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
+code, on the host alone). Any other start, a shell's or a launcher's included, may run the
+checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is `CHILD_START`'s."""

@@ -42,6 +42,7 @@ import json
 import re
 import resource
 import shutil
+import sys
 import tarfile
 import tempfile
 from collections import Counter, defaultdict
@@ -49,8 +50,11 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from dew.nn.kernels.generation import gpu_target
-from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import HloInstruction, collective, custom_call_kind, hlo_instructions
 from dew.telemetry.profile import report_table
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from trace_window import program_times
 
 PARTS = (
     # The decision head's own attention and norms are the head's; Qwen3.5 names every mixer
@@ -70,9 +74,6 @@ PARTS = (
 )
 CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "attention": "attention", "triton": "pallas"}
 """A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton calls."""
-COLLECTIVES = {"all-reduce", "all-gather", "reduce-scatter", "collective-permute", "all-to-all",
-               "all-reduce-start", "all-gather-start", "collective-permute-start", "all-reduce-done",
-               "all-gather-done", "collective-permute-done"}
 FUSED_KINDS = (
     ("gemm", {"dot", "convolution"}),
     ("gather_scatter", {"gather", "scatter"}),
@@ -119,7 +120,7 @@ def kind_of(row: dict, ops: dict[str, HloInstruction] | None = None) -> str:
         fused = frozenset(re.sub(r"\.\d+$", "", name).split("_")) if op == "fusion" else frozenset()
     else:
         op, target, fused = known.op, known.target, known.fused
-    if op in COLLECTIVES:
+    if collective(op) is not None:
         return "collective"
     if op == "custom-call":
         if not target and name.startswith("pallas_call"):
@@ -165,15 +166,6 @@ def heaviest(groups: dict) -> list:
     return sorted(groups.items(), key=lambda item: -sum(item[1].values()))
 
 
-def step_program(rows: list) -> str:
-    """The program the capture's device time went to most, its step: XProf's program id,
-    which is the number XLA's dump names the module by."""
-    programs = defaultdict(float)
-    for row in rows:
-        programs[str(row.get("program_id"))] += float(row["total_self_time"])
-    return max(programs, key=programs.__getitem__)
-
-
 def program_runs(rows: list, step: str, steps: int, ops: dict[str, HloInstruction] | None) -> float:
     """How many times a step ran its program `step`: the count most of its ops show over the ops'
     own calls a run (`HloInstruction.runs`). XProf counts an op's kernels, not its calls; a
@@ -206,10 +198,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     peak_source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
                    else f"unknown device: {device}" if device else "no device named")
     xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
-    programs = defaultdict(float)
-    for row in rows:
-        programs[str(row.get("program_id"))] += float(row["total_self_time"])
-    step = step_program(rows)
+    programs = program_times(rows)
+    step = max(programs, key=programs.__getitem__)
     runs = program_runs(rows, step, steps, ops)
     by_part: dict = defaultdict(lambda: defaultdict(float))
     by_kind: dict = defaultdict(float)
@@ -319,7 +309,7 @@ def gemm_precision(row: dict, known: HloInstruction | None) -> str:
 @contextlib.contextmanager
 def dump_files(hlo: Path, module: str, program: str | None = None) -> Iterator[dict]:
     """The after-optimizations HLO, live-range, buffer-assignment and memory-usage-report
-    files of `module`'s compile numbered `program`, the one a capture ran (`step_program`),
+    files of `module`'s compile numbered `program`, the one a capture spent most time in,
     or of its newest without a capture, by suffix (the HLO's is `.txt`), as paths read a
     line at a time (`lines`): from a .tgz only those four are extracted, to a directory that
     lasts the context. A dump holds every compile of the step, each tens of megabytes: a
@@ -471,7 +461,8 @@ def main(argv: list[str] | None = None) -> int:
         flops, device = entry.get("model_flops_per_step"), device or entry.get("device")
     result = {}
     rows = report_table(capture_of(args.trace) / "reports" / "hlo_stats.json")[1] if args.trace else []
-    program = step_program(rows) if rows else None
+    programs = program_times(rows)
+    program = max(programs, key=programs.__getitem__) if programs else None
     with dump_files(args.hlo, args.module, program) if args.hlo else contextlib.nullcontext({}) as files:
         if args.trace:
             ops = hlo_instructions(lines(files[".txt"])) if ".txt" in files else None

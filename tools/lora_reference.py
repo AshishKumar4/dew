@@ -72,8 +72,9 @@ def decoder(out: Path) -> None:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM
     import transformers
-    if transformers.__version__ != "5.16.1":
-        raise RuntimeError("the decoder reference runs on transformers 5.16.1")
+    from reference_releases import require
+
+    require("transformers")
 
     torch.manual_seed(0)
     base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32)
@@ -138,8 +139,9 @@ def _tiny_sd():
     import transformers
     from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTokenizer
-    if transformers.__version__ != "4.49.0":
-        raise RuntimeError("the pipeline reference runs on transformers 4.49.0")
+    from reference_releases import require
+
+    require("diffusers-pipelines")
     with tempfile.TemporaryDirectory() as extracted:
         with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
             archive.extractall(extracted, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],

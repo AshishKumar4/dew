@@ -521,7 +521,7 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 
@@ -1379,11 +1379,11 @@ for text in result.text:
 
 The task includes the checkpoint's processor, so it accepts strings and `result.text` holds the decoded continuations. The second positional argument is the token budget; if the checkpoint's `generation_config.json` declares one, that is the default. `n=4` draws four continuations per prompt. The prompts above go straight to the tokenizer. To apply the checkpoint's chat template, call `task.processor.chat(messages)` and pass the `ModelInputs` it returns to the same call.
 
-E2B wraps a multimodal model, and the task also accepts `images=` when the checkpoint declares a vision tower. The `dtype` here sets the compute dtype, not how weights are stored: the Gemma 4 loader keeps FP32 parameters. Loading also needs host buffers, device temporaries and the KV cache, so this example does not show that E2B fits on a 16 GB GPU.
+E2B wraps a multimodal model, and the task also accepts `images=` when the checkpoint declares a vision tower. The `dtype` here sets the compute dtype, not how weights are stored: each parameter keeps the dtype the checkpoint stores it in, and `param_dtype=` changes that ([`dew.pipeline`'s parameters](https://github.com/AshishKumar4/dew/blob/main/src/dew/inference/pipeline.py)). Loading also needs host buffers, device temporaries and the KV cache, so this example does not show that E2B fits on a 16 GB GPU.
 
 ### Generating text with a large decoder on a TPU slice
 
-Every process runs the same script with its own prompts, and `result.host()` returns only that process's real rows. I have not run this on a real TPU slice. The pipeline loads the checkpoint before it shards it, so having enough device memory in total does not mean loading will succeed.
+Every process runs the same script with its own prompts, and `result.host()` returns only that process's real rows. I have not run this on a real TPU slice. With `mesh=`, the pipeline streams each decoder leaf from the checkpoint onto the devices that hold it, so no host builds the whole model; the towers, projectors and dequantized tensors are still built on the host ([Host memory](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/distributed.md#host-memory)). So having enough device memory in total still does not by itself mean loading will succeed.
 
 Save this as `generate_tpu.py`:
 

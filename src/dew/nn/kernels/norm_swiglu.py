@@ -77,7 +77,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.interpreters.ad import JVPTracer
 
-from ..precision import at_least_fp32, compensated_add, rounded_to
+from ..precision import at_least_fp32, compensated_add, rounded_to, two_product
 from ..sharding import logical_spec, manual_map
 from . import generation, tuning
 from .generation import first_refusal
@@ -189,19 +189,7 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
             }""", constraints="=f,f,f,f", args=(left, right, high),
             result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
-    barrier = jax.lax.optimization_barrier
-    # Split significands in half by bits, avoiding splitter*value overflow.
-    def split(value):
-        bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
-        high = jax.lax.bitcast_convert_type(bits, jnp.float32)
-        return high, barrier(value - high)
-    lh, ll = split(left)
-    rh, rl = split(right)
-    product = barrier(left * right)
-    lost = barrier(barrier(lh * rh) - product)
-    lost = barrier(lost + barrier(lh * rl))
-    lost = barrier(lost + barrier(ll * rh))
-    return product, barrier(lost + barrier(ll * rl))
+    return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
 
 
 def _selected(choice: str, implementation: str, refusal: str | None) -> str:

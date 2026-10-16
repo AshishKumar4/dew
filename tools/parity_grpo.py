@@ -83,8 +83,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "grpo.npz")
     out = parser.parse_args(argv).out
-    if verl.__version__ != VERL:
-        raise RuntimeError(f"run with verl {VERL}, not {verl.__version__}")
+    from reference_releases import require
+
+    require("verl")
     torch.set_num_threads(1)
     arrays = rollout()
     loss, gradient = verl_loss(arrays, torch.float32)

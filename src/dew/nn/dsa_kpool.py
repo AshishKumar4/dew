@@ -336,7 +336,7 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             # The selection is always a mask, so training takes the kernel
             # a materialized mask runs on.
             implementation = kernel_for_materialized_mask(
-                implementation, query, dtype=self.dtype, precision=self.precision,
+                implementation, query, key, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax)
             indices = self.indexer.select_indices(x, q_resid, packed, visible)
         selected = selection_mask(indices, key.shape[1])
