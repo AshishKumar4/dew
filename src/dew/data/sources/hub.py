@@ -155,22 +155,7 @@ class Hub(Dataset):
             )
         revision, paths, format = selection
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in paths)
-        return Files(urls, format=format, columns=self.columns, file_info=self._facts(revision, paths))
-
-    def _facts(self, revision: str, paths: tuple[str, ...]) -> dict[str, dict[str, object]]:
-        """Each shard's size and git blob id at `revision`, as the Hub last answered
-        (`dew.cache.hub_answer`), which `Files` takes for the shard's own and so reads offline as
-        online."""
-        from huggingface_hub import HfApi
-        from huggingface_hub.hf_api import RepoFile
-
-        def ask() -> dict[str, dict[str, object]]:
-            answered = HfApi().get_paths_info(self.repo, list(paths), revision=revision, repo_type="dataset")
-            return {entry.path: {"bytes": entry.size, "ETag": entry.blob_id}
-                    for entry in answered if isinstance(entry, RepoFile)}
-
-        facts = hub_answer(f"datasets/{self.repo}/facts/{revision}/{self.split}", ask)
-        return {f"hf://datasets/{self.repo}@{revision}/{path}": facts[path] for path in paths}
+        return Files(urls, format=format, columns=self.columns)
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
         from huggingface_hub import HfApi

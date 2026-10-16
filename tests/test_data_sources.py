@@ -98,8 +98,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
 
     def header(self, path, **kwargs):
         payload = payloads[path]
-        return {"name": path, "type": "file", "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payload), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}}
 
     def refs(self, repo, *, repo_type):
         conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
@@ -152,8 +152,8 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
     }
 
     def header(self, path, **kwargs):
-        return {"name": path, "type": "file", "size": len(payloads[path]),
-                "sha256": hashlib.sha256(payloads[path]).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payloads[path]), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payloads[path]).hexdigest(), "size": len(payloads[path])}}
 
     def listing(self, repo, *, repo_type, revision):
         return (["default/train/0000.parquet"] if revision == "converted"
