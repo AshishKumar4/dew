@@ -1379,11 +1379,11 @@ for text in result.text:
 
 The task includes the checkpoint's processor, so it accepts strings and `result.text` holds the decoded continuations. The second positional argument is the token budget; if the checkpoint's `generation_config.json` declares one, that is the default. `n=4` draws four continuations per prompt. The prompts above go straight to the tokenizer. To apply the checkpoint's chat template, call `task.processor.chat(messages)` and pass the `ModelInputs` it returns to the same call.
 
-E2B wraps a multimodal model, and the task also accepts `images=` when the checkpoint declares a vision tower. The `dtype` here sets the compute dtype, not how weights are stored: the Gemma 4 loader keeps FP32 parameters. Loading also needs host buffers, device temporaries and the KV cache, so this example does not show that E2B fits on a 16 GB GPU.
+E2B wraps a multimodal model, and the task also accepts `images=` when the checkpoint declares a vision tower. The `dtype` here sets the compute dtype, not how weights are stored: each parameter keeps the dtype the checkpoint stores it in, and `param_dtype=` changes that ([`dew.pipeline`'s parameters](https://github.com/AshishKumar4/dew/blob/main/src/dew/inference/pipeline.py)). Loading also needs host buffers, device temporaries and the KV cache, so this example does not show that E2B fits on a 16 GB GPU.
 
 ### Generating text with a large decoder on a TPU slice
 
-Every process runs the same script with its own prompts, and `result.host()` returns only that process's real rows. I have not run this on a real TPU slice. The pipeline loads the checkpoint before it shards it, so having enough device memory in total does not mean loading will succeed.
+Every process runs the same script with its own prompts, and `result.host()` returns only that process's real rows. I have not run this on a real TPU slice. With `mesh=`, the pipeline streams each decoder leaf from the checkpoint onto the devices that hold it, so no host builds the whole model; the towers, projectors and dequantized tensors are still built on the host ([Host memory](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/distributed.md#host-memory)). So having enough device memory in total still does not by itself mean loading will succeed.
 
 Save this as `generate_tpu.py`:
 
