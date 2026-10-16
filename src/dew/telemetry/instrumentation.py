@@ -660,6 +660,20 @@ class StepFlops:
         return StepFlops(self.model + other.model, self.hardware + other.hardware,
                          self.unsized + other.unsized)
 
+    def __rmul__(self, calls: int) -> "StepFlops":
+        """The FLOPs of `calls` such calls (a step split into microbatches)."""
+        return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
+
+    def utilizations(self, steps: int, step_time: float) -> dict[str, float]:
+        """The interval's HLO utilizations of `steps` steps of `step_time` seconds each: train/hfu
+        off `hardware` and train/hlo_flops_util off `model`, both ending `_lower_bound` beside
+        train/unsized_kernels, the launches a step, where any launch's work went uncounted."""
+        bound = "_lower_bound" if self.unsized else ""
+        scalars = {f"train/{name}{bound}": utilization
+                   for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
+                   if (utilization := model_flops_utilization(counted / steps, step_time)) is not None}
+        return {**scalars, "train/unsized_kernels": self.unsized / steps} if bound else scalars
+
 
 NO_FLOPS = StepFlops(0.0, 0.0)
 """The FLOPs of no step, where an interval's sum starts."""
