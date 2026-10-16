@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, float64_terms
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
@@ -128,10 +128,14 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
         wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
         truth = jax.jit(stepwise_scan)(*exact)
         truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
-        twin = jax.jit(xla_chunk_scan)(*exact)
-        twin_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](wide_seeds))(*exact)
-        truth, twin = ([np.asarray(t) for t in (*first, *second)]
-                       for first, second in ((truth, truth_gradients), (twin, twin_gradients)))
+        # The XLA path in float64 and each entry's terms, its own sums (`float64_terms`), each entry's
+        # size where its sum cancels.
+        def twin_and_gradients(*o):
+            return (*xla_chunk_scan(*o), *jax.vjp(xla_chunk_scan, *o)[1](wide_seeds))
+
+        twin, terms = float64_terms(twin_and_gradients, *exact)
+        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
+        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
 
     xla = jax.jit(xla_chunk_scan)(*operands)
     xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
@@ -140,11 +144,11 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
         seeded))(*operands)
 
     names = ("output", "final", "x", "B", "C", "A dt", "state")
-    for name, mine, theirs, wide, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
-                                              twin, truth, strict=True):
+    pairs = zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients), twin, truth, terms, strict=True)
+    for name, mine, theirs, wide, want, summed in pairs:
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
+        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name, terms=summed)
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):
