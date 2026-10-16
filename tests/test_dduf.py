@@ -74,6 +74,9 @@ def diffusers_prediction(repo: str | Path, dduf_file: str, inputs, *, wide: bool
     import contextlib
 
     import torch
+    from tools.diffusers_reference_helpers import restore_transformers_names
+
+    restore_transformers_names()
     from diffusers import DiffusionPipeline, FluxPipeline
 
     dtype = torch.float64 if wide else torch.float32
