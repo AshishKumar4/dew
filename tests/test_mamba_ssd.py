@@ -19,8 +19,7 @@ from sharded import assert_runs_per_shard
 from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
-from dew.nn.kernels import mamba_ssd, tuning
-from dew.nn.mixers import mamba2
+from dew.nn.kernels import generation, mamba_ssd, tuning
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
 
 pytestmark = pytest.mark.kernel
@@ -29,11 +28,9 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 INTERPRETED = jax.default_backend() != "gpu"
 
 
-def row_names_port(monkeypatch, *, port: bool = True):
-    """The device's target row names the port for the scan where `port` (`measured_kernel`), as a
-    GPU's row does, and names none where not, as a CPU's does; off a GPU the port's kernels interpret."""
-    monkeypatch.setattr(mamba2, "measured_kernel",
-                        lambda choice, default: "pallas" if port and choice == "ssd" else default)
+def row_names_port(*, port: bool = True):
+    """Choose the port for the scan where `port`, else XLA; off a GPU the port's kernels interpret."""
+    return generation.chosen(ssd="pallas" if port else "xla")
 
 
 def scan_operands(batch, length, heads, width, groups, state, *, documents: bool, seed: int = 0):
@@ -134,7 +131,7 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
-def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound):
+def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype, bound):
     """The layer on the port, packed documents and all, hands the scan its compute dtype: its output
     and every parameter's gradient the XLA scan's, within fp32 rounding of the chunked algebra in
     float32 and within bf16 operands' rounding in bfloat16, mamba_ssm's numbers."""
@@ -149,10 +146,10 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound)
         out = jnp.asarray(layer.apply(params, x, MixerCall(metadata)))
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
-    row_names_port(monkeypatch, port=False)
-    (_, want), want_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-    row_names_port(monkeypatch)
-    (_, got), got_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
+    with row_names_port(port=False):
+        (_, want), want_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
+    with row_names_port():
+        (_, got), got_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
     assert got.dtype == want.dtype == dtype
     scale = float(jnp.max(jnp.abs(want.astype(jnp.float32))))
     assert float(jnp.max(jnp.abs(got.astype(jnp.float32) - want))) < bound * scale
@@ -164,7 +161,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound)
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
-def test_the_port_keeps_the_kernel_contract_on_a_mesh(monkeypatch, axis, split):
+def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     """`chunk_ssd` on the port over rows split two ways, or heads split two ways with the groups they
     read, runs per shard (`assert_runs_per_shard`): its output, final state and gradients within the
     float64 gate of one device's, and no operand moved between devices."""
@@ -177,7 +174,6 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(monkeypatch, axis, split):
     run = through(32, starts, dy, dfinal)
     with jax.enable_x64(new_val=True):
         truth = jax.tree.map(np.asarray, jax.jit(run)(*widened(operands)))
-    row_names_port(monkeypatch)
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))
@@ -188,4 +184,5 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(monkeypatch, axis, split):
              spec(4, rows + heads), spec(4, rows + heads), spec(1, (0,) if heads else ()),
              spec(4, rows + ((1,) if heads else ()))]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(run, operands, specs, mesh, truth)
+    with row_names_port():
+        assert_runs_per_shard(run, operands, specs, mesh, truth)

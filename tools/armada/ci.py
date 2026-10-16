@@ -73,6 +73,7 @@ import concurrent.futures
 import contextlib
 import hashlib
 import heapq
+import importlib.util
 import json
 import math
 import os
@@ -765,9 +766,7 @@ def coverage_report(directory: Path) -> int:
     """Combine the coverage data `coverage_items`' tasks left under `directory` and write its report:
     coverage.py's own JSON, and a table a module a line, the least covered first. It runs where the
     artifacts were downloaded, under this interpreter, which must have coverage.py."""
-    try:
-        import coverage  # noqa: F401
-    except ImportError:
+    if importlib.util.find_spec("coverage") is None:
         print(f"coverage.py is not importable from {sys.executable}; install the test extra", file=sys.stderr)
         return 1
     python = sys.executable

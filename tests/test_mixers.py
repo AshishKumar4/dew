@@ -27,6 +27,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
+from dew.nn.kernels.generation import chosen
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
@@ -350,18 +351,16 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
 
 
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
-def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, monkeypatch, capsys):
+@chosen(gated_delta_rule="fla")
+def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so
     a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving all of them,
     a tiny decoder of that kind saves each one for its backward. A delta rule's decay and inverse are
     its port's (`row_names_port`, interpreted off a GPU)."""
     from jax.ad_checkpoint import print_saved_residuals
 
-    from dew.nn import linear
     from dew.nn.backbones.decoder_block import RematPolicy
 
-    monkeypatch.setattr(linear, "measured_kernel",
-                        lambda choice, default: "fla" if choice == "gated_delta_rule" else default)
     value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
     assert value.residuals is not None
     model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])

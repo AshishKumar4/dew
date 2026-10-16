@@ -191,9 +191,9 @@ def main(destination: str) -> None:
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
+    cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "base": BASE,
-                                 "tokens": TOKENS, "cases": {}}
-    cases: dict[str, dict[str, object]] = record["cases"]  # type: ignore[assignment]
+                                 "tokens": TOKENS, "cases": cases}
     for name, case in CASES.items():
         for key, value in build(name, case, root).items():
             arrays[f"{name}.{key}"] = value

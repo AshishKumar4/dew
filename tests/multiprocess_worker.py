@@ -2295,7 +2295,7 @@ def mode_whole_validation(args) -> dict:
     ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
     `tests/test_whole_validation.py` runs them on one process."""
     import jax
-    from test_objective_inputs import corpus_windows
+    from objective_cases import corpus_windows
     from test_whole_validation import EVALUATED, evaluated, perplexity
 
     index, parts = (int(value) for value in args.part.split("/"))

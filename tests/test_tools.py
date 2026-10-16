@@ -640,6 +640,70 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
+    """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
+    `typing.cast` however it was imported, and a warning filter whose action is
+    "ignore" are each reported. A string that spells a comment, a function of the
+    file's own named `cast`, a filter that makes warnings errors, and an import kept
+    for the registry entry it makes are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "import warnings\n"
+            "from typing import cast as as_type\n"
+            "import pytest\n"
+            "import sparx.plugins  # noqa: F401  (registers the kind)\n"
+            "WIDTH = 1  # noqa: E501\n"
+            "SPELLED = 'x = 1  # noqa: E501'\n"
+            "def cast(value):\n"
+            "    return value\n"
+            "@pytest.mark.filterwarnings('ignore::DeprecationWarning')\n"
+            "def test_quiet():\n"
+            "    warnings.simplefilter('ignore')\n"
+            "    with warnings.catch_warnings(action='ignore'):\n"
+            "        assert as_type(int, cast(1))\n"
+            "@pytest.mark.filterwarnings('error')\n"
+            "def test_loud():\n"
+            "    warnings.filterwarnings(action='error')\n"
+            "@pytest.mark.filterwarnings('error', 'ignore::DeprecationWarning')\n"
+            "def test_quiet_after_all():\n"
+            "    pass\n"),
+        "tools/report.py": ("from typing_extensions import cast\n"
+                            "COUNT: int = '1'  # type: ignore[assignment]\n"
+                            "WIDTH = cast(int, COUNT)\n"),
+    })
+    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13, 17)),
+                     ("tools/report.py", 2, "SLOP003"), ("tools/report.py", 3, "SLOP003")]
+
+
+def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):
+    """SLOP008: a first-party module's member or table replaced in a test is reported through an
+    alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
+    named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
+    boundaries a test may replace."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = {}\n",
+        "tests/test_graph.py": (
+            "import time\n"
+            "import sparx.graph as g\n"
+            "from sparx import graph\n"
+            "def test_alias(monkeypatch):\n"
+            "    monkeypatch.setattr(g, 'narrowed_paths', dict)\n"
+            "def test_table(monkeypatch):\n"
+            "    monkeypatch.setitem(graph.EDGES, 'edge', 1)\n"
+            "    monkeypatch.delitem(g.EDGES, 'edge')\n"
+            "def test_local(monkeypatch):\n"
+            "    from sparx.graph import EDGES as edges\n"
+            "    monkeypatch.setitem(edges, 'edge', 1)\n"
+            "    monkeypatch.delattr(graph, 'narrowed_paths')\n"
+            "def test_boundaries(monkeypatch):\n"
+            "    monkeypatch.setattr(time, 'sleep', lambda seconds: None)\n"
+            "    monkeypatch.setattr(graph, 'snapshot', lambda: None)\n"
+            "    monkeypatch.setattr('sparx.graph.subprocess.run', print)\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
+
+
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
@@ -656,6 +720,94 @@ def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
                                 "optional = pytest.importorskip(modname='torch')\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP015") for line in (3, 4, 7)]
+
+
+def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_table(tmp_path):
+    """SLOP016: the device's generation, `device_generation()` or a `gpu_target()`'s `.generation`,
+    however imported, and through a name bound to it in the function, its module or a class body,
+    compared with or prefix-matched against one the source spells, matched against a spelled case,
+    cut up, or used as a table's key or attribute name, is reported outside nn/kernels/generation.py.
+    A value is read before its name takes it, and a comprehension's first iterable before its targets.
+    Comparing it with a recorded generation, reading a fact off the target, passing it to a function
+    (a `getattr` of the caller's among them), a name rebound to something else or shadowed by a
+    parameter or a comprehension (a lambda's in it too), and a class attribute, which no method reads
+    as a name, are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/nn/kernels/generation.py": (
+            "def device_generation():\n"
+            "    return 'sm80'\n"
+            "def gpu_target(name=None):\n"
+            "    return name\n"
+            "def wide():\n"
+            "    return device_generation().startswith('sm')\n"),
+        "src/sparx/tiles.py": (
+            "from sparx.nn.kernels import generation as hardware\n"
+            "from sparx.nn.kernels.generation import device_generation, gpu_target\n"
+            "TILES = {'sm80': 4096}\n"
+            "def tile():\n"
+            "    return TILES.get(device_generation(), 1024)\n"
+            "def held():\n"
+            "    target = hardware.gpu_target()\n"
+            "    return 0 if target.generation == 'sm90' else 1\n"
+            "def narrow():\n"
+            "    named = device_generation()\n"
+            "    return named.startswith('sm8') or int(named[2:]) > 89 or named in ('sm86', 'sm89')\n"
+            "def measured(on):\n"
+            "    named = device_generation()\n"
+            "    return named != on and gpu_target().shared_limit and gpu_target(named) and print(named)\n"
+            "GENERATION = device_generation()\n"
+            "def later():\n"
+            "    return lambda: GENERATION == 'sm90' or getattr(TILES, GENERATION)\n"
+            "class Launch:\n"
+            "    PICK = TILES[device_generation()]\n"
+            "def matched():\n"
+            "    named: str = device_generation()\n"
+            "    match named:\n"
+            "        case 'sm90' | 'sm100':\n"
+            "            return 0\n"
+            "    return 1\n"
+            "def relabeled(record):\n"
+            "    named = device_generation()\n"
+            "    named = record.label\n"
+            "    return named == 'label' or [named == 'sm80' for named in record.names]\n"
+            "def shadowed(GENERATION):\n"
+            "    return GENERATION == 'sm80'\n"
+            "def listed(record):\n"
+            "    named = device_generation()\n"
+            "    return [named == 'sm80' for named in record.names] and named == 'sm90'\n"
+            "def looked_up(TILES):\n"
+            "    named = device_generation()\n"
+            "    named = TILES[named]\n"
+            "    return named\n"
+            "def iterated(TILES):\n"
+            "    named = device_generation()\n"
+            "    return [named for named in TILES[named]]\n"
+            "class Scoped:\n"
+            "    LABEL = device_generation()\n"
+            "    def method(self):\n"
+            "        return LABEL == 'label'\n"
+            "def deferred(records):\n"
+            "    named = device_generation()\n"
+            "    return [lambda: named == 'label' for named in records]\n"
+            "def passed(getattr, TILES):\n"
+            "    return getattr(TILES, device_generation())\n"
+            "def copied(TILES):\n"
+            "    named = device_generation()\n"
+            "    named: str = named\n"
+            "    return TILES[named]\n"
+            "def relabeled_inside():\n"
+            "    named = device_generation()\n"
+            "    [(named := label) for label in ('label',)]\n"
+            "    held = [(found := device_generation()) for _ in ()]\n"
+            "    return named == 'label' or held and found == 'sm80'\n"
+            "def later_or_inner(TILES):\n"
+            "    named = device_generation()\n"
+            "    deferred = ((named := label) for label in ('label',))\n"
+            "    inner = [lambda: (named := 'label') for _ in ('x',)]\n"
+            "    return TILES[named], deferred, inner\n"),
+    })
+    assert found == [("src/sparx/tiles.py", line, "SLOP016")
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41, 54, 59, 64)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
