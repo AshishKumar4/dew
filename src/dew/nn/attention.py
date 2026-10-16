@@ -253,8 +253,15 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     row from its index; an explicit mask is reduced over its keys, folded
     with them (`combined_attention_mask`).
     """
-    # A query of another sequence's documents (`CrossDocuments`) sees a key only where its
-    # document has one, which only the mask says.
+    if isinstance(segment_ids, CrossDocuments) and mask is None and key_value_seq_lengths is None:
+        # A query of another sequence's documents sees a key where its document holds one: the
+        # keys' ids run in ascending order, padding after them, so each query's id is searched in
+        # its row's keys rather than compared with every key.
+        queries, keys = document_ids(segment_ids)
+        ordered = jnp.where(keys == 0, jnp.iinfo(keys.dtype).max, keys)
+        held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
+                        - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
+        return ((held > 0) & (queries != 0))[:, :, None, None]
     if (mask is not None or isinstance(segment_ids, CrossDocuments)
             or (segment_ids is not None and key_value_seq_lengths is not None)):
         visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
@@ -1167,17 +1174,20 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         rows, length = segment_ids.shape
         flat = (query.reshape(rows * length, *query.shape[2:]),
                 *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
-        if key_segment_ids is not None:
+        if key_segment_ids is None:
+            # A call's own documents are its runs, whatever their ids.
+            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
+            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+        else:
+            # Another sequence's documents pair with the queries' by id, sequence i each side's
+            # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
+            # has none of.
             offsets, key_offsets = (document_offsets(ids, max_segments)
                                     for ids in (segment_ids, key_segment_ids))
-            out = flash.flash_mha_varlen(*flat, offsets, length, sinks=sinks, key_cu_seqlens=key_offsets,
-                                         key_max_seqlen=key_segment_ids.shape[1])
-            return out.reshape(rows, length, *out.shape[1:])
-        changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-        begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-        offsets = cu_seqlens(begins, rows * (max_segments + 1))
+            own_keys = {"key_cu_seqlens": key_offsets, "key_max_seqlen": max(1, key_segment_ids.shape[1])}
         out = flash.flash_mha_varlen(*flat, offsets, length, is_causal=causal, window_size=window,
-                                     sinks=sinks)
+                                     sinks=sinks, **own_keys)
         return out.reshape(rows, length, *out.shape[1:])
 
     queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
