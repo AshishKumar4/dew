@@ -1042,10 +1042,10 @@ def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_o
                         lambda self, repo, revision=None: SimpleNamespace(sha=revision))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: list(names))
     monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **kwargs: stated[path])
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: path in stated)
     identity = Hub("owner/lines", revision="pinned").files.fingerprint()
     assert [facts["bytes"] for facts in identity["files"]] == [400, 96]
     offline(monkeypatch)
+    # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
     monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
     assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
