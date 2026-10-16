@@ -496,14 +496,15 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte"):
+def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte",
+                   pad_token_id=0):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
-    weights under a checkpoint that records the objective and the tokenizer
-    `tokenizer` names, each parameter moved by `moved` times a seeded normal
-    draw (a stand-in for training). The default fixture reads images and is the
-    published layout's own; `diffusion-gemma-sft` is Google's dense
-    text-only model, which transformers' class cannot build, so its export
-    is refused."""
+    weights under a checkpoint that records the objective, its `pad_token_id`
+    and the tokenizer `tokenizer` names, each parameter moved by `moved` times
+    a seeded normal draw (a stand-in for training); returns the objective and
+    the saved state. The default fixture reads images and is the published
+    layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
+    which transformers' class cannot build, so its export is refused."""
     from pathlib import Path
 
     from dew.data.text import tokenizer_for
@@ -513,6 +514,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
+                                        pad_token_id=pad_token_id,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     if moved:
@@ -524,6 +526,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
+    return objective, state
 
 
 def make_masked_run(directory):
@@ -566,6 +569,22 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     np.testing.assert_array_equal(drawn.host().tokens, expected.host().tokens)
     assert direct.decode(drawn) == front.decode(expected)
     assert all(isinstance(row, str) for row in direct.decode(drawn))
+
+
+def test_a_saved_block_run_pads_rows_as_its_live_task_does(tmp_path):
+    """The block objective's pad id is a control of its task that a loader
+    cannot read off the model, so the run records it: a restored task pads a
+    row that ended at an EOS with it, as the live task does."""
+    objective, state = make_block_run(tmp_path, pad_token_id=3)
+    live = objective.pipeline(state, ema=False)
+    # The row's first drawn token as the EOS ends it at once, so the rest of
+    # its response is padding.
+    eos = (int(live([[1, 5, 7]], 3, key=5).host().tokens[0, 3]),)
+    expected = dataclasses.replace(live, eos_token_ids=eos)([[1, 5, 7]], 3, key=5).host()
+    restored = dataclasses.replace(dew.pipeline(str(tmp_path), ema=False), eos_token_ids=eos)
+    actual = restored([[1, 5, 7]], 3, key=5).host()
+    np.testing.assert_array_equal(expected.lengths, [1])
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
