@@ -663,8 +663,11 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
     however imported, and through a name bound to it in the function, its module or a class body,
     compared with or prefix-matched against one the source spells, matched against a spelled case,
     cut up, or used as a table's key or attribute name, is reported outside nn/kernels/generation.py.
-    Comparing it with a recorded generation, reading a fact off the target, passing it to a function,
-    and a name rebound to something else or shadowed by a parameter or a comprehension are not."""
+    A value is read before its name takes it, and a comprehension's first iterable before its targets.
+    Comparing it with a recorded generation, reading a fact off the target, passing it to a function
+    (a `getattr` of the caller's among them), a name rebound to something else or shadowed by a
+    parameter or a comprehension (a lambda's in it too), and a class attribute, which no method reads
+    as a name, are not."""
     found = _linted(tmp_path, {
         "src/sparx/nn/kernels/generation.py": (
             "def device_generation():\n"
@@ -707,10 +710,26 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
             "    return GENERATION == 'sm80'\n"
             "def listed(record):\n"
             "    named = device_generation()\n"
-            "    return [named == 'sm80' for named in record.names] and named == 'sm90'\n"),
+            "    return [named == 'sm80' for named in record.names] and named == 'sm90'\n"
+            "def looked_up(TILES):\n"
+            "    named = device_generation()\n"
+            "    named = TILES[named]\n"
+            "    return named\n"
+            "def iterated(TILES):\n"
+            "    named = device_generation()\n"
+            "    return [named for named in TILES[named]]\n"
+            "class Scoped:\n"
+            "    LABEL = device_generation()\n"
+            "    def method(self):\n"
+            "        return LABEL == 'label'\n"
+            "def deferred(records):\n"
+            "    named = device_generation()\n"
+            "    return [lambda: named == 'label' for named in records]\n"
+            "def passed(getattr, TILES):\n"
+            "    return getattr(TILES, device_generation())\n"),
     })
     assert found == [("src/sparx/tiles.py", line, "SLOP016")
-                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34)]
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
