@@ -961,8 +961,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
 
     `source` names the local directory or the Hub repo at the commit the
     loader resolved, the identity a run records to reload the processor
-    (`load_processor`). Only the media branch reads media files from its
-    directory and keeps the wrapper's translated `record`.
+    (`load_processor`). A GGUF file's processor keeps none, since the source
+    alone does not name the file it read. Only the media branch reads media
+    files from its directory and keeps the wrapper's translated `record`.
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -975,8 +976,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                      else load_tokenizer(str(directory), local_files_only=True))
         if not hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
-        return Processor(tokenizer, config, record if media else {}, model.vocab_size, source=source,
-                         directory=directory if media else None)
+        return Processor(tokenizer, config, record if media else {}, model.vocab_size,
+                         source=source if gguf_path is None else None, directory=directory if media else None)
     return None
 
 
