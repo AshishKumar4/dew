@@ -126,7 +126,8 @@ class Engine(BaseHTTPRequestHandler):
     `/update_weight_version` answers `{"success": true}`. Like SGLang
     v0.5.20, a weight update answers `success` in its body and flushes the
     radix cache unless the request says otherwise. Every replica is its own
-    server, so each keeps its own record.
+    server, so each keeps its own record, and a path in its `refuses` answers
+    500, as a failed engine call does.
     """
 
     def answer(self, status, body):
@@ -141,6 +142,8 @@ class Engine(BaseHTTPRequestHandler):
         body = json.loads(raw) if raw else None
         path, _, query = self.path.partition("?")
         self.server.seen.append((path, query, body))
+        if path in self.server.refuses:
+            return self.answer(500, {"error": f"{path} failed"})
         if path in ("/pause", "/resume"):
             return self.answer(200, {"status": "paused" if path == "/pause" else "resumed"})
         if path == "/collective_rpc":
@@ -161,13 +164,13 @@ class Engine(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def replicas():
-    """Start local engine stand-ins on demand; each has `url`, `seen` and `flushed`."""
+    """Start local engine stand-ins on demand; each has `url`, `seen`, `flushed` and `refuses`."""
     started = []
 
     def start(count):
         for _ in range(count):
             server = HTTPServer(("127.0.0.1", 0), Engine)
-            server.seen, server.flushed = [], []
+            server.seen, server.flushed, server.refuses = [], [], ()
             server.url = f"http://127.0.0.1:{server.server_port}"
             threading.Thread(target=server.serve_forever, daemon=True).start()
             started.append(server)
@@ -212,6 +215,20 @@ def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_
         assert server.seen[3][2] == {"new_version": "5"}
     assert not (tmp_path / ".served.staging").exists()
     assert_served(tmp_path / "served", changed)
+
+
+def test_a_vllm_replica_that_fails_to_reload_holds_every_replica_paused(tmp_path, replicas):
+    """One replica that cannot reload stops the push after the reload phase:
+    no replica resets, stamps or resumes, so none serves weights another may
+    not hold, and the push raises."""
+    source = Pretrained.load(FIXTURE, dtype="float32")
+    engines = replicas(3)
+    engines[1].refuses = ("/collective_rpc",)
+    push = SafetensorsReload(source, tmp_path / "served", tuple(server.url for server in engines), "vllm")
+    with pytest.raises(RuntimeError):
+        push(doubled(source), 5)
+    for server in engines:
+        assert paths(server) == ["/pause", "/collective_rpc"]
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
