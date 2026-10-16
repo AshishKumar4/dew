@@ -434,6 +434,18 @@ def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
                                   live("charged twice!", asked)["team"].probabilities)
 
 
+@pytest.mark.parametrize("precision", [jax.lax.Precision.HIGHEST, jax.lax.DotAlgorithmPreset.F32_F32_F32,
+                                       "tensorfloat32", None], ids=str)
+def test_a_head_records_the_matmul_precision_it_computes_at(precision):
+    """A head's precision, a jax enum, a dot algorithm preset or a name, is written
+    into the run's JSON record as a name and read back as the same precision."""
+    from dew.decision.head import DecisionHead, Head
+    from dew.nn.precision import precision_names
+
+    record = json.loads(json.dumps(DecisionHead(32, layers=1, precision=precision).record()))
+    assert precision_names(Head.from_record(record, 32).precision) == precision_names(precision)
+
+
 @pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
                          ids=["unnamed", "flat"])
 def test_a_head_record_names_its_head_and_holds_its_fields(record):
