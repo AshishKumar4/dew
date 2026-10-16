@@ -74,7 +74,8 @@ def main() -> None:
 
     lowered = json.loads(tuning.tune(step, measure=True))
     path = Path(cache.kernel_picks_path(jax.devices()[0].device_kind))
-    # A GPU model nothing was measured on yet, every config of whose launches failed, has no store.
+    # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
+    # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
     stored = () if not path.is_file() else tokamax.AutotuningResult.load(path.open()).data
     for ba, timings in stored:
         fastest = timings.prune()
@@ -82,8 +83,8 @@ def main() -> None:
                           "config": str(fastest.fastest_config),
                           "ms": min(data.median_evaluation_time_ms for data in fastest.values()
                                     if isinstance(data, tokamax.BenchmarkData))}))
-    # The step's launches against the store's: a launch none of whose configs ran stays unpicked, and
-    # takes its heuristic config in every run.
+    # The step's launches beside the store's: a launch none of whose configs ran is in the first count
+    # alone, and takes its heuristic config in every run.
     print(json.dumps({"store": str(path), "launches": len(stored), "step_launches": len(lowered)}))
 
 
