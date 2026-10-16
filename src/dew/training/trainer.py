@@ -1548,8 +1548,10 @@ class Trainer(Generic[Loss, Effects]):
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
-                    # The objective reads the batch its device steps make (`_model_batch`).
-                    checked = self._model_shapes(device) if self._device else device
+                    # The objective reads the batch its device steps make (`_model_batch`),
+                    # traced under the run's mesh as its step is.
+                    with jax.set_mesh(self.device_mesh):
+                        checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
