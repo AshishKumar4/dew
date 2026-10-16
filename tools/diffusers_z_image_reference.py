@@ -40,8 +40,9 @@ from diffusers_reference_helpers import (
     saved_pipeline,
     tiny_qwen3_encoder,
 )
+from reference_releases import RELEASES, require
 
-DIFFUSERS = "0.40.0"
+DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
 BASE = {"all_patch_size": [2], "all_f_patch_size": [1], "in_channels": 4, "dim": 64, "n_layers": 2,
         "n_refiner_layers": 1, "n_heads": 2, "n_kv_heads": 2, "norm_eps": 1e-5, "qk_norm": True,
@@ -199,7 +200,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    root = recording(destination, DIFFUSERS)
+    root = recording(destination, "diffusers-0.40")
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
