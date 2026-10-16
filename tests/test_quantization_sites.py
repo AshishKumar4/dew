@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance, float64_forward
 
 import dew
 from dew.inference.projections import inference_projections, projection_groups
@@ -31,12 +31,17 @@ from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantizat
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
 def case(request):
+    """The checkpoint, loaded, and its reference arrays, with the terms of the logits Dew's own float64
+    forward sums (`float64_forward`), which size each logit the views are held to."""
     directory, reference = nvfp4_qdq_case(request.param)
-    return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    _, terms = float64_forward(loaded.model, loaded.variables, reference["ids"].astype(np.int32))
+    return directory, loaded, {**reference, "logits_terms": terms}
 
 
 def assert_quantized(logits, reference, label):
-    assert_as_exact_as_the_reference(np.asarray(logits), reference["logits"], reference["logits_f64"], label)
+    assert_as_exact_as_the_reference(np.asarray(logits), reference["logits"], reference["logits_f64"], label,
+                                     terms=reference["logits_terms"])
 
 
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):

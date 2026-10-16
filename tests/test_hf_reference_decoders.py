@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained
 from dew.sampling import Sampling, generate
@@ -39,12 +39,14 @@ def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_refere
         return np.load(directory / f'{array}.npy')
 
     mask, ids = fixture('attention_mask'), fixture('input_ids')
-    for rows, valid, logits in (
-            ('padded_logits', mask,
-             loaded.model.apply(loaded.variables, fixture('padded_ids'), attention_mask=mask)),
-            ('logits', np.ones(ids.shape, bool), loaded.model.apply(loaded.variables, ids))):
+    for rows, valid, given, options in (
+            ('padded_logits', mask, fixture('padded_ids'), {'attention_mask': mask}),
+            ('logits', np.ones(ids.shape, bool), ids, {})):
+        logits = loaded.model.apply(loaded.variables, given, **options)
+        _, terms = float64_forward(loaded.model, loaded.variables, given, **options)
         actual, expected = np.asarray(logits)[valid], fixture(rows)[valid]
-        assert_as_exact_as_the_reference(actual, expected, fixture(f'{rows}_f64')[valid], f'{name} {rows}')
+        assert_as_exact_as_the_reference(actual, expected, fixture(f'{rows}_f64')[valid], f'{name} {rows}',
+                                         terms=np.asarray(terms)[valid])
         np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
     continued = generate(loaded.model, loaded.variables, ids[:, :4], 6, key=0,
                          sampling=Sampling(temperature=0))
