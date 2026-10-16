@@ -398,12 +398,9 @@ def parameter_movement(tool, case, steps: int = 2):
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
     trainer = tool.build_trainer(case, "reference")
-    source = tool.batches(case, trainer.device_mesh)
-    state = jax.jit(trainer.initial_state)()
-    before = jax.tree.map(np.asarray, named(state.variables))  # the step consumes the state
-    compiled = trainer.compile(state, next(source))
-    for _ in range(steps):
-        state, loss, _, finite, _, _ = compiled(state, next(source))
+    with tool.compiled_step(case, trainer) as compiled:
+        before = jax.tree.map(np.asarray, named(compiled.state.variables))  # the step consumes the state
+        state, loss, finite, _ = tool.timed_steps(compiled.step, compiled.state, steps)
     after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
