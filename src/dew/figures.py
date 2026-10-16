@@ -234,6 +234,8 @@ class Figure:
         """Show each of `shapes` from its time in `times` until the next one's, the last until the
         loop ends. One fades out before the next fades in, so shapes drawn in one place, such as
         a frame's caption, never show together."""
+        if len(times) > 1:
+            fade = min(fade, float(np.min(np.diff(times))) / 3)
         for index, (shape, at) in enumerate(zip(shapes, times, strict=True)):
             keys: dict[float, Mapping[str, str | float]] = {at: {"opacity": 0}, at + fade: {"opacity": 1}}
             if index + 1 < len(shapes):
@@ -302,8 +304,18 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` steps over it.
     """
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
-    left, right, top, bottom = 50, 20, 38, 48
+    left, right, bottom = 50, 20, 48
     values = {name: np.asarray(ys, float) for name, ys in series.items()}
+    # With several series, a legend fills rows under the label, as many as the names need.
+    legend: list[tuple[float, float]] = []
+    x, y = left, 42.0
+    for name in values if len(values) > 1 else ():
+        span = 30 + 8 * (len(name) + 5)
+        if legend and x + span > width - right:
+            x, y = left, y + 22
+        legend.append((x, y))
+        x += span + 16
+    top = (legend[-1][1] if legend else 20) + 20
     every = np.concatenate(list(values.values()))
     low, high = y_range or (float(every.min()), float(every.max()))
     if high <= low:
@@ -326,10 +338,6 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     colors: tuple[Role, ...] = ("accent", "warm", "muted", "text")
     for index, (name, ys) in enumerate(values.items()):
         color = colors[index % len(colors)]
-        if len(values) > 1:
-            x = width - right - 140 * (len(values) - index)
-            figure.line(x, 15, x + 18, 15, color=color, width=2.5)
-            figure.text(x + 24, 20, name, size=TEXT, color=color)
         window = min(smooth, len(ys))
         lines = [(ys, 2.25)]
         if window > 1:
@@ -341,10 +349,16 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             if window > 1 and stroke < 2:
                 line.style["opacity"] = "0.35"
             figure.draw(line, 0.4, seconds * 0.55)
+        # The last value: beside the series' name in a legend, or else at the line's end.
         last = float(ys[-window:].mean())
-        x, y = at(steps - 1, last)
-        end = figure.text(x - 4, y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
-        figure.appear(end, seconds * 0.55)
+        if legend:
+            x, y = legend[index]
+            figure.line(x, y - 5, x + 18, y - 5, color=color, width=2.5)
+            figure.text(x + 24, y, f"{name} {last:.2f}", size=TEXT, color=color)
+        else:
+            x, y = at(steps - 1, last)
+            end = figure.text(x - 4, y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+            figure.appear(end, seconds * 0.55)
     return figure
 
 
