@@ -101,6 +101,17 @@ MOVES = ("all-gather", "all-to-all", "collective-permute")
 needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not a move."""
 
 
+def tpu_mesh(**axes: int) -> jax.sharding.AbstractMesh:
+    """A mesh of `axes` over abstract TPU v6e devices, none of which this process needs: a program
+    traced on it under `generation.assumed("v6e")` lowers its Mosaic kernels for that TPU on any host
+    (`lowering_platforms=("tpu",)`), where jax refuses one the partitioner would have to split."""
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    device = AbstractDevice(device_kind="TPU v6 lite", num_cores=None, platform="tpu")
+    return AbstractMesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                        abstract_device=device)
+
+
 def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     """The custom-kernel contract (module docstring): `fn(*args)` with `args` placed on `mesh` by
     `specs` (PartitionSpecs) is within the float64 gate (`assert_leaves_as_exact`) of `fn` on one

@@ -826,6 +826,11 @@ def tensor_shards(query) -> int:
                      for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
+def shard_heads(query) -> int:
+    """The query heads one shard holds (`tensor_shards`)."""
+    return query.shape[-2] // tensor_shards(query)
+
+
 def split_with_queries(key, value, split: int):
     """`key` and `value` with their heads repeated to the least common multiple
     of their count and `split`, the ways the mesh splits the query heads, so
@@ -1864,7 +1869,7 @@ def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=N
     if q_len % SPLASH_LANES or kv_len % SPLASH_LANES or min(q_len, kv_len) < SPLASH_MIN_LENGTH:
         return False
     return splash_mask_descriptor(
-        q_len, kv_len, query.shape[-2], causal, sliding_window, mask) is not None
+        q_len, kv_len, shard_heads(query), causal, sliding_window, mask) is not None
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
@@ -1887,12 +1892,17 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     splash under pallas's interpreter, which is how the parity tests run its
     arithmetic off a TPU; it is far slower than XLA, so only an explicit 'tpu'
     uses it. The flash kernel has no interpreter and runs only on a TPU.
+
+    A Mosaic kernel cannot be partitioned automatically, so on a mesh both run
+    per shard (`_per_shard`), on its rows and heads. Splash's descriptor then
+    covers one shard's heads, so a mask that differs by head where the mesh
+    splits the heads is flash's.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     descriptor = None
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
-            q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
+            q_len, kv_len, shard_heads(query), causal, sliding_window, mask)
     if descriptor is None and (softcap is not None or sinks is not None):
         raise ValueError(
             "attention implementation 'tpu' takes a softcap and sinks only on "
@@ -1900,12 +1910,20 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
             "describe or a length that is not a multiple of "
             f"{SPLASH_LANES}. Use attention_impl 'xla'.")
 
-    def attend(query, key, value, bias, sinks):
+    def local(query, key, value, bias=None, mask=None, sinks=None, segment_ids=None):
         if descriptor is None:
             return pallas_flash_attention(query, key, value, bias, mask, causal,
                                           sliding_window, segment_ids)
         return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
                                 segment_ids=segment_ids, interpret=interpret)
+
+    def attend(query, key, value, bias, sinks):
+        # Splash holds the mask in its descriptor; flash takes it as an array.
+        held = None if descriptor is not None or mask is None else _four_dimensional(mask)
+        return _per_shard(local, query, key, value,
+                          bias=(None if bias is None else _four_dimensional(bias), SCORES),
+                          mask=(held, SCORES), sinks=(sinks, ("activation_heads",)),
+                          segment_ids=(segment_ids, ("activation_batch", None)))
 
     if jnp.finfo(query.dtype).bits == 16 and not interpret:
         # Mosaic multiplies 16-bit operands at the default precision only.
