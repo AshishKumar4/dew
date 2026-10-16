@@ -16,6 +16,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops, ssd_flops
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.objectives.base import FROZEN
 from dew.objectives.diffusion import DiffusionObjective
@@ -134,6 +135,12 @@ def test_mamba2_layers_learn_their_maps_and_conv_and_not_their_scan():
                  + 2 * 4 * (width + 2 * groups_state))
     assert mixer.parameter_flops(lengths) == 4 * per_token
     assert mixer.model_flops(lengths) == 4 * per_token + ssd_flops(lengths, 2, 3, 4)
+    # Mamba's in_proj [x, z], x_proj [dt, B, C], dt_proj, out_proj and conv over x.
+    first = Mamba(8, 16, state_size=3, chunk_size=1)
+    rank, inner = first.time_step_rank, 16
+    maps = 2 * 8 * 2 * inner + 2 * inner * (rank + 2 * 3) + 2 * rank * inner + 2 * inner * 8 + 2 * 4 * inner
+    assert first.parameter_flops(lengths) == 4 * maps
+    assert first.model_flops(lengths) == 4 * maps + ssd_flops(lengths, 1, 3, inner)
     model = decoder(mixer={"class": "mamba2", "fields": {"state_size": 3, "chunk_size": 1}},
                     attention_impl="reference")
     tokens = jnp.ones((1, 4), jnp.int32)
