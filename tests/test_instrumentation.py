@@ -318,7 +318,7 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
 
 @pytest.mark.mesh(devices=8)
 def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move():
-    """A step over eight devices that gathers a bf16 array whole and sums an f32 one across them:
+    """A step over eight devices that gathers an f32 array whole and sums an int32 one across them:
     the shared parser names both collectives (`collective`) and the bytes each result holds, and
     the cluster diagnostic counts each once, an async pair by its `-done`, with those bytes."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -335,12 +335,13 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     # The gathered whole is the same on every device, which shard_map cannot infer of an all_gather.
     mapped = jax.shard_map(step, mesh=mesh, in_specs=(P("data"), P("data")), out_specs=(P(), P()),
                            check_vma=False)
-    gathered = jax.device_put(jnp.ones((64, 32), jnp.bfloat16), NamedSharding(mesh, P("data")))
-    summed = jax.device_put(jnp.ones((8, 16), jnp.float32), NamedSharding(mesh, P("data")))
+    # f32, as a CPU's collectives move bf16 widened.
+    gathered = jax.device_put(jnp.ones((64, 32), jnp.float32), NamedSharding(mesh, P("data")))
+    summed = jax.device_put(jnp.ones((8, 16), jnp.int32), NamedSharding(mesh, P("data")))
     text = jax.jit(mapped).lower(gathered, summed).compile().as_text()
     instructions = hlo_instructions(text).values()
     found = {collective(instruction.op) for instruction in instructions} - {None}
     assert found == {"all-gather", "all-reduce"}
     counted = load("cluster_vs_gpu").collectives(text)
     assert {kind: (entry["ops"], entry["bytes"]) for kind, entry in counted.items()} == {
-        "all-gather": (1, 64 * 32 * 2), "all-reduce": (1, 16 * 4)}
+        "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
