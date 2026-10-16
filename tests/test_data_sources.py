@@ -15,6 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+import psutil
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
@@ -1054,8 +1055,8 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
     failed_read = ValueError("failed child read")
 
     def descriptors(path):
-        with os.scandir("/proc/self/fd") as opened:
-            return {int(entry.name) for entry in opened if os.readlink(entry.path) == path}
+        real = os.path.realpath(path)
+        return {opened.fd for opened in psutil.Process().open_files() if opened.path == real}
 
     def blocked_read(reader, index):
         if not first_reader:

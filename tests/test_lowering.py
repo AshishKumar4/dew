@@ -227,6 +227,23 @@ def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exceptio
         assert measured_kernel("attention", "xla") == measured
 
 
+def test_a_function_jitted_before_a_choice_traces_again_within_it():
+    @jax.jit
+    def ported(x):
+        return x + (measured_kernel("ssd", "xla") == "pallas")
+
+    x = jnp.zeros((), jnp.int32)
+    assert ported(x) == 0
+    with kernel_choices(ssd="pallas"):
+        assert ported(x) == 1
+    assert ported(x) == 0
+
+
+def test_a_choice_no_dispatch_reads_is_refused_by_name():
+    with pytest.raises(ValueError), kernel_choices(gated_delta="fla"):
+        pass
+
+
 def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all():
     """FlashAttention takes no float32 query, so a float32 call declines nothing and says so nowhere; a
     bf16 call the dispatch sends off the kernel measured fastest is the dispatch's own choice, logged
