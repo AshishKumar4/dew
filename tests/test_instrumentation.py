@@ -24,8 +24,8 @@ from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import compiled_flops
-from dew.training import Trainer
+from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
+from dew.training import Trainer, trainer as trainer_module
 from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -219,6 +219,33 @@ def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
     both = compiled_flops(jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(shape, shape, shape).compile())
     assert forward == 2 * 2 * batch * heads * pairs * width
     assert both == (2 + 4) * 2 * batch * heads * pairs * width
+
+
+UNSIZED = """HloModule step
+
+ENTRY %main (p0: f32[8,16], p1: f32[16,4]) -> f32[8,4] {
+  %p0 = f32[8,16]{1,0} parameter(0)
+  %p1 = f32[16,4]{1,0} parameter(1)
+  %pallas_call.1 = (f32[8,16]{1,0}) custom-call(%p0), custom_call_target="__gpu$xla.gpu.triton"
+  %pallas_call.2 = (f32[8,16]{1,0}) custom-call(%p0), custom_call_target="__gpu$xla.gpu.triton"
+  ROOT %dot.1 = f32[8,4]{1,0} dot(%p0, %p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+"""
+
+
+def test_a_kernel_the_hlo_does_not_size_makes_the_hardware_count_a_named_lower_bound(monkeypatch):
+    """A Pallas kernel's Triton call states no work, so the count holds the matmul alone and says
+    how many launches it left out; the trainer then reports its utilizations as lower bounds, never
+    under the names of a complete count."""
+    flops = hlo_flops(UNSIZED)
+    assert (flops.model, flops.hardware, flops.unsized) == (2 * 8 * 16 * 4, 2 * 8 * 16 * 4, 2)
+    monkeypatch.setattr(trainer_module, "model_flops_utilization", lambda counted, seconds: counted / seconds)
+    trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
+    whole = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0))
+    bounded = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0, 3.0))
+    assert {"train/hfu", "train/hlo_flops_util"} <= whole.keys()
+    assert not {"train/hfu", "train/hlo_flops_util"} & bounded.keys()
+    assert (bounded["train/hfu_lower_bound"], bounded["train/unsized_kernels"]) == (2.0, 3.0)
 
 
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
