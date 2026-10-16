@@ -2,15 +2,15 @@
 
 A `Recipe` is an ordered sequence of `Stage`s sharing one built decoder.
 Each stage trains its own data with its own objective in its own checkpoint
-directory, and every stage after the first initializes from the model's part
-of the previous stage's final variables through the objective's `pretrained`
-mechanism, so the chain is pretraining, then SFT, then RL with nothing
-reloaded by hand. The optimizer starts fresh every stage; a stage never
-resumes another stage's step count.
+directory, and every stage after the first starts from the model's part of
+the previous stage's final variables, held as the starting tree of the
+objective that trains the model. So the chain is pretraining, then SFT,
+then RL with nothing reloaded by hand. The optimizer starts fresh every
+stage; a stage never resumes another stage's step count.
 
 The existing `--pretrained` flag cannot express this: it reads a Hugging
-Face decoder, not a dew run directory. The chain instead restores the dew
-checkpoint it just wrote. A GRPO stage names its reward callable and a PPO
+Face decoder, not a dew run directory. The chain instead hands each stage
+the tree the previous one trained, in memory. A GRPO stage names its reward callable and a PPO
 stage its environment and verifier; callables do not survive a command
 line, and neither does a chain: this recipe is a Python value, built where
 the reward lives.
@@ -151,14 +151,11 @@ class Recipe:
             raise ValueError("a recipe links at least one stage")
 
     def run(self) -> list[TrainState]:
-        # An objective takes its starting tree when it is built, so each stage
-        # is built again at its turn; this pass initializes no parameters.
-        for stage in self.stages:
-            self._build(stage, None)
+        built = [self._build(stage) for stage in self.stages]
         states: list[TrainState] = []
         variables = None
-        for index, stage in enumerate(self.stages):
-            objective, rollout = self._build(stage, variables)
+        for index, (stage, (objective, rollout, start)) in enumerate(zip(self.stages, built, strict=True)):
+            start.variables = variables
             trainer = Trainer(
                 objective,
                 self.optimizer,
@@ -175,9 +172,10 @@ class Recipe:
             variables = objective.model_variables(states[-1].variables)
         return states
 
-    def _build(self, stage: Stage, variables: Variables | None) -> tuple[Objective, Rollout | None]:
-        """The stage's objective over the shared model, continuing `variables`
-        past the first stage, with its rollout beside it for GRPO and PPO.
+    def _build(self, stage: Stage) -> tuple[Objective, Rollout | None, Objective]:
+        """The stage's objective over the shared model, its rollout for GRPO
+        and PPO, and the objective whose `variables` the stage starts from:
+        a distillation's student, PPO's actor, or the objective itself.
 
         This is the one place a stage's data picks its loss, so it also
         refuses the stage's settings that loss does not take or lacks
@@ -193,36 +191,38 @@ class Recipe:
         if supervised:
             if stage.beta is not None:
                 raise ValueError(f"stage {stage.name!r} sets beta on a stage with no KL term")
-            objective = _scored(self.model, data, variables)
+            student = _scored(self.model, data, None)
             if stage.teacher is None:
-                return objective, None
+                return student, None, student
             teacher = stage.teacher
-            return DistillationObjective(objective, _scored(teacher.model, data), alpha=teacher.alpha,
-                                         temperature=teacher.temperature), None
+            return DistillationObjective(student, _scored(teacher.model, data), alpha=teacher.alpha,
+                                         temperature=teacher.temperature), None, student
         if isinstance(data, PreferenceData):
             beta = 0.1 if stage.beta is None else stage.beta
-            return DPOObjective(self.model, data.seq_len - 1, beta=beta, variables=variables), None
+            objective = DPOObjective(self.model, data.seq_len - 1, beta=beta, variables=None)
+            return objective, None, objective
         beta = 0.0 if stage.beta is None else stage.beta
         if isinstance(data, PromptData):
             if stage.reward is None:
                 raise ValueError(f"stage {stage.name!r} samples without a reward; name one")
             objective = GRPOObjective(self.model, data.max_prompt_len + stage.max_new_tokens - 1,
-                                      beta=beta, variables=variables)
+                                      beta=beta, variables=None)
             tokenizer = tokenizer_for(data.tokenizer)
             sampling = with_ids_of(stage.sampling, Sampling(eos_token_ids=tokenizer.eos_id))
             return objective, SampledRollout(objective, stage.reward, decode=tokenizer.decode,
                                              groups=stage.groups, max_new_tokens=stage.max_new_tokens,
-                                             estimator=stage.estimator, sampling=sampling)
+                                             estimator=stage.estimator, sampling=sampling), objective
         episodes = stage.episodes
         if episodes is None:
             raise TypeError(f"stage {stage.name!r} trains {type(data).__name__}, which no loss reads")
         objective = PPOObjective(self.model, episodes.max_prompt_tokens + stage.max_new_tokens - 1,
-                                 critic=episodes.critic, beta=beta, variables=variables)
+                                 critic=episodes.critic, beta=beta, variables=None)
         # Every collection binds the step's variables, so the policy here holds none.
         source = EpisodeRollout(objective.policy({}), episodes.environment, episodes.verifier,
                                 episodes.max_prompt_tokens, stage.max_new_tokens, episodes.max_turns,
                                 stage.sampling, groups=stage.groups)
-        return objective, PPORollout(objective, source, gamma=episodes.gamma, lam=episodes.lam)
+        rollout = PPORollout(objective, source, gamma=episodes.gamma, lam=episodes.lam)
+        return objective, rollout, objective.actor
 
 
 def _scored(model: nn.Module | Source, data: TextData | ChatData,
