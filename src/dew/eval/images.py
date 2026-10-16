@@ -82,6 +82,12 @@ def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_ma
     return jnp.einsum('nd,nd->n', image_embeds, text_embeds)
 
 
+def _clip_score(cosine: jax.Array) -> jax.Array:
+    """Return each image's CLIPScore term, `100 * max(cos, 0)`, the one
+    transform a validation pass and `CLIPScore.score` share."""
+    return 100.0 * jnp.maximum(cosine, 0.0)
+
+
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
     """Return the per-image cosine for one sampled grid and its batch's prompts."""
     text = batch[field]
@@ -113,7 +119,7 @@ class CLIPScore(ImageMetric):
 
     def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
         def measure(artifact, batch):
-            return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
+            return _clip_score(_artifact_cosine(artifact, batch, field, self.modelname))
         super().__init__(name='clip_score', measure=measure)
         self.modelname = modelname
 
@@ -161,5 +167,5 @@ class CLIPScore(ImageMetric):
                 cosine = clip_image_text_cosine(pixels[start:stop], tokens["input_ids"][start:stop],
                                                 tokens["attention_mask"][start:stop],
                                                 modelname=self.modelname)
-                yield np.asarray(100.0 * jnp.maximum(cosine, 0.0), dtype=np.float64)
+                yield np.asarray(_clip_score(cosine), dtype=np.float64)
 

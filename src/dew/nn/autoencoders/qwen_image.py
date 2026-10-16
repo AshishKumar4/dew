@@ -13,7 +13,6 @@ to [-1, 1], and RMS gammas keep the stored `[C, 1, 1(, 1)]` shape.
 """
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -26,7 +25,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.interop.components import bind_component
+from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
 from .api import ModuleAutoEncoder
@@ -369,20 +368,26 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
         )
 
 
-def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32",
-                        params: Variables | None = None, lazy: bool = False
+def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
+                        subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
+                        lazy: bool = False
                         ) -> tuple[QwenImageAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
-    """Build the published autoencoder, its parameters and their source layouts
-    from `directory/vae`. Every tensor the module declares must be published,
+    """Build a published Qwen-Image 2.1 VAE, its parameters and their source
+    layouts from `subfolder` of a pipeline directory or Hub repo; only that
+    component downloads. Every tensor the module declares must be published,
     in the shape it declares. Supplied `params` are bound without a weight read;
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
-    config = json.loads((directory / "vae" / "config.json").read_text())
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
+    if config.get("_class_name") != "AutoencoderKLQwenImage21":
+        raise ValueError(
+            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLQwenImage21"
+        )
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     return bind_component(
-        directory / "vae", "vae", config, model, qwen_image_vae_path,
+        directory, "vae", config, model, qwen_image_vae_path,
         lambda bound: QwenImageAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                            latents_std=config["latents_std"]),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))

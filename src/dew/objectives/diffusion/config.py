@@ -147,8 +147,9 @@ class AudioCondition:
 class PretrainedAutoencoder:
     """A published autoencoder for latent diffusion.
 
-    It is a Stable Diffusion AutoencoderKL, or a DC-AE when the checkpoint's
-    config names `AutoencoderDC` (`dew.nn.autoencoders.pretrained.load_autoencoder`).
+    It is the class the checkpoint's config names, one of
+    `dew.nn.autoencoders.pretrained.LOADERS`, or a Stable Diffusion
+    AutoencoderKL (`dew.nn.autoencoders.pretrained.load_autoencoder`).
     """
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"

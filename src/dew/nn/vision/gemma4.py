@@ -4,7 +4,7 @@
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -29,9 +29,31 @@ from .common import (
     TowerBase,
     TowerGeometry,
     _vision_section,
+    activation_name,
     head_width,
     projector_weight_path,
+    refuse_dropout,
+    rope_base,
+    trunk_geometry,
 )
+
+
+def clipped_linear(module: nn.Module, linear: Callable[[jax.Array], jax.Array], inputs: jax.Array,
+                   clipped: bool) -> jax.Array:
+    """`linear(inputs)`, its input and output clamped where `clipped` to the
+    nontrainable bounds `module` keeps: the reference's one clippable linear
+    for both Gemma 4 towers (modeling_gemma4.py:168-194). The bounds stay
+    FP32 and clamp in each operand's dtype, as torch.clamp against a 0-dim
+    buffer does, so a bf16 tower stays bf16 through the map."""
+    if not clipped:
+        return linear(inputs)
+
+    def clamp(value, side):
+        low = module.variable("constants", f"{side}_min", lambda: jnp.array(-jnp.inf, jnp.float32)).value
+        high = module.variable("constants", f"{side}_max", lambda: jnp.array(jnp.inf, jnp.float32)).value
+        return jnp.clip(value, low.astype(value.dtype), high.astype(value.dtype))
+
+    return clamp(linear(clamp(inputs, "input")), "output")
 
 
 class Gemma4ClippableLinear(nn.Dense):
@@ -45,16 +67,7 @@ class Gemma4ClippableLinear(nn.Dense):
 
     @nn.compact
     def __call__(self, inputs):
-        if self.use_clipped_linears:
-            low = self.variable("constants", "input_min", lambda: jnp.array(-jnp.inf, jnp.float32))
-            high = self.variable("constants", "input_max", lambda: jnp.array(jnp.inf, jnp.float32))
-            inputs = jnp.clip(inputs, low.value.astype(inputs.dtype), high.value.astype(inputs.dtype))
-        output = super().__call__(inputs)
-        if self.use_clipped_linears:
-            low = self.variable("constants", "output_min", lambda: jnp.array(-jnp.inf, jnp.float32))
-            high = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf, jnp.float32))
-            output = jnp.clip(output, low.value.astype(output.dtype), high.value.astype(output.dtype))
-        return output
+        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
 
 
 class Gemma4VisionTransformer(nn.Module):
@@ -314,49 +327,31 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     their reference buffers outside the trainable parameter collection.
     """
     vision = _vision_section(hf_config)
-    hidden = records.integer(vision["hidden_size"], "hidden_size")
-    heads = records.integer(vision["num_attention_heads"], "num_attention_heads")
-    head_dim = vision.get("head_dim", hidden // heads)
-    if records.integer(head_dim, "head_dim") <= 0 or records.integer(head_dim, "head_dim") % 4:
-        raise ValueError(
-            f"head_dim ({head_dim}) must split into the two rotary dimensions and their halves")
-    activation = str(vision.get("hidden_activation", vision.get("hidden_act",
-                                                                "gelu_pytorch_tanh")))
-    if activation not in ("gelu_pytorch_tanh", "gelu"):
-        raise ValueError(
-            f"hidden_activation {activation!r} is not expressible: this trunk "
-            "runs gelu_pytorch_tanh or gelu")
+    geometry = trunk_geometry(vision)
     if vision.get("attention_bias", False):
         raise ValueError("attention_bias=True needs biased maps this trunk lacks")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout"):
-        raise ValueError("attention_dropout is training-time; this trunk runs eval")
+    refuse_dropout(vision, "attention_dropout")
     if "output_proj_dims" in vision:
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
             "projector width this record leaves to the text width")
-    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
-    if rope.get("rope_type", "default") != "default":
-        raise ValueError(
-            f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
-            "runs the default 2D rotary")
+    heads = geometry["num_heads"]
     return {
         "class": "gemma4", "fields": {
-        "hidden_size": hidden,
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": heads,
+        **geometry,
         "num_key_value_heads": records.integer(
             vision.get("num_key_value_heads", heads), "num_key_value_heads"
         ),
-        "head_dim": records.integer(head_dim, "head_dim"),
+        "head_dim": records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
         "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
         "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
         "position_embedding_size": records.integer(
             vision.get("position_embedding_size", 10240), "position_embedding_size"
         ),
-        "hidden_act": activation,
+        "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
+                                      ("hidden_activation", "hidden_act")),
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
+        "rope_theta": rope_base(vision, 100.0),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }}
