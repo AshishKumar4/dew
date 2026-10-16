@@ -46,8 +46,9 @@ from diffusers_reference_helpers import (
     saved_pipeline,
     tiny_qwen3_encoder,
 )
+from reference_releases import RELEASES, require
 
-DIFFUSERS = "0.40.0"
+DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
         "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32, "mlp_ratio": 3.0,
         "axes_dims_rope": (4, 4, 4, 4), "rope_theta": 2000, "eps": 1e-6, "guidance_embeds": True}
@@ -327,7 +328,7 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    root = recording(destination, DIFFUSERS)
+    root = recording(destination, "diffusers-0.40")
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})

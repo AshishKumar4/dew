@@ -132,17 +132,19 @@ def test_the_published_runs_weights_are_the_ones_its_models_read():
 @pytest.mark.network
 def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
     """The revision the live image pins holds exactly the committed layout,
-    and loads and samples an image, its text tower included, on the lane's
-    backend: the CPU unless the run sets JAX_PLATFORMS, as the live sampler
-    runs it."""
+    and loads and samples an image, its text tower included, on one device
+    of the lane's backend: the CPU unless the run sets JAX_PLATFORMS, as the
+    live sampler runs it. Loaded over the lane's eight host devices, the
+    weights would be held once per device, 10.9 GiB against 3.3."""
     import jax
     import numpy as np
     from flax.core import unfreeze
 
     from dew.sampling import TextToImage
+    from dew.training import MeshSpec
 
     repo, revision = LIVE_PIN.read_text().strip().split("@")
-    pipe = TextToImage.from_pretrained(repo, revision=revision)
+    pipe = TextToImage.from_pretrained(repo, revision=revision, mesh=MeshSpec().build(jax.devices()[:1]))
     artifact, expected = published_layout()
     held = unfreeze(pipe.variables)
     assert jax.tree.structure(held) == jax.tree.structure(expected)

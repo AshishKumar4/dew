@@ -23,6 +23,7 @@ import numpy as np
 from flax import linen as nn
 
 import dew.nn.conv as conv
+from dew.accuracy import reduction_bound, within
 from dew.nn.kernels.tuning import samples
 
 
@@ -93,10 +94,9 @@ def kernels(args):
                     for got, want, magnitude, terms in zip(
                             jax.tree.leaves(actual), jax.tree.leaves(expected), jax.tree.leaves(magnitudes),
                             (9, 9, np.prod(x.shape[:-1])), strict=True):
-                        gamma = terms * np.finfo(np.float32).eps / 2
-                        bound = 2 * gamma / (1 - gamma) * np.asarray(magnitude, np.float64)
+                        bound = reduction_bound(magnitude, terms)
                         error = np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64))
-                        assert np.all(error <= bound), (name, dtype, dilation, float(error.max()))
+                        assert within(error, bound), (name, dtype, dilation, float(error.max()))
                         ratios.append(float(np.max(np.divide(error, bound, out=np.zeros_like(error), where=bound > 0))))
                     row = {'batch': batch, 'dtype': str(jnp.dtype(dtype)), 'dilation': dilation,
                            'implementation': name, 'forward': timed(operation, (x, kernel), args.repeats),

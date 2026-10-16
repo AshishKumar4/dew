@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import fetched, ran, selected, stub_torch_utils
+from torch_precision import replaced
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
@@ -79,13 +80,9 @@ class Affine(torch.nn.Module):
 @contextlib.contextmanager
 def replayed(normals: torch.Tensor, noise: torch.Tensor):
     """`torch.randn` returns the sigma draw and `torch.randn_like` the noise."""
-    randn, randn_like = torch.randn, torch.randn_like
-    torch.randn = lambda *_, **__: normals.reshape(-1, 1, 1, 1)
-    torch.randn_like = lambda *_, **__: noise
-    try:
+    with replaced((torch, "randn", lambda *_, **__: normals.reshape(-1, 1, 1, 1)),
+                  (torch, "randn_like", lambda *_, **__: noise)):
         yield
-    finally:
-        torch.randn, torch.randn_like = randn, randn_like
 
 
 def run(loss, net, network, arrays: dict, dtype) -> dict[str, np.ndarray]:

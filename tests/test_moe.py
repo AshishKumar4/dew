@@ -32,6 +32,12 @@ pytestmark = pytest.mark.kernel
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
+ROUTER_TOLERANCE = 1e-6
+"""A router's gate values against the reference's, at fp32 on CPU: the largest observed
+difference is 1.79e-07, from the gate matmul reading a transposed kernel."""
+OUTPUT_TOLERANCE = 2e-5
+"""An expert block's output against the reference's, at fp32 on CPU: the largest observed
+difference is 7.63e-06 on outputs that reach 34.9, the summation order's spread."""
 
 
 def fixture(name: str) -> dict:
@@ -95,7 +101,7 @@ def test_router_reproduces_the_mixtral_choice_and_gate_values():
     assert np.array_equal(ours_indices, theirs_indices)
     # Largest observed difference 1.79e-07 at fp32 on CPU, from the gate
     # matmul reading a transposed kernel.
-    assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
+    assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
 
 
 def test_router_reproduces_the_deepseek_group_limited_choice():
@@ -113,7 +119,7 @@ def test_router_reproduces_the_deepseek_group_limited_choice():
     assert np.array_equal(ours_indices, theirs_indices)
     # Largest observed difference 2.38e-07 at fp32 on CPU, on weights the
     # routed_scaling_factor of 2.5 has already multiplied.
-    assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
+    assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
 
 
 def test_the_selection_bias_never_reaches_the_gate_values():
@@ -155,7 +161,7 @@ def test_the_expert_block_reproduces_the_mixtral_block_output():
     # reach 24.7, so 3.1e-07 of the scale. The reference sums each expert's
     # contribution into a zeroed buffer while the ragged path sums a token's
     # k slots, so the two differ in summation order alone.
-    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < 2e-5
+    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < OUTPUT_TOLERANCE
 
 
 def deepseek_block(shared: bool = True) -> SparseMLP:
@@ -198,7 +204,7 @@ def test_the_expert_block_reproduces_the_deepseek_block_output():
     tensors = fixture("deepseek")
     output = deepseek_block().apply(deepseek_variables(tensors),
                                     jnp.asarray(tensors["hidden"]))
-    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < 2e-5
+    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < OUTPUT_TOLERANCE
 
 
 def v4_router(**overrides) -> Router:
@@ -227,7 +233,7 @@ def test_router_reproduces_the_deepseek_v4_sqrt_softplus_choice():
     ours_indices, ours_weights = by_expert(
         indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
     assert np.array_equal(ours_indices, theirs_indices)
-    assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
+    assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
 
 
 def v4_experts(swiglu_limit) -> ExpertMLP:
@@ -252,7 +258,7 @@ def test_the_experts_reproduce_the_deepseek_v4_clamped_output():
     output = v4_experts(config["swiglu_limit"]).apply(
         variables, hidden, jnp.asarray(tensors["router_weights"]),
         jnp.asarray(tensors["router_indices"]))
-    assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) < 2e-5
+    assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) < OUTPUT_TOLERANCE
 
 
 # --------------------------------------------------------------------------

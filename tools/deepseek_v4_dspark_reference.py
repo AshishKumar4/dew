@@ -276,24 +276,11 @@ def widened_transformers(module):
     transformers adds, `.to(torch.float32)` and the compressors'
     `softmax(dtype=torch.float32)` (modeling_deepseek_v4.py:57, :408, :540,
     :665), each made float64."""
-    to, softmax = torch.Tensor.to, torch.Tensor.softmax
+    from torch_precision import dtype_widened, replaced, widened_to
 
-    def wide(dtype):
-        return torch.float64 if dtype is torch.float32 else dtype
-
-    def wide_to(self, *args, **kwargs):
-        if "dtype" in kwargs:
-            kwargs["dtype"] = wide(kwargs["dtype"])
-        return to(self, *(wide(arg) for arg in args), **kwargs)
-
-    torch.Tensor.to = wide_to
-    torch.Tensor.softmax = lambda self, *args, dtype=None, **kwargs: softmax(
-        self, *args, dtype=wide(dtype), **kwargs)
-    try:
-        with v41.widened(module):
-            yield
-    finally:
-        torch.Tensor.to, torch.Tensor.softmax = to, softmax
+    with replaced((torch.Tensor, "to", widened_to(torch.Tensor.to)),
+                  (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))), v41.widened(module):
+        yield
 
 
 def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
