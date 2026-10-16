@@ -519,19 +519,39 @@ def _labels(module: Module, line: int, word: str) -> bool:
     return False
 
 
+def _patched(node: ast.Call, table: dict[str, str]) -> str:
+    """What a patching call replaces, as a dotted path: `mock.patch("a.b")`'s
+    string; `patch.object(owner, "b")`'s and `monkeypatch.setattr(owner, "b",
+    ...)`'s or `monkeypatch.setattr("a.b", ...)`'s attribute, its owner read
+    through the scope's imports (`scopes.resolved`), however it was imported or
+    aliased; `monkeypatch.setitem(mapping, ...)`'s and `delitem`'s mapping,
+    which a module's table or registry is. "" for any other call."""
+    name = _named(node.func)
+    first = node.args[0]
+    spelled = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+    if name.endswith(("mock.patch", ".patch")) or name == "patch":
+        return spelled or ""
+    if name.endswith(("patch.object", "monkeypatch.setattr", "monkeypatch.delattr")):
+        if spelled is not None:
+            return spelled
+        attribute = node.args[1] if len(node.args) > 1 else None
+        attribute_name = (attribute.value if isinstance(attribute, ast.Constant)
+                          and isinstance(attribute.value, str) else "*")
+        owner = scopes.resolved(first, table)
+        return f"{owner}.{attribute_name}" if owner else ""
+    if name.endswith(("monkeypatch.setitem", "monkeypatch.delitem")):
+        return scopes.resolved(first, table)
+    return ""
+
+
 def mocks(module: Module) -> Iterator[Finding]:
-    """SLOP008: a first-party module replaced instead of a seam taken."""
-    for node in ast.walk(module.tree):
+    """SLOP008: a first-party module, or a table or registry it holds, replaced
+    instead of a seam taken."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.Call) or not node.args:
             continue
-        name = _named(node.func)
-        target = ""
-        if name.endswith(("mock.patch", "patch", "patch.object")):
-            target = node.args[0].value if isinstance(node.args[0], ast.Constant) else ""
-        elif name.endswith("monkeypatch.setattr"):
-            target = (node.args[0].value if isinstance(node.args[0], ast.Constant)
-                      else _named(node.args[0]))
-        if not isinstance(target, str) or not target.startswith(f"{module.package}."):
+        target = _patched(node, dict(table))
+        if not target.startswith(f"{module.package}."):
             continue
         if any(seam in target.lower() for seam in SEAMS):
             continue
