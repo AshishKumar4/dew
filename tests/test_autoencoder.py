@@ -115,25 +115,23 @@ def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
 
 
 def _published(kind: str, directory: Path):
-    """A built-in autoencoder and its parameters, loaded from its fixture at `directory`."""
+    """A built-in autoencoder and its parameters, built from its fixture at `directory` as a run's
+    `PretrainedAutoencoder` builds it: by the class the fixture's config names."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.dc_ae import load_dc_ae
-    from dew.nn.autoencoders.flux2 import load_flux2_vae
-    from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
-    from dew.nn.autoencoders.rae import load_rae
-    from dew.nn.autoencoders.wan import load_wan_vae
+    from dew.objectives.diffusion import PretrainedAutoencoder
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
-    archive, load = {
-        "dc_ae": ("dc_ae.tar.xz", lambda root: load_dc_ae(root / "conv")),
-        "wan": ("wan_vae.tar.xz", lambda root: load_wan_vae(root)),
-        "rae": ("rae.tar.xz", lambda root: load_rae(root / "dinov2")),
-        "flux2": ("flux2_source.tar.xz", lambda root: load_flux2_vae(root / "vae")),
-        "qwen_image": ("qwen_image_vae.tar.xz", lambda root: load_qwen_image_vae(root, jnp.float32)),
+    archive, inside = {
+        "dc_ae": ("dc_ae.tar.xz", "conv"),
+        "wan": ("wan_vae.tar.xz", ""),
+        "rae": ("rae.tar.xz", "dinov2"),
+        "flux2": ("flux2_source.tar.xz", "vae"),
+        "qwen_image": ("qwen_image_vae.tar.xz", ""),
     }[kind]
-    autoencoder, params, _, _ = load(extract_fixture(fixtures / archive, directory))
-    return autoencoder, params
+    source = extract_fixture(fixtures / archive, directory) / inside
+    autoencoder = PretrainedAutoencoder(modelname=str(source), dtype="float32").build()
+    return autoencoder, autoencoder.params
 
 
 @pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])
