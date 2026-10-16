@@ -65,7 +65,7 @@ def _only_when(due, taken, kept, operand):
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
 
 
-def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array,
+def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
             batch: Batch, stepped: jax.typing.ArrayLike) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
