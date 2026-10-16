@@ -3,8 +3,9 @@
     python examples/sft_gemma4.py --model google/gemma-4-E2B \\
         --dataset hf://datasets/allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
 
-The run packs whole conversations into windows, counts the loss on assistant
-targets alone, shards the weights over the visible devices and accumulates
+The run holds the first `--held-out` conversations out for its validation
+perplexity, packs the rest into windows, counts the loss on assistant targets
+alone, shards the weights over the visible devices and accumulates
 micro-batches into one update. It ends by exporting the trained weights to
 the Hugging Face layout, so transformers and `Pretrained.load` both read
 them, and the run directory itself scores through the harness:
@@ -28,7 +29,7 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.config.data import ChatData, loader
+from dew.config.data import ChatData, HoldOut, loader
 from dew.data import HFTokenizer, Loading
 from dew.data.chat import Role
 from dew.data.sources import Read
@@ -68,6 +69,8 @@ class Config:
     learning_rate: float = 1e-5
     rows: int | None = None
     """Conversations taken from the head of the split; unset takes them all."""
+    held_out: int = 512
+    """The first conversations, which validation scores and training never reads."""
     smoke: bool = False
     """Fine-tune the committed tiny Gemma 4 on canned turns instead."""
 
@@ -80,6 +83,14 @@ def write_conversations(conversations: list, out: Path) -> Path:
     return jsonl
 
 
+def smoke_config(config: Config) -> tuple[Config, str, str]:
+    """The run over the committed tiny Gemma 4: its config, the vocabulary
+    its ids were written against, and the canned turns written beside it."""
+    small = replace(config, model=str(SMOKE_MODEL), sequence_length=15, batch_size=2, accumulation=2,
+                    steps=2, held_out=2)
+    return small, str(SMOKE_VOCAB), str(write_conversations(SMOKE_CONVERSATIONS, config.out))
+
+
 def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     """Everything the run is but its model, which the checkpoint decides
     (`main` records the loaded one)."""
@@ -88,8 +99,8 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
         data_read=config.data_read,
-        data=ChatData(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
-                  split=split, seq_len=config.sequence_length, long="chunk"),
+        data=ChatData(tokenizer=tokenizer, source=chat, validation=HoldOut(records=config.held_out),
+                  column=config.column, split=split, seq_len=config.sequence_length, long="chunk"),
         validation_records=config.batch_size,
         loading=Loading(workers=0, threads=1, read_buffer=2,
                         worker_buffer=1) if smoke else Loading(workers=4),
@@ -110,13 +121,9 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
 
 def main(config: Config) -> Path:
     if config.smoke:
-        config = replace(config, model=str(SMOKE_MODEL), sequence_length=15, batch_size=2,
-                         accumulation=2, steps=2)
-        tokenizer = str(SMOKE_VOCAB)
-        chat = str(write_conversations(SMOKE_CONVERSATIONS, config.out))
+        config, tokenizer, chat = smoke_config(config)
     else:
-        tokenizer = config.model
-        chat = config.dataset
+        tokenizer, chat = config.model, config.dataset
 
     run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
