@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from shared_bridge import DEADLINE_HEADER, available, load, resident
+from shared_bridge import DEADLINE_HEADER, GUEST_UIDS, available, load, processes, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -40,12 +40,9 @@ except MemoryError:
 
 
 def model_process():
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            if b"model_service.py" in (proc / "cmdline").read_bytes():
-                return proc.name
-        except OSError:
-            pass
+    for pid, _, command in processes():
+        if b"model_service.py" in command:
+            return str(pid)
     raise AssertionError("the model process is not running")
 
 
@@ -58,18 +55,9 @@ def memory():
 
 def guests():
     """Each guest process's uid, state and command line."""
-    found = []
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            rows = (proc / "status").read_text().splitlines()
-            fields = dict(line.split(":", 1) for line in rows if ":" in line)
-            uid = int(fields["Uid"].split()[1])
-            command = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[-80:]
-        except (OSError, KeyError, ValueError):
-            continue
-        if 6100 <= uid < 6200:
-            found.append((proc.name, uid, fields["State"].strip(), command))
-    return found
+    return [(str(pid), int(fields["Uid"].split()[1]), fields["State"].strip(),
+             command.replace(b"\0", b" ").decode(errors="replace")[-80:])
+            for pid, fields, command in processes() if int(fields["Uid"].split()[1]) in GUEST_UIDS]
 
 
 def gateway_log():

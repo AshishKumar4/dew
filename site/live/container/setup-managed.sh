@@ -10,10 +10,13 @@ done
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
+# ipywidgets for tqdm, which the Hub's libraries import: in a kernel without it, tqdm warns on import
+# that it falls back to text bars. The page shows no widget, and a context runs offline, its inputs
+# fetched before (prepare-cells.py), so no bar is lost.
 /opt/venv/bin/pip install --no-cache-dir \
     "dewml[streaming,live] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
     -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/constraints.txt" \
-    ipykernel==7.3.0 jupyter-kernel-gateway==3.0.1 jupyter-client==8.10.0 pillow==12.3.0
+    ipykernel==7.3.0 jupyter-kernel-gateway==3.0.1 jupyter-client==8.10.0 pillow==12.3.0 ipywidgets==8.1.9
 # The profile cell's XProf, in a second pass. Resolved together with the first, pip backtracks
 # datasets to a release whose pyarrow has no wheel (XProf's gcsfs pins fsspec); after it, XProf's
 # dependencies settle on the fsspec already installed.
