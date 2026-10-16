@@ -415,12 +415,12 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
 
 def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
     """A head configured apart from its backbone, here computing in bfloat16
-    over float32 states, is recorded with its numerics, so the reloaded task
-    answers as the live one rather than in the dtype the backbone would give
-    a fresh head."""
+    over float32 states at jax's highest matmul precision, is recorded with its
+    numerics, so the reloaded task answers as the live one rather than in the
+    dtype the backbone would give a fresh head."""
     from dew.decision import DecisionHead
 
-    head = DecisionHead(32, layers=1, dtype=jnp.bfloat16)
+    head = DecisionHead(32, layers=1, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST)
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   head=head)
     data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
