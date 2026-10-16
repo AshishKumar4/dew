@@ -176,8 +176,8 @@ test = [
 mutation = ["cosmic-ray==8.7.0"]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
-# FID (scipy sqrtm) and Inception weight download
-metrics = ["scipy", "requests"]
+# FID's Inception weight download
+metrics = ["requests"]
 # Explicit LocalTracker.plot()/plots=True rendering.
 plots = ["matplotlib"]
 wandb = ["wandb"]

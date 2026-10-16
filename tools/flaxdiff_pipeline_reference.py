@@ -45,8 +45,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# Dew sets its numerical policy before the JAX backend opens, as in a test.
-import dew  # noqa: F401
+# Importing Dew sets its numerical policy before the JAX backend opens, as in a test.
+from dew.diffusion.presets import EDM
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "flaxdiff_pipeline" / "reference.npz"
@@ -255,7 +255,6 @@ def main() -> None:
         checkpoint(step, weights)
         start, noise, ours = draws(step, run_config(serialized, clip, vae))
 
-        from dew.diffusion.presets import EDM
         scale = float(EDM(regime="latent")().sampler_schedule.prior_scale())
         unit = (start / np.float32(scale)).astype(np.float32)
         arrays = {"start": start}
