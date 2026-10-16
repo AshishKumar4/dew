@@ -61,6 +61,7 @@ from dew.nn.sharding import (
     ruled_boxes,
 )
 from dew.objectives.base import Batch, Variables
+from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 
 # The role axes no parameter splits over: data holds a batch's replicas,
@@ -274,9 +275,12 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     axis and the devices it spans, and a later pool on them takes it, a
     resume among them: the decisions from it shape the step, and a figure
     measured again moves by noise, across a threshold one time in some."""
-    record = _link_record(mesh, axis)
-    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure.
-    if record is not None and all(from_every_process(record.exists())):
+    topology = link_topology(mesh, axis)
+    record = _link_record(topology)
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure,
+    # kept for exactly this placement.
+    if record is not None and all(from_every_process(
+            record.exists() and json.loads(record.read_text()).get("topology") == topology)):
         return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
@@ -295,20 +299,41 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
     if record is not None and jax.process_index() == 0:
         record.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(record, json.dumps({"bytes_per_second": received}))
+        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
     return received
 
 
-def _link_record(mesh: Mesh, axis: str) -> Path | None:
-    """Where `link_bandwidth` keeps `mesh`'s `axis` figure: beside the persistent compilation cache,
-    named by the axis's width, the mesh's shape and its devices' kinds and processes, or nowhere when
-    the process keeps no cache."""
+def link_topology(mesh: Mesh, axis: str) -> str:
+    """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
+    order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
+    its place in its system, so two meshes of one shape over other devices, or over the same devices
+    grouped otherwise along the axis, are other links; one built again over the same placement is the
+    same."""
+    devices = [[device.id, device.process_index, device.device_kind, _slice(device)]
+               for device in mesh.devices.flat]
+    return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
+
+
+def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
+    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each measured figure of
+    `bandwidths`, by mesh and axis, under the placement it was measured on (`link_topology`)."""
+    return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()
+            if figure is not None}
+
+
+def resumed_link_figures(rung: JSON) -> dict[str, float]:
+    """`link_figures` as a checkpoint's rung recorded them; none where it recorded none."""
+    links = record(record(rung, 'rung').get('links', {}), 'rung links')
+    return {topology: number(figure, f'link of {topology}') for topology, figure in links.items()}
+
+
+def _link_record(topology: str) -> Path | None:
+    """Where `link_bandwidth` keeps the figure of `topology` (`link_topology`): beside the persistent
+    compilation cache, or nowhere when the process keeps no cache."""
     cache = jax.config.jax_compilation_cache_dir
     if not cache:
         return None
-    devices = sorted({(device.device_kind, device.process_index) for device in mesh.devices.flat})
-    name = json.dumps([axis, dict(mesh.shape), devices], sort_keys=True)
-    return Path(cache) / "dew-links" / f"{hashlib.sha256(name.encode()).hexdigest()}.json"
+    return Path(cache) / "dew-links" / f"{hashlib.sha256(topology.encode()).hexdigest()}.json"
 
 
 def _slice(device) -> int:

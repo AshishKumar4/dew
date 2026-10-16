@@ -22,7 +22,11 @@ pytestmark = pytest.mark.mesh
 def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch):
     """The tool's row is the trainer's own compiled step run for real: a
     finite loss out of it, timed over the steps asked for, for every case of
-    the preset, and whether each step reads a fresh placement or reuses one."""
+    the preset, and whether each step reads a fresh placement or reuses one.
+    Its MFU numerator is the objective's training FLOPs on the case's batch,
+    the trainer's train/mfu count, or None where the model has none."""
+    from dew.nn.flops import MissingFlopsCount
+
     tool = load("benchmark_step")
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[architecture],
                                   warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
@@ -33,3 +37,8 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
+    try:
+        counted = tool.build_objective(case).training_flops(None, tool.global_batch(case))
+    except MissingFlopsCount:
+        counted = None
+    assert row["training_flops"] == counted

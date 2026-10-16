@@ -37,6 +37,7 @@ import jax
 import numpy as np
 import torch
 from reference_source import fetched, ran, selected
+from torch_precision import replaced
 
 COMMIT = "c112c526d193436838c98d81455ee51f90309470"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mdlm" / "loss.npz"
@@ -89,12 +90,9 @@ def stand_in(reference, backbone) -> object:
 @contextlib.contextmanager
 def drawn(*draws: torch.Tensor):
     """Each `torch.rand` call returns the next of `draws`."""
-    rand, queue = torch.rand, list(draws)
-    torch.rand = lambda *_, **__: queue.pop(0)
-    try:
+    queue = list(draws)
+    with replaced((torch, "rand", lambda *_, **__: queue.pop(0))):
         yield
-    finally:
-        torch.rand = rand
     assert not queue, "a stored draw was not taken"
 
 

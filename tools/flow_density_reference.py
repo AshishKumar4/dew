@@ -25,6 +25,7 @@ import jax
 import numpy as np
 import torch
 from diffusers.training_utils import compute_density_for_timestep_sampling
+from torch_precision import replaced
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flow" / "densities.npz"
 DRAWS = 4096
@@ -42,13 +43,9 @@ density, logit_mean, logit_std and mode_scale."""
 @contextlib.contextmanager
 def drawn(base: torch.Tensor):
     """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values."""
-    normal, rand = torch.normal, torch.rand
-    torch.normal = lambda mean, std, size, **_: mean + std * base
-    torch.rand = lambda size, **_: base
-    try:
+    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * base),
+                  (torch, "rand", lambda size, **_: base)):
         yield
-    finally:
-        torch.normal, torch.rand = normal, rand
 
 
 def main() -> None:

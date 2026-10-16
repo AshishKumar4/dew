@@ -44,18 +44,17 @@ def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
 def test_published_gemma4_tiny_logits_and_cached_generation(tmp_path):
     from reference_error import assert_as_exact_as_the_reference
 
-    from tools.gemma4_fp64_reference import CHECKPOINT, REVISION, reference_text
+    from tools.gemma4_fp64_reference import CHECKPOINT, REVISION, reference_logits
     from tools.wrapper_checkpoint_parity import measure_checkpoint
 
     result, logits = measure_checkpoint(CHECKPOINT, tmp_path / 'measurement.json', revision=REVISION)
     assert all(row['argmax_agreement'] and row['generation_agreement']
                for row in result['observations']), result
-    actual, reference, ids = logits[0]
-    truth, oracle_ids = reference_text()
-    np.testing.assert_array_equal(ids, oracle_ids)
-    assert truth.dtype == np.float64
-    # The CPU max delta is 2.50e-6, above the RTX 4080's 1.24e-6
-    # calibration. Both fp32 runs are 1.36e-7 RMS from the fp64 oracle.
-    assert_as_exact_as_the_reference(actual, reference, truth, 'published Gemma4 text')
-    image = result['observations'][1]
-    assert image['max_abs_error'] < image['bound'], image
+    # Each modality's fp32 runs, Dew's and the reference's, from the float64 oracle on the same batch:
+    # the image logits are held as the text's are, not to a largest difference a layer count bounds,
+    # which the reference's own fp32 rounding crossed in 1 of 6 runs (2.77e-6 against 2.59e-6).
+    for (actual, reference, ids), (truth, oracle_ids), modality in zip(
+            logits, reference_logits(), ('text', 'image'), strict=True):
+        np.testing.assert_array_equal(ids, oracle_ids)
+        assert truth.dtype == np.float64
+        assert_as_exact_as_the_reference(actual, reference, truth, f'published Gemma4 {modality}')

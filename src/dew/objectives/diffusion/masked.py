@@ -69,6 +69,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """
 
     saved_task = MaskedGeneration
+    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process', 'solver',
+                                  'sampling_steps'})
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 
@@ -130,12 +132,13 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def task_record(self) -> Mapping[str, JSON]:
-        """The row length, response budget, tokenizer, process, solver and sampling steps: the
-        task's own."""
-        from dew.inference.tasks import recorded_tokenizer
+        """The row length, response budget, tokenizer or source processor, process, solver and
+        sampling steps: the task's own."""
+        from dew.inference.tasks import recorded_processor, recorded_tokenizer
         from dew.registry import to_record
         return {'seq_len': self.seq_len, 'max_new_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
+                'processor': recorded_processor(self.processor),
                 'process': to_record(self.process, DiscreteProcess), 'solver': to_record(self.solver, Solver),
                 'sampling_steps': self.steps}
 

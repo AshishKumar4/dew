@@ -273,7 +273,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     (`persist_compilations`). `trust` names the packages outside Dew whose
     modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
-    from dew.registry import import_trusted
+    from dew.registry import import_trusted, objectives
     persist_compilations()
     checkpoints = Checkpoints(directory)
     step = checkpoints.pinned(step)
@@ -285,6 +285,11 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+    objective = objectives[named(record['objective'], 'objective')]
+    stray = set(record) - {'objective', 'model', *objective.inference_fields}
+    if stray:
+        raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
+                         f"{sorted(stray)}")
     return SavedRun(record, step)
 
 
@@ -310,11 +315,25 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     return None
 
 
-def _saved_processor(record: Mapping[str, object]) -> Processor | None:
-    """Build the run's tokenizer into a task's host processor."""
+def recorded_processor(processor: Processor | None) -> str | None:
+    """The source a run's record keeps for a checkpoint's own processor
+    (`dew.interop.processors.Processor.source`), which `_saved_processor`
+    reloads from its files; any other processor records none here."""
+    from dew.interop.processors import Processor as SourceProcessor
+
+    return processor.source if isinstance(processor, SourceProcessor) else None
+
+
+def _saved_processor(record: Mapping[str, object], config: ModelConfig) -> Processor | None:
+    """Build the run's host processor: the checkpoint's own, reloaded from the
+    source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
+    from dew.interop.pretrained import load_processor
 
+    source = record.get('processor')
+    if source is not None:
+        return load_processor(named(source, "processor"), config.build())
     tokenizer = record.get('tokenizer')
     return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
 
@@ -333,7 +352,8 @@ def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, 
                ) -> tuple[Mapping[str, object], int, ModelConfig, Processor | None]:
     """Read a run's record, the exact step it is, its model config at `dtype`, and its host processor."""
     record, step = run_record(directory, step, trust)
-    return record, step, saved_model(record, dtype), _saved_processor(record)
+    config = saved_model(record, dtype)
+    return record, step, config, _saved_processor(record, config)
 
 
 def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,

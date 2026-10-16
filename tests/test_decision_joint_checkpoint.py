@@ -66,6 +66,24 @@ def test_a_transformers_tokenizer_gives_the_special_tokens_its_dew_wrapper_gives
     assert parameter_type(Specials.of, "tokenizer") == Tokenizer | TokenizerSpecials
 
 
+@pytest.mark.parametrize("zero", ["[PAD]", "[MASK]"])
+def test_a_special_token_at_id_zero_is_the_tokenizers_own(zero):
+    """A vocabulary may put its padding or mask token at id 0, as BERT's puts
+    [PAD]; Specials.of keeps that id rather than taking 0 for a missing one
+    and laying out the end token in its place."""
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    words = [zero, *(word for word in ("[PAD]", "[MASK]", "[SEP]", "[UNK]") if word != zero)]
+    vocabulary = {word: index for index, word in enumerate(words)}
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="[PAD]", mask_token="[MASK]",
+                                        sep_token="[SEP]", unk_token="[UNK]")
+    specials = Specials.of(tokenizer)
+    assert (specials.pad, specials.marker) == (tokenizer.pad_token_id, tokenizer.mask_token_id)
+    assert 0 in (specials.pad, specials.marker)
+
+
 def laid_out(tokenizer: HFTokenizer) -> dict[str, tuple[dict[str, Question], Encoded]]:
     """Each case's questions and its one joint row."""
     rows = {}

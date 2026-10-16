@@ -48,7 +48,6 @@ posterior's sample `z`, which the batch norm reads, is kept too.
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import functools
 import json
@@ -67,6 +66,7 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from lpips_weights import drawn_weights
 from recorded_draws import Tape, TorchDraws
+from torch_precision import float_as, replaced
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
 from torchvision import models
@@ -204,18 +204,6 @@ class Accelerator:
 
     def unwrap_model(self, model):
         return model
-
-
-@contextlib.contextmanager
-def precision(dtype):
-    """`Tensor.float()`, which `preprocess_imgs_vae` and the loss's forward
-    call, as the run's precision."""
-    published = torch.Tensor.float
-    torch.Tensor.float = lambda self, *args, **kwargs: self.to(dtype)
-    try:
-        yield
-    finally:
-        torch.Tensor.float = published
 
 
 def tiny_vae() -> AutoencoderKL:
@@ -364,7 +352,8 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     accumulate = next(node for node in loop.body if isinstance(node, ast.With)
                       and ast.unparse(node.items[0]).startswith("accelerator.accumulate"))
     statements = [*loop.body[start:loop.body.index(accumulate)], *accumulate.body]
-    with precision(dtype):
+    # `Tensor.float()`, which `preprocess_imgs_vae` and the loss's forward call, as the run's precision.
+    with replaced(float_as(dtype)):
         ran(statements, scope, "train_repae.py")
     assert not tape.replayed, "the step drew fewer times than DiffusionObjective.loss"
 
