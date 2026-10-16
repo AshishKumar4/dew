@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
@@ -147,16 +147,22 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
         assert_as_exact_as_the_reference(np.moveaxis(np.asarray(moments), -1, 1), part("fp32", "moments"),
                                          part("fp64", "moments"), f"batch {batch} moments")
         return
-    grad_params, grad_image = jax.jit(jax.grad(
-        lambda p, x: jnp.sum(model.apply({"params": p}, x) * probe), argnums=(0, 1)))(params, image)
+    def gradients(p, x):
+        return jax.grad(lambda p, x: jnp.sum(model.apply({"params": p}, x) * probe), argnums=(0, 1))(p, x)
 
-    def source_layout(name: str) -> np.ndarray:
+    grad_params, grad_image = jax.jit(gradients)(params, image)
+    # Dew's own path in float64 on the CPU: each gradient entry's terms, what its sums add
+    # (`float64_terms`).
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, (param_terms, image_terms) = float64_terms(gradients, *widened((params, image)))
+
+    def source_layout(tree, name: str) -> np.ndarray:
         """A Dew gradient in Diffusers' layout: the one tensor translated
         alone names its place, and kernels transpose back."""
         shape = arrays[f"param.{name}"].shape
         [(path, _)] = jax.tree_util.tree_flatten_with_path(
             translate_vae_weights({f"encoder.{name}": np.zeros(shape, np.float32)})["encoder"])[0]
-        value = grad_params
+        value = tree
         for key in path:
             value = value[key.key]
         value = np.asarray(value)
@@ -164,15 +170,18 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
             return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
         return value
 
-    native = [np.moveaxis(np.asarray(grad_image), -1, 1), *(source_layout(name) for name in names)]
+    def native_order(grad_params, grad_image) -> np.ndarray:
+        native = [np.moveaxis(np.asarray(grad_image), -1, 1),
+                  *(source_layout(grad_params, name) for name in names)]
+        return np.concatenate([np.ravel(leaf) for leaf in native])
 
     def source_order(precision: str) -> np.ndarray:
         leaves = [part(precision, "grad_image"), *(part(precision, f"grad_param.{name}") for name in names)]
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
-    native_order = np.concatenate([np.ravel(leaf) for leaf in native])
-    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
-                                     f"batch {batch} gradients")
+    assert_as_exact_as_the_reference(native_order(grad_params, grad_image), source_order("fp32"),
+                                     source_order("fp64"), f"batch {batch} gradients",
+                                     terms=native_order(param_terms, image_terms))
 
 
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])

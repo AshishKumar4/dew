@@ -24,6 +24,7 @@ the largest difference over the largest value, 1e-5. Observed: prompt states
 3.2e-7, final latents 2.8e-6, decoded frames 2.7e-6.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -33,7 +34,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact
+from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_wan_weights, wan_fields
@@ -85,14 +86,22 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, n
     context = jnp.asarray(arrays[f"{name}.context"])
     probe = channels_last(arrays[f"{name}.probe"])
 
-    def flow(params, latents, context):
-        return model.apply({"params": params}, latents, times, DenoisingCondition(context))
+    def flow_and_gradients(model, params, latents, context):
+        def flow(params, latents, context):
+            return model.apply({"params": params}, latents, times, DenoisingCondition(context))
 
-    output = flow(params, latents, context)
-    grad_params, grad_latents, grad_context = jax.grad(
-        lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(params, latents, context)
+        return flow(params, latents, context), *jax.grad(
+            lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(params, latents, context)
+
+    output, grad_params, grad_latents, grad_context = flow_and_gradients(model, params, latents, context)
+    # Dew's own path in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, (output_terms, *gradient_terms) = float64_terms(
+            functools.partial(flow_and_gradients, model.clone(dtype=jnp.float64)),
+            *widened((params, latents, context)))
     assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1), arrays[f"{name}.fp32.output"],
-                                     arrays[f"{name}.fp64.output"], f"{name} flow")
+                                     arrays[f"{name}.fp64.output"], f"{name} flow",
+                                     terms=np.moveaxis(output_terms, -1, 1))
 
     def source_order(precision: str) -> np.ndarray:
         leaves = [arrays[f"{name}.{precision}.grad_latents"], arrays[f"{name}.{precision}.grad_context"]]
@@ -100,11 +109,14 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, n
                    for layout in layouts]
         return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
-    native = [np.moveaxis(np.asarray(grad_latents), -1, 1), np.asarray(grad_context)]
-    native += [layout.export({"params": grad_params}) for layout in layouts]
-    native_order = np.concatenate([np.ravel(leaf) for leaf in native])
-    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
-                                     f"{name} gradients")
+    def native_order(grad_params, grad_latents, grad_context) -> np.ndarray:
+        native = [np.moveaxis(np.asarray(grad_latents), -1, 1), np.asarray(grad_context)]
+        native += [layout.export({"params": grad_params}) for layout in layouts]
+        return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in native])
+
+    assert_as_exact_as_the_reference(native_order(grad_params, grad_latents, grad_context),
+                                     source_order("fp32"), source_order("fp64"), f"{name} gradients",
+                                     terms=native_order(*gradient_terms))
 
 
 @pytest.mark.parametrize("name", CASES)
