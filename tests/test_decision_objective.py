@@ -413,6 +413,38 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
                 task("first", questions)
 
 
+def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
+    """A head configured apart from its backbone, here computing in bfloat16
+    over float32 states, is recorded with its numerics, so the reloaded task
+    answers as the live one rather than in the dtype the backbone would give
+    a fresh head."""
+    from dew.decision import DecisionHead
+
+    head = DecisionHead(32, layers=1, dtype=jnp.bfloat16)
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=head)
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(reloaded("charged twice!", asked)["team"].probabilities,
+                                  live("charged twice!", asked)["team"].probabilities)
+
+
+@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
+                         ids=["unnamed", "flat"])
+def test_a_head_record_names_its_head_and_holds_its_fields(record):
+    """A run records a head as its name and its fields (`Head.record`); a
+    record of another shape is refused rather than read as Laya's head."""
+    from dew.decision.head import Head
+
+    with pytest.raises(ValueError):
+        Head.from_record(record, 32)
+
+
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     """A calibration saved into a run reloads with the step it was fitted
     on; trained further, the run's latest weights refuse it rather than
