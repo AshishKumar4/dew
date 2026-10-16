@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 
+from dew import cache
 from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
@@ -21,7 +22,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
-from dew.training import Trainer, rungs
+from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -175,7 +176,13 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     free(monkeypatch, LIMIT)
     again = lm()
     counted = []
-    monkeypatch.setattr(rungs, "step_flops", lambda executable: counted.append(executable))
+    as_text = jax.stages.Compiled.as_text
+
+    def read_text(executable, *args, **kwargs):
+        counted.append(executable)
+        return as_text(executable, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Compiled, "as_text", read_text)
     trained(again, steps=0)
     assert [probe["split"] for probe in again.plan["probes"]] == [first.plan["split"]]
     # The executable is the one the first run counted, so its FLOPs are the record's, its text unread.
@@ -184,8 +191,9 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
 
 @pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
 def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
-    """A step's kernel launches are read from a lowering of its own (`tune`) and recorded with
-    its plan, so a later run settles their configs from the record and lowers the step once."""
+    """A step's lowering records its kernel launches as it traces them (`tune`), with its plan,
+    so each run lowers its step once: the first again only where settling the launches changed
+    a config its trace read, and a later run, which settles them from the record first, never."""
     lowered = []
 
     def lowering(event, seconds, *, fun_name=None, **_):
@@ -193,15 +201,18 @@ def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_f
             lowered.append(seconds)
 
     counts = []
+    settled = cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
+            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
-    assert counts == [2, 1]
+    assert counts[1] == 1
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():

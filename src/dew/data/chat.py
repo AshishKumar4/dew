@@ -12,6 +12,10 @@ field. Each batch holds `text` and `text_roles`, aligned, and the windows'
 documents as `text_coordinates`. The training stream's position is a global
 window count, so a run can resume on any number of processes.
 
+Block diffusion reads a prompt and the canvases after it instead, so its
+`ChatCanvasData` recipe lays each assistant turn out as a row of its own,
+unpacked: the conversation before the turn, then the turn on whole canvases.
+
 A `Message` holds the fields the Hugging Face chat-template contract reads:
 a role; content that is a string, a list of typed parts, or nothing; an
 assistant's `tool_calls`; a tool response's `tool_call_id` and `name`; and

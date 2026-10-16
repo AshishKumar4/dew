@@ -107,13 +107,14 @@ def test_decoder_gradients_match_the_source(variant):
 
 @pytest.mark.network
 @pytest.mark.parametrize("name", VARIANTS)
-def test_the_published_rae_matches_the_source(name):
+def test_the_published_rae_matches_the_source(name, monkeypatch):
     """Each published RAE, downloaded, encodes a smooth 256x256 image and
     decodes a standard normal latent as diffusers' `AutoencoderRAE` does in
     float64, on the channels and pixels `rae_published.npz` keeps, to within
     twice the source's own float32 distance from that result: two float32
     walks rounding in different orders, and SigLIP's residual stream reaches
     several hundred."""
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = load("diffusers_rae_reference")
     repo, revision = tool.PUBLISHED[name]
     reference = np.load(ROOT / "tests/fixtures/rae_published.npz")
@@ -166,9 +167,10 @@ def test_the_plain_dinov2_matches_transformers(source, tmp_path):
 
 
 @pytest.mark.network
-def test_the_published_dinov2_matches_transformers():
+def test_the_published_dinov2_matches_transformers(monkeypatch):
     """`facebook/dinov2-base`, downloaded, on the smooth image at 224 pixels,
     against `Dinov2Model` in float64, as the published RAEs are held."""
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = load("diffusers_rae_reference")
     reference = np.load(ROOT / "tests/fixtures/rae_published.npz")
     module, params, _ = load_dinov2(tool.DINOV2[0], revision=tool.DINOV2[1])

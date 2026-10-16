@@ -1,6 +1,11 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
 import json
+import logging
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import jax
@@ -10,7 +15,16 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.sharding import Mesh
 
-from dew.nn.kernels.generation import PALLAS_CHOICES, TARGETS, assumed, gpu_mesh, gpu_target, triton_runs
+from dew.nn.kernels.generation import (
+    PALLAS_CHOICES,
+    TARGETS,
+    assumed,
+    chosen as kernel_choices,
+    gpu_mesh,
+    gpu_target,
+    measured_kernel,
+    triton_runs,
+)
 from dew.training._lowering import triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,21 +213,65 @@ def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_choo
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
 
 
-def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all(monkeypatch,
-                                                                                               caplog):
+def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
+    with assumed("sm80"):
+        measured = measured_kernel("attention", "xla")
+        with kernel_choices(attention="xla", ssd="pallas"):
+            assert measured_kernel("attention", "flash") == "xla"
+            with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
+                assert measured_kernel("attention", "xla") == "flash"
+                assert measured_kernel("ssd", "xla") == "pallas"
+                raise RuntimeError("the comparison ended")
+            assert measured_kernel("attention", "flash") == "xla"
+        assert measured_kernel("attention", "xla") == measured
+
+
+def test_a_function_jitted_before_a_choice_traces_again_within_it():
+    @jax.jit
+    def ported(x):
+        return x + (measured_kernel("ssd", "xla") == "pallas")
+
+    x = jnp.zeros((), jnp.int32)
+    with kernel_choices(ssd="xla"):
+        assert ported(x) == 0
+        with kernel_choices(ssd="pallas"):
+            assert ported(x) == 1
+        assert ported(x) == 0
+
+
+def test_a_choice_no_dispatch_reads_is_refused_by_name():
+    with pytest.raises(ValueError), kernel_choices(gated_delta="fla"):
+        pass
+
+
+def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all():
     """FlashAttention takes no float32 query, so a float32 call declines nothing and says so nowhere; a
     bf16 call the dispatch sends off the kernel measured fastest is the dispatch's own choice, logged
     once at INFO, which a run's console does not show."""
-    import logging
+    program = textwrap.dedent('''
+        import json
+        import logging
+        import jax.numpy as jnp
+        from dew.nn import attention
+        from dew.nn.kernels import generation
 
-    from dew.nn import attention
-    from dew.nn.kernels import generation
+        records = []
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append([record.levelno, record.args[:3]])
 
-    monkeypatch.setattr(generation, "_logged", set())
-    with assumed("sm80"), caplog.at_level(logging.INFO, logger=generation.__name__):
-        # Packed rows, which no Triton kernel takes, as the hero's are.
-        chosen = {dtype: attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)),
-                                                          max_segments=2)
-                  for dtype in (jnp.float32, jnp.bfloat16) for query in [jnp.zeros((1, 8, 2, 64), dtype)]}
-    assert [(record.levelno, record.args[:3]) for record in caplog.records] == [
-        (logging.INFO, ("attention", chosen[jnp.bfloat16], "flash"))]
+        logger = logging.getLogger(generation.__name__)
+        logger.setLevel(logging.INFO)
+        logger.addHandler(Capture())
+        with generation.assumed("sm80"):
+            selected = {}
+            for dtype in (jnp.float32, jnp.bfloat16, jnp.bfloat16):
+                query = jnp.zeros((1, 8, 2, 64), dtype)
+                selected[str(dtype)] = attention.resolve_implementation(
+                    "auto", query, query, segment_ids=jnp.ones((1, 8)), max_segments=2)
+        print(json.dumps({"selected": selected[str(jnp.bfloat16)], "records": records}))
+    ''')
+    fresh = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, check=True,
+                           timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+    logged = json.loads(fresh.stdout)
+    assert logged["records"] == [[logging.INFO, ["attention", logged["selected"], "flash"]]]
