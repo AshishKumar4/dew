@@ -664,14 +664,16 @@ class StepFlops:
         """The FLOPs of `calls` such calls (a step split into microbatches)."""
         return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
 
-    def utilizations(self, steps: int, step_time: float) -> dict[str, float]:
-        """The interval's HLO utilizations of `steps` steps of `step_time` seconds each: train/hfu
-        off `hardware` and train/hlo_flops_util off `model`, both ending `_lower_bound` beside
-        train/unsized_kernels, the launches a step, where any launch's work went uncounted."""
+    def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
+        """The interval's HLO utilizations of `steps` steps of `step_time` seconds each, of `peak`
+        (`model_flops_utilization`): train/hfu off `hardware` and train/hlo_flops_util off `model`,
+        both ending `_lower_bound` beside train/unsized_kernels, the launches a step, where any
+        launch's work went uncounted."""
         bound = "_lower_bound" if self.unsized else ""
         scalars = {f"train/{name}{bound}": utilization
                    for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
-                   if (utilization := model_flops_utilization(counted / steps, step_time)) is not None}
+                   if (utilization := model_flops_utilization(counted / steps, step_time, peak))
+                   is not None}
         return {**scalars, "train/unsized_kernels": self.unsized / steps} if bound else scalars
 
 
@@ -735,9 +737,10 @@ def _unsized(instruction: _Instruction) -> bool:
 
 
 def model_flops_utilization(
-    flops_per_step: float | None, step_time: float
+    flops_per_step: float | None, step_time: float, peak: float | None = None
 ) -> float | None:
-    """Fraction of one device's dense peak achieved by its executable.
+    """Fraction of one device's dense `peak` achieved by its executable, the
+    bf16 peak of device 0's kind by default.
 
     The optimized module is the program one device runs under SPMD, so its
     shapes are per-device and the denominator is one device's peak rather
@@ -745,7 +748,7 @@ def model_flops_utilization(
     """
     if not flops_per_step or step_time <= 0:
         return None
-    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak if peak is None else peak
     if peak is None:
         return None
     return flops_per_step / step_time / peak
