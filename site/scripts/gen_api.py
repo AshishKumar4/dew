@@ -271,6 +271,35 @@ def function_signature(function: griffe.Function, name: str | None = None) -> st
     return signature(f"{prefix} {name or function.name}", parameters(function), returns)
 
 
+def declaration(obj: griffe.Object, name: str | None = None, *, value_limit: int | None = None) -> str:
+    if obj.is_class:
+        return class_signature(obj)
+    if obj.is_function:
+        return function_signature(obj, name)
+    if obj.is_attribute:
+        annotation = f": {obj.annotation}" if obj.annotation is not None else ""
+        show_value = obj.value is not None and (value_limit is None or len(str(obj.value)) < value_limit)
+        value = f" = {obj.value}" if show_value else ""
+        return f"{name or obj.name}{annotation}{value}"
+    raise Unresolved(f"{obj.path} has no signature or fields")
+
+
+def render_references(package: griffe.Module, text: str) -> str:
+    """Expand `<!-- api: dotted.name ... -->` with the module pages' source declarations."""
+    def expand(match: re.Match) -> str:
+        declarations = []
+        for path in match[1].split():
+            try:
+                obj = resolve(module_at(package, path))
+            except (KeyError, Unresolved) as error:
+                raise Unresolved(f"{path}: {error}") from error
+            name = f"{obj.parent.name}.{obj.name}" if obj.parent and obj.parent.is_class else obj.name
+            declarations.append(declaration(obj, name))
+        return "```text\n" + "\n\n".join(declarations) + "\n```"
+
+    return re.sub(r"^<!-- api: (.+?) -->$", expand, text, flags=re.M)
+
+
 class Linker:
     """Turns `Name` and `module.Name` code spans in docstrings into links."""
 
@@ -390,14 +419,8 @@ def render_object(entry: Entry, linker: Linker, context: str) -> str:
     if obj.lineno:
         meta += f' <a class="api-source" href="{source_link(obj)}">source</a>'
     lines += [meta + "</p>", ""]
-    if obj.is_class:
-        lines += ["```python", class_signature(obj), "```", ""]
-    elif obj.is_function:
-        lines += ["```python", function_signature(obj, entry.name), "```", ""]
-    elif obj.is_attribute:
-        annotation = f": {obj.annotation}" if obj.annotation is not None else ""
-        value = f" = {obj.value}" if obj.value is not None and len(str(obj.value)) < 200 else ""
-        lines += ["```python", f"{entry.name}{annotation}{value}", "```", ""]
+    if obj.is_class or obj.is_function or obj.is_attribute:
+        lines += ["```python", declaration(obj, entry.name, value_limit=200), "```", ""]
     if obj.docstring:
         lines += [prose(obj.docstring.value, linker, context, own), ""]
     if obj.is_class:
@@ -726,11 +749,16 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
 
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
                   home: dict[str, str]) -> list[str]:
-    """What `unresolved_uses` reports for each Python unit `path` shows, in
-    order, a unit seeing the names the units before it bound."""
+    """Unresolved code and declaration references, with each Python unit seeing the names earlier units bound."""
     bound: dict[str, griffe.Object | Instance] = {}
-    return [problem for code, shown in usage_code(file, path)
-            for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+    problems = [problem for code, shown in usage_code(file, path)
+                for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+    if path.suffix == ".md":
+        try:
+            render_references(package, path.read_text())
+        except Unresolved as error:
+            problems.append(str(error))
+    return problems
 
 
 def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str, str]) -> list[str]:
@@ -863,7 +891,8 @@ def main() -> None:
         index += [f"| [`{module}`](/{page_slug(module)}/) | {escape(first_sentence(pages[module].module))} |"
                   for module in modules]
         index.append("")
-    overview.write_text(overview.read_text().rstrip() + "\n" + "\n".join(index).rstrip() + "\n")
+    overview.write_text(render_references(package, overview.read_text()).rstrip()
+                        + "\n" + "\n".join(index).rstrip() + "\n")
 
     generated.mkdir(parents=True, exist_ok=True)
     sidebar = [{"label": label, "collapsed": True,
