@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,7 @@ from .attention import LayerNorm, RMSNorm
 from .conv import Conv
 from .sharding import logical_axes
 from .vision import TowerBase, TowerGeometry
+from .vision.gemma4 import clipped_linear
 
 
 @struct.dataclass
@@ -125,28 +126,31 @@ def _clip(x, bound: float):
     return jnp.clip(x, -bound, bound)
 
 
+def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
+    """The encoders' bias-free linear map, its kernel drawn at `initializer_range`."""
+    return functools.partial(nn.Dense, use_bias=False, dtype=dtype, precision=precision,
+                             kernel_init=nn.initializers.normal(config.initializer_range))
+
+
 @logical_axes({("linear",): ("embed", "mlp")})
 class AudioLinear(nn.Module):
+    """Gemma 4's clippable linear in the audio tower's layout: the `dense` map
+    under `linear` and its bounds beside it, as the reference nests them
+    (`dew.nn.vision.gemma4.clipped_linear`)."""
+
     features: int
-    clipped: bool = False
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    initializer_range: float = 0.02
+    dense: Callable[..., nn.Dense]
+    use_clipped_linears: bool = False
 
     @nn.compact
     def __call__(self, x):
-        if self.clipped:
-            lo = self.variable("constants", "input_min", lambda: jnp.array(-jnp.inf)).value
-            hi = self.variable("constants", "input_max", lambda: jnp.array(jnp.inf)).value
-            x = jnp.clip(x, lo, hi)
-        x = nn.Dense(self.features, use_bias=False, dtype=self.dtype,
-                     precision=self.precision, kernel_init=nn.initializers.normal(self.initializer_range),
-                     name="linear")(x)
-        if self.clipped:
-            lo = self.variable("constants", "output_min", lambda: jnp.array(-jnp.inf)).value
-            hi = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf)).value
-            x = jnp.clip(x, lo, hi)
-        return x
+        return clipped_linear(self, self.dense(self.features, name="linear"), x, self.use_clipped_linears)
+
+
+def _clippable(config: Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
+    """Gemma 4's linear map: each one an `AudioLinear`."""
+    return functools.partial(AudioLinear, dense=_dense(config, dtype, precision),
+                             use_clipped_linears=config.use_clipped_linears)
 
 
 class CumulativeGroupNorm(nn.Module):
@@ -223,9 +227,7 @@ class AudioSubsample(nn.Module):
                 precision=self.precision, initializer_range=cfg.initializer_range,
                 name=f"conv_{i}" if old else f"layer{i}")(x, mask)
         x = x.reshape(x.shape[0], x.shape[1], -1)
-        return nn.Dense(cfg.hidden_size, use_bias=False, dtype=self.dtype,
-                        precision=self.precision, kernel_init=nn.initializers.normal(cfg.initializer_range),
-                        name="input_proj_linear")(x), mask
+        return _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="input_proj_linear")(x), mask
 
 
 def _block_context(x, chunk: int, left: int, right: int):
@@ -350,17 +352,9 @@ class Gemma4Attention(nn.Module):
     def __call__(self, x, valid):
         cfg = self.config
         heads, dim = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads
+        linear = _clippable(cfg, self.dtype, self.precision)
         projected = [
-            AudioLinear(
-                cfg.hidden_size,
-                cfg.use_clipped_linears,
-                dtype=self.dtype,
-                precision=self.precision,
-                initializer_range=cfg.initializer_range,
-                name=name,
-            )(x)
-            .astype(jnp.float32)
-            .reshape(*x.shape[:2], heads, dim)
+            linear(cfg.hidden_size, name=name)(x).astype(jnp.float32).reshape(*x.shape[:2], heads, dim)
             for name in ("q_proj", "k_proj", "v_proj")
         ]
         query, key, value = projected
@@ -399,52 +393,23 @@ class Gemma4Attention(nn.Module):
         )
         out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=self.precision)
         out = out.transpose(0, 2, 3, 1, 4).reshape(x.shape[0], -1, cfg.hidden_size)[:, :x.shape[1]]
-        return AudioLinear(
-            cfg.hidden_size,
-            cfg.use_clipped_linears,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="post",
-        )(out.astype(x.dtype))
+        return linear(cfg.hidden_size, name="post")(out.astype(x.dtype))
 
 
 class AudioFeedForward(nn.Module):
     width: int
     residual_weight: float
     clipping: float
-    clipped: bool = False
+    linear: Callable[..., nn.Module]
     activation: str = "silu"
-    wrapped: bool = False
     dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    initializer_range: float = 0.02
 
     @nn.compact
     def __call__(self, x):
         residual = x
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="pre_layer_norm")(_clip(x, self.clipping))
-        for name, width in (("ffw_layer_1", self.width * 4), ("ffw_layer_2", self.width)):
-            if self.wrapped:
-                x = AudioLinear(
-                    width,
-                    self.clipped,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    initializer_range=self.initializer_range,
-                    name=name,
-                )(x)
-            else:
-                x = nn.Dense(
-                    width,
-                    use_bias=False,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    kernel_init=nn.initializers.normal(self.initializer_range),
-                    name=name,
-                )(x)
-            if name == "ffw_layer_1":
-                x = _activation(x, self.activation)
+        x = _activation(self.linear(self.width * 4, name="ffw_layer_1")(x), self.activation)
+        x = self.linear(self.width, name="ffw_layer_2")(x)
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="post_layer_norm")(_clip(x, self.clipping))
         return residual + x * self.residual_weight
 
@@ -454,9 +419,8 @@ class AudioLightConv(nn.Module):
     kernel_size: int
     norm_eps: float
     clipping: float
-    clipped: bool = False
+    linear: Callable[..., nn.Module]
     activation: str = "silu"
-    wrapped: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
@@ -465,26 +429,7 @@ class AudioLightConv(nn.Module):
     def __call__(self, x):
         residual = x
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="pre_layer_norm")(x)
-        def linear(features, name, value):
-            if self.wrapped:
-                return AudioLinear(
-                    features,
-                    self.clipped,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    initializer_range=self.initializer_range,
-                    name=name,
-                )(value)
-            return nn.Dense(
-                features,
-                use_bias=False,
-                dtype=self.dtype,
-                precision=self.precision,
-                kernel_init=nn.initializers.normal(self.initializer_range),
-                name=name,
-            )(value)
-
-        x = linear(self.width * 2, "linear_start", x)
+        x = self.linear(self.width * 2, name="linear_start")(x)
         first, gate = jnp.split(x, 2, axis=-1)
         x = first * jax.nn.sigmoid(gate)
         x = Conv(
@@ -499,7 +444,7 @@ class AudioLightConv(nn.Module):
             name="depthwise_conv1d",
         )(x)
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="conv_norm")(_clip(x, self.clipping))
-        return residual + linear(self.width, "linear_end", _activation(x, self.activation))
+        return residual + self.linear(self.width, name="linear_end")(_activation(x, self.activation))
 
 
 class Gemma3nConformerAttention(nn.Module):
@@ -533,30 +478,17 @@ class Gemma3nConformer(nn.Module):
     @nn.compact
     def __call__(self, x, valid):
         cfg = self.config
-        x = AudioFeedForward(
-            cfg.hidden_size,
-            cfg.conf_residual_weight,
-            cfg.gradient_clipping,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="ffw_layer_start",
-        )(x)
+        dense = _dense(cfg, self.dtype, self.precision)
+        feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.conf_residual_weight,
+                                         cfg.gradient_clipping, dense, dtype=self.dtype)
+        x = feed_forward(name="ffw_layer_start")(x)
         x = Gemma3nConformerAttention(cfg, dtype=self.dtype, precision=self.precision, name="attention")(
             x, valid
         )
         x = AudioLightConv(cfg.hidden_size, cfg.conf_conv_kernel_size, cfg.rms_norm_eps,
-                           cfg.gradient_clipping, dtype=self.dtype, precision=self.precision,
+                           cfg.gradient_clipping, dense, dtype=self.dtype, precision=self.precision,
                            initializer_range=cfg.initializer_range, name="lconv1d")(x * valid[..., None])
-        x = AudioFeedForward(
-            cfg.hidden_size,
-            cfg.conf_residual_weight,
-            cfg.gradient_clipping,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="ffw_layer_end",
-        )(x)
+        x = feed_forward(name="ffw_layer_end")(x)
         return RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(_clip(x, cfg.gradient_clipping))
 
 
@@ -568,49 +500,20 @@ class Gemma4Conformer(nn.Module):
     @nn.compact
     def __call__(self, x, valid):
         cfg = self.config
-        x = AudioFeedForward(
-            cfg.hidden_size,
-            cfg.residual_weight,
-            cfg.gradient_clipping,
-            cfg.use_clipped_linears,
-            cfg.hidden_act,
-            wrapped=True,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="feed_forward1",
-        )(x)
+        linear = _clippable(cfg, self.dtype, self.precision)
+        feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.residual_weight,
+                                         cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype)
+        x = feed_forward(name="feed_forward1")(x)
         residual = x
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_pre_attn")(_clip(x, cfg.gradient_clipping))
         x = Gemma4Attention(cfg, dtype=self.dtype, precision=self.precision, name="self_attn")(x, valid)
         x = residual + RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_post_attn")(
             _clip(x, cfg.gradient_clipping)
         )
-        x = AudioLightConv(
-            cfg.hidden_size,
-            cfg.conv_kernel_size,
-            cfg.rms_norm_eps,
-            cfg.gradient_clipping,
-            cfg.use_clipped_linears,
-            cfg.hidden_act,
-            wrapped=True,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="lconv1d",
-        )(x)
-        x = AudioFeedForward(
-            cfg.hidden_size,
-            cfg.residual_weight,
-            cfg.gradient_clipping,
-            cfg.use_clipped_linears,
-            cfg.hidden_act,
-            wrapped=True,
-            dtype=self.dtype,
-            precision=self.precision,
-            initializer_range=cfg.initializer_range,
-            name="feed_forward2",
-        )(x)
+        x = AudioLightConv(cfg.hidden_size, cfg.conv_kernel_size, cfg.rms_norm_eps, cfg.gradient_clipping,
+                           linear, cfg.hidden_act, dtype=self.dtype, precision=self.precision,
+                           initializer_range=cfg.initializer_range, name="lconv1d")(x)
+        x = feed_forward(name="feed_forward2")(x)
         return RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_out")(_clip(x, cfg.gradient_clipping))
 
 
