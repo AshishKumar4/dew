@@ -34,7 +34,7 @@ from PIL import Image
 from dew.diffusion.presets import Cosine, Flow
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
-from dew.rl import clipped_surrogate_terms, group_advantage
+from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
@@ -339,11 +339,18 @@ def right_digits(previous: int, digits: str) -> list[bool]:
     return marks
 
 
-def digit_boxes(svg: Figure, x, y, digits, fills, size=26):
+def digit_boxes(svg: Figure, x, y, digits, fills, size=26, step=4):
     for j, (digit, fill) in enumerate(zip(digits, fills)):
-        svg.rect(x + j * (size + 4), y, size, size + 4, fill=fill, stroke="rule" if fill == "surface" else "none",
-                 rx=4)
-        svg.text(x + j * (size + 4) + size / 2, y + size / 2 + 7, digit, size=15, mono=True, anchor="middle")
+        svg.rect(x + j * (size + step), y, size, size + 4, fill=fill,
+                 stroke="rule" if fill == "surface" else "none", rx=4)
+        svg.text(x + j * (size + step) + size / 2, y + size / 2 + 7, digit, size=15, mono=True,
+                 anchor="middle")
+
+
+def save_both(svg: Figure, name: str, narrow: bool):
+    """A figure's wide layout is <name>.svg, which notebooks embed; the site swaps in <name>-narrow.svg
+    on a phone."""
+    svg.save(HERE / f"{name}{'-narrow' if narrow else ''}.svg")
 
 
 def rlvr_loop_figure():
@@ -353,48 +360,81 @@ def rlvr_loop_figure():
     rewards = np.array([np.mean(m) for m in marks], np.float32)
     advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))
     after = np.exp(0.6 * advantages) / np.exp(0.6 * advantages).sum()
-    svg = Figure(720, 316, seconds=11, label="The policy writes four answers to a prompt, a checker scores "
-                 "each one, and the update makes the answers that scored above the group's mean more likely.")
-    svg.rect(0.5, 0.5, 719, 315, fill="surface", rx=10)
-    svg.text(24, 128, "prompt", size=13, color="muted")
-    digit_boxes(svg, 24, 138, PROMPT, ["surface"] * 4, size=22)
-    svg.arrow(128, 155, 150, 155)
-    svg.rect(154, 86, 124, 140, fill="raised", stroke="accent", rx=8)
-    svg.text(216, 110, "policy", size=15, weight=600, anchor="middle")
-    svg.text(216, 130, "P(answer)", size=12, color="muted", anchor="middle")
-    for k, letter in enumerate("abcd"):
-        x = 172 + k * 24
-        svg.rect(x, 146, 16, 50, fill="rule", stroke="none", rx=2)
-        bar = svg.rect(x, 146, 16, 50, fill="accent", stroke="none", rx=2)
-        svg.animate(bar, {6.4: {"transform": "scaleY(0.25)"}, 7.6: {"transform": f"scaleY({after[k]:.3f})"}},
-                    origin="50% 100%")
-        svg.text(x + 8, 214, letter, size=12, mono=True, color="muted", anchor="middle")
-    svg.text(370, 30, "answers", size=13, color="muted")
-    svg.text(678, 30, "reward", size=13, color="muted", anchor="end")
-    with svg.group() as checker:
-        svg.rect(570, 44, 62, 224, fill="raised", stroke="text", rx=8)
-        svg.text(601, 160, "checker", size=12, color="text", anchor="middle")
-    svg.appear(checker, 2.9)
-    for i, (answer, right) in enumerate(zip(ANSWERS, marks)):
-        y = 44 + i * 58
-        with svg.group() as row:
-            svg.arrow(280, 156, 342, y + 15)
-            svg.text(362, y + 21, "abcd"[i], size=13, mono=True, color="muted", anchor="end")
-            digit_boxes(svg, 370, y, answer, ["surface"] * 6)
-        svg.appear(row, 0.8 + 0.45 * i)
-        with svg.group() as scored:
-            digit_boxes(svg, 370, y, answer, ["accent_fill" if r else "warm_fill" for r in right])
-            svg.arrow(632, y + 15, 640, y + 15)
-            svg.text(678, y + 21, f"{rewards[i]:.2f}", size=15, mono=True, weight=600, anchor="end",
-                     color="accent" if rewards[i] > rewards.mean() else "warm")
-        svg.appear(scored, 3.4 + 0.35 * i)
-    back = svg.polyline([(660, 274), (660, 298), (216, 298), (216, 232)], color="accent", width=1.5)
-    svg.draw(back, 5.2, 6.2)
-    head = svg.add("path", {"d": "M216,229 L212.5,236 L219.5,236 z"}, {"fill": svg.palette["accent"]})
-    svg.appear(head, 6.1, 0.2)
-    svg.appear(svg.text(438, 290, "update: answers that beat the group's mean get more likely", size=13,
-                        color="accent", anchor="middle"), 5.8)
-    svg.save(HERE / "rlvr-loop.svg")
+    label = ("The policy writes four answers to a prompt, a checker scores each one, and the update makes "
+             "the answers that scored above the group's mean more likely.")
+    for narrow in (False, True):
+        # Where each part sits in the wide (left to right) and narrow (top to bottom) layouts.
+        width, height = (360, 392) if narrow else (720, 316)
+        prompt_x, prompt_y = (16, 44) if narrow else (24, 138)
+        box_x, box_y = (170, 14) if narrow else (154, 86)
+        rows_x, rows_y, row_step = (44, 180, 44) if narrow else (370, 44, 58)
+        checker_x, reward_x = (226, 334) if narrow else (570, 678)
+        size, step = (22, 4) if narrow else (26, 4)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        svg.text(prompt_x, prompt_y - 10, "prompt", size=13, color="muted")
+        digit_boxes(svg, prompt_x, prompt_y, PROMPT, ["surface"] * 4, size=22)
+        svg.arrow(prompt_x + 104, prompt_y + 17, box_x - 4, prompt_y + 17 if narrow else box_y + 69)
+        svg.rect(box_x, box_y, 124, 140 if not narrow else 124, fill="raised", stroke="accent", rx=8)
+        svg.text(box_x + 62, box_y + 24, "policy", size=15, weight=600, anchor="middle")
+        svg.text(box_x + 62, box_y + 44, "P(answer)", size=12, color="muted", anchor="middle")
+        bars_y = box_y + (54 if narrow else 60)
+        for k, letter in enumerate("abcd"):
+            x = box_x + 18 + k * 24
+            svg.rect(x, bars_y, 16, 46, fill="rule", stroke="none", rx=2)
+            column = svg.rect(x, bars_y, 16, 46, fill="accent", stroke="none", rx=2)
+            svg.animate(column, {6.4: {"transform": "scaleY(0.25)"},
+                                 7.6: {"transform": f"scaleY({after[k]:.3f})"}}, origin="50% 100%")
+            svg.text(x + 8, bars_y + 64, letter, size=12, mono=True, color="muted", anchor="middle")
+        svg.text(rows_x, rows_y - 14, "answers", size=13, color="muted")
+        svg.text(reward_x, rows_y - 14, "reward", size=13, color="muted", anchor="end")
+        rows_end = rows_y + 3 * row_step + size + 4
+        with svg.group() as checker:
+            svg.rect(checker_x, rows_y, 62 if not narrow else 50, rows_end - rows_y, fill="raised",
+                     stroke="text", rx=8)
+            svg.text(checker_x + (31 if not narrow else 25), (rows_y + rows_end) / 2 + 4, "checker", size=12,
+                     anchor="middle")
+        svg.appear(checker, 2.9)
+        if narrow:
+            # One trunk from the policy down the left edge, a branch to each answer.
+            svg.polyline([(box_x + 62, box_y + 124), (box_x + 62, rows_y - 36), (14, rows_y - 36),
+                          (14, rows_y + 3 * row_step + size / 2)], color="muted", width=1.25)
+        for i, (answer, right) in enumerate(zip(ANSWERS, marks)):
+            y = rows_y + i * row_step
+            with svg.group() as row:
+                if narrow:
+                    svg.arrow(14, y + size / 2 + 2, rows_x - 16, y + size / 2 + 2)
+                else:
+                    svg.arrow(box_x + 126, box_y + 70, rows_x - 28, y + 15)
+                svg.text(rows_x - 8, y + size / 2 + 7, "abcd"[i], size=13, mono=True, color="muted",
+                         anchor="end")
+                digit_boxes(svg, rows_x, y, answer, ["surface"] * 6, size=size, step=step)
+            svg.appear(row, 0.8 + 0.45 * i)
+            with svg.group() as scored:
+                digit_boxes(svg, rows_x, y, answer, ["accent_fill" if r else "warm_fill" for r in right],
+                            size=size, step=step)
+                checker_end = checker_x + (62 if not narrow else 50)
+                svg.arrow(checker_end, y + size / 2 + 2, checker_end + 8, y + size / 2 + 2)
+                svg.text(reward_x, y + size / 2 + 8, f"{rewards[i]:.2f}", size=15, mono=True, weight=600,
+                         anchor="end", color="accent" if rewards[i] > rewards.mean() else "warm")
+            svg.appear(scored, 3.4 + 0.35 * i)
+        if narrow:
+            back = [(reward_x - 16, rows_end + 6), (reward_x - 16, rows_end + 18), (352, rows_end + 18),
+                    (352, box_y + 62), (box_x + 128, box_y + 62)]
+            tip_x, tip_y = box_x + 125, box_y + 62
+            head = f"M{tip_x},{tip_y} L{tip_x + 7},{tip_y - 3.5} L{tip_x + 7},{tip_y + 3.5} z"
+            note_x, note_y = 180, rows_end + 44
+        else:
+            back = [(660, 274), (660, 298), (216, 298), (216, 232)]
+            head = "M216,229 L212.5,236 L219.5,236 z"
+            note_x, note_y = 438, 290
+        svg.draw(svg.polyline(back, color="accent", width=1.5), 5.2, 6.2)
+        svg.appear(svg.add("path", {"d": head}, {"fill": svg.palette["accent"]}), 6.1, 0.2)
+        note = "update: answers that beat the group's mean get more likely"
+        if narrow:
+            note = "update: answers above the mean get more likely"
+        svg.appear(svg.text(note_x, note_y, note, size=13, color="accent", anchor="middle"), 5.8)
+        save_both(svg, "rlvr-loop", narrow)
 
 
 def rlvr_advantage_figure():
@@ -402,107 +442,196 @@ def rlvr_advantage_figure():
     rewards = np.array([1.0, 0.67, 0.0, 0.83, 0.17, 0.5, 0.0, 0.33], np.float32)
     advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(rewards)))
     mean, deviation = float(rewards.mean()), float(rewards.std(ddof=1))
-    svg = Figure(720, 300, seconds=11, label="Eight rewards, their group mean, and the advantages: each reward "
-                 "minus the mean, divided by the group's standard deviation.")
-    svg.rect(0.5, 0.5, 719, 299, fill="surface", rx=10)
-    floor, tall, slot = 236, 150, 38
-    svg.text(28, 32, "reward R of 8 answers to one prompt", size=13, color="muted")
-    svg.line(28, floor, 340, floor, color="rule")
-    level = floor - tall * mean
-    for i, reward in enumerate(rewards):
-        x = 36 + i * slot
-        up = reward > mean
-        # The bar grows in a neutral color, then takes the color of its side of the mean.
-        for fill, at in (("tint1", 0.0), ("accent" if up else "warm", 3.6 + 0.1 * i)):
-            with svg.group() as colored:
-                bar = svg.rect(x, floor - tall, 26, tall, fill=fill, stroke="none", rx=3)
-                svg.animate(bar, {0.3 + 0.15 * i: {"transform": "scaleY(0)"},
-                                  0.9 + 0.15 * i: {"transform": f"scaleY({reward:.3f})"}}, origin="50% 100%")
-            if at:
-                svg.appear(colored, at)
-        svg.text(x + 13, floor + 18, f"{reward:.2f}", size=12, mono=True, color="muted", anchor="middle")
-        gap = svg.line(x + 13, floor - tall * reward, x + 13, level, color="accent" if up else "warm", width=2,
-                       dash="2 3")
-        svg.appear(gap, 3.6 + 0.1 * i)
-    with svg.group() as average:
-        svg.line(28, level, 344, level, color="text", width=1.5, dash="5 4")
-        svg.text(344, level - 8, f"mean {mean:.2f}", size=13, mono=True, anchor="end")
-    svg.animate(average, {2.4: {"opacity": 0, "transform": "translateX(-24px)"},
-                          3.0: {"opacity": 1, "transform": "translateX(0px)"}})
-    zero, unit = 146, 44
-    svg.text(392, 32, f"advantage A = (R − {mean:.2f}) / {deviation:.2f}", size=13, color="muted")
-    svg.line(388, zero, 700, zero, color="rule")
-    for i, advantage in enumerate(advantages):
-        x = 396 + i * slot
-        up = advantage > 0
-        bar = svg.rect(x, zero - unit * advantage if up else zero, 26, unit * abs(advantage),
-                       fill="accent" if up else "warm", stroke="none", rx=3)
-        svg.animate(bar, {4.8 + 0.1 * i: {"transform": "scaleY(0)"}, 5.6 + 0.1 * i: {"transform": "scaleY(1)"}},
-                    origin="50% 100%" if up else "50% 0%")
-        y = zero - unit * advantage - 8 if up else zero + unit * abs(advantage) + 18
-        svg.appear(svg.text(x + 13, y, f"{advantage:+.1f}", size=12, mono=True, anchor="middle",
-                            color="accent" if up else "warm"), 6.2)
-    svg.appear(svg.text(544, 280, "above the mean is pushed up, below is pushed down", size=13, color="muted",
-                        anchor="middle"), 6.6)
-    svg.save(HERE / "rlvr-advantage.svg")
+    label = ("Eight rewards, their group mean, and the advantages: each reward minus the mean, divided by "
+             "the group's standard deviation.")
+    for narrow in (False, True):
+        width, height = (360, 560) if narrow else (720, 300)
+        # Each panel's top-left corner: rewards, then advantages beside them or below.
+        rx_, ry_ = 20, 0
+        ax_, ay_ = (20, 270) if narrow else (380, 0)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        floor, tall, slot = ry_ + 236, 150, 38
+        svg.text(rx_ + 8, ry_ + 32, "reward R of 8 answers to one prompt", size=13, color="muted")
+        svg.line(rx_ + 8, floor, rx_ + 320, floor, color="rule")
+        level = floor - tall * mean
+        for i, reward in enumerate(rewards):
+            x = rx_ + 16 + i * slot
+            up = reward > mean
+            # The bar grows in a neutral color, then takes the color of its side of the mean.
+            for fill, at in (("tint1", 0.0), ("accent" if up else "warm", 3.6 + 0.1 * i)):
+                with svg.group() as colored:
+                    column = svg.rect(x, floor - tall, 26, tall, fill=fill, stroke="none", rx=3)
+                    svg.animate(column, {0.3 + 0.15 * i: {"transform": "scaleY(0)"},
+                                         0.9 + 0.15 * i: {"transform": f"scaleY({reward:.3f})"}},
+                                origin="50% 100%")
+                if at:
+                    svg.appear(colored, at)
+            svg.text(x + 13, floor + 18, f"{reward:.2f}", size=12, mono=True, color="muted", anchor="middle")
+            gap = svg.line(x + 13, floor - tall * reward, x + 13, level, color="accent" if up else "warm",
+                           width=2, dash="2 3")
+            svg.appear(gap, 3.6 + 0.1 * i)
+        with svg.group() as average:
+            svg.line(rx_ + 8, level, rx_ + 324, level, color="text", width=1.5, dash="5 4")
+            svg.text(rx_ + 324, level - 8, f"mean {mean:.2f}", size=13, mono=True, anchor="end")
+        svg.animate(average, {2.4: {"opacity": 0, "transform": "translateX(-24px)"},
+                              3.0: {"opacity": 1, "transform": "translateX(0px)"}})
+        zero, unit = ay_ + 146, 44
+        svg.text(ax_ + 12, ay_ + 32, f"advantage A = (R − {mean:.2f}) / {deviation:.2f}", size=13,
+                 color="muted")
+        svg.line(ax_ + 8, zero, ax_ + 320, zero, color="rule")
+        for i, advantage in enumerate(advantages):
+            x = ax_ + 16 + i * slot
+            up = advantage > 0
+            column = svg.rect(x, zero - unit * advantage if up else zero, 26, unit * abs(advantage),
+                              fill="accent" if up else "warm", stroke="none", rx=3)
+            svg.animate(column, {4.8 + 0.1 * i: {"transform": "scaleY(0)"},
+                                 5.6 + 0.1 * i: {"transform": "scaleY(1)"}},
+                        origin="50% 100%" if up else "50% 0%")
+            y = zero - unit * advantage - 8 if up else zero + unit * abs(advantage) + 18
+            svg.appear(svg.text(x + 13, y, f"{advantage:+.1f}", size=12, mono=True, anchor="middle",
+                                color="accent" if up else "warm"), 6.2)
+        svg.appear(svg.text(ax_ + 164, ay_ + 280, "above the mean is pushed up, below is pushed down",
+                            size=13, color="muted", anchor="middle"), 6.6)
+        save_both(svg, "rlvr-advantage", narrow)
 
 
 def rlvr_clip_figure():
     """PPO's clipped objective against the ratio, from dew.rl's terms, with its flat stretches shaded."""
     ratios = np.linspace(0.02, 3.5, 351)
-    svg = Figure(720, 304, seconds=9, label="The clipped objective against the ratio for a positive and a "
-                 "negative advantage. Where it is flat the token gets no gradient.")
-    svg.rect(0.5, 0.5, 719, 303, fill="surface", rx=10)
-    for panel, advantage in enumerate((1.0, -1.0)):
-        left, top, wide, high = 52 + panel * 352, 58, 300, 170
+    log_ratio = jnp.log(jnp.asarray(ratios, jnp.float32))
+    label = ("The clipped objective against the ratio for a positive and a negative advantage. Where it is "
+             "flat, the clipped term gives the token no gradient.")
+    for narrow in (False, True):
+        width, height = (360, 590) if narrow else (720, 304)
+        svg = Figure(width, height, seconds=9, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        for panel, advantage in enumerate((1.0, -1.0)):
+            left, top = (40, 58 + panel * 270) if narrow else (52 + panel * 352, 58)
+            wide, high = 300, 170
 
-        def objective(log_ratio, advantage=advantage):
-            terms, _ = clipped_surrogate_terms(log_ratio[None, :], jnp.asarray([advantage]),
-                                               jnp.ones((1, log_ratio.size)))
-            return -terms[0]
+            def objective(log_ratio, advantage=advantage):
+                terms, _ = clipped_surrogate_terms(log_ratio[None, :], jnp.asarray([advantage]),
+                                                   jnp.ones((1, log_ratio.size)))
+                return -terms[0]
 
-        log_ratio = jnp.log(jnp.asarray(ratios, jnp.float32))
-        values = np.asarray(objective(log_ratio))
-        slopes = np.asarray(jax.vmap(jax.grad(lambda r, objective=objective: objective(r[None])[0]))(log_ratio))
-        low, high_value = (0.0, 1.5) if advantage > 0 else (-3.5, 0.0)
+            values = np.asarray(objective(log_ratio))
+            slope = jax.grad(lambda r, objective=objective: objective(r[None])[0])
+            slopes = np.asarray(jax.vmap(slope)(log_ratio))
+            low, high_value = (0.0, 1.5) if advantage > 0 else (-3.5, 0.0)
 
-        def at(r, v, left=left, top=top, low=low, high_value=high_value):
-            return left + wide * r / 3.5, top + high - high * (v - low) / (high_value - low)
+            def at(r, v, left=left, top=top, low=low, high_value=high_value):
+                return left + wide * r / 3.5, top + high - high * (v - low) / (high_value - low)
 
-        flat = slopes == 0
-        edges = np.flatnonzero(np.diff(np.concatenate([[0], flat.astype(int), [0]])))
-        for start, stop in zip(edges[::2], edges[1::2]):
-            x0, _ = at(ratios[start], low)
-            x1, _ = at(ratios[stop - 1], low)
-            with svg.group() as shade:
-                svg.rect(x0, top, x1 - x0, high, fill="warm_fill", stroke="none", rx=0)
-                name = "dual clip" if ratios[start] > 2 else "clipped"
-                svg.text(min((x0 + x1) / 2, left + wide - 26), top - 7, name, size=12, color="warm",
-                         anchor="middle")
-            svg.appear(shade, 3.6)
-        svg.line(left, top + high, left + wide, top + high, color="rule")
-        svg.line(left, top, left, top + high, color="rule")
-        for tick in (0, 1, 2, 3):
-            x, _ = at(tick, low)
-            svg.text(x, top + high + 18, str(tick), size=12, mono=True, color="muted", anchor="middle")
-        x1, _ = at(1.0, low)
-        svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
-        title = "A > 0: raise π(y), up to ρ = 1 + ε" if advantage > 0 else "A < 0: lower π(y), down to ρ = 1 − ε"
-        svg.text(left, 30, title, size=13, weight=600)
-        svg.text(left + wide, top + high + 38, "ratio ρ = π / π_old", size=12, color="muted", anchor="end")
-        name = svg.text(left - 12, top + high / 2, "objective", size=12, color="muted", anchor="middle")
-        name.attributes["transform"] = f"rotate(-90 {left - 12} {top + high / 2})"
-        line = svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5)
-        svg.draw(line, 0.4, 3.2)
-    svg.appear(svg.text(360, 292, "shaded: the objective is flat, so the token gets no gradient", size=12,
-                        color="warm", anchor="middle"), 4.0)
-    svg.save(HERE / "rlvr-clip.svg")
+            flat = slopes == 0
+            edges = np.flatnonzero(np.diff(np.concatenate([[0], flat.astype(int), [0]])))
+            for start, stop in zip(edges[::2], edges[1::2]):
+                x0, _ = at(ratios[start], low)
+                x1, _ = at(ratios[stop - 1], low)
+                with svg.group() as shade:
+                    svg.rect(x0, top, x1 - x0, high, fill="tint1", stroke="none", rx=0).style["opacity"] = "0.6"
+                    name = "dual clip" if ratios[start] > 2 else "clipped"
+                    svg.text(min((x0 + x1) / 2, left + wide - 26), top - 7, name, size=12, color="muted",
+                             anchor="middle")
+                svg.appear(shade, 3.6)
+            svg.line(left, top + high, left + wide, top + high, color="rule")
+            svg.line(left, top, left, top + high, color="rule")
+            for tick in (0, 1, 2, 3):
+                x, _ = at(tick, low)
+                svg.text(x, top + high + 18, str(tick), size=12, mono=True, color="muted", anchor="middle")
+            x1, _ = at(1.0, low)
+            svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
+            title = ("A > 0: raise π(y), up to ρ = 1 + ε" if advantage > 0
+                     else "A < 0: lower π(y), down to ρ = 1 − ε")
+            svg.text(left, top - 28, title, size=13, weight=600)
+            svg.text(left + wide, top + high + 38, "ratio ρ = π / π_old", size=12, color="muted",
+                     anchor="end")
+            name = svg.text(left - 12, top + high / 2, "objective", size=12, color="muted", anchor="middle")
+            name.attributes["transform"] = f"rotate(-90 {left - 12} {top + high / 2})"
+            line = svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5)
+            svg.draw(line, 0.4, 3.2)
+        svg.appear(svg.text(width / 2, height - 12, "shaded: flat, so the clipped term gives no gradient",
+                            size=12, color="muted", anchor="middle"), 4.0)
+        save_both(svg, "rlvr-clip", narrow)
+
+
+def rlvr_sequence_figure():
+    """One completion as the loss reads it: its tokens, the mask that keeps the written ones, and the
+    completion's advantage on each written token."""
+    answer = ANSWERS[1]
+    rewards = np.array([np.mean(right_digits(int(PROMPT[-1]), a)) for a in ANSWERS], np.float32)
+    advantage = float(np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))[1])
+    width, height, left, step = 440, 236, 108, 32
+    svg = Figure(width, height, seconds=9, label=f"The tokens of one completion: the prompt {' '.join(PROMPT)} "
+                 f"with mask 0, and the written digits {' '.join(answer)} with mask 1, each carrying the "
+                 f"completion's advantage {advantage:+.2f}.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    rows = [("tokens", 30), ("mask m", 82), ("A × m", 134)]
+    for name, y in rows:
+        svg.text(left - 14, y + 20, name, size=14, color="muted", anchor="end")
+    for j, token in enumerate(PROMPT + answer):
+        x, y = left + j * step, rows[0][1]
+        written = j >= len(PROMPT)
+        svg.rect(x, y, step - 4, 30, fill="tint1" if written else "surface",
+                 stroke="none" if written else "rule", rx=4)
+        svg.text(x + (step - 4) / 2, y + 21, token, size=15, mono=True, anchor="middle",
+                 color="text" if written else "muted")
+        mask = svg.text(x + (step - 4) / 2, rows[1][1] + 21, "1" if written else "0", size=15, mono=True,
+                        anchor="middle", color="text" if written else "muted")
+        svg.appear(mask, 1.2 + 0.08 * j)
+        with svg.group() as credit:
+            if written:
+                svg.rect(x, rows[2][1], step - 4, 30, fill="accent_fill", stroke="none", rx=4)
+            svg.text(x + (step - 4) / 2, rows[2][1] + 20, f"{advantage:+.1f}" if written else "0", size=12,
+                     mono=True, anchor="middle", color="accent" if written else "muted")
+        svg.appear(credit, 3.2 + 0.1 * j)
+    svg.appear(svg.text(width / 2, 204, f"reward {rewards[1]:.2f} gives A = {advantage:+.2f} on each written digit, "
+                        "0 on the prompt", size=13, color="muted", anchor="middle"), 4.6)
+    svg.save(HERE / "rlvr-sequence.svg")
+
+
+def rlvr_kl_figure():
+    """The k3 estimate against π / π_ref, from dew.rl.k3_kl: zero at 1, and a slope that pulls back to 1."""
+    ratios = np.geomspace(0.25, 4, 161)
+    values = np.asarray(k3_kl(jnp.log(jnp.asarray(ratios, jnp.float32)), jnp.zeros(ratios.size)))
+    width, height = 440, 280
+    left, top, wide, high = 56, 44, 360, 180
+    svg = Figure(width, height, seconds=9, label="The k3 estimate of the KL divergence against the ratio of "
+                 "the policy to the reference: zero where they agree and rising on both sides, so its "
+                 "gradient pulls the policy back toward the reference.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+
+    def at(r, v):
+        return left + wide * np.log(r / 0.25) / np.log(16), top + high - high * v / values.max()
+
+    svg.line(left, top + high, left + wide, top + high, color="rule")
+    svg.line(left, top, left, top + high, color="rule")
+    for tick in (0.25, 0.5, 1, 2, 4):
+        x, _ = at(tick, 0)
+        svg.text(x, top + high + 20, f"{tick:g}", size=13, mono=True, color="muted", anchor="middle")
+    svg.text(left + wide, top + high + 42, "π / π_ref, the policy over the reference", size=13, color="muted",
+             anchor="end")
+    svg.text(left, 28, "k3 per token", size=14, weight=600)
+    x1, _ = at(1, 0)
+    svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
+    svg.draw(svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5), 0.4, 2.8)
+    # A token that drifted to twice the reference's probability slides back toward it.
+    slide = np.geomspace(2.6, 1.0, 9)
+    heights = np.asarray(k3_kl(jnp.log(jnp.asarray(slide, jnp.float32)), jnp.zeros(slide.size)))
+    path = [at(r, v) for r, v in zip(slide, heights)]
+    ball = svg.circle(*path[0], 6, fill="text")
+    moves = {3.2 + 0.45 * i: {"transform": f"translate({x - path[0][0]:.1f}px,{y - path[0][1]:.1f}px)",
+                              "opacity": 1} for i, (x, y) in enumerate(path)}
+    svg.animate(ball, moves | {2.8: {"transform": "translate(0px,0px)", "opacity": 0}})
+    svg.appear(svg.text(x1 + 8, top + 16, "zero where π = π_ref", size=13, color="muted"), 3.0)
+    svg.save(HERE / "rlvr-kl.svg")
 
 
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
-           "rlvr-advantage": rlvr_advantage_figure, "rlvr-clip": rlvr_clip_figure}
+           "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
 
 
 if __name__ == "__main__":
