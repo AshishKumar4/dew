@@ -64,7 +64,8 @@ def reference_block(attention_bias: bool = False) -> Glm5NextTextAttention:
 
 def module(max_seq_len: int = 16, attention_bias: bool = False, **overrides) -> KPoolSparseAttention:
     return KPoolSparseAttention(
-        emb_features=E, num_heads=H, max_seq_len=max_seq_len, norm_eps=1e-5, scale_after_cast=True,
+        emb_features=E, num_heads=H, max_seq_len=max_seq_len, qk_rope_head_dim=0, norm_eps=1e-5,
+        scale_after_cast=True,
         attention_bias=attention_bias, **{**SETTINGS, **overrides})
 
 

@@ -401,9 +401,13 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
     live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
     requests = [(example.state, example.questions) for example in examples]
     first, second = live.batch(requests), reloaded.batch(requests)
+    # Each task is asked at one pass's shapes at a time: a pass of one row and a pass of two run
+    # different shapes, whose matmuls a GPU computes with kernels it picks by shape, so a request
+    # alone and the same request batched part by rounding (1.5e-7 on an A100), while a row's
+    # logits in a pass do not depend on the other rows in it.
     for request, (answer, usage), (again, restored_usage) in zip(requests, first, second, strict=True):
         np.testing.assert_array_equal(answer["q0"].probabilities, again["q0"].probabilities)
-        np.testing.assert_array_equal(again["q0"].probabilities,
+        np.testing.assert_array_equal(live(*request)["q0"].probabilities,
                                       reloaded(*request)["q0"].probabilities)
         assert usage == restored_usage
     score = Score("rate", ["low", "high"])

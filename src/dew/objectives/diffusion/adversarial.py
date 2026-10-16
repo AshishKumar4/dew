@@ -275,7 +275,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, drop_key)
         indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
         t = jnp.asarray(self.student_times)[indices]
-        noise = jax.random.normal(noise_key, samples.shape)
+        # Float32 draws, as the step's others are, at any precision.
+        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
         student = self.process.denoiser(self.model, self.model_variables(variables), conditions,
@@ -284,9 +285,9 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
 
         level_key, renoise_noise = jax.random.split(renoise_key)
         mean, std = self.renoise_times
-        level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,)))
+        level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,), dtype=jnp.float32))
         rates = broadcast_rates(schedule, level, samples)
-        renoise = jax.random.normal(renoise_noise, samples.shape)
+        renoise = jax.random.normal(renoise_noise, samples.shape, dtype=jnp.float32)
         teacher = jax.lax.stop_gradient(variables[TEACHER])
 
         def renoised(x):

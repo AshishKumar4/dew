@@ -29,7 +29,14 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import LayerNorm, NormalAttention, RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import (
+    LayerNorm,
+    NormalAttention,
+    RMSNorm,
+    projected_heads,
+    projected_output,
+    scaled_dot_product_attention,
+)
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -93,14 +100,12 @@ class WanAttention(nn.Module):
             lengths, context_lengths, inner)
 
     def _projected(self, name: str, x, *, norm: str | None = None):
-        projected = nn.Dense(self.heads * self.head_dim, dtype=self.dtype, precision=self.precision,
-                             name=name)(x)
-        if norm is not None and self.qk_norm:
-            # Diffusers' `RMSNorm` rounds the normalized row to the weight's
-            # dtype before it scales.
-            projected = RMSNorm(epsilon=self.epsilon, scale_after_cast=True, dtype=self.dtype,
-                                name=norm)(projected)
-        return projected.reshape(x.shape[0], x.shape[1], self.heads, self.head_dim)
+        # Diffusers' `RMSNorm` rounds the normalized row to the weight's
+        # dtype before it scales.
+        return projected_heads(x, name, self.heads, self.head_dim, flat=True, dtype=self.dtype,
+                               precision=self.precision, across_heads=True,
+                               norm=RMSNorm(epsilon=self.epsilon, scale_after_cast=True, dtype=self.dtype,
+                                            name=norm) if norm and self.qk_norm else None)
 
     @nn.compact
     def __call__(self, x, context=None, rotation=None):
@@ -113,9 +118,8 @@ class WanAttention(nn.Module):
             query, key = (rotate(part, *rotation, pairs="adjacent") for part in (query, key))
         attended = scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
                                                 precision=self.precision)
-        attended = attended.reshape(x.shape[0], x.shape[1], self.heads * self.head_dim)
-        return nn.Dense(self.heads * self.head_dim, dtype=self.dtype, precision=self.precision,
-                        name="to_out_0")(attended)
+        return projected_output(attended, "to_out_0", self.heads * self.head_dim, flat=True, dtype=self.dtype,
+                                precision=self.precision)
 
 
 class WanBlock(nn.Module):

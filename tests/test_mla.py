@@ -46,11 +46,8 @@ def fixture(name: str) -> dict:
 
 def yarn_of(settings: dict) -> YarnScaling:
     """The fixture's rope spelling as the mixer's yarn record."""
-    record = yarn_record(
-        dict(settings["rope_scaling"], rope_theta=settings["rope_theta"]),
-        "rope_scaling", float(settings["rope_theta"]),
-        int(settings["max_position_embeddings"]))
-    return YarnScaling(**record)
+    return YarnScaling(**yarn_record(settings["rope_scaling"], "rope_scaling",
+                                     int(settings["max_position_embeddings"])))
 
 
 def mla_module(settings: dict, max_seq_len: int = 64,
@@ -284,10 +281,6 @@ def mla_record(settings: dict) -> dict:
         "qk_rope_head_dim": settings["qk_rope_head_dim"],
         "v_head_dim": settings["v_head_dim"],
         "rope_interleave": settings.get("rope_interleave", True),
-        "yarn": yarn_record(
-            dict(settings["rope_scaling"], rope_theta=settings["rope_theta"]),
-            "rope_scaling", float(settings["rope_theta"]),
-            int(settings["max_position_embeddings"])),
         "index_topk": settings.get("index_topk"),
         "index_n_heads": settings.get("index_n_heads"),
         "index_head_dim": settings.get("index_head_dim"),
@@ -301,6 +294,8 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
         "num_heads": settings["num_attention_heads"],
         "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
         "mlp_features": 48, "max_seq_len": 64, "rope_theta": float(settings["rope_theta"]),
+        "yarn": yarn_record(settings["rope_scaling"], "rope_scaling",
+                            int(settings["max_position_embeddings"])),
         "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
         "attention_bias": bool(settings["attention_bias"]),
         "mixer": mla_record(settings), "attention_impl": "reference"}

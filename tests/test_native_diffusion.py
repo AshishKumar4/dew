@@ -145,6 +145,47 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
 
 
+def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved_pipelines, tmp_path):
+    """Saved with a shard bound below its components' sizes, a pipeline writes each component's
+    weights as shards and an index under the stem and shard names its library reads (the
+    denoiser's and the VAE's `diffusion_pytorch_model`, the text encoder's `model`), which
+    Diffusers' Hub download keeps, no single file beside them, and loads back to the same
+    tensors."""
+    import json
+
+    import numpy as np
+
+    from dew.interop import Pretrained
+    from tools.diffusers_reference_helpers import restore_transformers_names
+
+    restore_transformers_names()
+    from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
+
+    source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
+    destination = tmp_path / "export"
+    # Saved over itself, the directory holds the latest export alone, under names no earlier index
+    # held.
+    earlier: set[str] = set()
+    for save in range(3):
+        source.save(destination, max_shard_size=20_000)
+        files = [path.relative_to(destination).as_posix() for path in destination.rglob("*")
+                 if path.is_file()]
+        # What Diffusers downloads of the directory, published as it is.
+        downloaded, _ = variant_compatible_siblings(files)
+        for component, stem in (("unet", "diffusion_pytorch_model"), ("vae", "diffusion_pytorch_model"),
+                                ("text_encoder", "model")):
+            index = json.loads((destination / component / f"{stem}.safetensors.index.json").read_text())
+            shards = {f"{component}/{name}" for name in index["weight_map"].values()}
+            written = {file for file in files if file.startswith(f"{component}/{stem}-")}
+            assert len(shards) > 1 and written == shards
+            assert not (destination / component / f"{stem}.safetensors").exists()
+            assert shards <= set(downloaded) if save == 0 else not shards & earlier
+            earlier |= shards
+        reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+        for layout in reloaded.weight_layouts:
+            np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))
+
+
 def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(saved_pipelines):
     """An XL pipeline loaded at 64x48 instead of its own 32x32 states that size in its time ids, and
     the conditioner its run record rebuilds states the same, where it used to read the pipeline's
