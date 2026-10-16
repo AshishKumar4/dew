@@ -466,6 +466,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
+    inference_fields: ClassVar[frozenset[str]] = frozenset()
+    """The settings a saved run of this objective records beside its
+    `objective` and `model` (`inference_record`); a loader refuses a record
+    holding any other (`dew.inference.tasks.run_record`)."""
     _ema_is_reference: ClassVar[bool] = False
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the

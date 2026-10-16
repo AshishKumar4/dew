@@ -106,6 +106,7 @@ class PPOObjective(Objective[Ratio, Variables]):
     shown: Mapping[str, Shown] = {"loss": Shown(), "critic/loss": Shown(better="lower")}
 
     saved_task = TextGeneration
+    inference_fields = GRPOObjective.inference_fields
     _ema_is_reference = True
     _model_part = "policy"
 
