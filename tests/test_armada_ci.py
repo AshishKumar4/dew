@@ -128,7 +128,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     file that started a process, a shell's or any multiprocessing context's,
     has no key, so it is in, and no task reuses its row, whatever names its
     program (a descriptor, for `os.execve`); one that asked a native tool
-    about the host (`executed.TOOLS`) keeps its key. The command line
+    about the host or compiled a kernel with ptxas (`executed.TOOLS`) keeps
+    its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -162,6 +163,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
+                        "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
                         "    assert platform.platform()\n",
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
@@ -184,6 +186,10 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     }
     for name, source in files.items():
         (tmp_path / "tests" / name).write_text(source)
+    # A kernel's compiler, as the CUDA toolkit installs it.
+    (tmp_path / "tests/compiler").mkdir()
+    (tmp_path / "tests/compiler/ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
+    (tmp_path / "tests/compiler/ptxas").chmod(0o755)
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
