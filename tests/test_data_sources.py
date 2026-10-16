@@ -966,37 +966,40 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 
 
 
-def test_a_hub_split_prepared_online_reads_the_same_rows_with_the_hub_offline(tmp_path, monkeypatch):
-    """A Hub split prepared online reads the same rows with the Hub offline (HF_HUB_OFFLINE): its
-    commit is the answer the Hub gave online (`dew.cache.hub_answer`), and its Arrow is the cache
-    `datasets` prepared at that commit, which `datasets` itself cannot find offline."""
+def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
+    """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
+    the rows of the commit each source pins: the commit is the answer the Hub gave online
+    (`dew.cache.hub_answer`), the default branch's the last given, and the Arrow is the cache
+    `datasets` prepared at that commit, which `datasets` itself does not find offline."""
     import datasets
-    from hub_support import hub_split, offline
+    from hub_support import native_hub, offline
 
     from dew.data import Hub
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    commit = "0123456789abcdef0123456789abcdef01234567"
-    rows = datasets.Dataset.from_dict({"id": list(range(16))})
-    cache = str(tmp_path / "hub" / "cache")
+    first, second = "0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"
+    cache = str(tmp_path / "cache")
 
-    def read():
-        pipeline = Pipeline(Hub("acme/records", cache_dir=cache)).batch(4)
+    def read(revision=None):
+        pipeline = Pipeline(Hub("acme/records", revision=revision, cache_dir=cache)).batch(4)
         reader = compile(pipeline, read="indexed", loading=Loading(workers=0), provision=True).train(
             DataPartition())
         try:
-            return [int(value) for _ in range(4) for value in next(reader)["id"]]
+            return sorted(int(value) for _ in range(4) for value in next(reader)["id"])
         finally:
             reader.close()
 
-    with pytest.MonkeyPatch.context() as online:
-        hub_split(online, tmp_path / "hub", "acme/records", {"train": rows}, commit)
-        answered = read()
+    for commit, start in ((first, 0), (second, 100)):
+        rows = datasets.Dataset.from_dict({"id": list(range(start, start + 16))})
+        with pytest.MonkeyPatch.context() as online:
+            native_hub(online, tmp_path / commit, "acme/records", {"train": rows}, commit)
+            assert read(commit) == list(range(start, start + 16))
+            assert read() == list(range(start, start + 16))
     offline(monkeypatch)
-    assert Hub("acme/records", cache_dir=cache).commit == commit
-    assert read() == answered
-    assert sorted(answered) == list(range(16))
+    assert read(first) == list(range(16))
+    assert read() == list(range(100, 116))
+    assert Hub("acme/records", cache_dir=cache).commit == second
 
 
 def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub_conversion, monkeypatch):
@@ -1016,6 +1019,35 @@ def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub
     assert recorded.fingerprint() == identity
     with pytest.raises(OfflineModeIsEnabled):
         assert Hub("owner/elsewhere").commit
+
+
+def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
+    """A Hub split's JSON lines shard and the offset index its commit holds beside it keep, with the
+    Hub offline, the identity they had online, the index's facts among the shard's: an index the
+    offline Hub cannot confirm is not dropped from it."""
+    from types import SimpleNamespace
+
+    from hub_support import offline
+    from huggingface_hub import HfApi, HfFileSystem
+
+    from dew.data.sources import Hub
+
+    names = {"train.jsonl": 400, "train.index.npy": 96}
+    stated = {}
+    for index, (name, size) in enumerate(names.items()):
+        path = f"datasets/owner/lines@pinned/{name}"
+        stated[path] = {"name": path, "type": "file", "size": size, "blob_id": f"blob:{name}",
+                        "lfs": {"sha256": f"{index:064x}", "size": size}}
+    monkeypatch.setattr(HfApi, "dataset_info",
+                        lambda self, repo, revision=None: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: list(names))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **kwargs: stated[path])
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: path in stated)
+    identity = Hub("owner/lines", revision="pinned").files.fingerprint()
+    assert [facts["bytes"] for facts in identity["files"]] == [400, 96]
+    offline(monkeypatch)
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
