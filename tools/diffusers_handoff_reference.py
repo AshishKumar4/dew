@@ -31,8 +31,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT)]
 
-# Also restores the transformers names Diffusers 0.34.0's pipelines import.
+from tools.diffusers_reference_helpers import restore_transformers_names  # noqa: E402
 from tools.diffusers_wan_reference import float64, float64_scheduler  # noqa: E402
+
+restore_transformers_names()
 
 FIXTURE = ROOT / "tests" / "fixtures" / "diffusers_handoff.npz"
 STEPS, GUIDANCE, CUTOFF = 4, 3.0, 0.5

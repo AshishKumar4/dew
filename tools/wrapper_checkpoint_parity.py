@@ -42,6 +42,16 @@ def rounding_bound(config, reference, *, image=False):
     return float(2 * (_ROUNDING + recurrent_rounding) * epsilon * text.num_hidden_layers * scale)
 
 
+def parity_batches(processor, model_type: str) -> list[dict]:
+    """The two batches every parity measurement reads, and its float64 oracle too: a text prompt, and an
+    image prompt over one fixed 32 x 32 image (seed 67)."""
+    image = np.random.default_rng(67).integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    prompt = (f'The image shows {processor.image_token} a' if model_type == 'gemma4' else
+              'The image shows <|vision_start|><|image_pad|><|vision_end|> a')
+    return [dict(processor(text=['The capital of France is'], return_tensors='pt')),
+            dict(processor(text=[prompt], images=[image], return_tensors='pt'))]
+
+
 def measure_checkpoint(checkpoint, output, revision=None):
     """Return parity measurements and each (Dew logits, reference logits, token ids). The reference
     runs on the CPU whatever JAX's platform, so a CPU-only Torch build supplies it beside a GPU and
@@ -50,11 +60,7 @@ def measure_checkpoint(checkpoint, output, revision=None):
     processor = AutoProcessor.from_pretrained(checkpoint, revision=revision)
     reference = AutoModelForImageTextToText.from_pretrained(
         checkpoint, dtype=torch.float32, attn_implementation='eager', revision=revision).eval()
-    image = np.random.default_rng(67).integers(0, 256, (32, 32, 3), dtype=np.uint8)
-    prompt = (f'The image shows {processor.image_token} a' if config.model_type == 'gemma4' else
-              'The image shows <|vision_start|><|image_pad|><|vision_end|> a')
-    batches = [dict(processor(text=['The capital of France is'], return_tensors='pt')),
-               dict(processor(text=[prompt], images=[image], return_tensors='pt'))]
+    batches = parity_batches(processor, config.model_type)
     expected = []
     continuations = []
     with torch.no_grad():

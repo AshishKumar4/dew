@@ -190,6 +190,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             own["params"] = {name: value for name, value in own["params"].items() if name != PROJECTIONS}
         return own
 
+    def model_variables(self, variables: Variables) -> Variables:
+        """Return the student's model tree, without the teacher or the feature projections."""
+        return self.student.model_variables(self.student_variables(variables))
+
     def _student_step(self, step: Step) -> Step:
         return replace(step, ema=None if step.ema is None else self.student_variables(step.ema))
 

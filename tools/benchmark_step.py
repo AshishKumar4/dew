@@ -9,8 +9,10 @@ Under `dew launch` every process measures its own devices and process 0
 reports.
 
 FLOPs are read off the compiled executable's optimized HLO
-(dew.telemetry.instrumentation), and the utilisation is the figure the
-trainer logs as train/mfu. Each case is timed twice over the same number of
+(dew.telemetry.instrumentation), and their utilisation is the figure the
+trainer logs as train/hfu. MFU is the trainer's train/mfu: the objective's
+training FLOPs on the case's batch (`Objective.training_flops`) over the
+mesh's peak, or None where the model has no count. Each case is timed twice over the same number of
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
@@ -57,10 +59,11 @@ import numpy as np
 import tyro
 
 from dew.files import write_atomically
+from dew.nn.flops import MissingFlopsCount
 from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
-from dew.training.distributed import DevicePrefetchIterator
+from dew.training import Trainer
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
@@ -78,17 +81,18 @@ from benchmark_cases import (
 )
 from benchmark_models import (
     Batch as Batch,
-    batches,
     build_objective as build_objective,
     build_trainer,
+    compiled_step,
     decoder_objective as decoder_objective,
     global_batch as global_batch,
     image_tokens as image_tokens,
     media_row as media_row,
     media_values as media_values,
+    timed_steps,
     trainer_mesh,
 )
-from trace_window import device_events, kernel_category, length, overlap, union, window_split
+from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
 
 Row = dict[str, object]
 
@@ -271,13 +275,10 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
         raise ValueError(
             f"the trace under {directory} holds no device kernels: the profiler "
             "saw no accelerator, and a CPU run has no device timeline to read")
-    spans = union([(start, end) for _, start, end in kernels])
-    busy, window = length(spans), spans[-1][1] - spans[0][0]
-    by_category: dict[str, float] = {}
-    by_name: dict[str, float] = {}
-    for name, start, end in kernels:
-        by_category[kernel_category(name)] = by_category.get(kernel_category(name), 0.0) + end - start
-        by_name[name] = by_name.get(name, 0.0) + end - start
+    split = window_split(kernels)
+    busy, window = split["busy"], split["window"]
+    by_category, _ = kernel_totals(kernels, kernel_category)
+    by_name, _ = kernel_totals(kernels)
     per_step = 1e-6 / steps
     return {
         "profiled_steps": steps,
@@ -293,25 +294,6 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
     }
 
 
-# The HLO collective each NCCL kernel runs for, read off the `hlo_op` stat
-# XLA puts on the kernel: `all-to-all.3` where the partitioner made the op,
-# `all_to_all.124.1` where a shard_map's `jax.lax.all_to_all` did. NCCL runs
-# an all-to-all and a collective-permute as the same SendRecv kernel, so a
-# sequence exchange's Ulysses all-to-alls and a ring's or a Mamba-2 state's
-# shifts are told apart only here.
-HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter",
-                   "all-reduce")
-
-
-def _hlo_collective(event) -> str | None:
-    """The HLO collective op an NCCL kernel event ran for, or None."""
-    for name, value in event.stats:
-        if name == "hlo_op" and isinstance(value, str):
-            spelled = value.replace("_", "-")
-            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
-    return None
-
-
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     """Each device's traced window split by `trace_window.window_split` into
     compute, every collective, the communication no compute kernel
@@ -320,31 +302,18 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`HLO_COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`trace_window.HLO_COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
     if planes is None:
         planes = device_events(directory)[0]
-    devices = [([(event.name, event.start_ns, event.end_ns) for event in kernels],
-                [_hlo_collective(event) for event in kernels])
-               for kernels in planes.values() if kernels]
+    devices = [kernels for kernels in planes.values() if kernels]
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals: dict[str, float] = {}
-    for events, ops in devices:
-        figures = window_split(events)
-        figures.pop("busy")  # device_timeline's, over every device
-        compute = union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
-        for op in HLO_COLLECTIVES:
-            spans = union([(start, end) for (_, start, end), of in zip(events, ops, strict=True)
-                           if of == op])
-            key = op.replace("-", "_")
-            figures[key] = length(spans)
-            figures[f"{key}_exposed"] = length(spans) - overlap(spans, compute)
-        for key, value in figures.items():
-            totals[key] = totals.get(key, 0.0) + value
+    totals = communication_totals(devices)
+    totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")
     return {
@@ -355,40 +324,28 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
+def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float | None, float | None]:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator, and that MFU over the
+    mesh's peak; both None where the model has no count."""
+    try:
+        flops = trainer.objective.training_flops(None, global_batch(case))
+    except MissingFlopsCount:
+        return None, None
+    return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
+
+
 def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     trainer = build_trainer(case, config.attention_impl)
 
-    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
-        abstract = jax.eval_shape(trainer.initial_state)
-        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-
-
-        initial_batch = next(source)
-        jax.block_until_ready((state, initial_batch))
-        compile_start = time.perf_counter()
-        compiled = trainer.compile(state, initial_batch)
-        compile_seconds = time.perf_counter() - compile_start
-
-        def step(state):
-            batch = initial_batch if config.fixed_batch else next(source)
-            state, loss, _, finite, _, _ = compiled(state, batch)
-            return state, loss, finite
-
+    with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
+        state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
         # At least one warm step, so the first dispatch of the executable is
         # outside the timed window.
-        state, loss, is_finite = step(state)
-        for _ in range(config.warmup - 1):
-            state, loss, is_finite = step(state)
-        loss.block_until_ready()
-
-        start = time.perf_counter()
-        for _ in range(config.steps):
-            state, loss, is_finite = step(state)
-        loss.block_until_ready()
-        elapsed = time.perf_counter() - start
+        state, loss, is_finite, _ = timed_steps(step, state, max(config.warmup, 1))
+        state, loss, is_finite, elapsed = timed_steps(step, state, config.steps)
 
         # A second window of the same length, waiting on every step, for the
         # spread. The loop above dispatches asynchronously on purpose, as a run
@@ -429,6 +386,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
+        training_flops, mfu = training_work(trainer, case, step_time)
         peak = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
@@ -466,6 +424,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
             "flops_per_step": flops,
             "utilization": utilization,
+            "training_flops": training_flops,
+            "mfu": mfu,
             "peak_device_bytes": peak,
             "loss": float(loss),
             "finite": bool(is_finite),
@@ -487,11 +447,12 @@ TABLE_COLUMNS = (
     ("samples_per_sec", "samples/s", 10, "{:.1f}"),
     ("flops_per_step", "GFLOP/step", 11, "{:.1f}"),
     ("utilization", "util %", 7, "{:.1f}"),
+    ("mfu", "mfu %", 7, "{:.1f}"),
     ("peak_device_bytes", "peak GiB", 9, "{:.2f}"),
 )
 # Units the table shows a column in: FLOPs as GFLOP, a fraction as a
 # percentage, bytes as GiB.
-TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "peak_device_bytes": 2 ** -30}
+TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30}
 
 
 def format_table(rows: list[Row]) -> str:

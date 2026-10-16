@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -474,6 +474,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
+    inference_fields: ClassVar[frozenset[str]] = frozenset()
+    """The settings a saved run of this objective records beside its
+    `objective` and `model` (`inference_record`); a loader refuses a record
+    holding any other (`dew.inference.tasks.run_record`)."""
     _ema_is_reference: ClassVar[bool] = False
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the
@@ -1009,7 +1013,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         variables = Checkpoints(directory).variables(
             step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
             param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return cls._model_tree(variables)
+
+    @classmethod
+    def _model_tree(cls, variables: Variables) -> Variables:
+        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
+
+    def model_variables(self, variables: Variables) -> Variables:
+        """Return the model's own tree out of `variables`, a tree this objective trains.
+
+        That is the tree the model applies with, and another objective over
+        the same model starts from it. It is the whole tree, or the model's
+        part, trained and frozen collections together, of an objective that
+        nests the model beside other networks or frozen ones.
+        """
+        return self._model_tree(variables)
 
     def task_record(self) -> Mapping[str, JSON] | None:
         """Return the task settings a saved step records beside its model, or
@@ -1140,6 +1159,28 @@ class Metric(Protocol[S]):
     def finalize(self, accumulated: S, /) -> float:
         """Return the scalar for the completed pass."""
         ...
+
+
+def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
+    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
+    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
+    `owner` where it is given, by identity), a `Metric` the validation split's ('val'), and a
+    `(split, metric)` pair that split's. A metric its split did not record raises with the splits that
+    did."""
+    split = "val"
+    if isinstance(key, tuple) and len(key) == 2:
+        split, key = key
+    if isinstance(key, TrainingScalar):
+        if owner is not None and key.owner is not owner:
+            raise KeyError("training score belongs to another objective")
+        return f"train/{key.name}"
+    if isinstance(key, Metric):
+        if f"{split}/{key.name}" in names:
+            return f"{split}/{key.name}"
+        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
+        raise KeyError(f"metric {key.name!r} has no {split} score" + (
+            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
+    raise KeyError(key)
 
 
 def merge_totals(accumulated: tuple[float, float],

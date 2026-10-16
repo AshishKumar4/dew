@@ -71,8 +71,9 @@ def arrays(state):
 
 
 def write_reference(directory: Path):
-    if timm.__version__ != "1.0.29" or transformers.__version__ != "5.16.1":
-        raise RuntimeError("This fixture is pinned to timm 1.0.29 and transformers 5.16.1")
+    from reference_releases import require
+
+    require("timm", "transformers")
     torch.set_num_threads(2)
     directory.mkdir(parents=True, exist_ok=True)
     model = reference_model()

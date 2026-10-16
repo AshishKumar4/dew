@@ -379,8 +379,9 @@ def write_minimax_m2() -> None:
     import transformers
     from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
 
-    if transformers.__version__ != '5.18.0':
-        raise ValueError('MiniMax-M2 requires transformers 5.18.0 (rotary fix PR 48486)')
+    from reference_releases import require
+
+    require("minimax-m2")
     torch.manual_seed(0)
     model = MiniMaxM2ForCausalLM(MiniMaxM2Config(
         vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,

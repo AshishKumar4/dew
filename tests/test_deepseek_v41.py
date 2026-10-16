@@ -216,6 +216,36 @@ def test_left_padding_changes_no_row(source):
     np.testing.assert_array_equal(batched[1], greedy(ModelInputs(ids[1:, :prompt - pad]))[0])
 
 
+def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(source):
+    """Uncached, rows padded on the left by three tokens, a count no compression rate divides,
+    pool their compressed windows (CSA2's entries and index keys, HCA's) over their real tokens at
+    their ranks, as a cache appends them: the real tokens' logits lie within FACTOR of the
+    reference's rounding of the float64 truth of the rows unpadded."""
+    loaded, plain, reference = source
+    ids, pad = jnp.asarray(reference["input_ids"]), 3
+    valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
+    logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), attention_mask=valid)
+    assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
+
+
+def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
+    """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
+    before it in the other, as after the context alone: its real positions keep their ranks, the
+    padding is no key, and the block follows the last real position. The two drafts' logits, each
+    within FACTOR of the reference's rounding, lie within twice that of each other."""
+    loaded, plain, reference = source
+    ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
+    _, sown = plain.apply(loaded.variables, ids[:, :prompt], mutable=["prediction_inputs"])
+    context = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
+    drawn = ids[:, prompt]
+    _, alone, _ = plain.apply(loaded.variables, context, drawn, decode=False, method="draft")
+    padded = jnp.stack([jnp.pad(context[0], ((0, pad), (0, 0))), jnp.pad(context[1], ((pad, 0), (0, 0)))])
+    places = jnp.arange(prompt + pad)
+    valid = jnp.stack([places < prompt, places >= pad])
+    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False, valid=valid, method="draft")
+    assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
+
+
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
     """At zero temperature every rejected draft is replaced by the target's
     own token, so Speculative decoding with DSpark's blocks emits the greedy

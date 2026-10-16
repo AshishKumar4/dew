@@ -10,6 +10,7 @@ import sys
 import tarfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,15 +57,19 @@ def test_a_streamed_bundle_matches_the_source(saved_pipelines, task):
     run_check(saved_pipelines / task, "--streamed")
 
 
-@pytest.mark.parametrize("solver", ["pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm"])
+SCHEDULER_GRIDS = ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz"
+
+
+def grid_cases() -> list[str]:
+    """The source schedulers tools/diffusers_scheduler_pipeline_reference.py
+    walked the saved SD pipeline with, one config each in SCHEDULER_GRIDS."""
+    with np.load(SCHEDULER_GRIDS) as grids:
+        return sorted(name.removesuffix(".config") for name in grids.files if name.endswith(".config"))
+
+
+@pytest.mark.parametrize("solver", grid_cases())
 def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
-    run_check(
-        saved_pipelines / "sd",
-        "--grids",
-        ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz",
-        "--case",
-        solver,
-    )
+    run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS, "--case", solver)
 
 
 @pytest.mark.parametrize("task", ["sd", "xl"])
@@ -110,8 +115,6 @@ def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
 
 
 def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(saved_pipelines, tmp_path):
-    import numpy as np
-
     from dew.interop import Pretrained
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
@@ -197,7 +200,6 @@ def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines
     import shutil
 
     import jax.numpy as jnp
-    import numpy as np
     from safetensors.numpy import load_file, save_file
 
     from dew.interop import Pretrained
