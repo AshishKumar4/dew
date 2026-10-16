@@ -271,17 +271,19 @@ taken at their float64 values (`float64_terms`)."""
 
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier"})
+                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
+                     "name"})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter) and moved. A product or quotient of a sum by a value
-that is none carries them too, scaled element by element (`_applied`), as
-`s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
+added to a parameter) and moved, by a remat name (`checkpoint_name`) too.
+A product or quotient of a sum by a value that is none carries them too,
+scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
+`s_i x_ik`; a product of two sums ends them."""
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
+                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A body that runs elsewhere, a
 shard_map's per-device program or a Pallas kernel, is one operation, its
 outputs their own size."""
 
