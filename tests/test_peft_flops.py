@@ -148,8 +148,8 @@ def test_mamba2_layers_learn_their_maps_and_conv_and_not_their_scan():
     model = CausalTransformer(
         vocab_size=64, emb_features=8, num_layers=3, num_heads=2, num_kv_heads=1, head_dim=4, mlp_features=0,
         layer_types=("linear_attention", "mlp", "linear_attention"),
-        kinds={"linear_attention": LayerKind(mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=3, n_groups=1,
-                                                                norm_groups=1, chunk_size=1)),
+        kinds={"linear_attention": LayerKind(mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=3,
+                                                                n_groups=1, norm_groups=1, chunk_size=1)),
                "mlp": LayerKind(mixer=MLPMixer(intermediate_size=16))})
     tokens = jnp.ones((1, 4), jnp.int32)
     variables = model.init(jax.random.key(413), tokens)
