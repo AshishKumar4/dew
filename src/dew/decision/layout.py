@@ -264,11 +264,12 @@ class Layout:
         bounds, so a row shorter still starts a new window rather than
         outgrowing one."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
+        empty = self.state(encoder, specials, "")
 
         def size(*options: int) -> int:
             asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
                      for index, count in enumerate(options)}
-            return sum(len(row.tokens) for row in roomy.rows(encoder, specials, "", asked))
+            return sum(len(row.tokens) for row in roomy.rows(encoder, specials, "", asked, tokens=empty))
 
         row = size(1)
         question, option = size(1, 1) - row, size(2) - row
