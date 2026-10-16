@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { renderOutputs } from '../scripts/notebook-outputs.mjs';
+import { inventory, renderOutputs } from '../scripts/notebook-outputs.mjs';
 
 const stream = (name, text) => ({ output_type: 'stream', name, text });
 
@@ -22,4 +22,16 @@ test("an install cell's log folds away, and a widget's leftover text is left out
 	const html = await renderOutputs({ source: '%pip install dewml', outputs }, 'probe', 0, false, [], { images: [] });
 	assert.match(html, /<details class="nb-output nb-install">/);
 	assert.doesNotMatch(html, /widget 0%/);
+});
+
+test('a render of some notebooks replaces their entries in the aggregates and keeps the others', () => {
+	const entry = (stem, label) => ({ slug: `tutorials/${stem}`, label });
+	const previous = {
+		listing: [entry('01-a', 'a, as last rendered'), entry('02-b', 'b'), entry('09-gone', 'removed')],
+		outputs: { '01-a': { cell: 'old' }, '02-b': { cell: 'b' }, '09-gone': { cell: 'removed' } },
+	};
+	const rendered = { listing: [entry('01-a', 'a')], outputs: { '01-a': { cell: 'new' } } };
+	const { listing, outputs } = inventory(previous, rendered, ['01-a', '02-b']);
+	assert.deepEqual(listing, [entry('01-a', 'a'), entry('02-b', 'b')]);
+	assert.deepEqual(outputs, { '01-a': { cell: 'new' }, '02-b': { cell: 'b' } });
 });

@@ -676,19 +676,24 @@ class SuppressTokens:
 class BeginSuppressTokens(_Numerical):
     """Removes tokens at one generated position, as `SuppressTokensAtBeginLogitsProcessor`.
 
-    The reference suppresses where the sequence still has its prompt width, so
-    `offset` is the generated index the suppression applies at, zero for the
-    first drawn token and one where a forced BOS occupies that slot.
+    The reference suppresses the first drawn token, or the one after it where
+    `forced_bos` (`ForcedBOS`) forces the first: transformers moves the begin
+    index past the forced token only for a one-token prompt
+    (generation/utils.py:1278-1282, 5.16.1), the rows where `ForcedBOS` fires.
+    Each row decides by its own prompt, so rows of mixed prompt lengths
+    suppress each at its own position.
     """
 
     tokens: jax.Array
-    offset: int = struct.field(pytree_node=False, default=0)
+    forced_bos: bool = struct.field(pytree_node=False, default=False)
 
     def numerical(self) -> jax.tree_util.Partial:
-        return jax.tree_util.Partial(BeginSuppressTokens.apply, self.tokens, self.offset)
+        return jax.tree_util.Partial(BeginSuppressTokens.apply, self.tokens, self.forced_bos)
 
     @staticmethod
-    def apply(tokens: jax.Array, offset: int, state: StepState, logits: jax.Array) -> jax.Array:
+    def apply(tokens: jax.Array, forced_bos: bool, state: StepState, logits: jax.Array) -> jax.Array:
+        # A row's prompt is its real tokens less the ones it has drawn.
+        offset = (forced_bos & (state.total() - state.step == 1)).astype(state.step.dtype)
         removed = _membership(tokens, logits.shape[-1])[None, :] & (state.step == offset)[:, None]
         return jnp.where(removed, FILTER, logits)
 

@@ -27,7 +27,7 @@ from .solvers import (
     UniPC,
 )
 from .strategies import Beam, Sample, Speculative, Strategy
-from .text import Generation, Sampling, generate
+from .text import Generation, Sampling, generate, with_ids_of
 
 __all__ = [
     "APG",
@@ -69,4 +69,5 @@ __all__ = [
     "UniPC",
     "generate",
     "sample",
+    "with_ids_of",
 ]

@@ -23,8 +23,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    if timm.__version__ != "1.0.29":
-        raise RuntimeError("This fixture is pinned to timm 1.0.29")
+    from reference_releases import require
+
+    require("timm")
     rng = np.random.default_rng(1729)
     pixels = (rng.standard_normal((2, 256, 4, 4)) * 3).astype(np.float32)
     weight = (1 + 0.1 * rng.standard_normal(256)).astype(np.float32)

@@ -120,6 +120,17 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
     return jnp.sum(kv * weights, axis=2)
 
 
+def real_first(x, valid):
+    """`x` `[B, S, ...]` with each row's real tokens (`valid` `[B, S]`) first, in their order, and
+    its padding after them, as a cache appends a row (`cache_positions`): uncached, the compressor
+    pools windows of the real tokens' ranks, the places their queries see them at
+    (`Coordinates.places`), never a padding token. Unpadded rows come back as they are."""
+    if valid is None:
+        return x
+    order = jnp.argsort(~valid, axis=1, stable=True)
+    return jnp.take_along_axis(x, order.reshape(*order.shape, *(1,) * (x.ndim - 2)), axis=1)
+
+
 def entries_visible(positions, entries: int, rate: int):
     """Which compressed entries a query may attend: `[B, S, entries]`, bool.
 
@@ -261,9 +272,10 @@ class CompressedEntries(FakeQuantizing):
         first where the pooling ran in its own (v41:485)."""
         return self.kv_norm(pooled if self.pool_dtype is None else pooled.astype(dtype))
 
-    def latents(self, x):
-        """The normed entries before RoPE `[B, T, width]`, `T = S // rate`."""
-        kv, gate = self._projections(x)
+    def latents(self, x, valid=None):
+        """The normed entries before RoPE `[B, T, width]`, `T = S // rate`, over each row's real
+        tokens alone where `valid` marks them (`real_first`)."""
+        kv, gate = self._projections(real_first(x, valid))
         if gate is None:
             return self.kv_norm(kv)
         bias = self.bias.astype(x.dtype) if self.position_bias else None
@@ -275,13 +287,13 @@ class CompressedEntries(FakeQuantizing):
                                    dtype=at_least_fp32(latents.dtype))
         return _rotate_rope(latents, cos, sin)
 
-    def entries(self, x):
+    def entries(self, x, valid=None):
         """The rotated entries `[B, T, width]`, `T = S // rate`."""
-        return self.entries_and_latents(x)[0]
+        return self.entries_and_latents(x, valid)[0]
 
-    def entries_and_latents(self, x):
+    def entries_and_latents(self, x, valid=None):
         """The entries and the latents they rotate."""
-        latents = self.latents(x)
+        latents = self.latents(x, valid)
         return self._stored(latents, jnp.arange(latents.shape[1])), latents
 
     def _stored(self, latents, windows):
@@ -365,8 +377,9 @@ class LightningIndexer(CompressedEntries):
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
-    def select(self, x, q_resid, positions, cos, sin, cache=None):
-        """The entries each query attends: `[B, S, T]`, bool.
+    def select(self, x, q_resid, positions, cos, sin, cache=None, valid=None):
+        """The entries each query attends: `[B, S, T]`, bool. Uncached, `valid` leaves the
+        padding out of the entries (`real_first`).
 
         The top-k among the entries whose window closed before the query
         (:568-575: later entries score `-inf`, and a pick past the causal
@@ -376,7 +389,7 @@ class LightningIndexer(CompressedEntries):
         x = jax.lax.stop_gradient(x)
         q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
-        keys = self.entries(x) if cache is None else self.cached_entries(x, *cache)[0]
+        keys = self.entries(x, valid) if cache is None else self.cached_entries(x, *cache)[0]
         query = _rotate_rope(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
         scores = self.scorer(query, keys, x)
@@ -402,11 +415,12 @@ class Compressor(CompressedEntries):
                 n_heads=self.index_n_heads, top_k=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='indexer')
 
-    def __call__(self, x, q_resid, positions, cos, sin, cache=None):
-        """The entries `[B, T, width]` and which of them each query attends `[B, S, T]`."""
-        entries = self.entries(x) if cache is None else self.cached_entries(x, *cache)[0]
+    def __call__(self, x, q_resid, positions, cos, sin, cache=None, valid=None):
+        """The entries `[B, T, width]` and which of them each query attends `[B, S, T]`; uncached,
+        over each row's real tokens where `valid` marks them (`real_first`)."""
+        entries = self.entries(x, valid) if cache is None else self.cached_entries(x, *cache)[0]
         if self.index_topk is not None:
-            return entries, self.indexer.select(x, q_resid, positions, cos, sin, cache)
+            return entries, self.indexer.select(x, q_resid, positions, cos, sin, cache, valid)
         visible = entries_visible(positions, entries.shape[1], self.rate)
         return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
 
@@ -611,7 +625,7 @@ class DeepseekV4Attention(FakeQuantizing):
         assert rate is not None and index[0] is not None and index[1] is not None and index[2] is not None
         return rate, (index[0], index[1], index[2])
 
-    def _csa2(self, x, q_resid, positions, cos, sin, cache, kv_store):
+    def _csa2(self, x, q_resid, positions, cos, sin, cache, kv_store, valid):
         """CSA2's entries `[B, T, head_dim]` and the ones each query attends
         `[B, S, T]`, by the layer's mode (section 2.3.1, v41:722-763).
 
@@ -628,7 +642,7 @@ class DeepseekV4Attention(FakeQuantizing):
             entries = _published(kv_store, _CSA2_ENTRIES, 'Reindex')
             keys = _published(kv_store, _CSA2_INDEX_KEYS, 'Reindex')
         elif cache is None:
-            entries, latents = self.compress.entries_and_latents(x)
+            entries, latents = self.compress.entries_and_latents(x, valid)
             windows = jnp.arange(latents.shape[1])
             keys = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
                                                                self.rope_theta, self.yarn,
@@ -734,9 +748,10 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.compressor is not None:
             selected_positions = positions if cache is None else cache[0]
             if self.compressor == 'csa2':
-                entries, selected = self._csa2(x, q_resid, selected_positions, cos, sin, cache, kv_store)
+                entries, selected = self._csa2(x, q_resid, selected_positions, cos, sin, cache, kv_store,
+                                               valid)
             else:
-                entries, selected = self.compress(x, q_resid, selected_positions, cos, sin, cache)
+                entries, selected = self.compress(x, q_resid, selected_positions, cos, sin, cache, valid)
             if entries.shape[1]:
                 keys = jnp.concatenate([keys, entries], axis=1)
                 allowed = jnp.concatenate([allowed, selected], axis=-1)
@@ -786,7 +801,9 @@ class DSparkAttention(DeepseekV4Attention):
     block `x` `[B, K, D]` attends that window and all of itself, both
     directions. Cached, each call appends the real context to the window cache
     (an empty block only does that, the release's prefill), and a call without
-    context drafts after the cache; uncached, the context is whole.
+    context drafts after the cache; uncached, the context's real positions are
+    read at their ranks, as the cache holds them, and the block drafts after
+    the last of them.
     """
 
     @nn.compact
@@ -807,15 +824,20 @@ class DSparkAttention(DeepseekV4Attention):
                         down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
+            places, real = jnp.arange(main_keys.shape[1])[None], None
         elif main is None:
             raise ValueError(f"uncached, a DSpark stage's attention reads the whole context "
                              f"from kv_store[{DRAFT_CONTEXT!r}]")
         else:
-            main_keys = self._window_keys(main, *yarn_rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
-                                                                 self.rope_theta, self.yarn,
-                                                                 dtype=at_least_fp32(main.dtype)),
+            # Each real context position sits at its rank among its row's real ones, where a
+            # cached call writes it (`cache_positions`), and the block drafts after the last.
+            real = store.get(DRAFT_VALID)
+            places = (jnp.arange(main.shape[1])[None] if real is None
+                      else jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1)
+            main_keys = self._window_keys(main, *yarn_rope_freqs(places, self.rope_dim, self.rope_theta,
+                                                                 self.yarn, dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
-            last = jnp.full((batch,), main.shape[1] - 1)
+            last = jnp.broadcast_to(places[:, -1], (batch,))
         length = x.shape[1]
         if length == 0:
             return x
@@ -829,8 +851,9 @@ class DSparkAttention(DeepseekV4Attention):
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
         query = _rotate_rope(query, cos, sin)
-        slots = jnp.arange(main_keys.shape[1])
-        window = (slots[None] <= last[:, None]) & (slots[None] > last[:, None] - self.sliding_window)
+        window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)
+        if real is not None:
+            window = window & real
         allowed = jnp.concatenate([
             jnp.broadcast_to(window[:, None], (batch, length, main_keys.shape[1])),
             jnp.ones((batch, length, length), bool)], axis=-1)

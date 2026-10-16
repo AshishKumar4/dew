@@ -89,8 +89,8 @@ class GuidanceDistillationObjective(DiffusionObjective):
         self.model, *teacher = modules
         self.teacher.substitute(teacher)
 
-    def held_variables(self) -> Variables:
-        return {**super().held_variables(), TEACHER: self.teacher_variables}
+    def held_variables(self, *, beside: Variables | None = None) -> Variables:
+        return {**super().held_variables(beside=beside), TEACHER: self.teacher_variables}
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)

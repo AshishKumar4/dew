@@ -13,7 +13,7 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn, Protocol, TypedDict
+from typing import NamedTuple, NoReturn, Protocol, TypedDict
 
 import jax
 import numpy as np
@@ -1396,7 +1396,7 @@ class Packed:
     concatenated on `axis`, then permuted by `transpose`.
 
     Each name is a suffix after the stem a tensor and its parts share. A load
-    splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
+    splits the tensor into views of its parts (`DecoderFamily.readings`)
     and an export packs their leaves back (`layout`), so the one entry is
     both directions. With `chunks` the tensor is that many equal runs on
     `axis`, each holding its share of every part in turn, as a checkpoint
@@ -1462,12 +1462,8 @@ class Packed:
 def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
                  config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """`tensors` with each one a `packed` record names split into its parts
-    (`Packed.split`), the rest as they are.
-
-    A fused tensor and a part stored under its own name, such as Qwen's
-    `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
-    so the two must be the same tensor, of one dtype and equal values; any
-    other pair is refused, whichever comes first."""
+    (`Packed.split`), the rest as they are, each part held once
+    (`_held_twice`)."""
     split: dict[str, np.ndarray] = {}
     for name, tensor in tensors.items():
         packing = next((packing for packing in packed if name.endswith(packing.name)), None)
@@ -1475,11 +1471,57 @@ def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
         for part, value in parts.items():
             held = split.setdefault(part, value)
             if held is not value:
-                held, value = np.asarray(held), np.asarray(value)
-                if held.dtype != value.dtype or not np.array_equal(held, value):
-                    raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
-                                     f"checkpoint's tensors holds as a different {held.dtype} tensor")
+                _held_twice(name, part, held, value)
     return split
+
+
+def _held_twice(name: str, part: str, held, value) -> None:
+    """Refuse a second tensor for `part`, the stored tensor `name`'s, unless it is the one held.
+
+    A fused tensor and a part stored under its own name, such as Qwen's
+    `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
+    and the tree has one leaf for it, so the two must be the same tensor, of
+    one dtype and equal values; any other pair is refused, whichever the
+    checkpoint lists first."""
+    held, value = np.asarray(held), np.asarray(value)
+    if held.dtype != value.dtype or not np.array_equal(held, value):
+        raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
+                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
+
+
+class Part(NamedTuple):
+    """One tensor the path map reads: a stored tensor as `prepare` leaves it, or one part of a packed
+    one (`Packed.split`), and the leaf it fills (`DecoderFamily.source_path`), None where the tree
+    has no leaf for it."""
+
+    name: str
+    tensor: np.ndarray
+    path: tuple[str, ...] | None
+
+
+class Reading(NamedTuple):
+    """One tensor as the path map reads it (`DecoderFamily.readings`): its parts, split by its
+    `packing` or, unpacked, the one tensor itself, as `prepare` leaves them; and the tensor as the
+    checkpoint stores it, which a binding rebuilds (None for a name `prepare` made). `prepare`
+    reshapes only unpacked tensors (DeepSeek V4's grouped projection, Kimi's `A_log`), so a packed
+    tensor's parts are its stored tensor's."""
+
+    name: str
+    stored: np.ndarray | None
+    packing: Packed | None
+    parts: tuple[Part, ...]
+
+
+def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
+    """Each part `readings` hold, once: the tree's one leaf for a part a fused tensor and a tensor
+    of its own both store (`_held_twice`)."""
+    held: dict[str, Part] = {}
+    for reading in readings:
+        for part in reading.parts:
+            kept = held.setdefault(part.name, part)
+            if kept is not part:
+                _held_twice(reading.name, part.name, kept.tensor, part.tensor)
+    return held
 
 
 def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -> dict[str, np.ndarray]:
@@ -1610,20 +1652,28 @@ class DecoderFamily:
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
 
-    def prepare_weights(self, tensors: Mapping[str, np.ndarray],
-                        config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        """The checkpoint's tensors as the path map reads them: `prepare`'s, with
-        every `packed` tensor split into its parts.
-
-        A fused tensor and a part stored under its own name, such as Qwen's
-        `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
-        part, and one leaf reads it, so the two must be the same tensor, of
-        one dtype and equal values; any other pair is refused, whichever the
-        checkpoint lists first. A quantized copy reaches this decoded at the
-        load's storage dtype (`Pretrained.load`), so a dense copy beside it
-        must hold the decoded values in that dtype."""
-        prepared = self.prepare(tensors, config)
-        return split_packed(prepared, self.packed, config) if self.packed else prepared
+    def readings(self, tensors: Mapping[str, np.ndarray],
+                 config: Mapping[str, object]) -> tuple[Reading, ...]:
+        """The checkpoint's tensors as the path map reads them, in its order:
+        `prepare`'s, each `packed` one split into its parts (`Packed.split`:
+        views, or copies where parts interleave in runs), and the leaf each
+        part fills. Loading places them (`hf_decoders.read_decoder`, each part
+        once, `held_parts`), and the bindings that adapters, the export and
+        input quantization resolve source names through
+        (`Pretrained.weight_layouts`) are built from the same readings, so
+        the two directions read one plan. A quantized copy reaches this
+        decoded at the load's storage dtype (`Pretrained.load`), so a dense
+        copy beside it must hold the decoded values in that dtype."""
+        # One read of each tensor: a lazy mapping builds a tensor on every access
+        # (`LazyTensors`), and `prepare` and the stored tensors share these.
+        stored = dict(tensors)
+        readings = []
+        for name, tensor in self.prepare(stored, config).items():
+            packing = self.packing(name)
+            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+            readings.append(Reading(name, stored.get(name), packing, tuple(
+                Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
+        return tuple(readings)
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""

@@ -49,17 +49,12 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-import transformers.utils as transformers_utils
+from diffusers_reference_helpers import fed_noise as fed_noise, restore_transformers_names, step_noise as step_noise
 
-# Diffusers 0.34.0's pipeline modules import two names Transformers dropped
-# after 4.x. The guidance-rescale helper under test lives beside them, so the
-# names are restored rather than the helper copied.
-for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
-                      ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
-    if not hasattr(transformers_utils, _name):
-        setattr(transformers_utils, _name, _value)
+# The guidance-rescale helper under test lives among the pipelines.
+restore_transformers_names()
 
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg  # noqa: E402
 from diffusers.schedulers import (
     scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
     scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
@@ -69,8 +64,7 @@ from diffusers.schedulers import (
     scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
     scheduling_tcd, scheduling_unipc_multistep,
 )
-from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
-from diffusers_wan_reference import float64_scheduler
+from diffusers_wan_reference import float64_scheduler  # noqa: E402
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
@@ -617,8 +611,9 @@ def refused_record() -> dict[str, np.ndarray]:
 def main() -> None:
     import diffusers
 
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Requires diffusers==0.34.0")
+    from reference_releases import require
+
+    require("diffusers")
     torch.set_num_threads(2)
     FIXTURES.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}

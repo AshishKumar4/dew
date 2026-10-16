@@ -98,14 +98,19 @@ def apply_device(image: ArrayLike, parameters: ImageParameters, size: int) -> ja
     brightness, contrast, saturation = jnp.asarray(parameters.factors, dtype=pixels.dtype)
     grey = jnp.asarray(_GREY, dtype=pixels.dtype)
 
-    def colour(index, current):
-        return jnp.clip(jax.lax.switch(jnp.asarray(parameters.order)[index], (
-            lambda x: x * brightness,
-            lambda x: x * contrast + jnp.mean(jnp.sum(x * grey, axis=-1)) * (1 - contrast),
-            lambda x: x * saturation + jnp.sum(x * grey, axis=-1, keepdims=True) * (1 - saturation),
-        ), current), 0, 255)
+    def colour(current, operation):
+        # Each place in the order selects its operation per image, as a batched switch does; a
+        # selection also traces over rows an Explicit mesh axis types, which a switch does not.
+        brightened = current * brightness
+        contrasted = current * contrast + jnp.mean(jnp.sum(current * grey, axis=-1)) * (1 - contrast)
+        saturated = current * saturation + jnp.sum(current * grey, axis=-1, keepdims=True) * (1 - saturation)
+        return jnp.clip(jnp.where(operation == 0, brightened,
+                                  jnp.where(operation == 1, contrasted, saturated)), 0, 255)
 
-    return jax.lax.fori_loop(0, 3, colour, pixels)
+    order = jnp.asarray(parameters.order)
+    for place in range(3):
+        pixels = colour(pixels, order[place])
+    return pixels
 
 
 def jitter_host(pixels: np.ndarray, factors: ArrayLike, order: ArrayLike) -> np.ndarray:

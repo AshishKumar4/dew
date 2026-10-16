@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -35,9 +35,7 @@ class Example:
     targets: Mapping[str, tuple[float, ...]] = field(default_factory=dict)
 
     def __post_init__(self):
-        unknown = (set(self.answers) | set(self.targets)) - set(self.questions)
-        if unknown:
-            raise ValueError(f"answers name questions the example does not ask: {sorted(unknown)}")
+        _asked(self.questions, [*self.answers, *self.targets])
         both = set(self.answers) & set(self.targets)
         if both:
             raise ValueError(f"questions {sorted(both)} have both an answer and a target distribution")
@@ -71,11 +69,12 @@ class Example:
             if isinstance(label, bool) or not isinstance(label, (str, int)):
                 raise ValueError(f"answers.{name} names an option by its key or index, got {label!r}")
             answers[name] = label
+        stated = record(row.get("targets", {}), "targets")
+        _asked(questions, stated)
         targets = {}
-        for name, target in record(row.get("targets", {}), "targets").items():
-            if name in questions:
-                where = f"targets.{name}"
-                targets[name] = _distribution(questions[name], json_value(target, where), where)
+        for name, target in stated.items():
+            where = f"targets.{name}"
+            targets[name] = _distribution(questions[name], json_value(target, where), where)
         return cls(json_value(row.get("state"), "state"), questions, answers, targets)
 
     def labels(self) -> dict[str, int]:
@@ -92,6 +91,13 @@ class Example:
             target = np.asarray(self.targets[name], np.float64)
             return target / target.sum()
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
+
+
+def _asked(questions: Mapping[str, Question], named: Iterable[str]) -> None:
+    """Refuse an answer or a target to a question the example does not ask."""
+    unknown = set(named) - set(questions)
+    if unknown:
+        raise ValueError(f"answers or targets name questions the example does not ask: {sorted(unknown)}")
 
 
 def _distribution(question: Question, target: JSON, name: str) -> tuple[float, ...]:

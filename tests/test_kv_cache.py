@@ -7,6 +7,8 @@ rows.
 """
 
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -78,6 +80,27 @@ def test_a_cache_write_moves_whole_words_with_the_same_bits(dtype):
         buffer, values, jnp.where(positions >= 0, positions, DROPPED))
     written = jax.jit(write_cache)(buffer, values, positions)
     assert written.dtype == dtype and np.asarray(written).tobytes() == np.asarray(scattered).tobytes()
+
+
+@pytest.mark.gpu(reason="a CUDA bug, which the cuda lane's deterministic scatter reproduces")
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "openxla/xla#49380, fixed by openxla/xla#49498 (merged 2026-09-28, after jaxlib 0.11.2 of "
+    "2026-09-17): when this passes, dew.nn.scatter.DROPPED can give way to an index at its axis size, "
+    "and KVStore.write_tokens and linear.py's channel scatter can write unmapped"))
+def test_a_deterministic_scatter_drops_an_index_at_its_axis_size():
+    """The workarounds' sentry: a scatter with mode='drop' should drop a column index equal to its
+    axis size. The deterministic scatter (--xla_gpu_deterministic_ops) linearizes the index and drops
+    only a position past the whole operand, so row 0's dropped (0, 4) lands on (1, 0) and overwrites
+    row 1's 3 with 2. Any other outcome is no symptom of that bug, and raises."""
+    if "--xla_gpu_deterministic_ops=true" not in os.environ.get("XLA_FLAGS", ""):
+        pytest.skip("the bug is the deterministic scatter's, which the cuda lane's flags select")
+    scatter = jax.jit(lambda buffer, rows, columns, values: buffer.at[rows, columns].set(values, mode="drop"))
+    written = scatter(jnp.zeros((2, 4), jnp.int32), jnp.arange(2)[:, None], jnp.array([[0, 4], [0, 4]]),
+                      jnp.array([[1, 2], [3, 4]], jnp.int32)).tolist()
+    right, bug = [[1, 0, 0, 0], [3, 0, 0, 0]], [[1, 0, 0, 0], [2, 0, 0, 0]]
+    if written not in (right, bug):
+        raise RuntimeError(f"the scatter wrote {written}: neither the right {right} nor the bug's {bug}")
+    assert written == right
 
 
 def test_an_int8_cache_keeps_the_logits_outlier_key_channels_would_flatten():
