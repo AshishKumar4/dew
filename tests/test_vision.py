@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, ieee_fixture
+from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.nn.vision import (
@@ -306,8 +306,10 @@ def test_mimo_tower_is_as_exact_as_the_reference():
     variables = tower_variables("mimo", tensors, "float32")
     out = tower.apply(variables, refs["pixels"], refs["grid"])
     grid = refs["grid"]
+    _, terms = float64_forward(tower, variables, refs["pixels"], grid)
     assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
-                                     real(refs["tower_f64"], grid), "mimo tower")
+                                     real(refs["tower_f64"], grid), "mimo tower",
+                                     terms=real(np.asarray(terms), grid))
     sinkless = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key.startswith("sinks_") else leaf, variables)
     with pytest.raises(AssertionError):

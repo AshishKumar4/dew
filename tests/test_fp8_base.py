@@ -26,7 +26,7 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew import cache
 from dew.data.dataset import Loader
@@ -126,11 +126,14 @@ def assert_products_exact(x, leaves, cotangent, output, gradient):
     forward, forward_scale, dgrad, dgrad_scale = leaves
     rows, packed = operands(x, forward, forward_scale)
     cotangent_rows, packed_dgrad = operands(cotangent, dgrad, dgrad_scale)
-    truth, gradient_truth = rows @ packed.T, cotangent_rows @ packed_dgrad.T
-    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1])
+    with jax.enable_x64(new_val=True):
+        (truth, gradient_truth), (terms, gradient_terms) = float64_terms(
+            lambda a, b, c, d: (a @ b.T, c @ d.T), rows, packed, cotangent_rows, packed_dgrad)
+    truth, gradient_truth = np.asarray(truth), np.asarray(gradient_truth)
+    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1], terms=terms)
     rounded = np.asarray(jnp.asarray(gradient_truth, gradient.dtype), np.float64)
     assert_leaves_as_exact(np.asarray(gradient, np.float32), rounded, gradient_truth,
-                           reductions=forward.shape[0])
+                           reductions=forward.shape[0], terms=gradient_terms)
 
 
 def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():

@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, ieee_fixture
+from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 
 from dew.nn.mimo_audio import (
     AudioTokenizerEncoder,
@@ -66,11 +66,13 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
     padded = np.pad(refs["mels"], ((0, 0), (0, size), (0, 0)))
     mels = np.stack([padded[clip, start:start + size] for clip, start in segments])
     spans = jnp.asarray([min(size, refs["lengths"][clip] - start) for clip, start in segments], jnp.int32)
-    features, valid = AudioTokenizerEncoder(config.tokenizer).apply(
-        {"params": variables["params"]["tokenizer"]}, mels, spans, batch_longest(spans, config))
+    encoder, held = AudioTokenizerEncoder(config.tokenizer), {"params": variables["params"]["tokenizer"]}
+    features, valid = encoder.apply(held, mels, spans, batch_longest(spans, config))
     features = np.asarray(features)[np.asarray(valid)]
+    (_, wide_valid), (terms, _) = float64_forward(encoder, held, mels, spans, batch_longest(spans, config))
+    np.testing.assert_array_equal(np.asarray(wide_valid), np.asarray(valid))
     assert_as_exact_as_the_reference(features, refs[f"{prefix}features"], refs[f"{prefix}features_f64"],
-                                     "tokenizer features")
+                                     "tokenizer features", terms=np.asarray(terms)[np.asarray(valid)])
     books = [variables["params"]["quantizer"][f"codebook_{stage}"]
              for stage in range(len(config.tokenizer.codebook_size))]
     expected = np.concatenate([refs[f"{prefix}codes_{clip}"] for clip in range(len(refs["lengths"]))])

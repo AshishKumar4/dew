@@ -97,6 +97,7 @@ from reference_error import (
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
+    float64_forward,
     within,
 )
 from residual_orders import orders, permuted, residual_width
@@ -229,7 +230,8 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     assert actual == expected
     label = f"{trip.case.name} logits"
     if not trip.case.orders:
-        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label)
+        _, terms = float64_forward(trip.source.model, trip.trained, np.asarray(trip.ids, np.int32))
+        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label, terms=terms)
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]

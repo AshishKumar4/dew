@@ -275,6 +275,18 @@ shard_map's per-device program or a Pallas kernel, is one operation, its
 outputs their own size."""
 
 
+def float64_forward(module, variables, *args, **kwargs):
+    """`module`'s own forward of `args` in float64, and each output's terms
+    (`float64_terms`): the module computing in float64 over its variables
+    widened, integer inputs as they are, `kwargs` given as they are. A
+    reference's float64 truth written elsewhere (a fixture's) is sized by
+    these terms, what Dew's own float64 sums add."""
+    with jax.enable_x64(new_val=True):
+        wide = module.clone(dtype=jnp.float64)
+        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
+                             *widened((variables, *args)))
+
+
 def float64_terms(fn, *args):
     """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
     each output leaf's terms, alike: the root sum of squares of the terms its

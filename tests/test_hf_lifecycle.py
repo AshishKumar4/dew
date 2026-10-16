@@ -18,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained, PretrainedDecoder
@@ -97,8 +97,9 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
                              **({} if case.masked else {'use_cache': False})).logits.numpy()
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     if case.bound is None:
+        _, terms = float64_forward(loaded.model, loaded.variables, ids)
         assert_as_exact_as_the_reference(actual, expected, np.load(directory / 'logits_f64.npy'),
-                                         f'{case.fixture} export')
+                                         f'{case.fixture} export', terms=terms)
     else:
         np.testing.assert_allclose(actual, expected, atol=case.bound, rtol=0)
         np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
