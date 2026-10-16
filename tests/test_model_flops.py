@@ -635,10 +635,7 @@ def test_decision_heads_match_every_forward_product_including_pooling(kind):
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
     # The joint head writes its field/option cosine as multiply+reduce, not dot_general.
     scalar_cosine = 2 * 8 * 2 if kind == "joint" else 0
-    # Reads that are no model work, written as one-hot products: the type embedding's three rows at
-    # each token (laya) or question (joint), and the joint head's last token of 4 for its question.
-    reads = 2 * 3 * 8 * (4 if kind == "laya" else 1) + (2 * 4 * 8 if kind == "joint" else 0)
-    assert count + reads == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
+    assert count == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
 
 
 def test_chunked_ssm_dit_forward_equals_model_maps_plus_known_pole_products():
