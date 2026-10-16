@@ -1010,6 +1010,8 @@ def authorities(module: Module) -> Iterator[Finding]:
     for function in functions:
         generations, targets = _generations(function, tables, module.package)
         for node in scopes.own(function):
+            if not isinstance(node, ast.Compare | ast.Subscript | ast.Call):
+                continue
             device = functools.partial(_generation, table=tables.get(id(node), {}), owner=owner,
                                        generations=generations, targets=targets)
             operands = (node.left, *node.comparators) if isinstance(node, ast.Compare) else ()
