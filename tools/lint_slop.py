@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
+import hashlib
 import io
 import re
 import sys
@@ -1225,15 +1226,26 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     yield from sorted(findings, key=lambda finding: (finding.line, finding.col, finding.code))
 
 
+RECORDED = {"site/src/data/hero.py": "f7e0cf0918a8c8b973c17f4eb266a58c7b6678254bb70ca7f87c3d449d6e88e5"}
+"""Python files whose bytes a recording pins, each by its sha256: the landing hero's script, which
+site/src/data/capture.json's script_sha256 names and the site's build checks it against
+(site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
+fast as the recording's. The gate reads such a file only once its bytes are no longer the recorded ones,
+which an edit makes them."""
+
+
 def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
     """Every Python file under the named roots of `checkout`, or the root
-    itself when it names a file, skipping stub-only trees and the site's
-    installed npm packages (node-gyp ships Python)."""
+    itself when it names a file, skipping stub-only trees, the site's
+    installed npm packages (node-gyp ships Python) and a file whose bytes
+    are still those a recording pins (`RECORDED`)."""
     for root in roots:
         named = checkout / root
         for path in [named] if named.is_file() else sorted(named.rglob("*.py")):
             relative = path.relative_to(checkout).as_posix()
             if "/stubs/" in f"/{relative}" or "/node_modules/" in f"/{relative}":
+                continue
+            if RECORDED.get(relative) == hashlib.sha256(path.read_bytes()).hexdigest():
                 continue
             yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 

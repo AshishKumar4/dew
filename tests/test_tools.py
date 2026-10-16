@@ -655,6 +655,22 @@ def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but
     assert [module.relative for module in lint.collect(roots, tmp_path, "dew")] == ["site/scripts/build.py"]
 
 
+def test_the_gate_skips_the_hero_script_while_its_bytes_are_the_recorded_ones(tmp_path):
+    """The landing hero's script is recorded data: the hero capture pins its bytes (script_sha256),
+    so the gate leaves it alone while they are the recorded ones and reads it once they are not, as
+    an edit the hero is then recorded again for."""
+    lint = load("lint_slop")
+    hero = "site/src/data/hero.py"
+    recorded = (REPO_ROOT / hero).read_bytes()
+    capture = json.loads((REPO_ROOT / "site/src/data/capture.json").read_text())
+    assert {hero: capture["meta"]["script_sha256"]} == lint.RECORDED
+    (tmp_path / hero).parent.mkdir(parents=True)
+    (tmp_path / hero).write_bytes(recorded)
+    assert [module.relative for module in lint.collect(["site"], tmp_path, "dew")] == []
+    (tmp_path / hero).write_bytes(recorded + b"\n")
+    assert [module.relative for module in lint.collect(["site"], tmp_path, "dew")] == [hero]
+
+
 def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
     """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
     `typing.cast` however it was imported, and a warning filter whose action is
