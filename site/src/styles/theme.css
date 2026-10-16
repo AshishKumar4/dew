@@ -425,6 +425,27 @@ header.header {
 	font-size: 0.78rem;
 }
 
+/* Figures drawn by dew.figures, in a tutorial's text (.nb-figure) or in its outputs. Each keys
+   its own light and dark colors to data-theme, so only its size is set here: it scales with the
+   column, and a narrow screen scrolls it sideways at its drawn size, as the docs figures do. */
+
+.sl-markdown-content svg.dew-figure {
+	display: block;
+	max-width: 100%;
+	height: auto;
+}
+
+.sl-markdown-content .nb-figure {
+	margin-block: 1.25rem;
+	overflow-x: auto;
+}
+
+@media (max-width: 50rem) {
+	.sl-markdown-content svg.dew-figure {
+		max-width: none;
+	}
+}
+
 /* The tutorials grid, on /tutorials/ and on the landing page. */
 
 .tutorial-grid {
