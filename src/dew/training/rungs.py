@@ -42,8 +42,10 @@ if TYPE_CHECKING:
 
 
 def rung_records() -> Path | None:
-    """Where a step's rung is recorded: beside the persistent compilation
-    cache, or nowhere when the process keeps none."""
+    """Where a step's rung is recorded: DEW_RUNG_RECORDS when set, else beside
+    the persistent compilation cache, or nowhere when the process keeps none."""
+    if directory := os.environ.get('DEW_RUNG_RECORDS'):
+        return Path(directory)
     cache = jax.config.jax_compilation_cache_dir
     return None if not cache else Path(cache) / 'dew-rungs'
 

@@ -101,6 +101,25 @@ MOVES = ("all-gather", "all-to-all", "collective-permute")
 needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not a move."""
 
 
+def tpu_mesh(**axes: int) -> jax.sharding.Mesh:
+    """A mesh of `axes` over the first of this process's devices, its axes left to the partitioner as
+    a run's are (`MeshSpec`), for `tpu_lowering`."""
+    from jax.sharding import AxisType
+
+    return jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                         devices=jax.devices()[:math.prod(axes.values())])
+
+
+def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
+    """`fn` over `args`, ShapeDtypeStructs placed on `mesh`, lowered for a TPU v6e through `jax.export`
+    on any host, as the module's text: jax refuses there to lower a Mosaic kernel the partitioner
+    would have to split ("Mosaic kernels cannot be automatically partitioned")."""
+    from dew.nn.kernels import generation
+
+    with generation.assumed("v6e"), jax.set_mesh(mesh):
+        return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
+
+
 def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     """The custom-kernel contract (module docstring): `fn(*args)` with `args` placed on `mesh` by
     `specs` (PartitionSpecs) is within the float64 gate (`assert_leaves_as_exact`) of `fn` on one

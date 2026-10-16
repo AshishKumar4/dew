@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.attention import GroupNorm, scaled_dot_product_attention
+from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.conv import Conv
 
 
@@ -102,11 +102,11 @@ class FlaxAttentionBlock(nn.Module):
         batch, height, width, channels = hidden_states.shape
         hidden_states = GroupNorm(self.num_groups, dtype=self.dtype, name="group_norm")(hidden_states)
         hidden_states = hidden_states.reshape((batch, height * width, channels))
-        query, key, value = (nn.Dense(self.channels, dtype=self.dtype, name=name)(hidden_states)[:, :, None]
+        query, key, value = (projected_heads(hidden_states, name, 1, self.channels, flat=True,
+                                             dtype=self.dtype)
                              for name in ("query", "key", "value"))
-        hidden_states = scaled_dot_product_attention(query, key, value)[:, :, 0]
-
-        hidden_states = nn.Dense(self.channels, dtype=self.dtype, name="proj_attn")(hidden_states)
+        hidden_states = projected_output(scaled_dot_product_attention(query, key, value), "proj_attn",
+                                         self.channels, flat=True, dtype=self.dtype)
         return hidden_states.reshape((batch, height, width, channels)) + residual
 
 

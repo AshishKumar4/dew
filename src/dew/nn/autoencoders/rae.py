@@ -32,7 +32,7 @@ from flax.typing import Dtype
 from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
-from dew.nn.attention import LayerNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.mlp import GatedMLP
@@ -85,12 +85,11 @@ class _Attention(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        batch, length, _ = x.shape
-        split = (batch, length, self.heads, self.width // self.heads)
-        query, key, value = (nn.Dense(self.width, dtype=self.dtype, name=name)(x).reshape(split)
+        query, key, value = (projected_heads(x, name, self.heads, self.width // self.heads, flat=True,
+                                             dtype=self.dtype)
                              for name in ("query", "key", "value"))
         attended = scaled_dot_product_attention(query, key, value, dtype=self.dtype)
-        return nn.Dense(self.width, dtype=self.dtype, name="out")(attended.reshape(batch, length, self.width))
+        return projected_output(attended, "out", self.width, flat=True, dtype=self.dtype)
 
 
 class _Block(nn.Module):

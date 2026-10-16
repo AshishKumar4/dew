@@ -28,7 +28,13 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    distance,
+    float64_terms,
+    widened,
+)
 
 from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
@@ -206,9 +212,9 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         return model.apply({"params": params, "constants": constants}, image, times,
                            TextContext(text, jnp.asarray(mask)))
 
-    def evaluated(params):
+    def evaluated(params, image=image, text=text):
         output, pullback = jax.vjp(forward, params, image, text)
-        return output, pullback(jnp.asarray(part("probe")))
+        return output, pullback(jnp.asarray(part("probe"), output.dtype))
 
     def leaf(tree, path):
         for key in path:
@@ -249,6 +255,11 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         assert_as_exact_over_orders(gradient_distances, reference_gradients, f"{case} gradients")
     else:
         output, gradients = evaluated(params)
-        assert_as_exact_as_the_reference(output, part("fp32.output"), part("fp64.output"), f"{case} output")
-        assert_as_exact_as_the_reference(
-            gradient_order(gradients), source_order("fp32"), source_order("fp64"), f"{case} gradients")
+        # Dew's own path in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
+        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+            _, (output_terms, gradient_terms) = float64_terms(evaluated, *widened((params, image, text)))
+        assert_as_exact_as_the_reference(output, part("fp32.output"), part("fp64.output"), f"{case} output",
+                                         terms=output_terms)
+        assert_as_exact_as_the_reference(gradient_order(gradients), source_order("fp32"),
+                                         source_order("fp64"), f"{case} gradients",
+                                         terms=gradient_order(gradient_terms))

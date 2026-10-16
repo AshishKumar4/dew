@@ -68,10 +68,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import deepseek_v41_reference as v41
+from decoder_export_reference import lower_index_ties
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-import deepseek_v41_reference as v41  # noqa: E402
-from decoder_export_reference import lower_index_ties  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4-Flash-0731"
 DEEPSEEK_V4_0731_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"

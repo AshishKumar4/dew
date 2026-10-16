@@ -60,16 +60,7 @@ def own_rung_records(monkeypatch, tmp_path_factory):
     """Each test keeps its own rung records (`dew.training.rungs`). The suite
     shares one compilation cache, beside which a run records its step's
     rung, and a rung one test forces would be another's floor."""
-    from dew.training import rungs
-
-    directory = []
-
-    def records():
-        if not directory:
-            directory.append(tmp_path_factory.mktemp("rungs"))
-        return directory[0]
-
-    monkeypatch.setattr(rungs, "rung_records", records)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
 
 
 @pytest.fixture(autouse=True, scope="module")

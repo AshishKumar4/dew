@@ -106,7 +106,7 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
             'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
             f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight',
                                                    'shape': [16, 16], 'transpose': [1, 0]}
-            for name in ('q_proj', 'v_proj')}}}]
+            for name in ('q_proj', 'v_proj')}, 'bases': {}}}]
     assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
         state.variables['params']) if 'lora_B' in jax.tree_util.keystr(path))
     task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
