@@ -1081,23 +1081,29 @@ def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
         return hardware.without([node.name])
     if isinstance(node, COMPREHENSIONS):
         first = node.generators[0]
-        read(first.iter, hardware)
+        hardware = read(first.iter, hardware)
         names = [name.id for generator in node.generators for name in ast.walk(generator.target)
                  if isinstance(name, ast.Name)]
         inner, inherited = hardware.without(names), closure.without(names)
         for generator in node.generators:
             for child in (*([] if generator is first else [generator.iter]), *generator.ifs):
-                read(child, inner, inherited)
+                inner = read(child, inner, inherited)
         for child in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
-            read(child, inner, inherited)
-        return hardware
+            inner = read(child, inner, inherited)
+        # An assignment expression in it binds the enclosing scope's name.
+        walrus = {expression.target.id for expression in ast.walk(node)
+                  if isinstance(expression, ast.NamedExpr)}
+        outer = hardware.without(walrus)
+        return replace(outer, generations=outer.generations | (inner.generations & walrus),
+                       targets=outer.targets | (inner.targets & walrus))
     if found is not None and isinstance(node, ast.expr | ast.stmt) and hardware.keyed(node):
         found.append(node)
     if isinstance(node, ast.Assign | ast.AnnAssign | ast.NamedExpr):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         hardware = read(node.value, hardware)
         for target in targets:
-            hardware = read(target, hardware)
+            # Read for the keys a target holds; the names it binds are `assigned`'s.
+            read(target, hardware)
         return hardware.assigned(targets, node.value)
     for child in ast.iter_child_nodes(node):
         hardware = read(child, hardware)
