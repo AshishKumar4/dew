@@ -284,6 +284,9 @@ _YARN_SOURCES = (
       for name, _ in _YARN_SOURCES],
     ("gpt-oss-tiny", lambda config: {
         **config, "rope_parameters": _without("factor")(config["rope_parameters"])}),
+    # The Nemotron-H releases that carry their own remote code name the head width attention_head_dim.
+    ("nemotron-h-tiny", lambda config: {**_without("head_dim")(config),
+                                        "attention_head_dim": config["head_dim"]}),
     ("llada-tiny", _without("n_kv_heads", "head_dim", "rope_theta")),
     ("llada-tiny", lambda config: {
         **_without("n_layers", "activation_type")(config),
