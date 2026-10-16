@@ -24,6 +24,7 @@ import pyarrow.fs as pafs
 from fsspec.spec import AbstractFileSystem
 from fsspec.utils import infer_compression
 
+from dew.cache import hub_answer
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, content_version, local
@@ -125,6 +126,16 @@ def _seek_lines(file: BinaryIO, offset: int) -> None:
             raise ValueError("file reader position exceeds its decompressed stream")
 
 
+def _hub_header(info: Mapping[str, object]) -> dict[str, object]:
+    """What `Files` keys a Hub file by, of its `HfFileSystem.info`: its size, and the sha256 of its
+    content where the Hub states one (an LFS file's), else its git blob id, either of which names
+    its content."""
+    stored = info.get("lfs")
+    sha256 = stored.get("sha256") if isinstance(stored, Mapping) else None
+    return {"name": info["name"], "size": info["size"],
+            **({"sha256": sha256} if sha256 else {"ETag": info["blob_id"]})}
+
+
 @dataclass(frozen=True)
 class Files(Dataset):
     """Files at URLs, with producer indexes or explicit provisioning for text.
@@ -164,6 +175,9 @@ class Files(Dataset):
             stated = self.declared[url]
             return {"name": url, "size": stated["bytes"], **stated}
         fs, path = Store(url, self.storage_options).resolve()
+        if url.startswith("hf://"):
+            # The Hub's answer for the commit the URL pins, recorded, so it reads the same offline.
+            return hub_answer(f"files/{url.removeprefix('hf://')}", lambda: _hub_header(fs.info(path)))
         return fs.info(path)
 
     @cached_property
