@@ -60,10 +60,10 @@ class ResponseCanvases:
     `canvas_size`: `eos_id` fills the rest of its last canvas, `pad_id` the
     canvases after it, and `canvas_mask` marks the filled canvases, as the
     reference's `CanvasChunker` lays a response out (gemma bf0b49901,
-    `diffusion/hackable_diffusion_adapter/data/data.py`). A longer prompt
-    keeps its last ids, which hold the turn's header; a longer completion
-    keeps its first, as the reference cuts it. Either cut marks the row
-    truncated.
+    `diffusion/hackable_diffusion_adapter/data/data.py`). A longer prompt or
+    completion keeps its first ids, as the reference's `Pad(truncate=True)`
+    and `CanvasChunker` cut them (`gm/data/_functional.py:83`). Either cut
+    marks the row truncated.
     """
 
     prompt_length: int
@@ -87,7 +87,7 @@ class ResponseCanvases:
             response = ids[start:min(end, start + capacity)]
             filled = -(-len(response) // self.canvas_size) * self.canvas_size
             text = np.full(self.prompt_length + capacity, self.pad_id, np.int32)
-            text[:min(start, self.prompt_length)] = ids[max(0, start - self.prompt_length):start]
+            text[:min(start, self.prompt_length)] = ids[:min(start, self.prompt_length)]
             text[self.prompt_length:self.prompt_length + filled] = self.eos_id
             text[self.prompt_length:self.prompt_length + len(response)] = response
             cut = start > self.prompt_length or end - start > capacity
