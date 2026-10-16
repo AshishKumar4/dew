@@ -521,7 +521,7 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 

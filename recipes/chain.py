@@ -45,10 +45,6 @@ from dew.objectives.rl.rollout import Reward
 from dew.sampling import Sampling, with_ids_of
 from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 
-LOSSES = ((TextData, "pretraining"), (ChatData, "sft"), (PreferenceData, "dpo"), (PromptData, "grpo"),
-          (RecordsData, "ppo"))
-"""The loss each kind of stage data trains, in the order `Stage` matches them."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Teacher:
@@ -95,18 +91,19 @@ class Episodes:
 class Stage:
     """One link: `data` trained for `steps` gradient steps.
 
-    The data decides the loss (`LOSSES`): `TextData` trains next-token
-    pretraining, `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO,
-    and `RecordsData` of `task_id` rows PPO over the stage's `episodes`. A
-    `teacher` distills a pretraining or SFT stage.
-    `beta` is the KL strength of DPO, GRPO and PPO, 0.1 for DPO and 0.0
-    otherwise when None; a pretraining or SFT stage refuses one. A GRPO
-    stage names its `reward` and refuses to run without one: a rollout no
-    rule scores is steps in the dark. Its reward reads completions decoded
-    by the prompts' tokenizer, and its `sampling` stops at that tokenizer's
-    EOS unless it names its own. A PPO stage's `sampling` names the EOS
-    that ends an action. `groups` and `max_new_tokens` size both online
-    stages' sampling, and `estimator` GRPO's advantages.
+    The data decides the loss: `TextData` trains next-token pretraining,
+    `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO, and
+    `RecordsData` of `task_id` rows PPO over the stage's `episodes`, which
+    no other stage takes. A `teacher` distills a pretraining or SFT stage,
+    and any other stage refuses one. `beta` is the KL strength of DPO, GRPO
+    and PPO, 0.1 for DPO and 0.0 otherwise when None; a pretraining or SFT
+    stage refuses one. A GRPO stage refuses to run without a `reward`: a
+    rollout no rule scores is steps in the dark. Its reward reads
+    completions decoded by the prompts' tokenizer, and its `sampling` stops
+    at that tokenizer's EOS unless it names its own. A PPO stage's
+    `sampling` names the EOS that ends an action. `groups` and
+    `max_new_tokens` size both online stages' sampling, and `estimator`
+    GRPO's advantages. `Recipe.run` applies these rules.
     """
 
     name: str
@@ -126,27 +123,6 @@ class Stage:
     def __post_init__(self) -> None:
         if self.steps < 1:
             raise ValueError(f"stage {self.name!r} runs {self.steps} steps: at least one")
-        if not isinstance(self.data, tuple(data for data, _ in LOSSES)):
-            raise TypeError(f"stage {self.name!r} trains {type(self.data).__name__}, which no loss reads")
-        supervised = self.loss in ("pretraining", "sft")
-        if supervised and self.beta is not None:
-            raise ValueError(
-                f"stage {self.name!r} sets beta on a {self.loss} stage, which has no KL term")
-        if not supervised and self.teacher is not None:
-            raise ValueError(f"stage {self.name!r} names a teacher, which distills only pretraining or SFT")
-        if self.loss == "grpo" and self.reward is None:
-            raise ValueError(
-                f"stage {self.name!r} samples without a reward; name one")
-        if (self.loss == "ppo") != (self.episodes is not None):
-            raise ValueError(f"stage {self.name!r}: RecordsData and episodes make a PPO stage together")
-
-    @property
-    def loss(self) -> str:
-        return next(loss for data, loss in LOSSES if isinstance(self.data, data))
-
-    @property
-    def kind(self) -> str:
-        return self.loss if self.teacher is None else f"{self.loss} distillation"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,8 +133,9 @@ class Recipe:
     each stage; `key` seeds the first stage and folds forward from there;
     `batch` sizes every stage's batches; `layout` places every stage's
     state. `run` builds every stage's objective and rollout before the
-    first stage trains, so settings they refuse fail first, and returns each
-    stage's final state, oldest first.
+    first stage trains, so a stage whose settings its data or objective
+    refuses fails before anything trains, and returns each stage's final
+    state, oldest first.
     """
 
     model: nn.Module
@@ -189,7 +166,7 @@ class Recipe:
                 **({"rollout": rollout} if rollout is not None else {}),
             )
             print(f"Stage {index + 1}/{len(self.stages)}: {stage.name} "
-                  f"({stage.kind}, {stage.steps} steps)")
+                  f"({type(objective).__name__}, {stage.steps} steps)")
             states.append(trainer.fit(
                 loader(stage.data, batch=self.batch, read="memory", seed=stage.seed, loading=stage.loading),
                 steps=stage.steps))
@@ -198,9 +175,22 @@ class Recipe:
 
     def _build(self, stage: Stage, variables: Variables | None) -> tuple[Objective, Rollout | None]:
         """The stage's objective over the shared model, continuing `variables`
-        past the first stage, with its rollout beside it for GRPO and PPO."""
+        past the first stage, with its rollout beside it for GRPO and PPO.
+
+        This is the one place a stage's data picks its loss, so it also
+        refuses the stage's settings that loss does not take or lacks
+        (`Stage`'s rules): `ValueError`, or `TypeError` for data no loss
+        reads.
+        """
         data = stage.data
-        if isinstance(data, (TextData, ChatData)):
+        if isinstance(data, RecordsData) != (stage.episodes is not None):
+            raise ValueError(f"stage {stage.name!r}: RecordsData and episodes make a PPO stage together")
+        supervised = isinstance(data, (TextData, ChatData))
+        if not supervised and stage.teacher is not None:
+            raise ValueError(f"stage {stage.name!r} names a teacher, which distills only pretraining or SFT")
+        if supervised:
+            if stage.beta is not None:
+                raise ValueError(f"stage {stage.name!r} sets beta on a stage with no KL term")
             objective = _scored(self.model, data, variables)
             if stage.teacher is None:
                 return objective, None
@@ -212,7 +202,8 @@ class Recipe:
             return DPOObjective(self.model, data.seq_len - 1, beta=beta, variables=variables), None
         beta = 0.0 if stage.beta is None else stage.beta
         if isinstance(data, PromptData):
-            assert stage.reward is not None
+            if stage.reward is None:
+                raise ValueError(f"stage {stage.name!r} samples without a reward; name one")
             objective = GRPOObjective(self.model, data.max_prompt_len + stage.max_new_tokens - 1,
                                       beta=beta, variables=variables)
             tokenizer = tokenizer_for(data.tokenizer)
@@ -221,7 +212,8 @@ class Recipe:
                                              groups=stage.groups, max_new_tokens=stage.max_new_tokens,
                                              estimator=stage.estimator, sampling=sampling)
         episodes = stage.episodes
-        assert episodes is not None
+        if episodes is None:
+            raise TypeError(f"stage {stage.name!r} trains {type(data).__name__}, which no loss reads")
         objective = PPOObjective(self.model, episodes.max_prompt_tokens + stage.max_new_tokens - 1,
                                  critic=episodes.critic, beta=beta, variables=variables)
         # Every collection binds the step's variables, so the policy here holds none.

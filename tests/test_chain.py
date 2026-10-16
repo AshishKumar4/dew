@@ -4,11 +4,11 @@ A `Recipe` runs its stages in order, each in its own directory, with every
 stage after the first initializing from the model's part of the previous
 stage's final variables. The observable link: a DPO, GRPO or PPO stage's
 frozen reference, written at its first step, is the tree the previous stage
-handed on, byte for byte. Pretraining and a distilled SFT stage hand on the
+handed on, leaf for leaf. Pretraining and a distilled SFT stage hand on the
 decoder alone, without the teacher; PPO hands on its policy, without the
 critic. A GRPO stage's reward reads text its prompts' tokenizer decodes,
 and sampling stops at that tokenizer's EOS. A stage that names the wrong
-data or settings fails before anything trains.
+data or settings fails the run before its first stage trains.
 """
 
 import dataclasses
@@ -20,6 +20,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from bank_support import identical
 from episode_support import GROUPS, PROMPT, RESPONSE, SAMPLING, TURNS, Harness, ToolPolicy, verify
 from flax import linen as nn
 from rl_support import TinyHead
@@ -46,8 +47,11 @@ class Loaded:
     text_processor: None = None
 
 
-def raw(tree):
-    return [leaf.tobytes() for leaf in jax.tree.leaves(tree)]
+def moved(after, before) -> bool:
+    """Whether training changed a leaf of a tree that kept its structure."""
+    assert jax.tree.structure(after) == jax.tree.structure(before)
+    return any(not np.array_equal(new, old)
+               for new, old in zip(jax.tree.leaves(after), jax.tree.leaves(before), strict=True))
 
 
 def chat_parquet(tmp_path):
@@ -95,8 +99,8 @@ def test_each_stage_continues_the_last(tmp_path):
     assert len(states) == 2
     assert (tmp_path / "chain" / "sft").is_dir()
     assert (tmp_path / "chain" / "dpo").is_dir()
-    assert raw(states[1].ema) == raw(states[0].variables)
-    assert raw(states[1].variables) != raw(states[0].variables)
+    identical(states[1].ema, states[0].variables)
+    assert moved(states[1].variables, states[0].variables)
 
 
 def test_pretraining_and_distillation_hand_on_the_decoder_alone(tmp_path):
@@ -118,12 +122,12 @@ def test_pretraining_and_distillation_hand_on_the_decoder_alone(tmp_path):
 
     states = recipe.run()
 
-    assert raw(states[1].ema) == raw(states[0].variables)
+    identical(states[1].ema, states[0].variables)
     distilled = states[2].variables
-    assert raw(distilled[TEACHER]) == raw(held)
+    identical(distilled[TEACHER], held)
     student = {name: tree for name, tree in distilled.items() if name != TEACHER}
-    assert raw(student) != raw(states[1].variables)
-    assert raw(states[3].ema) == raw(student)
+    assert moved(student, states[1].variables)
+    identical(states[3].ema, student)
 
 
 def test_a_ppo_stage_acts_in_its_environment_and_hands_on_its_policy(tmp_path):
@@ -145,10 +149,10 @@ def test_a_ppo_stage_acts_in_its_environment_and_hands_on_its_policy(tmp_path):
     states = recipe.run()
 
     assert len(harness.opened) == 8 * GROUPS and harness.calls
-    assert raw(part(states[1].ema, "policy")) == raw(states[0].variables)
+    identical(part(states[1].ema, "policy"), states[0].variables)
     policy = part(states[1].variables, "policy")
-    assert raw(policy) != raw(states[0].variables)
-    assert raw(states[2].ema) == raw(policy)
+    assert moved(policy, states[0].variables)
+    identical(states[2].ema, policy)
 
 
 def leaning(vocab: int, letter: int, eos: int) -> np.ndarray:
@@ -159,9 +163,11 @@ def leaning(vocab: int, letter: int, eos: int) -> np.ndarray:
 
 
 def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_path):
-    """A policy that draws "a" or the prompts' tokenizer's EOS: every completion
-    the reward reads is a run of "a" that tokenizer decodes, and some runs end
-    before the token budget, where EOS stopped them."""
+    """DPO, GRPO, then DPO on a bigram policy that draws "a" or the prompts'
+    tokenizer's EOS. Each of the 8 * 4 completions the reward reads is a run
+    of "a" that tokenizer decodes; some are not empty, and some end before
+    the token budget, where EOS stopped them. GRPO's reference is the first
+    stage's final tree, and the last stage's reference is GRPO's."""
     tokenizer = tokenizer_for(str(TOKENIZER))
     letter, = tokenizer.encode("a", add_special_tokens=False)
     assert tokenizer.eos_id is not None
@@ -175,15 +181,23 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
 
     prompts = PromptData(source=tuple({"prompt": "hi"} for _ in range(8)), tokenizer=str(TOKENIZER),
                          max_prompt_len=8, long="truncate")
-    Recipe(model, optax.sgd(.1), jax.random.key(0),
-           (Stage(name="grpo", data=prompts, steps=1, reward=reward, max_new_tokens=4),),
-           str(tmp_path / "chain"), batch=8, layout=LAYOUT).run()
+    states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
+        Stage(name="dpo", data=pairs(), steps=1),
+        Stage(name="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
+        Stage(name="aligned", data=pairs(), steps=1),
+    ), str(tmp_path / "chain"), batch=8, layout=LAYOUT).run()
 
-    assert read and all(text == "a" * len(text) for text in read)
-    assert min(len(text) for text in read) < 4
+    assert len(read) == 8 * 4
+    assert all(text == "a" * len(text) for text in read)
+    lengths = [len(text) for text in read]
+    assert max(lengths) > 0 and min(lengths) < 4
+    identical(states[1].ema, states[0].variables)
+    identical(states[2].ema, states[1].variables)
 
 
-def test_a_mislinked_chain_is_refused(tmp_path):
+def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):
+    """Each refused stage follows a sound one, and the run fails before the
+    sound stage writes its directory."""
     model, optim, key = TinyHead(vocab_size=8), optax.sgd(0.1), jax.random.key(0)
     text = TextData(source=({"text": "hi"},), tokenizer=str(TOKENIZER))
     prompts = PromptData(source=tuple(json.loads(row) for row in ("{}",)), tokenizer=str(TOKENIZER),
@@ -197,23 +211,20 @@ def test_a_mislinked_chain_is_refused(tmp_path):
         Recipe(model, optim, key, (), str(tmp_path))
     with pytest.raises(ValueError):
         Stage(name="x", data=chat(tmp_path), steps=0)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=chat(tmp_path), beta=0.1)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=text, beta=0.1)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=prompts)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=tasks)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=pairs(), episodes=episodes)
-    with pytest.raises(ValueError):
-        Stage(name="x", data=pairs(), teacher=teacher)
     with pytest.raises(TypeError):
         Teacher(model, alpha=0.5, temperature=1.0)
-    # PPO actions end at an EOS, and this stage's sampling names none.
-    unstopped = Stage(name="ppo", data=tasks, max_new_tokens=RESPONSE, episodes=episodes)
-    with pytest.raises(ValueError):
-        Recipe(ToolPolicy(), optim, key, (Stage(name="dpo", data=pairs()), unstopped),
-               str(tmp_path / "chain")).run()
+    refused = (
+        Stage(name="x", data=chat(tmp_path), beta=0.1),
+        Stage(name="x", data=text, beta=0.1),
+        Stage(name="x", data=prompts),
+        Stage(name="x", data=tasks),
+        Stage(name="x", data=pairs(), episodes=episodes),
+        Stage(name="x", data=pairs(), teacher=teacher),
+        # PPO actions end at an EOS, and this stage's sampling names none.
+        Stage(name="x", data=tasks, max_new_tokens=RESPONSE, episodes=episodes),
+    )
+    for stage in refused:
+        with pytest.raises(ValueError):
+            Recipe(ToolPolicy(), optim, key, (Stage(name="dpo", data=pairs()), stage),
+                   str(tmp_path / "chain")).run()
     assert not (tmp_path / "chain").exists()

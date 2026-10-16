@@ -598,7 +598,7 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 
 ## Stage chains
 
-`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective (`recipes.chain.LOSSES`):
+`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective:
 
 | Stage data | Objective | Rollout |
 | --- | --- | --- |
@@ -610,7 +610,7 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 
 A pretraining or SFT stage with a `teacher` trains `DistillationObjective` over that objective instead. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
 
-In new stage directories, each stage starts a fresh optimizer and step counter from the model's part of the previous stage's final variables (`Objective.model_variables`): the policy without the critic after PPO, and the student without the teacher after distillation. DPO, GRPO and PPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` builds every stage's objective and rollout before the first stage trains, so a setting they refuse, such as a PPO budget that does not fit, fails before any training. It returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
+In new stage directories, each stage starts a fresh optimizer and step counter from the model's part of the previous stage's final variables (`Objective.model_variables`): the policy without the critic after PPO, and the student without the teacher after distillation. DPO, and GRPO or PPO with a positive `beta`, freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` builds every stage's objective and rollout before the first stage trains. A stage with a setting its data does not take, such as `episodes` beside `PromptData`, or one its objective or rollout refuses, such as PPO `sampling` with no EOS, fails before any training. It returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
 
 A `Stage` sets `steps` (default 100) and `beta` (`None` picks 0.1 for DPO and 0.0 for GRPO and PPO; a pretraining or SFT stage refuses a `beta`). `groups` and `max_new_tokens` size the GRPO and PPO samples, `estimator` sets the GRPO advantage, and `sampling` sets the decoding policy of both.
 
