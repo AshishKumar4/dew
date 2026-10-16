@@ -146,6 +146,8 @@ class KernelOp(tokamax.Op):
         if config is None:
             ba = self.bind(*args, **kwargs)
             keyed = self.keyed(ba)
+            if (collected := cache.KERNEL_SEEN.value) is not None:
+                collected.found.append((self, keyed))
             pin = dict(cache.KERNEL_PINS.value).get(type(self))
             pick = _pick(keyed) or self._nearest(keyed)
             config = (pin if pin in keyed.autotuning_configs
@@ -410,22 +412,48 @@ def launches() -> Iterator[None]:
         yield
 
 
-def tune(lower: Callable[[], jax.stages.Lowered], *, measure: bool = False) -> str:
-    """Settle every launch's config in the program `lower()` lowers across the
-    pool, read from a lowering of its own (`launches`): process 0 takes its
-    stored pick for each, with `measure` measuring and storing one for a
-    launch without where it has its GPU to itself, and every process takes
-    exactly process 0's picks. Returns the program's launches as JSON, which
-    `settled` settles again without a lowering. Without `measure` a launch
+class _Seen:
+    """The launches a lowering traced under `seen`, each its op and keyed
+    arguments; hashed by identity, as `dew.cache.KERNEL_SEEN` keys on it."""
+
+    def __init__(self) -> None:
+        self.found: list[tuple[KernelOp, tokamax.BoundArguments]] = []
+
+
+@contextlib.contextmanager
+def seen() -> Iterator[list[tuple[KernelOp, tokamax.BoundArguments]]]:
+    """Each kernel launch traced within whose config is read from picks, its
+    op and keyed arguments (`KernelOp.keyed`), recorded as it traces: a fresh
+    collection each time, so a trace cached before traces again."""
+    collected = _Seen()
+    with cache.KERNEL_SEEN(collected):
+        yield collected.found
+
+
+def tune(lower: Callable[[], jax.stages.Lowered], *,
+         measure: bool = False) -> tuple[jax.stages.Lowered, str]:
+    """The program `lower()` lowers, with every launch's config settled across
+    the pool, and its launches as JSON, which `settled` settles again without
+    a lowering. The lowering records its launches as it traces them (`seen`);
+    process 0 takes its stored pick for each, with `measure` measuring and
+    storing one for a launch without where it has its GPU to itself, and
+    every process takes exactly process 0's picks. Where that changes a
+    config the lowering traced, it lowers again: a launch's description in
+    the program, which tokamax reads its launches out of (`launches`), keeps
+    it from the persistent cache, so reading them so took a lowering of its
+    own, about 62 s of each cold plan candidate's compile of the packed
+    Qwen3.5-0.8B step on an A100 (ledger 561). Without `measure` a launch
     without a pick takes the nearest stored shape's or its heuristic, and the
     process says once how many lack one and how to measure them."""
     if not generation.triton_runs():
-        return "[]"
-    with launches():
+        return lower(), "[]"
+    tuned = cache.KERNEL_TUNES.get_global()
+    with seen() as found:
         lowered = lower()
-    found = [(op, op.keyed(ba)) for ba in _bound_args(lowered) if isinstance(op := ba.op, KernelOp)]
     _settle(found, measure=measure)
-    return dump_bound_args_to_json([ba for _, ba in found])
+    if cache.KERNEL_TUNES.get_global() != tuned:
+        lowered = lower()
+    return lowered, dump_bound_args_to_json([ba for _, ba in found])
 
 
 def settled(launches: str) -> bool:

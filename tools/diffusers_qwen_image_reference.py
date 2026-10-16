@@ -293,8 +293,9 @@ def main(destination: str) -> None:
     import transformers
     from diffusers import QwenImage21Pipeline
 
-    if transformers.__version__ != "5.17.0" or torch.__version__.split("+")[0] != "2.14.0":
-        raise RuntimeError("Requires transformers==5.17.0 and torch==2.14.0")
+    from reference_releases import require
+
+    require("qwen-image")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)

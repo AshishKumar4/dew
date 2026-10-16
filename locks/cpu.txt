@@ -150,6 +150,8 @@ contourpy==1.4.0
     # via matplotlib
 cosmic-ray==8.7.0
     # via dewml (pyproject.toml)
+coverage==7.16.2
+    # via dewml (pyproject.toml)
 cryptography==50.0.2
     # via
     #   google-auth

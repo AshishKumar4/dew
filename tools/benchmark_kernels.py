@@ -30,13 +30,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
-from benchmark_models import batches, build_trainer
+from benchmark_models import build_trainer, compiled_step, timed_steps
 
 from dew.config import OptimConfig
 from dew.nn.kernels.tuning import samples
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
-from dew.training.distributed import DevicePrefetchIterator
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
@@ -160,29 +159,16 @@ def step(args: argparse.Namespace) -> dict[str, object]:
     case = case_for(args.path, args.batch, args)
     trainer = build_trainer(case, optimizer=OptimConfig(
         optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
-    source = DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh)
-    with source:
-        abstract = jax.eval_shape(trainer.initial_state)
-        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-        first = next(source)
-        start = time.perf_counter()
-        compiled = trainer.compile(state, first)
-        compile_seconds = time.perf_counter() - start
-        losses = []
-        for _ in range(5):
-            state, loss, *_ = compiled(state, next(source))
-        losses.append(float(loss))
-        start = time.perf_counter()
-        for _ in range(args.steps):
-            state, loss, *_ = compiled(state, next(source))
-        loss.block_until_ready()
-        step_ms = (time.perf_counter() - start) / args.steps * 1e3
+    with compiled_step(case, trainer) as compiled:
+        state, loss, _, _ = timed_steps(compiled.step, compiled.state, 5)
+        losses = [float(loss)]
+        state, loss, _, seconds = timed_steps(compiled.step, state, args.steps)
+        step_ms = seconds / args.steps * 1e3
         if args.trace:
             with jax.profiler.trace(args.trace, profiler_options=capture_options()):
-                for _ in range(3):
-                    state, loss, *_ = compiled(state, next(source))
-                loss.block_until_ready()
+                state, loss, _, _ = timed_steps(compiled.step, state, 3)
         losses.append(float(loss))
+        compile_seconds = compiled.compile_seconds
     return {"path": args.path, "batch": args.batch, "implementation": args.implementation,
             "state_dtype": args.state_dtype, "remat": args.remat, "ms_per_step": step_ms,
             "compile_seconds": compile_seconds, "loss_after_warmup": losses[0],

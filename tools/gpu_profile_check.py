@@ -41,7 +41,7 @@ def capture(out: Path) -> dict:
     """One variant, in this process: warm the step, time it, capture it."""
     import jax
     import jax.numpy as jnp
-    from trace_window import device_events, length, union
+    from trace_window import busy_time, device_events
 
     import dew
     from dew.nn.kernels.tuning import samples
@@ -67,7 +67,7 @@ def capture(out: Path) -> dict:
     manifest = json.loads(path.read_text())
     planes, _ = device_events(directory)
     events = [event for name, found in planes.items() if name.startswith("/device:GPU") for event in found]
-    busy = length(union([(event.start_ns, event.start_ns + event.duration_ns) for event in events]))
+    busy = busy_time([(event.start_ns, event.start_ns + event.duration_ns) for event in events])
     return {"device": jax.devices()[0].device_kind, "platform": jax.default_backend(),
             "xla_flags": os.environ.get("XLA_FLAGS", ""),
             "attributed_ops": attributed_ops(directory / "reports"),

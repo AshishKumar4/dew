@@ -20,12 +20,12 @@ TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jit
 READ = Loading(workers=0, threads=1, read_buffer=2)
 
 
-def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=None):
+def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=None, jitter=True):
     rows = [{"image": np.random.default_rng(index).integers(
         0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
     return ImageData(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
                   validation=None,
-                  augment=Augment(flip=True, jitter=True, crop_scale=crop_scale,
+                  augment=Augment(flip=True, jitter=jitter, crop_scale=crop_scale,
                       backend=backend) if augment else None)
 
 
@@ -72,6 +72,28 @@ def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactl
     finally:
         stream.close()
         resumed.close()
+
+
+@pytest.mark.mesh
+def test_the_device_steps_jitter_rows_an_explicit_mesh_axis_types():
+    """A run whose data axis is Explicit (`MeshSpec(explicit=("data",))`) places its rows typed
+    by that axis; the compiled device steps crop, flip and jitter them into the pictures the
+    unplaced batch makes, within one uint8 code of a compilation's rounding."""
+    from dew.training.distributed import MeshSpec, shard_batch, split_fields
+
+    data = loader(spec(crop_scale=(0.5, 0.9)), batch=8, read="memory", seed=5, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        staged, _ = split_fields(next(stream))
+    finally:
+        stream.close()
+    expected = augmented(data, staged)
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    with jax.set_mesh(mesh):
+        placed = shard_batch(mesh, staged)
+        found = jax.jit(lambda rows: augmented(data, rows))(placed)
+    difference = np.asarray(found["image"], np.int32) - np.asarray(expected["image"], np.int32)
+    assert found["image"].shape == (8, 12, 12, 3) and np.abs(difference).max() <= 1
 
 
 @pytest.mark.parametrize("order", list(itertools.permutations(range(3))))
@@ -249,6 +271,40 @@ def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
     state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
     assert int(state.step) == 2
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them():
+    """Pictures staged at 24 pixels and cropped to 12 by the compiled step, on eight devices whose
+    data axis is Explicit and the rest Auto: the device steps' output the run checks and traces its
+    loss on keeps the rows split over that axis, as the step's own trace types them, and the run
+    trains. Cropped and flipped, not jittered: jitter's colour switch inside a loop does not trace
+    over rows an Explicit axis types (a finding of its own)."""
+    import optax
+
+    from dew import Field, InputSpec, Trainer
+    from dew.diffusion.presets import Flow
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.sampling import Euler
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import shard_batch, split_fields
+
+    objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
+                                             mlp_ratio=1),
+                                   Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
+    data = loader(spec(staging_size=24, jitter=False), batch=8, read="memory", loading=READ,
+                  objective=objective.data())
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, mesh=MeshSpec(explicit=("data",)),
+                      layout=Layout(min_shard=1, tolerance=1.))
+    state = trainer.fit(data, steps=2, log_every=1)
+    assert int(state.step) == 2
+    staged, _ = split_fields(next(iter(data.train(DataPartition()))))
+    # Under the run's mesh, where the step and its checks trace.
+    with jax.set_mesh(trainer.device_mesh):
+        image = trainer._model_shapes(shard_batch(trainer.device_mesh, staged))["image"]
+    assert image.shape == (8, 12, 12, 3)
+    assert image.sharding is not None and image.sharding.spec[0] == "data"
 
 
 def test_a_host_step_written_after_a_device_step_is_refused_in_every_spelling():

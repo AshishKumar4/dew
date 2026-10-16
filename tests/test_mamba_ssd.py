@@ -86,9 +86,9 @@ CASES = [
 def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     """mamba_ssm's own numbers at IEEE products (tools/mamba_ssd_reference.py, its kernels on a GPU):
     the port's output, final state and every gradient each within the float64 gate of mamba_ssm's
-    distance from the same scan in float64, `A` and `D`, which sum their cotangents over every token,
-    with those terms' absolute sums their floors. With `heads` the kernels that sum a group's heads take
-    that many a program."""
+    distance from the same scan in float64, each entry sized by its own float64 terms, and `A` and `D`,
+    which sum their cotangents over every token, held to the rounding of as many terms. With `heads` the
+    kernels that sum a group's heads take that many a program."""
     stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
     fixture = {name.removeprefix(f"{case}."): value
                for name, value in stored.items() if name.startswith(f"{case}.")}
@@ -118,14 +118,19 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         assert all(pin in each_config(kernel, run, *narrow) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         ported = jax.tree.map(np.asarray, jax.jit(run)(*narrow))
-    # The scan in float64 and each entry's terms, the XLA scan's own sums (`float64_terms`): `A` and `D`
-    # sum their cotangents over every token, so their terms, not their sizes, scale their rounding.
+    # The scan in float64 and each entry's terms, the XLA scan's own sums (`float64_terms`).
     with jax.enable_x64(new_val=True):
         cotangents = widened((fixture["dy"], fixture["dfinal"]))
         truth, terms = jax.tree.map(np.asarray, float64_terms(through(chunk, starts, *cotangents),
                                                               *widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
-    assert_leaves_as_exact(ported, reference, truth, reductions=chunk, terms=terms)
+    # A chunk's entries sum within it; `A` and `D` sum every token's, in another order than mamba_ssm's.
+    batch, length = inputs[0].shape[:2]
+    everywhere = {"A", "D"}
+    for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
+        mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
+                                      for tree in (ported, reference, truth, terms))
+        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
