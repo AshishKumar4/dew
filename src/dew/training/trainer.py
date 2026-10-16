@@ -2485,12 +2485,12 @@ class Trainer(Generic[Loss, Effects]):
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
                 scalars["train/mfu"] = utilization
-        bound = "_lower_bound" if flops is not None and flops.unsized else ""
+        unsized = 0.0 if flops is None else flops.unsized
         for name, counted in (("hlo_flops_util", None if flops is None else flops.model),
                               ("hfu", None if flops is None else flops.hardware)):
             utilization = None if counted is None else model_flops_utilization(counted / steps, step_time)
             if utilization is not None:
-                scalars[f"train/{name}{bound}"] = utilization
-        if bound:
-            scalars["train/unsized_kernels"] = flops.unsized / steps
+                scalars[f"train/{name}{'_lower_bound' if unsized else ''}"] = utilization
+        if unsized:
+            scalars["train/unsized_kernels"] = unsized / steps
         return scalars
