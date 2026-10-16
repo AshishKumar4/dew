@@ -916,7 +916,10 @@ def write_flax_component(directory: Path, component: str, tensors: Mapping[str, 
 def save_source(source, values, destination: Path, max_shard_size: int | str) -> None:
     """Write a native diffusion bundle back to its published directory layout, each component's
     weights one file or shards of at most `max_shard_size` and their index, under the stem its
-    library reads (`save_sharded`)."""
+    library reads (`save_sharded`). A component its source declares in Flax also gets the msgpack
+    Diffusers' Flax classes read, whole, since they read no shards; Diffusers' PyTorch classes
+    read the safetensors beside it, and their `from_flax` conversion, which reads the msgpack,
+    takes a folder without them (modeling_utils.py:1109-1113, 0.34.0)."""
     from dew.interop.safetensors_io import save_sharded
     destination.mkdir(parents=True, exist_ok=True)
     config = dict(source.config)

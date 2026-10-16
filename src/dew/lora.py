@@ -1073,11 +1073,16 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
            entries: Sequence[_Entry]) -> Adapter:
     """Build the adapter the entries describe, its factors restored into the model's tree."""
     components = _components(layouts)
-    settings = {(entry.config.rslora, entry.config.dropout, entry.config.base) for entry in entries}
+    settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
-        raise ValueError("the components disagree on use_rslora, lora_dropout or the base model, which "
-                         "one adapter carries once")
-    (rslora, dropout, base), = settings
+        raise ValueError(
+            "the components disagree on use_rslora or lora_dropout, which one adapter carries once"
+        )
+    (rslora, dropout), = settings
+    # A pipeline file's components each name their own base, as the tool that wrote it bound each
+    # (Diffusers writes each component's config apart); the adapter names one where they agree.
+    bases = {entry.config.base for entry in entries}
+    base = bases.pop() if len(bases) == 1 else None
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
     leaves: dict = {}

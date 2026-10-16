@@ -29,6 +29,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from interop_support import extract_fixture, hub_cache
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from test_joined import row_joins
@@ -37,8 +38,8 @@ from dew import lora
 from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
-from dew.interop.safetensors_io import read_file
-from dew.lora import Adapter, LoRA, Target
+from dew.interop.safetensors_io import read_file, write_file
+from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -359,33 +360,11 @@ def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_ther
     computes the logits Dew computes; Dew's own reload keeps the name. One bound to a local
     directory names none, since no other machine resolves it. The process runs offline over a Hub
     cache holding the tiny Llama at one commit."""
-    import os
-    import shutil
-    import subprocess
-    import sys
-
-    from huggingface_hub._tree_cache import TREE_CACHE_FORMAT_VERSION
-
-    # The cache a download leaves: the snapshot, the branch's commit, and the commit's tree listing.
-    commit = "0123456789abcdef0123456789abcdef01234567"
-    repo = tmp_path / "hub" / "models--dew--llama-tiny"
-    shutil.copytree(LLAMA, repo / "snapshots" / commit)
-    (repo / "refs").mkdir()
-    (repo / "refs" / "main").write_text(commit)
-    (repo / "trees").mkdir()
-    (repo / "trees" / f"{commit}.json").write_text(json.dumps({
-        "format_version": TREE_CACHE_FORMAT_VERSION,
-        "files": {path.name: {"size": path.stat().st_size, "blob_id": f"{index:040x}"}
-                  for index, path in enumerate(sorted(LLAMA.iterdir())) if path.is_file()}}))
+    commit = hub_cache(tmp_path / "hub", "dew/llama-tiny", LLAMA)
     hub, local = tmp_path / "hub-adapter", tmp_path / "local-adapter"
-    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
-           "PYTHONPATH": str(ROOT / "src")}
 
     def run(script, *arguments):
-        done = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], env=env, check=False,
-                              capture_output=True, text=True)
-        assert done.returncode == 0, done.stderr[-3000:]
-        return done.stdout.split("\n")
+        return offline(tmp_path / "hub", script, *arguments)
 
     reloaded = [json.loads(line) for line in run(_HUB_ADAPTER, hub, local, LLAMA) if line]
     assert reloaded == [["dew/llama-tiny", commit], True, None, True]
@@ -395,6 +374,47 @@ def test_an_adapter_names_the_hub_model_it_was_bound_to_and_peft_reloads_it_ther
     assert not {"base_model_name_or_path", "revision"} & set(written)
     run(_PEFT_READS, hub, LLAMA / "input_ids.npy")
     np.testing.assert_allclose(np.load(hub / "peft.npy"), np.load(hub / "logits.npy"), atol=2e-5)
+
+
+def offline(cache: Path, script: str, *arguments) -> list[str]:
+    """`script`'s output lines, run in a fresh process that resolves the Hub from `cache` alone."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "HF_HUB_CACHE": str(cache), "HF_HUB_OFFLINE": "1", "PYTHONPATH": str(ROOT / "src")}
+    done = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], env=env, check=False,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return done.stdout.split("\n")
+
+
+_HUB_PIPELINE_ADAPTER = """
+import json, sys
+from dew.interop.pretrained import load_diffusion_source
+from dew.interop.safetensors_io import read_file
+from dew.lora import DIFFUSERS_METADATA, DIFFUSERS_WEIGHTS, LoRA
+
+source = load_diffusion_source("dew/sd-tiny", dtype="float32", attention_impl="reference")
+adapted = source.adapt(LoRA(rank=2, modules=("to_q", "to_v")), key=0)
+adapted.adapter.save(adapted.variables, sys.argv[1])
+_, metadata = read_file(sys.argv[1] + "/" + DIFFUSERS_WEIGHTS)
+header = json.loads(metadata[DIFFUSERS_METADATA])
+print(json.dumps({key: value for key, value in header.items()
+                  if key.endswith((".base_model_name_or_path", ".revision"))}))
+"""
+
+
+def test_a_pipeline_a_run_reads_off_the_hub_names_it_as_its_adapters_base(tmp_path):
+    """The loader a diffusion run reads its pipeline with (`load_diffusion_source`),
+    offline over a Hub cache holding the tiny SD pipeline at one commit, binds an
+    adapter whose Diffusers file names that pipeline and commit as the denoiser's
+    base, as an adapter of `Pretrained.load`'s source does."""
+    source = extract_fixture(ROOT / "tests/fixtures/tiny_diffusers.tar.xz", tmp_path / "fixtures") / "sd"
+    commit = hub_cache(tmp_path / "hub", "dew/sd-tiny", source)
+    [named] = [json.loads(line) for line in offline(tmp_path / "hub", _HUB_PIPELINE_ADAPTER,
+                                                    tmp_path / "adapter") if line]
+    assert named == {"unet.base_model_name_or_path": "dew/sd-tiny", "unet.revision": commit}
 
 
 _PEFT_READS = """
@@ -593,6 +613,25 @@ def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_
         if key.startswith("merged/"):
             np.testing.assert_allclose(layouts[key.removeprefix("merged/")].export(merged), sd_reference[key],
                                        atol=1e-6, rtol=0)
+
+
+def test_a_pipeline_file_loads_whatever_base_each_component_names(pipeline, tmp_path):
+    """Diffusers writes each component's PEFT config apart, and the tool that bound
+    each names the model it bound it to, so a file's components may name different
+    bases. The file loads all the same, and the adapter names a base where every
+    component names the same one."""
+    tensors, metadata = read_file(SD / lora.DIFFUSERS_WEIGHTS)
+    header = json.loads(metadata[lora.DIFFUSERS_METADATA])
+    for bases, expected in (({"unet": "org/sd", "text_encoder": "org/clip"}, None),
+                            ({"unet": "org/sd", "text_encoder": "org/sd"}, AdapterBase("org/sd", None))):
+        named = {**header,
+                 **{f"{component}.base_model_name_or_path": name for component, name in bases.items()}}
+        directory = tmp_path / str(len(set(bases.values())))
+        directory.mkdir()
+        write_file(tensors, directory / lora.DIFFUSERS_WEIGHTS,
+                   {**metadata, lora.DIFFUSERS_METADATA: json.dumps(named)})
+        loaded = LoRA.load(pipeline.model, pipeline.variables, directory, layouts=pipeline.layouts)
+        assert loaded.base == expected
 
 
 def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
