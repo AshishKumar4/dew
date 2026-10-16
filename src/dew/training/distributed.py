@@ -61,6 +61,7 @@ from dew.nn.sharding import (
     ruled_boxes,
 )
 from dew.objectives.base import Batch, Variables
+from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 
 # The role axes no parameter splits over: data holds a batch's replicas,
@@ -313,6 +314,19 @@ def link_topology(mesh: Mesh, axis: str) -> str:
                 device.core_on_chip if hasattr(device, "core_on_chip") else None]
                for device in mesh.devices.flat]
     return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
+
+
+def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
+    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each measured figure of
+    `bandwidths`, by mesh and axis, under the placement it was measured on (`link_topology`)."""
+    return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()
+            if figure is not None}
+
+
+def resumed_link_figures(rung: JSON) -> dict[str, float]:
+    """`link_figures` as a checkpoint's rung recorded them; none where it recorded none."""
+    links = record(record(rung, 'rung').get('links', {}), 'rung links')
+    return {topology: number(figure, f'link of {topology}') for topology, figure in links.items()}
 
 
 def _link_record(topology: str) -> Path | None:
