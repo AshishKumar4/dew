@@ -876,8 +876,8 @@ def export_config(model) -> Mapping[str, object]:
                 f"and the {family.export_model_type} reference rotates every layer "
                 "at one table; the model cannot be written back")
         config['rope_parameters'] = {
-            kind: (dataclasses.asdict(yarn) if yarn is not None else
-                   {'rope_type': 'default', 'rope_theta': model.kind_of(kind).rope_theta})
+            kind: {**({'rope_type': 'default'} if yarn is None else dataclasses.asdict(yarn)),
+                   'rope_theta': model.kind_of(kind).rope_theta}
             for kind, yarn in yarns.items()}
         config.pop('rope_local_base_freq', None)
     elif ramped:

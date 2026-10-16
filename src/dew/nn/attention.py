@@ -28,11 +28,13 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .documents import CrossDocuments, document_ids, document_offsets, with_documents
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import (
     bf16_dot_runs,
+    capability,
     device_generation,
     first_refusal,
     gpu_placed,
@@ -178,19 +180,6 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
 
 
-def document_mask(segment_ids) -> jax.Array:
-    """Keep each packed document to itself: `[B, S, S]` boolean.
-
-    Two positions see each other when they carry the same segment id.
-    Segment 0 is padding, which sees nothing and is seen by nothing. This is
-    the mask every kernel but splash and the pallas flash kernel reads for
-    `segment_ids`; those two compare the ids per block.
-    """
-    segment_ids = jnp.asarray(segment_ids)
-    return ((segment_ids[:, :, None] == segment_ids[:, None, :])
-            & (segment_ids[:, :, None] != 0))
-
-
 def chunk_mask(query_positions, key_positions, chunk_size: int):
     """Boolean `[.., 1, T, S]` keeping keys in the query's chunk, both absolute.
 
@@ -234,7 +223,17 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     row from its index; an explicit mask is reduced over its keys, folded
     with them (`combined_attention_mask`).
     """
-    if mask is not None or (segment_ids is not None and key_value_seq_lengths is not None):
+    if isinstance(segment_ids, CrossDocuments) and mask is None and key_value_seq_lengths is None:
+        # A query of another sequence's documents sees a key where its document holds one: the
+        # keys' ids run in ascending order, padding after them, so each query's id is searched in
+        # its row's keys rather than compared with every key.
+        queries, keys = document_ids(segment_ids)
+        ordered = jnp.where(keys == 0, jnp.iinfo(keys.dtype).max, keys)
+        held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
+                        - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
+        return ((held > 0) & (queries != 0))[:, :, None, None]
+    if (mask is not None or isinstance(segment_ids, CrossDocuments)
+            or (segment_ids is not None and key_value_seq_lengths is not None)):
         visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
         if segment_ids is not None:
             visible = with_documents(visible, segment_ids)
@@ -826,6 +825,11 @@ def tensor_shards(query) -> int:
                      for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
+def shard_heads(query) -> int:
+    """The query heads one shard holds (`tensor_shards`)."""
+    return query.shape[-2] // tensor_shards(query)
+
+
 def split_with_queries(key, value, split: int):
     """`key` and `value` with their heads repeated to the least common multiple
     of their count and `split`, the ways the mesh splits the query heads, so
@@ -1002,8 +1006,8 @@ def cudnn_max_head_dim() -> int:
     """The widest heads cuDNN's fused bf16/fp16 kernel takes on this GPU: 256 on Hopper and later, 128
     before (jax's `check_is_flash_attention`, jax/_src/cudnn/fused_attention_stablehlo.py, which
     raises past it)."""
-    generation = device_generation()
-    return 256 if generation.startswith('sm') and int(generation[2:]) >= 90 else 128
+    named = capability(device_generation())
+    return 256 if named is not None and named >= (9, 0) else 128
 
 
 def cudnn_runs(query, softcap=None) -> bool:
@@ -1066,10 +1070,13 @@ def flash_architectures() -> tuple[str, ...] | None:
     return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
-def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
-    """Whether a wheel built for `architectures` holds code `generation` runs: its own, or sm80's on
-    any 8.x part, which runs it."""
-    return generation in architectures or (generation.startswith('sm8') and 'sm80' in architectures)
+def flash_built_for(device: str, architectures: tuple[str, ...]) -> bool:
+    """Whether a wheel built for `architectures` holds code the generation `device` runs: a CUDA
+    binary for X.Y runs on X.Z from Z = Y up, so its own, or sm80's on any 8.x part."""
+    own = capability(device)
+    built = [capability(architecture) for architecture in architectures]
+    return own is not None and any(named is not None and named[0] == own[0] and named[1] <= own[1]
+                                   for named in built)
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
@@ -1086,8 +1093,10 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
-    narrow = generation.startswith('sm8') and generation != 'sm80'
-    widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
+    named = capability(generation)
+    # FlashAttention's own rule (`is_sm8x`): an 8.x part past 8.0 takes no wider backward.
+    widest = (FLASH_MAX_BACKWARD_HEAD_DIM if named is not None and named[0] == 8 and named[1] > 0
+              else FLASH_MAX_HEAD_DIM)
     return first_refusal(
         (gpu_placed() and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
@@ -1139,19 +1148,33 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
-    def local(query, key, value, sinks=None, segment_ids=None):
+    def local(query, key, value, sinks=None, segment_ids=None, key_segment_ids=None):
         if segment_ids is None or max_segments is None:
             return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
         rows, length = segment_ids.shape
-        changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-        begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-        offsets = cu_seqlens(begins, rows * (max_segments + 1))
-        out = flash.flash_mha_varlen(*(x.reshape(rows * length, *x.shape[2:]) for x in (query, key, value)),
-                                     offsets, length, is_causal=causal, window_size=window, sinks=sinks)
+        flat = (query.reshape(rows * length, *query.shape[2:]),
+                *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
+        if key_segment_ids is None:
+            # A call's own documents are its runs, whatever their ids.
+            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
+            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+        else:
+            # Another sequence's documents pair with the queries' by id, sequence i each side's
+            # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
+            # has none of.
+            offsets, key_offsets = (document_offsets(ids, max_segments)
+                                    for ids in (segment_ids, key_segment_ids))
+            own_keys = {"key_cu_seqlens": key_offsets, "key_max_seqlen": max(1, key_segment_ids.shape[1])}
+        out = flash.flash_mha_varlen(*flat, offsets, length, is_causal=causal, window_size=window,
+                                     sinks=sinks, **own_keys)
         return out.reshape(rows, length, *out.shape[1:])
 
+    queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
     return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
-                      segment_ids=(segment_ids, ("activation_batch", None)))
+                      segment_ids=(queries, ("activation_batch", None)),
+                      key_segment_ids=(keys if isinstance(segment_ids, CrossDocuments) else None,
+                                       ("activation_batch", None)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1259,7 +1282,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
-                                 dropout_rng=None, deterministic=True):
+                                 dropout_rng=None, deterministic=True, key_segment_ids=None):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
     `implementation` names the kernel (`AttentionImpl`, dispatched by
@@ -1278,6 +1301,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
+    `key_segment_ids` `[B, K]` are the keys' own where they are not the
+    queries (`CrossDocuments`): each query reads its document's keys, with
+    no causal mask or window, whose positions the two sides do not share.
     `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding.
@@ -1291,6 +1317,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     shards = sequence_shards()
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
+    if key_segment_ids is not None:
+        if segment_ids is None or causal or sliding_window is not None:
+            raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids, and "
+                             "a call between two sequences' documents takes no causal mask or window")
+        segment_ids = CrossDocuments(segment_ids, key_segment_ids)
     if dropout_rate and not deterministic:
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
@@ -1358,12 +1389,6 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                 and at_least_fp32(dtype or query.dtype) == jnp.float32),
         qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
         attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
-
-
-def with_documents(mask, segment_ids):
-    """`mask` narrowed to each packed document's own keys, `[B, 1, S, S]`."""
-    inside = document_mask(segment_ids)[:, None]
-    return inside if mask is None else jnp.logical_and(mask, inside)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,
@@ -1864,7 +1889,7 @@ def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=N
     if q_len % SPLASH_LANES or kv_len % SPLASH_LANES or min(q_len, kv_len) < SPLASH_MIN_LENGTH:
         return False
     return splash_mask_descriptor(
-        q_len, kv_len, query.shape[-2], causal, sliding_window, mask) is not None
+        q_len, kv_len, shard_heads(query), causal, sliding_window, mask) is not None
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
@@ -1887,12 +1912,17 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     splash under pallas's interpreter, which is how the parity tests run its
     arithmetic off a TPU; it is far slower than XLA, so only an explicit 'tpu'
     uses it. The flash kernel has no interpreter and runs only on a TPU.
+
+    A Mosaic kernel cannot be partitioned automatically, so on a mesh both run
+    per shard (`_per_shard`), on its rows and heads. Splash's descriptor then
+    covers one shard's heads, so a mask that differs by head where the mesh
+    splits the heads is flash's.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     descriptor = None
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
-            q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
+            q_len, kv_len, shard_heads(query), causal, sliding_window, mask)
     if descriptor is None and (softcap is not None or sinks is not None):
         raise ValueError(
             "attention implementation 'tpu' takes a softcap and sinks only on "
@@ -1900,12 +1930,20 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
             "describe or a length that is not a multiple of "
             f"{SPLASH_LANES}. Use attention_impl 'xla'.")
 
-    def attend(query, key, value, bias, sinks):
+    def local(query, key, value, bias=None, mask=None, sinks=None, segment_ids=None):
         if descriptor is None:
             return pallas_flash_attention(query, key, value, bias, mask, causal,
                                           sliding_window, segment_ids)
         return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
                                 segment_ids=segment_ids, interpret=interpret)
+
+    def attend(query, key, value, bias, sinks):
+        # Splash holds the mask in its descriptor; flash takes it as an array.
+        held = None if descriptor is not None or mask is None else _four_dimensional(mask)
+        return _per_shard(local, query, key, value,
+                          bias=(None if bias is None else _four_dimensional(bias), SCORES),
+                          mask=(held, SCORES), sinks=(sinks, ("activation_heads",)),
+                          segment_ids=(segment_ids, ("activation_batch", None)))
 
     if jnp.finfo(query.dtype).bits == 16 and not interpret:
         # Mosaic multiplies 16-bit operands at the default precision only.
@@ -1937,7 +1975,7 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
         head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
     segments = (None if segment_ids is None
-                else splash_attention_kernel.SegmentIds(segment_ids, segment_ids))
+                else splash_attention_kernel.SegmentIds(*document_ids(segment_ids)))
 
     def example(q, k, v, ids):
         return kernel(q, k, v, segment_ids=ids, sinks=sinks)
@@ -2061,9 +2099,49 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
             jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
             (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
         combined = seated if combined is None else combined + seated
-    segments = None if segment_ids is None else SegmentIds(segment_ids, segment_ids)
+    segments = None if segment_ids is None else SegmentIds(*document_ids(segment_ids))
     return jnp.moveaxis(
         flash_attention(q, k, v, ab=combined, segment_ids=segments, causal=causal), -3, -2)
+
+
+def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias: bool = True,
+                    dtype: Dtype | None = None, precision: PrecisionLike = None,
+                    norm: Callable[[jax.Array], jax.Array] | None = None, across_heads: bool = False
+                    ) -> jax.Array:
+    """`x` `[..., C]` projected by the matrix `name` to `[..., heads, head_dim]`
+    in the calling module, then normalized by `norm`.
+
+    `flat` stores the matrix as the published diffusion and vision attentions
+    do, `[C, heads * head_dim]`, and splits its product into heads; otherwise
+    it is `[C, heads, head_dim]` (`nn.DenseGeneral`), Dew's own, whose heads a
+    tensor axis splits. A checkpoint's reader maps one layout or the other, so
+    each attention keeps its own. `norm` normalizes each head's channels, or
+    with `across_heads` each token's whole projection before it splits, as
+    Wan's `rms_norm_across_heads` does: another function, not another order.
+    """
+    width = heads * head_dim
+    if flat:
+        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+    else:
+        projected = nn.DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
+                                    name=name)(x)
+    if norm is not None and across_heads:
+        projected = norm(projected.reshape(*x.shape[:-1], width))
+    projected = projected.reshape(*x.shape[:-1], heads, head_dim)
+    return norm(projected) if norm is not None and not across_heads else projected
+
+
+def projected_output(attended, name: str, features: int, *, flat: bool, bias: bool = True,
+                     dtype: Dtype | None = None, precision: PrecisionLike = None) -> jax.Array:
+    """Heads `[..., heads, head_dim]` joined by the matrix `name` to `[..., features]`
+    in the calling module, the matrix stored as `projected_heads` stores its
+    own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
+    if flat:
+        # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
+        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+            attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
+    return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
+                           name=name)(attended)
 
 
 @logical_axes({
@@ -2083,7 +2161,10 @@ class NormalAttention(nn.Module):
     `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
     each query may read. `key_value_seq_lengths` `[B]` ends each row's keys
     instead, for a right-padded context, which a fused kernel skips rather
-    than reading as a dense bias per head.
+    than reading as a dense bias per head. `segment_ids` `[B, S]` keeps each
+    query to its packed document's keys, `key_segment_ids` `[B, S_context]`
+    numbering the context's (`CrossDocuments`), at most `max_segments` a
+    row, which a fused kernel runs as packed sequences rather than a mask.
     """
     query_dim: int
     heads: int = 4
@@ -2117,35 +2198,17 @@ class NormalAttention(nn.Module):
                 + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
-    def setup(self):
-        maps = self.projections()
-        dense = functools.partial(
-            nn.DenseGeneral,
-            features=[self.heads, maps['to_q'][1] // self.heads],
-            axis=-1,
+    def _heads(self, name: str, x, norm: str | None = None):
+        projected = projected_heads(
+            x, name, self.heads, self.dim_head, flat=False,
+            bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
             precision=self.precision,
-            use_bias=self.use_bias if self.qkv_bias is None else self.qkv_bias,
-            dtype=self.dtype
-        )
-        self.query = dense(name="to_q")
-        self.key = dense(name="to_k")
-        self.value = dense(name="to_v")
-
-        if self.qk_norm:
-            self.q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="q_norm")
-            self.k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="k_norm")
-
-        self.proj_attn = nn.DenseGeneral(
-            maps['to_out_0'][1],
-            axis=(-2, -1),
-            precision=self.precision,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            name="to_out_0",
-        )
+            norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
+        return constrain(projected, HEADS)
 
     @nn.compact
-    def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None):
+    def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,
+                 segment_ids=None, key_segment_ids=None, max_segments=None):
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
@@ -2156,13 +2219,10 @@ class NormalAttention(nn.Module):
         # [B, S, heads, head_dim], column-parallel under a tensor axis; a
         # context's positions split over a sequence axis where its link pays
         # for it (`split_positions`).
-        query = constrain(self.query(x), HEADS)
-        key, value = split_positions(
-            context, (self.heads, self.dim_head),
-            lambda tokens: (constrain(self.key(tokens), HEADS), constrain(self.value(tokens), HEADS)))
-        if self.qk_norm:
-            query = self.q_norm(query)
-            key = self.k_norm(key)
+        query = self._heads("to_q", x, "q_norm")
+        key, value = split_positions(context, (self.heads, self.dim_head),
+                                     lambda tokens: (self._heads("to_k", tokens, "k_norm"),
+                                                     self._heads("to_v", tokens)))
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
             query = rotate(query, freqs_cos, freqs_sin)
@@ -2172,8 +2232,10 @@ class NormalAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
+            segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
-        proj = self.proj_attn(constrain(hidden_states, HEADS))
+        proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
+                                bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
 

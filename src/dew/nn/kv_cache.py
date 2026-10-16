@@ -41,9 +41,11 @@ from typing import Literal, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import backend
 from dew.nn.scatter import DROPPED
+from dew.nn.sharding import logical_spec, manual_map, mesh_axes
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -459,7 +461,9 @@ class KVStore:
                 or self.layout.groups != 1 or self.dtype != jnp.bfloat16):
             return False
         if backend() == "tpu":
-            return True
+            # On a mesh the kernel runs per shard (`decode`), each holding the pool's key heads its
+            # query heads read.
+            return self.kv_heads % _head_shards(query) == 0
         if backend() != "gpu":
             return False
         from dew.nn.attention import FORWARD_MODE
@@ -473,8 +477,12 @@ class KVStore:
 
         Decode runs the device's paged kernel. The TPU kernel does not scale
         the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
-        same scale every other attention path applies. On a GPU, a `softcap`
-        raises `ValueError`.
+        same scale every other attention path applies. A Mosaic kernel cannot
+        be partitioned automatically, so on a mesh the TPU kernel runs per
+        shard (`manual_map`): each holds its rows' queries, lengths and page
+        tables, and the key heads of the pool its query heads read, with every
+        page, as the tables index the whole pool. On a GPU, a `softcap` raises
+        `ValueError`.
         """
         if backend() == "gpu":
             if softcap is not None:
@@ -483,17 +491,30 @@ class KVStore:
                               self._get(TABLE), lengths)
         from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
-        scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
-        table = self._get(TABLE)
-        return paged_attention(
-            scaled,
-            self._get("cached_key"),
-            self._get("cached_value"),
-            lengths,
-            table,
-            attn_logits_soft_cap=softcap,
-            pages_per_compute_block=_pages_per_block(table.shape[1]),
-        )
+        def local(query, key, value, lengths, table):
+            scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
+            return paged_attention(scaled, key, value, lengths, table, attn_logits_soft_cap=softcap,
+                                   pages_per_compute_block=_pages_per_block(table.shape[1]))
+
+        arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE))
+        mesh = jax.sharding.get_abstract_mesh()
+        if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+            return local(*arrays)
+        queries = logical_spec(DECODE_QUERY, query.shape)
+        # A spec leaves off trailing whole dimensions.
+        rows, heads = (*queries, None, None)[:2]
+        return manual_map(local, (queries, P(heads), P(heads), P(rows), P(rows)), queries)(*arrays)
+
+
+DECODE_QUERY = ("activation_batch", "activation_heads", None)
+"""The logical axes of a decode query `[rows, heads, head_dim]`."""
+
+
+def _head_shards(query: jax.Array) -> int:
+    """How many ways the mesh splits a decode query's heads."""
+    mesh = jax.sharding.get_abstract_mesh()
+    heads = (*logical_spec(DECODE_QUERY, query.shape), None, None)[1]
+    return math.prod(mesh.shape[axis] for axis in mesh_axes(heads))
 
 
 def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:

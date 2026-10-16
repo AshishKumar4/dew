@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import replaced  # noqa: E402
+from torch_precision import replaced
 
 
 def restore_transformers_names() -> None:

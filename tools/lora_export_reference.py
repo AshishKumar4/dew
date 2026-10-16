@@ -290,8 +290,10 @@ def consume() -> None:
     import torch
     import transformers
 
-    # Before Diffusers' pipelines: restores the transformers names they import.
-    import tools.diffusers_consumer  # noqa: F401
+    from tools.diffusers_reference_helpers import restore_transformers_names
+
+    # Before Diffusers' pipelines: the transformers names they import.
+    restore_transformers_names()
 
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for name, case in CASES.items():
