@@ -494,6 +494,17 @@ class JointLayout(Layout):
         return list(range(len(keys)))
 
 
+def default_layout(causal: bool, one_question: bool) -> Layout:
+    """The layout a head reads where none is given: every question of a
+    request in one row (`JointLayout`) for a head that reads several a row
+    (`Head.one_question` false), else the one the backbone's order asks for,
+    the state first for a causal backbone (`StateFirstLayout`) and Laya's
+    markers for a bidirectional one (`MarkerLayout`)."""
+    if not one_question:
+        return JointLayout()
+    return StateFirstLayout() if causal else MarkerLayout()
+
+
 def _compact(value: JSON) -> str:
     """A value as the joint layout renders it: text as it is, anything else as compact JSON with
     sorted keys."""

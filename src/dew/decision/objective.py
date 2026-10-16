@@ -23,11 +23,10 @@ from dew.decision.layout import (
     Bounds,
     DecisionInputs,
     Layout,
-    MarkerLayout,
     QuestionLayout,
     Specials,
-    StateFirstLayout,
     compacted,
+    default_layout,
     question_fields,
 )
 from dew.decision.model import DecisionModel
@@ -373,10 +372,12 @@ class DecisionObjective(Objective[Ratio]):
     `backbone` is a model built from scratch, a loaded model
     (`Pretrained.load`, adapted with LoRA or partly frozen through `freeze`, as
     `LMObjective` accepts one), or a whole `Decide` task, such as Laya's released
-    checkpoint, which brings its head and layout with it. A bidirectional
-    backbone reads Laya's `MarkerLayout` and a causal one the `StateFirstLayout`,
-    unless `layout` says otherwise. `tokenizer` and `specials` default to the
-    loaded model's.
+    checkpoint, which brings its head and layout with it. Unless `layout` says
+    otherwise, a head that reads several questions a row reads them in one
+    row (`JointLayout`), and one that reads one question a row reads Laya's
+    `MarkerLayout` over a bidirectional backbone and the `StateFirstLayout`
+    over a causal one (`default_layout`). `tokenizer` and `specials` default
+    to the loaded model's.
 
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
@@ -477,7 +478,7 @@ class DecisionObjective(Objective[Ratio]):
                     f"a {type(module).__name__} does not say whether it reads its tokens in "
                     "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)"
                 )
-            layout = StateFirstLayout() if module.causal else MarkerLayout()
+            layout = default_layout(module.causal, head.one_question)
         self.layout = layout
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
