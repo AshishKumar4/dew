@@ -168,7 +168,7 @@ _TYPE_ROWS = tuple({Noul: 0, Choice: 1, Score: 2}[kind] for kind in KINDS)
 
 class _Reading(NamedTuple):
     """Which of the window's tokens each attention query of the joint head reads: those of its own
-    row, by documents (`dew.nn.attention.CrossDocuments`). `tokens` `[B, L]` are the window's
+    row, by documents (`dew.nn.documents.CrossDocuments`). `tokens` `[B, L]` are the window's
     rows, `questions` `[B, Q]` each question's and `slots` `[B, P]` each option slot's, 0 for
     padding, each in window order with its padding after, as packed sequences need them."""
 
