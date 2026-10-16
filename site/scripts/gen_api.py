@@ -129,6 +129,20 @@ class Unresolved(Exception):
     pass
 
 
+def inside(obj: griffe.Object | griffe.Alias) -> griffe.Object | None:
+    """The object `obj` names within the package, through every alias; None where an alias leads into
+    another package (flax's Module, a TypedDict), which griffe has not loaded and whose members this
+    does not read. An alias within the package that leads nowhere raises (`Unresolved`)."""
+    while obj.is_alias:
+        if not f"{obj.target_path}.".startswith(f"{P.package}."):
+            return None
+        try:
+            obj = obj.target
+        except (griffe.AliasResolutionError, griffe.CyclicAliasError) as error:
+            raise Unresolved(str(error)) from error
+    return obj
+
+
 def resolve(obj: griffe.Object | griffe.Alias) -> griffe.Object:
     try:
         return obj.final_target if obj.is_alias else obj
@@ -498,8 +512,9 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
     if path.suffix == ".ipynb":
         for cell in json.loads(path.read_text())["cells"]:
             if cell["cell_type"] == "code":
-                # IPython's `%` and `!` lines are not Python.
-                yield "".join(re.sub(r"^\s*[%!].*", "", line) for line in cell["source"]), None
+                # IPython's `%` and `!` lines are not Python. A cell's source is one string or a list
+                # of its lines (nbformat's multiline string), which join to the same text.
+                yield re.sub(r"^\s*[%!].*", "", "".join(cell["source"]), flags=re.M), None
     elif path.suffix == ".md":
         for block in re.findall(r"^```(?:python|py)[^\n]*\n(.*?)^```", path.read_text(), re.S | re.M):
             yield block, None
@@ -537,7 +552,8 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     `name = Class(...)`, which binds an `Instance` whose calls must be methods."""
     try:
         tree = ast.parse(code)
-    except SyntaxError:
+    except SyntaxError as error:
+        yield f"a Python unit does not parse, so none of its names is checked: {error}"
         return
     assigned = {node.id for node in ast.walk(tree)
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
@@ -630,9 +646,10 @@ def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
     """Why calling `path`, an instance's member, leaves the documented API:
     the member is a value an instance holds, not a method, which is what a
     method renamed to make room for a field of the same name leaves behind."""
-    try:
-        member = resolve(cls.all_members[path[1]])
-    except (KeyError, Unresolved, griffe.AliasResolutionError, griffe.CyclicAliasError):
+    found = (cls.members if outside_bases(cls) else cls.all_members).get(path[1])
+    # A member the class lacks is `unresolved_chain`'s to report; one of another package's, not read.
+    member = None if found is None else inside(found)
+    if member is None:
         return None
     if member.is_attribute and "instance-attribute" in member.labels and "property" not in member.labels:
         return f"`{'.'.join(path)}(...)`: {path[1]} is a value {cls.path} holds, not a method"
@@ -666,28 +683,26 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
             member = current.members.get(attribute)
             if member is None or attribute.startswith("_"):
                 return f"`{used}`: {current.path} has no public {attribute}"
-            try:
-                current = resolve(member)
-                # `dew.pipeline` names the function its own module exports.
-                if current.is_module and f"{current.path}.{attribute}" in home:
-                    current = resolve(current.members[attribute])
-            except Unresolved:
+            current = inside(member)
+            # `dew.pipeline` names the function its own module exports.
+            if current is not None and current.is_module and f"{current.path}.{attribute}" in home:
+                current = inside(current.members[attribute])
+            if current is None:
+                # Another package's object, whose members this does not read.
                 return None
             if not current.is_module and current.path not in home:
                 return f"`{used}` ({current.path}) is not documented"
         elif current.is_class:
             if attribute.startswith("_") and not attribute.startswith("__"):
                 return f"`{used}`: {attribute} is private to {current.path}"
-            try:
-                members = current.all_members
-            except (griffe.AliasResolutionError, griffe.CyclicAliasError):
-                return None
+            outside = outside_bases(current)
+            members = current.members if outside else current.all_members
             if attribute not in members:
                 # A base outside Dew (flax, a TypedDict) may define it.
-                return None if outside_bases(current) else f"`{used}`: {current.path} has no {attribute}"
-            try:
-                current = resolve(members[attribute])
-            except Unresolved:
+                return None if outside else f"`{used}`: {current.path} has no {attribute}"
+            current = inside(members[attribute])
+            if current is None:
+                # Another package's object, whose members this does not read.
                 return None
         else:
             return None

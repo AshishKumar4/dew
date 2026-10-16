@@ -120,7 +120,7 @@ def main() -> None:
                                       "replay": "/hero/train.json"}}
     (DATA / "capture.json").write_text(json.dumps(capture, indent="\t") + "\n")
     (DATA / "hero.py").write_text(options.script.read_text())
-    print(f"prepared {len(replay['frames'])} frames from {replay['seconds']:.1f} s of recording")  # noqa: T201
+    print(f"prepared {len(replay['frames'])} frames from {replay['seconds']:.1f} s of recording")
 
 
 if __name__ == "__main__":

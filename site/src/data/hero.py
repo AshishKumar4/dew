@@ -12,14 +12,17 @@ steps = 1000
 tokens = None
 
 # Begin command line
-import argparse  # noqa: E402
+def command_line(steps, tokens):
+    import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--steps", type=int, default=steps)
-parser.add_argument("--tokens")
-args = parser.parse_args()
-steps = args.steps
-tokens = args.tokens
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=steps)
+    parser.add_argument("--tokens", default=tokens)
+    args = parser.parse_args()
+    return args.steps, args.tokens
+
+
+steps, tokens = command_line(steps, tokens)
 # End command line
 
 data = (load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=256)

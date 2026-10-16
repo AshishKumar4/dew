@@ -308,18 +308,16 @@ def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
     assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
 
 
-def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data(tmp_path):
-    """In a training context (live_training.install), a bare source through dew.data.load, a recipe
-    through its loader and a recipe's own load each read batches of BATCH rows, saying so first."""
+def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps(tmp_path):
+    """In a training context (live_training.install), a cell's bare source through dew.data.load, a
+    recipe through its loader and a recipe's own load each read batches of BATCH rows, and its fit
+    runs STEPS steps logging four times, each saying so first: IPython runs the cell with its calls
+    capped, and Dew's own functions are untouched."""
     import numpy as np
 
     np.arange(400, dtype=np.uint16).tofile(tmp_path / "train.bin")
     np.arange(400, dtype=np.uint16).tofile(tmp_path / "val.bin")
-    code = f"""
-import json, sys
-sys.path.insert(0, {str(CONTAINER)!r})
-import live_training
-live_training.install()
+    cell = f"""
 from dew.config.data import TextData, loader
 from dew.data import Loading, Memory, load
 windows = TextData(source={str(tmp_path)!r}, seq_len=4, stride=1)
@@ -327,14 +325,29 @@ options = dict(read="memory", loading=Loading(workers=0), validation_records=32)
 bare = load(Memory([{{"id": index}} for index in range(320)]), batch=64, provision=False,
             loading=Loading(workers=0))
 batches = [bare.batch, loader(windows, batch=64, **options).batch, windows.load(batch=64, **options).batch]
-print(json.dumps(batches))
+class Fitting:
+    def fit(self, data, *, steps, log_every=100):
+        return steps, log_every
+fits = [Fitting().fit(bare, steps=1000), Fitting().fit(bare, steps=3, log_every=1)]
+print(json.dumps([batches, fits, load is dew.data.load]))
+"""
+    code = f"""
+import json, sys
+sys.path.insert(0, {str(CONTAINER)!r})
+from IPython.core.interactiveshell import InteractiveShell
+import live_training
+shell = InteractiveShell.instance()
+live_training.install()
+shell.run_cell("import json, dew.data")
+shell.run_cell({cell!r}).raise_error()
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
-    *said, batches = done.stdout.strip().splitlines()
-    assert json.loads(batches) == [8, 8, 8]
-    assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3
+    *said, ran = done.stdout.strip().splitlines()
+    assert json.loads(ran) == [[8, 8, 8], [[20, 5], [3, 1]], True]
+    assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3 + [
+        "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
 
 
 def test_a_session_idle_past_its_allowance_ends_and_says_so(bridge, monkeypatch):
