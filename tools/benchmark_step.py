@@ -63,6 +63,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
+from dew.training import Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -358,6 +359,16 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
+def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float | None, float | None]:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator, and that MFU over the
+    mesh's peak; both None where the model has no count."""
+    try:
+        flops = trainer.objective.training_flops(None, global_batch(case))
+    except MissingFlopsCount:
+        return None, None
+    return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
+
+
 def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
@@ -432,12 +443,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
-        try:
-            training_flops = trainer.objective.training_flops(None, global_batch(case))
-        except MissingFlopsCount:
-            training_flops = None
-        mfu = None if training_flops is None else model_flops_utilization(
-            training_flops / trainer.device_mesh.devices.size, step_time)
+        training_flops, mfu = training_work(trainer, case, step_time)
         peak = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
