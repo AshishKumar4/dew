@@ -288,13 +288,14 @@ class TorchCausalLM(nn.Module):
         return self(tokens, train=train)
 
     def output_table(self) -> OutputTable | None:
-        """The output head's `[vocab, features]` torch weight cast as the forward
-        casts it, with the forward's compute dtype deciding the product's operands
-        whatever dtype the states arrive in (`head_product`), or None when the
-        logits are not its plain product."""
+        """The output head's `[vocab, features]` torch weight as the bound params
+        hold it, the parameter a loss keeps, with the forward's compute dtype,
+        which casts the product's operands as the forward casts them whatever
+        dtype the states arrive in (`head_product`); or None when the logits are
+        not its plain product."""
         if self.graph.head is None:
             return None
-        return OutputTable(self._compute(self.variables["params"][self.graph.head]), vocab_major=True,
+        return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
                            precision=self.precision, compute=self.dtype)
 
     def _run(self, tokens, train: bool) -> tuple[jax.Array, jax.Array]:
