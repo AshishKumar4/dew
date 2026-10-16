@@ -115,6 +115,12 @@ jobs:
         python tools/check_distribution.py dist/*
     - name: Install the wheel into an empty environment, compile it, run `dew --help` and train
       run: python tools/smoke_wheel.py dist/*.whl
+    # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
+    - if: github.event_name == 'release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: dist
+        path: dist/
     - name: Install the wheel from PyPI into an empty environment
       run: |
         python -m venv "$RUNNER_TEMP/clean"

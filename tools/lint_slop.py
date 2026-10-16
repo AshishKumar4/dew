@@ -27,6 +27,8 @@ Scope is per rule, because the rules are not all about the same thing:
   reads every call argument it takes, and a token mixer's `reads` names the
   `MIXING` fields (`src/<package>/nn/inputs.py`) it reads, no more and no
   fewer, since its block refuses a call that sets any other.
+- SLOP015 is about the suite. A test imports its own package, so an import
+  the package breaks fails the suite instead of skipping it.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -785,6 +787,17 @@ def wording(module: Module) -> Iterator[Finding]:
                           f"names {node.value}; test what the code does, not its source")
 
 
+def skips(module: Module) -> Iterator[Finding]:
+    """SLOP015: a test that skips when its own package fails to import."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if (isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.importorskip"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(name := node.args[0].value, str)
+                and (name == module.package or name.startswith(f"{module.package}."))):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP015",
+                          f"skips when {name} fails to import; import it, so a broken import fails")
+
+
 def patches(module: Module) -> Iterator[Finding]:
     """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
@@ -937,7 +950,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    rules = (*rules, mocks, wording) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
