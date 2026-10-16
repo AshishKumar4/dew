@@ -174,6 +174,40 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
     truth is the rows in windows of their own in float64."""
     objective = objective_for(arm)
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+                                          objective.model.head.clone(dtype=jnp.float64)))
+
+
+@pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
+def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
+    """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
+    by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
+    reading nothing. Each packed row's logits and the gradients are the row's alone within the
+    float64 gate, the truth the head in float64 on the xla kernel. A head that read the window
+    through a dense mask would not run on flash at all."""
+    layout = JointLayout(max_len=1536)
+    objective = DecisionObjective(
+        attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+        head=JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
+                             dtype=jnp.bfloat16, attention_impl="flash"),
+        loss=LogLoss(), shuffle_options=False)
+    head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
+    # A bf16 scalar's gradient is one rounding draw, the extreme-value statistic the RMS rule does
+    # not hold (tests/reference_error.py): the residual gate's ran from 1.2e-4 to 1.1e-3 from
+    # float64 over packed and alone, flash and xla, on an A100. The head's attention projections
+    # carry flash's forward and backward into many entries each.
+    def attending_in_the_head(path: str) -> bool:
+        return "['head']" in path and ("attn" in path or "['attention']" in path)
+
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
+                              held=attending_in_the_head)
+
+
+def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -> None:
+    """Two packed windows of the examples decide each row's questions as the row does in a window
+    of its own, logits and the gradients of the leaves `held` names (by `jax.tree_util.keystr`)
+    within the float64 gate, the truth `wide_modules`, the backbone and head in float64, over the
+    rows alone."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -190,8 +224,7 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     logits, grads = decided(objective, variables, rows, segments)
     with jax.enable_x64(new_val=True):
         wide = copy.copy(objective)
-        wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
-                         objective.model.head.clone(dtype=jnp.float64)))
+        wide.substitute(wide_modules)
         widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
         # Each gradient leaf's terms in float64: a key bias's and the scorer's shared bias
         # gradients cancel (q.b shifts every key's logit alike; the residual gate shifts every
@@ -200,6 +233,15 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
         truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
         truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
     logits = np.asarray(logits)[rows["options"]]
+
+    def kept(tree):
+        return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
+                                              for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
+                if held(name)}
+
+    packed_grads, grads, truth_grads, terms = (kept(tree)
+                                               for tree in (packed_grads, grads, truth_grads, terms))
+    assert packed_grads, "no gradient leaf held"
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
                            {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
                            terms={"logits": truth, "grads": terms})
