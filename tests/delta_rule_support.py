@@ -117,3 +117,17 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
         theirs = {name: found[name].astype(np.float64) for name in NAMES}
     theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
     return [theirs[name] for name in NAMES]
+
+
+def factorised_decay_terms(q, k, dq, dk, chunk: int = CHUNKED):
+    """The float64 terms of the decay gradient Kimi's port takes as fla factorises it, `[B, T, HV, K]`,
+    from each value head's queries and keys and their float64 gradients, `[B, T, HV, K]` each: each
+    token's `q dq - k dk` summed back over its chunk of `chunk` tokens from its row's start. A token's
+    terms are the root sum of squares of those products from it to its chunk's end, which its
+    gradient adds and takes back where earlier keys of zero make it zero."""
+    products = np.square(np.asarray(q * dq)) + np.square(np.asarray(k * dk))
+    batch, length = products.shape[:2]
+    padded = np.pad(products, ((0, 0), (0, -length % chunk), (0, 0), (0, 0)))
+    chunks = padded.reshape(batch, -1, chunk, *products.shape[2:])
+    summed_back = np.flip(np.cumsum(np.flip(chunks, 2), 2), 2)
+    return np.sqrt(summed_back).reshape(padded.shape)[:, :length]
