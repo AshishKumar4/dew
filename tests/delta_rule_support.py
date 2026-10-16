@@ -1,6 +1,7 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
-is run through (`through`), and fla's own outputs and gradients, the ports' reference (`fla_side`)."""
+is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), and
+the port's formula in the portable math where fla cannot run (`port_formula`)."""
 
 import itertools
 import os
@@ -12,6 +13,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
+from dew.nn import linear
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -117,3 +120,30 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
         theirs = {name: found[name].astype(np.float64) for name in NAMES}
     theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
     return [theirs[name] for name in NAMES]
+
+
+def plain_prefix(g, chunk: int = CHUNKED):
+    """`g` re-cut from fla's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`), each chunk of `chunk`
+    tokens from the row's start: each token's decay the difference of its prefix and the one before,
+    so the portable rule, rebuilding the prefixes, takes every range as the difference of two plain
+    prefixes, as fla and the port do. Its gradient passes to `g` unchanged."""
+    batch, length = g.shape[:2]
+    padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
+    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2)
+    earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
+    recut = (prefix - earlier).reshape(padded.shape)[:, :length]
+    return g + jax.lax.stop_gradient(recut - g)
+
+
+def port_formula(query, key, value, g, beta, state=None, *, starts=None):
+    """`linear.fla_rule`'s formula in the portable math: each packed document's first token decays by
+    `linear.FORGET`, and every range is the difference of two plain fp32 prefixes per row-aligned
+    chunk (`plain_prefix`), as the port takes them. A second rounding sample of the port's own
+    formula, where fla, which restarts a varlen sequence's prefix, cannot run."""
+    if starts is not None:
+        forget = jnp.asarray(starts, bool).reshape(*starts.shape, *(1,) * (g.ndim - 2))
+        g = g + jnp.where(forget, linear.FORGET, 0.0)
+    group = value.shape[2] // key.shape[2]
+    query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    decay = plain_prefix(g).reshape(*value.shape[:3], -1)
+    return linear.chunk_delta_rule(query, key, value, decay, beta, state)

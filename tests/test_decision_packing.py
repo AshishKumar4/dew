@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from delta_rule_support import port_formula
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
@@ -35,6 +36,7 @@ from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
 from dew.decision.objective import _ALONG_THE_QUESTIONS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
+from dew.nn import linear
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Step
 from dew.training.trainer import Trainer
@@ -166,13 +168,18 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason=(
+    "packing is the same plumbing on every device; a GPU's own kernels keep documents apart in "
+    "test_mixers::test_no_token_reaches_another_document"))
 @pytest.mark.parametrize("arm", sorted(ARMS))
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives in a window of its own, through
     Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within the
     float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64."""
+    truth is the rows in windows of their own in float64. On a GPU the delta rule's port runs a
+    window as one sequence, its rows' decay prefixes shifted by those before them
+    (`linear.FORGET`), which `test_the_port_runs_a_packed_window_by_its_own_formula` holds."""
     objective = objective_for(arm)
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
@@ -201,6 +208,42 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
         truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
     logits = np.asarray(logits)[rows["options"]]
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
+                           {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
+                           terms={"logits": truth, "grads": terms})
+
+
+@pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
+@pytest.mark.parametrize("arm", ["joint", "marker"])
+def test_the_port_runs_a_packed_window_by_its_own_formula(arm, monkeypatch):
+    """A packed window's logits and gradients on the GPU, Qwen3.5's Gated DeltaNet on the port, as
+    near the float64 rows in windows of their own as the same window with the port's formula in the
+    portable math (`port_formula`: each row's decay prefix shifted by the rows before it in its
+    chunk, `linear.FORGET`, every range two plain fp32 prefixes apart), within the float64 gate. fla's
+    own packed path rounds in TF32 (~1e-3 in fp32), so this bar sits well inside fla parity."""
+    objective = objective_for(arm)
+    batch = windows(objective, 2)
+    segments = objective.bounds.segments
+    variables = objective.init(jax.random.key(0))
+    packed_logits, packed_grads = decided(objective, variables, batch, segments)
+    with monkeypatch.context() as patched:
+        patched.setattr(linear, "fla_rule", port_formula)
+        logits, grads = decided(objective, variables, batch, segments)
+    rows = apart(batch)
+    with jax.enable_x64(new_val=True):
+        wide = copy.copy(objective)
+        wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
+                         objective.model.head.clone(dtype=jnp.float64)))
+        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
+        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
+    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
+
+    def asked(logits):
+        return np.concatenate([np.asarray(logits)[window][slots][batch["options"][window][slots]]
+                               for (window, _), slots in zip(rows_of(batch), order, strict=True)])
+
+    assert_leaves_as_exact({"logits": asked(packed_logits), "grads": packed_grads},
+                           {"logits": asked(logits), "grads": grads},
                            {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
                            terms={"logits": truth, "grads": terms})
 
