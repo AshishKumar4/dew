@@ -444,6 +444,9 @@ header.header {
 }
 
 @media (max-width: 40rem) {
+	.sl-markdown-content .nb-output.nb-html {
+		padding: 0.5rem;
+	}
 	.sl-markdown-content .nb-figure-pair .nb-figure-wide {
 		display: none;
 	}
