@@ -22,7 +22,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -297,10 +297,13 @@ class SafetensorsReload:
     `{"success": false}`.
 
     For vLLM (`engine="vllm"`, v0.30.0, `VLLM_SERVER_DEV_MODE=1`), the push
-    pauses with `mode=wait`, reloads, resets the prefix cache, sets the
-    weight version and resumes. In-flight draws therefore finish entirely on
-    the old weights, and no cached prefix outlives them. A replica that fails
-    after the pause stays paused until a later push succeeds. For SGLang
+    reloads the directory through `/collective_rpc` inside the publication
+    lifecycle it shares with `NCCLPush`: every replica pauses with
+    `mode=wait`, takes the weights, resets its prefix cache, sets the weight
+    version and resumes, and a phase that fails on any replica stops the
+    push before the next phase, leaving the paused replicas paused until a
+    later push succeeds. In-flight draws therefore finish entirely on
+    the old weights, and no cached prefix outlives them. For SGLang
     (`engine="sglang"`, v0.5.20), the push is one `/update_weights_from_disk`
     call, which waits for in-flight requests, holds new ones and flushes the
     radix cache. A failed SGLang load rolls back by re-reading the same
@@ -348,39 +351,72 @@ class SafetensorsReload:
         agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
 
     def _publish(self, version: int) -> None:
-        with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
-            pushes = [(root, pool.submit(self._replica, root, version)) for root in self.engines]
-            failures = [(root, push.exception()) for root, push in pushes if push.exception() is not None]
-        if failures:
-            raise RuntimeError(f"version {version} reached {len(self.engines) - len(failures)} of "
-                               f"{len(self.engines)} replicas: "
-                               + "; ".join(f"{root}: {failure}" for root, failure in failures))
-
-    def _replica(self, root: str, version: int) -> None:
-        root = root.rstrip("/")
-        # (path, JSON body, whether the answer must say {"success": true})
-        calls: tuple[tuple[str, JSON, bool], ...]
         if self.engine == "vllm":
-            calls = (
-                ("/pause?mode=wait", None, False),
-                ("/collective_rpc", {"method": "reload_weights"}, False),
-                ("/reset_prefix_cache", None, True),
-                ("/update_weight_version", {"new_version": str(version)}, True),
-                ("/resume", None, False),
-            )
-        else:
-            calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
-                                                    "flush_cache": True, "abort_all_requests": False,
-                                                    "weight_version": str(version)}, True),)
-        for path, body, reports in calls:
-            _post(root, path, body, self.timeout, reports=reports)
+            reload: JSON = {"method": "reload_weights"}
+            _vllm_publication(self.engines, version, self.timeout, lambda: _on_every(
+                self.engines, lambda root: _post(root, "/collective_rpc", reload, self.timeout)))
+            return
+        load: JSON = {"model_path": str(Path(self.directory).resolve()), "flush_cache": True,
+                      "abort_all_requests": False, "weight_version": str(version)}
+        _refused(version, self.engines, _on_every(
+            self.engines, lambda root: _post(root, "/update_weights_from_disk", load, self.timeout,
+                                             reports=True)))
+
+
+def _on_every(engines: Sequence[str], call: Callable[[str], object]) -> dict[str, BaseException]:
+    """Run `call` on every replica root at once, and return each failure by its replica."""
+    failures: dict[str, BaseException] = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(engines)), thread_name_prefix="dew-weight-push") as pool:
+        for root, run in [(root, pool.submit(call, root)) for root in engines]:
+            failure = run.exception()
+            if failure is not None:
+                failures[root] = failure
+    return failures
+
+
+def _refused(version: int, engines: Sequence[str], failures: Mapping[str, BaseException]) -> None:
+    """Raise an error naming every replica in `failures` that did not take `version`, if any."""
+    if failures:
+        raise RuntimeError(f"version {version} did not reach {len(failures)} of {len(engines)} replicas: "
+                           + "; ".join(f"{root}: {failure}" for root, failure in failures.items()))
+
+
+def _vllm_publication(engines: Sequence[str], version: int, timeout: float,
+                      deliver: Callable[[], Mapping[str, BaseException]], *, stamped: bool = False) -> None:
+    """Publish `version` to vLLM replicas (v0.30.0, `VLLM_SERVER_DEV_MODE=1`) around a transport's `deliver`.
+
+    Every replica pauses with `mode=wait`, so its in-flight draws finish on
+    the old weights and no new one starts. `deliver` then loads the weights
+    into every replica and returns the failures by replica. Each replica
+    resets its prefix cache, takes the version through
+    `/update_weight_version` unless the transport `stamped` it while
+    delivering, and resumes. The reset and the stamp must answer
+    `{"success": true}`, which vLLM withholds from one that did not happen.
+
+    A phase that fails on any replica raises before the next phase starts,
+    naming every replica it failed on. So no replica resumes on weights the
+    others may not hold, and a replica the push paused stays paused until a
+    later push succeeds.
+    """
+    def finish(root: str) -> None:
+        _post(root, "/reset_prefix_cache", None, timeout, reports=True)
+        if not stamped:
+            _post(root, "/update_weight_version", {"new_version": str(version)}, timeout, reports=True)
+        _post(root, "/resume", None, timeout)
+
+    def pause(root: str) -> None:
+        _post(root, "/pause?mode=wait", None, timeout)
+
+    _refused(version, engines, _on_every(engines, pause))
+    _refused(version, engines, deliver())
+    _refused(version, engines, _on_every(engines, finish))
 
 
 def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> httpx.Response:
     """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true."""
     import httpx
 
-    response = httpx.post(root + path, json=body, timeout=timeout)
+    response = httpx.post(root.rstrip("/") + path, json=body, timeout=timeout)
     if response.status_code != 200 or (reports and not _succeeded(response)):
         raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
     return response
