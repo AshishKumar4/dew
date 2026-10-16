@@ -127,6 +127,14 @@ class PNDM:
     def init(self, x, times, process, *, key):
         _check_endpoint_domain(process, times, source=True,
                                reason="PNDM stage differences are divided by the source alpha")
+        # The transfer is DDIM's rationalized for alpha^2 + sigma^2 = 1, Diffusers' beta tables: with
+        # alpha 1 (variance exploding) its eps term vanishes and every step returns x unchanged.
+        if times.shape[0] >= 2:
+            with jax.ensure_compile_time_eval():
+                alpha, sigma = process.sampler_schedule.rates(times)
+                if not bool(jnp.all(jnp.abs(alpha ** 2 + sigma ** 2 - 1) < 1e-4)):
+                    raise ValueError("PNDM's transfer is DDIM's for a variance-preserving process, "
+                                     f"not {type(process.sampler_schedule).__name__}'s rates")
         return jnp.zeros((4, *x.shape), x.dtype), jnp.zeros((), jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -229,6 +237,9 @@ class TCD:
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
         # The forward process's q(x_s | x_mid). The reference's 1 - ratio^2 is
         # its variance on a variance-preserving table only: with alpha 1 it adds
-        # no noise, and a variance-exploding walk collapsed to zero.
-        spread = jnp.sqrt(jnp.maximum(sigma_s ** 2 - (ratio * sigma_mid) ** 2, 0.0))
+        # no noise, and a variance-exploding walk collapsed to zero. As a
+        # product of the difference and the sum it is exactly 0 where the two
+        # rates coincide (the last step to t 0), as the reference's draw-free
+        # last step is; a difference of rounded squares need not be.
+        spread = jnp.sqrt(jnp.maximum((sigma_s - ratio * sigma_mid) * (sigma_s + ratio * sigma_mid), 0.0))
         return ratio * noised + spread * noise, state
