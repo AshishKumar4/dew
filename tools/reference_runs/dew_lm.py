@@ -107,6 +107,7 @@ class Run:
     total: int
     schedule_steps: int
     compile_seconds: float
+    """The plan's compiles, and the steps a frontier it opens is timed over (`Timer`)."""
     work: WorkloadWork
 
 
