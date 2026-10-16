@@ -1,6 +1,8 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
-is run through (`through`), and fla's own outputs and gradients, the ports' reference (`fla_side`)."""
+is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
+float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's plain decay
+prefix where fla cannot run (`plain_prefix`)."""
 
 import itertools
 import os
@@ -15,6 +17,7 @@ import pytest
 from reference_error import float64_terms
 
 from dew.nn import linear
+from dew.nn.kernels import fla_gdn
 from dew.nn.linear import FORGET
 
 CHUNKED = 64
@@ -213,3 +216,17 @@ def fla_decay_terms(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     if starts is not None:
         first |= np.asarray(starts, bool)
     return np.where(first[..., None, None], 0.0, terms)
+
+
+def plain_prefix(g, chunk: int = CHUNKED):
+    """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
+    of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
+    token's decay the difference of its prefix and the one before carried back to natural log. The
+    portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
+    of two rounded base-2 prefixes. Its gradient passes to `g` unchanged."""
+    batch, length = g.shape[:2]
+    padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
+    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2) * fla_gdn.RCP_LN2
+    earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
+    recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
+    return g + jax.lax.stop_gradient(recut - g)
