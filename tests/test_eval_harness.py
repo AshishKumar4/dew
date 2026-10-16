@@ -42,7 +42,8 @@ def adapter(run):
 
 
 BOS = 1
-"""The byte `\\x01` doubles as BOS in the BOS-vocabulary case; no test text holds it."""
+"""The byte `\\x01` doubles as BOS in the BOS-vocabulary case; only the text that starts with the
+prefix token on purpose holds it."""
 
 
 def _byte_tokenizer(bos: bool):
@@ -136,6 +137,32 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
     text = [instance(_text(40), request_type="loglikelihood_rolling")]
     assert ours.loglikelihood_rolling(text) == pytest.approx(theirs.loglikelihood_rolling(text),
                                                              rel=RELATIVE)
+
+
+@pytest.mark.parametrize("bos", [False, True])
+def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, tmp_path):
+    """`add_special_tokens` and `left_truncate_len` encode as `HFLM.tok_encode`
+    does, over vocabularies with and without BOS: the processor's BOS left
+    off when the caller asks for no special tokens, or when the text already
+    starts with the prefix token's text, and the last ids kept."""
+    ours, theirs = _pair(16, tmp_path if bos else None)
+    prefix = theirs.tokenizer.decode([theirs.prefix_token_id])
+    for text in ("the quick", prefix + "the quick"):
+        for special in (None, True, False):
+            for keep in (None, 3):
+                assert (ours.tok_encode(text, add_special_tokens=special, left_truncate_len=keep)
+                        == theirs.tok_encode(text, add_special_tokens=special, left_truncate_len=keep))
+
+
+def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
+    """A torch `--device`, and options `HFLM` does not read, raise instead of being dropped."""
+    with pytest.raises(ValueError):
+        DewLM.create_from_arg_string(f"run={run}", {"device": "cuda:0"})
+    assert DewLM.create_from_arg_string(f"run={run},batch_size=2", {"device": None}).batch_size == 2
+    with pytest.raises(TypeError):
+        adapter.tok_encode("the", truncation=True)
+    with pytest.raises(TypeError):
+        adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])

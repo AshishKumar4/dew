@@ -133,9 +133,11 @@ class DewLM(TemplateLM):
         """
         arguments.update({name: value for name, value in (additional or {}).items()
                           if value is not None})
-        # The harness hands every model a device; a run's weights are placed
-        # on a JAX mesh when the task is built, so it is dropped, not refused.
-        arguments.pop("device", None)
+        device = arguments.pop("device", None)
+        if device is not None:
+            raise ValueError(
+                f"--device {device} names a torch device, and a run's weights are placed on JAX "
+                f"devices when its task is built; leave --device unset")
         run = arguments.pop("run", None)
         if run is None:
             raise ValueError(
@@ -173,22 +175,39 @@ class DewLM(TemplateLM):
         return DEFAULT_CONTEXT if declared is None else declared
 
     def tok_encode(self, string: str, add_special_tokens: bool | None = None,
-                   **kwargs: int | None) -> list[int]:
-        """Encode `string` with the run's own tokenizer into one row of ids.
+                   left_truncate_len: int | None = None, **kwargs: object) -> list[int]:
+        """Encode `string` with the run's own tokenizer into one row of ids, as `HFLM.tok_encode` does.
 
-        The run's processor adds special tokens the way it did in training,
-        so `add_special_tokens` and the harness's other integer options
-        (`left_truncate_len`) are accepted but ignored.
+        The run's processor adds the special tokens it added in training.
+        With `add_special_tokens=False`, or with None and a string that
+        already starts with the prefix token's text, the BOS the processor
+        adds is left off, so no row starts with two. `left_truncate_len`
+        keeps that many of the last ids. Any other option raises TypeError,
+        since `HFLM` reads none.
         """
-        del add_special_tokens, kwargs
+        if kwargs:
+            raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
+        ids = self._encoded(string)
+        if self._adds_bos and (add_special_tokens is False or (
+                add_special_tokens is None and string.startswith(self.tok_decode([self.prefix_token_id])))):
+            ids = ids[1:]
+        return ids[-left_truncate_len:] if left_truncate_len else ids
+
+    def _encoded(self, string: str) -> list[int]:
         return [int(token) for token in np.asarray(self._processor([string]).tokens)[0]]
+
+    @functools.cached_property
+    def _adds_bos(self) -> bool:
+        """Whether the run's processor starts every encoding with BOS, as Llama's tokenizer does."""
+        bos = self._processor.bos_id
+        return bos is not None and self._encoded("") == [bos]
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
 
     def _loglikelihood_tokens(self, requests: Sequence[TokenRequest],
                               disable_tqdm: bool = False,
-                              **kwargs: int | None) -> list[tuple[float, bool]]:
+                              **kwargs: object) -> list[tuple[float, bool]]:
         """Return each pair's summed continuation log-probability, and whether
         greedy decoding of the context would have produced the continuation.
 
@@ -198,9 +217,12 @@ class DewLM(TemplateLM):
         a continuation longer than `max_length` is refused, since no row
         could hold it with any of its context, and a continuation with no
         ids of its own is refused: scored, it would be probability 1 and
-        greedy, and win every multiple-choice comparison it is in.
+        greedy, and win every multiple-choice comparison it is in. Any
+        option besides `disable_tqdm` raises TypeError.
         """
-        del disable_tqdm, kwargs
+        del disable_tqdm
+        if kwargs:
+            raise TypeError(f"_loglikelihood_tokens takes no {', '.join(sorted(kwargs))}")
         rows: list[list[int]] = []
         for strings, context, continuation in requests:
             named = repr(strings[1]) if strings is not None else "a continuation"
