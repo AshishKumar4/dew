@@ -31,13 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def measure(objective: Objective, batch: Batch) -> WorkloadWork:
     """Use the trainer's objective assembly on the complete host batch.
 
-    A model with no token geometry, a U-Net's convolutions, counts 0 tokens.
+    A model with no token geometry, a U-Net's convolutions, counts no tokens.
     """
     model = objective.program_key()[0].module
     try:
         tokens = int(np.sum(objective.real_lengths(batch)))
     except MissingFlopsCount:
-        tokens = 0
+        tokens = None
     return WorkloadWork(
         training_flops_per_step=objective.training_flops(None, batch),
         tokens_per_step=tokens,
@@ -93,10 +93,8 @@ def case(args) -> WorkloadWork:
     from benchmark_cases import parity_case
     from benchmark_models import build_objective, global_batch
 
-    chosen = parity_case(args.model, args.size)
-    config = chosen.config if args.vocab_size is None else {**chosen.config, "vocab_size": args.vocab_size}
-    chosen = dataclasses.replace(chosen, config=config, dtype=args.dtype,
-                                 batch_size=args.batch_size or chosen.batch_size)
+    chosen = dataclasses.replace(parity_case(args.model, args.size, batch_size=args.batch_size,
+                                             vocab_size=args.vocab_size), dtype=args.dtype)
     return measure(build_objective(chosen, args.attention), global_batch(chosen))
 
 

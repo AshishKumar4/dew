@@ -19,6 +19,7 @@ either, Dew without the decay lands at 1.1e-02 (ratio 22,000) and Dew
 without the clip at 1.9e-03 (ratio 4,000).
 """
 
+import dataclasses
 import os
 import subprocess
 import sys
@@ -188,27 +189,33 @@ def test_qwen35_work_counts_the_shared_smoke_geometry(monkeypatch, tmp_path):
     assert WorkloadWork.read(args.out) == work
 
 
-@pytest.mark.parametrize("model, size", [("causal_transformer", "small"), ("causal_transformer", "large"),
-                                         ("simple_dit", "small"), ("simple_dit", "large"), ("unet", "small")])
-def test_a_parity_case_is_counted_as_the_trainer_counts_its_batch(model, size, tmp_path, monkeypatch):
+@pytest.mark.parametrize("model, size, vocabulary", [
+    ("causal_transformer", "small", None), ("causal_transformer", "small", 8192),
+    ("causal_transformer", "large", None), ("simple_dit", "small", None), ("simple_dit", "large", None),
+    ("unet", "small", None)])
+def test_a_parity_case_is_counted_as_the_trainer_counts_its_batch(model, size, vocabulary, tmp_path,
+                                                                  monkeypatch):
     """`work.py case` writes the count `tools/benchmark_torch.py` divides by: the
-    parity case the torch port steps, at the torch side's batch size, counted
-    as the trainer counts that case's batch for train/mfu."""
-    import dataclasses
-
+    parity case the torch port steps, at the torch side's batch size and
+    vocabulary, counted as the trainer counts that case's batch for
+    train/mfu. A U-Net, whose convolutions have no token geometry, counts no
+    tokens rather than zero."""
     from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     writer = load("reference_runs/work")
     cases, models = load("benchmark_cases"), load("benchmark_models")
-    args = writer.arguments(["case", "--model", model, "--size", size, "--batch-size", "2",
+    vocab = [] if vocabulary is None else ["--vocab-size", str(vocabulary)]
+    args = writer.arguments(["case", "--model", model, "--size", size, "--batch-size", "2", *vocab,
                              "--out", str(tmp_path / "work.json")])
     work = args.count(args)
-    case = dataclasses.replace(cases.parity_case(model, size), dtype="bfloat16", batch_size=2)
+    case = cases.parity_case(model, size, batch_size=2, vocab_size=vocabulary)
+    case = dataclasses.replace(case, dtype="bfloat16")
     counted = prepare_counts(models.build_objective(case), models.global_batch(case), count_model=True)
     assert work.training_flops_per_step == pytest.approx(float(np.sum(counted[TRAINING_FLOPS])), rel=1e-6)
     assert work.examples_per_step == 2
+    assert (work.tokens_per_step is None) == (model == "unet")
 
 
 def test_reference_reads_work_without_importing_dew_or_jax(tmp_path):

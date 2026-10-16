@@ -90,9 +90,9 @@ ADAM = dict(lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
 # Presets: Dew's small preset and the larger compute-dominated cases
 # ----------------------------------------------------------------------------
 
-def preset(model: str, size: str) -> Case:
+def preset(model: str, size: str, *, batch_size: int | None = None, vocab_size: int | None = None) -> Case:
     """The parity case (`benchmark_cases.parity_case`) in the form the torch ports read."""
-    case = parity_case(model, size)
+    case = parity_case(model, size, batch_size=batch_size, vocab_size=vocab_size)
     if model != 'unet':
         return case
     # The torch port takes heads per level; Dew takes attention records.
@@ -779,13 +779,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = not args.no_tf32
     torch.backends.cudnn.benchmark = True
 
-    case = preset(args.model, args.size)
-    if args.batch_size:
-        case = dataclasses.replace(case, batch_size=args.batch_size)
-    if args.vocab_size is not None:
-        if case.architecture != 'causal_transformer':
-            raise ValueError('--vocab-size applies only to causal_transformer')
-        case.config['vocab_size'] = args.vocab_size
+    case = preset(args.model, args.size, batch_size=args.batch_size, vocab_size=args.vocab_size)
     model = build(case, args)
     params = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
@@ -845,7 +839,7 @@ def main():
         vocab_size=case.config.get('vocab_size'), params=n_params,
         warmup=args.warmup, warmup_s=round(warmup_s, 1), steps=args.steps,
         ms_per_step=step_s * 1e3, samples_per_sec=case.batch_size / step_s,
-        tokens_per_sec=work.tokens_per_step / step_s if work.tokens_per_step else None,
+        tokens_per_sec=None if work.tokens_per_step is None else work.tokens_per_step / step_s,
         event_ms_median=float(np.median(per_step)), event_ms_p10=float(np.percentile(per_step, 10)),
         event_ms_p90=float(np.percentile(per_step, 90)),
         inter_step_gap_ms_median=float(np.median(gaps)) if len(gaps) else None,
