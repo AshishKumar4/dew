@@ -464,7 +464,8 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
         _, terms = float64_terms(through(math, *operands[6:]), *operands[:6])
         if per_key:
             # Kimi's port takes fla's factorised decay gradient, whose terms the math's pairs never add.
-            terms = (*terms[:5], np.maximum(terms[5], factorised_decay_terms(*operands)), *terms[6:])
+            decay = factorised_decay_terms(*operands[:2], *truth[2:4])
+            terms = (*terms[:5], np.maximum(terms[5], decay), *terms[6:])
     for name, dew, fla, value, summed in zip(NAMES, got, theirs, truth, terms, strict=True):
         assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name, terms=np.asarray(summed))
 

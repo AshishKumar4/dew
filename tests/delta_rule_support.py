@@ -2,7 +2,6 @@
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
 is run through (`through`), and fla's own outputs and gradients, the ports' reference (`fla_side`)."""
 
-import functools
 import itertools
 import os
 import subprocess
@@ -92,15 +91,12 @@ np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
 into another under the names it is given (`NAMES`); packed documents as its varlen sequences, each
 with a memory of its own."""
 
-def factorised_decay_terms(q, k, v, g, beta, h0, do, dht, cuts=None, chunk: int = CHUNKED):
-    """The float64 terms of the decay gradient Kimi's port takes as fla factorises it, `[B, T, HV, K]`:
-    each token's `q dq - k dk`, a value head at a time, summed back over its chunk of `chunk` tokens
-    from its row's start, the row through its documents (`cuts`, as `recurrence` takes them). A token's
+def factorised_decay_terms(q, k, dq, dk, chunk: int = CHUNKED):
+    """The float64 terms of the decay gradient Kimi's port takes as fla factorises it, `[B, T, HV, K]`,
+    from each value head's queries and keys and their float64 gradients, `[B, T, HV, K]` each: each
+    token's `q dq - k dk` summed back over its chunk of `chunk` tokens from its row's start. A token's
     terms are the root sum of squares of those products from it to its chunk's end, which its
     gradient adds and takes back where earlier keys of zero make it zero."""
-    group = v.shape[2] // q.shape[2]
-    q, k = jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2)
-    dq, dk = through(functools.partial(recurrence, cuts=cuts), do, dht)(q, k, v, g, beta, h0)[2:4]
     products = np.square(np.asarray(q * dq)) + np.square(np.asarray(k * dk))
     batch, length = products.shape[:2]
     padded = np.pad(products, ((0, 0), (0, -length % chunk), (0, 0), (0, 0)))
