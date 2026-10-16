@@ -64,8 +64,9 @@ def verified(target, draft, candidates, drawn, dtype) -> tuple[int, np.ndarray]:
 
 
 def main() -> None:
-    if transformers.__version__ != "5.16.1":
-        raise SystemExit(f"the fixture pins transformers 5.16.1, got {transformers.__version__}")
+    from reference_releases import require
+
+    require("transformers")
     generator = np.random.default_rng(7)
     target = (generator.standard_normal((ROWS, BLOCK + 1, VOCAB)) * 1.5).astype(np.float32)
     unrelated = generator.standard_normal((ROWS, BLOCK, VOCAB)) * 1.5

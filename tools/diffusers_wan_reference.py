@@ -43,20 +43,12 @@ from types import ModuleType
 
 import numpy as np
 import torch
-import transformers.utils as transformers_utils
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from torch_precision import default_dtype, wide  # noqa: E402
+from reference_releases import RELEASES, require  # noqa: E402
 
-# Diffusers 0.34.0's pipeline modules import two names Transformers dropped
-# after 4.x; the pipeline walk needs `WanPipeline` itself, so the names are
-# restored, as tools/diffusers_sd3_reference.py restores them.
-for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
-                      ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
-    if not hasattr(transformers_utils, _name):
-        setattr(transformers_utils, _name, _value)
-
-DIFFUSERS = "0.34.0"
+DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,
@@ -238,8 +230,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 def output_root(destination: str) -> Path:
     import diffusers
 
-    if diffusers.__version__ != DIFFUSERS:
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
+    require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
@@ -408,6 +399,10 @@ def pipeline(destination: str) -> None:
 
 
 if __name__ == "__main__":
+    from diffusers_reference_helpers import restore_transformers_names
+
+    # The pipeline walk needs `WanPipeline` itself.
+    restore_transformers_names()
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         from diffusers_dc_ae_reference import bundle
 

@@ -39,8 +39,9 @@ def main() -> None:
     import transformers
     from transformers import AutoTokenizer
 
-    if transformers.__version__ != "5.16.1":
-        raise SystemExit(f"the fixture pins transformers 5.16.1, got {transformers.__version__}")
+    from reference_releases import require
+
+    require("transformers")
     record = {"transformers": transformers.__version__, "tokenizers": {}}
     for name, directory in TOKENIZERS.items():
         tokenizer = AutoTokenizer.from_pretrained(ROOT / directory)
