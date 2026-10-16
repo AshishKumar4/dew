@@ -239,18 +239,21 @@ def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_
     assert_served(tmp_path / "served", changed)
 
 
-def test_a_vllm_replica_that_fails_to_reload_holds_every_replica_paused(tmp_path, replicas):
-    """One replica that cannot reload stops the push after the reload phase:
-    no replica resets, stamps or resumes, so none serves weights another may
-    not hold, and the push raises."""
+@pytest.mark.parametrize("refused", ["/collective_rpc", "/reset_prefix_cache", "/update_weight_version"])
+def test_a_vllm_replica_that_fails_a_step_holds_every_replica_paused(refused, tmp_path, replicas):
+    """One replica that fails the reload, the cache reset or the version stamp
+    stops the push after that step on every replica: no replica goes on to a
+    later step or resumes, so none serves weights another may not hold, and
+    the push raises."""
     source = Pretrained.load(FIXTURE, dtype="float32")
     engines = replicas(3)
-    engines[1].refuses = ("/collective_rpc",)
+    engines[1].refuses = (refused,)
     push = SafetensorsReload(source, tmp_path / "served", tuple(server.url for server in engines), "vllm")
     with pytest.raises(RuntimeError):
         push(doubled(source), 5)
+    steps = ["/pause", "/collective_rpc", "/reset_prefix_cache", "/update_weight_version"]
     for server in engines:
-        assert paths(server) == ["/pause", "/collective_rpc"]
+        assert paths(server) == steps[:steps.index(refused) + 1]
 
 
 class Collectives:

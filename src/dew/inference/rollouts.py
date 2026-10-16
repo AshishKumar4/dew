@@ -400,18 +400,22 @@ def _vllm_publication(engines: Sequence[str], version: int, timeout: float,
     others may not hold, and a replica the push paused stays paused until a
     later push succeeds.
     """
-    def finish(root: str) -> None:
-        _post(root, "/reset_prefix_cache", None, timeout, reports=True)
-        if not stamped:
-            _post(root, "/update_weight_version", {"new_version": str(version)}, timeout, reports=True)
-        _post(root, "/resume", None, timeout)
-
     def pause(root: str) -> None:
         _post(root, "/pause?mode=wait", None, timeout)
 
+    def reset(root: str) -> None:
+        _post(root, "/reset_prefix_cache", None, timeout, reports=True)
+
+    def stamp(root: str) -> None:
+        _post(root, "/update_weight_version", {"new_version": str(version)}, timeout, reports=True)
+
+    def resume(root: str) -> None:
+        _post(root, "/resume", None, timeout)
+
     _refused(version, engines, _on_every(engines, pause))
     _refused(version, engines, deliver())
-    _refused(version, engines, _on_every(engines, finish))
+    for step in (reset, resume) if stamped else (reset, stamp, resume):
+        _refused(version, engines, _on_every(engines, step))
 
 
 def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> httpx.Response:
