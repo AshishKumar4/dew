@@ -343,10 +343,11 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
         ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / name / "rows.json", 600.0,
                 cache=False, coverage=tmp_path / "runs" / name)
     assert ci.coverage_report(tmp_path / "runs") == 0
-    files = json.loads((tmp_path / "runs/coverage.json").read_text())["files"]
-    assert files["src/dew/sign.py"]["summary"]["percent_covered"] == 100.0
-    table = (tmp_path / "runs/coverage.md").read_text().splitlines()
-    assert table[2].startswith("| src/dew/unused.py |") and "| 0.0% |" in table[2]
+    files = {Path(name).name: measured for name, measured in
+             json.loads((tmp_path / "runs/coverage.json").read_text())["files"].items()}
+    assert files["sign.py"]["summary"]["percent_covered"] == 100.0
+    least = (tmp_path / "runs/coverage.md").read_text().splitlines()[2].split(" | ")
+    assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
