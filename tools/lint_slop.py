@@ -45,6 +45,9 @@ dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
 scope (tools/lint_scopes.py).
+SLOP016 follows the device's generation through the names one file binds, in
+statement order: both arms of a branch in turn and a loop's body once, so a
+name an arm rebinds counts as rebound after it.
 SLOP004's isinstance half fires only when the annotation it needs is written in
 the same scope; a value whose type arrives from another module is not narrowed
 by this checker and is not reported. SLOP006 walks the handler body it can see,
@@ -1037,6 +1040,15 @@ def _spelled_pattern(pattern: ast.pattern) -> bool:
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
+def _eager(node: ast.AST) -> Iterator[ast.AST]:
+    """`node` and every node under it that runs where it stands: not a lambda's body."""
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(node, ast.Lambda) and child is node.body:
+            continue
+        yield from _eager(child)
+
+
 def _scope_choices(body: Sequence[ast.stmt], hardware: _Hardware, closure: _Hardware | None,
                    found: list[ast.expr | ast.stmt]) -> _Hardware:
     """Read a scope's `body` in statement order (`_choices`) from `hardware`, its names on entry. A
@@ -1090,8 +1102,11 @@ def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
                 inner = read(child, inner, inherited)
         for child in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
             inner = read(child, inner, inherited)
-        # An assignment expression in it binds the enclosing scope's name.
-        walrus = {expression.target.id for expression in ast.walk(node)
+        if isinstance(node, ast.GeneratorExp):
+            # Its body runs later, as it is consumed.
+            return hardware
+        # An assignment expression in it binds the enclosing scope's name; one in a lambda, the lambda's.
+        walrus = {expression.target.id for expression in _eager(node)
                   if isinstance(expression, ast.NamedExpr)}
         outer = hardware.without(walrus)
         return replace(outer, generations=outer.generations | (inner.generations & walrus),

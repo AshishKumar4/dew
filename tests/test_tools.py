@@ -729,16 +729,21 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
             "    return getattr(TILES, device_generation())\n"
             "def copied(TILES):\n"
             "    named = device_generation()\n"
-            "    again: str = named\n"
-            "    return TILES[again]\n"
+            "    named: str = named\n"
+            "    return TILES[named]\n"
             "def relabeled_inside():\n"
             "    named = device_generation()\n"
             "    [(named := label) for label in ('label',)]\n"
             "    held = [(found := device_generation()) for _ in ()]\n"
-            "    return named == 'label' or held and found == 'sm80'\n"),
+            "    return named == 'label' or held and found == 'sm80'\n"
+            "def later_or_inner(TILES):\n"
+            "    named = device_generation()\n"
+            "    deferred = ((named := label) for label in ('label',))\n"
+            "    inner = [lambda: (named := 'label') for _ in ('x',)]\n"
+            "    return TILES[named], deferred, inner\n"),
     })
     assert found == [("src/sparx/tiles.py", line, "SLOP016")
-                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41, 54, 59)]
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41, 54, 59, 64)]
 
 
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
