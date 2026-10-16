@@ -44,6 +44,15 @@ def native_hub(monkeypatch, directory: Path, repo: str, splits: Mapping[str, obj
     return built
 
 
+def stated_shards(monkeypatch):
+    """The Hub stating each shard a test names as `HfFileSystem.info` states a file outside LFS:
+    a byte, under its own git blob id."""
+    from huggingface_hub import HfFileSystem
+
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
+        "name": path, "type": "file", "size": 1, "blob_id": f"blob:{path}"})
+
+
 def offline(monkeypatch):
     """The Hub offline from here on, as HF_HUB_OFFLINE makes it: `datasets` and every Hub call a
     test stood in for raise OfflineModeIsEnabled, as the real ones then do, and `datasets` builds
@@ -66,11 +75,12 @@ def offline(monkeypatch):
 
 def hub_split(monkeypatch, directory: Path, repo: str, splits: Mapping[str, object], commit: str):
     """`repo` on the Hub at `commit` as `datasets` builds a Hub dataset: its packaged Parquet
-    builder over each split's file, keyed by the repo and the commit, so it prepares where a
-    download of the repo would (`<owner>___<name>/<configuration>/<version>/<commit>` under
-    `directory / "cache"`). The Hub answers for it as long as `monkeypatch` holds."""
+    builder over each split's file in the repo, keyed by the repo and the commit, so it prepares
+    where a download of the repo would (`<owner>___<name>/<configuration>/<version>/<commit>`
+    under `directory / "cache"`). The Hub answers for it, serving each file from `directory`, as
+    long as `monkeypatch` holds."""
     import datasets
-    from datasets.data_files import DataFilesDict
+    from datasets.data_files import DataFilesDict, DataFilesList
     from datasets.packaged_modules.parquet.parquet import Parquet
     from huggingface_hub import HfApi
     from huggingface_hub.hf_api import GitRefs
@@ -80,19 +90,23 @@ def hub_split(monkeypatch, directory: Path, repo: str, splits: Mapping[str, obje
     for split, rows in splits.items():
         assert isinstance(rows, datasets.Dataset)
         rows.to_parquet(directory / f"{split}.parquet")
-        files[split] = [f"{split}.parquet"]
-    located = DataFilesDict.from_local_or_remote(files, base_path=str(directory))
+        files[split] = DataFilesList([f"hf://datasets/{repo}@{commit}/{split}.parquet"], origin_metadata=[None])
     built = Parquet(cache_dir=str(directory / "cache"), dataset_name=repo.split("/")[-1], repo_id=repo,
-                    hash=commit, data_files=located)
+                    hash=commit, data_files=DataFilesDict(files))
 
     def builder(path, *, revision, **options):
         assert path == repo and revision == commit
         return built
+
+    def download(self, repo_id, filename, *, revision, **options):
+        assert repo_id == repo and revision == commit
+        return str(directory / filename)
 
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, name, revision=None, **options: SimpleNamespace(
         sha=commit))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **options: ["data.tar"])
     monkeypatch.setattr(HfApi, "list_repo_refs", lambda *args, **options: GitRefs(
         branches=[], converts=[], tags=[]))
+    monkeypatch.setattr(HfApi, "hf_hub_download", download)
     monkeypatch.setattr(datasets, "load_dataset_builder", builder)
     return built

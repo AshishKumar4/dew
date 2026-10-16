@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
+from hub_support import stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -329,6 +330,7 @@ def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
         HfApi, "dataset_info", lambda self, repo, revision=None: SimpleNamespace(sha=revision)
     )
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: [f"train.{format}"])
+    stated_shards(monkeypatch)
     native = Hub("owner/data", revision="pinned").files
     assert native.url == (f"hf://datasets/owner/data@pinned/train.{format}",)
     assert native.format == format
@@ -356,6 +358,7 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     source = Hub("owner/data", revision=revision)
     commit = "original" if native else "converted"
     assert source.supports("streamed")
