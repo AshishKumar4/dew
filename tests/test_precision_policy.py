@@ -395,7 +395,9 @@ def test_a_two_float_product_keeps_the_exact_float64_residual(bit_split, subtrac
     rng = np.random.default_rng(411)
     random = np.ldexp(rng.uniform(1, 2, 128).astype(np.float32), rng.integers(-40, 41, 128))
     values = np.concatenate([values, -values, random, -random, np.array([0.0, -0.0], np.float32)])
-    left, right = values[:, None], values[None, :]
+    # Equal-shaped operands isolate the scalar law from XLA's broadcast fusion;
+    # the quantizer's composed division below exercises its broadcast arithmetic.
+    left, right = (np.array(x) for x in np.broadcast_arrays(values[:, None], values[None, :]))
 
     def product(a, b):
         return two_product(a, b, bit_split=bit_split, subtract=subtract,

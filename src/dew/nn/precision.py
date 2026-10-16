@@ -150,7 +150,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     `subtract` keeps division's subtractive residual order and its signed zeros.
     Norm interpretation passes `optimization_barrier` as `rounding` to keep each
     product and residual step separate; the other callers allow fusion.
-    The residual is exact where the intermediates neither overflow nor underflow.
+    With each arithmetic step rounded, the residual is exact where intermediates
+    neither overflow nor underflow.
     """
     def rounded(value):
         return value if rounding is None else rounding(value)
