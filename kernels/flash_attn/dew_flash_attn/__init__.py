@@ -262,16 +262,20 @@ def _attend_backward(longest, scale, causal, window, residuals, grad):
     query, key, value, sinks, starts, out, lse = residuals
     dsinks = None
     if sinks is not None:
-        # The weights with the sink are the kernel's times the kept share, so the kernel's own
-        # backward of the scaled output takes the gradient times that share, and the sink's logit
-        # takes minus the share it holds times each row's gradient along the scaled output. That
-        # product scales the kernel's output in fp32, rounded once, as the kernel wrote it.
+        # The sink's logit takes minus the share it holds times each row's gradient along the
+        # scaled output. That product scales the kernel's output in fp32, rounded once, as the
+        # kernel wrote it.
         kept = _kept(lse, starts, query.shape[0], sinks)
         along = kept * jnp.sum(grad.astype(jnp.float32) * out.astype(jnp.float32), axis=-1, keepdims=True)
         rows = tuple(axis for axis in range(kept.ndim) if axis != kept.ndim - 2)
         dsinks = -jnp.sum((1 - kept) * along, axis=rows).astype(sinks.dtype)
-        grad = (grad.astype(jnp.float32) * kept).astype(grad.dtype)
+        # The kernel's backward recomputes its weights from the log-sum-exp it is handed, so with
+        # the sink's e^s in it they are the weights with the sink, and it takes the gradient as it
+        # is: scaling the gradient by the kept share instead rounds it to bf16 once more, which a
+        # row whose gradient along a value cancels (dout . v small beside its products) magnifies.
+        # Every layout holds a row's log-sum-exp under its head, [..., H, rows].
         out = _sunk(out, lse, starts, sinks)
+        lse = jnp.logaddexp(lse, sinks.astype(jnp.float32)[:, None])
     dq, dk, dv = _backward(grad, query, key, value, out, lse, starts, longest, scale, causal, window)
     offsets = None if starts is None else np.zeros(starts.shape, jax.dtypes.float0)
     return dq, dk, dv, dsinks, offsets
