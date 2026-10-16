@@ -186,7 +186,12 @@ def refuse_dropout(vision: Mapping[str, object], *fields: str) -> None:
 def rope_base(vision: Mapping[str, object], default: float) -> float:
     """A trunk's plain rotary base: `rope_parameters`' rope_theta, else the
     flat field, else the family's `default`. A scaled rope refuses, as any
-    rope does where only plain rotary has a place (`read_rope_theta`)."""
-    theta = read_rope_theta(records.record(vision.get("rope_parameters") or {}, "rope_parameters"),
-                            "rope_parameters")
+    rope does where only plain rotary has a place (`read_rope_theta`), and so
+    does the decoders' 'none' alias: the towers dispatch any type but
+    'default' to Transformers' rope initializers, which name no 'none'
+    (modeling_gemma4.py:716-719)."""
+    entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    if entry.get("rope_type", entry.get("type")) == "none":
+        raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
+    theta = read_rope_theta(entry, "rope_parameters")
     return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta

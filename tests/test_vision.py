@@ -270,6 +270,15 @@ def test_a_gemma4_tower_writes_back_the_config_it_was_read_from(name):
     assert towers.from_record(gemma4.translate_gemma4_vision_config(
         gemma4.export_gemma4_vision_config(unset))) == (
         dataclasses.replace(unset, head_dim=unset.hidden_size // unset.num_heads))
+    # The base reads alike from rope_parameters under either spelling of its type and from the flat
+    # field; the decoders' 'none' alias is no type of the towers' reference.
+    theta = written["rope_parameters"]["rope_theta"]
+    for spelled in ({"rope_parameters": {"type": "default", "rope_theta": theta}},
+                    {"rope_parameters": None, "rope_theta": theta}):
+        assert towers.from_record(gemma4.translate_gemma4_vision_config({**written, **spelled})) == tower
+    with pytest.raises(ValueError, match="'none'"):
+        gemma4.translate_gemma4_vision_config(
+            {**written, "rope_parameters": {"rope_type": "none", "rope_theta": theta}})
 
 
 def shared_fixture(name):
