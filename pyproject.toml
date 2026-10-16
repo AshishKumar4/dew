@@ -342,10 +342,14 @@ filterwarnings = [
 
 [tool.coverage.run]
 # tools/armada/ci.py coverage: every task's data names src/dew's files relative to its checkout, so the
-# report combines tasks that ran in other containers.
+# report combines tasks that ran in other containers, and the Python processes a test starts are measured
+# too, each into its own file. The core stays the default: sys.monitoring has no branches before 3.14.
 branch = true
 relative_files = true
 source = ["src/dew"]
+parallel = true
+patch = ["subprocess"]
+concurrency = ["thread", "multiprocessing"]
 
 [tool.setuptools.dynamic]
 version = {attr = "dew.__version__"}
