@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from flax import linen as nn
 
-from dew.nn.flops import counted_flops
+from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, TOKENWISE, MixerCall
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.moe import SparseMLP
@@ -32,6 +32,11 @@ class _MLP(nn.Module):
     def model_flops(self, lengths) -> float:
         """The same MLP work when it occupies a mixer's slot."""
         return counted_flops(self.feedforward, lengths)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Its feed-forward's learned work, as in the feed-forward's own slot."""
+        return parameter_flops(self.feedforward, lengths)
 
     def setup(self):
         nn.share_scope(self, self.feedforward)
