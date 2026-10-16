@@ -113,8 +113,9 @@ def gemma4():
 
 
 def write(root: Path):
-    if transformers.__version__ != "5.16.1":
-        raise RuntimeError("Reference fixtures require Transformers 5.16.1")
+    from reference_releases import require
+
+    require("transformers")
     torch.set_num_threads(2)
     sounds = waveforms()
     for kind, build in (("gemma-3n-audio-tiny", gemma3n), ("gemma-4-audio-tiny", gemma4)):

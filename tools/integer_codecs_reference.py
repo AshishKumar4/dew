@@ -179,8 +179,9 @@ def min_max_grid(weight, group: int = 16, bits: int = 4):
 
 
 def main():
-    if gptqmodel.__version__ != GPTQMODEL:
-        raise RuntimeError(f"recorded against gptqmodel {GPTQMODEL}, not {gptqmodel.__version__}")
+    from reference_releases import require
+
+    require("gptqmodel")
     torch.set_num_threads(2)
     packing, gemm = autoawq()
     rng = np.random.default_rng(5)

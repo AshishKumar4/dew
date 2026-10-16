@@ -137,8 +137,9 @@ def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=
 
 
 def main():
-    if transformers.__version__ != "5.16.1":
-        raise RuntimeError(f"reference requires transformers 5.16.1, got {transformers.__version__}")
+    from reference_releases import require
+
+    require("transformers")
     torch.manual_seed(0)
     model = tiny_model()
     FIXTURE.mkdir(parents=True, exist_ok=True)

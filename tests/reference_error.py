@@ -60,11 +60,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.accuracy import distance, reduction_bound, within
+
 FACTOR = 2.0
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
-row (`worst_row`). An RMS over every entry averages a few wrong rows into a
+row (`rows_over`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
@@ -119,63 +121,85 @@ def equations(graph):
             yield from equations(value)
 
 
-def within(error, bound) -> bool:
-    """Whether every `error` is at most its `bound`, both finite. Written as the
-    passing condition, so a NaN or infinite error never passes, nor does an
-    infinite allowance from a reference that diverged."""
-    error, bound = np.asarray(error, np.float64), np.asarray(bound, np.float64)
-    return bool(np.all(np.isfinite(error) & np.isfinite(bound) & (error <= bound)))
-
-
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
-    """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products)).
-
-    `magnitudes` holds the elementwise sum of absolute products; `terms`
-    counts the products and any bias term in each reduction. gamma_n is
-    n*u/(1-n*u), with fp32 unit roundoff u=2^-24.
-    """
-    roundoffs = terms * np.finfo(np.float32).eps / 2
-    gamma = roundoffs / (1 - roundoffs)
+    """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
+    (`dew.accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of
+    absolute products and `terms` counts the products and any bias term in each
+    reduction."""
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
-    bound = 2 * gamma * np.asarray(magnitudes, np.float64)
+    bound = reduction_bound(magnitudes, terms)
     assert within(error, bound), (float(error.max()), float(bound.max()))
 
 
-def distance(value, truth) -> float:
-    """The root-mean-square difference over every entry, in float64."""
-    difference = np.asarray(value, np.float64) - np.asarray(truth, np.float64)
-    return float(np.sqrt(np.mean(np.square(difference))))
+RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
+"""The smallest row float64 resolves, over its leaf's size: a row below it is
+float64's own rounding of the leaf (a packed row's padding at 4e-19 of a
+leaf at 1e-3), a zero `rows_over` sizes by the reference's row. 1024
+roundings is the longest chain the suite's oracles allow
+(`assert_computes_the_oracle`); a row at a float32 resolution is ten orders
+above it."""
 
 
-def worst_row(value, truth, scale: float) -> float:
-    """The largest row's RMS distance from float64, each row (every axis but
-    the last) over the larger of its own RMS and `scale`: a row's rounding
-    follows the size of what it sums, which a row that cancels or is masked to
-    zeros (a single-key query's gradient) does not show, and the leaf's own size
-    stands for it. A value of rank one or less is one row, which `distance`
-    already judges, and has none of its own (0), as has a zero leaf."""
-    value, truth = np.asarray(value, np.float64), np.asarray(truth, np.float64)
-    if truth.ndim < 2 or not scale > 0:
-        return 0.0
-    rows = (-1, truth.shape[-1])
-    sizes = np.sqrt(np.mean(np.square(truth.reshape(rows)), axis=1))
-    errors = np.sqrt(np.mean(np.square((value - truth).reshape(rows)), axis=1))
-    return float(np.max(errors / np.maximum(sizes, scale)))
+def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
+    """Each row's float64 size and `value`'s RMS distance from float64 on it,
+    a row every axis but the last. A row's size is the RMS of its float64
+    values, or, where `terms` gives each entry's float64 terms
+    (`float64_terms`), the larger of that and the RMS of what the row sums,
+    so a row that cancels is sized by its terms' rounding and not by its
+    near-zero result; a row below float64's `RESOLUTION` of its leaf has size
+    zero. No other row's size enters: a small row beside large ones has its
+    own. A value of rank one or less is one row, which `distance` already
+    judges, and has none here."""
+    truth = np.asarray(truth, np.float64)
+    if truth.ndim < 2:
+        return np.zeros(0), np.zeros(0)
+
+    def rms(rows):
+        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
+
+    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+    leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
+    sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
+    return sizes, rms(np.asarray(value, np.float64) - truth)
 
 
-def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
+def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
+    """Where Dew's rows are further from float64 than ROW_FACTOR times the
+    reference's (`row_errors`): its worst row over its own size against the
+    reference's worst, at least `floor` (an order floor in the rows' units),
+    and each row of size zero, a sum that cancels exactly before anything its
+    terms see (a query that keeps one key), against the reference's distance
+    on that same row, which is all the evidence such a row has: where the
+    reference is exactly the float64 zero, Dew must be too."""
+    sizes, mine = row_errors(dew, truth, terms)
+    _, theirs = row_errors(reference, truth, terms)
+    sized = sizes > 0
+    over = []
+    if sized.any():
+        row = float(np.max(mine[sized] / sizes[sized]))
+        their_row = float(np.max(theirs[sized] / sizes[sized]))
+        if not within(row, ROW_FACTOR * max(their_row, floor)):
+            over.append(f"the worst row is {row:.3e} from float64 over its size, the reference's "
+                        f"{their_row:.3e}, allowed {ROW_FACTOR * max(their_row, floor):.3e}")
+    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
+    if zero.any():
+        at = int(np.flatnonzero(zero)[0])
+        over.append(f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
+                    f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}")
+    return over
+
+
+def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64, and
-    its worst row within ROW_FACTOR times the reference's (`worst_row`)."""
+    its rows within ROW_FACTOR times the reference's (`rows_over`), each
+    sized by its float64 `terms` where they are given (`float64_terms`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
-    scale = distance(truth, 0)
-    row, their_row = worst_row(dew, truth, scale), worst_row(reference, truth, scale)
-    assert within(row, ROW_FACTOR * their_row), (
-        f"{label}: dew's worst row is {row:.3e} from float64 (rms over the row's size), the "
-        f"reference's {their_row:.3e} (ratio {row / their_row:.2f}, allowed {ROW_FACTOR})")
+    over = rows_over(dew, reference, truth, terms)
+    assert not over, f"{label}: " + "; ".join(over)
 
 
 
@@ -186,7 +210,8 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
 
 
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None) -> None:
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
+                           rows: bool = True) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
@@ -200,8 +225,11 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
     bias's gradient does under the softmax's shift invariance, is held to
     its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's worst row is held
-    to the reference's too (`ROW_FACTOR`)."""
+    signs are independent keeps about its own. Each leaf's rows are held to
+    the reference's too (`rows_over`), unless `rows` is false: after a
+    second training step a row inherits the first step's rounding through
+    the parameters it reads, which its own terms do not see, so such a
+    comparison holds each tensor alone and its first step holds the rows."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -214,12 +242,10 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # The worst row, its order floor the leaf's in the rows' own units.
-        row = worst_row(mine, true, scale)
-        row_bar = ROW_FACTOR * max(worst_row(theirs, true, scale), spread * unit)
-        if not within(row, row_bar):
-            over.append(f"{jax.tree_util.keystr(path)}: the worst row {row:.3e} from float64 "
-                        f"(rms over its size), allowed {row_bar:.3e}")
+        # Each row over its own terms where they are given, the order floor in those units.
+        over += [f"{jax.tree_util.keystr(path)}: {row}"
+                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
+                             if rows else ())]
     assert not over, "\n".join(over)
 
 
@@ -229,17 +255,19 @@ taken at their float64 values (`float64_terms`)."""
 
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier"})
+                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
+                     "name"})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter) and moved. A product or quotient of a sum by a value
-that is none carries them too, scaled element by element (`_applied`), as
-`s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
+added to a parameter) and moved, by a remat name (`checkpoint_name`) too.
+A product or quotient of a sum by a value that is none carries them too,
+scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
+`s_i x_ik`; a product of two sums ends them."""
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
+                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A body that runs elsewhere, a
 shard_map's per-device program or a Pallas kernel, is one operation, its
 outputs their own size."""
 

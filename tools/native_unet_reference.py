@@ -24,8 +24,9 @@ from native_diffusion_reference_files import convert
 
 
 def build(root):
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Use Diffusers 0.34.0 for the reference")
+    from reference_releases import require
+
+    require("diffusers")
     for case, linear, depths, channels, context_width, extra, ids_count in (
         ("sd1", False, (1, 1, 1), 4, 8, False, 0),
         ("sd2", True, (1, 1, 1), 4, 12, False, 0),
@@ -73,8 +74,9 @@ def build(root):
 
 def widen(root):
     """Each case's float64 prediction and input VJP, from the archive at `root`."""
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Use Diffusers 0.34.0 for the reference")
+    from reference_releases import require
+
+    require("diffusers")
     jax.config.update("jax_enable_x64", True)
     arrays = {}
     for case in ("sd1", "sd2", "sdxl-inpaint", "refiner"):

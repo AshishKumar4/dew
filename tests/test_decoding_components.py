@@ -289,6 +289,24 @@ def test_begin_suppress_tokens_fires_at_the_first_drawn_token():
         assert np.isfinite(got[:, 2]).all() == (step == 1)
 
 
+def test_begin_suppress_tokens_after_a_forced_bos_fires_where_each_rows_bos_ran():
+    """With a forced BOS, transformers suppresses one token later only for a
+    one-token prompt, the rows where the BOS is forced: a batch of a
+    one-token prompt and a longer one suppresses the first at its second
+    drawn token and the second at its first, as each row does alone."""
+    prompts = [[3], [7, 2, 5]]
+    for drawn in ([[], []], [[4], [5]]):
+        logits = logits_of(len(prompts))
+        got = applied(decoding.BeginSuppressTokens(jnp.asarray([2, 6], jnp.int32), forced_bos=True),
+                      rows(prompts, drawn), logits)
+        want = np.stack([
+            SuppressTokensAtBeginLogitsProcessor([2, 6], len(prompt) + (len(prompt) == 1))(
+                torch.tensor([history], dtype=torch.long),
+                torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
+            for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn), strict=True))])
+        np.testing.assert_array_equal(np.isfinite(got), np.isfinite(want))
+
+
 def test_exponential_decay_grows_the_eos_score_after_its_start():
     prompts = [[3, 3, 9, 1], [7, 2, 5, 2, 7]]
     drawn = [[1, 3, 9], [2]]

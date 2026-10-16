@@ -329,6 +329,22 @@ def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
         make_trainer(tmp_path).fit(data, steps=6, log_every=1)
 
 
+def test_a_final_checkpoint_resumes_only_a_stream_that_keeps_or_replays_its_position(tmp_path):
+    """A run that writes only its final checkpoint, as by default, holds no data position for a plain
+    generator: a later run toward more steps, which would read its data again from the start, is
+    refused by name. A generator declared to replay resumes from it onto the uninterrupted run."""
+    plain = stream(lambda partition: drawn())
+    make_trainer(tmp_path / "plain").fit(plain, steps=3, log_every=1)
+    assert Checkpoints(str(tmp_path / "plain" / "run")).latest == 3
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path / "plain").fit(plain, steps=6, log_every=1)
+    declared = stream(replayed(lambda partition: drawn()))
+    make_trainer(tmp_path / "declared").fit(declared, steps=3, log_every=1)
+    resumed = make_trainer(tmp_path / "declared").fit(declared, steps=6, log_every=1)
+    assert int(resumed.step) == 6
+    assert same_variables(resumed, make_trainer().fit(declared, steps=6, log_every=1))
+
+
 def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
     """The replay guard: a stream declared to replay that reads back another
     batch at its position, one over fresh entropy, is refused."""
