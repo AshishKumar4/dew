@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -117,6 +118,13 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
 
 
+def install_compiler(directory: Path) -> None:
+    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
+    directory.mkdir()
+    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
+    (directory / "ptxas").chmod(0o755)
+
+
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
     """A task keeps, beside each green file's key, where its run read the
@@ -129,7 +137,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     file that started a process, a shell's or any multiprocessing context's,
     has no key, so it is in, and no task reuses its row, whatever names its
     program (a descriptor, for `os.execve`); one that asked a native tool
-    about the host (`executed.TOOLS`) keeps its key. The command line
+    about the host or compiled a kernel with ptxas (`executed.TOOLS`) keeps
+    its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -163,6 +172,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
+                        "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
                         "    assert platform.platform()\n",
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
@@ -185,6 +195,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     }
     for name, source in files.items():
         (tmp_path / "tests" / name).write_text(source)
+    install_compiler(tmp_path / "tests/compiler")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -536,3 +547,30 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+
+
+def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
+    """`ci.py gangs` reads the models from test_multihost.py: each gang's -k selects a part of the
+    file's collected cases, the parts are disjoint and cover every case, and a model added to
+    MODELS makes a gang of its own."""
+    source = ROOT / "tests/test_multihost.py"
+    items = ci.gangs(source)
+
+    def collected(*select: str) -> set[str]:
+        # As a gang's rank collects it: the file skips itself outside a gang.
+        done = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p",
+                               "no:cacheprovider", str(source), *select],
+                              cwd=ROOT, capture_output=True, text=True, check=True,
+                              env={**os.environ, "ARMADA_WORLD": "4", "ARMADA_RANK": "0"})
+        return {line for line in done.stdout.splitlines() if "::" in line}
+
+    every = collected()
+    parts = [collected("-k", item["select"]) for item in items]
+    assert all(item["gang"] == 4 for item in items) and all(parts)
+    assert sum(len(part) for part in parts) == len(every) and set().union(*parts) == every
+    grown = tmp_path / "test_multihost.py"
+    grown.write_text(source.read_text().replace('MODELS = ("dense", "moe")',
+                                                'MODELS = ("dense", "moe", "hybrid")'))
+    assert [item["select"] for item in ci.gangs(grown)] == [
+        "layouts and dense", "layouts and moe", "layouts and hybrid",
+        "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]
