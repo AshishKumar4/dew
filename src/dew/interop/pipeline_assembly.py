@@ -676,29 +676,14 @@ def component_present(index: Mapping[str, object], name: str) -> bool:
 def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
                    params: Variables | None = None, lazy: bool = False
                    ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]:
-    """Build the published autoencoder, its parameters and their source layouts;
-    supplied `params` are bound without a weight read, and `lazy` leaves read
-    ones `SourceLeaf`s."""
-    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
-    from dew.nn.autoencoders.vae import _vae_path
+    """Build the published autoencoder `vae/` holds, as `LOADERS` names its
+    class and an AutoencoderKL otherwise, with its parameters and their source
+    layouts; supplied `params` are bound without a weight read, and `lazy`
+    leaves read ones `SourceLeaf`s."""
+    from dew.nn.autoencoders.pretrained import LOADERS, load_kl_vae
 
-    config = _component_config(directory, "vae")
-    if config.get("_class_name") == "AutoencoderKLWan":
-        from dew.nn.autoencoders.wan import load_wan_vae
-        return load_wan_vae(directory, compute, param_dtype=param_dtype, params=params, lazy=lazy)
-    if config.get("_class_name") == "AutoencoderKLQwenImage21":
-        from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
-        return load_qwen_image_vae(directory, compute, param_dtype=param_dtype, params=params, lazy=lazy)
-    if config.get("_class_name") == "AutoencoderKLFlux2":
-        from dew.nn.autoencoders.flux2 import load_flux2_vae
-        return load_flux2_vae(directory, compute, param_dtype=param_dtype, params=params, lazy=lazy)
-    model = AutoencoderKL.from_diffusers(config, compute)
-    return bind_component(
-        directory / "vae", "vae", config, model, _vae_path,
-        lambda bound: StableDiffusionVAE(str(directory), dtype=compute, params=bound, model=model,
-                                         latent_shift=config.get("shift_factor") or 0.0,
-                                         latent_scale=config.get("scaling_factor", 0.18215)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy)
+    load = LOADERS.get(_component_config(directory, "vae").get("_class_name", ""), load_kl_vae)
+    return load(directory, compute, subfolder="vae", param_dtype=param_dtype, params=params, lazy=lazy)
 
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",

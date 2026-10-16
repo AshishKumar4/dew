@@ -26,6 +26,7 @@ from dew.nn.attention import (
     chunk_mask,
     combined_attention_mask,
     cudnn_runs,
+    cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
     open_kv_cache,
@@ -541,7 +542,7 @@ class CausalSelfAttention(nn.Module):
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
                 kv_store[self.ctx.kv_store_key] = (key, value, positions)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
-            attention = self._mixed_attended(query, key, value, positions, attention_metadata.admitted)
+            attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value)
         sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
                  if self.ctx.attention_sinks else None)
@@ -625,25 +626,24 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
-    def _mask_kernel(self, query, decode: bool) -> str:
+    def _mask_kernel(self, query, key, decode: bool) -> str:
         """The kernel a call that builds its mask runs: xla
         (`kernel_for_materialized_mask`), except a cache call over several
-        queries (a prefill, a verified draft) under 'auto' or 'cudnn' where
-        `cudnn_runs` (which also keeps the deterministic-ops lane off it); an
-        explicit 'xla' stays xla. That call runs
+        queries (a prefill, a verified draft) where cuDNN takes the mask
+        (`cudnn_takes_mask`); an explicit 'xla' stays xla. That call runs
         forward only, where cuDNN takes the mask as its additive bias with
         none of the backward's refusals: 8 prompts of 256 at Qwen3-0.6B's
         widths took 4.0 against xla's 6.2 ms over 28 layers on an RTX 4080.
         It rounds elsewhere, so the prefill is not bitwise xla's: its RMS
         distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
         1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
-        only at bf16 near-ties (docs/performance.md). cuDNN cannot honor
-        attention sinks, so a sink layer keeps xla, which takes them."""
+        only at bf16 near-ties (docs/performance.md)."""
         masked = kernel_for_materialized_mask(
-            self.ctx.attention_impl, query, dtype=self.ctx.dtype, precision=self.ctx.precision,
+            self.ctx.attention_impl, query, key, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax)
-        if (decode and query.shape[1] > 1 and masked == 'xla' and self.ctx.attention_impl in ('auto', 'cudnn')
-                and not self.ctx.attention_sinks and cudnn_runs(query, self.ctx.attn_logit_softcap)):
+        if decode and query.shape[1] > 1 and masked == 'xla' and cudnn_takes_mask(
+                self.ctx.attention_impl, query, softcap=self.ctx.attn_logit_softcap,
+                sinks=self.ctx.attention_sinks):
             return 'cudnn'
         return masked
 
@@ -670,7 +670,6 @@ class CausalSelfAttention(nn.Module):
         B, S = query.shape[:2]
         causal, mask, documents = self.ctx.causal, None, None
         implementation = self.ctx.attention_impl
-        masked = self._mask_kernel(query, decode)
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -719,6 +718,8 @@ class CausalSelfAttention(nn.Module):
             # them per block, and every other kernel builds the document mask
             # from them (`attention_kernel`).
             documents = segment_ids
+        # Over the keys the call reads, the cache's or the prefix's joined.
+        masked = self._mask_kernel(query, key, decode)
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
             # A decode step's cache mask already holds the rows' validity; only
             # image groups add to it there.
@@ -840,11 +841,21 @@ class CausalSelfAttention(nn.Module):
                                      jnp.where(prompt, filled, -1).reshape(-1)])
         return positions[None]
 
-    def _mixed_attended(self, query, key, value, positions, admitted: Admitted):
+    def _mixed_attended(self, query, key, value, positions, metadata: AttentionMetadata):
         """A mixed call's attention: every valid token's keys and values go
         into its row of the cache, then each decoding row's query reads its
         row as a decode step does, and each prompt's queries read their row
-        up to their own slot."""
+        up to their own slot. Its rows' caches are its whole visibility, so a
+        call that also carries a pairwise mask, key positions or a position
+        bias is refused by name rather than run without them."""
+        carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
+                                            ("key positions", metadata.key_positions),
+                                            ("a position bias", metadata.position_bias)) if given is not None]
+        if carried:
+            raise ValueError(f"{self.name}: a serving step's mixed call reads each row's cache as a decode "
+                             f"step does, and takes no {' or '.join(carried)}")
+        admitted = metadata.admitted
+        assert admitted is not None
         index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
         store = KVStore.open(self, self.ctx.kv_cache, index.value.shape[0], self.ctx.max_seq_len,
                              self.ctx.num_kv_heads, self.ctx.head_dim, key.dtype, value_dim=self.value_dim)
@@ -882,7 +893,7 @@ class CausalSelfAttention(nn.Module):
         prefilled = scaled_dot_product_attention(
             queries, keys, values, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-            implementation=self._mask_kernel(queries, decode=True), causal=False, mask=keep,
+            implementation=self._mask_kernel(queries, keys, decode=True), causal=False, mask=keep,
             softcap=self.ctx.attn_logit_softcap)
         return jnp.concatenate([decoded.reshape(1, rows, *decoded.shape[2:]),
                                 prefilled.reshape(1, -1, *prefilled.shape[2:])], axis=1)
@@ -923,15 +934,16 @@ class CausalSelfAttention(nn.Module):
         """Whether a decode step may read a paged pool through its device's
         paged kernel (`KVStore.decode`) rather than the gathered rows. The
         paged kernels read keys and values of one width, so narrower values
-        take the gathered rows, which the attention core widens."""
-        if self.value_dim != self.ctx.head_dim:
+        take the gathered rows, which the attention core widens. Neither
+        device's paged kernel performs what only the reference path does
+        (`reference_only`), so such a step takes the gathered rows, where an
+        explicit kernel refuses it by name."""
+        if self.value_dim != self.ctx.head_dim or reference_only(
+                query, self.ctx.dtype, self.ctx.precision, self.ctx.force_fp32_for_softmax):
             return False
         if backend() != 'gpu':
             return self.ctx.attention_impl in ('auto', 'tpu')
-        return (self.ctx.attention_impl in ('auto', 'cudnn')
-                and cudnn_runs(query, self.ctx.attn_logit_softcap)
-                and not reference_only(query, self.ctx.dtype, self.ctx.precision,
-                                       self.ctx.force_fp32_for_softmax))
+        return self.ctx.attention_impl in ('auto', 'cudnn') and cudnn_runs(query, self.ctx.attn_logit_softcap)
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.

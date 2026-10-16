@@ -659,6 +659,28 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
         np.testing.assert_array_equal(got, expected)
 
 
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
+def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
+    """A layer whose rows are padded on the left builds its mask and runs the
+    kernel a materialized mask takes (`kernel_for_materialized_mask`). Over
+    more than 256 fp32 keys on XLA:CPU that is the reference path's blocked
+    sum, the route `resolve_implementation` takes for an unmasked call
+    (`_takes_reference`): the padded rows' real logits under 'auto' are the
+    'reference' kernel's, bit for bit."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    def model(implementation):
+        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=320, attention_impl=implementation)
+
+    tokens = jnp.asarray(np.random.default_rng(3).integers(1, 64, (2, 300)), jnp.int32)
+    valid = jnp.arange(300)[None] >= jnp.asarray([[0], [7]])
+    params = model('auto').init(jax.random.key(0), tokens)
+    chosen, reference = (np.asarray(model(name).apply(params, tokens, attention_mask=valid))
+                         for name in ('auto', 'reference'))
+    np.testing.assert_array_equal(chosen[np.asarray(valid)], reference[np.asarray(valid)])
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("heads", [1, 2])
 def test_folded_attention_is_jax_nn_attention(dtype, heads):

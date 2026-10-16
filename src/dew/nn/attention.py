@@ -1360,7 +1360,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                        with_documents(mask, segment_ids))
         causal, sliding_window, segment_ids = False, None, None
         implementation = kernel_for_materialized_mask(
-            implementation, query, dtype=dtype, precision=precision,
+            implementation, query, key, dtype=dtype, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
@@ -1787,12 +1787,10 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """
     if implementation not in get_args(AttentionImpl):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
+    if _takes_reference(implementation, query, key, dtype, precision, force_fp32_for_softmax):
         return 'reference'
     if implementation != 'auto':
         return implementation
-    if reference_only(query, dtype, precision, force_fp32_for_softmax):
-        return 'reference'
     # cuDNN keeps a window behind the query only (jax.nn.dot_product_attention
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.
@@ -1819,7 +1817,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     return ran_kernel('attention', chosen, refusal) if query.dtype in CUDNN_DTYPES else chosen
 
 
-def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, precision=None,
+def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None, precision=None,
                                  force_fp32_for_softmax=True) -> str:
     """Send a call that built an explicit mask to the xla kernel.
 
@@ -1829,15 +1827,36 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     then refuses an odd length while training. The xla kernel masks by
     exclusion with the same fp32 softmax, at 83.6 ms and 5.80 GiB a step against
     cuDNN's fixed window at 75.8 ms and 4.99 GiB
-    (docs/concepts/language_models.md). 'auto' first takes the reference path
-    for arithmetic only it performs (`reference_only`).
+    (docs/concepts/language_models.md). A call 'auto' or the xla kernel would
+    send to the reference path goes there as `resolve_implementation` sends it
+    (`_takes_reference`), an explicit 'cudnn' among them, which runs here as xla.
     """
-    if implementation == 'auto' and reference_only(query, dtype, precision,
-                                                   force_fp32_for_softmax):
+    masked = 'xla' if implementation == 'cudnn' else implementation
+    if _takes_reference(masked, query, key, dtype, precision, force_fp32_for_softmax):
         return 'reference'
-    if implementation in ('auto', 'cudnn', 'xla') and _xla_kernel_narrows(query):
-        return 'reference'
-    return 'xla' if implementation in ('auto', 'cudnn') else implementation
+    return 'xla' if masked == 'auto' else masked
+
+
+def _takes_reference(implementation: str, query, key, dtype, precision, force_fp32_for_softmax) -> bool:
+    """Whether a call `implementation` names takes the reference path: under
+    'auto' where it asks for arithmetic no fused kernel performs
+    (`reference_only`), and under 'auto' or 'xla' where jax.nn's xla kernel
+    would narrow it (`_xla_kernel_narrows`) or sum it in one chain
+    (`_xla_kernel_chains`). Every route to the xla kernel decides it here."""
+    if implementation not in ('auto', 'xla'):
+        return False
+    return ((implementation == 'auto' and reference_only(query, dtype, precision, force_fp32_for_softmax))
+            or _xla_kernel_narrows(query) or _xla_kernel_chains(query, key))
+
+
+def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
+    """Whether cuDNN may take a call's materialized mask as its additive bias:
+    the call names cudnn or chooses ('auto'), cuDNN runs it (`cudnn_runs`,
+    which also keeps the deterministic-ops lane off it) and it has no sinks,
+    which cuDNN cannot honor. A caller adds why its mask suits cuDNN's bias,
+    where `kernel_for_materialized_mask` sends the rest to xla: a forward-only
+    call, or a mask a window bounds."""
+    return implementation in ('auto', 'cudnn') and not sinks and cudnn_runs(query, softcap)
 
 
 # Splash's tile size. At 1024 the forward kernel holds 4 MiB of fp32 logits
