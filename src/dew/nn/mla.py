@@ -360,12 +360,16 @@ class MultiHeadLatentAttention(nn.Module):
                 raise ValueError(
                     "the indexer reads the query residual, which only exists "
                     "with a q_lora_rank")
-            self.indexer = SparseIndexer(
-                n_heads=self.index_n_heads,
-                head_dim=self.index_head_dim,
-                rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
-                rope_interleave=self.index_rope_interleave,
-                dtype=self.dtype, precision=self.precision, name=INDEXER)
+            self.indexer = self.make_indexer()
+
+    def make_indexer(self) -> nn.Module:
+        """The indexer beside the attention, built in `setup`: V3.2's lightning indexer."""
+        assert self.index_n_heads is not None and self.index_head_dim is not None
+        return SparseIndexer(
+            n_heads=self.index_n_heads, head_dim=self.index_head_dim,
+            rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
+            rope_interleave=self.index_rope_interleave,
+            dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @property
     def indexed(self) -> bool:
