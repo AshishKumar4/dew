@@ -131,14 +131,21 @@ def rows_of(batch) -> list[tuple[int, int]]:
 
 
 def at_offset(batch, window: int, row: int) -> dict:
-    """Row `row` of window `window` alone where the window packed it: its tokens at their places and
-    the window's others segment-0 padding, its question slots first."""
-    mine = batch["segments"][window] == row
+    """Row `row` of window `window` alone where the window packed it, its question slots first: the
+    tokens before it one document of token 0 with no questions, so the window keeps its real tokens
+    first as the layout's are, and none of the window's other rows; its tokens at their places; then
+    segment-0 padding."""
+    segments = batch["segments"][window]
+    mine = segments == row
+    before = np.arange(segments.size) < np.flatnonzero(mine)[0]
     asked = np.flatnonzero(owners(batch)[window] == row)
     one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
     one |= {name: np.where(mine.reshape(-1, *(1,) * (batch[name].ndim - 2)), batch[name][window], 0)[None]
-            for name in ("tokens", "positions", "slots") if name in batch}
-    return one | {"segments": mine.astype(np.int32)[None]}
+            for name in ("tokens", "slots") if name in batch}
+    if "positions" in batch:
+        filler = np.cumsum(before) - 1
+        one["positions"] = np.where(mine, batch["positions"][window], np.where(before, filler, 0))[None]
+    return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
 
 
 def apart(batch, laid=alone) -> dict:
