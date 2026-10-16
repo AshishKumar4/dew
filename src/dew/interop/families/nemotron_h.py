@@ -38,6 +38,9 @@ _ALIASES = {
     "n_groups": "mamba_n_groups", "conv_kernel": "mamba_d_conv",
     "use_conv_bias": "mamba_conv_bias", "chunk_size": "mamba_chunk_size",
     "time_step_min": "mamba_dt_min",
+    # The releases whose config is their own remote code's (Nemotron-H-4B/8B-Base-8K,
+    # configuration_nemotron_h.py) name the attention head width so.
+    "head_dim": "attention_head_dim",
 }
 # Mamba-2's trunk and layer names, and the attention, MLP and expert layers beside them.
 _LAYER: Mapping[str, tuple[str, ...]] = {

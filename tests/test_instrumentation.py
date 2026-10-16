@@ -341,3 +341,45 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         assert os.environ["XLA_FLAGS"] == named
     finally:
         jax.config.update("jax_compilation_cache_dir", previous)
+
+
+@pytest.mark.mesh(devices=8)
+def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move():
+    """A step over eight devices that gathers an f32 array whole and sums an int32 one across them:
+    the shared parser names both collectives (`collective`) and the bytes each result holds, and
+    the cluster diagnostic counts each once, an async pair by its `-done`, with those bytes."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from tool_support import load
+
+    from dew.telemetry.instrumentation import collective, hlo_instructions
+
+    mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
+
+    def step(gathered, summed):
+        whole = jax.lax.all_gather(gathered, "data", tiled=True)
+        return whole, jax.lax.psum(summed, "data")
+
+    # The gathered whole is the same on every device, which shard_map cannot infer of an all_gather.
+    mapped = jax.shard_map(step, mesh=mesh, in_specs=(P("data"), P("data")), out_specs=(P(), P()),
+                           check_vma=False)
+    # f32, as a CPU's collectives move bf16 widened.
+    gathered = jax.device_put(jnp.ones((64, 32), jnp.float32), NamedSharding(mesh, P("data")))
+    summed = jax.device_put(jnp.ones((8, 16), jnp.int32), NamedSharding(mesh, P("data")))
+    text = jax.jit(mapped).lower(gathered, summed).compile().as_text()
+    instructions = hlo_instructions(text).values()
+    found = {collective(instruction.op) for instruction in instructions} - {None}
+    assert found == {"all-gather", "all-reduce"}
+    counted = load("cluster_vs_gpu").collectives(text)
+    assert {kind: (entry["ops"], entry["bytes"]) for kind, entry in counted.items()} == {
+        "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
+
+
+def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
+    """An XLA dump's all-gather of int4 arrays: one per byte unpacked, a scalar's included, and two per
+    byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    module = """ENTRY %main () -> (s4[3], u4[], s4[3]) {
+  %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
+}"""
+    assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)

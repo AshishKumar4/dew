@@ -138,6 +138,8 @@ contourpy==1.4.0
     # via matplotlib
 cosmic-ray==8.7.0
     # via dewml (pyproject.toml)
+coverage==7.16.2
+    # via dewml (pyproject.toml)
 cryptography==50.0.2
     # via
     #   google-auth
@@ -172,7 +174,7 @@ deltalake==1.6.6
     # via dewml (pyproject.toml)
 deprecated==3.0.0
     # via deltalake
-dew-flash-attn-cu12==0.3.0
+dew-flash-attn-cu12==0.3.2
     # via dewml (pyproject.toml)
 diffusers==0.34.0
     # via dewml (pyproject.toml)

@@ -1,5 +1,6 @@
 """Decision rows packed into windows: each row decides as it does alone, and a run is one program."""
 
+import collections
 import copy
 import itertools
 from dataclasses import replace
@@ -14,6 +15,7 @@ from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.config.data import loader
+from dew.data import Loading
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -271,6 +273,35 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
         reader.close()
 
 
+@pytest.mark.parametrize("causal", [True, False])
+def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row(causal):
+    """A decision objective given the joint head and no layout lays a request out
+    as that head reads it, every question in one row (`JointLayout`), over a
+    causal and a bidirectional backbone alike, as a run's config does: it
+    scores a three-question request as the same objective given the
+    JointLayout does."""
+    example = EXAMPLES[4]
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
+                                 max_seq_len=2048, attention_impl="xla", causal=causal)
+    head = JointSchemaHead(32, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)
+
+    def objective(**layout):
+        return DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, head=head,
+                                 shuffle_options=False, **layout)
+
+    stated, defaulted = objective(layout=JointLayout()), objective()
+    # Drawn over a window the backbone holds; the weights are the same whatever the layout's length.
+    variables = objective(layout=JointLayout(max_len=2048)).init(jax.random.key(0))
+
+    def scores(objective):
+        rows = objective.layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
+        return np.asarray(objective.model.logits(variables, DecisionInputs.collate(rows, SPECIALS.pad)))
+
+    expected = scores(stated)
+    assert expected.shape[:2] == (1, len(example.questions))
+    np.testing.assert_array_equal(scores(defaulted), expected)
+
+
 @pytest.mark.parametrize("questions", [1, 2])
 def test_single_option_questions_fit_the_packing_bounds(questions):
     """A fitting singleton-choice schema packs even where a two-option row cannot fit."""
@@ -296,6 +327,42 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
     assert float(loss.mass) == questions and float(loss.total) == 0
     probabilities = objective.evaluate(variables, batch, step).probabilities
     np.testing.assert_array_equal(np.asarray(probabilities)[batch["options"]], np.ones(questions))
+
+
+class Counting(ByteTokenizer):
+    """The byte vocabulary, counting the texts it tokenizes. It does not hash,
+    as a tokenizer that compares by value need not."""
+
+    __hash__ = None
+
+    def __init__(self):
+        super().__init__()
+        self.texts: collections.Counter[str] = collections.Counter()
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        self.texts[text] += 1
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
+@pytest.mark.parametrize("arm", ["joint", "marker"])
+def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
+    """A reader lays each record out twice, to fit it and to train on it, and
+    every record asks its questions over options in a fresh order, yet each
+    text is tokenized once: each template, instruction and option once for
+    the run, and each state as its record is fit, which the row it trains on
+    lays out again."""
+    layout, _, head = ARMS[arm]
+    tokenizer = Counting()
+    objective = DecisionObjective(attending(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
+                                  layout=layout, head=head(), loss=LogLoss())
+    data = loader(Decisions(EXAMPLES), batch=2, read="memory", objective=objective.data(),
+                  loading=Loading(workers=0))
+    reader = data.train(DataPartition())
+    try:
+        assert len(list(itertools.islice(reader, 4))) == 4
+    finally:
+        reader.close()
+    assert tokenizer.texts and set(tokenizer.texts.values()) == {1}
 
 
 def test_a_packed_loss_counts_only_real_scored_questions():

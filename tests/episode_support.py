@@ -2,6 +2,7 @@
 
 import json
 import sys
+from collections.abc import Callable
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
@@ -55,17 +56,19 @@ def transition_logits():
 
 
 class ToolPolicy(nn.Module):
-    """A trainable bigram policy with a finite tool-call vocabulary.
+    """A trainable bigram policy, by default over a finite tool-call vocabulary.
 
     The shared sampler draws calls and final answers from logits; the test
     environment executes square(3) or square(4). No generated code executes.
+    `logits` builds the starting `[vocab_size, vocab_size]` table.
     """
 
     vocab_size: int = VOCAB
     max_seq_len: int = PROMPT + RESPONSE
+    logits: Callable[[], np.ndarray] = transition_logits
 
     def setup(self):
-        self.table = self.param("table", lambda key: jnp.asarray(transition_logits()))
+        self.table = self.param("table", lambda key: jnp.asarray(self.logits()))
 
     def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
         return jax.nn.one_hot(tokens, self.vocab_size)
