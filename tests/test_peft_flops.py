@@ -121,21 +121,30 @@ def test_residual_streams_separate_learned_work_from_mixing_for_peft(fields):
 
 
 def test_mamba2_layers_learn_their_maps_and_conv_and_not_their_scan():
-    """A Mamba-2 mixer's learned work is its maps and conv, the scan's state
-    contractions apart, so an adapted Mamba-2 decoder charges its frozen maps
-    twice their forward work, its scan three times and its factors three."""
+    """A Mamba-2 mixer's learned work is its two maps and its depthwise conv:
+    in_proj's [z, x, B, C, dt], out_proj back to the residual and the conv's
+    taps over x, B and C; the scan's state contractions are the rest. An
+    adapted Mamba-2 decoder charges its frozen work twice, its scan three
+    times, and its rank-2 factors three times, as many as its in_proj kernels'
+    widths make them."""
     lengths = np.array([4])
     mixer = Mamba2(8, 2, 4, state_size=3, chunk_size=1)
-    assert mixer.model_flops(lengths) - mixer.parameter_flops(lengths) == ssd_flops(lengths, 2, 3, 4)
+    width, groups_state = 2 * 4, 3
+    per_token = (2 * 8 * (2 * width + 2 * groups_state + 2) + 2 * width * 8
+                 + 2 * 4 * (width + 2 * groups_state))
+    assert mixer.parameter_flops(lengths) == 4 * per_token
+    assert mixer.model_flops(lengths) == 4 * per_token + ssd_flops(lengths, 2, 3, 4)
     model = decoder(mixer={"class": "mamba2", "fields": {"state_size": 3, "chunk_size": 1}},
                     attention_impl="reference")
     tokens = jnp.ones((1, 4), jnp.int32)
     variables = model.init(jax.random.key(413), tokens)
     adapted = LoRA(rank=2, alpha=4, modules=("in_proj",)).apply(model, variables, key=513)
+    kernels = [leaf.shape for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
+               if "in_proj" in jax.tree_util.keystr(path) and leaf.ndim == 2]
+    assert len(kernels) == model.num_layers
+    factors = sum(2 * 2 * (inputs + outputs) * 4 for inputs, outputs in kernels)
     native, learned = model.model_flops(lengths), model.parameter_flops(lengths)
     assert 0 < learned < native
-    factors = adapted.model.parameter_flops(lengths) - learned
-    assert factors > 0
     assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
 
 
