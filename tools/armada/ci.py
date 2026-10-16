@@ -6,6 +6,7 @@
     python3 tools/armada/ci.py durations VERDICT...
     python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -54,6 +55,7 @@ recorded and reused on the GPU's class as a CPU task's are on the CPU's.
 """
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import hashlib
@@ -699,6 +701,23 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
     return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
 
 
+GANG = 4
+"""Ranks of each multi-host gang: four containers, one host each."""
+
+
+def gangs(source: Path = Path("tests/test_multihost.py")) -> list[dict]:
+    """The multi-host gangs CI runs side by side, as armada map items: one a model of `source`'s
+    MODELS, for its layouts across hosts, and one for every other test, so each case runs in
+    exactly one of them and a model added there is a gang of its own. Read from the source, as
+    the CI runner has no Dew to import it."""
+    models = next(ast.literal_eval(node.value) for node in ast.parse(source.read_text()).body
+                  if isinstance(node, ast.Assign) and [target.id for target in node.targets
+                                                       if isinstance(target, ast.Name)] == ["MODELS"])
+    own = [f"layouts and {model}" for model in models]
+    return [{"gang": GANG, "select": select} for select in own] + [
+        {"gang": GANG, "select": " and ".join(f"not ({select})" for select in own)}]
+
+
 def pythons(*, check: bool) -> int:
     """Print the tested versions, one a line; with `check`, refuse the files that name them apart."""
     if not check:
@@ -744,6 +763,7 @@ def main() -> int:
     lane.add_argument("--cache", choices=("on", "off"), required=True)
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
+    operations.add_parser("gangs")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
@@ -753,6 +773,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
+    if args.operation == "gangs":
+        print(json.dumps(gangs()))
+        return 0
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
