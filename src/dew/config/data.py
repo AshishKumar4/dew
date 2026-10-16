@@ -261,13 +261,13 @@ class ChatCanvasData(_Loadable):
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.text import HFTokenizer
-
-        eos = HFTokenizer(self.tokenizer).eos_id
+        # The canvases' eos is the rendering's own tokenizer's, one pinned handle for both.
+        renderer = RenderChat(self.tokenizer, self.column)
+        eos = renderer.vocabulary.eos_id
         if eos is None:
             raise ValueError(f"tokenizer {self.tokenizer!r} declares no eos token to end a response's canvas")
         layout = ResponseCanvases(self.prompt_length, self.canvas_size, self.canvases, eos, self.pad_id)
-        rendered = Pipeline(_source(self.source)).map(RenderChat(self.tokenizer, self.column))
+        rendered = Pipeline(_source(self.source)).map(renderer)
         prefix = rendered.flat_map(layout).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
         return train, held, ()

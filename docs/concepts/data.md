@@ -130,7 +130,7 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
-`ChatCanvasData` renders the same way for `BlockDiffusionObjective`, which splits every row at its prompt length, so nothing is packed: each assistant turn is one row, the conversation before it padded to `prompt_length` and the turn on whole canvases, EOS closing the last one. A longer prompt keeps its tail, which holds the turn's header, and a longer turn keeps its head, as Google's reference cuts it.
+`ChatCanvasData` renders the same way for `BlockDiffusionObjective`, which splits every row at its prompt length, so nothing is packed: each assistant turn is one row, the conversation before it padded to `prompt_length` and the turn on whole canvases, EOS closing the last one. A longer prompt or turn keeps its head, as Google's reference cuts both.
 
 `Prompts` rejects over-length prompts by default. `long="truncate"` keeps their tail when that is the desired RL policy. `Preferences` refuses an over-length completion rather than cutting away its supervision.
 

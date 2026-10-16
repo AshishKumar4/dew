@@ -285,7 +285,7 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
             prompt = template.apply_chat_template(turns[:index], add_generation_prompt=True,
                                                   tokenize=True, return_dict=False)
             whole = template.apply_chat_template(turns[:index + 1], tokenize=True, return_dict=False)
-            expected.append((prompt[-objective.prompt_length:], whole[len(prompt):]))
+            expected.append((prompt[:objective.prompt_length], whole[len(prompt):]))
 
     batch = {name: np.stack([row[name] for row in rows]) for name in ("text", "canvas_mask")}
     _, tokens, response, _, valid, targets, _ = objective._row(batch)
