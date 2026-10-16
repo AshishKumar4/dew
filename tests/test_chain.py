@@ -1,4 +1,4 @@
-"""The recipe chain: every stage kind sharing one decoder, linked checkpoints.
+"""A recipe chain trains every stage kind on one decoder and links their checkpoints.
 
 A `Recipe` runs its stages in order, each in its own directory, with every
 stage after the first initializing from the model's part of the previous
@@ -156,18 +156,22 @@ def test_a_ppo_stage_acts_in_its_environment_and_hands_on_its_policy(tmp_path):
 
 
 def leaning(vocab: int, letter: int, eos: int) -> np.ndarray:
-    """Bigram logits that draw `letter` about three times in four after any id, and `eos` otherwise."""
+    """Bigram logits that draw `letter` about three times in four after any other id, `eos` the
+    rest of the time, and always `eos` after `letter`."""
     logits = np.full((vocab, vocab), -1000., np.float32)
     logits[:, letter], logits[:, eos] = 1., 0.
+    logits[letter, letter], logits[letter, eos] = -1000., 1000.
     return logits
 
 
 def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_path):
-    """DPO, GRPO, then DPO on a bigram policy that draws "a" or the prompts'
-    tokenizer's EOS. Each of the 8 * 4 completions the reward reads is a run
-    of "a" that tokenizer decodes; some are not empty, and some end before
-    the token budget, where EOS stopped them. GRPO's reference is the first
-    stage's final tree, and the last stage's reference is GRPO's."""
+    """DPO, GRPO, then DPO on a bigram policy that draws "a" then EOS, or
+    EOS at once. Of the 8 * 4 completions the reward reads, each is "a" or
+    empty as the prompts' tokenizer decodes it, and both occur: EOS stopped
+    every one inside the four-token budget, where sampling past it would
+    have decoded EOS text or a second "a". GRPO trains on the differing
+    rewards, its reference is the first stage's final tree, and the last
+    stage's reference is GRPO's."""
     tokenizer = tokenizer_for(str(TOKENIZER))
     letter, = tokenizer.encode("a", add_special_tokens=False)
     assert tokenizer.eos_id is not None
@@ -188,10 +192,9 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
     ), str(tmp_path / "chain"), batch=8, layout=LAYOUT).run()
 
     assert len(read) == 8 * 4
-    assert all(text == "a" * len(text) for text in read)
-    lengths = [len(text) for text in read]
-    assert max(lengths) > 0 and min(lengths) < 4
+    assert set(read) == {"", "a"}
     identical(states[1].ema, states[0].variables)
+    assert moved(states[1].variables, states[0].variables)
     identical(states[2].ema, states[1].variables)
 
 
