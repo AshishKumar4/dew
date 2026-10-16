@@ -154,9 +154,12 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
     import json
 
     import numpy as np
-    from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
 
     from dew.interop import Pretrained
+    from tools.diffusers_reference_helpers import restore_transformers_names
+
+    restore_transformers_names()
+    from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
 
     source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
