@@ -29,7 +29,6 @@ import io
 import json
 import platform
 import pstats
-import re
 import time
 import uuid
 from pathlib import Path
@@ -128,7 +127,7 @@ def dew_run(server, prompts: np.ndarray, output: int):
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
     """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
     import jax
-    from trace_window import device_events, length, union
+    from trace_window import DECODE_CATEGORIES, decode_category, device_events, kernel_totals, window_split
 
     import dew
 
@@ -164,24 +163,18 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     for plane, events in device_events(trace.parent)[0].items():
         if not plane.startswith("/device:GPU") or not events:
             continue
-        durations, counts = {}, {}
-        for event in events:
-            durations[event.name] = durations.get(event.name, 0) + event.duration_ns
-            counts[event.name] = counts.get(event.name, 0) + 1
-        spans = union([(event.start_ns, event.start_ns + event.duration_ns) for event in events])
-        busy, window = length(spans), spans[-1][1] - spans[0][0]
-        patterns = {"attention": r"fmha|flash|cudnn|attention", "gemm": r"gemm|cutlass|cublas|xmma|matmul|_dot",
-                    "movement": r"memcpy|copy|scatter|gather|transpose|concatenate",
-                    "reduction": r"reduce|argmax|topk|sort", "random": r"random|threefry|philox"}
-        classes = dict.fromkeys(patterns, 0) | {"other": 0}
-        for name, duration in durations.items():
-            kind = next((kind for kind, pattern in patterns.items() if re.search(pattern, name, re.I)), "other")
-            classes[kind] += duration
+        kernels = [(event.name, event.start_ns, event.start_ns + event.duration_ns) for event in events]
+        durations, counts = kernel_totals(kernels)
+        classes = (dict.fromkeys(DECODE_CATEGORIES, 0) | {"other": 0}
+                   | kernel_totals(kernels, decode_category)[0])
+        split = window_split(kernels)
+        busy, window = split["busy"], split["window"]
         devices[plane] = {"window_ms": window / 1e6, "busy_ms": busy / 1e6,
                           "busy_fraction": busy / window, "kernel_count": sum(counts.values()),
                           "kernel_ms": {kind: duration / 1e6 for kind, duration in classes.items()},
                           "top": [{"name": name, "ms": duration / 1e6, "count": counts[name]}
-                                  for name, duration in sorted(durations.items(), key=lambda item: -item[1])[:30]]}
+                                  for name, duration in sorted(durations.items(),
+                                                               key=lambda item: -item[1])[:30]]}
     return {"directory": str(directory), "steps": steps,
             "host_wall_seconds": host_wall, "host_profile": stream.getvalue(), "devices": devices}
 

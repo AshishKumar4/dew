@@ -9,11 +9,10 @@ that reads the backbone's output table says so with `reads_table`, and is
 given it as `[V, D]` rows.
 """
 
-import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar, Self
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +34,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
+from dew.registry import dtype_name, from_record, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -47,8 +47,8 @@ class Head(nn.Module):
     """What every decision head offers: its call, whether it reads the output
     table, and the record a run keeps of it.
 
-    A run records a head's own fields but not its width, which is the
-    backbone's, nor its numerics, which the run's model config gives.
+    A run records a head's fields, its numerics among them, but not its
+    width, which is the backbone's.
     """
 
     reads_table: ClassVar[bool] = False
@@ -67,29 +67,22 @@ class Head(nn.Module):
 
     def record(self) -> JSON:
         """Return the head's name and the fields a run records."""
-        kept: dict[str, JSON] = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
-                                 if field.name not in (*_NUMERICS, self.width_field)}
-        return {"name": type(self).__name__, "fields": kept}
+        fields = record_fields(self, type(self))
+        del fields[self.width_field]
+        return {"name": type(self).__name__, "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int, *, dtype: Dtype | None = None,
-                    attention_impl: str = "auto") -> "Head":
-        """Rebuild the head a run recorded, reading states `width` wide."""
+    def from_record(record: JSON, width: int, *, dtype: Dtype | None = None) -> "Head":
+        """Rebuild the head a run recorded, reading states `width` wide. A
+        record written before heads recorded their numerics computes in
+        `dtype`, the backbone's, as that run's head did."""
         held = records.record(record, "head")
-        name = records.text(held.get("name", "DecisionHead"), "head.name")
+        name = records.text(held.get("name"), "head.name")
         if name not in HEADS:
             raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = records.record(held.get("fields", held), "head.fields")
-        return HEADS[name].rebuilt(width, fields, dtype=dtype, attention_impl=attention_impl)
-
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        """Return the head of these recorded `fields`, reading states `width` wide."""
-        raise NotImplementedError
-
-
-_NUMERICS = ("parent", "name", "dtype", "precision", "attention_impl")
+        fields = {"dtype": None if dtype is None else dtype_name(dtype),
+                  **records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
+        return from_record(HEADS[name], fields)
 
 
 class DecisionHead(Head):
@@ -126,13 +119,6 @@ class DecisionHead(Head):
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
         return (self.layers * per_layer + projection_flops(options, self.features, self.features)
                 + projection_flops(options, self.features, 1))
-
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        return cls(features=width, layers=records.integer(fields.get("layers", 2), "head.layers"),
-                   dropout_rate=records.number(fields.get("dropout_rate", 0.0), "head.dropout_rate"),
-                   dtype=dtype, attention_impl=attention_impl)
 
     def setup(self):
         heads = max(1, self.features // 64)
@@ -249,6 +235,19 @@ def _gathered(values: jax.Array, indices: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, indices.reshape(*indices.shape, *(1,) * (values.ndim - 2)), axis=1)
 
 
+def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> jax.Array:
+    """Each question's `values` `[B, Q, F]` at its option slots, `[B, P, F]`: on the grid a question's
+    `width` slots repeat it, a broadcast whose transpose sums them, and compacted slots gather by their
+    `owners`. A gather's transpose is a scatter, which XLA's deterministic GPU scatter sorts: the
+    joint head's three [8, 75, 1024] reads at [8, 7500, 1024] slots took 3.99 ms forward and backward
+    on an A100 40GB as gathers, 0.18 as broadcasts."""
+    if inputs.option_slots is not None:
+        return _gathered(values, owners)
+    batch, count, width = inputs.options.shape
+    return jnp.broadcast_to(values[:, :, None], (batch, count, width, *values.shape[2:])).reshape(
+        batch, count * width, *values.shape[2:])
+
+
 def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Per-slot `values` `[B, P, ...]` back on the `[B, Q, K, ...]` grid, zero
     where no real option is: the grid itself where the inputs compact nothing."""
@@ -329,16 +328,6 @@ class JointSchemaHead(Head):
         return float(count + pooling + self.routing_layers * evidence
                      + self.layers * fields + scorer + summaries)
 
-    @classmethod
-    def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
-                attention_impl: str) -> Self:
-        def size(name: str) -> int:
-            return records.integer(fields[name], f"head.{name}")
-
-        return cls(hidden_size=width, width=size("width"), routing_layers=size("routing_layers"),
-                   layers=size("layers"), heads=size("heads"), feedforward=size("feedforward"), dtype=dtype,
-                   attention_impl=attention_impl)
-
     def setup(self):
         def dense(features: int, name: str) -> nn.Dense:
             return nn.Dense(features, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)
@@ -390,7 +379,7 @@ class JointSchemaHead(Head):
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
-                   + _gathered(self.option_question_projection(questions), owners))
+                   + _per_slot(self.option_question_projection(questions), owners, inputs))
         # A slot reads its own row's tokens and questions, and a padding slot every one of them, so
         # each query has a key. The masks are [B, 1, queries, keys], one for every head.
         read = _gathered(own, owners)[:, None]
@@ -411,11 +400,11 @@ class JointSchemaHead(Head):
             fields = layer(fields, memory, asked, own[:, None])
         fields = self.field_norm(fields)
 
-        anchor = _gathered(l2_normalized(questions + last_state, 1e-12), owners)
+        anchor = _per_slot(l2_normalized(questions + last_state, 1e-12), owners, inputs)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
                  * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
-        repeated = _gathered(fields, owners)
+        repeated = _per_slot(fields, owners, inputs)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]

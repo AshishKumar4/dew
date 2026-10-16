@@ -172,8 +172,9 @@ def reload(directory: str, recorded: str) -> None:
 def main(destination: str) -> None:
     import diffusers
 
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Requires diffusers==0.34.0")
+    from reference_releases import require
+
+    require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)

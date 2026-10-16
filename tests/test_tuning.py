@@ -109,7 +109,7 @@ import json
 from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
 print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15, 40)},
-                  tuning.settled(tuning.tune(lambda: step().lower(*operands(15))))]))
+                  tuning.settled(tuning.tune(lambda: step().lower(*operands(15)))[1])]))
 """
 
 
@@ -182,6 +182,24 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert repeatable != stored
 
 
+def test_a_lowering_records_each_launch_it_traces_as_a_lowering_made_to_describe_it_reads_it():
+    """A step's lowering records each launch whose config picks decide as it traces it (`seen`),
+    keyed as tokamax's description of it in a lowering made to read it is (`launches`), and again in
+    a lowering whose trace was cached before: a step needs no lowering of its own to be tuned."""
+    def keyed(op, ba):
+        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
+
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    described = sorted(keyed(ba.op, ba) for ba in found)
+    function = step()
+    function.lower(*operands(15))
+    for _ in range(2):
+        with tuning.seen() as found:
+            function.lower(*operands(15))
+        assert sorted(keyed(op, ba) for op, ba in found) == described
+
+
 def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_its_devices(monkeypatch):
     """Each launch of a step's lowering, the plain one and the one that
     describes its launches to `tune`, reads its config and its GPU model
@@ -231,10 +249,18 @@ import jax
 from test_tuning import operands, step
 from dew import cache
 from dew.nn.kernels import tuning
-launches = tuning.tune(lambda: step().lower(*operands(int(sys.argv[1]))), measure=True)
+lowerings = []
+
+
+def lower():
+    lowerings.append(None)
+    return step().lower(*operands(int(sys.argv[1])))
+
+
+_, launches = tuning.tune(lower, measure=True)
 path = cache.kernel_picks_path(jax.devices()[0].device_kind)
 stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
-print(json.dumps([path, stamp, tuning.settled(launches)]))
+print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
 """
 
 
@@ -260,7 +286,7 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     foreign = json.loads(with_foreign(seed.dumps()))["data"][-2:]
     fresh(STORED, json.dumps({**json.loads(seed.dumps()), "data": foreign}), cache_dir=tmp_path / "cache",
           flags=inherited)
-    path, measured, settled = fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
+    path, measured, settled, _ = fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
     assert settled is True
     with open(path) as file:
         written = json.load(file)
@@ -273,9 +299,10 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
         assert len(timings) > 1, type(ba.op)
         assert all(data.median_evaluation_time_ms > 0 for data in timings.values())
         assert timings.fastest_config in ba.autotuning_configs
-    assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True]
+    # A pass whose launches all have picks lowers its step once, recording them as it traces.
+    assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True, 1]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
-                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False]
+                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False, 1]
 
 
 STORES = """

@@ -61,8 +61,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_releases import RELEASES, require
 
-DIFFUSERS, TRANSFORMERS = "0.40.0", "4.57.1"
+DIFFUSERS, TRANSFORMERS = RELEASES["rae"]["diffusers"], RELEASES["rae"]["transformers"]
 DECODER = {"decoder_hidden_size": 64, "decoder_num_hidden_layers": 2, "decoder_num_attention_heads": 4,
            "decoder_intermediate_size": 128}
 CONFIGS = {
@@ -236,9 +237,7 @@ def main(destination: str) -> None:
     import diffusers
     import transformers
 
-    if (diffusers.__version__, transformers.__version__) != (DIFFUSERS, TRANSFORMERS):
-        raise RuntimeError(f"recorded against diffusers {DIFFUSERS} and transformers {TRANSFORMERS}, "
-                           f"not {diffusers.__version__} and {transformers.__version__}")
+    require("rae")
     torch.set_num_threads(2)
     root = Path(destination)
     for name in CONFIGS:

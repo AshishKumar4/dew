@@ -18,13 +18,19 @@ step, not a bare forward pass.
 Environment: a uv venv at /tmp/torchbench with torch CUDA 12 wheels
 (see the report for the exact versions used). Compiler scratch and caches
 default to $XDG_CACHE_HOME/dew/torchbench; set TMPDIR,
-TORCHINDUCTOR_CACHE_DIR, or TRITON_CACHE_DIR to override them. Run from the
-dew repo root:
+TORCHINDUCTOR_CACHE_DIR, or TRITON_CACHE_DIR to override them.
 
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer --mode compile
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model simple_dit --mode eager --attention sdpa
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model unet --mode max-autotune --json-out /tmp/out.json
-    /tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer --size large --profile
+The MFU numerator is Dew's own count of the case, the objective's training
+FLOPs on its real tokens, which the trainer logs as train/mfu. Dew's
+environment writes it once per case, and this venv reads it with --work.
+Run from the dew repo root:
+
+    PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python tools/reference_runs/work.py case \
+        --model causal_transformer --size small --out /tmp/lm-small.json
+    /tmp/torchbench/bin/python tools/benchmark_torch.py --model causal_transformer --mode compile \
+        --work /tmp/lm-small.json
+    /tmp/torchbench/bin/python tools/benchmark_torch.py --model unet --mode max-autotune \
+        --work /tmp/unet-small.json --json-out /tmp/out.json
 
 Modes: eager, compile (torch.compile default), max-autotune
 (torch.compile mode="max-autotune"), and max-autotune-no-graphs
@@ -67,9 +73,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, small_cases
-from reference_runs.common import peak_flops
-from trace_window import kernel_category, length, union
+from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, parity_case
+from reference_runs.common import WorkloadWork, peak_flops
+from trace_window import kernel_category, kernel_totals, window_split
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -84,31 +90,19 @@ ADAM = dict(lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
 # Presets: Dew's small preset and the larger compute-dominated cases
 # ----------------------------------------------------------------------------
 
-def preset(model: str, size: str) -> Case:
-    if model not in ('causal_transformer', 'simple_dit', 'unet'):
-        raise ValueError(model)
-    if size == 'small':
-        case = next(case for case in small_cases('bfloat16') if case.architecture == model)
-        # The torch CLI reports 64px even for its token-only case.
-        case = dataclasses.replace(case, image_size=64)
-        if model == 'unet':
-            # The torch port takes heads per level; Dew takes attention records.
-            attention = case.config['attention_configs']
-            if not isinstance(attention, list):
-                raise ValueError('the UNet preset needs attention records per level')
-            heads = [None if stage is None else stage['heads'] for stage in attention]
-            config = {'attention_heads' if name == 'attention_configs' else name:
-                      heads if name == 'attention_configs' else value for name, value in case.config.items()}
-            case = dataclasses.replace(case, config=config)
+def preset(model: str, size: str, *, batch_size: int | None = None, vocab_size: int | None = None) -> Case:
+    """The parity case (`benchmark_cases.parity_case`) in the form the torch ports read."""
+    case = parity_case(model, size, batch_size=batch_size, vocab_size=vocab_size)
+    if model != 'unet':
         return case
-    if model == 'causal_transformer':
-        return Case(model, dict(vocab_size=50304, emb_features=768, num_layers=12, num_heads=12,
-                                mlp_features=3072, max_seq_len=1024),
-                    batch_size=8, seq_len=1024, image_size=64)
-    if model == 'simple_dit':
-        return Case(model, dict(patch_size=4, emb_features=768, num_layers=12, num_heads=12, mlp_ratio=4),
-                    batch_size=32, image_size=64)
-    raise ValueError('the unet has no large preset')
+    # The torch port takes heads per level; Dew takes attention records.
+    attention = case.config['attention_configs']
+    if not isinstance(attention, list):
+        raise ValueError('the UNet preset needs attention records per level')
+    heads = [None if stage is None else stage['heads'] for stage in attention]
+    config = {'attention_heads' if name == 'attention_configs' else name:
+              heads if name == 'attention_configs' else value for name, value in case.config.items()}
+    return dataclasses.replace(case, config=config)
 
 
 # ----------------------------------------------------------------------------
@@ -694,15 +688,10 @@ def profile_step(step, n_steps):
                       if e.device_type == torch.autograd.DeviceType.CUDA), key=lambda kernel: kernel[1])
     if not kernels:
         return None
-    busy = length(union([(start, end) for _, start, end in kernels]))
-    window = kernels[-1][2] - kernels[0][1]
-    by_cat, by_name, count_cat, count_name = {}, {}, {}, {}
-    for name, start, end in kernels:
-        cat = kernel_category(name)
-        by_cat[cat] = by_cat.get(cat, 0.0) + (end - start)
-        count_cat[cat] = count_cat.get(cat, 0) + 1
-        by_name[name] = by_name.get(name, 0.0) + (end - start)
-        count_name[name] = count_name.get(name, 0) + 1
+    split = window_split(kernels)
+    busy, window = split["busy"], split["window"]
+    by_cat, count_cat = kernel_totals(kernels, kernel_category)
+    by_name, count_name = kernel_totals(kernels)
     top = sorted(by_name.items(), key=lambda kv: -kv[1])[:15]
     per_cat = {}
     for name, us in sorted(by_name.items(), key=lambda kv: -kv[1]):
@@ -716,68 +705,6 @@ def profile_step(step, n_steps):
                 kernels_by_category={k: v / n_steps for k, v in count_cat.items()},
                 top_kernels=[(name[:90], round(us / n_steps / 1e3, 3)) for name, us in top],
                 top_by_category=per_cat)
-
-
-def analytic_flops(case: Case):
-    """One formula per model class, applied identically to both frameworks:
-    6 x matmul params x tokens, plus 12 x layers x S^2 x width per sample for
-    attention (full square, causal not discounted), plus the small heads.
-    The UNet formula is the sum over its convolutions and denses of
-    6 x MACs per forward (forward + 2 backward), taken from the module graph."""
-    cfg, B = case.config, case.batch_size
-    if case.architecture == 'causal_transformer':
-        d, L, S, V = cfg['emb_features'], cfg['num_layers'], case.seq_len, cfg['vocab_size']
-        Fh = cfg['mlp_features']
-        assert isinstance(d, int) and isinstance(L, int) and isinstance(V, int) and isinstance(Fh, int)
-        per_layer = 4 * d * d + 3 * d * Fh
-        T = B * S
-        return dict(matmul=6 * (L * per_layer + d * V) * T, attention=12 * L * B * S * S * d,
-                    head=6 * d * V * T, tokens=T)
-    if case.architecture == 'simple_dit':
-        d, L, p = cfg['emb_features'], cfg['num_layers'], cfg['patch_size']
-        assert isinstance(d, int) and isinstance(L, int) and isinstance(p, int)
-        S = (case.image_size // p) ** 2
-        T = B * S
-        r = cfg['mlp_ratio']
-        assert isinstance(r, (int, float))
-        per_layer = 4 * d * d + 2 * d * r * d
-        # patch embed and text projection take inputs without gradients: forward + weight
-        # gradient only (4x); everything else is forward + two backward matmuls (6x)
-        small = 4 * (p * p * 3 * d) * T + 6 * (d * p * p * 3) * T + 6 * L * (6 * d * d) * B \
-            + 6 * B * (d * r * d + r * d * r * d + r * d * d) + 4 * B * TEXT_TOKENS * TEXT_FEATURES * d
-        return dict(matmul=6 * L * per_layer * T + small, attention=12 * L * B * S * S * d, tokens=T)
-    return None
-
-
-def unet_flops(model, case):
-    """Forward MACs of every conv and linear in the torch UNet, from hooks."""
-    macs = []
-
-    def conv_hook(mod, inputs, output):
-        w = mod.weight
-        macs.append(output.numel() * w.shape[1] * w.shape[2] * w.shape[3])
-
-    def linear_hook(mod, inputs, output):
-        macs.append(output.numel() * mod.weight.shape[1])
-
-    def attn_hook(mod, inputs, output):
-        x, ctx = inputs
-        B, C, H, W = x.shape
-        macs.append(2 * B * mod.heads * H * W * ctx.shape[1] * mod.dim_head)
-    hooks = []
-    for m in model.modules():
-        if isinstance(m, Conv):
-            hooks.append(m.register_forward_hook(conv_hook))
-        elif isinstance(m, Linear):
-            hooks.append(m.register_forward_hook(linear_hook))
-        elif isinstance(m, CrossAttentionBlock):
-            hooks.append(m.register_forward_hook(attn_hook))
-    batch = {k: v.cuda() for k, v in make_batch(case).items()}
-    with torch.no_grad():
-        diffusion_loss(model, batch)
-    for h in hooks:
-        h.remove()
-    return dict(matmul=6 * sum(macs), attention=0, tokens=case.batch_size * case.image_size ** 2)
 
 
 def _arguments() -> argparse.Namespace:
@@ -804,6 +731,9 @@ def _arguments() -> argparse.Namespace:
     ap.add_argument('--batch-size', type=int, default=None)
     ap.add_argument('--vocab-size', type=int, default=None,
                     help='LM vocabulary ablation; the matched preset is 50304')
+    ap.add_argument('--work', required=True,
+                    help="the case's training work, which tools/reference_runs/work.py case writes "
+                         "with the same --model, --size, --batch-size and --vocab-size")
     ap.add_argument('--json-out', default=None)
     ap.add_argument('--seed', type=int, default=0)
     return ap.parse_args()
@@ -844,13 +774,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = not args.no_tf32
     torch.backends.cudnn.benchmark = True
 
-    case = preset(args.model, args.size)
-    if args.batch_size:
-        case = dataclasses.replace(case, batch_size=args.batch_size)
-    if args.vocab_size is not None:
-        if case.architecture != 'causal_transformer':
-            raise ValueError('--vocab-size applies only to causal_transformer')
-        case.config['vocab_size'] = args.vocab_size
+    case = preset(args.model, args.size, batch_size=args.batch_size, vocab_size=args.vocab_size)
     model = build(case, args)
     params = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
@@ -893,8 +817,10 @@ def main():
 
     warmup_s, wall, per_step, gaps, (loss, aux, finite) = _timed(step, args.warmup, args.steps)
 
-    flops = unet_flops(model, case) if case.architecture == 'unet' else analytic_flops(case)
-    total_flops = flops['matmul'] + flops['attention']
+    work = WorkloadWork.read(args.work)
+    if work.examples_per_step != case.batch_size:
+        raise ValueError(f'{args.work} counts {work.examples_per_step} examples a step, '
+                         f'this case trains {case.batch_size}')
     step_s = wall / args.steps
     row = dict(
         framework='torch', torch=torch.__version__, cuda=torch.version.cuda,
@@ -908,13 +834,14 @@ def main():
         vocab_size=case.config.get('vocab_size'), params=n_params,
         warmup=args.warmup, warmup_s=round(warmup_s, 1), steps=args.steps,
         ms_per_step=step_s * 1e3, samples_per_sec=case.batch_size / step_s,
-        tokens_per_sec=flops['tokens'] / step_s,
+        tokens_per_sec=None if work.tokens_per_step is None else work.tokens_per_step / step_s,
         event_ms_median=float(np.median(per_step)), event_ms_p10=float(np.percentile(per_step, 10)),
         event_ms_p90=float(np.percentile(per_step, 90)),
         inter_step_gap_ms_median=float(np.median(gaps)) if len(gaps) else None,
-        analytic_flops=total_flops, analytic_tflops=total_flops / step_s / 1e12,
-        mfu_spec=(total_flops / step_s / peak if (peak := peak_flops(torch.cuda.get_device_name()))
-                  else None),
+        training_flops=work.training_flops_per_step, flops_basis=work.basis,
+        model_tflops=work.training_flops_per_step / step_s / 1e12,
+        mfu=(work.training_flops_per_step / step_s / peak
+             if (peak := peak_flops(torch.cuda.get_device_name())) else None),
         peak_allocated_gib=torch.cuda.max_memory_allocated() / 2 ** 30,
         peak_reserved_gib=torch.cuda.max_memory_reserved() / 2 ** 30,
         loss=float(loss), finite=bool(finite),

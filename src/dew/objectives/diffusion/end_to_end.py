@@ -22,10 +22,8 @@ times and noise.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -33,11 +31,9 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
+from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.objectives.base import Batch, Objective, Variables
-
-if TYPE_CHECKING:
-    from dew.nn.autoencoders import AutoEncoder
 
 AUTOENCODER = "autoencoder"
 """Where the trained autoencoder's parameters sit in `params`."""
@@ -64,6 +60,69 @@ class _BatchNorm(nn.Module):
         bias = self.param("bias", nn.initializers.zeros, (width,))
         mean, var = _moments(hidden, batch)
         return (hidden - mean) / jnp.sqrt(var + 1e-5) * weight + bias
+
+
+TUNED_WEIGHTS = "weights"
+"""Where a `TunedAutoEncoder`'s variables hold the trained autoencoder's weights."""
+
+
+class TunedAutoEncoder(AutoEncoder):
+    """`autoencoder` normalizing its latents by a tuned run's running statistics, read from the
+    variables each call takes, `{TUNED_WEIGHTS: weights, LATENT_STATS: statistics}`: shifted by the
+    running mean and scaled by the reciprocal square root of the running variance, without the batch
+    norm's epsilon, the scale REPA-E's `SiT.extract_latents_stats` gives its sampling to denormalize
+    with. The statistics are data, not constants of a compiled walk: one frozen autoencoder's tuned
+    copies are equal, so every publication of a run, each with its own statistics, samples through
+    the program the first compiled."""
+
+    def __init__(self, autoencoder: AutoEncoder, params: Variables):
+        self.autoencoder = autoencoder
+        self.model = autoencoder.model
+        self.params = params
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, TunedAutoEncoder) and other.autoencoder is self.autoencoder
+
+    def __hash__(self) -> int:
+        return hash((TunedAutoEncoder, id(self.autoencoder)))
+
+    def encode_batch(self, params, x, key=None):
+        return self.autoencoder.encode_batch(params[TUNED_WEIGHTS], x, key=key)
+
+    def decode_batch(self, params, z):
+        return self.autoencoder.decode_batch(params[TUNED_WEIGHTS], z)
+
+    def encode_video(self, params, x, key=None):
+        return self.autoencoder.encode_video(params[TUNED_WEIGHTS], x, key)
+
+    def decode_video(self, params, z):
+        return self.autoencoder.decode_video(params[TUNED_WEIGHTS], z)
+
+    @property
+    def downscale_factor(self) -> int:
+        return self.autoencoder.downscale_factor
+
+    @property
+    def latent_channels(self) -> int:
+        return self.autoencoder.latent_channels
+
+    def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        return self.autoencoder.latent_shape(shape)
+
+    def normalization(self, params, dtype=jnp.float32) -> tuple[jax.Array, jax.Array]:
+        """The latent shift and scale the running statistics in `params` give, in `dtype`."""
+        statistics = params[LATENT_STATS]
+        return jnp.asarray(statistics["mean"], dtype), jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype)
+
+    def encode(self, params, x, key=None):
+        latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
+        shift, scale = self.normalization(params, latent.dtype)
+        return (latent - shift) * scale
+
+    def decode(self, params, z):
+        shift, scale = self.normalization(params, z.dtype)
+        z = z / scale + shift
+        return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
 
 def _moments(values: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array]:
@@ -194,18 +253,11 @@ class EndToEnd:
     def tuned(self, autoencoder: AutoEncoder, variables: Variables) -> tuple[AutoEncoder, Variables]:
         """Return the autoencoder a task over a tuned run's `variables` decodes with, and its variables.
 
-        The trained weights come from `params/autoencoder` and go under
-        `autoencoder`. The latents are shifted by the running mean and scaled by the
-        reciprocal square root of the running variance, without the batch norm's
-        epsilon, which is the scale REPA-E's `SiT.extract_latents_stats` gives its
-        sampling to denormalize with.
+        The trained weights come from `params/autoencoder` and the running
+        statistics from `LATENT_STATS`, both under `autoencoder` (`TunedAutoEncoder`).
         """
-        tuned = copy.copy(autoencoder)
-        statistics = variables[LATENT_STATS]
-        tuned.latent_shift = statistics["mean"]
-        tuned.latent_scale = jax.lax.rsqrt(statistics["var"])
-        tuned.params = variables["params"][AUTOENCODER]
-        return tuned, {**variables, "autoencoder": tuned.params}
+        tuned = {TUNED_WEIGHTS: variables["params"][AUTOENCODER], LATENT_STATS: variables[LATENT_STATS]}
+        return TunedAutoEncoder(autoencoder, tuned), {**variables, "autoencoder": tuned}
 
     def normalized(self, latents: jax.Array, statistics: Variables) -> jax.Array:
         """Return `latents` normalized by the running statistics, as the batch norm does in eval mode."""
@@ -269,4 +321,5 @@ class EndToEnd:
         return total, hinge, terms
 
 
-__all__ = ["AUTOENCODER", "LATENT_STATS", "PERCEPTUAL", "EndToEnd", "PatchDiscriminator"]
+__all__ = ["AUTOENCODER", "LATENT_STATS", "PERCEPTUAL", "TUNED_WEIGHTS", "EndToEnd", "PatchDiscriminator",
+           "TunedAutoEncoder"]

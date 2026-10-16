@@ -1,0 +1,3 @@
+# What the site's Python generators import beyond the standard library (scripts/gen_api.py), pinned
+# once for every reader: the site's build (package.json) and tools/check.sh.
+griffe==2.3.0
