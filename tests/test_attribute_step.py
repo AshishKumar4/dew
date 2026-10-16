@@ -202,17 +202,29 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,
              "weight-gradient GEMM": 500.0}
     cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
-              "1", time, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
+              "2", time * 2, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
+    cells.append(("7", "custom-call", "other.1", "", "other program", "1", 15000.0, "", 0))
     rows = [{"c": [{"v": value} for value in values]} for values in cells]
     (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
                                                          "rows": rows}]))
     (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
+    idle_columns = ["host_or_device", "type", "total_self_time"]
+    idle_rows = [("Device", "IDLE", 2000), ("Device", "IDLE", 1000),
+                 ("Host", "IDLE", 10000), ("Device", "compute", 50000)]
+    (reports / "framework_op_stats.json").write_text(json.dumps([{
+        "cols": [{"id": name} for name in idle_columns],
+        "rows": [{"c": [{"v": value} for value in values]} for values in idle_rows]}]))
     dump = tmp_path / "hlo"
     dump.mkdir()
     (dump / "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(MODULE)
     out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump),
+                           "--out", str(out), "--steps", "2"]) == 0
     time = json.loads(out.read_text())["time"]
+    assert time["step_program"] == "15"
+    assert time["programs_ms"] == {"15": 9.5, "7": 7.5}
+    assert (time["device_busy_ms_per_step"], time["device_idle_ms_per_step"],
+            time["device_window_ms_per_step"]) == (9.5, 1.5, 11.0)
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
