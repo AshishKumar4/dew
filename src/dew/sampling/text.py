@@ -36,7 +36,16 @@ from typing_extensions import TypeVar
 from dew.interop.weights import decoding_storage
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
-from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, valid_order
+from dew.nn.inputs import (
+    ModelInputs,
+    PredictionPhase,
+    Request,
+    local_rows,
+    mesh_of,
+    next_position,
+    real_slots,
+    valid_order,
+)
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
@@ -393,11 +402,8 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
-    # An unpadded prompt carries no validity field, and its last real token is
-    # the last slot.
-    valid = inputs.token_fields.get("attention_mask")
-    last = (jnp.full((batch,), width - 1, jnp.int32) if valid is None else
-            jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
+    real = real_slots(inputs.token_fields, (batch, width))
+    last = jnp.max(jnp.where(real, jnp.arange(width)[None, :], -1), axis=1)
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
@@ -414,17 +420,9 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     if ops.record is not None:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
-    supplied = inputs.token_fields.get("positions")
     rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else supplied
-    # The model's own next coordinate, as its cache records it: the largest
-    # coordinate a real token holds on any axis, one on. A drawn token
-    # continues from there on every axis.
-    real = jnp.ones((batch, width), bool) if valid is None else valid.astype(bool)
-    positions = None if logical is None else jnp.max(
-        jnp.where(jnp.reshape(real, real.shape + (1,) * (logical.ndim - 2)), logical, -1),
-        axis=tuple(range(1, logical.ndim))) + 1
-    state = DecoderState(updated["cache"], drawn, positions,
+    logical = rotary if rotary is not None else inputs.token_fields.get("positions")
+    state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
@@ -681,7 +679,6 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     """
     batch, width = inputs.tokens.shape
     prompt = inputs.tokens if n == 1 else jnp.repeat(inputs.tokens, n, axis=0)
-    valid = inputs.token_fields.get("attention_mask")
     if trips == 0:
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
@@ -691,7 +688,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     state, real = prefill_state(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
-        valid=jnp.concatenate([jnp.ones((batch, width), bool) if valid is None else valid.astype(bool),
+        valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),
                                jnp.zeros((batch, trips), bool)], axis=1),
         step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width,
         budget=jnp.full(batch, budget, jnp.int32))
@@ -705,7 +702,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
 
 def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                   max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
-    """Shared host validation; return validity without placing unused device inputs."""
+    """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs."""
     if isinstance(model, BlockDenoiser):
         raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
                         "token at a time; generate with BlockGeneration")
@@ -718,9 +715,10 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
         raise ValueError("max_new_tokens must be a non-negative integer")
     if type(n) is not int or n < 1:
         raise ValueError("n must be a positive integer number of continuations")
-    valid = np.asarray(fields.get("attention_mask", np.ones(ids.shape, bool)))
-    if valid.shape != ids.shape or not np.all((valid == 0) | (valid == 1)):
+    mask = fields.get("attention_mask")
+    if mask is not None and (mask.shape != ids.shape or not np.all((mask == 0) | (mask == 1))):
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
+    valid = real_slots(fields, ids.shape, xp=np)
     if not np.all(valid.any(axis=1)):
         raise ValueError("each prompt must contain at least one valid token")
     cache_len = model.max_seq_len if isinstance(model, Bounded) else None
@@ -746,7 +744,7 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():
-        token_fields["attention_mask"] = jnp.asarray(valid.astype(bool))
+        token_fields["attention_mask"] = jnp.asarray(valid)
     prepared = ModelInputs(jnp.asarray(ids, jnp.int32), token_fields,
                            {name: jnp.asarray(value) for name, value in conditioning.items()})
     prepared.validate()

@@ -261,6 +261,21 @@ def test_media_prefill_and_canvas_generation_match_reference(system):
     np.testing.assert_array_equal(generated.decoder_steps, reference["image_steps"])
 
 
+def test_canvases_continue_the_prompts_logical_positions(system):
+    """Each canvas is refined and committed on from its prompt's logical
+    positions (`CanvasDecodeState.positions`), so a prompt whose positions
+    start past zero draws the reference's two canvases: rotary attention reads
+    only how far apart two tokens sit, and the cache's slots are not
+    positions."""
+    model, variables, process, reference, _ = system
+    prompt = jnp.asarray(reference["prompt"])
+    shifted = ModelInputs(prompt, {"positions": jnp.broadcast_to(jnp.arange(3, 8, dtype=jnp.int32),
+                                                                 prompt.shape)})
+    result = process.generate(model, variables, shifted, 7, key=jax.random.key(11))
+    np.testing.assert_array_equal(result.tokens, reference["tokens"][:, :12])
+    np.testing.assert_array_equal(result.decoder_steps, reference["steps"])
+
+
 def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
     model, variables, _, reference, _ = system
     tokens = jnp.array([[0, 0, 2, 3, 4], [2, 5, 7, 9, 11]], jnp.int32)

@@ -50,6 +50,7 @@ The specs in `dew.config.data` provide `.load(batch=..., read=...)`; `loader(spe
 | `RecordsData` / `records` | The source's fields, with numeric values in JAX's configured widths |
 | `TextData` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
 | `ChatData` / `chat` | Packed `text`, `text_coordinates` and aligned `text_roles` |
+| `ChatCanvasData` / `chat_canvases` | One row per assistant turn: `text`, int32 `[B, prompt_length + canvases * canvas_size]`, and `canvas_mask` |
 | `PromptData` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
 | `PreferenceData` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
 | `ImageData` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
@@ -128,6 +129,8 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 `TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Its static `.max_segments` is the most documents a window of the run holds: as many as the packing plan or the memory read placed in one, or a streamed pack's `segments`, or else its window length; a flash kernel's work follows it (performance.md). Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
+
+`ChatCanvasData` renders the same way for `BlockDiffusionObjective`, which splits every row at its prompt length, so nothing is packed: each assistant turn is one row, the conversation before it padded to `prompt_length` and the turn on whole canvases, EOS closing the last one. A longer prompt or turn keeps its head, as Google's reference cuts both.
 
 `Prompts` rejects over-length prompts by default. `long="truncate"` keeps their tail when that is the desired RL policy. `Preferences` refuses an over-length completion rather than cutting away its supervision.
 
