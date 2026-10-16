@@ -181,10 +181,14 @@ class DewLM(TemplateLM):
         The run's processor adds the special tokens it added in training.
         Where it inserts a BOS, the BOS is left off with
         `add_special_tokens=False`, and with None when the text already
-        starts with the BOS's own text, which the tokenizer reads as a
-        second BOS, so no such row starts with two. `left_truncate_len`
-        keeps that many of the last ids. Any other option raises TypeError,
-        since `HFLM` reads none.
+        starts with a BOS, which the tokenizer reads off the text as a second
+        BOS id, so no such row starts with two. `HFLM` asks instead whether
+        the text starts with the BOS's decoded text. The two agree wherever
+        decoding a BOS gives back its spelling, as in released vocabularies,
+        and this reads only what the processor does: the task's processor
+        names no tokenizer, and a checkpoint's decodes with special tokens
+        skipped. `left_truncate_len` keeps that many of the last ids. Any
+        other option raises TypeError, since `HFLM` reads none.
         """
         if kwargs:
             raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
