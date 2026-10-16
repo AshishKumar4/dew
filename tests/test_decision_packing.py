@@ -288,9 +288,10 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True, r
     packed_grads, grads, truth_grads, terms = (kept(tree)
                                                for tree in (packed_grads, grads, truth_grads, terms))
     assert packed_grads, "no gradient leaf held"
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
-                           terms={"logits": truth, "grads": terms})
+    # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
+    # another order than the rows alone.
+    assert_leaves_as_exact(packed, logits, truth, reductions=objective.layout.max_len, terms=truth)
+    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
