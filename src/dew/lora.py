@@ -170,7 +170,7 @@ class LoRA:
         `layouts` maps module names to tree paths: `Pretrained.layouts` for a loaded
         source, or None for a model built from its class, whose own module paths are
         its names. `base` is the published model `model` was loaded from
-        (`Pretrained.adapt` passes it), which the adapter's PEFT config names. An
+        (`Pretrained.adapt` passes it), which each component's PEFT config names. An
         entry of `modules` that matches no projection is refused. A is drawn per
         module from `key` in sorted name order, the way PEFT draws it, and B is
         zero, so the adapted model computes exactly what the source does.
@@ -197,8 +197,9 @@ class LoRA:
             targets[factors.module] = Target(self.rank, scaling)
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
                             INIT_B(factor_key, shape_b, jnp.float32))
+        bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
         return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound,
-                             base)
+                             bases)
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
                  modules: Sequence[str] | None = None,
@@ -252,8 +253,9 @@ class AdapterBase:
     """The published model an adapter was bound to: its Hub id and the commit the Hub resolved it
     to. PEFT's config names them (`base_model_name_or_path`, `revision`), so a reader on any machine
     loads the adapter onto the same weights. A config another tool wrote may name a base without a
-    commit, which is read and written back as it is. A run's record holds it (`AdapterRecord`), as
-    it holds each target's binding."""
+    commit, which is read and written back as it is. An adapter holds one for each component a
+    config names, since a pipeline file's components each name their own (`Adapter.bases`), and a
+    run's record holds them (`AdapterRecord`), as it holds each target's binding."""
 
     name: str
     revision: str | None
@@ -281,23 +283,25 @@ class Adapter:
     rslora: bool = False
     dropout: float = 0.0
     layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
-    base: AdapterBase | None = None
-    """The published model the adapter was bound to, which `save` names in its PEFT config, or None
-    for a model built from its class."""
+    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
+    """The published model each component was bound to, by component (`""` for a decoder's or a
+    registry-built model's one unnamed component), which `save` names in that component's PEFT
+    config; a component bound to a local directory or a model built from its class has none."""
 
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
               dropout: float, layouts: Mapping[str, WeightLayout],
-              base: AdapterBase | None = None) -> Adapter:
+              bases: Mapping[str, AdapterBase] | None = None) -> Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
-        The factors go under `params` and everything else under `FROZEN`. `base` is the published
-        model it was bound to, None for a model built from its class.
+        The factors go under `params` and everything else under `FROZEN`. `bases` are the published
+        models its components were bound to (`Adapter.bases`).
         """
-        adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts, base)
+        bases = dict(bases or {})
+        adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts, bases)
         factors = {(*path, factor) for path in targets for factor in FACTORS}
         return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)),
-                   targets, rslora, dropout, layouts, base)
+                   targets, rslora, dropout, layouts, bases)
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -345,7 +349,7 @@ class Adapter:
             if found != expected:
                 raise ValueError(f"the recorded binding {name} expects factors {expected}, and the "
                                  f"checkpoint holds {found}")
-        return cls(model, variables, targets, adapter.rslora, adapter.dropout, layouts, adapter.base)
+        return cls(model, variables, targets, adapter.rslora, adapter.dropout, layouts, dict(adapter.bases))
 
     def scale(self, target: Target) -> float:
         return _scale(target, self.rslora)
@@ -406,13 +410,14 @@ class Adapter:
         path = FilePath(path)
         path.mkdir(parents=True, exist_ok=True)
         if not components:
-            (path / PEFT_CONFIG).write_text(json.dumps(_config(self, named[""]), indent=2) + "\n")
+            (path / PEFT_CONFIG).write_text(json.dumps(_config(self, named[""], self.bases.get("")), indent=2)
+                                            + "\n")
             write_file({PEFT_PREFIX + name: tensor for name, tensor in tensors.items()},
                        path / PEFT_WEIGHTS, {"format": "pt"})
             return
         metadata = {f"{component}.{field}": value
                     for component, targets in sorted(named.items())
-                    for field, value in _config(self, targets).items()}
+                    for field, value in _config(self, targets, self.bases.get(component)).items()}
         write_file(tensors, path / DIFFUSERS_WEIGHTS,
                    {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
 
@@ -642,7 +647,7 @@ def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
 
 
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout],
-             bound_to: AdapterBase | None) -> nn.Module:
+             bound_to: Mapping[str, AdapterBase]) -> nn.Module:
     """Return `model` computing `branch` in every target module.
 
     The result is an instance of a subclass of `model`'s class with the
@@ -652,7 +657,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     `init` (Flax's dispatches through `init_with_output`) runs under it and
     splits what it draws, the factors under `params` and the rest under
     `FROZEN`. `layouts` are the bindings the class's record (`AdapterRecord`)
-    writes beside the targets, with the model the adapter was bound to
+    writes beside the targets, with the models its components were bound to
     (`bound_to`); the record is written when a run asks for it, so an adapter
     a run cannot record (a file's mixed ranks) still loads and computes.
     """
@@ -709,7 +714,7 @@ class AdapterRecord:
     dropout: float
     modules: tuple[str, ...]
     layouts: Mapping[str, AdapterBinding]
-    base: AdapterBase | None = None
+    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _rank("the adapter record", self.rank)
@@ -726,7 +731,7 @@ class AdapterRecord:
         """`model` adapted as this record says, which is how a recorded run's
         model is rebuilt (`ModelConfig.build`); the checkpoint supplies the factors."""
         targets, layouts = self.bound()
-        return _adapted(model, _Branch(targets, self.rslora, self.dropout), layouts, self.base)
+        return _adapted(model, _Branch(targets, self.rslora, self.dropout), layouts, dict(self.bases))
 
     def bound(self) -> tuple[dict[Path, Target], dict[str, WeightLayout]]:
         """The targets by native path and the bindings by the name a file writes them under."""
@@ -738,7 +743,7 @@ class AdapterRecord:
 
 
 def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
-            layouts: Mapping[str, WeightLayout], base: AdapterBase | None) -> AdapterRecord:
+            layouts: Mapping[str, WeightLayout], bases: Mapping[str, AdapterBase]) -> AdapterRecord:
     """The bound adapter as a model record holds it. A mixed-rank adapter is refused."""
     ranks = {target.rank for target in targets.values()}
     alphas = {target.alpha for target in targets.values()}
@@ -749,7 +754,7 @@ def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
                          tuple('/'.join(path) for path in sorted(targets)),
                          {'/'.join(path): AdapterBinding(bindings[path].name, bindings[path].shape,
                                                          bindings[path].transpose)
-                          for path in sorted(targets) if path in bindings}, base)
+                          for path in sorted(targets) if path in bindings}, dict(bases))
 
 
 def _site_codes(variables: Variables, path: Path) -> Mapping | None:
@@ -1002,7 +1007,7 @@ class PeftConfig(TypedDict):
     revision: NotRequired[str]
 
 
-def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
+def _config(lora: Adapter, named: Mapping[str, Target], base: AdapterBase | None) -> PeftConfig:
     """Build the PEFT config of `named` targets, keyed by the relative module name.
 
     The commonest rank and alpha become the defaults and the rest the patterns.
@@ -1025,10 +1030,10 @@ def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
         "init_lora_weights": True,
         "inference_mode": True,
     }
-    if lora.base is not None:
-        config["base_model_name_or_path"] = lora.base.name
-        if lora.base.revision is not None:
-            config["revision"] = lora.base.revision
+    if base is not None:
+        config["base_model_name_or_path"] = base.name
+        if base.revision is not None:
+            config["revision"] = base.revision
     return config
 
 
@@ -1080,9 +1085,9 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         )
     (rslora, dropout), = settings
     # A pipeline file's components each name their own base, as the tool that wrote it bound each
-    # (Diffusers writes each component's config apart); the adapter names one where they agree.
-    bases = {entry.config.base for entry in entries}
-    base = bases.pop() if len(bases) == 1 else None
+    # (Diffusers writes each component's config apart).
+    bases = {_component(components, entry.module)[0]: entry.config.base for entry in entries
+             if entry.config.base is not None}
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
     leaves: dict = {}
@@ -1109,7 +1114,7 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
                         factors.b.restore(entry.b, shape_b))
-    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, base)
+    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, bases)
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,

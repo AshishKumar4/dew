@@ -342,7 +342,7 @@ for name, directory in (("dew/llama-tiny", sys.argv[1]), (sys.argv[3], sys.argv[
     adapted.adapter.save(variables, directory)
     tokens = np.load(sys.argv[3] + "/input_ids.npy")
     np.save(directory + "/logits.npy", np.asarray(adapted.model.apply(variables, tokens)))
-    base = LoRA.load(source.model, source.variables, directory, layouts=source.layouts).base
+    base = LoRA.load(source.model, source.variables, directory, layouts=source.layouts).bases.get("")
     print(json.dumps(None if base is None else [base.name, base.revision]))
     # The run's record of the adapter keeps its base through JSON.
     from dew.lora import AdapterRecord
@@ -350,7 +350,7 @@ for name, directory in (("dew/llama-tiny", sys.argv[1]), (sys.argv[3], sys.argv[
 
     record = wrapper_layers(type(adapted.model))[1][0]._dew_wrapper()
     kept = from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord))))
-    print(json.dumps(kept.base == record.base))
+    print(json.dumps(kept.bases == record.bases))
 """
 
 
@@ -615,23 +615,28 @@ def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_
                                        atol=1e-6, rtol=0)
 
 
-def test_a_pipeline_file_loads_whatever_base_each_component_names(pipeline, tmp_path):
+def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_path):
     """Diffusers writes each component's PEFT config apart, and the tool that bound
     each names the model it bound it to, so a file's components may name different
-    bases. The file loads all the same, and the adapter names a base where every
-    component names the same one."""
+    bases. The file loads, and each component's base goes back out as it came in:
+    saved, reloaded, and through a run's record of the adapter."""
+    from dew.lora import AdapterRecord
+    from dew.registry import from_record, to_record, wrapper_layers
+
     tensors, metadata = read_file(SD / lora.DIFFUSERS_WEIGHTS)
     header = json.loads(metadata[lora.DIFFUSERS_METADATA])
-    for bases, expected in (({"unet": "org/sd", "text_encoder": "org/clip"}, None),
-                            ({"unet": "org/sd", "text_encoder": "org/sd"}, AdapterBase("org/sd", None))):
-        named = {**header,
-                 **{f"{component}.base_model_name_or_path": name for component, name in bases.items()}}
-        directory = tmp_path / str(len(set(bases.values())))
-        directory.mkdir()
-        write_file(tensors, directory / lora.DIFFUSERS_WEIGHTS,
-                   {**metadata, lora.DIFFUSERS_METADATA: json.dumps(named)})
-        loaded = LoRA.load(pipeline.model, pipeline.variables, directory, layouts=pipeline.layouts)
-        assert loaded.base == expected
+    bases = {"unet": AdapterBase("org/sd", "a" * 40), "text_encoder": AdapterBase("org/clip", None)}
+    named = {**header, "unet.revision": "a" * 40,
+             **{f"{component}.base_model_name_or_path": base.name for component, base in bases.items()}}
+    write_file(tensors, tmp_path / lora.DIFFUSERS_WEIGHTS,
+               {**metadata, lora.DIFFUSERS_METADATA: json.dumps(named)})
+    loaded = LoRA.load(pipeline.model, pipeline.variables, tmp_path, layouts=pipeline.layouts)
+    assert loaded.bases == bases
+    loaded.save(loaded.variables, tmp_path / "again")
+    again = LoRA.load(pipeline.model, pipeline.variables, tmp_path / "again", layouts=pipeline.layouts)
+    assert again.bases == bases
+    record = wrapper_layers(type(again.model))[1][0]._dew_wrapper()
+    assert from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord)))).bases == bases
 
 
 def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
