@@ -90,10 +90,15 @@ class Specials:
         end = first("sep_token_id", "eos_token_id")
         if end is None:
             raise ValueError("the tokenizer has neither a separator nor an end token to lay rows out with")
-        marker = first("mask_token_id") or end
+
+        def or_end(name: str) -> int:
+            found = first(name)
+            return end if found is None else found
+
+        marker = or_end("mask_token_id")
         return cls(begin=first("cls_token_id", "bos_token_id"), separator=end, marker=marker,
                    marker_text=records.text(hf.convert_ids_to_tokens(marker), "marker"),
-                   pad=first("pad_token_id") or end)
+                   pad=or_end("pad_token_id"))
 
 
 @dataclass(frozen=True)
