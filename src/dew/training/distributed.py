@@ -309,7 +309,8 @@ def link_topology(mesh: Mesh, axis: str) -> str:
     its place in its system, so two meshes of one shape over other devices, or over the same devices
     grouped otherwise along the axis, are other links; one built again over the same placement is the
     same."""
-    devices = [[device.id, device.process_index, device.device_kind, _slice(device)] for device in mesh.devices.flat]
+    devices = [[device.id, device.process_index, device.device_kind, _slice(device)]
+               for device in mesh.devices.flat]
     return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
 
 
