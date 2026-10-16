@@ -240,7 +240,7 @@ def test_a_kernel_the_hlo_does_not_size_makes_the_hardware_count_a_named_lower_b
     under the names of a complete count."""
     flops = hlo_flops(UNSIZED)
     assert (flops.model, flops.hardware, flops.unsized) == (2 * 8 * 16 * 4, 2 * 8 * 16 * 4, 2)
-    monkeypatch.setattr(instrumentation, "model_flops_utilization", lambda counted, seconds: counted / seconds)
+    monkeypatch.setattr(instrumentation, "model_flops_utilization", lambda flops, seconds: flops / seconds)
     trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
     whole = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0))
     bounded = trainer._throughput(1.0, 1, 8, StepFlops(1.0, 2.0, 3.0))
