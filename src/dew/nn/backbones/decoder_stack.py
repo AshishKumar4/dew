@@ -157,7 +157,9 @@ class SharedPassView:
     records the layers' cursors (`cache_index`) as it finds them (`first`); a later pass sees every
     entry as the pass before left it but the cursors, which start where the first pass's started,
     so it writes the step's keys and values over the last pass's. Each pass keeps the cursors it
-    advanced, which are the first pass's after its step."""
+    advanced, which are the first pass's after its step. Where the first pass allocates the cache,
+    finding no cursors, it leaves them at zero, advancing none (`cache_positions`), and so does
+    every later pass."""
     cursors: dict = dataclasses.field(default_factory=dict)
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
@@ -171,7 +173,11 @@ class SharedPassView:
         return {**variables, 'cache': _with_cursors(cache, self.cursors)}
 
     def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        return dict(variables)
+        cache = variables.get('cache')
+        if cache is None or self.cursors:
+            return dict(variables)
+        allocated = {path: jnp.zeros_like(leaf) for path, leaf in cursors_of(cache).items()}
+        return {**variables, 'cache': _with_cursors(cache, allocated)}
 
 
 def cursors_of(cache: Mapping[str, object]) -> dict[tuple[str, ...], object]:
