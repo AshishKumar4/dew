@@ -148,7 +148,8 @@ def synthetic(temperature: float, count: int, options: int, seed: int) -> list[S
     scored = []
     for _ in range(count):
         logits = rng.normal(0.0, 3.0, options)
-        scored.append(Scored(question.kind, logits, int(rng.choice(options, p=softmax(logits, temperature)))))
+        label = int(rng.choice(options, p=softmax(logits, temperature)))
+        scored.append(Scored(question.kind, logits, np.eye(options)[label]))
     return scored
 
 
@@ -163,6 +164,28 @@ def test_a_fitted_temperature_is_the_log_loss_minimum():
     fitted = Temperatures.fit(scored, bucket_minimum=100).of("choice", 4)
     assert log_loss(scored, fitted) < log_loss(scored, fitted * 1.01)
     assert log_loss(scored, fitted) < log_loss(scored, fitted / 1.01)
+
+
+def test_calibrating_on_the_distributions_the_model_gives_keeps_its_temperatures(decide):
+    """Held-out answers whose gold is a distribution rather than one option:
+    where every gold is the distribution the uncalibrated model gives, log
+    loss is least at temperature 1, so each question type's fitted
+    temperature is 1. Fitting to each gold's most likely option alone would
+    sharpen it instead."""
+    from dew.decision import Calibration
+
+    raw = replace(decide, calibration=Calibration())
+    held = []
+    for request in CASES.values():
+        example = Example.of({"state": request["state"], "questions": request["questions"],
+                              "answers": dict.fromkeys(request["questions"], 0)})
+        answers = raw(example.state, example.questions)
+        held.append({"state": request["state"], "questions": request["questions"],
+                     "targets": {name: answer.probabilities.tolist() for name, answer in answers.items()}})
+    fitted = raw.calibrated(held, type_minimum=1).calibration.temperatures
+    assert set(fitted.types) == {"choice", "score", "noul"}
+    for temperature in fitted.types.values():
+        assert temperature == pytest.approx(1.0, rel=1e-3)
 
 
 def test_abstention_keeps_the_accepted_answers_within_the_target_error():
@@ -379,6 +402,25 @@ def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_p
                              for path in (tmp_path / "release").rglob("*") if path.is_file())
     for name in written:
         assert (tmp_path / "export" / name).read_bytes() == (tmp_path / "release" / name).read_bytes(), name
+
+
+def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
+    """A task whose options keep 4 tokens each, not the layout's 48, saves
+    that budget and reads it back: the reloaded task answers a question of
+    long options as the task does, and the 48-token task answers otherwise."""
+    from dew.decision import Choice
+
+    tight = replace(decide, layout=replace(decide.layout, option_tokens=4))
+    tight.save_pretrained(tmp_path)
+    again = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    assert again.layout.option_tokens == 4
+    question = {"q": Choice("Which team handles it?", {
+        "billing": "invoices, refunds, chargebacks, double charges and any dispute about money taken",
+        "technical": "outages, errors, failed logins, slow pages and anything that does not work"})}
+    state = "I was charged twice and the second charge bounced my rent."
+    expected = tight(state, question)["q"].probabilities
+    np.testing.assert_array_equal(again(state, question)["q"].probabilities, expected)
+    assert not np.array_equal(decide(state, question)["q"].probabilities, expected)
 
 
 def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
