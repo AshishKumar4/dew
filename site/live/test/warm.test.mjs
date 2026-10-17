@@ -75,6 +75,12 @@ test('session requests that find no warm model start one leased preparation of t
 	try {
 		await warming(worker, 0);
 		assert.deepEqual(await asked(worker, 1), [PINNED]);
+		// The operator reads where it stands: the registry holds its lease of the pinned commit.
+		const read = await worker.dispatchFetch('https://live/v1/operator/preparation', { headers: { Authorization: 'Bearer operator' } });
+		const preparation = await read.json();
+		assert.equal(preparation.pinned, PINNED);
+		assert.equal(preparation.registry.rebuild !== null, true);
+		assert.deepEqual(Object.keys(preparation.preparers).sort(), ['trial', 'trusted']);
 	} finally {
 		await worker.dispose();
 	}

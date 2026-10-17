@@ -13,6 +13,8 @@ export class Preparer extends DurableObject<Harness> {
 		if (this.env.PREPARER_DOWN) throw new Error('the preparer is down');
 	}
 	async asked() { return (await this.ctx.storage.get<string[]>('asked')) ?? []; }
+	async status() { return null; }
+	async held() { return null; }
 }
 
 /**

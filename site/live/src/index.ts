@@ -134,6 +134,17 @@ export default {
 			if (request.method === 'POST') await Promise.all(preparers.map((preparer) => preparer.forget(plan.delete)));
 			return Response.json({ ...plan, live: [...live] });
 		}
+		if (url.pathname === '/v1/operator/preparation' && request.method === 'GET') {
+			// Where the pinned generation's preparation stands: the registry's lease, failure and alarm, each
+			// preparer's phase and the job it holds.
+			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
+			const preparers = Object.fromEntries(await Promise.all(['trusted', 'trial'].map(async (name) => {
+				const preparer = env.PREPARER.get(env.PREPARER.idFromName(name));
+				return [name, { phase: await preparer.status(), job: await preparer.held() }];
+			})));
+			return Response.json({ registry: await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).status(),
+				pinned: env.SNAPSHOT_COMMIT, preparers });
+		}
 		if (url.pathname === '/v1/operator/trial') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));
