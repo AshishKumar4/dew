@@ -956,10 +956,13 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
     """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
     one piece of work are reported where the function deals with no subprocess, network, service or
-    other process, itself or through the module's functions it calls. A timed wait made once is a
-    deadline, a loop over items that skips the failed ones retries nothing, and a retry or a sleep
-    beside a subprocess is at its boundary."""
+    other process, itself or through the module's functions and methods it calls. A timed wait made
+    once is a deadline, a future's wait is the deadline of work handed elsewhere, a loop over items
+    that skips the failed ones retries nothing, and a retry or a sleep beside a subprocess is at its
+    boundary. A method or a function named like another, a definition only defined, a parameter
+    called and a nested loop's exits are each read as what they are."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import concurrent.futures\n"
         "import subprocess\n"
         "import time\n"
         "def poll(done):\n"
@@ -990,15 +993,47 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "            return run(command)\n"
         "        except subprocess.CalledProcessError:\n"
         "            time.sleep(1)\n"
-        "    return None\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (4, 7, 11)]
+        "    return None\n"
+        "def futures(pending):\n"
+        "    while pending:\n"
+        "        done, pending = concurrent.futures.wait(pending)\n"
+        "class Waiting:\n"
+        "    def run(self):\n"
+        "        time.sleep(1)\n"
+        "class Other:\n"
+        "    def run(self):\n"
+        "        return 1\n"
+        "def given(run):\n"
+        "    run()\n"
+        "    time.sleep(1)\n"
+        "def defined():\n"
+        "    def helper():\n"
+        "        subprocess.run(['true'])\n"
+        "    time.sleep(1)\n"
+        "def after(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            work()\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        break\n"
+        "def inner(rows):\n"
+        "    for index in range(len(rows)):\n"
+        "        try:\n"
+        "            for row in rows[index]:\n"
+        "                break\n"
+        "        except ValueError:\n"
+        "            continue\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50)]
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     """SLOP019: a handler of the ImportError, ModuleNotFoundError or AttributeError a missing feature
-    raises that carries on instead of raising, in the package's source. One that raises, naming
-    what to install, requires the feature and is not reported."""
+    raises, by any name it is imported as, that carries on instead of raising, in the package's
+    source. One that raises, naming what to install, requires the feature and is not reported; a
+    raise in a function the handler only defines is no raise of its own."""
     found = _linted(tmp_path, {"src/sparx/features.py": (
+        "from builtins import ImportError as Missing\n"
         "def optional():\n"
         "    try:\n"
         "        import yaml\n"
@@ -1015,8 +1050,16 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    try:\n"
         "        return module.fast\n"
         "    except AttributeError:\n"
-        "        return module.slow\n")})
-    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (4, 16)]
+        "        return module.slow\n"
+        "def aliased():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except (ValueError, Missing):\n"
+        "        def later():\n"
+        "            raise RuntimeError('never')\n"
+        "        yaml = None\n"
+        "    return yaml\n")})
+    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
