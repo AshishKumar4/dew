@@ -117,7 +117,7 @@ class FlowGRPOObjective(DiffusionObjective):
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
                          guidance=guidance, steps=steps, variables=variables)
-        sde.validate(self.process)
+        sde.validate(self.process, self.process.times(rollout_steps))
         if beta == 0:
             self.ema = None
         self.sde = sde

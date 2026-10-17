@@ -495,21 +495,6 @@ def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np
     return refined, refined_times, prior
 
 
-def _check_unique_start(times: np.ndarray) -> None:
-    """Refuse a grid whose first model time appears again in it.
-
-    The source looks its starting step up by that time and takes the
-    second match, which runs its walk off the end of its sigma table (a
-    cosine table's Karras grid at few steps does this). Later repeats are
-    the deliberate ones of the two-evaluation classes and PNDM's warmup.
-    """
-    if len(times) > 1 and float(np.sum(times == times[0])) > 1:
-        raise ValueError(
-            "The recovered model times repeat their first value "
-            f"({times[0]}), which the source scheduler cannot walk: it "
-            "looks its starting step up by that value and finds the second")
-
-
 def _flow_grid(policy: SourcePolicy, flow: FlowShift, steps: int, tokens: int | None,
                origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
     """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
@@ -581,21 +566,14 @@ def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: Predictio
         schedule: NoiseScheduler = SigmaGrid(sigmas, times, prior)
     elif policy.family == "sigma":
         sigmas, times, prior = _sigma_grid(policy, betas, steps)
-        _check_unique_start(times)
         schedule = SigmaGrid(sigmas, np.append(times, times[-1]), prior)
     elif policy.family == "stage":
         sigmas, times, prior = _stage_grid(policy, betas, steps)
-        # The source matches its starting time against the whole
-        # interleaved evaluation list, stage rows included; only the
-        # padding row this table carries past the last stage is never
-        # evaluated. Repeats after the first entry are the deliberate ones.
-        _check_unique_start(times[:2 * steps - 1])
         schedule = StageSigmaGrid(sigmas, times, prior)
         return (Process(schedule, prediction),
                 jnp.arange(len(sigmas) - 1, -1, -2, dtype=jnp.float32))
     else:
         sigmas, times, prior = _lambda_grid(policy, betas, steps)
-        _check_unique_start(times)
         paired = FlowGrid if policy.flow_shift is not None else VPGrid
         schedule = paired(sigmas, np.append(times, times[-1]), prior)
     return (Process(schedule, prediction),
