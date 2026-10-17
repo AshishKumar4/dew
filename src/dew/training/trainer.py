@@ -965,13 +965,16 @@ class Trainer(Generic[Loss, Effects]):
         """The state with the accumulation a `window` of microbatches of
         `batch`'s shapes pools in, empty; unchanged under a window of one, a
         custom step or an accumulation already held."""
-        if window == 1 or self.step is not None or state.accumulation is not None:
+        if window == 1 or self.step is not None:
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
         if self._ramped and not shared:
+            # A restored accumulation too: its replay slots hold the batches of the run that saved it.
             raise ValueError("a loss of composite statistics replays its accumulation window's batches, "
                              "whose shape a batch ramp changes at each stage; ramp the batch or accumulate")
+        if state.accumulation is not None:
+            return state
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:

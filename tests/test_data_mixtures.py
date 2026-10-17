@@ -864,6 +864,21 @@ class Regression(Objective):
         return jnp.mean(self.errors(variables, batch)), Aux({})
 
 
+class Composite(Regression):
+    """`Regression` whose statistics are a pair it reduces itself, which an accumulation window keeps
+    by replaying the window's batches."""
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        errors = self.errors(variables, batch)
+        return (jnp.sum(errors), jnp.asarray(errors.shape[0], errors.dtype)), Aux({})
+
+    def reduce_loss(self, stats):
+        total, count = stats
+        return total / count, count > 0
+
+
 class Pooled(Regression):
     """`Regression` as its records' summed error and their count, which an accumulation window pools by
     the records each batch read."""
@@ -978,6 +993,25 @@ def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp
     assert set(pooled) == set(batched)
     for name, value in batched.items():
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
+
+
+def test_a_ramp_is_refused_with_a_window_that_replays_its_batches(tmp_path):
+    """A loss of composite statistics replays its window's batches, whose shape a ramp changes at each
+    stage: a ramp with such a window is refused before the run trains, whether the run starts there
+    or resumes a checkpoint whose saved window holds the batches of a fixed-batch run."""
+    layout, ramp = Layout(min_shard=1, tolerance=1.0), Ramp(start=8, increment=8, samples=16)
+
+    def trainer(checkpoints: Checkpoints | None = None) -> Trainer:
+        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout,
+                       checkpoints=checkpoints)
+
+    saved = Checkpoints(str(tmp_path / "run"), keep=8)
+    assert int(trainer(saved).fit(indexed_data(256, 16), steps=2, log_every=100).updates) == 1
+    with pytest.raises(ValueError):
+        trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
+            ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+    with pytest.raises(ValueError):
+        trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
 
 
 @pytest.mark.mesh
