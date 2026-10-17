@@ -37,6 +37,7 @@ from dew.inputs import InputSpec
 from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.config_records import NativeFields
+from dew.interop.decoder_bindings import decoder_layouts, reading_layout
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -63,7 +64,7 @@ from dew.interop.processors import (
     hosts,
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
-from dew.interop.streaming import SourceLeaf, WeightLayout
+from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
@@ -84,73 +85,9 @@ if TYPE_CHECKING:
 
 
 
-def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
-    `experts/K/projection/kernel` path into, and K."""
-    if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
-            and path[-1] == "kernel"):
-        return (*path[:-3], path[-2], path[-1]), int(path[-3])
-    return path, None
-
-
-def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
-                  expert_index: int | None) -> int:
-    """Return how many axes a bound leaf carries ahead of its stored matrix.
-
-    A kernel stores `[in, out]` where its source stores `[out, in]`, and a
-    grouped projection's leaf keeps one such matrix per group: DeepSeek
-    V4's `[groups, in, rank]` is stored `[groups * rank, in]`, the group
-    axis folded into the rows (modeling_deepseek_v4.py:294-323). The
-    transpose is the same swap of the trailing pair under those axes, so
-    the leaf says how many there are. A per-expert source tensor is one
-    slice of its stacked leaf, which is taken before the transpose.
-    """
-    node: object = variables
-    for part in path:
-        if not isinstance(node, Mapping) or part not in node:
-            raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
-        node = node[part]
-    if not isinstance(node, np.ndarray | jax.Array | SourceLeaf):
-        return 0
-    rank = node.ndim - (0 if expert_index is None else 1)
-    return max(rank - 2, 0)
-
-
-def _reading_layout(name: str, reading: decoder_parts.Reading, config, model_type: str,
-                    variables: Mapping[str, object], component: str | None = None) -> WeightLayout | None:
-    """The binding of the stored tensor `name` that the text family reads as `reading`
-    (`DecoderFamily.readings`): the leaves its parts fill and the storage operations that rebuild
-    it from them, a `packed` tensor's from the layouts of its parts; None where no leaf takes it."""
-    family = decoders.families()[model_type]
-    if reading.packing is None:
-        # The tensor as stored, which `prepare` may have reshaped for the tree.
-        stored = reading.parts[0]._replace(tensor=reading.stored)
-        return _leaf_layout(name, stored, family, variables, component)
-    parts = [_leaf_layout(part.name, part, family, variables, component) for part in reading.parts]
-    if any(part is None for part in parts):
-        raise ValueError(f"packed tensor {name!r} has no parameter path")
-    return reading.packing.layout(name, [part for part in parts if part is not None], config)
-
-
-def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.DecoderFamily,
-                 variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
-    def nested(path: tuple[str, ...]) -> tuple[str, ...]:
-        return path if component is None else (path[0], component, *path[1:])
-
-    transpose = None
-    tensor = part.tensor
-    if part.path is None:
-        return None
-    path, expert_index = _stacked_expert(part.path)
-    paths = (nested(path),)
-    if path[-1] == "kernel" and tensor.ndim == 2:
-        lead = _leading_axes(variables, paths[0], expert_index)
-        transpose = (*range(lead), lead + 1, lead)
-    # A floating weight is written in its leaf's dtype; an index table
-    # carries the width the checkpoint stored it in back.
-    stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
-    padded = tensor.shape[0] if part.name.endswith(family.zero_padded) else None
-    return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
+def _in_language_model(path: tuple[str, ...]) -> tuple[str, ...]:
+    """Where a media wrapper holds its decoder's leaf: under `language_model` in the leaf's collection."""
+    return (path[0], "language_model", *path[1:])
 
 
 def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading]):
@@ -163,6 +100,9 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     same one.
     """
     readings = {reading.name: reading for reading in language}
+    # The decoder's own tree, each collection's `language_model` entry, which its readings index.
+    language_tree = {collection: tree["language_model"] for collection, tree in variables.items()
+                     if isinstance(tree, Mapping) and "language_model" in tree}
     from dew.nn import vision
     from dew.nn.vision.common import projector_weight_path
 
@@ -173,8 +113,8 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
         if group == "language_model":
-            layout = _reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
-                                     record["text_model_type"], variables, "language_model")
+            layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
+                                    record["text_model_type"], language_tree, _in_language_model)
             if layout is None:
                 retained[name] = tensor
             else:
@@ -1211,23 +1151,6 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     return scheme.apply(model), {**variables, QUANTIZATION: held}
 
 
-def _decoder_layouts(readings: Sequence[decoder_parts.Reading], record: decoder_parts.DecoderFields,
-                     family: str, variables: Variables
-                     ) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
-    """Each source tensor's binding into the tree, from the readings the load placed, and the
-    tensors none binds."""
-    bindings, retained = [], {}
-    for reading in readings:
-        if reading.stored is None:
-            continue
-        binding = _reading_layout(reading.name, reading, record, family, variables)
-        if binding is None:
-            retained[reading.name] = reading.stored
-        else:
-            bindings.append(binding)
-    return tuple(bindings), retained
-
-
 class _Built(NamedTuple):
     """A decoder source built and bound: the model, its variables, the
     record it was translated to, what it was built from, and the source
@@ -1309,7 +1232,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     entry = decoders.families()[family]
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
-        layouts, retained = _decoder_layouts(readings, record, family, variables)
+        layouts, retained = decoder_layouts(readings, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
 
