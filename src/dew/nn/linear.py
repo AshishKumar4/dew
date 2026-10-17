@@ -681,6 +681,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     k_cumdecay = inv @ (kb_c * entering)
 
     state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
+    # Inside a shard_map that checks varying axes the chunk loop's carry varies as the operands it
+    # takes in do, which a zero state, or one held whole, does not.
+    if varying := tuple(jax.typeof(value).vma - jax.typeof(state).vma):
+        state = jax.lax.pcast(state, varying, to='varying')
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
