@@ -13,6 +13,8 @@ Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.
 `qwen35`, `mimo` and `muse_glimmer` hold the configs and checkpoint maps.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping

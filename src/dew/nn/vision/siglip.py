@@ -2,6 +2,8 @@
 (transformers 5.16.1 `models/siglip/modeling_siglip.py`, `models/gemma3/modeling_gemma3.py`).
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -46,7 +48,7 @@ class SiglipVisionTransformer(nn.Module):
     checkpoints carry is not built; the Gemma path reads the sequence alone.
     """
 
-    config: "SiglipVision"
+    config: SiglipVision
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
