@@ -330,9 +330,10 @@ class _FitPlan:
 
     @property
     def scored(self) -> tuple[Metric, ...]:
-        """Fit's metrics and every suite's, each once."""
+        """Fit's metrics and every suite's, each instance once: two suites' instances of one metric
+        are both a selection's to name."""
         every = (*self.metrics, *(metric for suite in self.suites.values() for metric in suite.metrics))
-        return tuple({metric.name: metric for metric in every}.values())
+        return tuple({id(metric): metric for metric in every}.values())
 
     @property
     def cadenced(self) -> bool:
@@ -1848,8 +1849,11 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
+        if (best is not None or restore_best) and self.checkpoints is None:
+            raise ValueError("best= and restore_best select among checkpoints; give the Trainer Checkpoints")
         splits = tuple(suites) or ('val',)
-        metrics = tuple({metric.name: metric for metric in (*metrics, *(
+        # Each instance once, as `_FitPlan.scored`: two suites may each hold their own of one metric.
+        metrics = tuple({id(metric): metric for metric in (*metrics, *(
             metric for suite in suites.values() for metric in suite.metrics))}.values())
         raw = (
             ()

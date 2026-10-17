@@ -308,6 +308,18 @@ def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tm
         assert_the_metric_over_every_record(reports[0]["one"], 1)
 
 
+@pytest.mark.distributed
+def test_a_metric_reads_the_host_fields_of_every_process_share(tmp_path):
+    """`tests/test_whole_validation.py`'s metric over host fields on a pool of two: each process
+    reads its share of every batch, and the root's metric reads every record's name beside its own
+    label, in the order of the gathered batch, each record once."""
+    from test_whole_validation import RECORDS
+
+    reports = run_pool("host_fields", tmp_path / "out", 2)
+    assert [tuple(seen) for seen in reports[0]["seen"]] == [
+        (f"record {index}", index) for index in range(RECORDS)]
+
+
 # --------------------------------------------------------------------------
 # The same step, on more processes
 # --------------------------------------------------------------------------
