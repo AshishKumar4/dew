@@ -41,10 +41,10 @@ class TokenFeatures(nn.Module):
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
 
-def build_ppo(verifier=verify, gamma=.97, **policy_options):
+def build_ppo(verifier=verify, gamma=.97, *, split=None, **policy_options):
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
                              critic=ValueHead(TokenFeatures()), beta=.03, **policy_options)
-    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19))
+    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), split=split)
     source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
                             PROMPT, RESPONSE, TURNS, sampling=SAMPLING, groups=GROUPS)
     rollout = PPORollout(objective, source, gamma=gamma, lam=.9)
@@ -274,8 +274,9 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
 
 
 @pytest.mark.parametrize("coefficient", [0., .5])
-def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficient):
-    trainer, rollout = build_ppo(sequence_mask=(.8, 1.2))
+@pytest.mark.parametrize("split", [1, 2])
+def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficient, split):
+    trainer, rollout = build_ppo(sequence_mask=(.8, 1.2), split=split)
     objective = rollout.objective
     objective.value_coefficient = coefficient
     state = trainer.initial_state()
