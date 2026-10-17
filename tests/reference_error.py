@@ -165,7 +165,7 @@ def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.
     return sizes, rms(np.asarray(value, np.float64) - truth)
 
 
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0, *, elements: bool = True) -> list[str]:
+def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
     """Where Dew's rows, and then its elements, are further from float64 than
     ROW_FACTOR times the reference's (`row_errors`): its worst over its own
     size against the reference's worst, at least `floor` (an order floor in
@@ -178,12 +178,11 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0, *, elements
     it is wrong. An element of size zero is held to the reference's worst
     such element instead of its own: one rounding against another, with no
     row's mean to settle them, part by any ratio, and where the reference
-    computes every such element exactly Dew must too. Without `elements`
-    only the rows are held (`assert_leaves_as_exact`)."""
+    computes every such element exactly Dew must too."""
     over = []
-    for name, alone in (("row", False), ("element", True))[:2 if elements else 1]:
-        sizes, mine = row_errors(dew, truth, terms, elements=alone)
-        _, theirs = row_errors(reference, truth, terms, elements=alone)
+    for name, elements in (("row", False), ("element", True)):
+        sizes, mine = row_errors(dew, truth, terms, elements=elements)
+        _, theirs = row_errors(reference, truth, terms, elements=elements)
         sized = sizes > 0
         if sized.any():
             worst = float(np.max(mine[sized] / sizes[sized]))
@@ -192,7 +191,7 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0, *, elements
                 over.append(f"the worst {name} is {worst:.3e} from float64 over its size, the reference's "
                             f"{their_worst:.3e}, allowed {ROW_FACTOR * max(their_worst, floor):.3e}")
         unsized = theirs[~sized]
-        zero = ~sized & ~(mine <= ROW_FACTOR * (np.max(unsized) if alone and unsized.size else theirs))
+        zero = ~sized & ~(mine <= ROW_FACTOR * (np.max(unsized) if elements and unsized.size else theirs))
         if zero.any():
             at = int(np.flatnonzero(zero)[0])
             over.append(f"{int(zero.sum())} {name}s of float64 zero are further from it than the reference's "
@@ -223,7 +222,7 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
 
 
 def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True, elements: bool = True) -> None:
+                           rows: bool = True) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
@@ -242,9 +241,7 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     after a second training step a row inherits the first step's rounding
     through the parameters it reads, which its own terms do not see, so
     such a comparison holds each tensor alone and its first step holds the
-    rows and elements. Without `elements` the rows are held and the
-    elements are not: a comparison of deep gradients whose worst element is
-    sized by its last sum's terms alone, which says why where it asks."""
+    rows and elements."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -259,8 +256,8 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
         # Each row and element over its own terms where they are given, the order floor in those units.
         over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit,
-                                       elements=elements) if rows else ())]
+                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
+                             if rows else ())]
     assert not over, "\n".join(over)
 
 
@@ -366,13 +363,16 @@ def _evaluated(jaxpr, consts, args, given=None):
 
 
 def _carrying(jaxpr) -> set:
-    """The variables whose terms reach an output of `jaxpr`."""
+    """The variables whose terms reach an output of `jaxpr`: those carried into it, and a sum's
+    operands, whose terms size its own."""
     from jax.extend.core import Var
 
     wanted = {var for var in jaxpr.outvars if isinstance(var, Var)}
     for equation in reversed(jaxpr.eqns):
         if any(var in wanted for var in equation.outvars):
-            wanted.update(equation.invars[index] for index in _carried(equation)
+            sized = ([index for index, var in enumerate(equation.invars) if _real(var)]
+                     if equation.primitive.name in SUMS else [])
+            wanted.update(equation.invars[index] for index in {*_carried(equation), *sized}
                           if isinstance(equation.invars[index], Var))
     return wanted
 
@@ -443,10 +443,12 @@ def _applied(equation, inputs, given, wanted: bool):
         return outputs, [None] * len(outputs)
     if name in ("mul", "div"):
         summed = [index for index in carried if given[index] is not None]
-        if not summed or (name == "div" and 0 not in summed):
+        if not summed or (name == "div" and summed != [0]):
             return outputs, [None] * len(outputs)
-        if name == "div":
-            return outputs, [given[0] / jnp.square(jnp.abs(inputs[1]))]
+        if len(summed) == 1:
+            (index,) = summed
+            scale = jnp.square(jnp.abs(inputs[1 - index]))
+            return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
         # A product of two sums sums the products of their terms.
         return outputs, [_sized(given[0], inputs[0]) * _sized(given[1], inputs[1])]
     if all(given[index] is None for index in carried):

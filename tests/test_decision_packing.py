@@ -265,15 +265,7 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     """Two packed windows of the examples decide each row's questions as the row does alone where its
     window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
     `jax.tree_util.keystr`) within the float64 gate, the truth `wide_modules`, the backbone and head
-    in float64, over the rows in windows of their own.
-
-    The gradients' rows are held and their elements are not. A weight gradient sums every window's
-    tokens in another order packed than alone, and its worst element is sized by its last sum's
-    terms alone (`float64_terms` resets at every sum), not by the cancelling sums upstream of it:
-    between these two equally exact computations on an A100 the worst element of a leaf parted by
-    up to 12.32 over six seeds of the marker arm (4.03, 3.20, 12.32, 6.87, 2.86, 1.61), so no
-    element bar a spread like that allows would catch an element ten times wrong. The logits'
-    elements are held."""
+    in float64, over the rows in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -308,8 +300,7 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     assert_leaves_as_exact(packed, logits, truth, reductions=objective.layout.max_len, terms=truth)
-    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms,
-                           elements=False)
+    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
