@@ -23,8 +23,9 @@ LAYERS = {
     "bf16-stored-under-fp32-declared": (lambda dense: dense(8), jnp.bfloat16, (4, 6)),
     "bf16-product-of-its-own": (
         lambda dense: dense(8, dtype=jnp.bfloat16, dot_general=jax.lax.dot_general), jnp.float32, (4, 6)),
-    "fp32-product-of-its-own": (lambda dense: dense(8, dtype=jnp.bfloat16,
-                                                    dot_general=fp32_result_dot_general()), jnp.float32, (4, 6)),
+    "fp32-product-of-its-own": (
+        lambda dense: dense(8, dtype=jnp.bfloat16, dot_general=fp32_result_dot_general()),
+        jnp.float32, (4, 6)),
     "no-bias": (lambda dense: dense(8, use_bias=False, dtype=jnp.bfloat16), jnp.float32, (4, 6)),
     "partitioned": (lambda dense: dense(8, kernel_init=PARTITIONED), jnp.float32, (4, 6)),
 }

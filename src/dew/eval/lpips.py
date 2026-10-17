@@ -31,7 +31,6 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid
-from dew.nn.conv import Conv
 from dew.objectives.base import Variables
 
 from .common import ImageMetric, paired
@@ -73,7 +72,7 @@ class VGG16(nn.Module):
             if stage:
                 hidden = nn.max_pool(hidden, (2, 2), strides=(2, 2))
             for width in widths:
-                hidden = nn.relu(Conv(width, (3, 3), padding=1, name=f"conv_{layer}")(hidden))
+                hidden = nn.relu(nn.Conv(width, (3, 3), padding=1, name=f"conv_{layer}")(hidden))
                 layer += 1
             outputs.append(hidden)
         return outputs
@@ -89,7 +88,7 @@ class LPIPSNetwork(nn.Module):
         distance = jnp.zeros(images.shape[0], images.dtype)
         features = zip(vgg((images - shift) / scale), vgg((references - shift) / scale), strict=True)
         for stage, (left, right) in enumerate(features):
-            weighted = Conv(1, (1, 1), use_bias=False, name=f"lin_{stage}")(
+            weighted = nn.Conv(1, (1, 1), use_bias=False, name=f"lin_{stage}")(
                 jnp.square(_unit(left) - _unit(right)))
             distance = distance + jnp.mean(weighted, axis=(1, 2, 3))
         return distance
