@@ -22,6 +22,9 @@ def test_probe_dory_against_vllm(tmp_path):
     lines = []
     plain = {k: v for k, v in os.environ.items() if not k.startswith(("DEW_XLA_CACHE", "VIRTUAL_ENV", "PYTHON",
                                                                        "XLA_", "JAX_"))}
+    # The lane reads the Hub offline; this probe downloads the release.
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        plain.pop(name, None)
     plain["HF_HOME"] = str(tmp_path / "hf")
     venv = tmp_path / "vllm"
     built = subprocess.run(f"uv venv -q -p 3.12 {venv} && VIRTUAL_ENV={venv} uv pip install -q '{WHEEL}'",
@@ -46,7 +49,8 @@ def test_probe_dory_against_vllm(tmp_path):
         records[mode] = out
         if not out.exists():
             pytest.fail("\n".join(lines), pytrace=False)
-    dew_env = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "HF_HOME": plain["HF_HOME"],
+    dew_env = {**{k: v for k, v in os.environ.items() if k not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")},
+               "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "HF_HOME": plain["HF_HOME"],
                "PYTHONPATH": os.pathsep.join(filter(None, ["src", os.environ.get("PYTHONPATH")]))}
     dew_env.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
     ran = subprocess.run([sys.executable, str(HERE / "dew_side.py"), str(records["per_loop"]),

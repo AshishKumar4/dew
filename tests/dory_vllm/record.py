@@ -10,7 +10,7 @@ REPO = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 PROMPTS = ["The capital of France is", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
            "Water boils at a temperature of"]
 mode, out = sys.argv[1], sys.argv[2]
-llm = LLM(model=REPO, dtype="bfloat16", max_model_len=512, enforce_eager=True, gpu_memory_utilization=0.38,
+llm = LLM(model=REPO, dtype="bfloat16", max_model_len=512, enforce_eager=True, gpu_memory_utilization=0.6,
           hf_overrides={"recurrent_kv_cache_mode": mode})
 tokenizer = llm.get_tokenizer()
 ids = [tokenizer.encode(text) for text in PROMPTS]
