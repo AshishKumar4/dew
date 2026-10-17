@@ -595,6 +595,43 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     return out
 
 
+def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) -> dict[str, np.ndarray]:
+    """`packed`, holding every engine record any process of the pool packed.
+
+    `pack` adds a record only where a call recorded it, so a data share whose
+    calls recorded none (all of them truncated, say) packs a different tree
+    than a share whose calls did, and the step cannot place the pool's rows
+    (`shard_batch` takes one tree from every process). A record another
+    process packed and this one did not holds its empty form here: `routed`
+    false over expert ids of zero, and supports of -1, which the trainer
+    reads as no record. The routing's `[layers, top_k]` and dtype come from
+    the processes that packed it, which must agree. A process that packed
+    nothing, a share's later reader, keeps nothing. Every process calls
+    this, in the order of its other coordination rounds.
+    """
+    from dew.coordination import from_every_process
+
+    routed = packed.get(ROUTED_EXPERTS_KEY)
+    pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],
+                               "support": SUPPORT_KEY in packed})
+    layouts = {tuple(share["routing"]) for share in pool if share["routing"] is not None}
+    if len(layouts) > 1:
+        raise ValueError(f"the pool's routed_experts disagree on [layers, top_k] or dtype: {sorted(layouts)}")
+    if not packed:
+        return packed
+    shape = np.shape(packed[IDS_KEY])
+    filled = dict(packed)
+    if layouts and routed is None:
+        (layers, top_k, dtype), = layouts
+        filled[ROUTED_EXPERTS_KEY] = np.zeros((*shape, layers, top_k), np.dtype(dtype))
+        filled[ROUTED_KEY] = np.zeros(shape, bool)
+    if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
+        assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
+        filled[SUPPORT_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
+        filled[SUPPORT_COLUMNS_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
+    return filled
+
+
 def sampled_values(batch: Mapping[str, np.ndarray],
                    values: Callable[[int, int], Sequence[float]]) -> np.ndarray:
     """Scatter per-call host values, one per sampled id, into the packed layout.
