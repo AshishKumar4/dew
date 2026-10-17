@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from PIL import Image
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
@@ -231,8 +231,8 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
     if measured_kernel("gated_delta_rule", "xla") == "fla":
-        with np.load(TINY / "logits_fla.npz") as on_fla:
-            reference = [on_fla[key] for key in keys]
+        on_fla = ieee_fixture(TINY / "logits_fla.npz")
+        reference = [on_fla[key] for key in keys]
     assert_as_exact_as_the_reference(joint_logits(decide), np.concatenate(reference), np.concatenate(truth),
                                      "the joint head over Dew's Qwen 3.5")
 
