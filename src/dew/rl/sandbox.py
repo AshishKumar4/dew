@@ -367,7 +367,7 @@ def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return streams, Verdict.TIMEOUT
-            for key, _ in ready.select(min(remaining, .1)):
+            for key, _ in ready.select(remaining):
                 if key.data == "stdin":
                     try:
                         sent += os.write(key.fd, stdin[sent:])
