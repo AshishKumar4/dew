@@ -565,6 +565,92 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     assert sorted(indexed[index]["value"] for index in range(20)) == list(range(20))
 
 
+def test_a_predicate_held_in_memory_keeps_the_rows_it_selects(tmp_path):
+    """A memory read of a filtered parquet source holds the rows the predicate keeps, as a
+    streamed read does, from a row group it filters in part and one it filters whole."""
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"x": [0, 1, 2, 3]}), tmp_path / "rows.parquet", row_group_size=2)
+    for where, kept in ((ds.field("x") > 0, [1, 2, 3]), (ds.field("x") > 1, [2, 3])):
+        files = Files(str(tmp_path / "rows.parquet"), where=where)
+        streamed_rows = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        assert [row["x"] for row in files.records("memory")] == [row["x"] for row in streamed_rows] == kept
+
+
+@pytest.mark.parametrize("format", ["jsonl", "csv"])
+def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_path, format):
+    """`columns=` selects a mapping row's fields however a line source is read, as an Arrow
+    source's projection does, and a field the rows lack is refused by name."""
+    rows = [{"id": str(index), "unused": "x" * index} for index in range(4)]
+    path = tmp_path / f"rows.{format}"
+    path.write_text("id,unused\n" + "".join(f"{row['id']},{row['unused']}\n" for row in rows)
+                    if format == "csv" else "".join(json.dumps(row) + "\n" for row in rows))
+    Files(str(path)).provision()
+    projected = Files(str(path), columns=("id",))
+    expected = [{"id": row["id"]} for row in rows]
+    manifest = projected.manifest()
+    assert [row for shard in manifest.shards for row in manifest.reader(shard)] == expected
+    assert list(projected.records("memory")) == expected
+    indexed = projected.records("indexed")
+    assert [indexed[index] for index in range(len(indexed))] == expected
+    with pytest.raises(ValueError):
+        list(Files(str(path), columns=("missing",)).records("memory"))
+
+
+def test_reading_a_csv_source_leaves_the_processes_csv_policy_as_its_caller_set_it(tmp_path):
+    """A caller's own `csv.field_size_limit` holds through a CSV source's reads, which once set the
+    limit for every parser in the process each time a source opened its file."""
+    import csv
+
+    path = tmp_path / "rows.csv"
+    path.write_text("id,text\n0,short\n")
+    previous = csv.field_size_limit(4096)
+    try:
+        files = Files(str(path))
+        assert list(files.records("memory")) == [{"id": "0", "text": "short"}]
+        files.provision()
+        assert files.records("indexed")[0] == {"id": "0", "text": "short"}
+        assert csv.field_size_limit() == 4096
+    finally:
+        csv.field_size_limit(previous)
+
+
+def test_a_fetch_from_a_server_that_trickles_its_body_ends_at_its_timeout():
+    """A server that sends a byte every tenth of a second holds a fetch no longer than its
+    timeout: the attempt is dropped as transient, where it once read on byte by byte."""
+    import http.server
+    import time
+
+    from dew.data.pipeline import Rejected
+    from dew.data.sources.urls import Fetch
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "60")
+            self.end_headers()
+            for _ in range(60):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.1)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    try:
+        began = time.monotonic()
+        fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
+        waited = time.monotonic() - began
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert waited < 1.5
+
+
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
     values = Memory([{"id": index} for index in range(80)], shard_rows=5)
     all_rows = []
