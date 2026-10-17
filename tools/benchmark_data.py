@@ -318,15 +318,15 @@ def grain_reader(config: Worker, objective, loading: Loading):
     import grain.python as grain
 
     from dew.data import images
-    from dew.data.steps.image import EncodeCaptions
+    from dew.data.images import EncodeCaptions
 
     read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
     if config.workload == "image":
         source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
         rows = grain.MapDataset.source(source).shuffle(seed=config.seed).repeat()
         # The image recipe's own record steps (`ImageData.pipelines`), applied by Grain alone.
-        rows = rows.map(images.decode("image", at_least=config.image_size, rejects=False))
-        rows = rows.map(images.resize(config.image_size)).map(images.caption())
+        rows = rows.map(images.DecodeImage("image", at_least=config.image_size, rejects=False))
+        rows = rows.map(images.Resize(config.image_size)).map(images.caption())
         rows = rows.batch(config.batch, drop_remainder=True).map(EncodeCaptions())
         stream = grain_options(rows.to_iter_dataset(read_options), config)
     elif config.workload == "text" and config.engine == "grain_prepacked":
@@ -715,8 +715,8 @@ def run_scaling(config: Scaling) -> None:
     rows = []
     for cycle in config.cycles:
         chain = (Files(str(directory), format="array_record").read("streamed")
-                 .map(images.decode("image", at_least=config.image_size, rejects=False))
-                 .map(images.resize(config.image_size)).interleave(cycle).repeat().batch(config.batch))
+                 .map(images.DecodeImage("image", at_least=config.image_size, rejects=False))
+                 .map(images.Resize(config.image_size)).interleave(cycle).repeat().batch(config.batch))
         data = compile(chain, loading=Loading(workers=0))
         worker = Worker("dew", "image", directory, config.output, steps=config.steps, warmup=config.warmup,
                         batch=config.batch, image_size=config.image_size)

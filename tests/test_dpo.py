@@ -234,7 +234,7 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
 
 def test_a_preference_dataset_trains_as_the_preference_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
-    DPO adds none, so one step over `preferences.pair` rows moves the policy
+    DPO adds none, so one step over `preferences.PreferencePair` rows moves the policy
     exactly as one step over the same pairs through `PreferenceData`."""
     import optax
     from bank_support import identical
@@ -249,7 +249,7 @@ def test_a_preference_dataset_trains_as_the_preference_config_does():
                           layout=Layout(min_shard=1, tolerance=1.0))
         return trainer.fit(data, steps=1).variables
 
-    identical(trained(Memory(pairs).map(preferences.pair(4)).batch(8)),
+    identical(trained(Memory(pairs).map(preferences.PreferencePair(4)).batch(8)),
               trained(loader(PreferenceData(source=tuple(pairs), seq_len=4), batch=8, read="memory",
                              loading=Loading(workers=0))))
 
