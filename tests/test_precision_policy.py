@@ -360,6 +360,17 @@ def test_a_configured_dot_algorithm_reads_as_the_precision_it_asks(configured, d
         assert precision.asks_default_precision(None, configured=True) is default
 
 
+def test_a_dot_algorithm_reads_as_its_own_precision_past_the_default():
+    """A `jax.lax.DotAlgorithm`, which JAX's precision alias takes beside its presets, asks for more
+    than the default precision, by its own name, apart from another algorithm's."""
+    from dew.nn import precision
+    wide = jax.lax.DotAlgorithm(jnp.float32, jnp.float32, jnp.float32)
+    narrow = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32)
+    assert not precision.asks_default_precision(wide)
+    assert len(precision.precision_names(wide)) == 1
+    assert precision.precision_names(wide) != precision.precision_names(narrow)
+
+
 def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
     """Chained `compensated_add`s keep the pair renormalised: after -1 and 63 additions of -2^-25,
     each a quarter of a float32 step of the running sum and so lost from a plain one, the high half
