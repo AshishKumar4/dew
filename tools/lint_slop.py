@@ -876,14 +876,15 @@ def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         # A binding takes effect once its statement's value has been read: at the statement's end.
-        binding = ast.Assign | ast.AnnAssign | ast.AugAssign
-        nodes = [node for node in scopes.own(function) if isinstance(node, binding | ast.Compare | ast.Call)]
-        events = sorted(((node.end_lineno or node.lineno, node.end_col_offset or 0)
-                         if isinstance(node, binding) else (node.lineno, node.col_offset), id(node), node)
-                        for node in nodes)
+        events: list[tuple[int, int, int, ast.AST]] = []
+        for node in scopes.own(function):
+            if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
+                events.append((node.end_lineno or node.lineno, node.end_col_offset or 0, id(node), node))
+            elif isinstance(node, ast.Compare | ast.Call):
+                events.append((node.lineno, node.col_offset, id(node), node))
         names: set[str] = set()
-        for _, _, node in events:
-            if isinstance(node, ast.Compare | ast.Call):
+        for *_, node in sorted(events, key=lambda event: event[:3]):
+            if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
                 held[id(node)] = frozenset(names)
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -912,7 +913,7 @@ def wording(module: Module) -> Iterator[Finding]:
     warning's text matched, a sentence looked for in captured output, or source text read."""
     held = _held(module.tree)
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if _spelled_in_captured(node, held.get(id(node), frozenset())):
+        if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           "looks for a sentence in captured output; assert the state it reports")
         if isinstance(node, ast.Call):
@@ -1295,6 +1296,7 @@ WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
 """The methods that block on in-process synchronization (an event, a condition, a lock, a queue, a
 thread) until a timeout they are given. A future's (`result`, `concurrent.futures.wait`) is not
 among them: its work is handed elsewhere, a thread, a process or a service, whose deadline it is."""
+FUTURE_WAITS = {"concurrent.futures.wait", "asyncio.wait", "asyncio.wait_for"}
 
 
 def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
@@ -1306,7 +1308,7 @@ def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
     if called in ("time.sleep", "asyncio.sleep"):
         return "a sleep"
     method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
-    if method not in WAITS:
+    if method not in WAITS or called in FUTURE_WAITS:
         return ""
     # A positional timeout is read where the method is unambiguous (a string's join is not a wait).
     positional = node.args[:1] if method == "wait" else node.args[1:2] if method == "wait_for" else []
@@ -1316,43 +1318,117 @@ def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
     return ""
 
 
+def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
+    """Every node `nodes` run themselves: a nested function's, lambda's or class's body runs only
+    where it is called, so it is left out."""
+    for node in nodes:
+        yield node
+        if not isinstance(node, scopes.SCOPES):
+            yield from scopes.own(node)
+
+
+def _loop_level(statements: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
+    """The statements of a loop's body that belong to that loop: through a branch, a `with` or a
+    `try`, but not into a nested loop or a definition, whose exits are their own."""
+    for statement in statements:
+        yield statement
+        if isinstance(statement, ast.If | ast.With | ast.AsyncWith):
+            yield from _loop_level([*statement.body, *getattr(statement, "orelse", [])])
+        elif isinstance(statement, ast.Try):
+            yield from _loop_level([*statement.body, *statement.orelse, *statement.finalbody,
+                                    *(line for handler in statement.handlers for line in handler.body)])
+
+
+def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
+    """Whether `statements` leave the loop they sit in by one of `kinds` (a `return` or `raise`
+    anywhere they run; a `break` only where it belongs to that loop)."""
+    loop_own = {id(node) for node in _loop_level(statements)}
+    return any(isinstance(node, kinds) and (not isinstance(node, ast.Break) or id(node) in loop_own)
+               for node in _executed(statements))
+
+
 def _retrying(loop: ast.For | ast.While) -> bool:
     """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` (attempts, not
-    items), whose body tries the work, leaves the loop where it succeeds, and goes round again
-    where it fails."""
-    attempts = isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range" if isinstance(
-        loop, ast.For) else True
-    if not attempts:
+    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it
+    at the loop's level) and goes round again where it fails (a handler that leaves by none)."""
+    ranged = isinstance(loop, ast.For) and isinstance(loop.iter, ast.Call) and (
+        _named(loop.iter.func) == "range")
+    if isinstance(loop, ast.For) and not ranged:
         return False
+    body = list(loop.body)
+    for index, attempt in enumerate(body):
+        if not isinstance(attempt, ast.Try):
+            continue
+        succeeds = (_exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return))
+                    or _exits(body[index + 1:], (ast.Break, ast.Return)))
+        fails_round = any(not _exits(handler.body, (ast.Raise, ast.Break, ast.Return))
+                          for handler in attempt.handlers)
+        if succeeds and fails_round:
+            return True
+    return False
 
-    def leaves(nodes: Sequence[ast.AST], exits: tuple[type, ...]) -> bool:
-        return any(isinstance(child, exits) for node in nodes for child in ast.walk(node))
 
-    return any(isinstance(node, ast.Try) and leaves((*node.body, *node.orelse), (ast.Break, ast.Return))
-               and any(not leaves([handler], (ast.Raise, ast.Break, ast.Return)) for handler in node.handlers)
-               for node in loop.body)
+class _Calls:
+    """The module's functions a call reaches, read from where it is made: a bare name that the
+    calling function neither takes nor binds names a function nested in it or the module's own;
+    `self.f` or `cls.f` the method of the calling function's class; and `self.held.f`, through an
+    attribute of another object, any method `f` of the module's classes."""
+
+    def __init__(self, tree: ast.Module):
+        self.top: dict[str, ast.AST] = {node.name: node for node in tree.body
+                                        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+        self.owner: dict[int, ast.ClassDef] = {}
+        self.methods: dict[int, dict[str, ast.AST]] = {}
+        self.named: dict[str, list[ast.AST]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                own: dict[str, ast.AST] = {item.name: item for item in node.body
+                                           if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)}
+                self.methods[id(node)] = own
+                for name, item in own.items():
+                    self.owner[id(item)] = node
+                    self.named.setdefault(name, []).append(item)
+
+    def reached(self, function: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call) -> list[ast.AST]:
+        if isinstance(call.func, ast.Name):
+            name = call.func.id
+            body = list(_executed(function.body))
+            nested = {node.name: node for node in body
+                      if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+            if name in nested:
+                return [nested[name]]
+            bound = {argument.arg for argument in scopes.arguments(function)} | {
+                node.id for node in body if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+            return [] if name in bound or name not in self.top else [self.top[name]]
+        if not isinstance(call.func, ast.Attribute):
+            return []
+        through, root = 0, call.func.value
+        while isinstance(root, ast.Attribute):
+            through, root = through + 1, root.value
+        if _named(root) not in ("self", "cls"):
+            return []
+        owner = self.owner.get(id(function))
+        if through == 0:
+            method = None if owner is None else self.methods[id(owner)].get(call.func.attr)
+            return [] if method is None else [method]
+        return self.named.get(call.func.attr, [])
 
 
-def _leaves(function: ast.AST, tables: Mapping[int, Mapping[str, str]], local: Mapping[str, ast.AST],
-            seen: set[int]) -> bool:
-    """Whether `function` deals with what leaves the process (`EXTERNAL`): it names such a module,
-    or calls a function or method of the module that does."""
+def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
+            calls: _Calls, seen: set[int]) -> bool:
+    """Whether `function` deals with what leaves the process (`EXTERNAL`): its own body names such
+    a module, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
-    for node in ast.walk(function):
+    for node in _executed(function.body):
         if isinstance(node, ast.Name | ast.Attribute):
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
         if isinstance(node, ast.Call):
-            # A function of the module by name, or a method reached from `self` (`self.gcloud.nodes`).
-            root = node.func.value if isinstance(node.func, ast.Attribute) else None
-            while isinstance(root, ast.Attribute):
-                root = root.value
-            name = (node.func.id if isinstance(node.func, ast.Name) else node.func.attr
-                    if isinstance(node.func, ast.Attribute) and _named(root) in ("self", "cls") else "")
-            helper = local.get(name)
-            if helper is not None and id(helper) not in seen and _leaves(helper, tables, local, seen):
-                return True
+            for helper in calls.reached(function, node):
+                if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
+                        and _leaves(helper, tables, calls, seen)):
+                    return True
     return False
 
 
@@ -1361,24 +1437,27 @@ def waits(module: Module) -> Iterator[Finding]:
     process: one inside a function that deals with no subprocess, network, remote service or other
     process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
     work is ordered or woken, not waited on; a timed wait made once is a deadline."""
-    local = {node.name: node for node in ast.walk(module.tree)
-             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+    calls = _Calls(module.tree)
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
-    for function in local.values():
+    for function in ast.walk(module.tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
         external = None
-        looped = {id(inner) for loop in scopes.own(function) if isinstance(loop, ast.For | ast.While)
-                  for inner in ast.walk(loop)}
-        for node in scopes.own(function):
+        # What a loop runs each time round: its body, and a `while`'s test, asked before each.
+        looped = {id(inner) for loop in _executed(function.body) if isinstance(loop, ast.For | ast.While)
+                  for inner in _executed([*loop.body, *([loop.test] if isinstance(loop, ast.While) else [])])}
+        for node in _executed(function.body):
             what = _waiting(node, tables.get(id(node), {}))
             if what == "a timed wait":
                 # Once, it is a deadline; round a loop, a poll.
                 what = "a poll" if id(node) in looped else ""
             if not what and isinstance(node, ast.For | ast.While) and _retrying(node):
                 what = "a retry"
-            if not what:
+            # A wait is a call and a retry a loop: both have a place in the source.
+            if not what or not isinstance(node, ast.expr | ast.stmt):
                 continue
             if external is None:
-                external = _leaves(function, tables, local, set())
+                external = _leaves(function, tables, calls, set())
             if not external:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP018",
                               f"{what} where nothing leaves the process; order the work or wake the waiter")
@@ -1389,14 +1468,15 @@ DETECTED = {"ImportError", "ModuleNotFoundError", "AttributeError"}
 
 def detections(module: Module) -> Iterator[Finding]:
     """SLOP019: a feature detected by the exception its absence raises: a handler of ImportError,
-    ModuleNotFoundError or AttributeError that carries on instead of raising."""
-    for node in ast.walk(module.tree):
+    ModuleNotFoundError or AttributeError, by any name it is imported as, that carries on instead of
+    raising (a raise in a function it only defines does not count)."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
             continue
         caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
-        kinds = [_named(kind) for kind in caught]
-        if any(kind.rsplit(".", 1)[-1] in DETECTED for kind in kinds) and not any(
-                isinstance(child, ast.Raise) for child in ast.walk(node)):
+        kinds = [scopes.resolved(kind, table) or _named(kind) for kind in caught]
+        detected = any(kind.removeprefix("builtins.") in DETECTED for kind in kinds)
+        if detected and not any(isinstance(child, ast.Raise) for child in _executed(node.body)):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP019",
                           f"detects a feature by `except {'/'.join(kinds)}`; require it, or ask for it by "
                           "the version that has it")
