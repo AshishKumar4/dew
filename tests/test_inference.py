@@ -389,7 +389,7 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
     with the field ignored."""
     from dew.inference.tasks import TextSettings, saved_settings, settings_fields
 
-    _, state = make_lm_run(tmp_path)
+    objective, state = make_lm_run(tmp_path)
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     record = checkpoints.artifact()
     assert isinstance(record, dict)
