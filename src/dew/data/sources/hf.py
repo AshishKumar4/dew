@@ -30,9 +30,9 @@ class _HFShard(Shard):
 
 @dataclass(frozen=True, eq=False)
 class HF(Dataset):
-    """A `datasets.Dataset`, read by index from its Arrow table, or an
-    `IterableDataset`, read over its shards whose positions its own
-    `state_dict` checkpoints; the `.map()`s it holds are already applied. An
+    """A `datasets.Dataset`, read by index from its Arrow table or as one
+    stream of it, or an `IterableDataset`, read over its shards whose
+    positions its own `state_dict` checkpoints; the `.map()`s it holds are already applied. An
     image column reads as its encoded bytes, which `images.decode` decodes.
     `name` is its identity in a run's plan, a cache's key and its logs, its
     fingerprint by default; a stream has no fingerprint of its content, so
@@ -79,7 +79,7 @@ class HF(Dataset):
         return {"store": "hf-datasets", "name": self.describe(), **self.metadata()}
 
     def supports(self, read: Read) -> bool:
-        return (read == "streamed") == self.streamed
+        return read == "streamed" or not self.streamed
 
     def _undecoded(self):
         from datasets import Image
