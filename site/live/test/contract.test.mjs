@@ -28,7 +28,7 @@ function checkout(commit) {
 	const archive = execFileSync('git', ['archive', commit, 'site/live/src'], { cwd: here('../../..') });
 	execFileSync('tar', ['-x', '-C', root], { input: archive });
 	mkdirSync(join(root, 'site/live/test'), { recursive: true });
-	cpSync(here('contract-harness.ts'), join(root, 'site/live/test/contract-harness.ts'));
+	cpSync(here('warm-harness.ts'), join(root, 'site/live/test/warm-harness.ts'));
 	return join(root, 'site/live');
 }
 
@@ -38,7 +38,7 @@ function checkout(commit) {
  * production's, and `host` routes to it.
  */
 async function deploy(name, live, pinned, owner = null, host = null) {
-	const bundle = await build({ entryPoints: [join(live, 'test/contract-harness.ts')], bundle: true, format: 'esm',
+	const bundle = await build({ entryPoints: [join(live, 'test/warm-harness.ts')], bundle: true, format: 'esm',
 		platform: 'neutral', external: ['cloudflare:workers'], nodePaths: [here('../../node_modules')], write: false });
 	const owned = (className) => ({ className, useSQLite: true, ...(owner ? { scriptName: owner } : {}) });
 	return {
@@ -84,7 +84,9 @@ for (const [production, preview] of [['this', OTHER], [OTHER, 'this']]) {
 		try {
 			const generation = { snapshot: { id: 'serving' }, commit: PRODUCTION, created: Date.now() - 60_000,
 				prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
-			assert.equal((await worker.dispatchFetch('https://live/left', { method: 'POST', body: JSON.stringify(generation) })).status, 204);
+			const left = await worker.dispatchFetch('https://live/left', { method: 'POST',
+				body: JSON.stringify({ generation, retrying: false }) });
+			assert.equal(left.status, 204);
 			const session = await visit(worker, 'preview.live');
 			assert.deepEqual(await (await worker.dispatchFetch('https://live/held')).json(), [session]);
 			// Production's own visitor too, the objects being its own build's.
