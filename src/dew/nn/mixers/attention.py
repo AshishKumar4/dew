@@ -739,19 +739,9 @@ class CausalSelfAttention(nn.Module):
             causal, window = False, None
             implementation = masked
         if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
-            pairwise = jnp.asarray(attention_metadata.pairwise_mask)
-            if pairwise.shape != (B, S, key.shape[-3]) or pairwise.dtype != jnp.bool_:
-                raise ValueError("attention_pairwise_mask must be boolean [B, queries, keys]")
-            mask = pairwise[:, None]
-            key_positions = attention_metadata.key_positions
-            if key_positions is not None:
-                if key_positions.shape != (B, key.shape[-3]):
-                    raise ValueError("attention_key_positions must be [B, keys]")
-                key_places = key_positions
-                if self.ctx.sliding_window is not None:
-                    query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
-                    distance = query_positions[:, :, None] - key_positions[:, None, :]
-                    mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
+            mask, key_positions = self._pairwise_mask(attention_metadata, rotary_positions, B, S,
+                                                      key.shape[-3])
+            key_places = key_places if key_positions is None else key_positions
             causal, window, documents = False, None, None
             implementation = masked
         if self.ctx.attention_chunk is not None:
@@ -768,6 +758,24 @@ class CausalSelfAttention(nn.Module):
         max_segments = None if documents is None else coordinates_of(attention_metadata, B, S).max_segments
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, key_places)
+
+    def _pairwise_mask(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int):
+        """A call's own mask `[B, 1, S, keys]` (`AttentionMetadata.pairwise_mask`) and the places its
+        keys are read at, None where it names none; a window keeps each query to the keys within it
+        of the query's rotary position."""
+        pairwise = jnp.asarray(metadata.pairwise_mask)
+        if pairwise.shape != (B, S, keys) or pairwise.dtype != jnp.bool_:
+            raise ValueError("attention_pairwise_mask must be boolean [B, queries, keys]")
+        mask = pairwise[:, None]
+        key_positions = metadata.key_positions
+        if key_positions is not None:
+            if key_positions.shape != (B, keys):
+                raise ValueError("attention_key_positions must be [B, keys]")
+            if self.ctx.sliding_window is not None:
+                query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
+                distance = query_positions[:, :, None] - key_positions[:, None, :]
+                mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
+        return mask, key_positions
 
     def _cached_places(self, places, slots) -> jax.Array:
         """Each cache slot's logical place `[rows, capacity]`, where a chunk
