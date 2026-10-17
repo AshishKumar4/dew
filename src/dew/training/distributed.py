@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+import collections
 import dataclasses
 import fnmatch
 import functools
@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import math
-import queue
 import statistics
 import threading
 import time
@@ -1119,7 +1118,11 @@ class DevicePrefetchIterator:
         self._iterator: Iterator | None = iter(iterator)
         self._source_name = type(self._iterator).__name__
         self._mesh: Mesh | None = mesh
-        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        # The placed batches waiting for the consumer, at most `depth`; `_ready` wakes whoever waits on
+        # them, on an enqueue, a dequeue, a stop and the worker's end, so neither side polls.
+        self._queued: collections.deque[tuple[Batch, bytes | None]] = collections.deque()
+        self._depth = depth
+        self._ready = threading.Condition()
         self._stop = threading.Event()
         self._done = threading.Event()
         self._start_lock = threading.Lock()
@@ -1166,6 +1169,8 @@ class DevicePrefetchIterator:
         """Ask the worker to stop between batches, and a stoppable source to stop its own work."""
         first = not self._stop.is_set()
         self._stop.set()
+        with self._ready:
+            self._ready.notify_all()
         if first:
             self._stop_source()
 
@@ -1192,7 +1197,7 @@ class DevicePrefetchIterator:
         iterator, mesh = self._iterator, self._mesh
         assert iterator is not None and mesh is not None
         source = iterator if isinstance(iterator, Checkpointable) else None
-        batch = state = placed = None
+        batch = state = read = placed = None
         try:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
@@ -1206,22 +1211,19 @@ class DevicePrefetchIterator:
                 if self._stop.is_set():
                     break
                 with region("data.position"):
-                    state = source.get_state() if source is not None else None
-                    if source is not None and not isinstance(state, bytes):
-                        state = json.dumps(state).encode()
+                    read = source.get_state() if source is not None else None
+                    state = read if read is None or isinstance(read, bytes) else json.dumps(read).encode()
                 with region("data.place"), nn.logical_axis_rules(self._rules):
                     if self._prepare is not None:
                         batch = self._prepare(batch)
                     placed = shard_batch(mesh, batch, self._reads)
                 batch = None
-                with region("data.enqueue"):
-                    while not self._stop.is_set():
-                        try:
-                            self._queue.put((placed, state), timeout=0.05)
-                            break
-                        except queue.Full:
-                            continue
-                placed = state = None
+                with region("data.enqueue"), self._ready:
+                    self._ready.wait_for(lambda: self._stop.is_set() or len(self._queued) < self._depth)
+                    if not self._stop.is_set():
+                        self._queued.append((placed, state))
+                        self._ready.notify_all()
+                placed = state = read = None
         except StopIteration:
             # A drained source is how a prefetch thread ends; the finally
             # below publishes the end, and no error goes with it.
@@ -1229,7 +1231,7 @@ class DevicePrefetchIterator:
         except BaseException as error:
             self._error = error
         finally:
-            batch = placed = state = None
+            batch = placed = state = read = None
             try:
                 close = iterator.close if isinstance(iterator, Closeable) else None
                 if close is not None:
@@ -1245,13 +1247,15 @@ class DevicePrefetchIterator:
                 iterator = source = mesh = close = None
                 if self._stop.is_set():
                     self._discard()
-                self._done.set()
+                with self._ready:
+                    self._done.set()
+                    self._ready.notify_all()
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self._queue.get_nowait()
+        with self._ready:
+            self._queued.clear()
+            self._ready.notify_all()
 
     def close(self, *, timeout: float | None = None) -> None:
         """Stop the worker and wait for it, discarding unread batches but keeping `source_state`.
@@ -1315,29 +1319,24 @@ class DevicePrefetchIterator:
         if self._stop.is_set():
             raise StopIteration
         self._start()
-        while not self._stop.is_set():
-            try:
-                batch, position = self._queue.get(timeout=0.05)
-            except queue.Empty:
-                if not self._done.is_set():
-                    continue
-                # The final publication may race the timed-out get.
-                try:
-                    batch, position = self._queue.get_nowait()
-                except queue.Empty:
-                    error, self._error = self._error, None
-                    cleanup, self._cleanup_error = self._cleanup_error, None
-                    if error is not None:
-                        if cleanup is not None:
-                            error.add_note(f"Source cleanup failed: {cleanup!r}")
-                        raise error from None
-                    if cleanup is not None:
-                        raise cleanup from None
-                    raise StopIteration from None
+        with self._ready:
+            self._ready.wait_for(lambda: self._queued or self._done.is_set() or self._stop.is_set())
             if self._stop.is_set():
-                break
-            self.source_state = position
-            return batch
+                raise StopIteration
+            if self._queued:
+                batch, position = self._queued.popleft()
+                self._ready.notify_all()
+                self.source_state = position
+                return batch
+        # The worker ended, every batch it published read: with its error, if it had one.
+        error, self._error = self._error, None
+        cleanup, self._cleanup_error = self._cleanup_error, None
+        if error is not None:
+            if cleanup is not None:
+                error.add_note(f"Source cleanup failed: {cleanup!r}")
+            raise error from None
+        if cleanup is not None:
+            raise cleanup from None
         raise StopIteration
 
 
