@@ -497,7 +497,8 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
     Within one iterator a corpus's counters are its stages': the outermost
     counts what it accepted, the deepest what was attempted, and each its own
     rejections. The iterators Grain interleaves, its worker processes or a
-    corpus's shards, each read records of their own, so their counts add."""
+    corpus's shards, each read records of their own, so their counts add,
+    a shard waiting past the cycle (a future state) included."""
 
     def visit(branch) -> dict[str, CorpusCounts]:
         counted: dict[str, CorpusCounts] = {}
@@ -508,8 +509,10 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                 counted[corpus].restore(stored)
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):
+                # A restored interleave keeps the positions of shards past its cycle as future states.
+                future = branch.get("future_states") or {}
                 independent: dict[str, CorpusCounts] = {}
-                for child in interleaved:
+                for child in (*interleaved, *(future.values() if isinstance(future, Mapping) else ())):
                     for counts in visit(child).values():
                         _added(independent, counts)
                 _nested(counted, independent)
