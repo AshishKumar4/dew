@@ -53,7 +53,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _workers
+from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
@@ -80,6 +80,7 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
+    Rebatch,
     RecordStep,
     Repeat,
     Shuffle,
@@ -462,10 +463,9 @@ def _staged(
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
     train, validation = branches[0], (None if validation is None else branches[1])
-    batching = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if batching is None:
+    if not any(isinstance(stage, BatchStage) for stage in train.stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = batching.size
+    batch = _output_batch(train)
     original = train
     if read == "memory":
         train = _materialize(train, counts)
@@ -476,6 +476,12 @@ def _staged(
             validation = None
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
+
+
+def _output_batch(pipeline: Pipeline) -> int:
+    """The rows each batch of `pipeline` holds as its reader yields them, which its loader declares
+    and its share pads to: the last rebatch's, else its batch's own, which still groups its reads."""
+    return [stage.size for stage in pipeline.stages if isinstance(stage, (BatchStage, Rebatch))][-1]
 
 
 def _compiled(
@@ -537,7 +543,8 @@ def _compiled(
             _validation_reader,
             pipeline=validation,
             build=dataclasses.replace(
-                build, lowering=_analyzed(validation, read, validation=True), training=False
+                build, lowering=_analyzed(validation, read, validation=True), training=False,
+                batch=_output_batch(validation),
             ).tuned(validation),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
@@ -673,7 +680,8 @@ def _compile_phases(
         end = None if until is None else until * phase.build.batch
         staged.append((phase, end))
         if end is not None:
-            _delivered(pipeline, end - previous, consumed)
+            # The phase as it reads: its members a memory read kept, at the shares the lowering mixes.
+            _delivered(phase.train, end - previous, consumed)
             previous = end
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
@@ -730,7 +738,8 @@ def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None
     if isinstance(source, Phases):
         raise ValueError("nested phases have no single corpus share")
     if isinstance(source, Mixture):
-        weights = tuple(weight / sum(source.weights) for weight in source.weights)
+        lowered = _weights(source)
+        weights = tuple(weight / sum(lowered) for weight in lowered)
         for child, taken in zip(source.pipelines, weight_counts(weights, count), strict=True):
             _delivered(child, taken, consumed)
     else:
@@ -1025,7 +1034,7 @@ def validation(
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
     # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+    batch = _output_batch(pipeline)
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
     packed = _coordinated(pipeline)

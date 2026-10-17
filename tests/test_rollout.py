@@ -11,6 +11,7 @@ through the objective's own head.
 
 import jax
 import numpy as np
+import pytest
 from affine_run import dataset, frozen_trainer, raw_leaf
 from recording import RecordingTracker
 from rl_support import TinyHead
@@ -117,14 +118,14 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
 
 
 class Calls:
-    """Records each call's arguments; scores 1 when the completion's first token matches the reference."""
+    """Records each call's arguments; scores how many of the completion's tokens are the reference."""
 
     def __init__(self):
         self.seen = []
 
     def __call__(self, data_source, completion, ground_truth, extra_info):
         self.seen.append((data_source, completion, ground_truth, extra_info))
-        return 1.0 if completion.split()[:1] == [ground_truth] else 0.0
+        return float(completion.split().count(ground_truth))
 
 
 def tiny_objective(seq=PROMPT_WIDTH + NEW_TOKENS - 1):
@@ -217,53 +218,42 @@ def test_a_prompts_group_is_the_policys_continuations_of_one_request():
         np.testing.assert_array_equal(chain["behavior_log_probs"][sampled], drawn.behavior_log_probs[index])
 
 
-def test_rewards_and_advantages_follow_the_calls():
-    """The reward sees each row's own context, and the advantages are the
-    group family over exactly the rewards the calls returned."""
+def test_the_reward_sees_each_rows_own_context():
+    """Each call reads its own row's data source and reference."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     reward = Calls()
     rollout = SampledRollout(objective, reward, groups=GROUPS,
                              max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
 
-    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+    rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    assert len(reward.seen) == 4
     assert [seen[0] for seen in reward.seen] == ["rule", "rule", "other", "other"]
     assert [seen[2] for seen in reward.seen] == ["1", "1", "2", "2"]
-    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
-    expected = np.asarray(group_advantage(scores, GROUPS), np.float32)
-    for index, chain in chains(out).items():
-        np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
 
 
-def test_the_rollout_names_its_advantage_family_the_way_pack_does():
-    """One estimator name for every producer: Dr.GRPO's centred rewards too."""
+@pytest.mark.parametrize("estimator", ["group", "mean", "rloo"])
+def test_each_estimator_turns_the_calls_rewards_into_the_packed_advantages(estimator):
+    """Four completions a prompt under a sampling policy, scored by how many
+    of their tokens are the prompt's reference: the rewards differ within
+    every group, so the advantages are not all zero, and the packed column
+    holds the named family, as `pack` names it, over exactly those rewards
+    (Dr.GRPO's centred rewards for "mean")."""
+    groups = 4
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     reward = Calls()
-    rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                             sampling=Sampling(temperature=0.0), estimator="mean")
+    rollout = SampledRollout(objective, reward, groups=groups, max_new_tokens=NEW_TOKENS,
+                             sampling=Sampling(temperature=1.3, top_k=5), estimator=estimator)
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
-    expected = np.asarray(group_advantage(scores, GROUPS, normalise_by_std=False), np.float32)
-    for index, chain in chains(out).items():
-        np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
-
-
-def test_rloo_advantages_follow_the_calls():
-    """The leave-one-out family flows through the same packer."""
-    objective = tiny_objective()
-    params = objective.init(jax.random.key(0))
-    reward = Calls()
-    rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                             sampling=Sampling(temperature=0.0), estimator="rloo")
-
-    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
-
-    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
-    expected = np.asarray(rloo_advantage(scores, GROUPS), np.float32)
+    assert len(reward.seen) == 2 * groups
+    scores = np.asarray([reward(*seen) for seen in reward.seen[:2 * groups]], np.float32)
+    assert all(len(set(group)) > 1 for group in scores.reshape(-1, groups))
+    expected = np.asarray({"group": group_advantage(scores, groups),
+                           "mean": group_advantage(scores, groups, normalise_by_std=False),
+                           "rloo": rloo_advantage(scores, groups)}[estimator], np.float32)
+    assert all(np.count_nonzero(group) >= 2 for group in expected.reshape(-1, groups))
     for index, chain in chains(out).items():
         np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)

@@ -58,6 +58,13 @@ class DPOObjective(LMObjective):
         self.inputs = InputSpec(sample=Field(IDS_KEY, (2, seq_len + 1)))
         self.beta = beta
 
+    def data(self, tokenizer=None):
+        """No steps of its own: a preference record step (`preferences.pair`)
+        lays out the pairs, which LM's text windows would cut."""
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData()
+
     def _halves(self, batch):
         """Split the batch into chosen and rejected halves with the shifted mask.
 
