@@ -170,12 +170,21 @@ def shared(python: str) -> str:
 
 
 def contents(name: str) -> bytes:
-    """The hash of file `name`'s bytes, or b"missing"."""
-    return hashlib.sha256(Path(name).read_bytes()).digest() if Path(name).is_file() else b"missing"
+    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and
+    compiled bytecode's (a run's own leftovers), or b"missing"."""
+    path = Path(name)
+    if path.is_file():
+        return hashlib.sha256(path.read_bytes()).digest()
+    if path.is_dir():
+        entries = sorted(entry.name for entry in path.iterdir()
+                         if not entry.name.startswith(".") and entry.name != "__pycache__")
+        return hashlib.sha256("\n".join(entries).encode()).digest()
+    return b"missing"
 
 
 def cache_key(common: str, name: str, depends: list[str]) -> str:
-    """The key of test file `name` whose run executed `depends`: those files' contents and `common`."""
+    """The key of test file `name` whose run executed or read `depends` (executed.py): those files'
+    contents, those directories' entries, and `common`."""
     digest = hashlib.sha256(common.encode())
     for path in sorted({name, *depends}):
         digest.update(path.encode() + contents(path))

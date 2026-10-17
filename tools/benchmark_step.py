@@ -59,6 +59,7 @@ import numpy as np
 import tyro
 
 from dew.files import write_atomically
+from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
 from dew.registry import models
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
@@ -166,7 +167,7 @@ class BenchmarkConfig:
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
     """Model compute dtype for every case that names none of its own; losses
     stay fp32 either way."""
-    attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
+    attention_impl: AttentionImpl = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
     fixed_batch: bool = False
     """Reuse one placed batch in every step, as tools/benchmark_torch.py does
