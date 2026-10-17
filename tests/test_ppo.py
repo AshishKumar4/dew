@@ -140,12 +140,12 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     )
     final = trainer.fit(data, steps=2, log_every=1)
     assert int(final.updates) == 2
-    for part in ("policy", "critic"):
+    for name in ("policy", "critic"):
         differences = [
             np.max(np.abs(np.asarray(after) - np.asarray(before)))
             for before, after in zip(
-                jax.tree.leaves(initial.variables["params"][part]),
-                jax.tree.leaves(final.variables["params"][part]),
+                jax.tree.leaves(initial.variables["params"][name]),
+                jax.tree.leaves(final.variables["params"][name]),
                 strict=True,
             )
         ]
@@ -262,7 +262,8 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
     want, want_gradient = jax.value_and_grad(expected)(state.variables["params"])
     got, got_gradient = jax.value_and_grad(actual)(state.variables["params"])
     np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
-    for observed, reference in zip(jax.tree.leaves(got_gradient), jax.tree.leaves(want_gradient), strict=True):
+    for observed, reference in zip(jax.tree.leaves(got_gradient),
+                                   jax.tree.leaves(want_gradient), strict=True):
         np.testing.assert_allclose(observed, reference, rtol=1e-6, atol=1e-7)
     _, aux = objective.scalar_loss(state.variables, batch, step)
     critic = token_mean(clipped_value_loss_terms(objective.values(state.variables, batch),
@@ -286,7 +287,8 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
              BEHAVIOR_LOG_PROBS_KEY: old - 2 * jnp.asarray(batch["response_mask"])}
     before = jax.tree.map(np.asarray, state.variables["params"])
     state, _, _, _, accepted, _ = trainer.compile(state, batch)(state, batch)
-    assert bool(accepted) == (coefficient > 0)
+    assert bool(accepted)
+    assert int(state.updates) == int(coefficient > 0)
     for start, end in zip(jax.tree.leaves(before["policy"]),
                           jax.tree.leaves(state.variables["params"]["policy"]), strict=True):
         np.testing.assert_array_equal(start, end)
