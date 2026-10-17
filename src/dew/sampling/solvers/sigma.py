@@ -9,7 +9,7 @@ from jax import lax
 
 from dew.diffusion.schedules import expand
 
-from .common import _push, _sigma_integrator
+from .common import _check_distinct_levels, _push, _sigma_integrator
 
 
 def _euler_step(x, denoised, source, target):
@@ -235,6 +235,7 @@ class MultiStepDPM:
     FlaxDiff's `MultiStepDPM`, which despite the name is not DPM-Solver."""
 
     def init(self, x, times, process, *, key):
+        _check_distinct_levels(process, times, reason="its finite differences divide by")
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
@@ -296,6 +297,8 @@ class LMS:
             raise ValueError(f"LMS's order is at least 1, not {self.order}")
 
     def init(self, x, times, process, *, key):
+        if self.order > 1:
+            _check_distinct_levels(process, times, reason="LMS's Lagrange basis divides by")
         sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
         return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 

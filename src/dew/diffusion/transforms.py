@@ -14,7 +14,7 @@ and is converted with `target_error_scale`.
 """
 
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -47,12 +47,14 @@ class PredictionTransform:
 
     normalize_input: bool = False
 
-    divides_by_signal: ClassVar[bool] = False
-    """Whether `backward_diffusion` divides by the signal rate alpha, and so is undefined where
-    alpha is 0, as at a rectified flow's pure-noise end."""
-
     def __init__(self, *, normalize_input: bool = False):
         self.normalize_input = normalize_input
+
+    @property
+    def divides_by_signal(self) -> bool:
+        """Whether recovering `(x_0, epsilon)` from a prediction divides by the signal rate alpha,
+        and so is undefined where alpha is 0, as at a rectified flow's pure-noise end."""
+        return False
 
     def pred_transform(self, x_t, prediction, rates, t) -> jax.Array:
         """Return the model's raw output at `(x_t, t)` as a prediction in target space.
@@ -98,7 +100,9 @@ class PredictionTransform:
 
 
 class EpsilonPredictionTransform(PredictionTransform):
-    divides_by_signal = True
+    @property
+    def divides_by_signal(self) -> bool:
+        return True
 
     def backward_diffusion(self, x_t, prediction, rates):
         signal_rates, noise_rates = rates
@@ -216,6 +220,10 @@ class ConsistencyBoundary(PredictionTransform):
         c_out = scaled / (scaled ** 2 + self.sigma_data ** 2) ** 0.5
         return c_out * x_0 + c_skip * x_t
 
+    @property
+    def divides_by_signal(self) -> bool:
+        return self.inner.divides_by_signal
+
     def backward_diffusion(self, x_t, prediction, rates):
         return from_clean(x_t, prediction, rates)
 
@@ -268,6 +276,10 @@ class SourceLimitedPrediction(PredictionTransform):
 
     def pred_transform(self, x_t, prediction, rates, t):
         return self.inner.pred_transform(x_t, prediction, rates, t)
+
+    @property
+    def divides_by_signal(self) -> bool:
+        return self.inner.divides_by_signal
 
     def backward_diffusion(self, x_t, prediction, rates):
         x_0, epsilon = self.inner.backward_diffusion(x_t, prediction, rates)

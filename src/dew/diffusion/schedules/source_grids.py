@@ -495,21 +495,6 @@ def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np
     return refined, refined_times, prior
 
 
-def _distinct_intervals(sigmas: np.ndarray) -> None:
-    """Refuse a grid with an interval of no length before its last.
-
-    Repeated model times over distinct sigmas walk as the source walks them.
-    A spacing that puts more steps than the table can separate gives equal
-    sigma rows, and a multistep solver's coefficients over such an interval
-    divide by its zero length, as the source's own do; the last interval may
-    be empty (`final_sigmas_type="sigma_min"`), where every solver stays put.
-    """
-    inner = sigmas[:-1]
-    if np.any(inner[:-1] == inner[1:]):
-        raise ValueError("the spacing gives equal sigma rows inside the walk, an interval of no length "
-                         "that a multistep solver divides by; take fewer steps or another spacing")
-
-
 def _flow_grid(policy: SourcePolicy, flow: FlowShift, steps: int, tokens: int | None,
                origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
     """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
@@ -581,7 +566,6 @@ def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: Predictio
         schedule: NoiseScheduler = SigmaGrid(sigmas, times, prior)
     elif policy.family == "sigma":
         sigmas, times, prior = _sigma_grid(policy, betas, steps)
-        _distinct_intervals(sigmas)
         schedule = SigmaGrid(sigmas, np.append(times, times[-1]), prior)
     elif policy.family == "stage":
         sigmas, times, prior = _stage_grid(policy, betas, steps)
@@ -590,7 +574,6 @@ def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: Predictio
                 jnp.arange(len(sigmas) - 1, -1, -2, dtype=jnp.float32))
     else:
         sigmas, times, prior = _lambda_grid(policy, betas, steps)
-        _distinct_intervals(sigmas)
         paired = FlowGrid if policy.flow_shift is not None else VPGrid
         schedule = paired(sigmas, np.append(times, times[-1]), prior)
     return (Process(schedule, prediction),

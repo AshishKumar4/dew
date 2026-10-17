@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from .common import _check_endpoint_domain, _push
+from .common import _check_distinct_levels, _check_endpoint_domain, _push
 
 
 class UniPCState(NamedTuple):
@@ -181,6 +181,10 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
+        # The corrector at point j divides by the interval before it, unless `disable_corrector` names it.
+        corrected = [j for j in range(1, times.shape[0] - 1) if j - 1 not in self.disable_corrector]
+        if self.order > 1 or corrected:
+            _check_distinct_levels(process, times, reason="UniPC's corrector and higher orders divide by")
         with jax.ensure_compile_time_eval():
             alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
             corrector, predictor = _unipc_tables(np.asarray(alpha, np.float64), np.asarray(sigma, np.float64),
