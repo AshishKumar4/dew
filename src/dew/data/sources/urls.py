@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -22,8 +21,8 @@ _log = logging.getLogger(__name__)
 
 
 class _Deadline:
-    """One fetch attempt's deadline, over every connection it opens (a redirect's included):
-    resolving its host, connecting, a proxy's tunnel, the TLS handshake and the body. A
+    """One fetch attempt's deadline, over every connection it opens (a redirect's included) once
+    its host is resolved: connecting, a proxy's tunnel, the TLS handshake and the response. A
     socket timeout bounds each receive, not a response a server trickles a byte at a time, so when
     the deadline passes each connection is shut down, which ends a wait in any of those stages.
     The deadline shuts its own duplicate of each socket, which no close by urllib can hand to
@@ -62,7 +61,7 @@ class _Deadline:
         connects, and each wait at most the time the deadline leaves, in place of `timeout`."""
         host, port = address
         failure: OSError | None = None
-        for family, kind, protocol, _, target in _resolved(host, port, self.at - time.monotonic()):
+        for family, kind, protocol, _, target in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
             left = self.at - time.monotonic()
             if left <= 0:
                 raise TimeoutError(f"no time left to connect to {host}")
@@ -93,24 +92,6 @@ class _Deadline:
             self._passed = True
             for handle in self._handles:
                 _shut(handle)
-
-
-@functools.cache
-def _resolver() -> concurrent.futures.ThreadPoolExecutor:
-    """The threads every fetch resolves host names on, at most 16: the system resolver takes no
-    timeout, so a lookup a deadline gave up on keeps one of them until the resolver returns."""
-    return concurrent.futures.ThreadPoolExecutor(16, thread_name_prefix="dew-fetch-resolve")
-
-
-def _resolved(host: str, port: int, seconds: float) -> list[tuple]:
-    """`socket.getaddrinfo` for a stream to `host`, waited on at most `seconds`; a lookup still
-    queued behind busy resolver threads when its time is up is withdrawn."""
-    lookup = _resolver().submit(socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM)
-    try:
-        return lookup.result(timeout=max(seconds, 0.0))
-    except TimeoutError:
-        lookup.cancel()
-        raise
 
 
 def _shut(connection: socket.socket) -> None:
@@ -160,8 +141,11 @@ def _opener(deadline: _Deadline) -> urllib.request.OpenerDirector:
 class Fetch:
     """Fetch the bytes at a record's url into `output`, in one attempt: a url
     that fails now is dropped as transient, for a later epoch or a cache
-    refill to fetch again, so a reader waits at most `timeout` on it. A cache
-    never freezes a fetch's outcome; only `snapshot(url)` seals outcomes."""
+    refill to fetch again, so a reader waits at most `timeout` on it from
+    connecting to its last byte, however slowly a server sends. Resolving its
+    host is the system resolver's, which takes no timeout, as in urllib3 and
+    requests. A cache never freezes a fetch's outcome; only `snapshot(url)`
+    seals outcomes."""
 
     field: str = "url"
     output: str = "bytes"
