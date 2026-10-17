@@ -25,6 +25,7 @@ from dew.diffusion.schedules import RectifiedFlow, expand
 
 from .guidance import Guidance, Walk
 from .sample import sample
+from .solvers.common import _check_endpoint_domain
 
 
 @struct.dataclass
@@ -130,24 +131,26 @@ class FlowSDE:
     the noise rate sigma that results, as the reference scheduler does.
     Predictions are converted to clean samples and noise by the denoiser.
     A process without a rectified-flow schedule raises `ValueError`, and so
-    does a prediction whose conversion divides by the signal rate
-    (`PredictionTransform.divides_by_signal`, epsilon's), since the
-    trajectory starts at pure noise, where that rate is 0.
+    does a grid that evaluates a prediction dividing by the signal rate
+    (`PredictionTransform.divides_by_signal`, epsilon's) where that rate is
+    0, as at pure noise: a walk from an interior time takes it.
     """
 
     noise_level: float = struct.field(pytree_node=False, default=0.7)
 
-    def validate(self, process: Process) -> None:
-        schedule = process.sampler_schedule
-        if not isinstance(schedule, RectifiedFlow):
+    def validate(self, process: Process, times: jax.Array | None = None) -> None:
+        """Refuse a process this solver cannot walk, and with the concrete grid `times`, a grid
+        whose prediction is undefined at a point it is evaluated at: every one but the last."""
+        if not isinstance(process.sampler_schedule, RectifiedFlow):
             raise ValueError("FlowSDE requires a rectified-flow schedule")
-        if process.prediction.divides_by_signal and float(schedule.rates(jnp.asarray(schedule.T))[0]) == 0:
-            raise ValueError(f"a {type(process.prediction).__name__} recovers the clean sample by dividing "
-                             f"by the signal rate, which is 0 where the trajectory starts")
+        if times is not None and process.prediction.divides_by_signal:
+            _check_endpoint_domain(process, times, source=True,
+                                   reason=f"a {type(process.prediction).__name__} divides by the signal rate")
 
     def init(self, x: jax.Array, times: jax.Array, process: Process, *,
              key: jax.Array) -> tuple[jax.Array, jax.Array]:
         """No transition yet: a NaN density and no noise, per row."""
+        self.validate(process, times)
         return jnp.full((x.shape[0],), jnp.nan, jnp.float32), jnp.zeros((x.shape[0],), bool)
 
     def transition(self, x: jax.Array, t: jax.Array, t_next: jax.Array,

@@ -19,7 +19,7 @@ from recording import RecordingTracker
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.diffusion.presets import JiT
-from dew.diffusion.transforms import EpsilonPredictionTransform, VPredictionTransform
+from dew.diffusion.transforms import ConsistencyBoundary, EpsilonPredictionTransform, VPredictionTransform
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
@@ -114,14 +114,40 @@ def test_flow_objective_uses_converted_predictions(prediction):
     assert np.isfinite(float(loss))
 
 
-def test_a_prediction_undefined_at_pure_noise_is_refused_where_the_trajectory_starts():
-    """An epsilon prediction recovers the clean sample by dividing by alpha, which a rectified
-    flow's trajectory starts at 0: the objective refuses it when built, rather than rolling out
-    non-finite states."""
-    process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+@pytest.mark.parametrize("prediction", [EpsilonPredictionTransform(),
+                                        ConsistencyBoundary(EpsilonPredictionTransform())],
+                         ids=["epsilon", "consistency_epsilon"])
+def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evaluates_it(prediction):
+    """Epsilon's clean sample divides by alpha, inside a consistency boundary or not, and a
+    rectified flow's alpha is 0 at pure noise. A trajectory from there, and an objective whose
+    rollouts start there, are refused before they run, rather than rolling out non-finite states.
+    From t = 0.9 the same prediction walks compiled, and each transition rescores, compiled on its
+    own, to the density the walk recorded."""
+    process = Process(FlowMatchingScheduler(), prediction)
+    model = AffineVelocity()
+    x = jnp.asarray([[0.2, -0.5], [-0.1, 0.7]])
+    denoise = process.denoiser(model, model.init(jax.random.key(0), x, jnp.ones(2)), {})
+    solver = FlowSDE(0.5)
     with pytest.raises(ValueError):
-        FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
-                          guidance=None)
+        solver.trajectory(denoise, x, 5, key=1)
+    with pytest.raises(ValueError):
+        FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), sde=solver, guidance=None)
+    times = jnp.linspace(0.9, 0.0, 5)
+    _, (states, log_probs) = jax.jit(lambda start: sample(
+        denoise, start, solver=solver, key=jax.random.key(1), times=times, final_denoise=False,
+        record=lambda following, state: (following, state[0])))(x)
+    states = jnp.concatenate((x[None], states))
+    assert np.isfinite(np.asarray(states)).all()
+
+    @jax.jit
+    def rescored(latent, action, t, s):
+        t, s = jnp.full((latent.shape[0],), t), jnp.full((latent.shape[0],), s)
+        clean, noise = denoise(latent, t)
+        return solver.transition(latent, t, s, clean, noise, process).log_prob(action)
+
+    for index in range(4):
+        np.testing.assert_allclose(rescored(states[index], states[index + 1], times[index], times[index + 1]),
+                                   log_probs[index], atol=3e-6, rtol=2e-6)
 
 
 def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():

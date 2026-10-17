@@ -9,7 +9,15 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from .common import Multistep, _check_endpoint_domain, _half_log_snr, _lambda_step, _multistep, _tapered_order
+from .common import (
+    Multistep,
+    _check_distinct_levels,
+    _check_endpoint_domain,
+    _half_log_snr,
+    _lambda_step,
+    _multistep,
+    _tapered_order,
+)
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
 
@@ -98,6 +106,8 @@ class DPMSolverMultistep:
             _check_endpoint_domain(
                 process, times, source=True, target=not first_at_end,
                 reason="sde-dpmsolver requires finite alpha and a lowered order at sigma zero")
+        if self.order > 1:
+            _check_distinct_levels(process, times, reason="DPM-Solver's higher orders divide by")
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -215,6 +225,8 @@ class DPMSolverSinglestep:
                 and 3 in orders[:3]):
             _check_endpoint_domain(process, times, source=True,
                                    reason="third-order SDE Heun differences diverge at an alpha=0 anchor")
+        if any(order > 1 for order in orders):
+            _check_distinct_levels(process, times, reason="DPM-Solver's higher orders divide by")
         return Singlestep(_multistep(x, times, self.order), x, jnp.asarray(orders, jnp.int32))
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -352,6 +364,8 @@ class DEIS:
             raise ValueError(f"DEIS has orders 1, 2 and 3, not {self.order}")
 
     def init(self, x, times, process, *, key):
+        if self.order > 1:
+            _check_distinct_levels(process, times, reason="DEIS's higher orders divide by")
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):

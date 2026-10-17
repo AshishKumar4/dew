@@ -72,6 +72,26 @@ def _check_endpoint_domain(process: Process, times: jax.Array, *,
             raise ValueError("sigma=0 target has no finite update: " + reason)
 
 
+def _check_distinct_levels(process: Process, times: jax.Array, *, reason: str) -> None:
+    """Reject two adjacent points with one noise level before the grid's last, while it is concrete.
+
+    An update that combines model evaluations from several levels divides by
+    the gaps between them, so an interval of no length leaves it undefined,
+    as it leaves the source's own. The levels are the rates the walk reads,
+    at its tables' precision, so values distinct only when the grid was
+    built are caught too. The last interval is the solvers' endpoint rules'
+    (`final_sigmas_type="sigma_min"` repeats its sigma). Euler and Heun take
+    an empty interval as staying put, and do not call this.
+    """
+    if times.shape[0] < 3:
+        return
+    with jax.ensure_compile_time_eval():
+        alpha, sigma = process.sampler_schedule.rates(times[:-1])
+        if bool(jnp.any((alpha[1:] == alpha[:-1]) & (sigma[1:] == sigma[:-1]))):
+            raise ValueError("two adjacent points of the grid have one noise level, an interval of no "
+                             "length that " + reason + "; take fewer steps or another spacing")
+
+
 def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
     schedule = process.sampler_schedule
     if not isinstance(schedule, GeneralizedNoiseScheduler):
