@@ -40,8 +40,6 @@ float64 against 8.3e-8 relative RMS) and cost 19% of an H100's forward and 26% o
 than the gate asks for.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 from typing import ClassVar

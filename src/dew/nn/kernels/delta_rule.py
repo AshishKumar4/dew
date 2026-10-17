@@ -19,8 +19,6 @@ the rule over a step's tokens in one ragged call, which is the layout of a
 serving step's mixed call (`dew.nn.inputs.Admitted`) rather than this one.
 """
 
-from __future__ import annotations
-
 import dataclasses
 from typing import ClassVar
 
