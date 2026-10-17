@@ -250,6 +250,19 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
         dataclasses.replace(video, val_metrics=("clip",)).build_eval_metrics()
 
 
+def test_a_diffusion_runs_default_metric_asks_for_validation_and_a_named_one_always(tmp_path):
+    """With no val_metrics named, an image run scores CLIP where its data validates and nothing where
+    it holds no validation split, and a video run nothing; a metric named is asked for either way,
+    so a run whose data holds no validation split refuses it (`Trainer.fit`)."""
+    images = run_config(tmp_path)
+    assert images.val_metrics is None
+    assert [type(metric).__name__ for metric in images.build_eval_metrics(validates=True)] == ["CLIPDistance"]
+    assert images.build_eval_metrics(validates=False) == []
+    video = dataclasses.replace(images, data=VideoData(source="clips", frame_size=8, frames=2))
+    assert video.build_eval_metrics(validates=True) == []
+    assert len(dataclasses.replace(video, val_metrics=("psnr",)).build_eval_metrics(validates=False)) == 1
+
+
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
