@@ -160,16 +160,19 @@ class LayaCheckpoint:
         `encoder.` and the head's under Laya's names), `encoder/config.json`, the
         tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
         depth, the layout's budgets and the temperatures. The backbone must be a
-        ModernBERT encoder and the head Laya's.
+        ModernBERT encoder and the head Laya's. A backbone under LoRA is written
+        with its factors merged into their kernels (`Pretrained.bound`).
         """
         from dew.interop.pretrained import PretrainedDecoder
 
         head = from_record(DecisionHead, self.model.head)
         backbone = thaw(part(self.variables, "backbone"))
-        if any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
-               for path, _ in jax.tree_util.tree_leaves_with_path(backbone) for key in path):
-            raise ValueError("the backbone carries LoRA factors; merge them into its kernels before saving")
-        bundle = PretrainedDecoder.from_model(self.model.backbone, backbone)
+        encoder = self.model.backbone
+        bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+        if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+                                          for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
+                                          for key in path):
+            raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
         if bundle.config.get("model_type") != "modernbert":
             raise ValueError("Laya's layout holds a ModernBERT encoder, "
                              f"not a {bundle.config.get('model_type')}")

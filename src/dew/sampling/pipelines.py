@@ -28,7 +28,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.guidance import CFG, Guidance, guidance_modules
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
@@ -703,7 +703,8 @@ class TextToImage:
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
             initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
-            models = (self.model,) if self.autoencoder is None else (self.model, self.autoencoder.model)
+            models = (self.model, *guidance_modules(chosen),
+                      *(() if self.autoencoder is None else (self.autoencoder.model,)))
             walked = _run(plan.sharding, tuple(compiler_options(*models).items()))
             generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
                                solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
@@ -848,8 +849,9 @@ def _initial(rows: jax.sharding.NamedSharding | None):
 
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The walk over `rows`, compiled with its denoiser's and autoencoder's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
+    """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
+    its autoencoder (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never
+    share it."""
     # Rebinding weights must not change the static compilation identity, nor a
     # solver's or guidance's numbers, nor the grid's values: the solver and the
     # guidance are pytrees whose structure is static and whose numbers (a
