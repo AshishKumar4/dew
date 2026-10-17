@@ -177,15 +177,14 @@ def distillation_loss(student_logits, teacher_logits, targets, mask, student_fea
 
 
 def dew_outputs(model, variables, ids, layers):
-    """The model's logits and the named layers' outputs under Dew's forward."""
-    import jax
+    """The model's logits and the named layers' outputs under Dew's forward, in the model's own
+    dtype and differentiable; the fixture writes them as float32."""
     from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 
     logits = model.apply(variables, ids)
     _, state = model.apply(variables, ids, method=type(model).hidden_states,
                            capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
-    kept = [layer_output(state[INTERMEDIATES], index) for index in layers]
-    return np.asarray(logits, np.float32), [np.asarray(x, np.float32) for x in kept]
+    return logits, [layer_output(state[INTERMEDIATES], index) for index in layers]
 
 
 def flat(tree, prefix: str) -> dict[str, np.ndarray]:
@@ -220,8 +219,10 @@ def main() -> None:
             jnp.float32))
         for index in range(len(PAIRS))}
 
-    student_logits, student_states = dew_outputs(student, student_vars, ids, [s for _, s in PAIRS])
-    teacher_logits, teacher_states = dew_outputs(teacher, teacher_vars, ids, [t for t, _ in PAIRS])
+    student_logits, student_states = jax.tree.map(lambda value: np.asarray(value, np.float32), dew_outputs(
+        student, student_vars, ids, [s for _, s in PAIRS]))
+    teacher_logits, teacher_states = jax.tree.map(lambda value: np.asarray(value, np.float32), dew_outputs(
+        teacher, teacher_vars, ids, [t for t, _ in PAIRS]))
     projected = [state.astype(np.float64) @ projections[f"projection_{index}"].astype(np.float64)
                  for index, state in enumerate(student_states)]
     mask = (targets != PAD).astype(np.float32)

@@ -592,9 +592,10 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     """`z_loss * log(Z)^2` per counted target, masked and averaged with the
     cross entropy, as MaxText's `cross_entropy_with_logits` and
     `train.py` sum it (tools/distillation_reference.py:z_loss_reference): the
-    loss and its z term as near the oracle's float64 value as the oracle's own
-    float32 run is (`assert_as_exact_as_the_reference`), and zero keeps the
-    loss the plain cross entropy to the bit."""
+    loss and its z term as near the oracle on the float64 forward's logits as
+    the oracle's own float32 run on the float32 logits is
+    (`assert_as_exact_as_the_reference`), and zero keeps the loss the plain
+    cross entropy to the bit."""
     from tools.distillation_reference import z_loss_reference
 
     pad_id, coefficient = 0, 1e-2
@@ -602,10 +603,13 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     tokens = np.asarray(batch[TEXT_KEY])
     plain = make_objective(pad_id=pad_id)
     params = plain.init(jax.random.key(0))
-    logits = np.asarray(plain.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32)))
+    ids = jnp.asarray(tokens[:, :-1], jnp.int32)
+    logits = np.asarray(plain.model.apply(params, ids))
     weights = (tokens[:, 1:] != pad_id).astype(np.float64)
-    expected, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
     rounded, rounded_z, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient, dtype=np.float32)
+    with jax.enable_x64(new_val=True):
+        wide_logits = np.asarray(plain.model.clone(dtype=jnp.float64).apply(widened(params), ids))
+        expected, z_term, _ = z_loss_reference(wide_logits, tokens[:, 1:], weights, coefficient)
 
     loss, aux = make_objective(pad_id=pad_id, z_loss=coefficient).scalar_loss(params, batch, step_at())
     without, plain_aux = plain.scalar_loss(params, batch, step_at())
@@ -624,8 +628,9 @@ def test_z_loss_gradient_carries_the_reference_factor():
     """The oracle's logit gradient, `(1 + 2 z log Z) softmax - onehot`, pulled
     back through the model, holds the objective's parameter gradient as near
     float64 as the oracle's own float32 run is (`assert_leaves_as_exact`):
-    the truth pulls the float64 oracle back through the model run in
-    float64, the reference pulls the float32 oracle back in float32."""
+    the truth pulls the float64 oracle at the float64 forward's logits back
+    through that forward, the reference pulls the float32 oracle at the
+    float32 logits back in float32."""
     from tools.distillation_reference import z_loss_reference
 
     coefficient = 1e-2
@@ -640,10 +645,11 @@ def test_z_loss_gradient_carries_the_reference_factor():
     _, _, rounded = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient,
                                      dtype=np.float32)
     reference, = pullback(jnp.asarray(rounded))
-    _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient)
     with jax.enable_x64(new_val=True):
         wide = model.clone(dtype=jnp.float64)
-        _, widened_pullback = jax.vjp(lambda p: wide.apply({"params": p}, ids), widened(params["params"]))
+        wide_logits, widened_pullback = jax.vjp(lambda p: wide.apply({"params": p}, ids),
+                                                widened(params["params"]))
+        _, _, cotangent = z_loss_reference(np.asarray(wide_logits), tokens[:, 1:], weights, coefficient)
         truth, = widened_pullback(cotangent)
         truth = jax.tree.map(np.asarray, truth)
     actual = jax.grad(lambda p: objective.scalar_loss({"params": p}, batch, step_at())[0])(params["params"])
