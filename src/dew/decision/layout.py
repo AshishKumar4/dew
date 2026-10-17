@@ -59,7 +59,7 @@ class TokenizerSpecials(Protocol):
     def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
 
 
-def _holds_specials(tokenizer: Tokenizer | TokenizerSpecials | PreTrainedTokenizerBase
+def _holds_specials(tokenizer: "Tokenizer | TokenizerSpecials | PreTrainedTokenizerBase"
                     ) -> TypeGuard[TokenizerSpecials]:
     """Whether `tokenizer` answers what `TokenizerSpecials` declares. Each member is read, not
     looked up statically, since a transformers tokenizer answers its ids through `__getattr__`."""
