@@ -192,13 +192,10 @@ def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():
     assert read[:8] == [1000, 1001, 1002, 2000, 1003, 1004, 1005, 2001]
 
 
-@pytest.mark.parametrize("weights, message", [
-    ((1.0,), "at least two pipelines"),
-    ((1.0, 0.0), "finite and positive"),
-    ((1.0, -1.0), "finite and positive"),
-])
-def test_a_mixture_that_is_not_one_is_refused(weights, message):
-    corpora = [Pipeline(Memory(Indexed(tag, 8))) for tag in range(1, len(weights) + 1)]
+@pytest.mark.parametrize("count, weights", [(0, ()), (2, (1.0,)), (2, (1.0, 0.0)), (2, (1.0, -1.0))])
+def test_a_mixture_that_is_not_one_is_refused(count, weights):
+    """A mixture is one or more datasets with one finite, positive weight each."""
+    corpora = [Pipeline(Memory(Indexed(tag, 8))) for tag in range(1, count + 1)]
     with pytest.raises(ValueError):
         mix(corpora, weights=weights)
 

@@ -93,7 +93,7 @@ def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
     pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().filter_map(
         Fetch(output="image"), DecodeImage("image")).batch(4)
     data = compile(pipeline, read="indexed", loading=READ,
-                   budget=SearchBudget(consecutive=8, seconds=2))
+                   budget=SearchBudget(consecutive=8))
     stream = data.train(DataPartition())
     try:
         with pytest.raises(ValueError):
