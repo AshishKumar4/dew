@@ -470,13 +470,14 @@ always stores float8_e4m3fn, so Qwen3's FP8 repos that omit it are E4M3;
 DeepSeek writes 'e4m3' and MiniMax 'float8_e4m3fn'."""
 
 
-def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
-    """Return the block size and whether the scales are ue8m0, from `quantization`.
+def fp8_format(quantization: Mapping[str, object]) -> tuple[tuple[int, int], bool]:
+    """Return the block's rows and columns and whether the scales are ue8m0, from `quantization`.
 
-    The finegrained format or refused: E4M3 weights (`E4M3_NAMES`) in a
-    square block, the scales float32 (`scale_fmt` absent or 'float', V3)
-    or ue8m0 (V3.2). A per-tensor or rectangular scale, or a scale format
-    with no rounding rule here, is not this format.
+    The finegrained format or refused: E4M3 weights (`E4M3_NAMES`) in blocks
+    of any positive rows and columns, square as DeepSeek's or a row's
+    `[1, cols]`, the scales float32 (`scale_fmt` absent or 'float', V3) or
+    ue8m0 (V3.2). A per-tensor scale, or a scale format with no rounding rule
+    here, is not this format.
 
     This codec follows transformers 5.16.1's dequantize=True reader: its
     finegrained FP8 quantizer chooses that path on CPU without a GPU/XPU,
@@ -494,19 +495,26 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
                              for key in ('fmt', 'weight_block_size', 'scale_fmt'))
     if (fmt not in E4M3_NAMES or not isinstance(block, list) or len(block) != 2
             or any(type(side) is not int or side < 1 for side in block)
-            or block[0] != block[1] or scale_fmt not in (None, 'float', 'ue8m0')
-            or quantization.get('weight_per_tensor')):
+            or scale_fmt not in (None, 'float', 'ue8m0') or quantization.get('weight_per_tensor')):
         raise ValueError(
             f"quantization_config names fp8 with fmt {fmt!r}, weight_block_size "
             f"{block!r} and scale_fmt {scale_fmt!r}; this loader reads e4m3 weights "
-            f"in square blocks, not per tensor, with float32 or ue8m0 scales and nothing else")
-    return block[0], scale_fmt == 'ue8m0'
+            f"in blocks, not per tensor, with float32 or ue8m0 scales and nothing else")
+    return (block[0], block[1]), scale_fmt == 'ue8m0'
 
 
 Block = int | tuple[int, int]
 """The rows and columns one FP8 scale covers: DeepSeek's square `block`, or
 `(rows, cols)`, such as `(1, cols)` for one scale a row of a `cols`-wide
 matrix (a frozen FP8 matrix's rows, `dew.training.quantization`)."""
+
+
+def _square(block: tuple[int, int], release: str) -> int:
+    """The side of a square `block`, the only kind `release` storage holds: its
+    row-scaled tensors take a `(1, side)` block beside the square ones."""
+    if block[0] != block[1]:
+        raise ValueError(f"{release} FP8 storage scales square blocks; weight_block_size is {list(block)}")
+    return block[0]
 
 
 def _sides(block: Block) -> tuple[int, int]:
@@ -672,9 +680,9 @@ def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return names
 
 
-def fp8_blocks(block: int = BLOCK, *, ue8m0: bool = False) -> SourceQuantization:
-    """DeepSeek's FP8 blocks of `block` x `block` under `_scale_inv`
-    partners, encoded back with ue8m0 scales where the source's are."""
+def fp8_blocks(block: Block = BLOCK, *, ue8m0: bool = False) -> SourceQuantization:
+    """Finegrained FP8 in `block`s (`Block`) under `_scale_inv` partners,
+    encoded back with ue8m0 scales where the source's are."""
     return SourceQuantization(
         scaled_names, lambda name: (name + SCALE_SUFFIX,),
         lambda tensors, name: dequantize_fp8_blocks(tensors[name], tensors[name + SCALE_SUFFIX], block),
@@ -1667,6 +1675,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         # pairs (inference/model.py `Linear` under float4_e2m1fn_x2), 'fp8' or
         # null as FP8 blocks like every other Linear (the Base releases).
         block, ue8m0 = fp8_format(quantization)
+        side = _square(block, "DeepSeek-V4's")
         experts = quantization.get("expert_dtype", config.get("expert_dtype"))
         if not ue8m0:
             raise ValueError(
@@ -1675,16 +1684,17 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         if experts not in ("fp4", "fp8", None):
             raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
                              f"pairs or as fp8 blocks and nothing else")
-        return deepseek_v4(block, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
+        return deepseek_v4(side, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
     if method == "fp8" and quantization.get("store_dtype") is not None:
         block, ue8m0 = fp8_format(quantization)
+        side = _square(block, "MiMo-V2.6's")
         stored, group = quantization["store_dtype"], quantization.get("mxfp4_block_size", GROUP)
         if stored != "mxfp4" or group != GROUP or ue8m0:
             raise ValueError(f"quantization_config stores fp8 as {stored!r} in groups of {group!r}; this "
                              f"loader reads store_dtype 'mxfp4' in groups of {GROUP} beside float32 FP8 "
                              f"block scales")
         heads = config.get("num_key_value_heads")
-        return mxfp4_store(block, None if heads is None else records.integer(heads, "num_key_value_heads"))
+        return mxfp4_store(side, None if heads is None else records.integer(heads, "num_key_value_heads"))
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
         return fp8_blocks(block, ue8m0=ue8m0)
