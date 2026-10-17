@@ -794,10 +794,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None):
     B, _, Hv, Dv = value.shape
     state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
              else state.astype(jnp.float32))
-    mesh = jax.sharding.get_abstract_mesh()
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return _blocked_rule(query, key, value, g, beta, state, starts)
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
