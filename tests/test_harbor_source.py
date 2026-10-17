@@ -402,6 +402,31 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     assert rollout.status is Status.INFRA_ERROR and resolved < 20
 
 
+def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
+    """With no deadline, the cancel's escalation still bounds the trial: a grace after the SIGKILL,
+    the output a child outside the group keeps open is left unread, and the trial resolves
+    CANCELLED long before the child's minute-long sleep ends."""
+    task = "lingering-detached-waits"
+    (tmp_path / task).mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0)
+    try:
+        (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "trials").glob("*/child.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        began = time.monotonic()
+        source.cancel([future])
+        rollout = future.result(timeout=30)
+        resolved = time.monotonic() - began
+    finally:
+        source.close()
+        for child in (tmp_path / "trials").glob("*/child.json"):
+            os.kill(json.loads(child.read_text()), 9)
+    assert rollout.status is Status.CANCELLED and resolved < 20
+
+
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
     gateway, _ = fake_gateway()

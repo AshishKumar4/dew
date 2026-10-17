@@ -249,11 +249,13 @@ def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
         prompts = PromptSource(engine, lambda *_: 1.0, decode=str, max_new_tokens=4)
         rollout = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=30)
         prompts.close()
+        with pytest.raises(InfrastructureError) as caught:
+            engine.submit((1, 2), 4, key=KEY).result(timeout=30)
     finally:
         engine.close()
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
     for failed in (session, rollout):
         assert failed.status == Status.INFRA_ERROR and "InfrastructureError" in failed.detail
-        assert "ConnectError" in failed.detail
 
     def judged(task, episode):
         try:
