@@ -183,15 +183,20 @@ def test_production_fp32_crop_and_colour_are_within_one_uint8_code():
     assert np.max(np.abs(rounded - reference)) <= 1
 
 
-def test_device_none_keeps_the_old_resize_bit_identical():
-    host = loader(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    device = loader(spec(augment=False, backend="device"), batch=4, read="memory", seed=37,
-        loading=READ).train(DataPartition())
+def test_without_augmentation_each_picture_is_its_record_resized_by_opencvs_area_rule():
+    """With augmentation off, a training batch holds each record's pixels resized to the output
+    size by OpenCV's area interpolation, as `cv2.resize` makes them from the record itself."""
+    import cv2
+
+    rows = {int(row["label"]): row["image"] for row in spec(augment=False).source.records("memory")}
+    stream = loader(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     try:
-        np.testing.assert_array_equal(next(device)["image"], next(host)["image"])
+        batch = next(stream)
     finally:
-        host.close()
-        device.close()
+        stream.close()
+    for label, image in zip(np.asarray(batch["label"]), np.asarray(batch["image"]), strict=True):
+        expected = cv2.resize(rows[int(label)], (12, 12), interpolation=cv2.INTER_AREA)
+        np.testing.assert_array_equal(image, expected)
 
 
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
