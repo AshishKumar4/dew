@@ -87,7 +87,7 @@ def test_images_apply_a_user_random_step_on_the_host_right_after_resize():
 
     baseline = first_batch(source.pipe(presets.images, 16, batch=8))
     augmented = first_batch(source.pipe(presets.images, 16, batch=8, augment=mirror))
-    equivalent = first_batch(source.filter_map(images.decode("image")).map(images.resize(16))
+    equivalent = first_batch(source.filter_map(images.DecodeImage("image")).map(images.Resize(16))
                              .random_map(mirror).batch(8))
     np.testing.assert_array_equal(augmented["image"], baseline["image"][:, :, ::-1])
     np.testing.assert_array_equal(augmented["label"], baseline["label"])

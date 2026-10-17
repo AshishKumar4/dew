@@ -157,6 +157,28 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
         confidence_threshold=_number(generation, "confidence_threshold", 0.005))
 
 
+def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
+                         pad_token_id: int | None = None) -> dict[str, records.JSON]:
+    """The generation_config.json transformers' DiffusionGemmaGenerationConfig
+    reads, and `generation_process` reads back as `process`: its inverse. The
+    canvas and vocabulary are the model's in both, as a block run's process
+    takes them from its model (`BlockDiffusionObjective`)."""
+    # Floats where BlockProcess also takes an int, as transformers' reader
+    # requires (generation_diffusion_gemma.py:181-183, 333).
+    sampler: dict[str, records.JSON] = {"_cls_name": "EntropyBoundSamplerConfig",
+                                        "entropy_bound": float(process.entropy_bound)}
+    values: dict[str, records.JSON] = {
+        "max_denoising_steps": process.max_steps, "t_min": float(process.t_min),
+        "t_max": float(process.t_max), "stability_threshold": process.stability_threshold,
+        "confidence_threshold": float(process.confidence_threshold), "sampler_config": sampler,
+    }
+    if max_new_tokens:
+        values["max_new_tokens"] = max_new_tokens
+    if pad_token_id is not None:
+        values["pad_token_id"] = pad_token_id
+    return values
+
+
 def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTransformer:
     """Return `text` with its layer-scalar policy set to the one `variables` keeps.
 

@@ -28,7 +28,7 @@ from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.nn.inputs import ModelInputs, request_axes
+from dew.nn.inputs import ModelInputs, coordinates, request_axes
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -95,10 +95,12 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     assert not np.allclose(losses[:, 2:], plain[:, 2:])
 
 
-def test_padding_that_holds_the_mask_token_scores_nothing():
+@pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
+def test_padding_that_holds_the_mask_token_scores_nothing(given):
     """A padded row whose padding slots hold the mask token, as a tokenizer padding with it writes
     them: the loss, its gradient and the evaluation's per-token scores are finite and the same as
-    with any other token there, since padding is neither masked nor scored."""
+    with any other token there, since padding is neither masked nor scored. The padding is
+    marked by the attention mask, or by the coordinates' validity the decoder reads."""
     model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
                          num_heads=2, mlp_features=16, max_seq_len=4, causal=False, qk_norm=False,
                          attention_impl='reference', dtype=jnp.float32)
@@ -110,7 +112,8 @@ def test_padding_that_holds_the_mask_token_scores_nothing():
 
     def scored(padding):
         tokens = jnp.asarray([[2, 5, padding, padding]], jnp.int32)
-        batch = {"text": ModelInputs(tokens, {"attention_mask": mask})}
+        batch = ({"text": ModelInputs(tokens, {"attention_mask": mask})} if given == "attention_mask"
+                 else {"text": tokens, "text_coordinates": coordinates(valid=mask)})
         loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
         return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
 

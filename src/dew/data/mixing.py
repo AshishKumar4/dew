@@ -6,11 +6,10 @@ import dataclasses
 import logging
 import math
 import threading
-import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
-from typing import overload
+from typing import TypeGuard, overload
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -73,11 +72,10 @@ class CorpusCounts:
 @dataclasses.dataclass(frozen=True)
 class SearchBudget:
     consecutive: int = 10_000
-    seconds: float | None = 60.0
     warn_over: float = 0.01
 
     def __post_init__(self) -> None:
-        if self.consecutive < 1 or (self.seconds is not None and self.seconds <= 0):
+        if self.consecutive < 1:
             raise ValueError("rejection search budgets must be positive")
         if not 0 <= self.warn_over <= 1:
             raise ValueError("warn_over is a share between zero and one")
@@ -90,10 +88,9 @@ class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, budget: SearchBudget, tokens: Callable[[Batch], int] | None):
         self.counts, self.budget, self.tokens = counts, budget, tokens
         self.consecutive = 0
-        self.started: float | None = None
         self.warned = False
 
-    def __call__(self, element: Batch | Rejected) -> bool:
+    def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         reason = element.reason if isinstance(element, Rejected) else None
         if reason is None and self.tokens is not None and not isinstance(element, Rejected):
@@ -107,14 +104,11 @@ class _KeepAccepted:
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
             self._probe()
-            self.consecutive, self.started = 0, None
+            self.consecutive = 0
             return True
         self.counts.rejected[reason] += 1
         self.consecutive += 1
         self._probe()
-        now = time.monotonic()
-        if self.started is None:
-            self.started = now
         if (
             not self.warned
             and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over
@@ -126,9 +120,7 @@ class _KeepAccepted:
                 reason,
             )
             self.warned = True
-        if self.consecutive >= self.budget.consecutive or (
-            self.budget.seconds is not None and now - self.started >= self.budget.seconds
-        ):
+        if self.consecutive >= self.budget.consecutive:
             raise ValueError(
                 f"corpus {self.counts.name}: rejection search budget exhausted after "
                 f"{self.consecutive} consecutive rejections ({reason}); "
@@ -181,21 +173,11 @@ class Chunked(pygrain.IterDataset[Record]):
 
 
 class _AcceptedIterator(_CountedIterator[Batch]):
-    _read: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch]
+    _read: pygrain.DatasetIterator[Batch]
 
-    def __init__(
-        self,
-        parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
-        predicate: _KeepAccepted,
-    ):
+    def __init__(self, parent: pygrain.DatasetIterator[Batch], predicate: _KeepAccepted):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
-
-    def __next__(self) -> Batch:
-        value = next(self._read)
-        if isinstance(value, Rejected):
-            raise RuntimeError("Grain filter delivered a rejected record")
-        return value
 
     def get_state(self) -> Mapping[str, object]:
         return {
@@ -207,7 +189,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
     def set_state(self, state: Mapping[str, object]) -> None:
         super().set_state(state)
         self._predicate.consecutive = integer(state["consecutive"], "consecutive")
-        self._predicate.started = None
         self._predicate.warned = bool(state["warned"])
 
 

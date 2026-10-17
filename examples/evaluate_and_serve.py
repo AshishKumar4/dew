@@ -5,16 +5,16 @@ continuations, and, for a diffusion run, CLIPScore of a sampled grid against
 its prompts and FID against a reference set. Everything is read through `dew.pipeline`, so
 a run directory, a published checkpoint and a Hub repository all work.
 
-    python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
-        --tokens data/shakespeare --tasks hellaswag arc_easy --harness-limit 200
-    python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
+    python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \\
+        --tokens data/shakespeare-val --tasks hellaswag arc_easy --harness-limit 200
+    python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \\
         --image-run runs/flowers-tpu/checkpoints/flowers-256 \\
         --reference-images data/flowers-heldout
 
 The same suites run from the command line, which is the harness's own entry
 point with Dew's model registered:
 
-    python -m dew.eval --model dew --model_args run=runs/shakespeare/lm-shakespeare \\
+    python -m dew.eval --model dew --model_args run=runs/shakespeare/checkpoints \\
         --tasks hellaswag --limit 200
 
 `--openai-base-url` adds a served comparison: the same prompts through the
@@ -63,7 +63,8 @@ class Config:
     run: Path | None = None
     """The run directory, published checkpoint or Hub repo to score."""
     tokens: Path | None = None
-    """Token directory from `dew tokenize`; its val split is the perplexity set."""
+    """The held-out token store whose tokens are the perplexity set, as
+    `dew data export --tokenizer` writes one (examples/train_lm.py)."""
     out: Path = Path("reports/evaluation")
     sequence_length: int = 256
     batch_size: int = 8
@@ -95,26 +96,26 @@ class Config:
 
 
 def smoke_run(out: Path) -> tuple[Path, Path]:
-    """A two-step byte-level LM run and the token files it read.
+    """A two-step byte-level LM run and the held-out tokens it validated on.
 
     The same shape tests/test_inference.py's `make_lm_run` builds: a tiny
     causal decoder and its checkpoint, whose record names the model, the
     byte tokenizer the objective decodes through and the preview budget.
     """
-    tokens = out / "tokens"
-    tokens.mkdir(parents=True, exist_ok=True)
     text = ("to be or not to be, that is the question. " * 200).encode()
-    (tokens / "train.bin").write_bytes(text[:6000])
-    (tokens / "val.bin").write_bytes(text[6000:])
-    (tokens / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
+    tokens, held = out / "tokens", out / "held-out"
+    for store, part in ((tokens, text[:6000]), (held, text[6000:])):
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "train.bin").write_bytes(part)
+        (store / "meta.json").write_text(json.dumps(
+            {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
 
     model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
                               vocab_size=256, max_seq_len=48, dtype=jnp.float32,
                               attention_impl="reference")
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
-        data=TextData(source=str(tokens), validation=TokenFiles(str(tokens), split="val"), seq_len=32),
+        data=TextData(source=str(tokens), validation=TokenFiles(str(held)), seq_len=32),
         loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
         max_new_tokens=8,
         optim=OptimConfig(learning_rate=1e-3),
@@ -125,11 +126,11 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                             processor=RunProcessor(ByteTokenizer()))
     run.train(objective, loader(run.data, batch=run.trainer.batch_size, read=run.data_read,
         loading=run.loading), name="smoke")
-    return Path(run.trainer.checkpoint_dir) / "smoke", tokens
+    return Path(run.trainer.checkpoint_dir) / "smoke", held
 
 
 def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
-    """The run's loss over a held-out split, through the evaluation contract.
+    """The run's loss over the held-out tokens, through the evaluation contract.
 
     `Evaluation.run` is what the trainer calls at a validation step, minus the
     optimizer and the tracker: the same objective, the same metric, one
@@ -137,12 +138,12 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """
     if config.tokens is None:
         return {}
-    data = loader(TextData(source=str(config.tokens), validation=TokenFiles(str(config.tokens), split="val"),
-                     seq_len=config.sequence_length),
-                batch=config.batch_size, read="memory", validation_records=4 * config.batch_size,
-                loading=Loading(workers=0))
-    if data.val is None:
-        raise ValueError(f"{config.tokens} holds no val split to score")
+    # The held-out store is the validation the loader compiles; its training side is never read.
+    held = TokenFiles(str(config.tokens))
+    data = loader(TextData(source=held, validation=held, seq_len=config.sequence_length),
+                  batch=config.batch_size, read="memory", validation_records=4 * config.batch_size,
+                  loading=Loading(workers=0))
+    assert data.val is not None
     scored = Evaluation.run(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),
                       metrics=[Perplexity()])

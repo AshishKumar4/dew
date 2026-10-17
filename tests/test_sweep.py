@@ -61,3 +61,22 @@ def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_pa
     assert ([row['scalars']['sweep/value'] for row in journal(tmp_path / 'sweep', 'scalars.jsonl')]
             == [trial.value for trial in trials])
     assert json.loads((tmp_path / 'ledger.json').read_text())['trials'][2]['index'] == 2
+
+
+
+def test_optunas_first_trials_draw_apart_and_a_resumed_sweep_draws_the_same():
+    """TPE draws its first ten trials at random, and the finished trials a study is given are added
+    without drawing: each trial's point comes from the sweep's seed and its number, so the first
+    trials of a large space are not one repeated point, and the same ledger asks the same point."""
+    from dew.config.sweep import OptunaSearch
+    from dew.telemetry.records import TrialFinished
+
+    space = {"optim.learning_rate": [10.0 ** -exponent for exponent in range(1, 41)]}
+    search = OptunaSearch(seed=3)
+    finished: list[TrialFinished] = []
+    for index in range(5):
+        point = search(space, finished)
+        assert search(space, finished) == point
+        finished.append(TrialFinished(index=index, name=f"trial-{index}", overrides=point,
+                                      value=float(index)))
+    assert len({trial.overrides["optim.learning_rate"] for trial in finished}) > 1

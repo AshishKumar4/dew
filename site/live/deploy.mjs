@@ -1,5 +1,7 @@
 // Deploy the live Worker with trusted managed-snapshot preparation pinned to main.
-// Everything after `--` goes to Wrangler, including --env and --secrets-file.
+// Everything after `--` goes to Wrangler, including --env and --secrets-file. With the
+// secrets file, whose OPERATOR_SECRET the operator's warm takes, the pool is warmed at
+// once; without it, the first visitor's session request warms it (src/warm.ts).
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
