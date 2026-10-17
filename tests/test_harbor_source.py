@@ -2,9 +2,14 @@
 
 The gateway's traces are the JSON rllm-model-gateway serves for a vLLM or
 SGLang worker; Harbor is a stand-in executable that takes the same `trials
-start` arguments and writes a `TrialResult`-shaped `result.json`.
+start` arguments and writes a `TrialResult`-shaped `result.json`. A trial
+that hangs past `trial_timeout` is interrupted and retried by a real
+`RolloutScheduler` under a `Trainer`, and a child Harbor leaves in its
+process group, which ignores SIGINT and SIGTERM and holds its output open,
+is killed with the group, at the deadline and at exit.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -17,6 +22,7 @@ from pathlib import Path
 
 import httpx
 import jax
+import numpy as np
 import pytest
 
 from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
@@ -167,11 +173,40 @@ trial = os.path.join(value("--trials-dir"), value("--trial-name"))
 os.makedirs(trial)
 with open(os.path.join(trial, "seen.json"), "w") as seen:
     json.dump({"arguments": arguments, "agent": agent, "pid": os.getpid()}, seen)
-if "stubborn" in value("-p"):
+if "stubborn" in value("-p") or "quiet" in value("-p"):
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+if "quiet" in value("-p"):
+    # Harbor closes its output and runs on, ignoring the interrupt: only the deadline's
+    # escalation ends it.
+    os.close(1)
+    os.close(2)
+    time.sleep(60)
 if "slow" in value("-p") or "stubborn" in value("-p"):
     time.sleep(60)
+if "lingering" in value("-p"):
+    # A child inherits Harbor's output, ignores SIGINT and SIGTERM, then writes its pid. It stays
+    # in Harbor's process group, or with `detached` leaves it.
+    import subprocess
+    subprocess.Popen([sys.executable, "-c", "import json, os, signal, sys, time\\n"
+                      "signal.signal(signal.SIGINT, signal.SIG_IGN)\\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+                      "json.dump(os.getpid(), open(sys.argv[1], 'w'))\\n"
+                      "time.sleep(60)", os.path.join(trial, "child.json")],
+                     start_new_session="detached" in value("-p"))
+    if "waits" in value("-p"):
+        time.sleep(60)
+    sys.exit(1)
+if "once" in value("-p"):
+    # The first trial of the task directory hangs, with its pid in the marker; the others finish.
+    try:
+        marker = os.open(os.path.join(value("-p"), "hung"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        pass
+    else:
+        os.write(marker, str(os.getpid()).encode())
+        os.close(marker)
+        time.sleep(60)
 with open(os.path.join(trial, "result.json"), "w") as out:
     json.dump({"exception_info": None, "verifier_result": {"rewards": {"reward": 1}}}, out)
 '''
@@ -185,8 +220,8 @@ def harbor(tmp_path):
     return executable
 
 
-def fake_gateway(unhealthy_checks=0, unreachable_models=0):
-    """A gateway whose every session recorded one call sampling [10 + sample].
+def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7):
+    """A gateway whose every session recorded one call sampling [10 + sample], stamped `version`.
 
     Its one worker is dead for the first `unhealthy_checks` health reads, like rllm-model-gateway
     started beside an engine still loading: its health loop marks the worker dead, and until the
@@ -214,7 +249,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0):
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
         sample = int(session.split(":")[2])
-        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=7)])
+        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=version)])
 
     return Gateway("http://gateway", sandbox_url="http://172.17.0.1:9090",
                    client=httpx.Client(transport=httpx.MockTransport(network))), asked
@@ -309,6 +344,182 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
         source.close()
 
 
+def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tmp_path, harbor):
+    """Harbor bounds a trial's phases, not the whole trial. One trial hangs: `trial_timeout`
+    interrupts it, its Harbor exits, it resolves INFRA_ERROR, and the scheduler's retry
+    completes its group, so the step admits every task's group."""
+    import optax
+
+    from dew.data.dataset import Loader
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.objectives.rl.scheduler import task_ids
+    from dew.training import Layout, Trainer
+
+    class Publisher:
+        version = 0
+
+        def load(self, variables, version):
+            self.version = version
+
+    hanging = tmp_path / "once"
+    hanging.mkdir()
+    gateway, _ = fake_gateway(version=None)
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0, trial_timeout=10.0)
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=16, dtype="float32")
+    objective = GRPOObjective(model, seq_len=7)
+    tasks, records = jax.device_count(), []
+    scheduler = RolloutScheduler(
+        objective, source, Publisher(), width=8, rows=2 * tasks, groups=2, max_lag=0, ahead=0,
+        tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
+        log=records.append)
+    data = scheduler.tasks(Loader(train=lambda partition: iter(
+        lambda: {"task_id": np.arange(tasks, dtype=np.int32)}, None), val=None, records=None, batch=tasks))
+    try:
+        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        state = trainer.fit(data, steps=1, log_every=1)
+    finally:
+        scheduler.close()
+        source.close()
+    assert int(state.step) == 1
+    [record] = records
+    assert record.groups == tasks and record.abandoned == 0 and record.resubmitted == {"infra_error": 1}
+    # The hung trial's Harbor exited on the interrupt, long before its sleep ended, so of the
+    # 2 * tasks + 1 trials only the hung one wrote no result.
+    pid = int((hanging / "hung").read_text())
+    assert not Path(f"/proc/{pid}").exists()
+    assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 2 * tasks + 1
+    assert len(list((tmp_path / "trials").glob("*/result.json"))) == 2 * tasks
+
+
+def ended(pid):
+    """Whether process `pid` is gone or a zombie waiting to be reaped."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except FileNotFoundError:
+        return True
+
+
+@pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])
+def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, harbor, task):
+    """Harbor exits before the deadline (`exits`) or on its interrupt (`waits`), and a child that
+    ignores SIGINT and SIGTERM holds its output open. In Harbor's process group, the escalation
+    runs until the output closes and the SIGKILL ends the child. A child that left the group
+    (`detached`) is beyond the group's signals, so reading stops a grace after the SIGKILL.
+    Either way the trial resolves INFRA_ERROR within a few graces of its deadline, long before
+    the child's minute-long sleep ends."""
+    (tmp_path / task).mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0, trial_timeout=2.0)
+    began = time.monotonic()
+    try:
+        (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    resolved = time.monotonic() - began
+    (child,) = (tmp_path / "trials").glob("*/child.json")
+    pid = json.loads(child.read_text())
+    if "detached" in task:
+        os.kill(pid, 9)
+    else:
+        assert ended(pid)
+    assert rollout.status is Status.INFRA_ERROR and resolved < 20
+
+
+def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(tmp_path, harbor):
+    """Harbor closes its output, ignores the interrupt and runs on: the deadline still holds past
+    the output's close, its escalation's SIGTERM ends Harbor, and the trial resolves INFRA_ERROR
+    within a few graces, long before Harbor's minute-long sleep ends."""
+    task = "quiet"
+    (tmp_path / task).mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0, trial_timeout=2.0)
+    began = time.monotonic()
+    try:
+        (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    (seen,) = (tmp_path / "trials").glob("*/seen.json")
+    assert ended(json.loads(seen.read_text())["pid"])
+    assert rollout.status is Status.INFRA_ERROR and time.monotonic() - began < 20
+
+
+def test_a_trial_without_a_descriptor_for_its_wake_pipe_fails_and_frees_its_worker(tmp_path, harbor):
+    """A trial that cannot make its wake pipe, every descriptor taken, fails its future with that
+    OSError, and the source's one worker goes on to run the next trial once descriptors are free.
+    In a process of its own, whose descriptor limit it lowers (`descriptorless_flow`)."""
+    (tmp_path / "task").mkdir()
+    here = Path(__file__).resolve().parent
+    script = (f"import test_harbor_source as tests; "
+              f"tests.descriptorless_flow({str(harbor)!r}, {str(tmp_path)!r})")
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+                         cwd=here, env={**os.environ,
+                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+    assert run.returncode == 0, run.stderr[-4000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "OSError", "COMPLETED"]
+
+
+def descriptorless_flow(harbor: str, root: str) -> None:
+    """Run a trial, take every descriptor and submit one, free them and submit another, on one
+    worker; print the first's and last's statuses and the middle one's error class."""
+    import resource
+
+    task = Task("hello", {HARBOR_KEY: str(Path(root) / "task")})
+    source = HarborSource(fake_gateway()[0], harbor=harbor, model="hosted_vllm/policy",
+                          trials=Path(root) / "trials", workers=1)
+    try:
+        (first,) = source.submit(task, 1, version=0, key=KEY)
+        before = first.result(timeout=120)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+        taken = []
+        with contextlib.suppress(OSError):
+            while True:
+                taken.append(os.open(os.devnull, os.O_RDONLY))
+        (starved,) = source.submit(task, 1, version=0, key=KEY)
+        error = starved.exception(timeout=120)
+        for descriptor in taken:
+            os.close(descriptor)
+        (after,) = source.submit(task, 1, version=0, key=KEY)
+        rollout = after.result(timeout=120)
+    finally:
+        source.close()
+    print(json.dumps([before.status.name, type(error).__name__, rollout.status.name]))
+
+
+def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
+    """With no deadline, the cancel's escalation still bounds the trial: a grace after the SIGKILL,
+    the output a child outside the group keeps open is left unread, and the trial resolves
+    CANCELLED long before the child's minute-long sleep ends."""
+    task = "lingering-detached-waits"
+    (tmp_path / task).mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0)
+    try:
+        (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "trials").glob("*/child.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        began = time.monotonic()
+        source.cancel([future])
+        rollout = future.result(timeout=30)
+        resolved = time.monotonic() - began
+    finally:
+        source.close()
+        # A trial that never resolved has waited the child out in `close`.
+        for child in (tmp_path / "trials").glob("*/child.json"):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(json.loads(child.read_text()), 9)
+    assert rollout.status is Status.CANCELLED and resolved < 20
+
+
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
     gateway, _ = fake_gateway()
@@ -399,18 +610,22 @@ root = Path({root!r})
 source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p",
                       trials=root / "trials", workers=1,
                       grace=2.0)
-source.submit(Task("slow", {{HARBOR_KEY: str(root / "slow")}}), 2, version=0, key=KEY)
-while not list((root / "trials").glob("*/seen.json")):
+source.submit(Task({task!r}, {{HARBOR_KEY: str(root / {task!r})}}), 2, version=0, key=KEY)
+while not list((root / "trials").glob({ready!r})):
     time.sleep(0.05)
 raise KeyboardInterrupt  # the trainer is interrupted mid-trial and never calls close()
 """
 
 
-def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_path, harbor):
-    (tmp_path / "slow").mkdir()
+@pytest.mark.parametrize("task", ["slow", "lingering-waits"])
+def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_path, harbor, task):
+    """With `lingering-waits`, Harbor exits on the interrupt but a child in its group ignores
+    SIGINT and SIGTERM; the exit hook kills the group, so the child dies with the trainer too."""
+    (tmp_path / task).mkdir()
     script = tmp_path / "trainer.py"
     script.write_text(TRAINER.format(src=str(Path(__file__).resolve().parents[1] / "src"),
-                                     tests=str(Path(__file__).parent), root=str(tmp_path)))
+                                     tests=str(Path(__file__).parent), root=str(tmp_path), task=task,
+                                     ready="*/child.json" if task.startswith("lingering") else "*/seen.json"))
     began = time.monotonic()
     trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
                              env={**os.environ, "JAX_PLATFORMS": "cpu"})
@@ -428,3 +643,13 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     if alive:
         os.kill(pid, 9)
     assert not alive, "the interrupted trainer's running trial outlived it"
+    if task.startswith("lingering"):
+        (child,) = (tmp_path / "trials").glob("*/child.json")
+        pid = json.loads(child.read_text())
+        deadline = time.monotonic() + 10
+        while not ended(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        lingering = not ended(pid)
+        if lingering:
+            os.kill(pid, 9)
+        assert not lingering, "a child of the interrupted trainer's trial outlived it"

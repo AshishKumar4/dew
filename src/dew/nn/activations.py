@@ -69,13 +69,14 @@ def relu2(x: jax.Array) -> jax.Array:
 
 
 Activation = Callable[[jax.Array], jax.Array]
-_HIDDEN_ACT: dict[str, Activation] = {'gelu': gelu_exact, 'gelu_pytorch_tanh': gelu_tanh,
-                                      'quick_gelu': quick_gelu, 'silu': silu, 'relu': jax.nn.relu}
+HIDDEN_ACT: dict[str, Activation] = {'gelu': gelu_exact, 'gelu_pytorch_tanh': gelu_tanh,
+                                     'quick_gelu': quick_gelu, 'silu': silu, 'relu': jax.nn.relu}
+"""The activations Hugging Face's `hidden_act` names, as Dew computes them."""
 
 
 def activation(name: str) -> Activation:
-    """The activation Hugging Face's `hidden_act` `name` computes; callers check `name` first."""
-    return _HIDDEN_ACT[name]
+    """The activation Hugging Face's `hidden_act` `name` computes (`HIDDEN_ACT`)."""
+    return HIDDEN_ACT[name]
 
 
 UNGATED: dict[str, Activation] = {
