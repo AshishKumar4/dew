@@ -30,6 +30,10 @@ and torchsde==0.2.6:
     PYTHONPATH=src python tools/diffusers_source_reference.py
     PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
         tests/fixtures/diffusers/source_rounding.npz 32
+
+`cases NAME...` records those cases alone into the stored record and keeps
+every other array as it is, so a case added later leaves the cases another
+machine's float32 rounding recorded untouched.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -238,6 +242,9 @@ CASES: Mapping[str, Case] = {
     "lms.exponential_v": Case("LMSDiscreteScheduler", dict(
         VP, use_exponential_sigmas=True, prediction_type="v_prediction")),
     "euler.default": Case("EulerDiscreteScheduler", VP),
+    # A linspace grid ends at the table's first sigma, which sigma_min appends
+    # again: the last interval has no length.
+    "euler.linspace_min": Case("EulerDiscreteScheduler", dict(VP, final_sigmas_type="sigma_min")),
     "euler.beta_trailing_min": Case("EulerDiscreteScheduler", dict(
         VP, use_beta_sigmas=True, timestep_spacing="trailing", final_sigmas_type="sigma_min")),
     "euler.zero_snr_v": Case("EulerDiscreteScheduler", dict(
@@ -608,7 +615,7 @@ def refused_record() -> dict[str, np.ndarray]:
     return arrays
 
 
-def main() -> None:
+def main(only: Sequence[str] = ()) -> None:
     import diffusers
 
     from reference_releases import require
@@ -616,12 +623,26 @@ def main() -> None:
     require("diffusers")
     torch.set_num_threads(2)
     FIXTURES.mkdir(parents=True, exist_ok=True)
+    unknown = sorted(set(only) - set(CASES))
+    if unknown:
+        raise SystemExit(f"no cases named {unknown}")
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
                                  "guidance_scale": GUIDANCE_SCALE,
                                  "label": LABEL, "cases": cases}
+    if only:
+        record = json.loads((FIXTURES / "source_schedulers.json").read_text())
+        if record["diffusers"] != diffusers.__version__:
+            raise SystemExit(f"the stored record is diffusers {record['diffusers']}, "
+                             f"this is {diffusers.__version__}")
+        cases = record["cases"]
+        with np.load(FIXTURES / "source_schedulers.npz") as stored:
+            arrays = {key: stored[key] for key in stored.files
+                      if not any(key.startswith(f"{name}.") for name in only)}
     for name, case in CASES.items():
+        if only and name not in only:
+            continue
         result = run(name, case)
         for key, value in result.items():
             arrays[f"{name}.{key}"] = value
@@ -629,11 +650,12 @@ def main() -> None:
                        "guidance": case.guidance,
                        "latent_scale": float(np.abs(result["latents"]).max())}
         print(f"{name}: {case.steps} intervals, |latent| <= {cases[name]['latent_scale']:.4g}")
-    arrays.update(refused_record())
-    record["refused"] = sorted(REFUSED)
-    for key, value in brownian_record().items():
-        arrays[f"brownian.{key}"] = value
-    print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
+    if not only:
+        arrays.update(refused_record())
+        record["refused"] = sorted(REFUSED)
+        for key, value in brownian_record().items():
+            arrays[f"brownian.{key}"] = value
+        print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
     np.savez_compressed(FIXTURES / "source_schedulers.npz", **arrays)
     (FIXTURES / "source_schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = (FIXTURES / "source_schedulers.npz").stat().st_size
@@ -643,5 +665,7 @@ def main() -> None:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["rounding"]:
         rounding(Path(sys.argv[2]), int(sys.argv[3]))
+    elif sys.argv[1:2] == ["cases"]:
+        main(sys.argv[2:])
     else:
         main()
