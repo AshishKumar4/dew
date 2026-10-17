@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import ClassVar, Protocol, TypeGuard
 
 import jax.numpy as jnp
 import numpy as np
@@ -58,6 +58,12 @@ class TokenizerSpecials(Protocol):
 _SPECIAL_IDS = ("cls_token_id", "sep_token_id", "eos_token_id", "bos_token_id", "mask_token_id",
                 "pad_token_id")
 """The special-token ids `TokenizerSpecials` declares."""
+
+
+def _holds_specials(tokenizer: object) -> TypeGuard[TokenizerSpecials]:
+    """Whether `tokenizer` answers what `TokenizerSpecials` declares. Each member is read, not
+    looked up statically, since a transformers tokenizer answers its ids through `__getattr__`."""
+    return all(hasattr(tokenizer, name) for name in (*_SPECIAL_IDS, "convert_ids_to_tokens"))
 
 
 class _Same:
@@ -115,8 +121,7 @@ class Specials:
         end token) as the marker, and its padding token or else its end token.
         """
         hf = tokenizer.tokenizer if isinstance(tokenizer, HFTokenizer) else tokenizer
-        # Read, not looked up statically: a transformers tokenizer answers these through `__getattr__`.
-        if not all(hasattr(hf, name) for name in (*_SPECIAL_IDS, "convert_ids_to_tokens")):
+        if not _holds_specials(hf):
             raise ValueError(f"Specials.of reads a tokenizer's special tokens, which this "
                              f"{type(hf).__name__} does not hold; give its Specials explicitly")
 
