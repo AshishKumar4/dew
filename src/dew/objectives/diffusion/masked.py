@@ -34,6 +34,7 @@ from dew.artifacts import TokenScores
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
+from dew.nn.inputs import real_slots
 from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -50,7 +51,7 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
-from dew.objectives.lm.objective import TEXT_KEY, batch_text, documents_of, text_preview
+from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
 from dew.records import JSON
 from dew.sampling.sample import sample
 from dew.sampling.solvers import Solver
@@ -201,7 +202,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         positions. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked
         nor scored: a packed window scores as its documents would one by one.
-        Padding under `attention_mask` is not scored either, and a media
+        Padding that the validity marks (`attention_mask`, or the coordinates'
+        `valid`) is not masked or scored either (`real_slots`), and a media
         placeholder (`image_indices` or `audio_indices` at or above zero) is
         the media's slot, which the model reads and nothing masks or predicts.
         """
@@ -212,12 +214,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             raise ValueError(
                 f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
         fields = prepared.token_fields
-        real = jnp.ones(tokens.shape, bool)
-        documents = documents_of(fields)
-        if documents is not None:
-            real &= documents != 0
-        if "attention_mask" in fields:
-            real &= fields["attention_mask"].astype(bool)
+        real = real_slots(fields, tokens.shape)
         for media in ("image_indices", "audio_indices"):
             if media in fields:
                 real &= fields[media] < 0
