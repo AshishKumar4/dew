@@ -295,7 +295,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
 
         real = self._features(teacher, renoised(samples), level, conditions)
         fake = self._features(teacher, renoised(clean), level, conditions)
-        held = self._features(teacher, renoised(jax.lax.stop_gradient(clean)), level, conditions)
+        # The discriminator's pass reads the same features without the student's gradient.
+        held = jax.tree.map(jax.lax.stop_gradient, fake)
         condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions))
         heads = variables["params"][DISCRIMINATOR]
 
