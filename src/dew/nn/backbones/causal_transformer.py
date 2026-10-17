@@ -623,18 +623,27 @@ class CausalTransformer(nn.Module):
 
     def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
-        cannot apply them."""
-        mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
-               or self.logits_scaling != 1.0 or self.initializer_range is not None)
-        if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
-                    or (self.mixture is not None and self.mixture.parallel)
-                    or self.mlp == 'swigluoai' or self.laurel_rank is not None
-                    or self.altup is not None or self.per_layer_input_dim):
+        cannot apply them.
+
+        `embedding_multiplier` and `logits_scaling` act at the root, on the embeddings before the
+        first layer (`scaled_embeddings`) and on the final states, so any stack of blocks takes
+        them; prediction depths and the DSpark drafter embed their own tokens unscaled and score
+        their own states. `residual_multiplier` and `initializer_range` act inside lm-engine's
+        dense and routed blocks."""
+        root = self.embedding_multiplier != 1.0 or self.logits_scaling != 1.0
+        block = self.residual_multiplier != 1.0 or self.initializer_range is not None
+        if (root or block) and (self.num_nextn_predict_layers or self.dspark is not None):
             raise ValueError(
-                "embedding_multiplier, residual_multiplier, logits_scaling and "
-                "initializer_range are lm-engine's dense and routed blocks; prediction "
-                "depths, hyper-connection streams, Gemma 4's parallel experts, gpt-oss "
-                "experts, LAuReL, AltUp and per-layer inputs do not carry them")
+                "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
+                "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
+        if block and (self.hyper_connections is not None
+                      or (self.mixture is not None and self.mixture.parallel)
+                      or self.mlp == 'swigluoai' or self.laurel_rank is not None
+                      or self.altup is not None or self.per_layer_input_dim):
+            raise ValueError(
+                "residual_multiplier and initializer_range are lm-engine's dense and routed "
+                "blocks; hyper-connection streams, Gemma 4's parallel experts, gpt-oss experts, "
+                "LAuReL, AltUp and per-layer inputs do not carry them")
         if self.logits_scaling <= 0 or (self.initializer_range is not None
                                         and self.initializer_range <= 0):
             raise ValueError("logits_scaling and initializer_range are positive")
