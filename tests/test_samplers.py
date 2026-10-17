@@ -835,6 +835,72 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
         np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("kind, extra", [
+    ("EulerDiscrete", {"sigma_min": 30000, "sigma_max": 80000}),
+    ("KDPM2Discrete", {}),
+    ("DPMSolverMultistep", {"solver_order": 1}),
+])
+def test_source_grids_walk_repeated_initial_model_times(kind, extra):
+    """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does."""
+    import contextlib
+    import copy
+
+    import torch
+    from diffusers.schedulers import (
+        scheduling_dpmsolver_multistep,
+        scheduling_euler_discrete,
+        scheduling_k_dpm_2_discrete,
+    )
+    from tool_support import load
+
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    modules = {"EulerDiscrete": scheduling_euler_discrete,
+               "KDPM2Discrete": scheduling_k_dpm_2_discrete,
+               "DPMSolverMultistep": scheduling_dpmsolver_multistep}
+    module = modules[kind]
+    config = {"_class_name": kind + "Scheduler", "beta_schedule": "squaredcos_cap_v2",
+              "use_karras_sigmas": True, **extra}
+    schedule = SourceSchedule.from_config(config)
+    process, times = schedule.sampling(6)
+    model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
+    assert np.count_nonzero(model_times == model_times[0]) > 1
+    sigmas = process.sampler_schedule.sigmas(times)
+    assert np.all(np.diff(sigmas) < 0)
+    initial = np.random.default_rng(7).normal(size=(2, 3, 64)).astype(np.float32)
+    model = SourceOracle()
+    denoise = process.denoiser(model, {}, {})
+    _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
+                       times=times, final_denoise=False, record=lambda x, _: x)
+
+    prepared = getattr(module, kind + "Scheduler").from_config(config)
+    prepared.set_timesteps(6)
+    precision = load("diffusers_wan_reference")
+    reference = []
+    for dtype in (torch.float32, torch.float64):
+        source = copy.deepcopy(prepared)
+        # A pipeline can choose its first sigma by index, without a model-time lookup.
+        source.set_begin_index(0)
+        if dtype == torch.float64:
+            for name, value in vars(source).items():
+                if isinstance(value, torch.Tensor) and value.is_floating_point():
+                    setattr(source, name, value.double())
+        context = precision.float64_scheduler(module) if dtype == torch.float64 else contextlib.nullcontext()
+        with context:
+            x = torch.tensor(initial, dtype=dtype)
+            latents = []
+            for index, time in enumerate(source.timesteps):
+                scaled = source.scale_model_input(x, time)
+                prediction = torch.sin(scaled) * 0.07 + time * 0.001
+                x = source.step(prediction, time, x).prev_sample
+                if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
+                    latents.append(x.numpy().copy())
+        reference.append(np.stack(latents))
+    for index, actual in enumerate(walked):
+        assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
+                                         f"{kind} repeated model time, step {index}")
+
+
 def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
     walks with different keys integrate one path; without it the walk's own
