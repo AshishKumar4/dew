@@ -36,6 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.traverse_util import unflatten_dict
+from jax.typing import ArrayLike
 
 from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
@@ -299,8 +300,8 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
 def prompt_batch(prompt: Sequence[int] | Sequence[Sequence[int]]) -> ModelInputs:
     """One prompt's ids, or several prompts of any lengths, as one left-padded
     request (`pad_token_rows`): its rows, and an attention mask where they differ."""
-    rows = [prompt] if np.ndim(prompt[0]) == 0 else list(prompt)
-    tokens, fields = pad_token_rows([np.asarray(row) for row in rows])
+    rows = [np.asarray(prompt)] if np.ndim(prompt[0]) == 0 else [np.asarray(row) for row in prompt]
+    tokens, fields = pad_token_rows(rows)
     return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
 
@@ -351,7 +352,7 @@ def batch_text(batch) -> ModelInputs:
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
-                     generate: Callable[[S], tuple[jax.Array, jax.Array | None, jax.Array | None]],
+                     generate: Callable[[S], tuple[ArrayLike, ArrayLike | None, ArrayLike | None]],
                      decode: Callable[[list[int]], str] | None) -> TextSamples | None:
     """A text preview, on every process: agree on `setup`, generate from what
     it returns the rows, which of their slots are real (None for all), and the
@@ -1050,15 +1051,16 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             weights = self.evaluation_variables(params, step)
             return self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens
 
-        def generate(prepared):
+        def generate(prepared: tuple[TextGeneration, ModelInputs, int]
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             policy, prompt, max_new_tokens = prepared
-            tokens = policy(prompt, max_new_tokens, key=step.key).host().tokens
+            tokens = np.asarray(policy(prompt, max_new_tokens, key=step.key).host().tokens)
             given = prompt.token_fields.get("attention_mask")
-            asked = np.ones(prompt.tokens.shape, bool) if given is None else np.asarray(given, bool)
+            ids = np.asarray(prompt.tokens)
+            asked = np.ones(ids.shape, bool) if given is None else np.asarray(given, bool)
             # The prompt's padding is no text; every drawn column is shown, as it was drawn.
-            drawn = np.ones((asked.shape[0], tokens.shape[1] - asked.shape[1]), bool)
-            real = np.concatenate([asked, drawn], axis=1)
-            return tokens, real, np.asarray(prompt.tokens)[0][asked[0]]
+            drawn = np.ones((ids.shape[0], tokens.shape[1] - ids.shape[1]), bool)
+            return tokens, np.concatenate([asked, drawn], axis=1), ids[0][asked[0]]
 
         return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
