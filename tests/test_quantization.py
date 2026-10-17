@@ -11,6 +11,7 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -248,20 +249,19 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
 
 
 def compiled_as_a_run(script: str, *arguments) -> None:
-    """Run `script` with `arguments` in a fresh process under the lane's flags without the two that
-    pin XLA's GEMM and cuDNN configurations (`--xla_gpu_autotune_level=0`,
-    `--xla_gpu_enable_triton_gemm=false`, lane_environment.REPEATABLE_GPU_FLAGS), as a run
-    compiles; XLA reads its flags once a process.
+    """Run `script` with `arguments` in a fresh process under the lane's flags without its
+    repeatable ones (`lane_environment.REPEATABLE_GPU_FLAGS`), as a run compiles; XLA reads its flags
+    once a process.
 
-    Pinned, XLA leaves a cuDNN call the configuration it was emitted with, which cuDNN refuses for an
-    fp8 convolution on an H100 (CUDNN_STATUS_NOT_SUPPORTED); and every int8 product is a cuBLASLt
-    call, one of them with its lhs contracting dimension major where XLA folded a transpose into the
-    dot (`s8[16,8]{1,0}` contracting dim 0, a decoder's o_proj), which cuBLAS 12.9.2
-    (locks/cuda12.txt) runs and 13.8.1 (locks/cuda13.txt) refuses on an A100
+    Under them XLA leaves a cuDNN call the configuration it was emitted with, which cuDNN refuses
+    for an fp8 convolution on an H100 (CUDNN_STATUS_NOT_SUPPORTED); and deterministic ops leave an
+    int8 product no GEMM backend but cuBLASLt, which XLA hands, for a decoder's o_proj, an lhs
+    whose contracting dimension is major (`s8[16,8]{1,0}` over dim 0). cuBLAS 12.9.2
+    (locks/cuda12.txt) runs it and 13.8.1 (locks/cuda13.txt) refuses it on an A100
     (`cublasLtMatmulAlgoGetHeuristic`: the requested functionality is not supported), int8 IMMA
-    taking TN operands. A run compiles that product as a Triton GEMM."""
+    taking TN operands; a run without them computes it as a Triton GEMM."""
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith(("--xla_gpu_autotune_level", "--xla_gpu_enable_triton_gemm"))]
+             if flag not in lane_environment.REPEATABLE_GPU_FLAGS]
     root = Path(__file__).resolve().parents[1]
     run = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], capture_output=True, text=True,
                          env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": str(root / "src")},
