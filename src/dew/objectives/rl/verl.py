@@ -284,6 +284,9 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
         else:
             dew = _dew(row)
             count = integer(dew["chains"], "chains")
+            if not 1 <= count <= len(rows) - cursor:
+                raise ValueError(f"verl row {cursor} says its session spans {count} rows; "
+                                 f"a session spans at least one, and {len(rows) - cursor} remain")
             group = rows[cursor:cursor + count]
             if (
                 len(group) != count

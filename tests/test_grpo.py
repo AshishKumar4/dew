@@ -101,6 +101,35 @@ def rollout_batch(seed=0):
     }
 
 
+def test_a_prompt_dataset_trains_as_the_prompt_config_does():
+    """`Trainer.fit` compiles a Dataset with the objective's own stages.
+    GRPO adds none, so one rollout step over `prompts.encode` rows moves the
+    policy exactly as one over the same prompts through `PromptData`."""
+    import optax
+    from bank_support import identical
+
+    from dew.config.data import PromptData, loader
+    from dew.data import Loading, Memory, prompts
+    from dew.data.text import tokenizer_for
+    from dew.training import Layout, Trainer
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    vocab = tokenizer_for(tokenizer).vocab_size
+    rows = [{"prompt": "hi", "data_source": "rule", "ground_truth": "a"}] * 8
+
+    def trained(data):
+        objective = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)
+        rollout = SampledRollout(objective, lambda source, text, truth, info: float(len(text)), groups=2,
+                                 max_new_tokens=4, sampling=Sampling(temperature=1.0))
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)
+        return trainer.fit(data, steps=1).variables
+
+    identical(trained(Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)),
+              trained(loader(PromptData(source=tuple(rows), tokenizer=tokenizer, max_prompt_len=8), batch=8,
+                             read="memory", loading=Loading(workers=0))))
+
+
 def test_the_loss_reads_the_rolled_out_batch():
     """The objective's loss is the composition over the batch's own terms:
     current log-probabilities scored along each chain, ratio against the
