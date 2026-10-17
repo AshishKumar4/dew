@@ -1063,9 +1063,10 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
     """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
     that binds `f` in its method resolution order, from a method or a closure in one; a name to its
     binding, which a comprehension's own variable does not make outside it but does inside, and a
-    pattern's capture, an exception's name or a class body's assignment does. A generator's element
-    runs only as it is consumed. A sleep beside a call that reaches a subprocess, a list built of
-    them included, is at its boundary."""
+    pattern's capture, an exception's name or a class body's assignment does, and a receiver a
+    comprehension rebinds is another object's. A generator's element runs only as it is consumed,
+    and a list's again and again, as a loop's body does. A sleep beside a call that reaches a
+    subprocess, a list built of them included, is at its boundary."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import subprocess\n"
         "import time\n"
@@ -1126,8 +1127,14 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "    time.sleep(1)\n"
         "def eager():\n"
         "    [subprocess.run(['true']) for _ in range(3)]\n"
-        "    time.sleep(1)\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57)]
+        "    time.sleep(1)\n"
+        "class Peers(Base):\n"
+        "    def spin(self, peers):\n"
+        "        [self.work() for self in peers]\n"
+        "        time.sleep(1)\n"
+        "def polled(done):\n"
+        "    return [done.wait(0.1) for _ in range(3)]\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):

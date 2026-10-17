@@ -1332,9 +1332,6 @@ def _evaluated(definition: ast.AST) -> list[ast.AST]:
     return []
 
 
-COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
 def _comprehended(comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
                   ) -> list[ast.AST]:
     """What a comprehension evaluates in its own scope: every part but its first iterable."""
@@ -1517,21 +1514,24 @@ class _Calls:
             lines = [line[1:] if line and line[0] is head else line for line in lines]
         return order
 
-    def _method(self, function: ast.AST, receiver: str, name: str) -> ast.AST | None:
-        """The method `name` the receiver `receiver` of `function`, or of the method it closes
-        over, reaches: the first class in its method resolution order that binds `name`."""
-        scope: ast.AST | None = function
-        while isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            owner = self.enclosing.get(id(scope))
-            parameters = [argument.arg for argument in scopes.arguments(scope)]
-            if parameters[:1] == [receiver] and isinstance(owner, ast.ClassDef):
-                for cls in self._order(owner):
-                    if name in self.bindings[id(cls)]:
-                        return self.bindings[id(cls)][name]
+    def _method(self, scope: ast.AST, receiver: str, name: str) -> ast.AST | None:
+        """The method `name` the receiver `receiver`, read in `scope`, reaches: the receiver of the
+        method that scope is in or closes over, to the first class in that method's class's resolution
+        order that binds `name`. A scope on the way that binds the receiver itself (a comprehension's
+        target, a closure's own) makes it another object, whose methods are not followed."""
+        current: ast.AST | None = scope
+        while current is not None:
+            owner = self.enclosing.get(id(current))
+            if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                parameters = [argument.arg for argument in scopes.arguments(current)]
+                if parameters[:1] == [receiver] and isinstance(owner, ast.ClassDef):
+                    for cls in self._order(owner):
+                        if name in self.bindings[id(cls)]:
+                            return self.bindings[id(cls)][name]
+                    return None
+            if receiver in self.bindings.get(id(current), {}):
                 return None
-            if receiver in self.bindings.get(id(scope), {}):
-                return None  # The closure binds a receiver of its own.
-            scope = owner
+            current = owner
         return None
 
     def reached(self, scope: ast.AST, function: ast.AST, call: ast.Call) -> list[ast.AST]:
@@ -1548,7 +1548,7 @@ class _Calls:
             return []
         if through:
             return self.named.get(call.func.attr, [])
-        method = self._method(function, root.id, call.func.attr)
+        method = self._method(scope, root.id, call.func.attr)
         return [method] if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef) else []
 
 
@@ -1582,8 +1582,14 @@ def waits(module: Module) -> Iterator[Finding]:
             continue
         external = None
         # What a loop runs each time round: its body, and a `while`'s test, asked before each.
-        looped = {id(inner) for loop in _executed(function.body) if isinstance(loop, ast.For | ast.While)
-                  for inner in _executed([*loop.body, *([loop.test] if isinstance(loop, ast.While) else [])])}
+        # What runs again and again: a loop's body and a `while`'s test, and an eager comprehension's body.
+        repeated: list[ast.AST] = []
+        for node in _executed(function.body):
+            if isinstance(node, ast.For | ast.While):
+                repeated += [*node.body, *([node.test] if isinstance(node, ast.While) else [])]
+            elif isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp):
+                repeated += _comprehended(node)
+        looped = {id(inner) for inner in _executed(repeated)}
         for node in _executed(function.body):
             what = _waiting(node, tables.get(id(node), {}))
             if what == "a timed wait":
