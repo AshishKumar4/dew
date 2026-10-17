@@ -24,7 +24,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, distance, float64_terms, widened
+from reference_error import (
+    assert_as_exact_as,
+    assert_as_exact_as_the_reference,
+    distance,
+    float64_terms,
+    measured,
+    widened,
+)
 from tuned import each_config
 
 from dew.nn import attention
@@ -100,15 +107,20 @@ def compare(functions, operands, seed, labels, *, coefficient=None):
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
     differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
     assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
-    reference, (truth, terms) = oracles(functions, operands, seed)
+    reference, truth, standards = oracles(functions, operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-    gated(labels, actual, reference, truth, terms, seed, coefficient)
+    gated(labels, actual, reference, truth, standards, seed, coefficient)
 
 
 def oracles(functions, operands, seed):
-    """XLA's outputs and gradients, and float64 truth with its terms (`float64`)."""
+    """XLA's outputs and gradients, their float64 truth, and XLA measured from it once, each entry
+    sized by its terms (`float64`, `measured`): every config of a kernel is held to one measurement."""
     xla, _, exact = functions
-    return jax.jit(functools.partial(evaluated, xla))(operands, seed), float64(exact, operands, seed)
+    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
+    truth, terms = float64(exact, operands, seed)
+    standards = [None if theirs is None else measured(theirs, want, summed)
+                 for theirs, want, summed in zip(reference, truth, terms, strict=True)]
+    return reference, truth, standards
 
 
 def float64(function, operands, seed):
@@ -119,10 +131,11 @@ def float64(function, operands, seed):
         return float64_terms(functools.partial(evaluated, function), *widened((operands, seed)))
 
 
-def gated(labels, actual, reference, truth, terms, seed, coefficient):
-    """Every output and gradient within the float64 gate."""
+def gated(labels, actual, reference, truth, standards, seed, coefficient):
+    """Every output and gradient within the float64 gate of XLA's (`oracles`)."""
     try:
-        for label, mine, theirs, want, summed in zip(labels, actual, reference, truth, terms, strict=True):
+        for label, mine, theirs, want, standard in zip(labels, actual, reference, truth, standards,
+                                                       strict=True):
             if mine is None:
                 assert theirs is None and want is None
                 continue
@@ -132,7 +145,7 @@ def gated(labels, actual, reference, truth, terms, seed, coefficient):
                 assert_scale_accumulation(mine, theirs, coefficient, seed)
             elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
-            assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+            assert_as_exact_as(mine, standard, label)
     except AssertionError as error:
         report = rounding_report(labels, actual, reference, truth)
         print(report, flush=True)
@@ -204,7 +217,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
                         "wide rows": lambda: norm_operands((7, 4096), dtype, jnp.float32),
                         "narrow rows": lambda: norm_operands((4099, 256), dtype, jnp.float32)}[operands]()
     functions = norm_functions(dtype, offset=True, after_cast=True)
-    reference, (truth, terms) = oracles(functions, (x, scale), seed)
+    reference, truth, standards = oracles(functions, (x, scale), seed)
     configs = each_config(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
     assert len(configs) > 1
     for config in configs:
@@ -213,7 +226,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
             # The factors this config's forward rounded, which its weight gradient sums.
             coefficient = scale_coefficient(x, dtype, after_cast=True)
         try:
-            gated(("y", "x", "scale"), actual, reference, truth, terms, seed, coefficient)
+            gated(("y", "x", "scale"), actual, reference, truth, standards, seed, coefficient)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -228,14 +241,14 @@ def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
     xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
-    reference, (truth, terms) = oracles((xla, pallas, xla), operands, seed)
+    reference, truth, standards = oracles((xla, pallas, xla), operands, seed)
     configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
     assert len(configs) > 1
     for config in configs:
         with tuning.pinned({kernel: config}):
             actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
         try:
-            gated(("y", "gate", "up"), actual, reference, truth, terms, seed, None)
+            gated(("y", "gate", "up"), actual, reference, truth, standards, seed, None)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -517,7 +530,7 @@ def test_c53_gradients_are_as_close_to_float64_as_xla_and_measured_liger(operati
         sigmoid = 1 / (1 + np.exp(-first))
         activated = first * sigmoid
         truth = (activated * second, dy * second * (sigmoid + activated * (1 - sigmoid)), dy * activated)
-    for index, (mine, theirs, want, measured) in enumerate(zip(
+    for index, (mine, theirs, want, liger) in enumerate(zip(
             actual, reference, truth, LIGER_RMS_ERRORS[operation], strict=True)):
         floor = 4 * np.finfo(np.float32).eps * np.sqrt(np.mean(np.square(want)))
-        assert distance(mine, want) <= min(distance(theirs, want), measured) + floor, (operation, index)
+        assert distance(mine, want) <= min(distance(theirs, want), liger) + floor, (operation, index)

@@ -56,6 +56,8 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -140,34 +142,61 @@ roundings is the longest chain the suite's oracles allow
 above it."""
 
 
-def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """Each row's float64 size and `value`'s RMS distance from float64 on it,
-    a row every axis but the last, or each element alone where `elements`
-    asks. A row's size is the RMS of its float64 values, or, where `terms`
-    gives each entry's float64 terms (`float64_terms`), the larger of that
-    and the RMS of what the row sums, so a row that cancels is sized by its
-    terms' rounding and not by its near-zero result; a row below float64's
-    `RESOLUTION` of its leaf has size zero. No other row's size enters: a
-    small row beside large ones has its own. A value of rank one or less is
-    one row, which `distance` already judges, and has none here; a scalar
-    has no elements either."""
+def row_sizes(truth, terms=None, *, elements: bool = False) -> np.ndarray:
+    """Each row's float64 size, a row every axis but the last, or each element's alone where
+    `elements` asks: the RMS of its float64 values, or, where `terms` gives each entry's float64
+    terms (`float64_terms`), the larger of that and the RMS of what the row sums, so a row that
+    cancels is sized by its terms' rounding and not by its near-zero result; a row below float64's
+    `RESOLUTION` of its leaf has size zero. No other row's size enters: a small row beside large
+    ones has its own. A value of rank one or less is one row, which `distance` already judges, and
+    has none here; a scalar has no elements either."""
     truth = np.asarray(truth, np.float64)
     if truth.ndim < (1 if elements else 2):
-        return np.zeros(0), np.zeros(0)
-    width = 1 if elements else truth.shape[-1]
-
-    def rms(rows):
-        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, width)), axis=1))
-
-    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+        return np.zeros(0)
+    sizes = _rms(truth, elements)
+    if terms is not None:
+        sizes = np.maximum(sizes, _rms(terms, elements))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
-    sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
-    return sizes, rms(np.asarray(value, np.float64) - truth)
+    return np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
 
 
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
+def row_distances(value, truth, *, elements: bool = False) -> np.ndarray:
+    """`value`'s RMS distance from float64 on each row of `row_sizes`, or each element's."""
+    truth = np.asarray(truth, np.float64)
+    if truth.ndim < (1 if elements else 2):
+        return np.zeros(0)
+    return _rms(np.asarray(value, np.float64) - truth, elements)
+
+
+def _rms(rows, elements: bool) -> np.ndarray:
+    rows = np.asarray(rows, np.float64)
+    return np.sqrt(np.mean(np.square(rows.reshape(-1, 1 if elements else rows.shape[-1])), axis=1))
+
+
+@dataclasses.dataclass(frozen=True)
+class Standard:
+    """A reference measured from float64 once (`measured`): its RMS distance, and each row's and
+    element's size (`row_sizes`) with the reference's own distance on it (`row_distances`). Every
+    port held to it reads them (`assert_as_exact_as`), so each config of a kernel is held to one
+    measurement of the reference rather than measuring it again."""
+
+    truth: np.ndarray
+    distance: float
+    rows: tuple[np.ndarray, np.ndarray]
+    elements: tuple[np.ndarray, np.ndarray]
+
+
+def measured(reference, truth, terms=None) -> Standard:
+    """`reference` measured from float64 `truth`, each entry sized by its `terms` where given."""
+    truth = np.asarray(truth, np.float64)
+    rows, elements = ((row_sizes(truth, terms, elements=each), row_distances(reference, truth, elements=each))
+                      for each in (False, True))
+    return Standard(truth, distance(reference, truth), rows, elements)
+
+
+def rows_over(dew, standard: Standard, floor: float = 0.0) -> list[str]:
     """Where Dew's rows, and then its elements, are further from float64 than
-    ROW_FACTOR times the reference's (`row_errors`): its worst over its own
+    ROW_FACTOR times the reference's (`Standard`): its worst over its own
     size against the reference's worst, at least `floor` (an order floor in
     those units), and each of size zero, a sum that cancels exactly before
     anything its terms see (a query that keeps one key), against the
@@ -181,8 +210,8 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
     computes every such element exactly Dew must too."""
     over = []
     for name, elements in (("row", False), ("element", True)):
-        sizes, mine = row_errors(dew, truth, terms, elements=elements)
-        _, theirs = row_errors(reference, truth, terms, elements=elements)
+        sizes, theirs = standard.elements if elements else standard.rows
+        mine = row_distances(dew, standard.truth, elements=elements)
         sized = sizes > 0
         if sized.any():
             worst = float(np.max(mine[sized] / sizes[sized]))
@@ -199,19 +228,23 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
     return over
 
 
-def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
+def assert_as_exact_as(dew, standard: Standard, label: str) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64, and
     its rows and elements within ROW_FACTOR times the reference's
-    (`rows_over`), each sized by its float64 `terms` where they are given
-    (`float64_terms`)."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
+    (`rows_over`), the reference measured once (`measured`)."""
+    mine, theirs = distance(dew, standard.truth), standard.distance
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
-    over = rows_over(dew, reference, truth, terms)
+    over = rows_over(dew, standard)
     assert not over, f"{label}: " + "; ".join(over)
 
+
+def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
+    """`assert_as_exact_as` the reference measured from float64 `truth`, each entry sized by its
+    float64 `terms` where they are given (`float64_terms`)."""
+    assert_as_exact_as(dew, measured(reference, truth, terms), label)
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
@@ -256,8 +289,8 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
         # Each row and element over its own terms where they are given, the order floor in those units.
         over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
-                             if rows else ())]
+                 for row in (rows_over(mine, measured(theirs, true, None if terms is None else summed),
+                                       spread * unit) if rows else ())]
     assert not over, "\n".join(over)
 
 
