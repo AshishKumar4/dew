@@ -656,22 +656,73 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
         assert_same_generation(actual, retrained(prompt, 5, key=3))
 
 
-def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
+@pytest.mark.parametrize("finished", [True, False], ids=["prefilled", "prefilling"])
+def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     """A cached prompt page holds keys the old weights computed; after a
     reload the same prompt prefills again and draws what the new weights
-    draw alone."""
+    draw alone. That holds too for a prompt still prefilling in pieces of
+    three when the reload lands: its first piece kept the old weights'
+    keys, so its pages are never shared."""
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=4, pages=40),
-                              prefix_cache=True)
+                              chunk=3, prefix_cache=True)
     server.submit("1234567", 8, key=0)
-    server.run()
+    if finished:
+        server.run()
+    else:
+        server.step()
     other = bound.variables.copy({"params": jax.tree.map(lambda leaf: leaf * 1.5, bound.variables["params"])})
     server.reload(other)
+    server.run()
     hits = server.prefix_hits
     ticket = server.submit("1234567", 8, key=0)
     server.run()
     assert server.prefix_hits == hits
-    assert ticket.result().text == bound.bind(other)("1234567", 8, key=0).text
+    assert_same_generation(ticket.result(), bound.bind(other)("1234567", 8, key=0))
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=4, pages=3), "prefix_cache": True}],
+                         ids=["dense", "paged"])
+def test_a_request_cancelled_while_it_waits_leaves_its_peers_running(options):
+    """One slot, three requests: the second is cancelled while the first
+    runs. The server goes on, the first and third draw what they draw
+    alone, and the cancelled one never takes the slot. A seated request
+    can no longer be cancelled. The paged pool holds three pages, which the
+    third request needs whole, so it seats only once the pages the
+    cancelled request was given back are free again."""
+    bound = task()
+    server = Server.from_task(bound, slots=1, capacity=128, **options)
+    tickets = [server.submit(prompt, 5, key=index) for index, prompt in enumerate(PROMPTS[:3])]
+    server.step()
+    assert not tickets[0].cancel()
+    assert tickets[1].cancel()
+    for _ in range(64):
+        if not (server.queued or server.occupancy):
+            break
+        server.step()
+    assert server.occupancy == 0 and not server.queued, "a request is still waiting for its pages"
+    server.run()
+    assert tickets[1].cancelled()
+    for index in (0, 2):
+        assert_same_generation(tickets[index].result(), bound(PROMPTS[index], 5, key=index))
+
+
+def test_a_request_past_the_servers_own_capacity_is_refused_at_submit():
+    """A user's decoder declares a context of 128 and is served at a
+    capacity of 64: a request that fits 64 draws what the task draws alone,
+    and a budget or a prompt past it is refused at submission, leaving the
+    server serving."""
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
+    plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
+    server = Server.from_task(plain, slots=2, capacity=64)
+    assert plain.model.max_seq_len == 128
+    with pytest.raises(ValueError):
+        server.submit("12", 63, key=0)
+    with pytest.raises(ValueError):
+        server.submit("1" * 64, 1, key=0)
+    ticket = server.submit("12", 62, key=0)
+    server.run()
+    assert_same_generation(ticket.result(), plain("12", 62, key=0))
 
 
 def test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws():
