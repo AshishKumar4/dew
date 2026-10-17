@@ -259,3 +259,37 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
     assert (losses.num, losses.sum) == (1, 0.5)
     shown = json.loads(reader.Tensors('val/decisions')[0].tensor_proto.string_val[0])
     assert [row[:4] for row in shown['rows']] == [[0, 0, 2, 2], [0, 1, 0, 0]]
+
+
+def test_a_live_panel_keeps_redrawing_while_evaluations_of_new_splits_arrive():
+    """Rich redraws the live panel on its own thread while training records each split's first
+    evaluation; a redraw that walked the splits while one was added would raise there, which Rich does
+    not catch, and the panel would stop updating. Many splits arriving under a fast redraw leave the
+    redraw thread running and every split drawn."""
+    import io
+    import threading
+
+    from rich.console import Console
+    from rich.live import Live
+
+    from dew.training.display import TrainingDisplay
+    from dew.training.evaluation import Evaluation
+
+    display = TrainingDisplay(total=10)
+    failures: list[BaseException] = []
+    hook = threading.excepthook
+    threading.excepthook = lambda failed: failures.append(failed.exc_value)
+    console = Console(file=io.StringIO(), force_terminal=True, width=120, height=4000)
+    try:
+        with Live(display, console=console, refresh_per_second=200) as live:
+            display.live = live
+            for split in range(400):
+                display.evaluation(Evaluation(
+                    step=1, split=f"split{split}", scores={f"split{split}/loss": float(split)},
+                    coordinated_batches=1, records=1, event_key=(0,), elapsed_seconds=0.0, previews=()))
+            redrawing = live._refresh_thread is not None and live._refresh_thread.is_alive()
+            display.live = None
+    finally:
+        threading.excepthook = hook
+    assert failures == [] and redrawing
+    assert len(display.evaluation_rows()) == 400
