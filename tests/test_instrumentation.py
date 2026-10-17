@@ -221,6 +221,31 @@ def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
     assert both == (2 + 4) * 2 * batch * heads * pairs * width
 
 
+def test_a_fused_attention_counts_its_value_product_at_the_values_width():
+    """`Q K^T` and its two backward products run at the query's width, `P V` and its two at the
+    value's, which a model may set apart (MiMo's 192 and 128): FlashAttention-3's forward and
+    backward calls, as the wheel issues them, count each product at its own width."""
+    batch, length, heads, query_width, value_width = 1, 64, 2, 192, 128
+    module = f"""HloModule step
+
+ENTRY %main (q: bf16[1,64,2,192], k: bf16[1,64,2,192], v: bf16[1,64,2,128], g: bf16[1,64,2,128]) -> f32[] {{
+  %q = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(0)
+  %k = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(1)
+  %v = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(2)
+  %g = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(3)
+  %fwd = (bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}}) custom-call(%q, %k, %v), \
+custom_call_target="dew_flash3_mha_fwd", api_version=API_VERSION_TYPED_FFI
+  %bwd = (bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}}) custom-call(%g, %q, %k, %v), \
+custom_call_target="dew_flash3_mha_bwd", api_version=API_VERSION_TYPED_FFI
+  ROOT %zero = f32[] constant(0)
+}}
+"""
+    counted = hlo_flops(module)
+    assert counted is not None
+    product = 2 * batch * heads * length * length
+    assert counted.hardware == (1 + 2) * product * (query_width + value_width)
+
+
 UNSIZED = """HloModule step
 
 ENTRY %main (p0: f32[8,16], p1: f32[16,4]) -> f32[8,4] {

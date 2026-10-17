@@ -1,12 +1,12 @@
 """Turns raw audio into the arrays a batch carries.
 
 This runs inside grain's workers, so the device only ever sees ready tensors.
-`transformers` is imported on construction, not on import. Captions are
+`transformers` is imported when a step runs, not on import. Captions are
 tokenized by the condition encoder that reads them (`dew.inputs`).
 """
 
 import dataclasses
-import inspect
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -23,42 +23,19 @@ class Sampled(Protocol):
     sampling_rate: int
 
 
-class AutoAudioProcessor:
-    """Runs a Hugging Face audio feature extractor and returns its arrays
-    unchanged, such as `input_values` for wav2vec2 or `input_features` for
-    Whisper.
+class FeatureExtractor(Protocol):
+    """A Hugging Face audio feature extractor, as `AutoFeatureExtractor` loads one: it turns
+    waveforms into the arrays its model reads, the first of which it names first."""
 
-    `modelname` names the model whose extractor is loaded. The audio is read
-    at `sampling_rate`, which defaults to the rate the extractor states, or
-    16 kHz when it states none. An extractor that pads to a fixed window by
-    default, as Whisper's pads to 30 seconds, keeps that padding. One that
-    does not pad by default, such as wav2vec2's, pads a batch to its longest
-    waveform.
-    """
+    model_input_names: list[str]
 
-    def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
-                 sampling_rate=None):
-        from transformers import AutoFeatureExtractor
-        extractor = AutoFeatureExtractor.from_pretrained(modelname)
-        self.processor = extractor
-        self.tensor_type = tensor_type
-        # An extractor that pads to a fixed window by default (Whisper's 30
-        # seconds, which its encoder is built for) keeps that; one that pads
-        # nothing by default (wav2vec2's) pads a batch to its longest
-        # waveform, so rows of several lengths still stack.
-        padding = inspect.signature(extractor.__call__).parameters.get("padding")
-        stated = extractor.sampling_rate if isinstance(extractor, Sampled) else 16000
-        self.sampling_rate = sampling_rate or stated
-        self.padding = {} if padding is None else {"padding": padding.default or True}
+    def __call__(self, raw_speech: list[np.ndarray], *, sampling_rate: int,
+                 return_tensors: str) -> Mapping[str, np.ndarray]: ...
 
-    def __call__(self, audio):
-        """Return the extractor's arrays for one waveform or a batch of them, as a dict."""
-        features = self.processor(audio, sampling_rate=self.sampling_rate,
-                                  return_tensors=self.tensor_type, **self.padding)
-        return dict(features)
 
-    def __repr__(self):
-        return self.__class__.__name__ + '()'
+def sampling_rate(extractor: FeatureExtractor) -> int:
+    """The rate a feature extractor reads its audio at: the one it states (`Sampled`), or 16 kHz."""
+    return extractor.sampling_rate if isinstance(extractor, Sampled) else 16000
 
 
 @dataclasses.dataclass(frozen=True)
