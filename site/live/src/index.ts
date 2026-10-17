@@ -140,7 +140,7 @@ export default {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const pool = env.POOL.get(env.POOL.idFromName('global'));
 			if (url.pathname.endsWith('/warm') && request.method === 'POST') {
-				await warm(env);
+				await warm(env, { retryNow: true });
 			} else if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
 			return Response.json(await pool.status());
 		}

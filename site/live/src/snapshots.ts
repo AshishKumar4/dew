@@ -63,19 +63,27 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		};
 	}
 
-	async ensure(commit = this.env.SNAPSHOT_COMMIT): Promise<{
+	/**
+	 * The generation of `commit`, or its preparation started: within a second, or once the lease a
+	 * preparation holds ends. Where `commit`'s last preparation failed, the retry `retry` scheduled
+	 * keeps its time unless `retryNow`, the operator's warm: a visitor's request does not undo the
+	 * backoff.
+	 */
+	async ensure(commit = this.env.SNAPSHOT_COMMIT, { retryNow = false } = {}): Promise<{
 		generation: SnapshotGeneration | null; rebuilding: boolean;
 	}> {
 		const generation = await this.current(commit);
 		if (generation) return { generation, rebuilding: false };
 		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot generation must be pinned');
 		await this.ctx.storage.transaction(async (storage) => {
-			if ((await storage.get<string>('requested')) !== commit) await storage.delete('retries');
+			const requested = await storage.get<string>('requested');
+			if (requested !== commit) await storage.delete('retries');
 			await storage.put('requested', commit);
 			const lease = await storage.get<{ until: number }>('rebuild');
 			const next = lease && lease.until > Date.now() ? lease.until + 1000 : Date.now() + 1000;
 			const alarm = await storage.getAlarm();
-			if (alarm === null || alarm > next) await storage.setAlarm(next);
+			const failed = requested === commit && (await storage.get<{ commit: string }>('failure'))?.commit === commit;
+			if (alarm === null || (alarm > next && (retryNow || !failed))) await storage.setAlarm(next);
 		});
 		return { generation: null, rebuilding: true };
 	}
