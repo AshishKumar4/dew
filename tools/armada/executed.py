@@ -3,7 +3,8 @@ executed and the checkout's files and directories they read, for the test cache 
 whose recorded files are unchanged since it ran green is not run again. A read is a file opened to
 read, as Python's `open` audits it (a documentation page a test trains from, a fixture), or a
 directory listed (the pages a test globs, so a page added is a change); the import system's and
-pytest's collection's own listings are not, as what they find is recorded as it runs. Hidden
+pytest's collection's own listings are not, as what they find is recorded as it runs. `os.open`
+is wrapped (`opened`) so that a path it opens relative to a directory descriptor is placed. Hidden
 directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
@@ -24,6 +25,7 @@ import dis
 import json
 import os
 import sys
+import threading
 import types
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -40,6 +42,8 @@ code, on the host alone). Any other start, a shell's or a launcher's included, m
 checkout's code or hold the GPU."""
 READS = {"open", "os.listdir", "os.scandir"}
 """Audit events of a read: a file opened, a directory listed."""
+IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
+"""The import system's frozen modules, which list the directories it imports from."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is `CHILD_START`'s."""
@@ -63,6 +67,8 @@ everywhere: set[str] = set()
 readers: list[set[str]] = []
 """Where a read is kept. conftest.py's reads are every test's, so they are left out."""
 decided: dict[types.CodeType, bool] = {}
+placing = threading.local()
+"""Whether the `os.open` this thread is making opens relative to a directory descriptor (`opened`)."""
 
 
 def started(code, offset):
@@ -127,10 +133,13 @@ def audited(event, args):
         read(event, args)
     elif running and event in SPAWNS and not native(programs(event, args)):
         spawned.add(running[-1])
+
+
 def read(event: str, args: tuple) -> None:
     """Records the checkout's file or directory that a read event names in the current test file's
     record, as `started` records what it executes: a file opened only to read (`open`'s mode, or
-    its flags for `os.open`), or a directory listed but by a listing tool (`listing_tool`)."""
+    its flags for `os.open`), or a directory listed but by a listing tool (`listing_tool`). An open
+    relative to a directory descriptor is `opened`'s to record."""
     path = args[0]
     if isinstance(path, int):
         return
@@ -138,21 +147,48 @@ def read(event: str, args: tuple) -> None:
         mode, flags = args[1], args[2]
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
-        if written:
+        if written or (mode is None and getattr(placing, "relative", False)):
             return
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return
-    name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    record(os.path.abspath(os.fsdecode(path if path is not None else ".")))
+
+
+def record(name: str) -> None:
+    """Records absolute path `name` where it is the checkout's, its own directory as `.`."""
+    if name == root.removesuffix(os.sep):
+        current[-1].add(".")
+        return
     if not name.startswith(root):
         return
     relative = name[len(root):]
     if relative.split(os.sep)[0].startswith(".") or "__pycache__" in relative or "site-packages" in relative:
         return
     current[-1].add(relative)
+
+
+def opened(path, flags, mode=0o777, *, dir_fd=None):
+    """`os.open`, whose audit event names a path relative to `dir_fd` without the descriptor: such an
+    open, once it has opened to read, is recorded here, in the directory the descriptor names."""
+    if dir_fd is None:
+        return OPEN(path, flags, mode)
+    placing.relative = True
+    try:
+        descriptor = OPEN(path, flags, mode, dir_fd=dir_fd)
+    finally:
+        placing.relative = False
+    if flags & os.O_ACCMODE == os.O_RDONLY:
+        record(os.path.normpath(os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), os.fsdecode(path))))
+    return descriptor
+
+
 def listing_tool(name: str) -> bool:
-    """Whether code in file `name` lists directories for the import system or for pytest's
-    collection, whose listings are no test's input: what they find is recorded as it runs."""
-    return name.startswith("<frozen") or f"{os.sep}_pytest{os.sep}" in name
+    """Whether code in file `name` lists directories for the import system, for its search of the
+    installed distributions (the locks' to key) or for pytest's collection, whose listings are no
+    test's input: what they find is recorded as it runs. The rest of the standard library's
+    frozen modules (`os.walk`'s) list for whoever calls them."""
+    return (name in IMPORTING or f"{os.sep}_pytest{os.sep}" in name
+            or f"{os.sep}importlib{os.sep}metadata{os.sep}" in name)
 
 
 def programs(event: str, args: tuple) -> list:
@@ -183,6 +219,8 @@ sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
 sys.addaudithook(audited)
+OPEN = os.open
+os.open = opened
 
 
 @pytest.hookimpl(hookwrapper=True)
