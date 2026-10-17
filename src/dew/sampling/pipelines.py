@@ -256,7 +256,6 @@ class TextToImage:
         Dew the run's record may import (`TextGeneration.from_run`).
         """
         from dew.config import ModelConfig
-        from dew.diffusion.process import Process
         from dew.inference.tasks import run_record, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
