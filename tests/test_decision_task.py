@@ -197,9 +197,11 @@ def test_a_temperature_fit_does_not_depend_on_a_common_logit_shift():
 
     logits = np.asarray([[0.0, 1.0, 2.0], [0.5, -1.0, 0.0], [2.0, 2.5, -0.5]])
     for shift in (0.0, 1e7):
-        held = [Scored("choice", row + shift, softmax(row, 1.0).astype(np.float32).astype(np.float64))
-                for row in logits]
-        assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
+        for widened in (False, True):
+            golds = [softmax(row, 1.0).astype(np.float32) for row in logits]
+            held = [Scored("choice", row + shift, gold.astype(np.float64) if widened else gold)
+                    for row, gold in zip(logits, golds, strict=True)]
+            assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
 
 
 def test_abstention_keeps_the_accepted_answers_within_the_target_error():

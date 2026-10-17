@@ -129,7 +129,8 @@ def _temperature(group: Sequence[Scored]) -> float:
     real = np.zeros((len(group), width), bool)
     for row, held in enumerate(group):
         z[row, :len(held.logits)] = held.logits
-        gold[row, :len(held.target)] = held.target / np.sum(held.target)
+        target = np.asarray(held.target, np.float64)
+        gold[row, :len(target)] = target / np.sum(target)
         real[row, :len(held.logits)] = True
     labelled = np.sum(gold * z, axis=1)
     inverse = 1.0
