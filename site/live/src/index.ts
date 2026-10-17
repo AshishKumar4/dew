@@ -134,6 +134,20 @@ export default {
 			if (request.method === 'POST') await Promise.all(preparers.map((preparer) => preparer.forget(plan.delete)));
 			return Response.json({ ...plan, live: [...live] });
 		}
+		if (url.pathname === '/v1/operator/preparation' && request.method === 'GET') {
+			// Where the pinned generation's preparation stands: the registry's lease, failure and alarm, each
+			// preparer's phase and the job it holds.
+			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
+			// A preparer an alarm still holds runs the code it started on, which may answer `held` with an error: that
+			// error is the operator's to read, beside what the rest answered.
+			const read = <T>(ask: () => Promise<T>) => ask().catch((error: unknown) => ({ error: String(error) }));
+			const preparers = Object.fromEntries(await Promise.all(['trusted', 'trial'].map(async (name) => {
+				const preparer = env.PREPARER.get(env.PREPARER.idFromName(name));
+				return [name, { phase: await read(() => preparer.status()), job: await read(() => preparer.held()) }];
+			})));
+			return Response.json({ registry: await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).status(),
+				pinned: env.SNAPSHOT_COMMIT, preparers });
+		}
 		if (url.pathname === '/v1/operator/trial') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));
