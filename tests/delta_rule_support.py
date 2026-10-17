@@ -240,7 +240,14 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
     sums of Dew's portable math add on the whole row, its documents from their starts as the port runs
     them (`float64_terms`, `HEADS` value heads at a time), and for a decay per key dimension's
     gradient those of the parts Kimi's port sums besides (`fla_decay_terms`). A key head's gradients
-    and terms are summed over the value heads it serves."""
+    and terms are summed over the value heads it serves.
+
+    Packed at `cuts`, the port chunks the row from its start and fla each document from its own
+    (`fla_side`), so the two sum alike but end their chunks at other tokens, and a chunk's last
+    token reads the inter-chunk sum whole (a dot of its key with the state's gradient, which
+    `float64_terms` sizes at that sum's value). When two implementations chunk the same sums
+    differently, each element is sized by the larger of the two formulas' terms: the port layout's
+    and fla's per-document layout's (`_per_document`)."""
     q, k, v, g, beta, h0, do, dht = inputs
     group = v.shape[2] // q.shape[2]
     rows = None if cuts is None else (cuts,)
@@ -271,7 +278,11 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
                     q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
                     h0[:, valued], do[:, :, valued], dht[:, valued])), host)
                 _, terms = float64_terms(through(packed, *block[6:]), *block[:6])
-                sizes.append([np.asarray(x) for x in terms])
+                terms = [np.asarray(x) for x in terms]
+                if cuts is not None:
+                    terms = [np.maximum(port, documents)
+                             for port, documents in zip(terms, _per_document(block, cuts), strict=True)]
+                sizes.append(terms)
 
     def joined(leaves):
         return [np.concatenate([each[i] for each in leaves], axis=axis)
@@ -286,6 +297,23 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
     for i in (2, 3):
         found[i] = grouped(found[i])
     return found, terms
+
+
+def _per_document(block, cuts) -> list[np.ndarray]:
+    """The float64 terms of `block` (`float64_truth`'s operands and cotangents) as fla runs its packed
+    documents at `cuts` (`fla_side`): each a sequence of its own, chunked from its start, the row's
+    memory the first's and its final memory and cotangent the last's."""
+    q, k, v, g, beta, h0, do, dht = block
+    bounds = [*cuts, q.shape[1]]
+    pieces = []
+    for start, end in itertools.pairwise(bounds):
+        memory = h0 if start == 0 else jnp.zeros_like(h0)
+        cotangent = dht if end == q.shape[1] else jnp.zeros_like(dht)
+        _, terms = float64_terms(through(math, do[:, start:end], cotangent),
+                                 *(x[:, start:end] for x in (q, k, v, g, beta)), memory)
+        pieces.append([np.asarray(x) for x in terms])
+    timed = [np.concatenate([piece[i] for piece in pieces], axis=1) for i in (0, 2, 3, 4, 5, 6)]
+    return [timed[0], pieces[-1][1], *timed[1:], pieces[0][7]]
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
