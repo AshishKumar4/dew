@@ -94,37 +94,45 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
 
 def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_reference_does():
     """`hidden_act` may name any activation the shared table computes,
-    quick_gelu here, in both the feed-forward and the light convolution. The
-    reference pins its attention to float32, so it runs in no wider precision
-    and its float32 output is the truth: the bf16 tower's encoded frames are
-    as exact as the reference's bf16 tower's."""
+    quick_gelu here, and a tower so configured loads. Its feed-forwards and
+    light convolution, the blocks the activation runs in, each compute the
+    reference's block with the tower's own weights: in fp32, as exact as the
+    reference's fp32 block from its float64 run. The whole reference tower pins
+    its attention to float32, so the blocks run alone."""
+    import functools
+
     import torch
+    from flax import linen as nn
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
+    from dew.nn.audio import AudioFeedForward, AudioLightConv
     from tools.audio_reference import audio_config as reference_config, perturb
 
     config = reference_config("gemma4")
     config.hidden_act = "quick_gelu"
-    config._attn_implementation = "sdpa"
     torch.manual_seed(314)
     reference = Gemma4AudioModel(config).eval()
     perturb(reference)
-    tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
-    data = np.load(FIXTURES / "gemma4" / "reference.npz")
-    features, mask = data["input_features"], data["input_features_mask"]
-
-    def encoded(dtype):
-        with torch.no_grad():
-            output = reference.to(dtype)(torch.from_numpy(features).to(dtype), torch.from_numpy(mask))
-        return output.last_hidden_state.float().numpy(), output.attention_mask.numpy()
-
-    (truth, valid), (theirs, _) = encoded(torch.float32), encoded(torch.bfloat16)
     ours = audio_config(config.to_dict())
-    encoding = ours.build().clone(dtype=jnp.bfloat16).apply(
-        audio_weights(tensors, ours), input_features=features, input_features_mask=mask)
-    np.testing.assert_array_equal(np.asarray(encoding.mask), valid)
-    assert_as_exact_as_the_reference(np.asarray(encoding.features, np.float32)[valid], theirs[valid],
-                                     truth[valid], "quick_gelu bf16 encoded")
+    tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
+    tree = audio_weights(tensors, ours)
+    linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
+                               use_clipped_linears=ours.use_clipped_linears)
+    feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,
+                                    ours.hidden_act)
+    light_conv = AudioLightConv(ours.hidden_size, ours.conv_kernel_size, ours.rms_norm_eps,
+                                ours.gradient_clipping, linear, ours.hidden_act)
+    x = np.random.default_rng(5).normal(size=(2, 12, ours.hidden_size)).astype(np.float32)
+    layer = reference.layers[0]
+    blocks = {"feed_forward1": feed_forward, "lconv1d": light_conv, "feed_forward2": feed_forward}
+    for name, block in blocks.items():
+        theirs = getattr(layer, name)
+        with torch.no_grad():
+            wide, narrow = (theirs.to(dtype)(torch.from_numpy(x).to(dtype)).numpy()
+                            for dtype in (torch.float64, torch.float32))
+        variables = {collection: held["layers_0"][name] for collection, held in tree.items()
+                     if name in held.get("layers_0", {})}
+        assert_as_exact_as_the_reference(np.asarray(block.apply(variables, x)), narrow, wide, name)
 
 
 @on_gpu

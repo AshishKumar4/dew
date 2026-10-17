@@ -229,14 +229,16 @@ def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():
     """A merge decodes each FP8 site's kernel and adds its trained delta, and
     the codes go with the kernel they stood for: the model without its
     adapter computes the merged tree as the plain decoder computes its
-    kernels, which the trained deltas moved off the decoded base."""
-    _, fp8 = adapters()
+    kernels, which the trained deltas moved off the decoded base. The head is
+    tied, so no packed vocabulary head plays a part."""
+    model = decoder(tie_embeddings=True)
+    _, fp8 = adapters(model)
     state = fit(fp8, 3)
     merged = fp8.merge(state.variables)
-    expected = np.asarray(decoder().apply({"params": merged["params"]}, ids()), np.float32)
+    expected = np.asarray(model.apply({"params": merged["params"]}, ids()), np.float32)
     np.testing.assert_array_equal(np.asarray(unadapted(fp8.model).apply(merged, ids()), np.float32), expected)
     base = fp8.merge(fp8.variables)["params"]
-    assert np.abs(expected - np.asarray(decoder().apply({"params": base}, ids()), np.float32)).max() > 1e-3
+    assert np.abs(expected - np.asarray(model.apply({"params": base}, ids()), np.float32)).max() > 1e-3
 
 
 def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
