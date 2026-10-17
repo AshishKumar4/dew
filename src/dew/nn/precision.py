@@ -16,7 +16,6 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from flax.linen.linear import PromoteDtypeFn
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
@@ -32,31 +31,20 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
-def fp32_bias(promote: PromoteDtypeFn) -> PromoteDtypeFn:
-    """A flax layer's `promote_dtype`: `promote`'s, with the bias then held
-    at fp32 (`at_least_fp32`) of the value it computes with.
+def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
+    """`product` plus `bias` broadcast over its leading axes, in the dtype the two sum to, the sum
+    taken at fp32 (`at_least_fp32`) and rounded once.
 
-    JAX transposes a broadcast into a sum in the broadcast operand's dtype
-    (jax-ml/jax#30310), so a bfloat16 bias added to bfloat16 products sums
-    its gradient over every position in bfloat16, where torch's addmm and
-    convolutions sum theirs in float32: Qwen 2's projection biases, summed
-    over 8192 tokens, came out up to 3.75 times further from float64 than
-    torch's own bfloat16 gradients. Broadcast at fp32, the bias's gradient
-    accumulates at fp32 and rounds once into the parameter. Its value is
-    the compute dtype's, so the layer's sum, rounded back to the product's
-    dtype (`product_dtype`), is the one flax computes, and the product's own
-    backward is unchanged.
+    JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
+    a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
+    where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
+    came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
+    at fp32, the gradient sums at fp32 and rounds once into the bias. The sum of two values rounded
+    once is the one the narrower addition computes, so the forward is unchanged.
     """
-    def promoted(*arrays, dtype=None, inexact: bool = True):
-        *operands, bias = promote(*arrays, dtype=dtype, inexact=inexact)
-        return [*operands, None if bias is None else bias.astype(at_least_fp32(bias.dtype))]
-    return promoted
-
-
-def product_dtype(inputs: jax.Array, param_dtype: DTypeLike, dtype: DTypeLike | None) -> jnp.dtype:
-    """The dtype flax's promotion gives a layer's product: its `dtype`, or with none set,
-    the inputs' and parameters' common one."""
-    return jnp.dtype(dtype) if dtype is not None else jnp.result_type(inputs, param_dtype)
+    dtype = jnp.result_type(product, bias)
+    wide = at_least_fp32(dtype)
+    return (product.astype(wide) + bias.astype(wide)).astype(dtype)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:

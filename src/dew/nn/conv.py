@@ -44,7 +44,6 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import fp32_bias, product_dtype
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -241,13 +240,11 @@ class Conv(nn.Conv):
     """Flax's convolution with safe placement and backend-specific depthwise work.
 
     The kernel is placed where Flax reads its promoted operands, through
-    `promote_dtype`, and the bias reaches the sum at fp32, so its gradient
-    accumulates at fp32 (`fp32_bias`) before the sum rounds back to the
-    product's dtype. Parameters and names remain Flax's, so checkpoints do
+    `promote_dtype`. Parameters and names remain Flax's, so checkpoints do
     not change. Other grouped and ordinary convolutions remain lax calls.
     """
 
-    promote_dtype: PromoteDtypeFn = fp32_bias(_promoted_whole)
+    promote_dtype: PromoteDtypeFn = _promoted_whole
     conv_general_dilated: ConvGeneralDilatedT | None = _conv_general_dilated
 
     @nn.nowrap
@@ -285,5 +282,4 @@ class Conv(nn.Conv):
                        else any(stride > 1 for stride in self.strides))
             if strided:
                 inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
-        convolved = super().__call__(inputs).astype(product_dtype(inputs, self.param_dtype, self.dtype))
-        return _unreplicated(convolved, spatial)
+        return _unreplicated(super().__call__(inputs), spatial)
