@@ -7,10 +7,11 @@ template. Every token gets the role of the message that wrote it, so
 only.
 
 The rendered conversations are packed by the token pipeline's plan over
-the whole corpus (`PackedWindows`), with `text_roles` as one more per-token
-field. Each batch holds `text` and `text_roles`, aligned, and the windows'
-documents as `text_coordinates`. The training stream's position is a global
-window count, so a run can resume on any number of processes.
+the whole corpus (`dew.data.packing.plan_windows`), with `text_roles` as
+one more per-token field. Each batch holds `text` and `text_roles`,
+aligned, and the windows' documents as `text_coordinates`. The training
+stream's position is a global window count, so a run can resume on any
+number of processes.
 
 Block diffusion reads a prompt and the canvases after it instead, so its
 `ChatCanvasData` recipe lays each assistant turn out as a row of its own,

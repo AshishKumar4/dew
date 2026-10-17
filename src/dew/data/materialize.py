@@ -7,10 +7,10 @@ the accepted rows, each with the source position it came from, as a
 `_Memory` source, which the Grain lowering then reads by index like any
 other. Record steps, token splits, Grain's packers and cache reads run by
 the Grain lowering's own definitions (`dew.data.lowering`); first-fit
-packing and windows run by their indexed plans (`PackedWindows`,
-`IndexedWindows`), so the plan can fingerprint them. It counts what it
-attempted, accepted and rejected, and records the derived order facts a
-resume checks.
+packing and windows run by their indexed plans (`plan_windows`, read as
+`PackedSource` reads it, and `IndexedWindows`), so the plan can
+fingerprint them. It counts what it attempted, accepted and rejected, and
+records the derived order facts a resume checks.
 """
 
 from __future__ import annotations
@@ -202,8 +202,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
         elif isinstance(stage, Pack):
-            from dew.data.packing import refuse_overlong
-            from dew.data.tokens import PackedWindows
+            from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
@@ -213,18 +212,23 @@ def _memory_stages(
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
-                packed = PackedWindows(
-                    pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe(),
-                    segments=stage.segments,
-                )
-                derived["packing"] = fingerprint([packed.order.tolist(), packed.starts.tolist()])
+                # The plan and windows reader of an indexed read of documents that state
+                # their lengths (`PackedSource.planned`): it reads the windows that hold a
+                # target, and the plan counts the rest as zero_targets.
+                plan = _Held(_Memory(source, documents, sizes, {}), stage)
+                planned = plan.arrays
+                derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
+                packed = _PackedRows(documents, plan)
+                rows = [((plan.at("accepted", index),), packed[index]) for index in range(len(packed))]
+                counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
+                targets = {"valid_targets": plan.at("totals", 0)}
             else:
                 # Only first-fit of tokens alone has an indexed plan; the rest is Grain's
                 # own packer, run once over the corpus as an indexed read streams it.
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
-            rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter,
-                                      stage.fields[0])
+                rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
+                                          stage.fields[0])
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
