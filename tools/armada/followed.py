@@ -41,6 +41,8 @@ CHILDREN = "DEW_EXECUTED_CHILDREN"
 FOLLOWER_TOOL = 4
 """The sys.monitoring tool a child records with: executed.py's pytest process holds 3, and a task's
 pytest is itself a followed child of a test that runs one."""
+FOLLOWER = "dew-followed"
+"""The recorder's name for its tool."""
 PTH = "dew_followed.pth"
 GPUS = ("cuda", "rocm")
 OPENED = ("_init_backend", os.path.join("jax", "_src", "xla_bridge.py"))
@@ -209,7 +211,14 @@ def installed() -> None:
 
 
 def follow() -> None:
-    """Record this child for the process that started it, as it exits."""
+    """Record this child for the process that started it, as it exits: once, though the environment
+    processes its site-packages' `.pth` files twice (a uv environment's `site` adds the directory
+    again), so a second start finds the recorder holding its tool and leaves it. Where another tool
+    holds that id the child records no files, and says so (`unfollowed`): its file then has no key,
+    and the child starts as it would without the recorder."""
+    holder = sys.monitoring.get_tool(FOLLOWER_TOOL)
+    if holder == FOLLOWER:
+        return
     directory, root = Path(os.environ[CHILDREN]), os.environ["DEW_EXECUTED_ROOT"]
     mark = directory / f"{os.getpid()}.started"
     # A child given its parent's fraction holds one more of the parent's shares where it opens the GPU.
@@ -263,12 +272,15 @@ def follow() -> None:
         partial.write_text(json.dumps(ended))
         partial.replace(directory / f"{os.getpid()}.json")
 
+    atexit.register(written)
+    if holder is not None:
+        record["unfollowed"] = True
+        return
     opening(record["files"].add, root)
-    sys.monitoring.use_tool_id(FOLLOWER_TOOL, "dew-followed")
+    sys.monitoring.use_tool_id(FOLLOWER_TOOL, FOLLOWER)
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
     sys.monitoring.set_events(FOLLOWER_TOOL, sys.monitoring.events.PY_START)
     sys.addaudithook(audited)
-    atexit.register(written)
 
 
 def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:

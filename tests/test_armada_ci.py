@@ -246,10 +246,11 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
 
 def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):
     """A Python child a test file starts with its environment records itself
-    (tools/armada/followed.py): its reads of the backend join the file's
-    evidence, and the files it executed and the pages it read the file's key,
-    which holds until one changes. A child given an environment of its own,
-    or killed before it wrote its record, leaves its file without a key."""
+    (tools/armada/followed.py), once and silently though its site-packages are
+    processed again: its reads of the backend join the file's evidence, and
+    the files it executed and the pages it read the file's key, which holds
+    until one changes. A child given an environment of its own, or killed
+    before it wrote its record, leaves its file without a key."""
     url, _, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -257,10 +258,14 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     files = {
         "devices.py": "class Device:\n    platform = 'gpu'\ndef placed(device): return device.platform\n",
         "plain.py": "def helper(): return 1\n",
-        "child.py": "import devices, plain\n"
+        "child.py": "import site, sysconfig\n"
+                    "site.addsitedir(sysconfig.get_paths()['purelib'])\n"
+                    "import devices, plain\n"
                     "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n"
                     "assert open('notes/page.md').read()\n",
-        "test_child.py": started + "subprocess.run([sys.executable, 'tests/child.py'], check=True)\n",
+        "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
+                                   "                      capture_output=True, text=True)\n"
+                                   "    assert not done.stderr, done.stderr\n",
         "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
