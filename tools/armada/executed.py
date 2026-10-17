@@ -1,14 +1,19 @@
 """A pytest plugin that records, for each test file a task runs, the checkout's Python files its tests
-executed, for the test cache (`ci.py`): a file whose recorded files are unchanged since it ran green
-is not run again.
+executed and the checkout's files and directories they read, for the test cache (`ci.py`): a file
+whose recorded files are unchanged since it ran green is not run again. A read is a file opened to
+read, as Python's `open` audits it (a documentation page a test trains from, a fixture), or a
+directory listed (the pages a test globs, so a page added is a change); the import system's and
+pytest's collection's own listings are not, as what they find is recorded as it runs. `os.open`
+is wrapped so that a path it opens relative to a directory descriptor is placed (`followed.opening`).
+Hidden directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
-A Python child a test file starts records itself as it exits (`followed`), and its files, reads and
-GPU pool join the file's record. Any other process start runs code no event sees, so its record says
-so, and the cache never skips it; but for the native tools Dew and its tests ask about the host
-(`followed.TOOLS`), which run none of the checkout's code.
+A Python child a test file starts records what it executes and reads as it exits (`followed`), and
+its files, its reads of the backend and its GPU pool join the file's record. Any other process start
+runs code no event sees, so its record says so, and the cache never skips it; but for the native
+tools Dew and its tests ask about the host (`followed.TOOLS`), which run none of the checkout's code.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
@@ -95,6 +100,11 @@ def conftest(name: str) -> bool:
 
 
 def audited(event, args):
+    if event in followed.READS:
+        read = followed.read(event, args, sys._getframe(1).f_code.co_filename, root)
+        if read is not None:
+            current[-1].add(read)
+        return
     kind = followed.start(event, args, str(children)) if running else None
     if kind == "followed":
         starts[running[-1]] = starts.get(running[-1], 0) + 1
@@ -111,6 +121,7 @@ followed.installed()
 os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
+followed.opening(lambda read: current[-1].add(read), root)
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
