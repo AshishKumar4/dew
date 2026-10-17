@@ -355,7 +355,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
             self.g_proj = Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision, name='g_proj')
+                                dtype=self.dtype, precision=self.precision, name='g_proj')
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(

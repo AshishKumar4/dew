@@ -264,7 +264,7 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
             nn.Sequential([
                 LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
                 Dense(features=self.projections()[f'fusion_{s}'][1], dtype=self.dtype,
-                         precision=self.precision),
+                      precision=self.precision),
             ], name=f"fusion_{s}") for s in decoder_stages
         ]
         self.decoder_blocks = [self.stage_blocks(s, "decoder") for s in decoder_stages]
@@ -285,13 +285,13 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
         self.conditioning = self._conditioning(self.emb_features[0])
         self.cond_projs = [
             Dense(features=self.projections()[f'cond_proj_stage{i}'][1], dtype=self.dtype,
-                     precision=self.precision, name=f"cond_proj_stage{i}")
+                  precision=self.precision, name=f"cond_proj_stage{i}")
             for i in range(num_stages)
         ]
         # Per-stage text streams (dims differ per stage)
         self.txt_embeds = [
             Dense(features=self.projections()[f'txt_embed_stage{i}'][1], dtype=self.dtype,
-                     precision=self.precision, name=f"txt_embed_stage{i}")
+                  precision=self.precision, name=f"txt_embed_stage{i}")
             for i in range(num_stages)
         ]
 

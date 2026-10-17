@@ -106,7 +106,7 @@ class MuseGlimmerProjectorModule(nn.Module):
                                  activation_after=True, dtype=self.dtype, precision=self.precision,
                                  name="adapter")(image_features)
         projected = Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.precision,
-                             name="projection")(adapted)
+                          name="projection")(adapted)
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
 
 

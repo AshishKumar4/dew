@@ -251,7 +251,7 @@ class JepaPredictor(_JepaStackOptions):
 
     def setup(self):
         self.proj_in = Dense(features=self.predictor_features, dtype=self.dtype,
-                                precision=self.precision, name="proj_in")
+                             precision=self.precision, name="proj_in")
         self.mask_token = self.param(
             "mask_token", nn.initializers.normal(0.02), (1, 1, self.predictor_features))
         stack = FactorizedTokenStack if self.factorized else TokenStack
@@ -261,7 +261,7 @@ class JepaPredictor(_JepaStackOptions):
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
         self.proj_out = Dense(features=self.emb_features, dtype=self.dtype,
-                                 precision=self.precision, name="proj_out")
+                              precision=self.precision, name="proj_out")
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):
         """Map context embeddings [B, (T,) N_ctx, F] to predictions [B, (T,) N_tgt, F]."""

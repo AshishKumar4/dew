@@ -218,7 +218,7 @@ class AltUpLayer(nn.Module):
         self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
         self.prediction_coefs = coefficients(maps['prediction_coefs'][1], name='prediction_coefs')
         self.modality_router = Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
-                                        precision=self.precision, name='modality_router')
+                                     precision=self.precision, name='modality_router')
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 
     def modalities(self, x):

@@ -7,17 +7,25 @@ which sums its gradient at fp32, and the sum rounds back to the product's
 dtype. A layer given its own `dot_general` keeps that product's result, which
 Dew's fp32-result products (`fp32_result_dot_general`, `head_dot_general`)
 already widen, the bias summed at fp32 with them.
+
+Each call runs flax's own body (`inspect.unwrap` of its method) inside this
+one: calling `super().__call__` would enter flax's method wrapper a second
+time, and every method interceptor (an adapter, an input quantization) would
+run twice on one layer.
 """
+
+import inspect
 
 import jax
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import PromoteDtypeFn
+from flax.typing import Array
 
 from .precision import fp32_bias, product_dtype
 
 
-def _rounded_back(layer: nn.Dense | nn.DenseGeneral, inputs: jax.Array, summed: jax.Array) -> jax.Array:
+def _rounded_back(layer: nn.Dense | nn.DenseGeneral, inputs: Array, summed: jax.Array) -> jax.Array:
     """`summed` rounded to the dtype `layer`'s own product gives it, unless it multiplies by a
     product of its own, whose result stands."""
     if layer.dot_general is not None or layer.dot_general_cls is not None:
@@ -25,13 +33,18 @@ def _rounded_back(layer: nn.Dense | nn.DenseGeneral, inputs: jax.Array, summed: 
     return summed.astype(product_dtype(inputs, layer.param_dtype, layer.dtype))
 
 
+_DENSE = inspect.unwrap(nn.Dense.__call__)
+_DENSE_GENERAL = inspect.unwrap(nn.DenseGeneral.__call__)
+
+
 class Dense(nn.Dense):
     """Flax's Dense, its bias gradient accumulated at fp32 (the module docstring)."""
 
     promote_dtype: PromoteDtypeFn = fp32_bias(promote_dtype)
 
-    def __call__(self, inputs: jax.Array) -> jax.Array:
-        return _rounded_back(self, inputs, super().__call__(inputs))
+    @nn.compact
+    def __call__(self, inputs: Array) -> jax.Array:
+        return _rounded_back(self, inputs, _DENSE(self, inputs))
 
 
 class DenseGeneral(nn.DenseGeneral):
@@ -39,5 +52,6 @@ class DenseGeneral(nn.DenseGeneral):
 
     promote_dtype: PromoteDtypeFn = fp32_bias(promote_dtype)
 
-    def __call__(self, inputs: jax.Array) -> jax.Array:
-        return _rounded_back(self, inputs, super().__call__(inputs))
+    @nn.compact
+    def __call__(self, inputs: Array) -> jax.Array:
+        return _rounded_back(self, inputs, _DENSE_GENERAL(self, inputs))

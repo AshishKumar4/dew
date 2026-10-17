@@ -102,7 +102,7 @@ class Flux2SingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
         maps = self.projections()
         projected = Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
-                             precision=self.precision, name="to_qkv_mlp_proj")(normalized)
+                          precision=self.precision, name="to_qkv_mlp_proj")(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
             part.reshape(heads) for part in jnp.split(projected[..., : 3 * inner], 3, axis=-1)
@@ -119,7 +119,7 @@ class Flux2SingleBlock(nn.Module):
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
-                                            precision=self.precision, name="proj_fused")(joined)
+                                         precision=self.precision, name="proj_fused")(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),

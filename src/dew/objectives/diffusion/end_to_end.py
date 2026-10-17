@@ -156,7 +156,7 @@ class PatchDiscriminator(nn.Module):
     def __call__(self, images: jax.Array, batch: Batch) -> jax.Array:
         def conv(features: int, stride: int, name: str, *, bias: bool = True) -> Conv:
             return Conv(features, (4, 4), strides=stride, padding=1, use_bias=bias, name=name,
-                           kernel_init=nn.initializers.normal(0.02))
+                        kernel_init=nn.initializers.normal(0.02))
 
         hidden = nn.leaky_relu(conv(self.width, 2, "conv_0")(images), 0.2)
         for index in range(1, self.layers + 1):
