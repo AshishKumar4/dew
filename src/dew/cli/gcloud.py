@@ -123,12 +123,27 @@ class Gcloud:
             raise SystemExit(outcome.text or f"{argv[0]} failed with code {outcome.code}")
         return outcome
 
-    def json(self, *args: str, default: JSON = None) -> JSON:
-        """Run a gcloud command that speaks JSON and parse it."""
-        outcome = self.run(self.argv(*args, "--format=json"))
-        if not outcome.ok or not outcome.out.strip():
-            return default
-        return json.loads(outcome.out)
+    def json(self, *args: str) -> JSON:
+        """Run a gcloud command that speaks JSON and parse it: None in a dry run, which prints the
+        command instead. A failed command stops dew with gcloud's message, as an answer of nothing
+        would read as nothing there (an authentication failure as no TPUs)."""
+        outcome = self.run(self.argv(*args, "--format=json"), check=True)
+        return json.loads(outcome.out) if outcome.out.strip() else None
+
+    def nodes(self, zone: str) -> list[Node]:
+        """The TPUs `zone` lists: none in a dry run. A TPU absent from a listing gcloud gave is not
+        there, which a failed describe cannot say apart from gcloud failing."""
+        payload = self.json("compute", "tpus", "tpu-vm", "list", f"--zone={zone}")
+        if payload is None:
+            return []
+        if not isinstance(payload, list):
+            raise ValueError(f"gcloud listed {payload!r} in {zone}, which is not a list of TPU records")
+        nodes = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise ValueError(f"gcloud listed {entry!r} in {zone}, which is not a TPU record")
+            nodes.append(Node.parse(entry))
+        return nodes
 
     def config_value(self, name: str) -> str:
         """Read one value from the local gcloud config.
@@ -227,9 +242,9 @@ class Tpu:
         return self.vm(*args)
 
     def describe(self) -> Node | None:
-        payload = self.gcloud.json(
-            "compute", "tpus", "tpu-vm", "describe", self.name, f"--zone={self.zone}")
-        return Node.parse(payload) if isinstance(payload, dict) and payload else None
+        """This TPU as its zone lists it, or None where the zone has none of its name: not created
+        yet, or deleted."""
+        return next((node for node in self.gcloud.nodes(self.zone) if node.name == self.name), None)
 
     def fanout(self, jobs: Sequence[tuple[int, str]], *, capture: bool = False,
                ssh_flags: Sequence[str] = ()) -> list[Result]:

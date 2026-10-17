@@ -117,10 +117,7 @@ def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) 
         return cached or cfg.zones[0]
     order = cfg.zones if not cached else (cached, *(z for z in cfg.zones if z != cached))
     for zone in order:
-        found = gcloud.run(gcloud.argv(
-            "compute", "tpus", "tpu-vm", "describe", name,
-            f"--zone={zone}", "--format=value(name)"))
-        if found.ok:
+        if any(node.name == name for node in gcloud.nodes(zone)):
             config.cache_zone(name, zone)
             return zone
     config.forget_zone(name)
@@ -440,17 +437,9 @@ class List(Base):
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
         zones = cfg.zones if self.zone in (None, "all") else (self.zone,)
-        rows = []
-        for zone in zones:
-            payload = gcloud.json("compute", "tpus", "tpu-vm", "list",
-                                  f"--zone={zone}", default=[])
-            for entry in payload if isinstance(payload, list) else ():
-                if not isinstance(entry, dict):
-                    raise ValueError(f"gcloud listed {entry!r}, which is not a TPU record")
-                node = Node.parse(entry)
-                rows.append((node.name, node.accelerator_type, node.state,
-                             node.health or "-", str(node.workers), zone,
-                             "yes" if node.spot else "-", next(iter(node.ips), "") or "-"))
+        rows = [(node.name, node.accelerator_type, node.state, node.health or "-", str(node.workers), zone,
+                 "yes" if node.spot else "-", next(iter(node.ips), "") or "-")
+                for zone in zones for node in gcloud.nodes(zone)]
         if not rows:
             emit(f"no TPUs in {', '.join(zones)}")
             return 0
