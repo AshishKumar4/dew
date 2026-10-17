@@ -1020,14 +1020,14 @@ def glm5_native_export_case(variant):
 
 
 @pytest.mark.parametrize(("fixture", "changed"), [
-    ("gemma4-native-tiny", {"v_norm": False}),
-    ("gemma4-native-tiny", {"qk_norm_scope": "full"}),
-    ("gemma4-native-tiny", {"embedding_scale": False}),
+    ("gemma4-ple", {"v_norm": False}),
+    ("gemma4-ple", {"qk_norm_scope": "full"}),
+    ("gemma4-ple", {"embedding_scale": False}),
     ("gemma4-moe-tiny", {"mixture.capacity_factor": 1.25}),
     ("glm5-next-tiny", {"sandwich_norms": True}),
     ("glm5-next-tiny", {"mlp": "geglu"}),
     ("glm5-next-tiny", {"mixture.bias": False}),
-    ("gemma4-native-tiny", {"scale_after_cast": True}),
+    ("gemma4-ple", {"scale_after_cast": True}),
     ("glm5-next-tiny", {"layer_scalar": "frozen"}),
 ])
 def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, changed):
@@ -1038,14 +1038,16 @@ def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, ch
     from dew.interop.hf_decoders import export_config
 
     loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
-    model = loaded.model
+    # Gemma 4 exports its layer scalars as frozen or trainable, which a loaded model leaves open.
+    exportable = loaded.model.clone(layer_scalar="frozen") if fixture.startswith("gemma4") else loaded.model
+    model = exportable
     for name, value in changed.items():
         if name.startswith("mixture."):
             routed = dataclasses.replace(model.mixture, **{name.removeprefix("mixture."): value})
             model = model.clone(mixture=routed)
         else:
             model = model.clone(**{name: value})
-    export_config(loaded.model)
+    export_config(exportable)
     with pytest.raises(ValueError):
         export_config(model)
     with pytest.raises(ValueError):
