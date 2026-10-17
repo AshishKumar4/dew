@@ -680,7 +680,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
     k_cumdecay = inv @ (kb_c * entering)
 
-    state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
+    # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
+    # carry varies as the operands it takes in do.
+    state = jnp.zeros_like(value, work, shape=(B, H, Dk, Dv)) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
