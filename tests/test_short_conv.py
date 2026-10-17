@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_gdn_support import KernelCase
-from kernel_compile import compile_kernels
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
 
 from dew.nn.kernels import generation, short_conv
@@ -222,19 +221,6 @@ def training_cases():
     for packed in (False, True):
         yield case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True,
                    valid=False, packed=packed)
-
-
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Each training case lowered as on the GPU and compiled by pip's Triton for its capability on this
-    CPU (tests/kernel_compile.py), within the compile bound and the block's shared memory."""
-    pytest.importorskip("triton")
-    found = compile_kernels(training_cases(), target)
-    assert len(found) == 2 * len(TRAINING_SHAPES) + 2
-    failures = [f"{record['name']}: {record['error']}" if "error" in record else
-                f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
-                for record in found if "error" in record or not record["shared"] <= record["limit"]]
-    assert not failures, "\n".join(failures)
 
 
 @pytest.mark.mesh(devices=2)

@@ -132,6 +132,28 @@ def test_an_engine_error_is_an_event_that_decides_the_session(refused, status):
     assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is status
 
 
+@pytest.mark.parametrize(
+    ("traces", "exception", "harness_exit"),
+    [
+        # An engine failure beside an overflow, in either order.
+        ([refusal("EngineCore died", 500), overflow("vllm")], None, None),
+        ([overflow("sglang"), refusal("EngineCore died", 500)], None, None),
+        # An aborted call, then the harness's retry overflowing.
+        ([trace([1, 2], [3], [-0.5], "abort"), overflow("vllm")], None, None),
+        # A model client that failed, in a trial that also timed out.
+        ([trace([1, 2], [3], [-0.5])], "AgentTimeoutError", "APIConnectionError"),
+    ],
+)
+def test_an_infrastructure_failure_outranks_a_limit_the_trial_also_hit(traces, exception, harness_exit):
+    """The scheduler retries an infra session and may train a truncated one, so
+    a trial the infrastructure broke is infra even where it also overflowed or
+    ran out of time."""
+    recorded = calls([{**entry, "timestamp": 1.0 + index} for index, entry in enumerate(traces)], unstamped=0)
+    status, *_ = outcome(result(exception, rewards={"reward": 0}), recorded.calls, errors=recorded.errors,
+                         harness_exit=harness_exit)
+    assert status is Status.INFRA_ERROR
+
+
 def result(exception=None, rewards=None):
     return {
         "exception_info": {"exception_type": exception, "exception_message": "boom"} if exception else None,

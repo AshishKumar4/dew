@@ -78,6 +78,18 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
     return (*types[:-1], 'full_attention') if last_full and types else types
 
 
+GEMMA4_ROPE = {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000.0},
+               'full_attention': {'rope_type': 'proportional', 'partial_rotary_factor': 0.25,
+                                  'rope_theta': 1000000.0}}
+"""The records Gemma4TextConfig and DiffusionGemmaTextConfig install when
+rope_parameters is absent or null (configuration_gemma4.py:203-208)."""
+
+GEMMA4_DEFAULTS = {'hidden_activation': 'gelu_pytorch_tanh', 'head_dim': 256, 'num_key_value_heads': 4,
+                   'sliding_window': 512}
+"""The class defaults Gemma 4's text configs share where Dew's readers would
+otherwise fall back to another value (configuration_gemma4.py:152-183)."""
+
+
 def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, float | None]:
     """Return (rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
 
@@ -335,7 +347,8 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             full_kv = records.integer(global_kv, 'num_global_key_value_heads')
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
-    entries = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    stated = hf_config.get('rope_parameters')
+    entries = GEMMA4_ROPE if stated is None else records.record(stated, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
     per_layer = records.integer(
@@ -605,6 +618,8 @@ GEMMA4_TEXT = DecoderFamily(
     packed=FUSED_EXPERTS,
     export_weights=gemma4_export_weights,
     preserve_source_layout=True,
+    defaults={**GEMMA4_DEFAULTS, 'hidden_size_per_layer_input': 256,
+              'vocab_size_per_layer_input': 262144},
 )
 
 GEMMA3_TEXT = DecoderFamily(
