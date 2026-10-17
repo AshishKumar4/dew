@@ -53,7 +53,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _workers
+from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
@@ -673,7 +673,8 @@ def _compile_phases(
         end = None if until is None else until * phase.build.batch
         staged.append((phase, end))
         if end is not None:
-            _delivered(pipeline, end - previous, consumed)
+            # The phase as it reads: its members a memory read kept, at the shares the lowering mixes.
+            _delivered(phase.train, end - previous, consumed)
             previous = end
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
@@ -730,7 +731,8 @@ def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None
     if isinstance(source, Phases):
         raise ValueError("nested phases have no single corpus share")
     if isinstance(source, Mixture):
-        weights = tuple(weight / sum(source.weights) for weight in source.weights)
+        lowered = _weights(source)
+        weights = tuple(weight / sum(lowered) for weight in lowered)
         for child, taken in zip(source.pipelines, weight_counts(weights, count), strict=True):
             _delivered(child, taken, consumed)
     else:

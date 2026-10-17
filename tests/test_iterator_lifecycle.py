@@ -250,7 +250,7 @@ def test_chain_statistics_count_the_records_every_worker_read():
     from dew.data.pipeline import Pipeline
 
     rows = [{"i": np.int32(index)} for index in range(24)]
-    chain = Pipeline(Memory(rows), name="rows").repeat(1).filter_map(reject_thirds).batch(2)
+    chain = Pipeline(Memory(rows, shard_rows=4), name="rows").repeat(1).filter_map(reject_thirds).batch(2)
     data = compile(chain, read="streamed", loading=Loading(workers=2, threads=1, read_buffer=1,
                                                            worker_buffer=1))
     reader = data.train(DataPartition())
