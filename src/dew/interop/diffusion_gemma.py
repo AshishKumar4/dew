@@ -120,10 +120,10 @@ def translate_weights(
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
-        tower_variables = vision_variables("gemma4", vision, param_dtype)
+        tower_variables, _ = vision_variables("gemma4", vision, param_dtype)
         params["conditioner"] = {
             "tower": tower_variables["params"],
-            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)}
+            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)[0]}
         if "constants" in tower_variables:
             variables.setdefault("constants", {})["conditioner"] = {"tower": tower_variables["constants"]}
     elif vision or projection:
