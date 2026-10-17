@@ -1002,6 +1002,33 @@ def image_flow():
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
 
 
+def test_an_int8_autoguidance_guide_walks_as_the_host_does():
+    """A float denoiser guided by a copy of itself quantized to int8 (`Autoguidance`) walks a prompt's
+    latents as the same task does on the host: the walk compiles for the guide's int8 products too.
+    With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(autoguidance_flow)
+
+
+def autoguidance_flow():
+    import tempfile
+
+    from dew.sampling.guidance import Autoguidance
+
+    with tempfile.TemporaryDirectory() as root:
+        task = flux_source(Path(root))
+    guide = task.quantized(Quantization(patterns=FLUX_BLOCKS))
+    prepared, held, guided = jax.device_get((task.prepare("a red bird", key=0, steps=2), task.variables,
+                                             guide.variables["params"]))
+
+    def run(dtype):
+        walked = dataclasses.replace(task, model=task.model.clone(dtype=dtype),
+                                     variables=placed({**held, "guide": {"params": guided}}, dtype))
+        guidance = Autoguidance(scale=2.0, model=guide.model.clone(dtype=dtype))
+        return walked(placed(prepared, dtype), steps=2, key=1, decode=False, guidance=guidance).host().latents
+
+    assert_computed_as_on_the_host(run, "an int8 guide's latents")
+
+
 def test_an_int8_decision_task_answers_as_the_host_does():
     """`Decide` over a backbone quantized to int8 gives each option the probability the same task
     gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
@@ -1037,6 +1064,34 @@ def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
 
 
 def training_flow():
+    assert_step_moves_by_the_hosts_gradient()
+
+
+def test_an_int8_training_step_on_xla_default_options_moves_the_weights_by_the_hosts_gradient():
+    """A run whose recorded plan compiles its step under XLA's default options, the planner's half
+    rung, keeps the options its int8 products need to compute right: one SGD step moves the weights
+    by the host's gradient. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(training_on_xla_default_options_flow)
+
+
+def training_on_xla_default_options_flow():
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as records:
+        os.environ["DEW_RUNG_RECORDS"] = records
+        assert_step_moves_by_the_hosts_gradient()
+        [path] = Path(records).glob("*.json")
+        stored = json.loads(path.read_text())
+        assert not stored["rung"]["xla_defaults"]
+        path.write_text(json.dumps({**stored, "rung": {**stored["rung"], "xla_defaults": True}}))
+        assert_step_moves_by_the_hosts_gradient()
+        assert json.loads(path.read_text())["rung"]["xla_defaults"], "the run planned its own rung"
+
+
+def assert_step_moves_by_the_hosts_gradient():
+    """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
+    of its loss the host computes."""
     from dew.config.data import RecordsData, loader
     from dew.data import Loading
     from dew.training.trainer import Trainer
