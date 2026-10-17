@@ -192,6 +192,42 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     np.testing.assert_allclose(actual, np.load(FIXTURES / name / "logits.npy"), atol=1e-4, rtol=0)
 
 
+@pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
+def test_an_expert_schedule_that_routes_no_layer_loads_as_the_dense_model_the_reference_builds(
+        tmp_path, family):
+    """A Qwen3-MoE whose mlp_only_layers cover every layer, or a DeepSeek-V3 whose dense layers are
+    all of them (with no expert count at all), is a dense model to the reference, which builds a
+    plain MLP on each layer; it loads as that model, to the reference's logits."""
+    import torch
+    from transformers import DeepseekV3Config, DeepseekV3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    torch.manual_seed(0)
+    if family == "qwen3_moe":
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+            vocab_size=64, hidden_size=32, intermediate_size=48, moe_intermediate_size=16,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=8, num_experts=4,
+            num_experts_per_tok=2, mlp_only_layers=[0, 1], tie_word_embeddings=False))
+    else:
+        model = DeepseekV3ForCausalLM(DeepseekV3Config(
+            vocab_size=64, hidden_size=32, intermediate_size=48, moe_intermediate_size=16,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4, q_lora_rank=None,
+            kv_lora_rank=16, qk_rope_head_dim=8, qk_nope_head_dim=8, v_head_dim=8, first_k_dense_replace=2,
+            tie_word_embeddings=False))
+    model.eval()
+    model.save_pretrained(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    if family == "deepseek_v3":
+        del config["n_routed_experts"]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    ids = np.arange(12, dtype=np.int32).reshape(1, 12) % 64
+    with torch.no_grad():
+        expected = model(torch.tensor(ids, dtype=torch.long)).logits.float().numpy()
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    assert loaded.model.mixture is None
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+
+
 def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     """The rotary rule, on the release's own geometry and without its
     weights: `Olmo3RotaryEmbedding` calls `ROPE_INIT_FUNCTIONS['yarn']` for
