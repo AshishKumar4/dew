@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Generic, Self
 
 import jax.numpy as jnp
@@ -40,13 +41,14 @@ from dew.nn.text_encoders import (
     translate_t5_config,
 )
 from dew.objectives.base import FROZEN, Variables
-from dew.registry import dtype_name, encoders, resolve_dtype
+from dew.registry import dtype_name, encoders, import_path, resolve_dtype
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
     from transformers import PreTrainedTokenizerBase
 
     from dew.data.processors import AutoAudioProcessor
+    from dew.data.text import PinnedTokenizer
 
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
@@ -126,6 +128,11 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     def to_json(self) -> dict:
         """Return the keyword fields that `from_pretrained` rebuilds this encoder from."""
 
+    def dependencies(self) -> Mapping[str, object]:
+        """What `tokenize` makes of raw data depends on: the encoder and the fields it is
+        rebuilt from, which hold its context length and its checkpoint's revision."""
+        return {"class": import_path(type(self)), "fields": self.to_json()}
+
 
 def rebuild(name: str, fields: Mapping[str, object], *,
             params: Variables | None = None) -> ConditionEncoder:
@@ -143,6 +150,15 @@ def rebuild(name: str, fields: Mapping[str, object], *,
         raise ValueError(f"the {name} record names no checkpoint to rebuild from")
     rest = {key: value for key, value in fields.items() if key != "checkpoint"}
     return encoders[name].from_pretrained(checkpoint, **rest, params=params)
+
+
+def _pinned_tokenizer(checkpoint: str, revision: str | None) -> PinnedTokenizer:
+    """A text tower's tokenizer files resolved once (`pin_tokenizer`): a local directory as it is,
+    a Hub repo at `revision`, so the tokenizer read and its recorded hashes are one set of files."""
+    from dew.data.text import pin_tokenizer
+
+    hub = revision is not None and not Path(checkpoint).is_dir()
+    return pin_tokenizer(f"{checkpoint}@{revision}" if hub else checkpoint)
 
 
 @dataclass(frozen=True, eq=False)
@@ -166,6 +182,8 @@ class _TextTower(ConditionEncoder[str, TextContext]):
     transformer: CLIPTextTransformer | T5EncoderTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
+    tokenizer_files: PinnedTokenizer
+    """The files `tokenizer` was read from, resolved once (`_pinned_tokenizer`)."""
     dtype: Dtype | None = None
 
     revision: str | None = None
@@ -194,6 +212,11 @@ class _TextTower(ConditionEncoder[str, TextContext]):
     def recorded(self) -> dict:
         """The fields this tower records beyond the ones every tower has."""
         return {}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the tokenizer files it reads, so a tokenizer
+        that moved under an unpinned checkpoint name changes the identity too."""
+        return {**super().dependencies(), "tokenizer": self.tokenizer_files.snapshot}
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.context,
@@ -239,13 +262,12 @@ class CLIPText(_TextTower):
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
                         revision: str | None = None, param_dtype: str = "float32",
                         params: Variables | None = None) -> CLIPText:
-        from dew.data.text import load_tokenizer
-
         dtype = resolve_dtype(dtype)
         transformer, variables = bind_text_tower("CLIP text", translate_config, _text_path, checkpoint,
                                                  revision, params, dtype, param_dtype)
+        pinned = _pinned_tokenizer(checkpoint, revision)
         return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
-                   tokenizer=load_tokenizer(checkpoint, revision=revision),
+                   tokenizer=pinned.transformers(), tokenizer_files=pinned,
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property
@@ -273,13 +295,12 @@ class T5Text(_TextTower):
                         revision: str | None = None,
                         max_length: int = 256, param_dtype: str = "float32",
                         params: Variables | None = None) -> T5Text:
-        from dew.data.text import load_tokenizer
-
         dtype = resolve_dtype(dtype)
         transformer, variables = bind_text_tower("T5", translate_t5_config, _t5_path, checkpoint, revision,
                                                  params, dtype, param_dtype, validate=t5_embedding)
+        pinned = _pinned_tokenizer(checkpoint, revision)
         return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
-                   tokenizer=load_tokenizer(checkpoint, revision=revision),
+                   tokenizer=pinned.transformers(), tokenizer_files=pinned,
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property
