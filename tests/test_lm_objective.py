@@ -18,13 +18,12 @@ import numpy as np
 import optax
 import pytest
 from affine_run import dataset
-from flax import linen as nn
 from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
-from dew.nn.inputs import coordinates
-from dew.nn.protocols import OutputTable
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
@@ -44,64 +43,16 @@ STEPS = 200
 TINY = 64
 
 
-class TinyCausalLM(nn.Module):
-    """A small causal transformer, standing in for `causal_transformer`.
-
-    Same contract as the real backbone: int32 ids `[B, S]` in, float32 logits
-    `[B, S, vocab]` out, `train` gating dropout, no path from a position to a
-    later one, and the head split off behind `hidden_states` and
-    `output_table` so the loss can score a vocabulary slice at a time. The
-    head carries no bias, so the table's product is the whole projection.
-    """
-
-    vocab_size: int
-    emb_features: int = 16
-    num_layers: int = 2
-    max_seq_len: int = 64
-    dropout_rate: float = 0.0
-    final_logit_softcap: float | None = None
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.float32,
-                                name="lm_head")
-
-    def __call__(self, tokens, train: bool = False, **packing):
-        logits = self.lm_head(self.hidden_states(tokens, train=train, **packing))
-        if self.final_logit_softcap is not None:
-            cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
-            logits = cap * jnp.tanh(logits / cap)
-        return logits.astype(jnp.float32)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
-        length = tokens.shape[1]
-        positions = self.param("positions", nn.initializers.normal(0.02),
-                               (self.max_seq_len, self.emb_features))
-        x = nn.Embed(self.vocab_size, self.emb_features)(tokens) + positions[:length]
-        causal = jnp.tril(jnp.ones((length, length), bool))
-        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
-
-        for _ in range(self.num_layers):
-            h = nn.LayerNorm()(x)
-            query = nn.Dense(self.emb_features)(h)
-            key = nn.Dense(self.emb_features)(h)
-            value = nn.Dense(self.emb_features)(h)
-            scores = query @ jnp.swapaxes(key, -1, -2) / np.sqrt(self.emb_features)
-            attention = jax.nn.softmax(jnp.where(causal, scores, -1e9), axis=-1)
-            x = x + dropout(nn.Dense(self.emb_features)(attention @ value))
-
-            h = nn.LayerNorm()(x)
-            x = x + nn.Dense(self.emb_features)(nn.gelu(nn.Dense(2 * self.emb_features)(h)))
-
-        return nn.LayerNorm()(x)
-
-    def output_table(self):
-        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False,
-                           softcap=self.final_logit_softcap)
+def tiny_decoder(**options):
+    """The native decoder at test size: two layers of 16 features in float32,
+    attention through XLA so the CPU runs the same kernel everywhere."""
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=64, dtype="float32", attention_impl="xla",
+                             **options)
 
 
 def make_objective(seq=SEQ, model=None, **kwargs):
-    return LMObjective(model or TinyCausalLM(vocab_size=VOCAB), seq, **kwargs)
+    return LMObjective(model or tiny_decoder(), seq, **kwargs)
 
 
 def step_at(index=0, key=1, ema=None):
@@ -157,6 +108,25 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     assert abs(expected - unshifted) > 1e-3
 
 
+@pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
+def test_the_validity_the_decoder_reads_decides_which_targets_count(given):
+    """Three tokens whose last is marked invalid, by the attention mask or
+    by the coordinates' validity the decoder reads: the loss is the cross
+    entropy of the one target between valid tokens, which the model gives
+    the row of its first token alone."""
+    objective = make_objective(seq=2)
+    params = objective.init(jax.random.key(0))
+    ids = jnp.asarray([[3, 5, 7]], jnp.int32)
+    valid = jnp.asarray([[True, True, False]])
+    batch = ({TEXT_KEY: ModelInputs(ids, {"attention_mask": valid})} if given == "attention_mask"
+             else {TEXT_KEY: ids, "text_coordinates": coordinates(valid=valid)})
+
+    loss, _ = objective.scalar_loss(params, batch, step_at())
+
+    logits = objective.model.apply(params, ids[:, :1])
+    assert float(loss) == pytest.approx(reference_cross_entropy(logits, np.asarray(ids[:, 1:2])), rel=1e-5)
+
+
 def test_padded_targets_are_left_out_of_the_average():
     pad_id = 0
     objective = make_objective(pad_id=pad_id)
@@ -195,7 +165,7 @@ def test_aux_reports_perplexity_and_token_accuracy():
 def test_dropout_runs_on_the_step_key():
     """The loss passes the step key as the dropout rng, so a model with
     dropout is stochastic across keys and reproducible under one."""
-    objective = make_objective(model=TinyCausalLM(vocab_size=VOCAB, dropout_rate=0.5))
+    objective = make_objective(model=tiny_decoder(dropout_rate=0.5))
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
@@ -276,7 +246,6 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
 # --- evaluation ------------------------------------------------------------
 
 def test_evaluation_correctness_is_the_same_full_forward_argmax():
-    from dew.nn.backbones import CausalTransformer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=8, attention_impl="reference")
@@ -333,7 +302,6 @@ def test_scoring_with_samples_configured_does_not_decode():
 
 
 def test_preview_generates_reproducible_text_from_ema():
-    from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
@@ -421,44 +389,8 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
 
 # --- packed batches --------------------------------------------------------
 
-class PackedTinyLM(TinyCausalLM):
-    """TinyCausalLM that honours the packing arguments the real backbone takes.
-
-    The loss reads `hidden_states`, so that is where the packing arguments
-    have to arrive; `__call__` forwards them, as `CausalTransformer` does.
-    """
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False, positions=None,
-                      segment_ids=None, coordinates=None):
-        if coordinates is not None:
-            positions, segment_ids = coordinates.positions, coordinates.segments
-        length = tokens.shape[1]
-        table = self.param("positions", nn.initializers.normal(0.02),
-                           (self.max_seq_len, self.emb_features))
-        index = jnp.arange(length) if positions is None else positions
-        x = nn.Embed(self.vocab_size, self.emb_features)(tokens) + table[index]
-        mask = jnp.tril(jnp.ones((length, length), bool))[None]
-        if segment_ids is not None:
-            mask = mask & ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                           & (segment_ids[:, :, None] != 0))
-        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
-
-        for _ in range(self.num_layers):
-            h = nn.LayerNorm()(x)
-            query, key, value = (nn.Dense(self.emb_features)(h) for _ in range(3))
-            scores = query @ jnp.swapaxes(key, -1, -2) / np.sqrt(self.emb_features)
-            attention = jax.nn.softmax(jnp.where(mask, scores, -1e9), axis=-1)
-            x = x + dropout(nn.Dense(self.emb_features)(attention @ value))
-
-            h = nn.LayerNorm()(x)
-            x = x + nn.Dense(self.emb_features)(nn.gelu(nn.Dense(2 * self.emb_features)(h)))
-
-        return nn.LayerNorm()(x)
-
-
 def packed_objective(seq=SEQ, **kwargs):
-    return LMObjective(PackedTinyLM(vocab_size=VOCAB), seq, **kwargs)
+    return LMObjective(tiny_decoder(), seq, **kwargs)
 
 
 def documents(first=7, second=3, seq=SEQ):
@@ -710,7 +642,6 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     """The term is the coefficient times each router's squared logsumexp of
     its gate logits, averaged over the positions it routed and summed over
     routers, beside the cross entropy and not inside its token mean."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
@@ -755,7 +686,6 @@ def vocabulary_products(jaxpr, vocab: int) -> int:
 def head_scored(vocab: int, **options):
     """A two-layer decoder whose untied head spans `vocab` columns, and two
     9-token rows of its ids, for the tests that count the head's products."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
                               max_seq_len=8, tie_embeddings=False, qk_norm=False, attention_impl="reference",
                               **options)

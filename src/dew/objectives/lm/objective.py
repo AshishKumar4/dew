@@ -45,7 +45,7 @@ from dew.inference.tasks import Processor, recorded_processor, recorded_tokenize
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
-from dew.nn.inputs import Coordinates, ModelInputs
+from dew.nn.inputs import COORDINATES_FIELD, Coordinates, ModelInputs, real_slots, token_layout
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
@@ -274,11 +274,11 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
     `segment_ids` and `positions`. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
-    the packing off what this returns (`documents_of`).
+    the packing off what this returns (`dew.nn.inputs.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
-                                                 ("coordinates", coordinates))
+                                                 (COORDINATES_FIELD, coordinates))
                if column is not None}
     for name in columns:
         if name in prepared.token_fields:
@@ -346,15 +346,6 @@ def batch_text(batch) -> ModelInputs:
                          f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
-
-
-def documents_of(fields: Mapping[str, jax.Array | Coordinates]) -> jax.Array | None:
-    """The document of each token the token fields name: their coordinates'
-    segments, or a rollout's `segment_ids`; None for rows of one document."""
-    laid, segments = fields.get("coordinates"), fields.get("segment_ids")
-    if isinstance(laid, Coordinates):
-        return laid.segments
-    return None if isinstance(segments, Coordinates) else segments
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
@@ -697,26 +688,22 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
         return None
 
-    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-        """The host's tokens, attention mask and documents: the fields the loss reads."""
+    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
+        """The host's tokens and their fields, a packed batch's coordinates
+        among them: what the loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        fields = prepared.token_fields
         laid = batch.get("text_coordinates")
-        documents = laid.segments if isinstance(laid, Coordinates) else documents_of(fields)
-        mask = fields.get("attention_mask")
-        return (np.asarray(prepared.tokens), None if mask is None else np.asarray(mask, bool),
-                None if documents is None else np.asarray(documents))
+        fields = prepared.token_fields if laid is None else {**prepared.token_fields, COORDINATES_FIELD: laid}
+        return np.asarray(prepared.tokens), fields
 
     def _counted_tokens(self, batch: Batch):
         """Host input geometry: each real token, and the documents."""
-        tokens, mask, documents = self._token_geometry(batch)
-        valid = np.ones(tokens.shape, bool) if self.pad_id is None else tokens != self.pad_id
-        if mask is not None:
-            valid &= mask
-        if documents is not None:
-            valid &= documents != 0
-        return valid, documents
+        tokens, fields = self._token_geometry(batch)
+        valid = real_slots(fields, tokens.shape, xp=np)
+        if self.pad_id is not None:
+            valid = valid & (tokens != self.pad_id)
+        return valid, token_layout(fields, xp=np)[1]
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real input lengths, each packed document its own attention square.
@@ -779,7 +766,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         would join across pad holes.
         """
         valid, documents = self._counted_tokens(batch)
-        tokens, mask, _ = self._token_geometry(batch)
+        tokens, fields = self._token_geometry(batch)
+        mask, _ = token_layout(fields, xp=np)
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
@@ -801,9 +789,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""
-        tokens, mask, documents = self._token_geometry(batch)
-        return np.sum(self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth), axis=-1,
-                      dtype=np.int64)
+        tokens, fields = self._token_geometry(batch)
+        scored = self._scored(np, tokens, *token_layout(fields, xp=np), self._batch_roles(batch, np), depth)
+        return np.sum(scored, axis=-1, dtype=np.int64)
 
     def __init__(
         self,
@@ -1061,20 +1049,17 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
         with `loss_role` one role's targets alone."""
-        fields = prepared.token_fields
         if roles is not None and roles.shape != prepared.tokens.shape:
             raise ValueError(
                 f"text_roles has shape {tuple(roles.shape)} for "
                 f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
                 "tokens, one per token")
-        return self._scored(jnp, prepared.tokens, fields.get("attention_mask"), documents_of(fields),
-                            roles).astype(dtype)
+        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
-        fields = prepared.token_fields
-        return self._scored(jnp, prepared.tokens, fields.get("attention_mask"), documents_of(fields), roles,
+        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles,
                             depth).astype(dtype)
 
     def _scored(self, xp, tokens, mask, documents, roles, depth: int = 0):
@@ -1184,23 +1169,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark every real query whose router statistics and indexer KL count.
 
-        A query counts when its token is real, neither the pad id nor a slot
-        the `ModelInputs` attention mask leaves out, and, in a packed batch,
-        when it sits inside a document.
+        A query counts when its token is real (`real_slots`), and not the pad id.
         """
-        inputs = prepared.tokens[:, :-1]
-        weights = (jnp.ones_like(inputs, dtype) if self.pad_id is None
-                   else (inputs != self.pad_id).astype(dtype))
-        documents = documents_of(prepared.token_fields)
-        if documents is not None:
-            weights = weights * (documents[:, :-1] != 0).astype(dtype)
-        valid = prepared.token_fields.get("attention_mask")
-        if valid is not None:
-            weights = weights * valid[:, :-1].astype(dtype)
-        laid = prepared.token_fields.get("coordinates")
-        if isinstance(laid, Coordinates) and laid.valid is not None:
-            weights = weights * laid.valid[:, :-1].astype(dtype)
-        return weights
+        real = real_slots(prepared.token_fields, prepared.tokens.shape)[:, :-1]
+        if self.pad_id is not None:
+            real = real & (prepared.tokens[:, :-1] != self.pad_id)
+        return real.astype(dtype)
 
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
@@ -1342,9 +1316,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         statistics: Ratio | LMStatistics = prediction
         queries = (self._query_weights(prepared, bool)
                    & (self.row_weights(batch, weights.shape[0]) > 0)[:, None])
-        documents = documents_of(prepared.token_fields)
+        documents = token_layout(prepared.token_fields)[1]
         if alpha is not None:
-            laid = prepared.token_fields.get("coordinates")
+            laid = prepared.token_fields.get(COORDINATES_FIELD)
             statistics, reported["aux_loss"] = self._router_statistics(
                 prediction, routing, alpha, batch, queries, documents,
                 max_segments=laid.max_segments if isinstance(laid, Coordinates) else None)
