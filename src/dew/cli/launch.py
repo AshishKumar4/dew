@@ -359,8 +359,7 @@ class Launch:
         if host in LOCAL_HOSTS:
             return self.command
         script = remote_script(self.command, env, self.cwd or os.getcwd())
-        # -tt gives the remote command a terminal, so closing the connection,
-        # which stopping the pool does, delivers SIGHUP to it.
+        # -tt gives the remote shell a terminal, whose signals stop the command (`remote_script`).
         return ("ssh", "-tt", "-o", "BatchMode=yes", host, script)
 
     def tpu_pool(self) -> list[Process]:
@@ -401,12 +400,31 @@ def split_names(entries: Sequence[str]) -> tuple[str, ...]:
     return tuple(name for entry in entries for name in entry.split(",") if name)
 
 
+STOP_BYTE = "\x03"
+"""What the launcher writes to a rank's ssh to stop it: the terminal's interrupt character, which the
+line discipline of the terminal ssh -tt gives the remote shell turns into its SIGINT (`remote_script`)."""
+
+
 def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) -> str:
     """The shell line that runs `command` with `env` in `cwd` on another
-    machine; a relative `cwd` is under the login directory."""
-    assignments = "".join(f"{name}={shlex.quote(value)} " for name, value in env.items())
-    run = f"exec env {assignments}{shlex.join(command)}" if env else f"exec {shlex.join(command)}"
-    return f"cd {shlex.quote(cwd)} && {run}" if cwd else run
+    machine, a relative `cwd` under the login directory, and stops it as a
+    local rank is stopped.
+
+    The ssh that runs it gives it a terminal (-tt). The command runs in a
+    session of its own, apart from that terminal, its input /dev/null as a
+    local rank's is, and the shell waits on it, so the terminal's signals
+    reach the shell: the interrupt the launcher writes to stop the pool
+    (`STOP_BYTE`) makes the shell send the command SIGTERM, the preemption
+    notice a training run checkpoints on, and the connection stays open, its
+    output flowing, until the command exits; the connection closing, which
+    hangs the terminal up, makes the shell send it SIGHUP. The shell exits
+    with the command's code."""
+    assignments = tuple(f"{name}={value}" for name, value in env.items())
+    run = shlex.join(("env", *assignments, *command) if env else command)
+    lines = [f"cd {shlex.quote(cwd)} || exit 1"] if cwd else []
+    return "; ".join([*lines, f"setsid {run} </dev/null & rank=$!",
+                      "trap 'kill -TERM -$rank' INT", "trap 'kill -HUP -$rank' HUP",
+                      "while :; do wait $rank; code=$?; kill -0 $rank 2>/dev/null || exit $code; done"])
 
 
 def gpu_count(host: str, visible: str | None) -> int | None:
@@ -468,6 +486,18 @@ def _signalled(group: int, signum: int) -> bool:
     return True
 
 
+def _interrupted(child: subprocess.Popen) -> bool:
+    """Stop a rank started over ssh as `remote_script` arranges, by its terminal: whether its ssh was
+    still there to carry the interrupt (`STOP_BYTE`)."""
+    assert child.stdin is not None
+    try:
+        child.stdin.write(STOP_BYTE)
+        child.stdin.flush()
+    except BrokenPipeError:
+        return False
+    return True
+
+
 def _held(child: subprocess.Popen) -> bool:
     """Whether a rank's process group still holds a process: its own, or one it started, which its
     exit leaves running on in the group (a data worker, a server). Its own exit is reaped first,
@@ -478,8 +508,10 @@ def _held(child: subprocess.Popen) -> bool:
 
 def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.Event) -> None:
     """SIGTERM every rank's process group that still holds a process, its rank
-    exited or not, give them `grace` seconds to exit, or until `forced` is set,
-    and SIGKILL those still held, rank 0 last.
+    exited or not, or a rank over ssh through its terminal (`remote_script`),
+    give them `grace` seconds to exit, or until `forced` is set, and SIGKILL
+    those still held, rank 0 last: the ssh of a rank over ssh, which hangs its
+    terminal up.
 
     A JAX process of a pool takes SIGTERM as a preemption notice
     (jax_enable_preemption_service): `Trainer.fit` checkpoints at the step
@@ -490,7 +522,7 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     """
     # Each rank leads a session of its own (`supervise`), whose group its pid names.
     for child in running:
-        if _held(child):
+        if _held(child) and not (child.stdin is not None and _interrupted(child)):
             _signalled(child.pid, signal.SIGTERM)
     deadline = time.monotonic() + grace
     while (not forced.is_set() and time.monotonic() < deadline
@@ -560,7 +592,9 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 # line-buffers already.
                 env={"PYTHONUNBUFFERED": "1", **os.environ, **process.env} if process.local
                 else None,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                # A rank over ssh is stopped through its terminal, which its ssh's input feeds.
+                stdin=subprocess.DEVNULL if process.local else subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", start_new_session=True)
             running.append(child)
             stdout = child.stdout
