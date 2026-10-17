@@ -15,6 +15,8 @@ Parameter gradients are written back into the source layout through the
 same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 """
 
+import json
+import shutil
 from pathlib import Path
 
 import jax
@@ -60,6 +62,18 @@ def channels_last(array):
 def posterior(model, params, video):
     mean, log_variance = jnp.split(model.apply({"params": params}, video, method=model.moments), 2, axis=-1)
     return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+
+
+def test_a_configs_training_dropout_loads_the_same_autoencoder(source, loaded, tmp_path):
+    """`dropout` acts in a training forward alone, which a frozen autoencoder
+    never runs: a config that states one loads the same model and weights."""
+    copy = shutil.copytree(source, tmp_path / "source")
+    config = json.loads((copy / "vae" / "config.json").read_text())
+    (copy / "vae" / "config.json").write_text(json.dumps({**config, "dropout": 0.1}))
+    autoencoder, params, _, _ = load_wan_vae(copy)
+    assert autoencoder.model == loaded[0].model
+    for got, want in zip(jax.tree.leaves(params), jax.tree.leaves(loaded[1]), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, loaded):

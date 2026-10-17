@@ -313,13 +313,11 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
                                logits=held.at[seated].set(logits[0, rows:], mode="drop"))
 
 
-def mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement: Placement,
-                   width: int) -> str | None:
+def mixed_refusal(model: nn.Module, shapes: Slots, placement: Placement) -> str | None:
     """Why a server's admitting step keeps the prompts' prefill in a forward
     of its own, or None when one mixed forward (`_mixed_step`) runs the model
-    as the two would. The model answers for its layers (`Serving`),
-    and one that does not keeps the two forwards. `width` is a row's pages
-    in its table."""
+    as the two would. The model answers for its layers (`Serving`), and one
+    that does not keeps the two forwards; the placement answers for the rest."""
     if not isinstance(model, Serving):
         return f"{type(model).__name__} does not say its layers run a mixed step (Serving)"
     refusal = model.mixed_admission_refusal()
@@ -329,25 +327,7 @@ def mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement:
         return "its slots split into the mesh's row groups"
     if shapes.decoder.positions is not None:
         return "its rows carry their own rotary positions"
-    rows = shapes.decoder.logits.shape[0]
-    try:
-        jax.eval_shape(lambda params, decoder: _mixed_step(
-            model, params, 0, placement, decoder, jnp.zeros(rows, jnp.int32), jnp.zeros(rows, bool),
-            _probe_admission(width)), params, shapes.decoder)
-    except ValueError as refused:
-        if "mixed serving step" not in str(refused):
-            raise
-        return str(refused)
     return None
-
-
-def _probe_admission(width: int) -> Admission:
-    """One admitted row of 64 tokens for `mixed_refusal`'s trace, which
-    reads its prompt, slot, cursor, page table and finality."""
-    one = jnp.zeros(1, jnp.int32)
-    return Admission(ModelInputs(jnp.zeros((1, 64), jnp.int32), {"attention_mask": jnp.zeros((1, 64), bool)}),
-                     slots=one, budgets=one, keys=one, tables=jnp.zeros((1, width), jnp.int32), cursors=one,
-                     final=jnp.zeros(1, bool), history=one, history_valid=one)
 
 
 def split_donated(state: Slots) -> tuple[Slots, Slots]:

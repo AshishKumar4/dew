@@ -56,6 +56,10 @@ export class ModelPool extends DurableObject<Env> {
 			hosts: Object.fromEntries(ready.map((host, index) => [host.id, health[index]])) };
 	}
 
+	/**
+	 * The image a new session runs on, where a ready host of the serving generation has room. Workers of other builds
+	 * call it (the preview's, by script_name), so its reply keeps its shape: an RPC here is only ever extended.
+	 */
 	async image(): Promise<string | null> {
 		const pool = await this.state();
 		const load = (id: string) => Object.values(pool.sessions).filter((host) => host === id).length;

@@ -38,8 +38,8 @@ from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import TFDS, Files, Loading
 from dew.data.dataset import DataPartition
+from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
-from dew.data.steps.image import EncodeCaptions
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
 from dew.nn.backbones import SimpleDiT
