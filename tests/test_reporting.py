@@ -262,34 +262,41 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
 
 
 def test_a_live_panel_keeps_redrawing_while_evaluations_of_new_splits_arrive():
-    """Rich redraws the live panel on its own thread while training records each split's first
-    evaluation; a redraw that walked the splits while one was added would raise there, which Rich does
-    not catch, and the panel would stop updating. Many splits arriving under a fast redraw leave the
-    redraw thread running and every split drawn."""
-    import io
+    """Rich redraws the live panel on a thread of its own while training records each split's first
+    evaluation; a redraw that walked the splits while one was added would raise there ("dictionary
+    changed size during iteration"), which Rich does not catch, and the panel would stop updating.
+    A redraw walking the splits without pause, the interpreter switching threads every microsecond,
+    while thousands of splits arrive, never raises, and draws every split."""
+    import sys
     import threading
-
-    from rich.console import Console
-    from rich.live import Live
 
     from dew.training.display import TrainingDisplay
     from dew.training.evaluation import Evaluation
 
     display = TrainingDisplay(total=10)
     failures: list[BaseException] = []
-    hook = threading.excepthook
-    threading.excepthook = lambda failed: failures.append(failed.exc_value)
-    console = Console(file=io.StringIO(), force_terminal=True, width=120, height=4000)
+    arriving = threading.Event()
+
+    def redraw():
+        while not arriving.is_set():
+            try:
+                display.evaluation_rows()
+            except RuntimeError as failure:
+                failures.append(failure)
+                return
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    redrawing = threading.Thread(target=redraw)
+    redrawing.start()
     try:
-        with Live(display, console=console, refresh_per_second=200) as live:
-            display.live = live
-            for split in range(400):
-                display.evaluation(Evaluation(
-                    step=1, split=f"split{split}", scores={f"split{split}/loss": float(split)},
-                    coordinated_batches=1, records=1, event_key=(0,), elapsed_seconds=0.0, previews=()))
-            redrawing = live._refresh_thread is not None and live._refresh_thread.is_alive()
-            display.live = None
+        for split in range(3000):
+            display.evaluation(Evaluation(
+                step=1, split=f"split{split}", scores={f"split{split}/loss": float(split)},
+                coordinated_batches=1, records=1, event_key=(0,), elapsed_seconds=0.0, previews=()))
     finally:
-        threading.excepthook = hook
-    assert failures == [] and redrawing
-    assert len(display.evaluation_rows()) == 400
+        arriving.set()
+        redrawing.join()
+        sys.setswitchinterval(interval)
+    assert failures == []
+    assert len(display.evaluation_rows()) == 3000
