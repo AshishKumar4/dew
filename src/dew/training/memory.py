@@ -18,7 +18,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
-from dew.nn.kernels.generation import backend, compiler_options, device_generation, gpu_target
+from dew.nn.kernels.generation import backend, device_generation, gpu_target
+from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables

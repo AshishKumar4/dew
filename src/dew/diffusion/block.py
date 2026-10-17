@@ -32,7 +32,7 @@ from dew.nn.inputs import (
     prompt_major,
     real_slots,
 )
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
 
@@ -427,6 +427,6 @@ def _refining(options: tuple[tuple[str, bool], ...]):
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_generate, static_argnames=("model", "plan", "n"),
                    in_shardings=(None, rows, None), out_shardings=rows, compiler_options=dict(options))

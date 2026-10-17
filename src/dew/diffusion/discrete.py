@@ -44,7 +44,7 @@ from dew.nn.inputs import (
     mesh_of,
     real_slots,
 )
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
@@ -385,7 +385,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(
         _generate,
         static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
