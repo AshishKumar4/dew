@@ -180,7 +180,8 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     """On the same weights, a request that samples under `top_k=1` draws what
     lm-eval's own model draws there and what greedy decoding draws; a beam
-    search of three under a length penalty, a total `max_length`, a
+    search of three under a length penalty, with and without a stop string
+    it reaches, which ends the search itself, a total `max_length`, a
     request's own EOS and an explicit zero temperature return lm-eval's own
     answers. A sampled beam search, which no likelihood describes, a control
     `generate` would not use, and sampling at temperature 0, which
@@ -204,7 +205,13 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     eos = ours.tok_encode(answer[0][1], add_special_tokens=False)[0]
     ended = {**greedy, "eos_token_id": eos}
     assert ours.generate_until(asked(ended)) != answer
-    for controls in (beams, {**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
+    # A stop the beams reach, the unstopped beam answer's third character, ends the search there.
+    searched = ours.generate_until(asked(beams))[0]
+    assert len(searched) > 3
+    stopped = {**beams, "until": [searched[2]]}
+    assert len(ours.generate_until(asked(stopped))[0]) < len(searched)
+    for controls in (beams, stopped, {**greedy, "max_length": context + 2}, ended,
+                     {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
     for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
                     {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
