@@ -6,7 +6,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained
 from dew.interop.sources import load_shards
@@ -22,13 +22,17 @@ def test_phi3_short_and_long_logits_match_transformers(padded):
     mask = np.load(DIRECTORY / 'attention_mask.npy') if padded else np.ones_like(ids, bool)
     prefix = 'padded_' if padded else ''
     actual = np.asarray(loaded.model.apply(loaded.variables, ids, attention_mask=mask))
+    _, terms = float64_forward(loaded.model, loaded.variables, ids, attention_mask=mask)
     expected, truth = (np.load(DIRECTORY / f'{prefix}logits{suffix}.npy') for suffix in ('', '_f64'))
-    assert_as_exact_as_the_reference(actual[mask], expected[mask], truth[mask], 'Phi-3 long logits')
+    assert_as_exact_as_the_reference(actual[mask], expected[mask], truth[mask], 'Phi-3 long logits',
+                                     terms=np.asarray(terms)[mask])
     np.testing.assert_array_equal(actual[mask].argmax(-1), expected[mask].argmax(-1))
     if not padded:
         short = loaded.model.apply(loaded.variables, ids[:, :4])
+        _, terms = float64_forward(loaded.model, loaded.variables, ids[:, :4])
         assert_as_exact_as_the_reference(short, np.load(DIRECTORY / 'short_logits.npy'),
-                                         np.load(DIRECTORY / 'short_logits_f64.npy'), 'Phi-3 short logits')
+                                         np.load(DIRECTORY / 'short_logits_f64.npy'), 'Phi-3 short logits',
+                                         terms=terms)
 
 
 def test_phi3_cached_greedy_crosses_the_longrope_boundary():
@@ -59,8 +63,11 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
     reference = np.load(DIRECTORY / 'generation_logits.npy')
     truth = np.load(DIRECTORY / 'generation_logits_f64.npy')
     for step in range(6):
+        # Each step's logits are the uncached forward's last over the tokens so far, LongRoPE's
+        # factor chosen by their length, as transformers' were.
+        _, terms = float64_forward(loaded.model, loaded.variables, generated[:, :4 + step])
         assert_as_exact_as_the_reference(actual[:, step], reference[:, step], truth[:, step],
-                                         f'Phi-3 crossing step {step}')
+                                         f'Phi-3 crossing step {step}', terms=np.asarray(terms)[:, -1])
     np.testing.assert_array_equal(actual.argmax(-1), generated[:, 4:])
 
 
@@ -89,8 +96,10 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
             reference.config, dtype=torch.float64, attn_implementation='eager').eval()
         truth_model.load_state_dict(reference.state_dict())
         truth = rows(truth_model)
+    _, terms = float64_forward(loaded.model, loaded.variables, ids, positions=positions)
     for row in range(2):
-        assert_as_exact_as_the_reference(actual[row], expected[row], truth[row], f'Phi-3 mixed row {row}')
+        assert_as_exact_as_the_reference(actual[row], expected[row], truth[row], f'Phi-3 mixed row {row}',
+                                         terms=np.asarray(terms)[row])
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
     uniform = loaded.model.apply(loaded.variables, ids, positions=np.stack((np.arange(4), np.arange(4))))
