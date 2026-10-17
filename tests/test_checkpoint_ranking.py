@@ -15,6 +15,7 @@ from affine_run import Counting, dataset, val_batches
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
+from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
 from dew.training import Trainer
@@ -395,7 +396,7 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     state = plain.fit(data(), steps=2, log_every=1)
     plain.checkpoints.wait()
     # The data position the run saved with its state, which a resume past step 0 needs.
-    _, position = plain.checkpoints.restore(step=2)
+    _, position = plain.checkpoints.restore(step=2, share=DataPartition())
     path, local = str(tmp_path / 'run'), str(tmp_path / 'local')
     control = {'plateau:val/value': {'best': .2, 'bad': 1, 'step': 2,
                                     'rule': {'mode': 'min', 'evals': 3, 'min_delta': 0.}}}
