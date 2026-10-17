@@ -5,38 +5,34 @@ is not run again.
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
-A test file that starts another process runs code no event sees, so its record says so, and the
-cache never skips it; but for the native tools Dew and its tests ask about the host (`TOOLS`), which
-run none of the checkout's code.
+A Python child a test file starts records itself as it exits (`followed`), and its files, reads and
+GPU pool join the file's record. Any other process start runs code no event sees, so its record says
+so, and the cache never skips it; but for the native tools Dew and its tests ask about the host
+(`followed.TOOLS`), which run none of the checkout's code.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
 runs it (`ci.py gpu-tier`), each file in a process of its own, which records its peak memory on the
-GPU (`gpu_peak`). A read is the test file's being collected or run. As with the files they
-execute, what session-scoped fixtures read is every file's, and what runs under a module's body,
-which runs once, as it is imported, is its own test file's too, and every file's before collection."""
+GPU (`gpu_peak`) and its children's pools. A read is the test file's being collected or run. As with
+the files they execute, what session-scoped fixtures read is every file's, and what runs under a
+module's body, which runs once, as it is imported, is its own test file's too, and every file's
+before collection."""
 
-import dis
 import json
 import os
+import shutil
 import sys
-import types
+import tempfile
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 
+import followed
 import pytest
 from ci import MARKS
+from followed import CHILDREN, checkout, reads_backend
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
-TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
-"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs),
-uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
-code, on the host alone). Any other start, a shell's or a launcher's included, may run the
-checkout's code or hold the GPU."""
-SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
-          "os.fork", "os.forkpty"}
-"""Audit events of a process start; a multiprocessing child's is `CHILD_START`'s."""
 CHILD_START = BaseProcess.start.__code__
 """Where every multiprocessing context starts a child, a Python process: Python 3.12 audits no spawn
 or forkserver start, and a forkserver's later children start in its own process."""
@@ -56,7 +52,9 @@ everywhere: set[str] = set()
 """What session-scoped fixtures read, and module bodies before collection."""
 readers: list[set[str]] = []
 """Where a read is kept. conftest.py's reads are every test's, so they are left out."""
-decided: dict[types.CodeType, bool] = {}
+starts: dict[str, int] = {}
+"""How many followed children each test file's own process started (`followed.start`)."""
+children = Path(tempfile.mkdtemp(prefix="dew-children-"))
 
 
 def started(code, offset):
@@ -67,7 +65,7 @@ def started(code, offset):
             spawned.add(running[-1])
         return None
     name = code.co_filename
-    if not checkout(name):
+    if not checkout(name, root):
         return sys.monitoring.DISABLE
     current[-1].add(name[len(root):])
     if conftest(name):
@@ -83,7 +81,7 @@ def started(code, offset):
         frame = sys._getframe(1)
         while frame is not None:
             body = frame.f_code.co_filename
-            if frame.f_code.co_name == "<module>" and checkout(body) and not conftest(body):
+            if frame.f_code.co_name == "<module>" and checkout(body, root) and not conftest(body):
                 if Path(body).name.startswith("test_"):
                     module_reads.setdefault(body[len(root):], set()).add(site)
                 elif not readers:
@@ -92,59 +90,27 @@ def started(code, offset):
     return sys.monitoring.DISABLE
 
 
-def checkout(name: str) -> bool:
-    """Whether `name` is a Python file of the checkout. The environment's packages, which CI installs
-    in the checkout, are the locks' to key."""
-    return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
-
-
 def conftest(name: str) -> bool:
     return Path(name).name == "conftest.py"
 
 
-def reads_backend(code: types.CodeType) -> bool:
-    """Whether `code` calls `default_backend` (jax's), by any name table, or reads a device's
-    `platform`: an attribute of anything but the `sys` and `platform` modules."""
-    if code not in decided:
-        steps = list(dis.get_instructions(code))
-        decided[code] = any(
-            step.argval == "default_backend"
-            or (step.opname == "LOAD_ATTR" and step.argval == "platform" and not (
-                index and steps[index - 1].opname in ("LOAD_GLOBAL", "LOAD_NAME")
-                and steps[index - 1].argval in ("sys", "platform")))
-            for index, step in enumerate(steps))
-    return decided[code]
-
-
 def audited(event, args):
-    if running and event in SPAWNS and not native(programs(event, args)):
+    kind = followed.start(event, args, str(children)) if running else None
+    if kind == "followed":
+        starts[running[-1]] = starts.get(running[-1], 0) + 1
+    elif kind == "unfollowed":
         spawned.add(running[-1])
-
-
-def programs(event: str, args: tuple) -> list:
-    """The programs a process start of `event` may run, by the paths its audit names: `subprocess`'s
-    executable (its command's first word where it names none), `_posixsubprocess`'s candidates, and
-    none for a fork, whose child runs this process's own code."""
-    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
-        return [args[0]]
-    if event == "_posixsubprocess.fork_exec":
-        return list(args[0] or ())
-    if event == "os.spawn":
-        return [args[1]]
-    return []
-
-
-def native(names: list) -> bool:
-    """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
-    its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
-    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
-                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
 
 
 # Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
 # import Dew; repository modules imported even earlier join what every file shares.
 shared.update(name[len(root):] for module in list(sys.modules.values())
-              if checkout(name := getattr(module, "__file__", None) or ""))
+              if checkout(name := getattr(module, "__file__", None) or "", root))
+# The children this process starts record themselves (`followed`), the GPU share it was given beside.
+followed.installed()
+os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
+               "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
+               "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
@@ -157,6 +123,7 @@ def pytest_runtest_protocol(item, nextitem):
     if not running or running[-1] != name:
         running[:] = [name]
         current[:] = [own.setdefault(name, set())]
+        os.environ["DEW_EXECUTED_FILE"] = name
         sys.monitoring.restart_events()
     reads.setdefault(name, set()).update(f"mark:{mark}" for mark in MARKS if item.get_closest_marker(mark))
     readers.append(reads[name])
@@ -200,11 +167,18 @@ def pytest_sessionfinish(session):
     sys.monitoring.set_events(TOOL, 0)
     out = os.environ.get("DEW_EXECUTED")
     if out:
-        # A file that started a process may have used the GPU there, which no allocator here saw.
-        peak = gpu_peak() if len(own) == 1 and not spawned else None
-        recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
-                           "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere),
-                           "peak": peak} for name, files in own.items()}
+        found = followed.gathered(children, starts)
+        shutil.rmtree(children)
+        lost = {name for name, child in found.items() if not child["followed"]}
+        peak = gpu_peak() if len(own) == 1 and not spawned | lost else None
+        recorded = {}
+        for name, files in own.items():
+            child = found.get(name, {"files": set(), "reads": set(), "shares": 0, "pools": 0})
+            whole = name not in spawned | lost
+            recorded[name] = {"depends": sorted(files | shared | child["files"]) if whole else None,
+                              "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere
+                                              | child["reads"]),
+                              "peak": peak, "shares": child["shares"], "pools": child["pools"]}
         Path(out).write_text(json.dumps(recorded))
 
 
