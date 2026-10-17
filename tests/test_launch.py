@@ -147,6 +147,43 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     assert not any(alive(pid) for pid in ranks)
 
 
+def test_a_failing_rank_leaves_none_of_its_own_processes_running(tmp_path):
+    """Rank 1 starts a worker of its own, as a data loader does, and fails; the
+    worker is in its rank's process group, which the launch stops though the
+    rank itself has exited, so nothing it started outlives the launch."""
+    program = ("import os, pathlib, subprocess, sys, time\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "pathlib.Path(sys.argv[1], 'rank' + rank).write_text(str(os.getpid()))\n"
+               "if rank == '1':\n"
+               "    worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+               "    pathlib.Path(sys.argv[1], 'worker').write_text(str(worker.pid))\n"
+               "    time.sleep(1)\n"
+               "    sys.exit(3)\n"
+               "time.sleep(600)\n")
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path))
+    try:
+        launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    assert launch.returncode == 3
+    worker = int((tmp_path / "worker").read_text())
+    deadline = time.monotonic() + 10
+    while running(worker) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not running(worker)
+
+
+def running(pid: int) -> bool:
+    """Whether `pid` runs: an exited process its new parent has not reaped yet (a zombie, state Z in
+    /proc) has stopped, though a signal still finds it."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
+
+
 def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "dew.cli.main", "launch", *arguments],
                           cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120)
