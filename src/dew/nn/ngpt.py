@@ -8,6 +8,7 @@ in fp32 (`slerp_norm`).
 """
 
 import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -18,28 +19,41 @@ EPSILON = 1e-6
 
 @dataclasses.dataclass(frozen=True)
 class NGPT:
-    """A normalized transformer's gains. nGPT stores each learned gain at the initializer's scale
-    and multiplies it back by a constant (`gain`): these are those constants, Dory's in its terms
-    (`initializer_range` std, `ngpt_alpha_init` a0, hidden width H, head width d).
+    """A normalized transformer's constants, as a checkpoint states them: `std` the initializer's
+    standard deviation (`initializer_range`), `alpha` the residual's initial step
+    (`ngpt_alpha_init`) and `gate_logit` the attention output gate's initial logit scale
+    (`attention_output_gate_logit_scale_init`, None for the square root of the model's width).
 
-    `step` scales a sublayer's residual step, `|alpha * step|` (a0 / std), and `step_init` is the
-    step it starts at (a0). `query` scales the query's per-feature gain, squared over the unit
-    query after its rotation (sqrt(d) / std). `gate` scales the attention output gate's, squared
-    over the gate's logits (sqrt(g0) / std, g0 = sqrt(H) unless a checkpoint names it). `hidden`
-    scales the feed-forward's gate and up gains (sqrt(H)), and `logits` the per-token logit gain
-    (1 / std).
+    nGPT stores each learned gain at the initializer's scale and multiplies it back by a constant
+    these give: the step's `alpha / std`, the query's `sqrt(head_dim) / std`, the gate's
+    `sqrt(gate_logit) / std`, the feed-forward's `sqrt(width)` and the logits' `1 / std`.
 
     A model under it keeps every hidden state on the unit sphere: no norm has a weight, the
     keys and the attention's and feed-forward's outputs are unit-normed (`unit`), each sublayer
     joins the residual by `stepped`, and no norm precedes the head.
     """
 
-    step: float
-    step_init: float
-    query: float
-    gate: float
-    hidden: float
-    logits: float
+    std: float
+    alpha: float
+    gate_logit: float | None = None
+
+    @property
+    def step(self) -> float:
+        return self.alpha / self.std
+
+    def query(self, head_dim: int) -> float:
+        return math.sqrt(head_dim) / self.std
+
+    def gate(self, width: int) -> float:
+        return math.sqrt(math.sqrt(width) if self.gate_logit is None else self.gate_logit) / self.std
+
+    @staticmethod
+    def hidden(width: int) -> float:
+        return math.sqrt(width)
+
+    @property
+    def logits(self) -> float:
+        return 1 / self.std
 
 
 def unit(x: jax.Array) -> jax.Array:

@@ -250,19 +250,23 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("an nGPT attention unit-norms its own rotated queries and keys: it takes no "
                              "q/k norm, shared or value keys, or unrotated heads")
         width = self.ctx.num_heads * self.ctx.head_dim
-        self.sqk = self.param('sqk', nn.initializers.constant(1 / self.ctx.ngpt.query), (width,), jnp.float32)
+        ngpt = self.ctx.ngpt
+        # Each gain starts at 1 times its constant.
+        self.sqk = self.param('sqk', nn.initializers.constant(1 / ngpt.query(self.ctx.head_dim)),
+                              (width,), jnp.float32)
         if self.ctx.output_gate:
             if self.gate_projection != 'own':
                 raise ValueError("an nGPT attention gates its output by a projection of its own "
                                  "(gate_projection='own')")
-            self.s_gate = self.param('s_gate', nn.initializers.constant(1 / self.ctx.ngpt.gate), (width,),
-                                     jnp.float32)
+            self.s_gate = self.param('s_gate', nn.initializers.constant(1 / ngpt.gate(self.ctx.emb_features)),
+                                     (width,), jnp.float32)
 
     def _ngpt_rotated(self, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
         learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
         assert self.ctx.ngpt is not None
-        heads = gain(self.sqk, self.ctx.ngpt.query).reshape(self.ctx.num_heads, self.ctx.head_dim)
+        heads = gain(self.sqk, self.ctx.ngpt.query(self.ctx.head_dim))
+        heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
         query = (jnp.square(heads) * unit(query).astype(jnp.float32)).astype(query.dtype)
         return query, unit(key)
 
@@ -1020,8 +1024,9 @@ class CausalSelfAttention(nn.Module):
         if gate is not None and self.ctx.ngpt is not None:
             # nGPT scales the gate's logits by the square of their learned gain, gates in fp32 and
             # unit-norms the gated heads together (dory.py:154-157).
-            logits = gate.astype(jnp.float32) * jnp.square(gain(self.s_gate, self.ctx.ngpt.gate)).reshape(
-                self.ctx.num_heads, self.ctx.head_dim)
+            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
+            logits = gate.astype(jnp.float32) * jnp.square(scale).reshape(self.ctx.num_heads,
+                                                                           self.ctx.head_dim)
             attention = (attention.astype(jnp.float32) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects

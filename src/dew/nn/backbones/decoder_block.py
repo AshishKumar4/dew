@@ -869,7 +869,7 @@ class DecoderBlock(nn.Module):
             raise ValueError("an nGPT block steps its one residual along the sphere: it takes no "
                              "hyper-connections, depth mixture, altup, laurel, per-layer inputs or "
                              "parallel branch")
-        start = nn.initializers.constant(ngpt.step_init / ngpt.step)
+        start = nn.initializers.constant(ngpt.alpha / ngpt.step)
         self.attn_alpha = self.param('attn_alpha', start, (self.emb_features,), jnp.float32)
         if self.feedforward is not None:
             self.mlp_alpha = self.param('mlp_alpha', start, (self.emb_features,), jnp.float32)

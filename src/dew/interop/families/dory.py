@@ -19,7 +19,6 @@ A run picks its loop count as vLLM's `--hf-overrides` does: the loaded model's
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Mapping
 
@@ -95,12 +94,9 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
         refuse(f'n_recurrent_loops {loops}', 'a loop runs its block at least once')
     std = records.number(hf_config.get('initializer_range', 0.02), 'initializer_range')
     alpha = records.number(hf_config.get('ngpt_alpha_init', 0.05), 'ngpt_alpha_init')
-    hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
-    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    head_dim = records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
     stated_gate = hf_config.get('attention_output_gate_logit_scale_init')
-    gate = math.sqrt(hidden) if stated_gate is None else records.number(
-        stated_gate, 'attention_output_gate_logit_scale_init')
+    gate = (None if stated_gate is None
+            else records.number(stated_gate, 'attention_output_gate_logit_scale_init'))
     used.update(('n_input_layers', 'n_recurrent_layers', 'n_output_layers', 'n_recurrent_loops',
                  'recurrent_kv_cache_mode', 'initializer_range', 'ngpt_alpha_init',
                  'attention_output_gate_logit_scale_init'))
@@ -113,8 +109,7 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
     config.update(
         qk_norm=False, pre_norms=False, output_gate=True,
         mixer={'class': 'attention', 'fields': {'gate_projection': 'own'}},
-        ngpt={'step': alpha / std, 'step_init': alpha, 'query': math.sqrt(head_dim) / std,
-              'gate': math.sqrt(gate) / std, 'hidden': math.sqrt(hidden), 'logits': 1 / std},
+        ngpt={'std': std, 'alpha': alpha, 'gate_logit': gate},
         loop={'steps': loops, 'layers': [first // 2, (first + recurrent) // 2], 'reinject': True,
               'shared_cache': mode == 'last_loop'})
     return config
@@ -144,7 +139,7 @@ def _dory_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
     block = f'layers_{index // 2}'
     if rest == ('mlp_alpha' if index % 2 else 'attn_alpha'):
         return ('params', block, rest)
-    table = _MLP if index % 2 else _ATTENTION
+    table: Mapping[str, tuple[str, ...]] = _MLP if index % 2 else _ATTENTION
     tail = rest.removeprefix('mixer.')
     if not rest.startswith('mixer.') or tail not in table:
         raise ValueError(f'{name!r} is no tensor of a Dory {"mlp" if index % 2 else "attention"} layer')
@@ -170,15 +165,14 @@ def _dory_name(dew_name: str, config: Mapping[str, object]) -> str | None:
 def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
     assert model.ngpt is not None and model.loop is not None
     first, end = model.loop.layers or (0, model.num_layers)
-    std = 1 / model.ngpt.logits
     layer_types = [kind for attention in model.per_layer_types for kind in (attention, 'mlp')]
     return {
         'num_hidden_layers': 2 * model.num_layers, 'layer_types': layer_types,
         'n_input_layers': 2 * first, 'n_recurrent_layers': 2 * (end - first),
         'n_output_layers': 2 * (model.num_layers - end), 'n_recurrent_loops': model.loop.steps,
         'recurrent_kv_cache_mode': 'last_loop' if model.loop.shared_cache else 'per_loop',
-        'initializer_range': std, 'ngpt_alpha_init': model.ngpt.step_init,
-        'attention_output_gate_logit_scale_init': (model.ngpt.gate * std) ** 2,
+        'initializer_range': model.ngpt.std, 'ngpt_alpha_init': model.ngpt.alpha,
+        'attention_output_gate_logit_scale_init': model.ngpt.gate_logit,
         'attention_bias': False, 'mlp_bias': False,
     }
 

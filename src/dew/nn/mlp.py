@@ -111,7 +111,7 @@ class GatedMLP(nn.Module):
                 raise ValueError("an nGPT feed-forward is a plain gated product: it takes no clamp, "
                                  "activation sparsity or ungated activation")
             # Each gain starts where the normalized transformer starts it, at 1.
-            start = nn.initializers.constant(1 / self.ngpt.hidden)
+            start = nn.initializers.constant(1 / self.ngpt.hidden(self.out_features))
             self.suv_gate = self.param('suv_gate', start, (self.hidden_features,), jnp.float32)
             self.suv_up = self.param('suv_up', start, (self.hidden_features,), jnp.float32)
 
@@ -159,8 +159,9 @@ class GatedMLP(nn.Module):
             self.gate_proj(x), self.up_proj(x))
         gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
         up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
-        gate = (gate.astype(jnp.float32) * gain(self.suv_gate, self.ngpt.hidden)).astype(gate.dtype)
-        up = (up.astype(jnp.float32) * gain(self.suv_up, self.ngpt.hidden)).astype(up.dtype)
+        factor = self.ngpt.hidden(self.out_features)
+        gate = (gate.astype(jnp.float32) * gain(self.suv_gate, factor)).astype(gate.dtype)
+        up = (up.astype(jnp.float32) * gain(self.suv_up, factor)).astype(up.dtype)
         hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(jnp.float32), up.astype(jnp.float32))
         return self._down(unit(hidden.astype(gate.dtype)), train)
 

@@ -1840,7 +1840,8 @@ class CausalTransformer(nn.Module):
         injected = x
         shared = SharedPassView() if loop.shared_cache else None
         first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, mutable=True)
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            mutable=True)
         x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)

@@ -153,40 +153,46 @@ class Loop:
 
 @dataclasses.dataclass
 class SharedPassView:
-    """A pass of a `Loop` with `shared_cache`, over its block's own cache entries. The first pass
-    records the layers' cursors (`cache_index`) as it finds them (`first`); a later pass sees every
-    entry as the pass before left it but the cursors, which start where the first pass's started,
-    so it writes the step's keys and values over the last pass's. Each pass keeps the cursors it
-    advanced, which are the first pass's after its step. Where the first pass allocates the cache,
-    finding no cursors, it leaves them at zero, advancing none (`cache_positions`), and so does
-    every later pass."""
-    cursors: dict = dataclasses.field(default_factory=dict)
+    """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
+    pass reads and writes. The first pass's cursors (`cache_index`) are recorded as it finds them
+    (`first`) and as it leaves them (`first_out`). A later pass sees every entry as the pass before
+    left it but the cursors, which start where the first pass's started, so it writes the step's
+    keys and values over the last pass's (`inside`), and it leaves the cursors as the first pass
+    left them (`outside`): a pass that allocates the cache advances none (`cache_positions`), and
+    the later ones, finding it allocated, must not either."""
+    before: dict = dataclasses.field(default_factory=dict)
+    after: dict = dataclasses.field(default_factory=dict)
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
-        self.cursors = cursors_of(variables.get('cache', {}))
+        self.before = cursors_of(variables.get('cache', {}))
+        return dict(variables)
+
+    def first_out(self, variables: Mapping[str, Mapping]) -> dict:
+        self.after = cursors_of(variables.get('cache', {}))
         return dict(variables)
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
+        return self._placed(variables, {**self.after, **self.before})
+
+    def outside(self, variables: Mapping[str, Mapping]) -> dict:
+        return self._placed(variables, self.after)
+
+    @staticmethod
+    def _placed(variables: Mapping[str, Mapping], cursors: Mapping) -> dict:
         cache = variables.get('cache')
         if cache is None:
             return dict(variables)
-        return {**variables, 'cache': _with_cursors(cache, self.cursors)}
-
-    def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        cache = variables.get('cache')
-        if cache is None or self.cursors:
-            return dict(variables)
-        allocated = {path: jnp.zeros_like(leaf) for path, leaf in cursors_of(cache).items()}
-        return {**variables, 'cache': _with_cursors(cache, allocated)}
+        return {**variables, 'cache': _with_cursors(cache, cursors)}
 
 
 def cursors_of(cache: Mapping[str, object]) -> dict[tuple[str, ...], object]:
     """Every `cache_index` in a cache tree, by its path."""
-    return {path: leaf for path, leaf in flatten_dict(unfreeze(cache)).items() if path[-1] == 'cache_index'}
+    return {path: leaf for path, leaf in flatten_dict(unfreeze(dict(cache))).items()
+            if path[-1] == 'cache_index'}
 
 
 def _with_cursors(cache: Mapping[str, object], cursors: Mapping[tuple[str, ...], object]) -> dict:
-    flat = flatten_dict(unfreeze(cache))
+    flat = flatten_dict(unfreeze(dict(cache)))
     return unflatten_dict({path: cursors.get(path, leaf) for path, leaf in flat.items()})
 
 
