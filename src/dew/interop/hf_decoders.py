@@ -845,40 +845,30 @@ def export_config(model) -> Mapping[str, object]:
         config['rope_theta'] = model.rope_theta
     if sliding is not None and sliding.window is not None:
         config['sliding_window'] = sliding.window
-    # The ramp writes in the flat spelling every family that reads one
-    # accepts (rope_scaling beside rope_theta, as Llama 3.1 ships it); a
-    # ramp that differs between kinds has that spelling in no reference
-    # this exports, so it is refused naming the kinds.
-    ramps = {kind: model.kind_of(kind).rope_scaling for kind in set(types)}
-    if len(set(ramps.values())) > 1:
-        raise ValueError(
-            f"rope_scaling differs between layer kinds ({sorted(ramps)}), which "
-            "no exported family spells; the model cannot be written back")
-    ramp = model.kind_of(types[0]).rope_scaling
-    if ramp is not None:
-        config['rope_scaling'] = dataclasses.asdict(ramp)
-    # A YaRN table replaces the frequencies rather than riding over them.
-    # One table the whole model shares writes flat beside rope_theta, which
-    # is where the single-table references read it. A table that differs
-    # between the kinds is what Olmo3RotaryEmbedding builds, one per kind
-    # out of nested rope_parameters (modeling_olmo3.py:277-291, the
-    # spelling Olmo3Config.to_dict writes); a reference with one table for
-    # the whole model cannot say it, so that is refused naming the kinds.
-    yarns = {kind: model.kind_of(kind).yarn for kind in sorted(set(types))}
-    ramped = {kind: yarn for kind, yarn in yarns.items() if yarn is not None}
-    per_kind = bool(ramped) and (set(ramped) != set(yarns)
+    # A ramp, Llama 3's over the frequencies or a YaRN table in place of them,
+    # that the whole model shares writes flat beside rope_theta, which is
+    # where the single-table references read it (as Llama 3.1 ships it). A
+    # ramp that differs between the kinds is what Olmo3RotaryEmbedding
+    # builds, each kind's through its own ROPE_INIT_FUNCTIONS entry out of
+    # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
+    # Olmo3Config.to_dict writes); a reference with one table for the whole
+    # model cannot say it, so that is refused naming the kinds.
+    tables = {kind: model.kind_of(kind).yarn or model.kind_of(kind).rope_scaling
+              for kind in sorted(set(types))}
+    ramped = {kind: table for kind, table in tables.items() if table is not None}
+    per_kind = bool(ramped) and (set(ramped) != set(tables)
                                  or len(set(ramped.values())) > 1
                                  or local_theta is not None)
     if per_kind:
         if not sandwich:
             raise ValueError(
-                f"the yarn table differs between the layer kinds {sorted(yarns)}, "
+                f"the rotary ramp differs between the layer kinds {sorted(tables)}, "
                 f"and the {family.export_model_type} reference rotates every layer "
                 "at one table; the model cannot be written back")
         config['rope_parameters'] = {
-            kind: {**({'rope_type': 'default'} if yarn is None else dataclasses.asdict(yarn)),
+            kind: {**({'rope_type': 'default'} if table is None else dataclasses.asdict(table)),
                    'rope_theta': model.kind_of(kind).rope_theta}
-            for kind, yarn in yarns.items()}
+            for kind, table in tables.items()}
         config.pop('rope_local_base_freq', None)
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
