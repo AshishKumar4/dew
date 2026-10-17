@@ -1233,9 +1233,7 @@ class RunConfig:
         `lora` is not applied here: the recipe attaches it to the model and variables
         it builds the objective from. `rollout` is the trainer's rollout, which turns
         each prefetched batch into the one the step trains on, as an on-policy
-        objective samples it. `metrics` score the data's validation split, and
-        where the data holds none, nothing is validated and they are not asked
-        for. `validation` names the splits each evaluation
+        objective samples it. `validation` names the splits each evaluation
         scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
         split and a test set are logged as `val/...` and `test/...`. With no
         `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
@@ -1257,8 +1255,6 @@ class RunConfig:
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
-        # A recipe's metrics score its data's validation split; data that holds none validates nothing.
-        validated = dataset.val is not None or bool(validation)
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
         dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
@@ -1304,7 +1300,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
-                metrics=metrics if validated else (), preview=trainer.wandb is not None,
+                metrics=metrics, preview=trainer.wandb is not None,
                 best=trainer.best_policies(), validation=validation,
             )
             if after is not None:
