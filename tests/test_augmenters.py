@@ -30,8 +30,8 @@ if not flags.FLAGS.is_parsed():
 from dew.config.data import Augment, ImageData, loader
 from dew.data import Loading, Memory, images
 from dew.data.dataset import DataPartition
+from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays, unpack_dict_of_byte_arrays
-from dew.data.steps.image import EncodeCaptions
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -118,7 +118,7 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
             "ImageData(source=(), labels=labels)",
-            "for stage in (images.flip(), images.color_jitter()):",
+            "for stage in (images.Flip(), images.ColorJitter()):",
             "    out = stage.random_map({'image': image}, np.random.default_rng(0))['image']",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
             "print('ok')",

@@ -74,6 +74,25 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     assert jax.tree.map(lambda leaf: leaf.dtype, rebuilt) == jax.tree.map(lambda leaf: leaf.dtype, direct)
 
 
+def test_an_accumulating_run_snapshotted_every_step_reconstructs_its_average(tmp_path):
+    """With two steps a committed update, a snapshot at every step holds each update's averages
+    twice, which would make the solve singular: the reconstruction counts each update once, so it is
+    the one a run snapshotted only at its committed updates rebuilds, bit for bit."""
+    def rebuilt(name, every):
+        trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)),
+                          key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0), accumulation=2,
+                          checkpoints=Checkpoints(str(tmp_path / name)))
+        trainer.fit(dataset(), steps=16, log_every=16, checkpoint_every=every)
+        trainer.checkpoints.wait()
+        checkpoints = Checkpoints(str(tmp_path / name))
+        assert len(checkpoints.profile_steps()) == 16 // every
+        return checkpoints.posthoc_ema(0.07)
+
+    every_step, committed = rebuilt("every", 1), rebuilt("committed", 2)
+    for got, want in zip(jax.tree.leaves(every_step), jax.tree.leaves(committed), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
 def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     """A snapshot is the ordinary checkpoint itself: averages are stored
     once in opt_state, retained, and every restore reads them bit for bit."""

@@ -92,7 +92,7 @@ from dew.data.pipeline import (
     Volatile,
     Windows,
     Workers,
-    _rejects,
+    _declares_rejects,
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
@@ -236,9 +236,9 @@ def _configured(
         if isinstance(resolved, Expansion):
             stages.append(FlatMap(resolved, configured=binding))
         elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_rejects(resolved), configured=binding))
+            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
         else:
-            stages.append(Map(resolved, rejects=_rejects(resolved), configured=binding))
+            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
@@ -552,8 +552,6 @@ def _compiled(
     records = _epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
-    if records is not None and records < batch:
-        raise ValueError(f"corpus {_name(train)} has {records} records, fewer than one batch of {batch}")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
@@ -859,8 +857,9 @@ def _objective_records(
         elif isinstance(step, Configured):
             pipeline = pipeline.then(step)
         elif isinstance(step, pygrain.RandomMapTransform):
-            pipeline = pipeline.random_filter_map(step) if _rejects(step) else pipeline.random_map(step)
-        elif _rejects(step):
+            drops = _declares_rejects(step)
+            pipeline = pipeline.random_filter_map(step) if drops else pipeline.random_map(step)
+        elif _declares_rejects(step):
             pipeline = pipeline.filter_map(step)
         else:
             pipeline = pipeline.map(step)

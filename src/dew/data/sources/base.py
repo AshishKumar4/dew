@@ -124,4 +124,33 @@ def _consumed(source: Source, read: Read) -> Source:
     return source.consumed(read) if isinstance(source, Consumed) else source
 
 
+def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int) -> ShardManifest:
+    """The records `source` reads by index as a stream: consecutive ranges of
+    at most `rows` records, each `Shard` named `<prefix>:<start>` at `uri`,
+    read as that slice of its indexed records (`_IndexedSlice`)."""
+    count = len(source.records("indexed"))
+    return ShardManifest(
+        tuple(
+            Shard(f"{prefix}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
+            for start in range(0, count, rows)
+        ),
+        _IndexedSlice(source),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _IndexedSlice:
+    """Reads a shard of `_indexed_manifest` as the slice of `source`'s indexed
+    records it spans. It pickles with its source, as Grain's worker processes
+    need."""
+
+    source: Source
+
+    def __call__(self, shard: Shard) -> pygrain.IterDataset:
+        import grain.python as pygrain
+
+        records = pygrain.MapDataset.source(self.source.records("indexed"))
+        return records[shard.start : shard.stop].to_iter_dataset()
+
+
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]
