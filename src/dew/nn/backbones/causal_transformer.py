@@ -67,6 +67,7 @@ from ..inputs import (
     LayerInputs,
     PredictionPhase,
     coordinates as build_coordinates,
+    coordinates_of,
 )
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -623,18 +624,27 @@ class CausalTransformer(nn.Module):
 
     def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
-        cannot apply them."""
-        mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
-               or self.logits_scaling != 1.0 or self.initializer_range is not None)
-        if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
-                    or (self.mixture is not None and self.mixture.parallel)
-                    or self.mlp == 'swigluoai' or self.laurel_rank is not None
-                    or self.altup is not None or self.per_layer_input_dim):
+        cannot apply them.
+
+        `embedding_multiplier` and `logits_scaling` act at the root, on the embeddings before the
+        first layer (`scaled_embeddings`) and on the final states, so any stack of blocks takes
+        them; prediction depths and the DSpark drafter embed their own tokens unscaled and score
+        their own states. `residual_multiplier` and `initializer_range` act inside lm-engine's
+        dense and routed blocks."""
+        root = self.embedding_multiplier != 1.0 or self.logits_scaling != 1.0
+        block = self.residual_multiplier != 1.0 or self.initializer_range is not None
+        if (root or block) and (self.num_nextn_predict_layers or self.dspark is not None):
             raise ValueError(
-                "embedding_multiplier, residual_multiplier, logits_scaling and "
-                "initializer_range are lm-engine's dense and routed blocks; prediction "
-                "depths, hyper-connection streams, Gemma 4's parallel experts, gpt-oss "
-                "experts, LAuReL, AltUp and per-layer inputs do not carry them")
+                "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
+                "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
+        if block and (self.hyper_connections is not None
+                      or (self.mixture is not None and self.mixture.parallel)
+                      or self.mlp == 'swigluoai' or self.laurel_rank is not None
+                      or self.altup is not None or self.per_layer_input_dim):
+            raise ValueError(
+                "residual_multiplier and initializer_range are lm-engine's dense and routed "
+                "blocks; hyper-connection streams, Gemma 4's parallel experts, gpt-oss experts, "
+                "LAuReL, AltUp and per-layer inputs do not carry them")
         if self.logits_scaling <= 0 or (self.initializer_range is not None
                                         and self.initializer_range <= 0):
             raise ValueError("logits_scaling and initializer_range are positive")
@@ -1417,7 +1427,8 @@ class CausalTransformer(nn.Module):
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
                                    attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions)
+                                   image_groups=image_groups, rotary_positions=rotary_positions,
+                                   coordinates=coordinates)
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
@@ -1702,20 +1713,21 @@ class CausalTransformer(nn.Module):
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             coordinates)
-        if attention_metadata is not None and attention_metadata.coordinates is not None:
-            positions = attention_metadata.coordinates.positions
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
         x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
-            places = positions
+            # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
+            # caller gave them in; a cached call's continue from its cache's cursor.
+            tokens_at = coordinates_of(attention_metadata, *tokens.shape)
+            places = tokens_at.positions
             if places is None:
-                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
-                         if decode else None)
-                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
+                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
                 places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+                # A first cached call finds no cursor yet: its tokens start the row.
+                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
@@ -1778,8 +1790,8 @@ class CausalTransformer(nn.Module):
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
                 "call would attend across documents; prefill each document into a row of its own")
         engram_ids = (None if self.engram is None else self.engram_hashes(
-            tokens, attention_mask, None if coordinates is None else coordinates.positions, decode,
-            media_mask))
+            tokens, None if coordinates is None else coordinates.valid,
+            None if coordinates is None else coordinates.positions, decode, media_mask))
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):

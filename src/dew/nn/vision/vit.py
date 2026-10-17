@@ -251,8 +251,6 @@ class VisionTransformer(nn.Module):
                                          rotary_positions=_gather(rotary, order), position_bias=bias)
             hidden = vit_block(lay, index, dtype=self.dtype, precision=self.precision)(
                 hidden, attention_metadata=metadata)
-            # A block without hyper-connections hands on the plain residual.
-            assert isinstance(hidden, jax.Array)
         leaving = orders[current]
         if leaving is not None:
             hidden = _gather(hidden, jnp.argsort(leaving, axis=1))

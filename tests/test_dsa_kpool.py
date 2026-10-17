@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from flax import linen as nn
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
@@ -302,6 +303,30 @@ def test_the_kind_builds_from_the_configs_fields_and_is_nope():
     with pytest.raises(ValueError):
         mixer.build(MixerContext(emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8,
                                  max_seq_len=16, kv_shared=True))
+
+
+def test_a_gated_layer_gates_its_heads_context_as_latent_attention_does():
+    """K-pool attention takes the latent attention's output gate, a layer's
+    `output_gate` as its kind builds it: the gated layer's output is o_proj
+    over the ungated heads' context times sigmoid(g_proj(x)), each projection
+    a plain Dense of the layer's kernels, bitwise. The heads' context is the
+    ungated layer's output through an identity o_proj."""
+    gated, plain = (KPoolSparseAttentionMixer(**SETTINGS).build(MixerContext(
+        emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8, max_seq_len=16, norm_eps=1e-5,
+        scale_after_cast=True, output_gate=gate))(name="self_attn") for gate in (True, False))
+    hidden, _ = inputs()
+    params = gated.init(jax.random.key(0), hidden)["params"]
+    width = H * SETTINGS["v_head_dim"]
+    assert width == E, "an identity o_proj reads the heads' context back"
+    ungated = {name: leaf for name, leaf in params.items() if name != "g_proj"}
+    context = plain.apply({"params": {**ungated, "o_proj": {"kernel": jnp.eye(width)}}}, hidden)
+
+    def dense(kernel, x):
+        return nn.Dense(kernel.shape[1], use_bias=False).apply({"params": {"kernel": kernel}}, x)
+
+    gate = jax.nn.sigmoid(dense(params["g_proj"]["kernel"], hidden))
+    expected = dense(params["o_proj"]["kernel"], context * gate)
+    np.testing.assert_array_equal(np.asarray(gated.apply({"params": params}, hidden)), np.asarray(expected))
 
 
 def test_a_budget_the_pool_does_not_divide_is_refused():
