@@ -13,7 +13,8 @@ The program is one row-head and one block of value columns, over a state
 laid out `[rows * heads, Dk, Dv]`; its body is whole-block array arithmetic
 with nothing Triton-specific but the warp count, so a Mosaic GPU kernel (JAX
 0.11 deprecates the Triton backend, and Mosaic GPU targets sm90 on) takes
-the same body and block specs. On a TPU the step stays XLA's: tokamax's
+the same body and block specs. Off a GPU it interprets, as the CPU suite
+runs it. On a TPU the step stays XLA's: tokamax's
 Mosaic TPU `causal_conv1d_gated_delta_rule` covers the conv, the gating and
 the rule over a step's tokens in one ragged call, which is the layout of a
 serving step's mixed call (`dew.nn.inputs.Admitted`) rather than this one.
@@ -109,6 +110,7 @@ def step(state, query, key, value, decay, beta, active=None):
                    jax.ShapeDtypeStruct((flat, dv), query.dtype)],
         input_output_aliases={1: 0},
         compiler_params=plgpu.CompilerParams(num_warps=WARPS),
+        interpret=not triton_runs(),
     )(jnp.repeat(jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32), heads)[:, None],
       state.reshape(flat, dk, dv), query.reshape(flat, dk), key.reshape(flat, dk),
       value.reshape(flat, dv), decay.reshape(flat, dk),
