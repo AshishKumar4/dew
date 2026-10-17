@@ -13,7 +13,7 @@ from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.plan import fingerprint
-from dew.data.text import chunk
+from dew.data.text import Chunks
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -46,7 +46,7 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     targeted = [packed for packed, count in zip(reference, targets, strict=True) if count]
 
     def pipeline(source):
-        return Pipeline(source).flat_map(chunk(window, fields=FIELDS)).pack(
+        return Pipeline(source).flat_map(Chunks(window, fields=FIELDS)).pack(
             window, fields=FIELDS, bins=bins, segments=segments)
 
     def windows(source, read):
