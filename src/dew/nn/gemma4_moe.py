@@ -18,6 +18,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops
 from dew.nn.moe import ExpertMLP, GatedActivation, chosen_experts
 from dew.nn.precision import at_least_fp32
@@ -46,7 +47,7 @@ class Gemma4TextRouter(nn.Module):
                          name='norm')(x)
         scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
-        logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype,
+        logits = Dense(self.num_experts, use_bias=False, dtype=self.dtype,
                           precision=self.precision, name='proj')(scaled)
         probabilities = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
         indices = chosen_experts(lambda: jax.lax.top_k(probabilities, self.top_k)[1],

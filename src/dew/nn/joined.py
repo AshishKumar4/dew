@@ -15,6 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
+from dew.nn.dense import Dense
+
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 
@@ -35,8 +37,8 @@ def _intercepted() -> bool:
 def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None."""
     return first_refusal(
-        (all(type(projection) is nn.Dense for projection in projections),
-         "a projection is not a plain nn.Dense, whose call the join reproduces"),
+        (all(type(projection) is Dense for projection in projections),
+         "a projection is not a plain Dense, whose call the join reproduces"),
         (all(projection.dot_general is None and projection.dot_general_cls is None
              for projection in projections), "a projection takes its own dot_general"),
         (len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
@@ -80,4 +82,5 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
                             precision=projections[0].precision)
     if not projections[0].use_bias:
         return y
-    return y + jnp.stack([bias for _, _, bias in promoted], axis=axis + 2)
+    # Each Dense's promotion holds its bias at fp32, and its sum rounds back to the product's dtype.
+    return (y + jnp.stack([bias for _, _, bias in promoted], axis=axis + 2)).astype(y.dtype)

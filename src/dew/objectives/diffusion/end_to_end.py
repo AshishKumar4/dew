@@ -33,6 +33,7 @@ from jax.typing import ArrayLike
 
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_moments
+from dew.nn.conv import Conv
 from dew.objectives.base import Batch, Objective, Variables
 
 AUTOENCODER = "autoencoder"
@@ -153,8 +154,8 @@ class PatchDiscriminator(nn.Module):
 
     @nn.compact
     def __call__(self, images: jax.Array, batch: Batch) -> jax.Array:
-        def conv(features: int, stride: int, name: str, *, bias: bool = True) -> nn.Conv:
-            return nn.Conv(features, (4, 4), strides=stride, padding=1, use_bias=bias, name=name,
+        def conv(features: int, stride: int, name: str, *, bias: bool = True) -> Conv:
+            return Conv(features, (4, 4), strides=stride, padding=1, use_bias=bias, name=name,
                            kernel_init=nn.initializers.normal(0.02))
 
         hidden = nn.leaky_relu(conv(self.width, 2, "conv_0")(images), 0.2)

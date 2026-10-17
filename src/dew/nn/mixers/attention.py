@@ -34,6 +34,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.blocks import normal_kernel
+from dew.nn.dense import Dense
 from dew.nn.documents import with_documents
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
@@ -167,7 +168,7 @@ class CausalSelfAttention(nn.Module):
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
     and DeepSeek-V4.1 vision towers)."""
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., Dense] = Dense
     """The projections' module: Gemma 4's vision tower clips their inputs and
     outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     nope: bool = False

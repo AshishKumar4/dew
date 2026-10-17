@@ -28,6 +28,7 @@ from dew.interop.weights import ParamTree, checkpoint_array, translate_parameter
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
+from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.text_encoders import clip_layer
 
@@ -191,7 +192,7 @@ class VisionTransformer(nn.Module):
         valid = place < jnp.prod(grid, axis=1, keepdims=True)
         frame = place // area
 
-        hidden = nn.Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
+        hidden = Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
                           precision=self.precision, name="patch_embed")(pixels)
         if lay.position_table:
             table = nn.Embed(lay.position_table, lay.hidden_size, dtype=self.dtype, name="position_table")
@@ -343,7 +344,7 @@ class MergeProjector(nn.Module):
             grouped = grouped.swapaxes(-1, -2)
         grouped = grouped.reshape(batch, count // block, block * self.hidden_size)
         act = named_activation(self.activation)
-        dense = functools.partial(nn.Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision)
         out = dense(self.out_width, name="fc2")(act(dense(self.width, name="fc1")(grouped)))
         return act(out) if self.activation_after else out
 

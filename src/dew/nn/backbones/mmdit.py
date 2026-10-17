@@ -12,6 +12,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
+
 from ..attention import LayerNorm
 from ..dit import (
     ROPE_THETA,
@@ -77,7 +79,7 @@ class SimpleMMDiT(_DiTStackOptions):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.conditioning = self._conditioning(self.emb_features)
         # text tokens enter the sequence, so they need their own projection
-        self.txt_embed = nn.Dense(
+        self.txt_embed = Dense(
             features=self.projections()['txt_embed'][1], dtype=self.dtype,
             precision=self.precision, name="txt_embed")
         self.blocks = [_block(self, self.remat, self.emb_features, self.num_heads, f"mmdit_block_{i}")
@@ -121,7 +123,7 @@ class PatchMerging(nn.Module):
         B, _, C = x.shape
         merged = patchify(x.reshape(B, H_patches, W_patches, C), PATCH_SIDE)
         merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
-        merged = nn.Dense(
+        merged = Dense(
             features=self.out_features,
             dtype=self.dtype,
             precision=self.precision,
@@ -149,7 +151,7 @@ class PatchExpanding(nn.Module):
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B = x.shape[0]
-        x = nn.Dense(
+        x = Dense(
             features=self.expanded_features,
             dtype=self.dtype,
             precision=self.precision,
@@ -261,7 +263,7 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
         self.fusion_layers = [
             nn.Sequential([
                 LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
-                nn.Dense(features=self.projections()[f'fusion_{s}'][1], dtype=self.dtype,
+                Dense(features=self.projections()[f'fusion_{s}'][1], dtype=self.dtype,
                          precision=self.precision),
             ], name=f"fusion_{s}") for s in decoder_stages
         ]
@@ -282,13 +284,13 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
         # Base conditioning at the finest dim, projected per stage
         self.conditioning = self._conditioning(self.emb_features[0])
         self.cond_projs = [
-            nn.Dense(features=self.projections()[f'cond_proj_stage{i}'][1], dtype=self.dtype,
+            Dense(features=self.projections()[f'cond_proj_stage{i}'][1], dtype=self.dtype,
                      precision=self.precision, name=f"cond_proj_stage{i}")
             for i in range(num_stages)
         ]
         # Per-stage text streams (dims differ per stage)
         self.txt_embeds = [
-            nn.Dense(features=self.projections()[f'txt_embed_stage{i}'][1], dtype=self.dtype,
+            Dense(features=self.projections()[f'txt_embed_stage{i}'][1], dtype=self.dtype,
                      precision=self.precision, name=f"txt_embed_stage{i}")
             for i in range(num_stages)
         ]
