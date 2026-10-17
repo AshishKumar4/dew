@@ -960,7 +960,9 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     once is a deadline, a future's wait is the deadline of work handed elsewhere, a loop over items
     that skips the failed ones retries nothing, and a retry or a sleep beside a subprocess is at its
     boundary. A method or a function named like another, a definition only defined, a parameter
-    called and a nested loop's exits are each read as what they are."""
+    or a local import called, a helper of an enclosing function, a class body run where it is
+    defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
+    that falls through to the loop's exit retries nothing."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import concurrent.futures\n"
         "import subprocess\n"
@@ -1023,15 +1025,124 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "            for row in rows[index]:\n"
         "                break\n"
         "        except ValueError:\n"
+        "            continue\n"
+        "def counted():\n"
+        "    from math import factorial as run\n"
+        "    run(5)\n"
+        "    time.sleep(1)\n"
+        "def outer():\n"
+        "    def helper():\n"
+        "        subprocess.run(['true'])\n"
+        "    def enclosed():\n"
+        "        helper()\n"
+        "        time.sleep(1)\n"
+        "    enclosed()\n"
+        "def classy():\n"
+        "    class Probe:\n"
+        "        subprocess.run(['true'])\n"
+        "    time.sleep(1)\n"
+        "def once(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            work()\n"
+        "        except ValueError:\n"
+        "            failed = True\n"
+        "        break\n"
+        "def matched(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            match work():\n"
+        "                case None:\n"
+        "                    break\n"
+        "        except ValueError:\n"
         "            continue\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50)]
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
+
+
+def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
+    """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
+    that binds `f` in its method resolution order, from a method or a closure in one; a name to its
+    binding, which a comprehension's own variable does not make outside it but does inside, and a
+    pattern's capture, an exception's name or a class body's assignment does, and a receiver a
+    comprehension rebinds is another object's. A generator's element runs only as it is consumed,
+    and a list's again and again, as a loop's body does. A sleep beside a call that reaches a
+    subprocess, a list built of them included, is at its boundary."""
+    found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import subprocess\n"
+        "import time\n"
+        "def run(command):\n"
+        "    return subprocess.run(command, check=True)\n"
+        "class Base:\n"
+        "    def work(self):\n"
+        "        subprocess.run(['true'])\n"
+        "class Running(Base):\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "    def launch(self):\n"
+        "        def poll():\n"
+        "            self.work()\n"
+        "            time.sleep(1)\n"
+        "        poll()\n"
+        "def comprehended():\n"
+        "    doubled = [run * 2 for run in range(3)]\n"
+        "    run(doubled)\n"
+        "    time.sleep(1)\n"
+        "def matching(value, callback):\n"
+        "    match callback:\n"
+        "        case run:\n"
+        "            run(value)\n"
+        "    time.sleep(1)\n"
+        "def namespaced():\n"
+        "    class Local:\n"
+        "        run = abs\n"
+        "        run(-1)\n"
+        "    time.sleep(1)\n"
+        "class Pure(Base):\n"
+        "    def work(self):\n"
+        "        return 1\n"
+        "class Left(Base):\n"
+        "    pass\n"
+        "class Diamond(Left, Pure):\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "class Plain(Base):\n"
+        "    work = staticmethod(abs)\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "def inline():\n"
+        "    [run(-1) for run in (abs,)]\n"
+        "    time.sleep(1)\n"
+        "def deferred():\n"
+        "    pending = (subprocess.run(['true']) for _ in range(3))\n"
+        "    time.sleep(1)\n"
+        "    return pending\n"
+        "def handled():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as subprocess:\n"
+        "        subprocess.add_note('local')\n"
+        "    time.sleep(1)\n"
+        "def eager():\n"
+        "    [subprocess.run(['true']) for _ in range(3)]\n"
+        "    time.sleep(1)\n"
+        "class Peers(Base):\n"
+        "    def spin(self, peers):\n"
+        "        [self.work() for self in peers]\n"
+        "        time.sleep(1)\n"
+        "def polled(done):\n"
+        "    return [done.wait(0.1) for _ in range(3)]\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     """SLOP019: a handler of the ImportError, ModuleNotFoundError or AttributeError a missing feature
     raises, by any name it is imported as, that carries on instead of raising, in the package's
-    source. One that raises, naming what to install, requires the feature and is not reported; a
-    raise in a function the handler only defines is no raise of its own."""
+    source. One that raises, naming what to install, requires the feature and is not reported, as
+    is one whose class body raises where it is defined; a raise in a function the handler only
+    defines is no raise of its own."""
     found = _linted(tmp_path, {"src/sparx/features.py": (
         "from builtins import ImportError as Missing\n"
         "def optional():\n"
@@ -1058,6 +1169,13 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "        def later():\n"
         "            raise RuntimeError('never')\n"
         "        yaml = None\n"
+        "    return yaml\n"
+        "def strict():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        class Missing:\n"
+        "            raise RuntimeError('install sparx[yaml]')\n"
         "    return yaml\n")})
     assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22)]
 

@@ -1318,25 +1318,68 @@ def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
     return ""
 
 
-def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
-    """Every node `nodes` run themselves: a nested function's, lambda's or class's body runs only
-    where it is called, so it is left out."""
+def _evaluated(definition: ast.AST) -> list[ast.AST]:
+    """The parts of a definition evaluated where it is defined: its decorators and defaults, and a
+    class's bases and keywords. An annotation is a type, not an operation (postponed under
+    `from __future__ import annotations`, and lazy since Python 3.14), so it is not among them."""
+    if isinstance(definition, ast.ClassDef):
+        return [*definition.decorator_list, *definition.bases, *definition.keywords]
+    if isinstance(definition, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+        signature = definition.args
+        defaults: list[ast.AST] = [*signature.defaults,
+                                   *(item for item in signature.kw_defaults if item is not None)]
+        return defaults if isinstance(definition, ast.Lambda) else [*definition.decorator_list, *defaults]
+    return []
+
+
+def _comprehended(comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+                  ) -> list[ast.AST]:
+    """What a comprehension evaluates in its own scope: every part but its first iterable."""
+    first, *rest = comprehension.generators
+    elements = [comprehension.key, comprehension.value] if isinstance(comprehension, ast.DictComp) else [
+        comprehension.elt]
+    return [*first.ifs, *(part for generator in rest for part in (generator.iter, *generator.ifs)), *elements]
+
+
+def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
+    """Every node that runs where `nodes` run, in `scope`, with the scope its names resolve in: a nested
+    function's or lambda's evaluated parts (`_evaluated`) but not its body, which runs only where it is
+    called, and a class's body, which runs where the class is defined, in the class's own namespace."""
     for node in nodes:
+        yield node, scope
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            yield from _executed_in(_evaluated(node), scope)
+        elif isinstance(node, ast.ClassDef):
+            yield from _executed_in(_evaluated(node), scope)
+            yield from _executed_in(node.body, node)
+        elif isinstance(node, COMPREHENSIONS):
+            # Its first iterable is evaluated where it stands; the rest runs in its own scope, where its
+            # targets bind: at once for a list, a set or a dict, and only as it is consumed for a generator.
+            yield from _executed_in([node.generators[0].iter], scope)
+            if not isinstance(node, ast.GeneratorExp):
+                yield from _executed_in(_comprehended(node), node)
+        else:
+            yield from _executed_in(ast.iter_child_nodes(node), scope)
+
+
+def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
+    """Every node that runs where `nodes` run (`_executed_in`)."""
+    for node, _ in _executed_in(nodes, ast.Module(body=[], type_ignores=[])):
         yield node
-        if not isinstance(node, scopes.SCOPES):
-            yield from scopes.own(node)
 
 
 def _loop_level(statements: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
-    """The statements of a loop's body that belong to that loop: through a branch, a `with` or a
-    `try`, but not into a nested loop or a definition, whose exits are their own."""
+    """The statements of a loop's body that belong to that loop: through a branch, a `with`, a
+    `try` or a `match`, but not into a nested loop or a definition, whose exits are their own."""
     for statement in statements:
         yield statement
         if isinstance(statement, ast.If | ast.With | ast.AsyncWith):
             yield from _loop_level([*statement.body, *getattr(statement, "orelse", [])])
-        elif isinstance(statement, ast.Try):
+        elif isinstance(statement, ast.Try | ast.TryStar):
             yield from _loop_level([*statement.body, *statement.orelse, *statement.finalbody,
                                     *(line for handler in statement.handlers for line in handler.body)])
+        elif isinstance(statement, ast.Match):
+            yield from _loop_level([line for case in statement.cases for line in case.body])
 
 
 def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
@@ -1349,83 +1392,178 @@ def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
 
 def _retrying(loop: ast.For | ast.While) -> bool:
     """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` (attempts, not
-    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it
-    at the loop's level) and goes round again where it fails (a handler that leaves by none)."""
+    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it)
+    and goes round again where it fails: a handler that continues the loop, or that leaves by no
+    exit where nothing after the `try` leaves either."""
     ranged = isinstance(loop, ast.For) and isinstance(loop.iter, ast.Call) and (
         _named(loop.iter.func) == "range")
     if isinstance(loop, ast.For) and not ranged:
         return False
     body = list(loop.body)
     for index, attempt in enumerate(body):
-        if not isinstance(attempt, ast.Try):
+        if not isinstance(attempt, ast.Try | ast.TryStar):
             continue
-        succeeds = (_exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return))
-                    or _exits(body[index + 1:], (ast.Break, ast.Return)))
-        fails_round = any(not _exits(handler.body, (ast.Raise, ast.Break, ast.Return))
-                          for handler in attempt.handlers)
-        if succeeds and fails_round:
+        after = _exits(body[index + 1:], (ast.Break, ast.Return))
+        succeeds = _exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return)) or after
+        again = any(any(isinstance(line, ast.Continue) for line in _loop_level(handler.body))
+                    or not (after or _exits(handler.body, (ast.Raise, ast.Break, ast.Return)))
+                    for handler in attempt.handlers)
+        if succeeds and again:
             return True
     return False
 
 
 class _Calls:
-    """The module's functions a call reaches, read from where it is made: a bare name that the
-    calling function neither takes nor binds names a function nested in it or the module's own;
-    `self.f` or `cls.f` the method of the calling function's class; and `self.held.f`, through an
-    attribute of another object, any method `f` of the module's classes."""
+    """The module's functions a call reaches, read where it is made, as one module's lexical scopes
+    give them: a bare name through the scopes that enclose the call (a class body's names reach none
+    of its methods) to the definition that binds it there; `self.f` or `cls.f`, the receiver of the
+    method the call is in or closes over, to `f` in the method resolution order of that method's
+    class among the module's classes; and `self.held.f`, through an attribute of another object, to
+    any method `f` of the module's classes. Calls through other modules, callables passed in and
+    attributes set at run time are not followed."""
 
-    def __init__(self, tree: ast.Module):
-        self.top: dict[str, ast.AST] = {node.name: node for node in tree.body
-                                        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
-        self.owner: dict[int, ast.ClassDef] = {}
-        self.methods: dict[int, dict[str, ast.AST]] = {}
+    def __init__(self, tree: ast.Module, parent: Sequence[str]):
+        self.parent = parent
+        self.enclosing: dict[int, ast.AST | None] = {}
+        self.bindings: dict[int, dict[str, ast.AST | None]] = {}
         self.named: dict[str, list[ast.AST]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                own: dict[str, ast.AST] = {item.name: item for item in node.body
-                                           if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)}
-                self.methods[id(node)] = own
-                for name, item in own.items():
-                    self.owner[id(item)] = node
-                    self.named.setdefault(name, []).append(item)
+        self._index(tree, None)
 
-    def reached(self, function: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call) -> list[ast.AST]:
+    def _index(self, scope: ast.AST, enclosing: ast.AST | None) -> None:
+        self.enclosing[id(scope)] = enclosing
+        names: dict[str, ast.AST | None] = {}
+
+        def bind(name: str | None, definition: ast.AST | None) -> None:
+            # A name bound twice in one scope, once otherwise, is no one definition's.
+            if name is not None:
+                names[name] = definition if names.get(name, definition) is definition else None
+
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            for argument in scopes.arguments(scope):
+                bind(argument.arg, None)
+        own = list(scopes.own(scope))
+        # A comprehension's targets bind in its own implicit scope, not this one.
+        comprehended = {id(name) for node in own if isinstance(node, ast.comprehension)
+                        for name in ast.walk(node.target)}
+        for node in own:
+            if isinstance(node, COMPREHENSIONS):
+                self._comprehension(node, scope)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                if id(node) not in comprehended:
+                    bind(node.id, None)
+            elif isinstance(node, ast.MatchAs | ast.MatchStar):
+                bind(node.name, None)
+            elif isinstance(node, ast.MatchMapping):
+                bind(node.rest, None)
+            elif isinstance(node, ast.ExceptHandler):
+                bind(node.name, None)
+            elif isinstance(node, ast.Import | ast.ImportFrom):
+                for name in scopes.bound_by(node, self.parent):
+                    bind(name, None)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                bind(node.name, node)
+                if isinstance(scope, ast.ClassDef) and not isinstance(node, ast.ClassDef):
+                    self.named.setdefault(node.name, []).append(node)
+            if isinstance(node, scopes.SCOPES):
+                self._index(node, scope)
+        self.bindings[id(scope)] = names
+
+    def _comprehension(self, node: ast.AST, enclosing: ast.AST) -> None:
+        """Index a comprehension, which `_index` meets in the scope that holds it, as a scope of its own: its
+        targets bind there, and a comprehension it holds encloses in it."""
+        if id(node) in self.bindings:
+            return
+        assert isinstance(node, COMPREHENSIONS)
+        self.enclosing[id(node)] = enclosing
+        self.bindings[id(node)] = {name.id: None for generator in node.generators
+                                   for name in ast.walk(generator.target) if isinstance(name, ast.Name)}
+        for part in _comprehended(node):
+            for inner in ast.walk(part):
+                if isinstance(inner, COMPREHENSIONS):
+                    self._comprehension(inner, node)
+
+    def _lookup(self, scope: ast.AST | None, name: str) -> ast.AST | None:
+        """What `name` stands for, read in `scope`: its own binding, else the enclosing scopes'
+        (a class's names reach no scope inside it)."""
+        start = scope
+        while scope is not None:
+            bound = self.bindings.get(id(scope), {})
+            if name in bound and (scope is start or not isinstance(scope, ast.ClassDef)):
+                return bound[name]
+            scope = self.enclosing.get(id(scope))
+        return None
+
+    def _order(self, owner: ast.ClassDef, seen: frozenset[int] = frozenset()) -> list[ast.ClassDef]:
+        """`owner`'s method resolution order among the module's classes (C3, as Python computes it),
+        a base the module does not define ending its line."""
+        if id(owner) in seen:
+            return [owner]
+        bases = [base for base in (self._lookup(self.enclosing.get(id(owner)), node.id)
+                                   for node in owner.bases if isinstance(node, ast.Name))
+                 if isinstance(base, ast.ClassDef)]
+        lines = [self._order(base, seen | {id(owner)}) for base in bases] + [bases]
+        order = [owner]
+        while any(lines):
+            for line in lines:
+                head = line[0] if line else None
+                if head is not None and not any(head in other[1:] for other in lines):
+                    break
+            else:
+                return order  # No consistent order: Python refuses the class; nothing more is read.
+            order.append(head)
+            lines = [line[1:] if line and line[0] is head else line for line in lines]
+        return order
+
+    def _method(self, scope: ast.AST, receiver: str, name: str) -> ast.AST | None:
+        """The method `name` the receiver `receiver`, read in `scope`, reaches: the receiver of the
+        method that scope is in or closes over, to the first class in that method's class's resolution
+        order that binds `name`. A scope on the way that binds the receiver itself (a comprehension's
+        target, a closure's own) makes it another object, whose methods are not followed."""
+        current: ast.AST | None = scope
+        while current is not None:
+            owner = self.enclosing.get(id(current))
+            if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                parameters = [argument.arg for argument in scopes.arguments(current)]
+                if parameters[:1] == [receiver] and isinstance(owner, ast.ClassDef):
+                    for cls in self._order(owner):
+                        if name in self.bindings[id(cls)]:
+                            return self.bindings[id(cls)][name]
+                    return None
+            if receiver in self.bindings.get(id(current), {}):
+                return None
+            current = owner
+        return None
+
+    def reached(self, scope: ast.AST, call: ast.Call) -> list[ast.AST]:
+        """The definitions `call`, made in `scope`, reaches."""
         if isinstance(call.func, ast.Name):
-            name = call.func.id
-            body = list(_executed(function.body))
-            nested = {node.name: node for node in body
-                      if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
-            if name in nested:
-                return [nested[name]]
-            bound = {argument.arg for argument in scopes.arguments(function)} | {
-                node.id for node in body if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
-            return [] if name in bound or name not in self.top else [self.top[name]]
+            found = self._lookup(scope, call.func.id)
+            return [found] if isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef) else []
         if not isinstance(call.func, ast.Attribute):
             return []
         through, root = 0, call.func.value
         while isinstance(root, ast.Attribute):
             through, root = through + 1, root.value
-        if _named(root) not in ("self", "cls"):
+        if not isinstance(root, ast.Name) or root.id not in ("self", "cls"):
             return []
-        owner = self.owner.get(id(function))
-        if through == 0:
-            method = None if owner is None else self.methods[id(owner)].get(call.func.attr)
-            return [] if method is None else [method]
-        return self.named.get(call.func.attr, [])
+        if through:
+            return self.named.get(call.func.attr, [])
+        method = self._method(scope, root.id, call.func.attr)
+        return [method] if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef) else []
 
 
 def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
             calls: _Calls, seen: set[int]) -> bool:
-    """Whether `function` deals with what leaves the process (`EXTERNAL`): its own body names such
+    """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
     a module, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
-    for node in _executed(function.body):
+    for node, scope in _executed_in(function.body, function):
         if isinstance(node, ast.Name | ast.Attribute):
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
         if isinstance(node, ast.Call):
-            for helper in calls.reached(function, node):
+            for helper in calls.reached(scope, node):
                 if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
                         and _leaves(helper, tables, calls, seen)):
                     return True
@@ -1437,15 +1575,21 @@ def waits(module: Module) -> Iterator[Finding]:
     process: one inside a function that deals with no subprocess, network, remote service or other
     process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
     work is ordered or woken, not waited on; a timed wait made once is a deadline."""
-    calls = _Calls(module.tree)
+    calls = _Calls(module.tree, _parent(module))
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
     for function in ast.walk(module.tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         external = None
         # What a loop runs each time round: its body, and a `while`'s test, asked before each.
-        looped = {id(inner) for loop in _executed(function.body) if isinstance(loop, ast.For | ast.While)
-                  for inner in _executed([*loop.body, *([loop.test] if isinstance(loop, ast.While) else [])])}
+        # What runs again and again: a loop's body and a `while`'s test, and an eager comprehension's body.
+        repeated: list[ast.AST] = []
+        for node in _executed(function.body):
+            if isinstance(node, ast.For | ast.While):
+                repeated += [*node.body, *([node.test] if isinstance(node, ast.While) else [])]
+            elif isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp):
+                repeated += _comprehended(node)
+        looped = {id(inner) for inner in _executed(repeated)}
         for node in _executed(function.body):
             what = _waiting(node, tables.get(id(node), {}))
             if what == "a timed wait":
