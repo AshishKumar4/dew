@@ -702,7 +702,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         tokens, fields = self._token_geometry(batch)
         valid = real_slots(fields, tokens.shape, xp=np)
         if self.pad_id is not None:
-            valid &= tokens != self.pad_id
+            valid = valid & (tokens != self.pad_id)
         return valid, token_layout(fields, xp=np)[1]
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
