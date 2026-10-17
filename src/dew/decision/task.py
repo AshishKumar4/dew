@@ -123,8 +123,8 @@ class DecideSettings:
     head: JSON
     layout: JSON
     specials: Specials
-    tokenizer: str | None = None
-    processor: str | None = None
+    tokenizer: str | None
+    processor: str | None
 
 
 @dataclass(frozen=True)
