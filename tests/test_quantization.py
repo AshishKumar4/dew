@@ -972,8 +972,9 @@ def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
 
 
 def test_an_int8_image_task_samples_as_the_host_does(tmp_path):
-    """`TextToImage.quantized` in int8 over the tiny FLUX source samples, decoded, as the same task
-    on the host does."""
+    """`TextToImage.quantized` in int8 over the tiny FLUX source walks a prompt's latents as the
+    same task does on the host, from the same quantized weights and encoded prompt."""
+    import dataclasses
     import tarfile
 
     from dew.interop.pretrained import Pretrained
@@ -981,11 +982,15 @@ def test_an_int8_image_task_samples_as_the_host_does(tmp_path):
     pytest.importorskip("qwix")
     with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
+    with jax.default_device(jax.devices("cpu")[0]):
+        task = Pretrained.load(tmp_path / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+        served = task.quantized(Quantization())
+        prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
 
     def run(dtype):
-        task = Pretrained.load(tmp_path / "pipeline", dtype=jnp.dtype(dtype).name,
-                               attention_impl="xla").text_to_image()
-        return task.quantized(Quantization())(["a red bird"], steps=2, key=1).host().images
+        walked = dataclasses.replace(served, model=served.model.clone(dtype=dtype),
+                                     variables=placed(held, dtype))
+        return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
     assert_computed_as_on_the_host(run, "an int8 image task's samples")
 
@@ -1023,10 +1028,13 @@ def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
     from dew.training.trainer import Trainer
 
     pytest.importorskip("qwix")
-    spec, batch = Quantization(patterns=(".*_proj",)), token_batch()
-    held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
-    objective = LMObjective(spec.apply(tiny()), seq_len=SEQ_LEN, ema_decay=None, variables=held)
-    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=BATCH,
+    # Eight rows of four tokens: one row on each of the host's eight test devices, and on one GPU a
+    # weight gradient over 32 tokens, a contraction XLA's autotuner gives the Triton fusion.
+    spec, length = Quantization(patterns=(".*_proj",)), 4
+    batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
+    held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
+    objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
+    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=8,
                   loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
     state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
     moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
@@ -1034,7 +1042,7 @@ def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
 
     def gradient(dtype):
         step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
-        program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=SEQ_LEN, ema_decay=None)
+        program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
         variables = placed(held, dtype)
         return jax.grad(lambda params: program.loss({**variables, "params": params},
                                                     {"text": jnp.asarray(batch["text"])}, step)[0].total)(
