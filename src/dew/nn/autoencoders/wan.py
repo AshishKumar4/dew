@@ -386,8 +386,6 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
         raise ValueError(
             "attention inside the levels (attn_scales) is not ported; the published VAEs have none"
         )
-    if config.get("dropout", 0.0):
-        raise ValueError("a frozen autoencoder runs without dropout")
     for name in ("is_residual", "patch_size"):
         if config.get(name):
             raise ValueError(f"{name} belongs to Wan 2.2's VAE, which this port does not compute")
