@@ -127,6 +127,10 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
     dependencies: dict[str, Mapping[str, object]] = {}
     for field in dataclasses.fields(step):
         value = getattr(step, field.name)
+        # A step that calls a configured object's method (`InputSpec.tokenize`) computes what that
+        # object's configuration says.
+        if inspect.ismethod(value):
+            value = value.__self__
         if isinstance(value, _Dependencies):
             dependencies[field.name] = value.dependencies()
         elif dataclasses.is_dataclass(value) and not isinstance(value, type):
