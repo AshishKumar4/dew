@@ -19,7 +19,7 @@ from recording import RecordingTracker
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.diffusion.presets import JiT
-from dew.diffusion.transforms import VPredictionTransform
+from dew.diffusion.transforms import EpsilonPredictionTransform, VPredictionTransform
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
@@ -112,6 +112,16 @@ def test_flow_objective_uses_converted_predictions(prediction):
     np.testing.assert_allclose(objective.log_probs(variables, batch), trajectory.log_probs, atol=3e-6)
     loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(32), None))
     assert np.isfinite(float(loss))
+
+
+def test_a_prediction_undefined_at_pure_noise_is_refused_where_the_trajectory_starts():
+    """An epsilon prediction recovers the clean sample by dividing by alpha, which a rectified
+    flow's trajectory starts at 0: the objective refuses it when built, rather than rolling out
+    non-finite states."""
+    process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+    with pytest.raises(ValueError):
+        FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
+                          guidance=None)
 
 
 def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
