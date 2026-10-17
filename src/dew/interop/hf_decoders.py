@@ -55,8 +55,8 @@ from dew.interop.decoder_parts import (
     refuse,
     translated,
 )
-from dew.interop.streaming import LazyTree, SourceLeaf, materialize
-from dew.interop.weights import checkpoint_dtype, insert
+from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -486,13 +486,15 @@ def read_wrapper(
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
-) -> tuple[Variables, tuple[Reading, ...]]:
+) -> tuple[Variables, tuple[Reading, ...], tuple[WeightLayout, ...]]:
     """Map wrapper weights into language, tower, projector and audio trees,
     and return them with the language model's readings (`read_decoder`),
-    named as the language model reads them (`wrapper_route`'s local names).
-    Each name routes by prefix (`wrapper_route`). The language half rides
-    the text family's own map, including the top-level tied head copy, and
-    the tower and projector halves ride theirs. `lazy` leaves the language
+    named as the language model reads them (`wrapper_route`'s local names),
+    and the layouts the media readers placed their tensors by, under the
+    source's own names, at their paths in the wrapper's collections. Each
+    name routes by prefix (`wrapper_route`). The language half rides the
+    text family's own map, including the top-level tied head copy, and the
+    tower and projector halves ride theirs. `lazy` leaves the language
     model's leaves unread; the towers and projectors are small and read
     whole.
     """
@@ -501,23 +503,27 @@ def read_wrapper(
               for group, held in sources.items()}
     language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
                                       lazy=lazy)
-    variables = {
-        "language_model": language,
-        "tower": vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"], param_dtype),
-        "projector": {"params": vision_nn.projector_variables(
-            _kind_name(record, "projector"), tables["projector"], param_dtype)},
-    }
+    tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
+                                                     param_dtype)
+    projector, projector_layouts = vision_nn.projector_variables(
+        _kind_name(record, "projector"), tables["projector"], param_dtype)
+    variables = {"language_model": language, "tower": tower, "projector": {"params": projector}}
+    placed = {"tower": tower_layouts, "projector": nested(projector_layouts, 0, "params")}
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower {audio['class']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(
-            tables["audio_tower"], encoder, param_dtype=param_dtype
-        )
-        variables["audio_projector"] = {"params": vision_nn.projector_variables(
-            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
-    return variables, readings
+        variables["audio_tower"], placed["audio_tower"] = audio_nn.audio_weights(
+            tables["audio_tower"], encoder, param_dtype=param_dtype)
+        audio_projector, audio_layouts = vision_nn.projector_variables(
+            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
+        variables["audio_projector"] = {"params": audio_projector}
+        placed["audio_projector"] = nested(audio_layouts, 0, "params")
+    # Each component's collections hold it under its own name in the wrapper's.
+    media = tuple(dataclasses.replace(layout, name=sources[group][layout.name])
+                  for group, layouts in placed.items() for layout in nested(layouts, 1, group))
+    return variables, readings, media
 
 
 def _stack_experts(params: LazyTree) -> None:

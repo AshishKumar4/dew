@@ -76,7 +76,7 @@ def test_siglip_tower_matches_the_reference_implementation():
     fixture = load_fixture("siglip-tiny")
     record = siglip.translate_siglip_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = tower_variables("siglip", fixture["tensors"], "float32")
+    variables, _ = tower_variables("siglip", fixture["tensors"], "float32")
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
@@ -98,7 +98,7 @@ def test_gemma_projector_matches_the_reference_implementation():
         fixture["projector"]["mm_tokens_per_image"])
     projector = projectors.from_record(record).build()
     variables = {"params": siglip.translate_gemma_projector_weights(
-        fixture["projector_tensors"])}
+        fixture["projector_tensors"])[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
         - fixture["projector_ref"])) < 1e-4
@@ -116,7 +116,7 @@ def test_llama4_tower_matches_the_reference_implementation():
     fixture = load_fixture("llama4-vision-tiny")
     record = llama4.translate_llama4_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = tower_variables("llama4", fixture["tensors"], "float32")
+    variables, _ = tower_variables("llama4", fixture["tensors"], "float32")
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
@@ -133,7 +133,7 @@ def test_llama4_projector_matches_the_reference_implementation():
     fixture = load_fixture("llama4-vision-tiny")
     record = llama4.translate_llama4_projector_config(fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
-    variables = {"params": projector_variables("llama4", fixture["projector_tensors"], "float32")}
+    variables = {"params": projector_variables("llama4", fixture["projector_tensors"], "float32")[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
         - fixture["projector_ref"])) < 1e-4
@@ -156,7 +156,7 @@ def test_gemma4_tower_matches_the_reference_implementation():
     fixture = load_fixture("gemma4-vision-tiny")
     record = gemma4.translate_gemma4_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = tower_variables("gemma4", fixture["tensors"], "float32")
+    variables, _ = tower_variables("gemma4", fixture["tensors"], "float32")
     patch = record["fields"]["patch_size"]
     assert isinstance(patch, int)
     image = gemma4_image(fixture["pixels"], patch)
@@ -186,7 +186,7 @@ def test_gemma4_projector_matches_the_reference_implementation():
         trunk["fields"], fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": gemma4.translate_gemma4_projector_weights(
-        fixture["projector_tensors"])}
+        fixture["projector_tensors"])[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
         - fixture["projector_ref"])) < 1e-4
@@ -205,7 +205,7 @@ def test_gemma4_widened_head_computes_the_reference_features():
     record = gemma4.translate_gemma4_vision_config(fixture['config'])
     vision = towers.from_record(record)
     tower = vision.build()
-    variables = tower_variables("gemma4", fixture["tensors"], "float32")
+    variables, _ = tower_variables("gemma4", fixture["tensors"], "float32")
     positions = np.load(FIXTURES / 'gemma4-vision-wide-tiny' / 'positions.npy')
     actual = np.asarray(tower.apply(variables, fixture['pixels'], positions))
     np.testing.assert_allclose(actual, fixture['tower_ref'], atol=1e-4, rtol=0)
@@ -221,7 +221,7 @@ def test_qwen35_tower_matches_the_reference_implementation():
     fixture = load_fixture("qwen35-vision-tiny")
     record = qwen35.translate_qwen35_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = tower_variables("qwen3_5", fixture["tensors"], "float32")
+    variables, _ = tower_variables("qwen3_5", fixture["tensors"], "float32")
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
@@ -241,7 +241,7 @@ def test_qwen35_projector_matches_the_reference_implementation():
     record = qwen35.translate_qwen35_projector_config(
         fixture["config"], fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
-    variables = {"params": projector_variables("qwen3_5", fixture["projector_tensors"], "float32")}
+    variables = {"params": projector_variables("qwen3_5", fixture["projector_tensors"], "float32")[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
         - fixture["projector_ref"])) < 1e-4
@@ -303,7 +303,7 @@ def test_mimo_tower_is_as_exact_as_the_reference():
     the float64 gate; with the sinks zeroed the trunk leaves the reference by far more."""
     config, tensors, _, refs = shared_fixture("mimo-vision-tiny")
     tower = towers.from_record(mimo.translate_mimo_vision_config(config)).build()
-    variables = tower_variables("mimo", tensors, "float32")
+    variables, _ = tower_variables("mimo", tensors, "float32")
     out = tower.apply(variables, refs["pixels"], refs["grid"])
     grid = refs["grid"]
     _, terms = float64_forward(tower, variables, refs["pixels"], grid)
@@ -321,7 +321,7 @@ def test_mimo_merger_is_as_exact_as_the_reference():
     config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
     projector = projectors.from_record(record).build()
-    variables = {"params": projector_variables("mimo", projector_tensors, "float32")}
+    variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]
     assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
@@ -334,7 +334,7 @@ def test_muse_glimmer_tower_is_as_exact_as_the_reference():
     and the first row again from its NCHW image packed in the processor's time-then-channel order."""
     config, tensors, _, refs = shared_fixture("muse-glimmer-vision-tiny")
     tower = towers.from_record(muse_glimmer.translate_muse_glimmer_vision_config(config)).build()
-    variables = tower_variables("muse_glimmer", tensors, "float32")
+    variables, _ = tower_variables("muse_glimmer", tensors, "float32")
     grid = refs["grid"]
     out = tower.apply(variables, refs["pixels"], grid)
     assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
@@ -352,7 +352,7 @@ def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config)).build()
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
               for prefix in PROJECTOR_PREFIX["muse_glimmer"] if name.startswith(prefix)}
-    variables = {"params": projector_variables("muse_glimmer", routed, "float32")}
+    variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]
     assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
