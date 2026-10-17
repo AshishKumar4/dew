@@ -258,8 +258,8 @@ def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
     assert adamw[0] == muon[0]
     assert adamw[1:] != muon[1:]
     assert curves["adamw"]["tokens"] == 3 * 8 * 8
-    # Every line's bytes and its EOS.
-    assert curves["adamw"]["corpus_tokens"] == sum(len(line.encode()) + 1 for line in LINES)
+    # Every line's bytes, its newline and its EOS.
+    assert curves["adamw"]["corpus_tokens"] == sum(len(line.encode()) + 2 for line in LINES)
 
 
 # ---------------------------------------------------------------------------
