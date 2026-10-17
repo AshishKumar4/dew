@@ -61,10 +61,15 @@ def operands(rows: int, width: int = 64, hidden: int = 96):
 
 def launches(function, *args) -> dict[str, tuple[tuple[int, ...], int]]:
     """Each Pallas launch's grid and warps in `function`'s program, by kernel name."""
-    graph = jax.make_jaxpr(function)(*args).jaxpr
-    return {str(eqn.params["name"]): (tuple(eqn.params["grid_mapping"].grid),
-                                      eqn.params["compiler_params"].num_warps)
-            for eqn in equations(graph) if eqn.primitive.name == "pallas_call"}
+    return {name: (tuple(grid), warps) for name, grid, warps in launched(jax.make_jaxpr(function)(*args))}
+
+
+def launched(program) -> list[list]:
+    """Each Pallas launch of the traced `program` (a closed jaxpr), its sub-programs' included, as
+    `[kernel name, grid, warps]`, in the order traced."""
+    return [[str(eqn.params["name"]), list(eqn.params["grid_mapping"].grid),
+             eqn.params["compiler_params"].num_warps]
+            for eqn in equations(program.jaxpr) if eqn.primitive.name == "pallas_call"]
 
 
 def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src") -> list:
@@ -253,27 +258,44 @@ def test_a_step_settles_each_distinct_launch_once(tmp_path):
     assert len(one) == 4 and two == one
 
 
-@pytest.mark.parametrize("holder", [0, 1])
-def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick(tmp_path, holder):
+@pytest.mark.parametrize("stores, rows, norms", [
+    ({0: {8: (4, 2)}}, (15,), [[[4], 2]]),
+    ({1: {8: (4, 2)}}, (15,), [[[1], 4]]),
+    ({0: {16: (4, 2)}, 1: {8: (4, 2), 64: (8, 4)}}, (16, 32), [[[4], 2], [[8], 2]]),
+], ids=["process 0 holds", "process 1 holds", "one pick moves another's nearest"])
+def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick(tmp_path, stores, rows,
+                                                                                   norms):
     """A launch without a pick of its own takes the nearest stored pick, or its
-    heuristic, as process 0 resolves it, whatever another process stores. One
-    process of two stores an 8-token norm's pick, 4 rows a program and 2
-    warps, the other none; tuned for a 15-token step, both launch its norm as
-    the pick's 4 programs of 2 warps where process 0 stores it, and as the
-    heuristic's one program of 4 warps where process 1 does."""
-    # The 8-token launch as a step traced for the GPU keys it, which is how a measurement stores it.
-    with generation.assumed("sm80"), tuning.seen() as found:
-        jax.make_jaxpr(step())(*operands(8))
-    [norm] = [ba for op, ba in found if type(op) is norm_swiglu.RmsForward]
+    heuristic, as process 0 resolves it, whatever another process stores: the
+    program `tune` returns on each of two processes launches each norm alike.
+    Where process 0 stores an 8-token norm's pick, 4 rows a program and 2
+    warps, a 15-token step's norm takes it on both; where process 1 does, the
+    heuristic's one program of 4 warps. Where process 0 stores a 16-token pick
+    and process 1 an 8- and a 64-token one, a step at 16 and 32 tokens takes
+    process 0's pick for both on both: process 1's 32-token norm, first traced
+    with its 64-token neighbour's 8 rows and 4 warps, traces again once the
+    16-token pick that becomes its nearest is installed."""
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
-    picks = tmp_path / "picks.json"
-    picks.write_text(tokamax.AutotuningResult(jax.devices()[0].device_kind, (
-        (norm, tuning.AutotuningData({norm_swiglu.RowsConfig(4, 2): timing})),)).dumps())
+
+    def keyed(count):
+        # The launch as a step traced for the GPU keys it, which is how a measurement stores it.
+        with generation.assumed("sm80"), tuning.seen() as found:
+            jax.make_jaxpr(step())(*operands(count))
+        [norm] = [ba for op, ba in found if type(op) is norm_swiglu.RmsForward]
+        return norm
+
+    picks = tmp_path / "picks"
+    picks.mkdir()
+    for process, held in stores.items():
+        stored = tuple((keyed(count), tuning.AutotuningData({norm_swiglu.RowsConfig(*config): timing}))
+                       for count, config in held.items())
+        result = tokamax.AutotuningResult(jax.devices()[0].device_kind, stored)
+        (picks / f"process{process}.json").write_text(result.dumps())
     reports = run_pool("settle", tmp_path / "pool", 2, script=Path(__file__).with_name("tuning_worker.py"),
-                       cache=tmp_path / "cache", picks=picks, holder=holder)
-    expected = [[4], 2] if holder == 0 else [[1], 4]
-    assert [report["rms_norm_forward"] for report in reports] == [expected, expected]
+                       cache=tmp_path / "cache", picks=picks, rows=",".join(map(str, rows)))
+    assert reports[0] == reports[1]
+    assert [[grid, warps] for name, grid, warps in reports[0] if name == "rms_norm_forward"] == norms
 
 
 TRAINED = """

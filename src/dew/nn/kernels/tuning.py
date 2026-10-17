@@ -542,17 +542,20 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
                     for chosen in json.loads(text))
     settled: dict[tuple[tokamax.Op, Hashable], AutotuningData] = {
         (op, key): fastest for op, key, fastest in _kernel_launches(picked)}
-    changed = False
+    def launched() -> list[Hashable]:
+        # The configs the launches take, as the trace read them; tokamax's ignore-cache setting keeps
+        # the picks None. One launch's pick moves another's nearest, so all are read before any moves.
+        return [_config(_pick(ba) or op._nearest(ba)) for op, ba in found]
+
+    traced = launched()
     for op, ba in found:
         picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
-        # The pick resolution reads, which tokamax's ignore-cache setting keeps None.
-        held = _config(_pick(ba) or op._nearest(ba))
         picks.pop(key, None)
         if (fastest := settled.get((ba.op, key))) is not None:
             picks[key] = fastest
         _NEAREST.setdefault((_identity(op), kind), {})[key] = (
             near[(ba.op, key)][1] if (ba.op, key) in near else None)
-        changed |= _config(_pick(ba) or op._nearest(ba)) != held
+    changed = launched() != traced
     if any(coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
         cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
