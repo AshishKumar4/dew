@@ -903,6 +903,27 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
                                          f"{kind} repeated model time, step {index}")
 
 
+@pytest.mark.parametrize("kind", ["UniPCMultistep", "DPMSolverMultistep", "EulerDiscrete"])
+def test_a_spacing_too_fine_for_its_table_is_refused_by_the_grid(kind):
+    """Four leading-spaced steps over a four-entry table land every step on one model time and one
+    sigma, intervals of no length that multistep coefficients divide by: the grid refuses them,
+    where the walk would otherwise end in NaN. Three steps over the same table walk distinct
+    sigmas."""
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    config = {"_class_name": kind + "Scheduler", "num_train_timesteps": 4, "timestep_spacing": "leading"}
+    with pytest.raises(ValueError):
+        SourceSchedule.from_config(config).sampling(4)
+    schedule = SourceSchedule.from_config(config)
+    process, times = schedule.sampling(3)
+    model = SourceOracle()
+    x_T = jax.random.normal(jax.random.PRNGKey(3), (2, 3, 4))
+    denoise = process.denoiser(model, model.init(jax.random.PRNGKey(1), x_T[:1], jnp.ones((1,))), {})
+    walked = sample(denoise, x_T, solver=schedule.solver, key=jax.random.PRNGKey(0), times=times,
+                    final_denoise=False)
+    assert np.all(np.isfinite(np.asarray(walked)))
+
+
 def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
     walks with different keys integrate one path; without it the walk's own

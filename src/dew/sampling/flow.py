@@ -129,14 +129,21 @@ class FlowSDE:
     Process times may be resolution-shifted. The transition integrates in
     the noise rate sigma that results, as the reference scheduler does.
     Predictions are converted to clean samples and noise by the denoiser.
-    A process without a rectified-flow schedule raises `ValueError`.
+    A process without a rectified-flow schedule raises `ValueError`, and so
+    does a prediction whose conversion divides by the signal rate
+    (`PredictionTransform.divides_by_signal`, epsilon's), since the
+    trajectory starts at pure noise, where that rate is 0.
     """
 
     noise_level: float = struct.field(pytree_node=False, default=0.7)
 
     def validate(self, process: Process) -> None:
-        if not isinstance(process.sampler_schedule, RectifiedFlow):
+        schedule = process.sampler_schedule
+        if not isinstance(schedule, RectifiedFlow):
             raise ValueError("FlowSDE requires a rectified-flow schedule")
+        if process.prediction.divides_by_signal and float(schedule.rates(jnp.asarray(schedule.T))[0]) == 0:
+            raise ValueError(f"a {type(process.prediction).__name__} recovers the clean sample by dividing "
+                             f"by the signal rate, which is 0 where the trajectory starts")
 
     def init(self, x: jax.Array, times: jax.Array, process: Process, *,
              key: jax.Array) -> tuple[jax.Array, jax.Array]:

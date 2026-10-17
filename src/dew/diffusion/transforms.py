@@ -14,7 +14,7 @@ and is converted with `target_error_scale`.
 """
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +46,10 @@ class PredictionTransform:
     """
 
     normalize_input: bool = False
+
+    divides_by_signal: ClassVar[bool] = False
+    """Whether `backward_diffusion` divides by the signal rate alpha, and so is undefined where
+    alpha is 0, as at a rectified flow's pure-noise end."""
 
     def __init__(self, *, normalize_input: bool = False):
         self.normalize_input = normalize_input
@@ -94,6 +98,8 @@ class PredictionTransform:
 
 
 class EpsilonPredictionTransform(PredictionTransform):
+    divides_by_signal = True
+
     def backward_diffusion(self, x_t, prediction, rates):
         signal_rates, noise_rates = rates
         return (x_t - prediction * noise_rates) / signal_rates, prediction
