@@ -66,12 +66,30 @@ class LocalRetention:
                     shutil.rmtree(writer)
                     shutil.rmtree(segments)
 
+    @staticmethod
+    def _abandoned(key: Path) -> None:
+        """Remove `key`'s writers that stopped before they sealed and no process holds: a run that
+        ends mid-fill closes its writer unsealed, and no generation reads an unsealed writer's
+        shards (`generation._sealed`), so they hold bytes alone."""
+        for writer in (key / "shards").glob("*"):
+            if not writer.is_dir() or not re.fullmatch(r"[a-f0-9]{32}", writer.name):
+                continue
+            segments = key / "segments" / writer.name
+            with LocalRetention._exclusive(writer) as available:
+                if available and not (segments / "seal.json").is_file():
+                    shutil.rmtree(writer)
+                    if segments.is_dir():
+                        shutil.rmtree(segments)
+
     @contextlib.contextmanager
     def reserve(self, target: Path, byte_count: int) -> Iterator[None]:
         self.directory.mkdir(parents=True, exist_ok=True)
         with FileLock(str(self.directory / ".retention.lock")):
             replaced = target.stat().st_size if target.is_file() else 0
             needed = max(0, byte_count - replaced)
+            if self._size() + needed > self.max_bytes:
+                for key in self._keys():
+                    self._abandoned(key)
             candidates = sorted(
                 (manifest.stat().st_atime_ns, manifest.parent)
                 for key in self._keys()

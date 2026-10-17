@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
+from hub_support import stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -62,6 +63,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     with pytest.raises(FileNotFoundError):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
@@ -98,8 +100,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
 
     def header(self, path, **kwargs):
         payload = payloads[path]
-        return {"name": path, "type": "file", "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payload), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}}
 
     def refs(self, repo, *, repo_type):
         conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
@@ -152,8 +154,8 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
     }
 
     def header(self, path, **kwargs):
-        return {"name": path, "type": "file", "size": len(payloads[path]),
-                "sha256": hashlib.sha256(payloads[path]).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payloads[path]), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payloads[path]).hexdigest(), "size": len(payloads[path])}}
 
     def listing(self, repo, *, repo_type, revision):
         return (["default/train/0000.parquet"] if revision == "converted"
@@ -329,6 +331,7 @@ def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
         HfApi, "dataset_info", lambda self, repo, revision=None: SimpleNamespace(sha=revision)
     )
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: [f"train.{format}"])
+    stated_shards(monkeypatch)
     native = Hub("owner/data", revision="pinned").files
     assert native.url == (f"hf://datasets/owner/data@pinned/train.{format}",)
     assert native.format == format
@@ -356,6 +359,7 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     source = Hub("owner/data", revision=revision)
     commit = "original" if native else "converted"
     assert source.supports("streamed")
@@ -528,13 +532,20 @@ def test_file_catalog_keeps_distinct_nested_names_including_underscore_directori
 
 
 def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
+    import csv
+
     text = "a" * 140_000 + "\n" + "b" * 140_000
     root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
     root.write(('id,text\n0,"' + text + '"\n').encode())
     files = Files(root.url)
-    assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
-    files.provision()
-    assert files.records("indexed")[0] == {"id": "0", "text": text}
+    # A field past Python's default limit reads under the limit its caller raises (`Files`).
+    previous = csv.field_size_limit(len(text) + 1)
+    try:
+        assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
+        files.provision()
+        assert files.records("indexed")[0] == {"id": "0", "text": text}
+    finally:
+        csv.field_size_limit(previous)
 
 
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
@@ -559,6 +570,132 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     indexed = Files(root.url, format="parquet").records("indexed")
     assert len(indexed) == 20
     assert sorted(indexed[index]["value"] for index in range(20)) == list(range(20))
+
+
+def test_a_predicate_held_in_memory_keeps_the_rows_it_selects(tmp_path):
+    """A memory read of a filtered parquet source holds the rows the predicate keeps, as a
+    streamed read does, from a row group it filters in part and one it filters whole."""
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"x": [0, 1, 2, 3]}), tmp_path / "rows.parquet", row_group_size=2)
+    for where, kept in ((ds.field("x") > 0, [1, 2, 3]), (ds.field("x") > 1, [2, 3])):
+        files = Files(str(tmp_path / "rows.parquet"), where=where)
+        streamed_rows = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        assert [row["x"] for row in files.records("memory")] == [row["x"] for row in streamed_rows] == kept
+
+
+@pytest.mark.parametrize("format", ["jsonl", "csv"])
+def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_path, format):
+    """`columns=` selects a mapping row's fields however a line source is read, as an Arrow
+    source's projection does, and a field the rows lack is refused by name."""
+    rows = [{"id": str(index), "unused": "x" * index} for index in range(4)]
+    path = tmp_path / f"rows.{format}"
+    path.write_text("id,unused\n" + "".join(f"{row['id']},{row['unused']}\n" for row in rows)
+                    if format == "csv" else "".join(json.dumps(row) + "\n" for row in rows))
+    Files(str(path)).provision()
+    projected = Files(str(path), columns=("id",))
+    expected = [{"id": row["id"]} for row in rows]
+    manifest = projected.manifest()
+    assert [row for shard in manifest.shards for row in manifest.reader(shard)] == expected
+    assert list(projected.records("memory")) == expected
+    indexed = projected.records("indexed")
+    assert [indexed[index] for index in range(len(indexed))] == expected
+    with pytest.raises(ValueError):
+        list(Files(str(path), columns=("missing",)).records("memory"))
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_path, read):
+    """CSV is parsed by Python's csv module under the process's own field size limit, which a
+    source never changes: a 200 KiB quoted field is refused under the default limit, and under a
+    limit its caller raised it reads through a loader of four reader threads at its provisioned
+    offsets and resumes where it stopped. A source once raised the limit for every parser in the
+    process each time it opened a file."""
+    import csv
+
+    from dew.data.compile import compile
+
+    texts = [f"row {index}" if index != 2 else "x" * (200 * 1024) + "\nand more" for index in range(6)]
+    expected = [(str(index), text) for index, text in enumerate(texts)]
+    path = tmp_path / "rows.csv"
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "text"])
+        writer.writerows([str(index), text] for index, text in enumerate(texts))
+
+    def rows(reader) -> list[tuple[str, str]]:
+        return [(str(batch["id"][0]), str(batch["text"][0])) for batch in reader]
+
+    previous = csv.field_size_limit(128 * 1024)
+    try:
+        refused = Files(str(path))
+        with pytest.raises(csv.Error):
+            list(refused.records("memory"))
+        csv.field_size_limit(1024 * 1024)
+        Files(str(path)).provision()
+        data = compile(Files(str(path)).repeat(1).batch(1), read=read,
+                       loading=Loading(workers=0, threads=4, read_buffer=4))
+        whole = data.train(DataPartition())
+        try:
+            assert rows(whole) == expected
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = rows(itertools.islice(stopped, 3))
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert head + rows(resumed) == expected
+        finally:
+            resumed.close()
+        assert csv.field_size_limit() == 1024 * 1024
+    finally:
+        csv.field_size_limit(previous)
+
+
+@pytest.mark.parametrize("trickled", ["headers", "body"])
+def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
+    """A server that sends its headers or its body a byte every tenth of a second holds a fetch
+    no longer than its timeout: the attempt is dropped as transient, where it once read on byte
+    by byte, each byte inside the socket's timeout."""
+    import http.server
+    import time
+
+    from dew.data.pipeline import Rejected
+    from dew.data.sources.urls import Fetch
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if trickled == "headers":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", "60")
+                self.end_headers()
+            for _ in range(60):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.1)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    try:
+        began = time.monotonic()
+        fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
+        waited = time.monotonic() - began
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert waited < 1.5
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
@@ -960,6 +1097,90 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
     stored = Files(str(destination)).records("indexed")
     assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
 
+
+
+def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
+    """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
+    the rows of the commit each source pins: the commit is the answer the Hub gave online
+    (`dew.cache.hub_answer`), the default branch's the last given, and the Arrow is the cache
+    `datasets` prepared at that commit, which `datasets` itself does not find offline."""
+    import datasets
+    from hub_support import native_hub, offline
+
+    from dew.data import Hub
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    first, second = "0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"
+    cache = str(tmp_path / "cache")
+
+    def read(revision=None):
+        pipeline = Pipeline(Hub("acme/records", revision=revision, cache_dir=cache)).batch(4)
+        reader = compile(pipeline, read="indexed", loading=Loading(workers=0), provision=True).train(
+            DataPartition())
+        try:
+            return sorted(int(value) for _ in range(4) for value in next(reader)["id"])
+        finally:
+            reader.close()
+
+    for commit, start in ((first, 0), (second, 100)):
+        rows = datasets.Dataset.from_dict({"id": list(range(start, start + 16))})
+        with pytest.MonkeyPatch.context() as online:
+            native_hub(online, tmp_path / commit, "acme/records", {"train": rows}, commit)
+            assert read(commit) == list(range(start, start + 16))
+            assert read() == list(range(start, start + 16))
+    offline(monkeypatch)
+    assert read(first) == list(range(16))
+    assert read() == list(range(100, 116))
+    assert Hub("acme/records", cache_dir=cache).commit == second
+
+
+def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub_conversion, monkeypatch):
+    """A Hub split's streamed shards keep the identity a compiled cache is keyed by with the Hub
+    offline: the commit, the commit's files, its conversion and each shard's facts are the Hub's
+    answers, recorded online. A repo never answered online raises the offline error."""
+    from hub_support import offline
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew.data.sources import Hub
+
+    answered = Hub("owner/data").files
+    identity = answered.fingerprint()
+    offline(monkeypatch)
+    recorded = Hub("owner/data").files
+    assert recorded.url == answered.url
+    assert recorded.fingerprint() == identity
+    with pytest.raises(OfflineModeIsEnabled):
+        assert Hub("owner/elsewhere").commit
+
+
+def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
+    """A Hub split's JSON lines shard and the offset index its commit holds beside it keep, with the
+    Hub offline, the identity they had online, the index's facts among the shard's: an index the
+    offline Hub cannot confirm is not dropped from it."""
+    from types import SimpleNamespace
+
+    from hub_support import offline
+    from huggingface_hub import HfApi, HfFileSystem
+
+    from dew.data.sources import Hub
+
+    names = {"train.jsonl": 400, "train.index.npy": 96}
+    stated = {}
+    for index, (name, size) in enumerate(names.items()):
+        path = f"datasets/owner/lines@pinned/{name}"
+        stated[path] = {"name": path, "type": "file", "size": size, "blob_id": f"blob:{name}",
+                        "lfs": {"sha256": f"{index:064x}", "size": size}}
+    monkeypatch.setattr(HfApi, "dataset_info",
+                        lambda self, repo, revision=None: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: list(names))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **kwargs: stated[path])
+    identity = Hub("owner/lines", revision="pinned").files.fingerprint()
+    assert [facts["bytes"] for facts in identity["files"]] == [400, 96]
+    offline(monkeypatch)
+    # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")

@@ -44,6 +44,7 @@ from dew.inference.banks import (
     one_layer,
 )
 from dew.nn.backbones.layer_plan import group_name
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
@@ -300,7 +301,15 @@ def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     return jax.vjp(evaluate, primal, has_aux=True)
 
 
-@functools.partial(jax.jit, static_argnames=("sites", "paths", "layout"))
+@functools.cache
+def _pullback(options: tuple[tuple[str, bool], ...]):
+    """`_trainable_cotangent` compiled with the objective's modules' XLA `options`
+    (`compiler_options`): with an int8 backward (`Quantization.bwd_qtype`) the pullback runs its
+    int8 dots here, apart from the forward's program."""
+    return jax.jit(_trainable_cotangent, static_argnames=("sites", "paths", "layout"),
+                   compiler_options=dict(options))
+
+
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     """Run the pullback, the unstack and the selection as one computation.
 
@@ -468,7 +477,8 @@ class HostExecution:
             # A shared owner is one bank input, so native reverse mode already
             # sums every use's contribution into it.
             with jax.set_mesh(self.accelerator):
-                gradient = _trainable_cotangent(
+                options = compiler_options(*(entry.module for entry in self.objective.program_key()))
+                gradient = _pullback(tuple(options.items()))(
                     back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
                     layout=layout)
             return self.on_cpu(gradient)

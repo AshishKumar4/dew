@@ -99,6 +99,10 @@ class GpuTarget:
     aliases: tuple[str, ...] = ()
     head_tile: tuple[int, int] | None = None
     wgmma: bool = False
+    int8_triton_gemm: bool = False
+    """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
+    A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
+    `dew.nn.kernels.options.compiler_options`)."""
 
     @property
     def device_kind_prefixes(self) -> tuple[str, ...]:
