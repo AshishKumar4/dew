@@ -221,15 +221,19 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
 # tools/optimizer_curve.py
 # ---------------------------------------------------------------------------
 
+LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range(60)]
+
+
 def token_directory(tmp_path: Path) -> Path:
-    """A byte-tokenized corpus, in the directory the curve reads from."""
-    from token_support import encoded_token_fixture
+    """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
+    a text file's lines, each a document closed by EOS."""
+    from dew.cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
-    corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
-                              for i in range(60)))
+    corpus.write_text("".join(f"{line}\n" for line in LINES))
     out = tmp_path / "tokens"
-    encoded_token_fixture(out, [corpus.read_text()], tokenizer="byte", val_fraction=0.1)
+    assert DataExport("records", str(out), fields=json.dumps({"source": str(corpus)}), tokenizer="byte",
+                      eos=True, read="memory").run_command() == 0
     return out
 
 
@@ -254,8 +258,8 @@ def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
     assert adamw[0] == muon[0]
     assert adamw[1:] != muon[1:]
     assert curves["adamw"]["tokens"] == 3 * 8 * 8
-    assert curves["adamw"]["corpus_tokens"] == json.loads(
-        (tokens / "meta.json").read_text())["train_tokens"]
+    # Every line's bytes and its EOS.
+    assert curves["adamw"]["corpus_tokens"] == sum(len(line.encode()) + 1 for line in LINES)
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +470,21 @@ def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
     _, two_canvases = parameter_movement(
         tool, composite_case(tool, "diffusion_gemma"), steps=1)
     assert two_canvases > one_canvas
+
+
+
+def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names():
+    """A canvas case's head chunking and objective keywords reach the block objective its step
+    trains, as a decoder case's reach its objective. A case that names another decoder objective is
+    refused."""
+    tool = load("benchmark_step")
+    case = dataclasses.replace(
+        composite_case(tool, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
+        head_chunks=1, objective={"encoder_loss_weight": 0.0})
+    objective = tool.build_objective(case)
+    assert (objective.head_chunks, objective.encoder_loss_weight) == (1, 0.0)
+    with pytest.raises(ValueError):
+        tool.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
 
 
 # ---------------------------------------------------------------------------

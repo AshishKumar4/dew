@@ -1,6 +1,10 @@
 """A pytest plugin that records, for each test file a task runs, the checkout's Python files its tests
-executed, for the test cache (`ci.py`): a file whose recorded files are unchanged since it ran green
-is not run again.
+executed and the checkout's files and directories they read, for the test cache (`ci.py`): a file
+whose recorded files are unchanged since it ran green is not run again. A read is a file opened to
+read, as Python's `open` audits it (a documentation page a test trains from, a fixture), or a
+directory listed (the pages a test globs, so a page added is a change); the import system's and
+pytest's collection's own listings are not, as what they find is recorded as it runs. Hidden
+directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
@@ -34,6 +38,8 @@ TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
 uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
 code, on the host alone). Any other start, a shell's or a launcher's included, may run the
 checkout's code or hold the GPU."""
+READS = {"open", "os.listdir", "os.scandir"}
+"""Audit events of a read: a file opened, a directory listed."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is `CHILD_START`'s."""
@@ -117,8 +123,36 @@ def reads_backend(code: types.CodeType) -> bool:
 
 
 def audited(event, args):
-    if running and event in SPAWNS and not native(programs(event, args)):
+    if event in READS:
+        read(event, args)
+    elif running and event in SPAWNS and not native(programs(event, args)):
         spawned.add(running[-1])
+def read(event: str, args: tuple) -> None:
+    """Records the checkout's file or directory that a read event names in the current test file's
+    record, as `started` records what it executes: a file opened only to read (`open`'s mode, or
+    its flags for `os.open`), or a directory listed but by a listing tool (`listing_tool`)."""
+    path = args[0]
+    if isinstance(path, int):
+        return
+    if event == "open":
+        mode, flags = args[1], args[2]
+        written = any(letter in mode for letter in "wax+") if mode is not None else (
+            flags & os.O_ACCMODE != os.O_RDONLY)
+        if written:
+            return
+    elif listing_tool(sys._getframe(2).f_code.co_filename):
+        return
+    name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    if not name.startswith(root):
+        return
+    relative = name[len(root):]
+    if relative.split(os.sep)[0].startswith(".") or "__pycache__" in relative or "site-packages" in relative:
+        return
+    current[-1].add(relative)
+def listing_tool(name: str) -> bool:
+    """Whether code in file `name` lists directories for the import system or for pytest's
+    collection, whose listings are no test's input: what they find is recorded as it runs."""
+    return name.startswith("<frozen") or f"{os.sep}_pytest{os.sep}" in name
 
 
 def programs(event: str, args: tuple) -> list:
