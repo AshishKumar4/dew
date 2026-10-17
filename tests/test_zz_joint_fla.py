@@ -42,9 +42,11 @@ def test_joint_fla():
     lines.append(f"env ready at {time.time() - started:.0f} s: " + ", ".join(
         line for line in listed.splitlines() if line.split(" ")[0] in ("torch", "triton", "transformers", "fla-core",
                                                                        "einops", "flash-linear-attention")))
+    # The suite holds the Hub offline; the recorder reads the release's model code from it.
+    online = {key: value for key, value in os.environ.items()
+              if key not in ("HF_HUB_OFFLINE", "HF_ENDPOINT", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")}
     done = subprocess.run([str(python), "tools/joint_checkpoint_reference.py", "--fla"], cwd=ROOT,
-                          env={**os.environ, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}",
-                               },
+                          env={**online, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"},
                           capture_output=True, text=True, timeout=2400)
     lines.append(f"recorder exit {done.returncode} at {time.time() - started:.0f} s\n"
                  f"{(done.stdout + done.stderr)[-3000:]}")
