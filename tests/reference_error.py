@@ -75,17 +75,7 @@ reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
 exported logits). A row that differs rather than rounds moves further: the
 suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
 with its sinks zeroed, put their worst rows at 7.1 and 3,419 times the
-reference's.
-
-Elements are not held alone (ledger 560, 2026-10-17). Between two equally
-exact computations, the same rows packed and alone on an A100, a large weight
-gradient's worst element over its terms parted from the other's by up to
-12.32 (the decision-packing marker arm, seeds 0 to 5: 4.03, 3.20, 12.32, 6.87,
-2.86, 1.61): an element downstream of a cancelling sum is sized by its last
-sum's terms alone, which a row's RMS averages out and its worst element does
-not. A factor set from that spread as this one was, 1.65 times the largest,
-would pass a single element ten times wrong, so a row is the finest unit the
-rule holds."""
+reference's."""
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -142,30 +132,32 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
 
 
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
-"""The smallest row float64 resolves, over its leaf's size: a row below it is
-float64's own rounding of the leaf (a packed row's padding at 4e-19 of a
-leaf at 1e-3), a zero `rows_over` sizes by the reference's row. 1024
+"""The smallest row or element float64 resolves, over its leaf's size: one
+below it is float64's own rounding of the leaf (a packed row's padding at
+4e-19 of a leaf at 1e-3), a zero `rows_over` sizes by the reference's. 1024
 roundings is the longest chain the suite's oracles allow
 (`assert_computes_the_oracle`); a row at a float32 resolution is ten orders
 above it."""
 
 
-def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
+def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Each row's float64 size and `value`'s RMS distance from float64 on it,
-    a row every axis but the last. A row's size is the RMS of its float64
-    values, or, where `terms` gives each entry's float64 terms
-    (`float64_terms`), the larger of that and the RMS of what the row sums,
-    so a row that cancels is sized by its terms' rounding and not by its
-    near-zero result; a row below float64's `RESOLUTION` of its leaf has size
-    zero. No other row's size enters: a small row beside large ones has its
-    own. A value of rank one or less is one row, which `distance` already
-    judges, and has none here."""
+    a row every axis but the last, or each element alone where `elements`
+    asks. A row's size is the RMS of its float64 values, or, where `terms`
+    gives each entry's float64 terms (`float64_terms`), the larger of that
+    and the RMS of what the row sums, so a row that cancels is sized by its
+    terms' rounding and not by its near-zero result; a row below float64's
+    `RESOLUTION` of its leaf has size zero. No other row's size enters: a
+    small row beside large ones has its own. A value of rank one or less is
+    one row, which `distance` already judges, and has none here; a scalar
+    has no elements either."""
     truth = np.asarray(truth, np.float64)
-    if truth.ndim < 2:
+    if truth.ndim < (1 if elements else 2):
         return np.zeros(0), np.zeros(0)
+    width = 1 if elements else truth.shape[-1]
 
     def rms(rows):
-        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
+        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, width)), axis=1))
 
     sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
@@ -174,35 +166,44 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
 
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
-    """Where Dew's rows are further from float64 than ROW_FACTOR times the
-    reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, at least `floor` (an order floor in the rows' units),
-    and each row of size zero, a sum that cancels exactly before anything its
-    terms see (a query that keeps one key), against the reference's distance
-    on that same row, which is all the evidence such a row has: where the
-    reference is exactly the float64 zero, Dew must be too."""
-    sizes, mine = row_errors(dew, truth, terms)
-    _, theirs = row_errors(reference, truth, terms)
-    sized = sizes > 0
+    """Where Dew's rows, and then its elements, are further from float64 than
+    ROW_FACTOR times the reference's (`row_errors`): its worst over its own
+    size against the reference's worst, at least `floor` (an order floor in
+    those units), and each of size zero, a sum that cancels exactly before
+    anything its terms see (a query that keeps one key), against the
+    reference's distance on that same row, which is all the evidence it
+    has: where the reference is exactly the float64 zero, Dew must be too.
+    An element is held as a row is: a wrong element of a long row, or of a
+    value of rank one, moves its row's RMS by little and itself by as much as
+    it is wrong. An element of size zero is held to the reference's worst
+    such element instead of its own: one rounding against another, with no
+    row's mean to settle them, part by any ratio, and where the reference
+    computes every such element exactly Dew must too."""
     over = []
-    if sized.any():
-        row = float(np.max(mine[sized] / sizes[sized]))
-        their_row = float(np.max(theirs[sized] / sizes[sized]))
-        if not within(row, ROW_FACTOR * max(their_row, floor)):
-            over.append(f"the worst row is {row:.3e} from float64 over its size, the reference's "
-                        f"{their_row:.3e}, allowed {ROW_FACTOR * max(their_row, floor):.3e}")
-    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
-    if zero.any():
-        at = int(np.flatnonzero(zero)[0])
-        over.append(f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
-                    f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}")
+    for name, elements in (("row", False), ("element", True)):
+        sizes, mine = row_errors(dew, truth, terms, elements=elements)
+        _, theirs = row_errors(reference, truth, terms, elements=elements)
+        sized = sizes > 0
+        if sized.any():
+            worst = float(np.max(mine[sized] / sizes[sized]))
+            their_worst = float(np.max(theirs[sized] / sizes[sized]))
+            if not within(worst, ROW_FACTOR * max(their_worst, floor)):
+                over.append(f"the worst {name} is {worst:.3e} from float64 over its size, the reference's "
+                            f"{their_worst:.3e}, allowed {ROW_FACTOR * max(their_worst, floor):.3e}")
+        unsized = theirs[~sized]
+        zero = ~sized & ~(mine <= ROW_FACTOR * (np.max(unsized) if elements and unsized.size else theirs))
+        if zero.any():
+            at = int(np.flatnonzero(zero)[0])
+            over.append(f"{int(zero.sum())} {name}s of float64 zero are further from it than the reference's "
+                        f"own, {name} {at} by {mine[at]:.3e} against {theirs[at]:.3e}")
     return over
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64, and
-    its rows within ROW_FACTOR times the reference's (`rows_over`), each
-    sized by its float64 `terms` where they are given (`float64_terms`)."""
+    its rows and elements within ROW_FACTOR times the reference's
+    (`rows_over`), each sized by its float64 `terms` where they are given
+    (`float64_terms`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
     assert within(mine, FACTOR * theirs), (
@@ -235,11 +236,12 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
     bias's gradient does under the softmax's shift invariance, is held to
     its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows are held to
-    the reference's too (`rows_over`), unless `rows` is false: after a
-    second training step a row inherits the first step's rounding through
-    the parameters it reads, which its own terms do not see, so such a
-    comparison holds each tensor alone and its first step holds the rows."""
+    signs are independent keeps about its own. Each leaf's rows and elements
+    are held to the reference's too (`rows_over`), unless `rows` is false:
+    after a second training step a row inherits the first step's rounding
+    through the parameters it reads, which its own terms do not see, so
+    such a comparison holds each tensor alone and its first step holds the
+    rows and elements."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -252,7 +254,7 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row over its own terms where they are given, the order floor in those units.
+        # Each row and element over its own terms where they are given, the order floor in those units.
         over += [f"{jax.tree_util.keystr(path)}: {row}"
                  for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
                              if rows else ())]
