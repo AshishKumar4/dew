@@ -177,7 +177,7 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
-def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
+def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model(tmp_path):
     """On the same weights, a request that samples under `top_k=1` draws what
     lm-eval's own model draws there and what greedy decoding draws; a beam
     search of three under a length penalty, with and without a stop string
@@ -205,14 +205,16 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     eos = ours.tok_encode(answer[0][1], add_special_tokens=False)[0]
     ended = {**greedy, "eos_token_id": eos}
     assert ours.generate_until(asked(ended)) != answer
-    # A stop the beams reach, the unstopped beam answer's third character, ends the search there.
-    searched = ours.generate_until(asked(beams))[0]
-    assert len(searched) > 3
-    stopped = {**beams, "until": [searched[2]]}
-    assert len(ours.generate_until(asked(stopped))[0]) < len(searched)
-    for controls in (beams, stopped, {**greedy, "max_length": context + 2}, ended,
-                     {**greedy, "temperature": 0.0}):
+    for controls in (beams, {**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
+    # A stop the beams reach, the unstopped answer's third character, ends the search there; stop
+    # strings in a search are read through a tokenizer that lists its vocabulary.
+    listed, listed_theirs = _pair(64, tmp_path, bos="inserted")
+    searched = listed.generate_until(asked(beams))[0]
+    assert len(searched) > 3
+    stopped = asked({**beams, "until": [searched[2]]})
+    assert len(listed.generate_until(stopped)[0]) < len(searched)
+    assert listed.generate_until(stopped) == listed_theirs.generate_until(stopped)
     for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
                     {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
         with pytest.raises(ValueError):
