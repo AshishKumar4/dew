@@ -1492,10 +1492,6 @@ def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
     return tuple(stem + '.weight' for stem in stems)
 
 
-def _modelopt_parts(name: str) -> tuple[str, ...]:
-    return tuple(name.removesuffix('.weight') + suffix for suffix in MODELOPT_PARTS)
-
-
 def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: str = 'NVFP4',
                      layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> np.ndarray:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
@@ -1557,24 +1553,21 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
                    grid: Mapping[str, np.ndarray] | None) -> SourceQuantization:
     """ModelOpt's per-layer dispatch, held to the author's exporter and quantizers.
 
-    FP8 and NVFP4 own their stored input multipliers; W4A16_NVFP4 stores
-    only quantized weights even when generic config_groups advertise an
-    input quantizer. Per-expert activation quantizers remain refused.
-    The checkpoint Qwix provider reads each accepted Linear's input rule.
+    One algorithm for every quantized layer (`quant_algo` FP8, NVFP4 or
+    W4A16_NVFP4, as ModelOpt 0.47.0 writes a checkpoint of one scheme) or a
+    published table of them (`MIXED_PRECISION`, `quantized_layers`). FP8 and
+    NVFP4 own their stored input multipliers; W4A16_NVFP4 stores only
+    quantized weights even when generic config_groups advertise an input
+    quantizer. A layer is quantized where its scales are stored, so experts
+    left dense read as dense; an expert stack's input quantizers are refused
+    where the weights bind (`dew.interop.pretrained`). The checkpoint Qwix
+    provider reads each accepted Linear's input rule.
     """
     method = quantization.get('quant_algo')
-    if method not in ('NVFP4', 'MIXED_PRECISION'):
-        raise ValueError(f"quant_method 'modelopt' quant_algo {quantization.get('quant_algo')!r} needs "
-                         "other input activations; this loader reads dense NVFP4 W4A4")
+    if method not in (*MODELOPT_ALGOS, 'MIXED_PRECISION'):
+        raise ValueError(f"quant_method 'modelopt' quant_algo {method!r} has no input rule in this loader")
     if quantization.get('kv_cache_quant_algo') is not None or quantization.get('kv_cache_scheme') is not None:
         raise ValueError("ModelOpt KV cache quantization is not computed by this loader")
-    text = config.get('text_config')
-    architecture = text if isinstance(text, Mapping) else config
-    for key in ('num_experts', 'num_local_experts', 'n_routed_experts', 'num_routed_experts'):
-        experts = architecture.get(key)
-        if method == 'NVFP4' and isinstance(experts, int) and experts > 1:
-            raise ValueError("ModelOpt per-expert input activations need a provider "
-                             "this loader does not compute")
     layers: dict[str, str] = {}
     if method == 'MIXED_PRECISION':
         if not isinstance(quantization.get('quantized_layers'), Mapping):
@@ -1582,44 +1575,30 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
         declared = records.record(quantization['quantized_layers'], 'ModelOpt quantized_layers')
         if not declared:
             raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
-        for name, entry in declared.items():
-            entry = records.record(entry, f'ModelOpt quantized_layers.{name}')
-            algo = entry.get('quant_algo')
-            if algo not in MODELOPT_ALGOS:
-                raise ValueError(f"ModelOpt {name} quant_algo {algo!r} has no input rule in this loader")
-            if algo in ('NVFP4', 'W4A16_NVFP4') and entry.get('group_size', 16) != 16:
-                raise ValueError(f"ModelOpt {name} group_size must be 16")
-            if algo == 'NVFP4' and '.experts' in str(name):
-                raise ValueError(f"ModelOpt {name} per-expert input activations are not computed")
-            layers[str(name)] = str(algo)
-        # config_groups can advertise W4A4 for a W4A16_NVFP4 layer. The
-        # published per-layer table is the deployment dispatch contract.
-        return SourceQuantization(
-            partial(_modelopt_names, method=str(method), layers=layers),
-            lambda name: _modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)),
-            partial(_modelopt_decode, method=str(method), layers=layers),
-            partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
-            grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
-            input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
-            input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
-    groups = records.record(quantization.get('config_groups'), 'ModelOpt config_groups')
-    expected = {'num_bits': 4, 'type': 'float', 'group_size': 16, 'dynamic': False}
-    if not groups:
-        raise ValueError("ModelOpt config_groups must declare the NVFP4 W4A4 scheme")
-    for name, group in groups.items():
-        group = records.record(group, f'ModelOpt config_groups.{name}')
-        for side in ('weights', 'input_activations'):
-            args = records.record(group.get(side), f'ModelOpt {name}.{side}')
-            if (any(args.get(key) != value for key, value in expected.items())
-                    or args.get('symmetric', True) is not True):
-                raise ValueError(f"ModelOpt {name}.{side} must declare "
-                                 "static-global 4-bit float groups of 16")
-        if group.get('output_activations') is not None:
-            raise ValueError(f"ModelOpt {name}.output_activations is not computed by this input provider")
+        entries = {str(name): records.record(entry, f'ModelOpt quantized_layers.{name}')
+                   for name, entry in declared.items()}
+    else:
+        entries = {'': quantization}
+    for name, entry in entries.items():
+        algo = entry.get('quant_algo')
+        if algo not in MODELOPT_ALGOS:
+            raise ValueError(f"ModelOpt {name} quant_algo {algo!r} has no input rule in this loader")
+        if algo in ('NVFP4', 'W4A16_NVFP4') and entry.get('group_size', 16) != 16:
+            raise ValueError(f"ModelOpt {name or 'quant_algo'} group_size must be 16")
+        if algo == 'NVFP4' and '.experts' in name:
+            raise ValueError(f"ModelOpt {name} per-expert input activations are not computed")
+        if name:
+            layers[name] = str(algo)
+    # config_groups can advertise W4A4 for a W4A16_NVFP4 layer. The published
+    # algorithm, uniform or per layer, is the deployment dispatch contract.
     return SourceQuantization(
-        _modelopt_names, _modelopt_parts, _modelopt_decode, partial(_modelopt_encode, grid=grid),
-        grid=lambda name: (*_modelopt_parts(name), name), input_scale_dtype='float8_e4m3fn',
-        input_format='modelopt', input_suffix='.input_scale')
+        partial(_modelopt_names, method=str(method), layers=layers),
+        lambda name: _modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)),
+        partial(_modelopt_decode, method=str(method), layers=layers),
+        partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
+        grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
+        input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
+        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
 
 
 # --------------------------------------------------------------------------

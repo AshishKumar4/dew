@@ -70,3 +70,51 @@ def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tm
     with pytest.raises(ValueError):
         Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16',
                         attention_impl='reference')
+
+
+@pytest.mark.parametrize('uniform', ['FP8', 'W4A16_NVFP4'])
+def test_a_checkpoint_of_one_modelopt_algorithm_loads_as_that_algorithms_layers_in_a_mixed_one(
+        tmp_path, uniform):
+    """ModelOpt writes a checkpoint of one scheme as a uniform quant_algo with no layer table. Its
+    quantized layers decode as the same layers of a mixed table do, the rest read dense, and with
+    FP8 layers its activations quantize as the mixed table's do."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    stored = read_weights(FIXTURE)
+    config = json.loads((FIXTURE / 'config.json').read_text())
+    codec = codecs.source_quantization(config)
+    assert codec is not None
+    tensors = dict(stored)
+    for layer, entry in config['quantization_config']['quantized_layers'].items():
+        if entry['quant_algo'] != uniform:
+            tensors[layer + '.weight'] = codec.decode(stored, layer + '.weight')
+            for part in ('.weight_scale', '.weight_scale_2', '.input_scale'):
+                tensors.pop(layer + part, None)
+    quantization = {'quant_algo': uniform, 'kv_cache_quant_algo': None,
+                    **({'group_size': 16} if uniform == 'W4A16_NVFP4' else {})}
+    producer = config['quantization_config']['producer']
+    save_hf_layout(tensors, {**config, 'quantization_config': {**quantization, 'producer': producer,
+                                                                 'quant_method': 'modelopt'}}, tmp_path)
+    (tmp_path / 'hf_quant_config.json').write_text(json.dumps({'producer': producer,
+                                                               'quantization': quantization}))
+    load = {'dtype': 'float32', 'param_dtype': 'bfloat16', 'attention_impl': 'reference'}
+    single, mixed = Pretrained.load(tmp_path, **load), Pretrained.load(FIXTURE, **load)
+    params = (jax.tree.leaves(single.variables['params']), jax.tree.leaves(mixed.variables['params']))
+    for ours, theirs in zip(*params, strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    if uniform == 'FP8':
+        ids = np.arange(8, dtype=np.int32).reshape(1, 8)
+        np.testing.assert_array_equal(np.asarray(single.model.apply(single.variables, ids)),
+                                      np.asarray(mixed.model.apply(mixed.variables, ids)))
+
+
+@pytest.mark.parametrize('experts', ['num_experts', 'num_local_experts', 'n_routed_experts'])
+def test_a_modelopt_nvfp4_description_of_a_model_with_experts_is_read_by_its_stored_layers(experts):
+    """ModelOpt may leave a model's experts dense and quantize its projections; the quantized
+    layers are those whose scales are stored, so a uniform NVFP4 description of a model with
+    experts reads as one, and only an expert stack's input quantizers are refused, where the
+    weights bind."""
+    config = {'model_type': 'qwen3_moe', experts: 8,
+              'quantization_config': {'quant_method': 'modelopt', 'quant_algo': 'NVFP4', 'group_size': 16}}
+    assert codecs.source_quantization(config) is not None
+
