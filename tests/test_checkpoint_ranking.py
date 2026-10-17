@@ -136,19 +136,25 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
         trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
 
 
-def test_a_best_policy_names_one_suites_instance_of_a_metric_two_suites_hold(tmp_path):
+@pytest.mark.parametrize('spelling', ['object', 'name', 'recorded'])
+def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suites_hold(tmp_path, spelling):
     """Two suites may each score their own instance of one metric, each declaring its own direction: a
-    policy naming the first suite's instance ranks that suite's scores in that instance's direction,
-    though the other suite's instance has the same name and the opposite direction. The value rises
-    as training does, so the best of a higher-is-better value is the last step."""
+    policy for each suite, by the instance, by its name and split, or by its recorded name, ranks that
+    suite's scores in that suite's instance's direction, though the other's has the same name and the
+    opposite one. The value rises as training does, so the best of a higher-is-better value is the
+    last step and of a lower-is-better one the first."""
     from dew.training import EvalSuite
 
     often, rare = Value('value', Shown(better='higher')), Value('value', Shown(better='lower'))
+    best = {'object': [Best(often, split='often'), Best(rare, split='rare')],
+            'name': [Best('value', split='often'), Best('value', split='rare')],
+            'recorded': ['often/value', 'rare/value']}[spelling]
     run = trainer(tmp_path / 'run')
-    run.fit(data(), steps=3, log_every=1, eval_every=1, metrics=[often], best=Best(often, split='often'),
+    run.fit(data(), steps=3, log_every=1, eval_every=1, metrics=[often], best=best,
             validation={'often': data().val, 'rare': EvalSuite(data().val, (rare,), 1)})
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:often/value') == 3
+    assert run.checkpoints.resolve('best:rare/value') == 1
 
 
 def test_restore_best_without_checkpoints_is_refused_before_training():

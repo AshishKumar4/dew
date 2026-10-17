@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -196,7 +197,7 @@ for word in sys.argv[1:]:
         words.append(word)
 pid, terminal = pty.fork()
 if pid == 0:
-    os.execvp("sh", ["sh", "-c", " ".join(words[1:])])
+    os.execvp(SHELL[0], [*SHELL, "-c", " ".join(words[1:])])
 reading = True
 while True:
     ready = select.select([terminal, *([0] if reading else [])], [], [])[0]
@@ -217,11 +218,12 @@ sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 """
 
 
-def ssh_stand_in(tmp_path: Path) -> Path:
-    """A directory holding `ssh`, the stand-in `SSH` runs as, to put first on a PATH."""
+def ssh_stand_in(tmp_path: Path, shell: Sequence[str] = ("sh",)) -> Path:
+    """A directory holding `ssh`, the stand-in `SSH` runs as, to put first on a PATH, whose remote
+    commands `shell` runs, as the remote user's login shell does."""
     binaries = tmp_path / "bin"
     binaries.mkdir()
-    (binaries / "ssh.py").write_text(SSH)
+    (binaries / "ssh.py").write_text(f"SHELL = {list(shell)!r}\n{SSH}")
     (binaries / "ssh").write_text(f'#!/bin/sh\nexec {sys.executable} {binaries / "ssh.py"} "$@"\n')
     (binaries / "ssh").chmod(0o755)
     return binaries
@@ -282,14 +284,18 @@ def test_a_failing_rank_over_ssh_leaves_none_of_its_processes_on_its_host(tmp_pa
     assert not running(int((tmp_path / "worker").read_text()))
 
 
-def test_a_rank_over_ssh_stopped_through_its_terminal_exits_with_its_own_code(tmp_path):
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_a_rank_over_ssh_stopped_through_its_terminal_exits_with_its_own_code(tmp_path, shell):
     """The shell behind a rank's terminal waits again on a wait the stop cut
     short, so a rank that takes the stop and exits at once, before the shell
     looks again, still hands back its own code, not the shell's interrupted
-    wait's."""
+    wait's, under either login shell. strace holds the shell after each kill it
+    sends, so the rank has exited, and bash has reaped it, by the time the shell
+    looks."""
     from dew.cli.launch import STOP_BYTE, remote_script
 
-    binaries = ssh_stand_in(tmp_path)
+    binaries = ssh_stand_in(tmp_path, ("strace", "-qq", "-o", "/dev/null", "-e", "trace=kill",
+                                       "-e", "inject=kill:delay_exit=300000", shell))
     program = ("import signal, sys, time\n"
                "signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(7))\n"
                "print('up', flush=True)\n"
