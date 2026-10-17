@@ -142,6 +142,7 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
         if marker in name and name.endswith('_proj.weight'):
             tensors.update(nvfp4(name, np.asarray(weight, np.float32)))
             layers[name.removesuffix('.weight')] = {'quant_algo': 'NVFP4', 'group_size': 16}
+    layers_weights = {stem + '.weight' for stem in layers}
     producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
 
     def written(directory, quantization):
@@ -164,5 +165,12 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
     single, table = Pretrained.load(uniform, **load), Pretrained.load(mixed, **load)
     logits = np.asarray(single.model.apply(single.variables, ids))
     np.testing.assert_array_equal(logits, np.asarray(table.model.apply(table.variables, ids)))
-    dense = Pretrained.load(source, **load)
-    assert np.abs(logits - np.asarray(dense.model.apply(dense.variables, ids))).max() > 0
+    # The same decoded weights with no input quantizers: what the two compute beyond them is
+    # the attention inputs' NVFP4 rounding.
+    codec = codecs.source_quantization(json.loads((uniform / 'config.json').read_text()))
+    assert codec is not None
+    decoded = {name: (codec.decode(tensors, name) if name in layers_weights else value)
+               for name, value in stored.items()}
+    save_hf_layout(decoded, config, tmp_path / 'decoded')
+    weights_only = Pretrained.load(tmp_path / 'decoded', **load)
+    assert np.abs(logits - np.asarray(weights_only.model.apply(weights_only.variables, ids))).max() > 0
