@@ -134,11 +134,14 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
-    file that started a process, a shell's or any multiprocessing context's,
-    has no key, so it is in, and no task reuses its row, whatever names its
-    program (a descriptor, for `os.execve`); one that asked a native tool
-    about the host or compiled a kernel with ptxas (`executed.TOOLS`) keeps
-    its key. The command line
+    Python child a file starts with its environment is followed: its own
+    reads and files join the file's record, which keeps its key. A file
+    that started any other process, a shell's, a child it killed, one given
+    an environment of its own, or any multiprocessing context's, has no key,
+    so it is in, and no task reuses its row, whatever names its program (a
+    descriptor, for `os.execve`); one that asked a native tool about the
+    host or compiled a kernel with ptxas (`followed.TOOLS`) keeps its key.
+    The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -169,6 +172,19 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_lost.py": "def test_lost(): pass\n",
         "test_spawns.py": "import subprocess, sys\n"
                           "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
+        "child.py": "import devices, plain\n"
+                    "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n",
+        "test_child.py": "import subprocess, sys\n"
+                         "def test_child(): subprocess.run([sys.executable, 'tests/child.py'], check=True)\n",
+        "test_killed.py": "import subprocess, sys\n"
+                          "def test_killed():\n"
+                          "    child = subprocess.Popen([sys.executable, '-c', 'input()'],\n"
+                          "                             stdin=subprocess.PIPE)\n"
+                          "    child.kill()\n    child.wait()\n",
+        "test_own_environment.py": "import os, subprocess, sys\n"
+                                   "def test_child():\n"
+                                   "    subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
+                                   "                   env={'PATH': os.environ['PATH']})\n",
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
@@ -208,6 +224,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
+    # The child's files are its file's: its key holds until one changes.
+    assert ci.reused("3.12", "tests/test_child.py", "", ci.shared("3.12")) is not None
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
     stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())[len(url):]] = None
@@ -226,13 +244,17 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
         "tests/test_spawn.py": ["changed"],
-        "tests/test_spawns.py": ["changed"],
+        "tests/test_child.py": ["tests/devices.py:placed"],
+        "tests/test_killed.py": ["changed"],
+        "tests/test_own_environment.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
-    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
-            for name in ("test_machine.py", "test_tool.py", "test_spawns.py", "test_spawn.py",
-                         "test_forkserver.py", "test_fork.py", "test_shell.py")] == [
-        True, True, False, False, False, False, False]
+    # test_child.py's child read plain.py, which changed.
+    kept = ("test_machine.py", "test_tool.py", "test_spawns.py")
+    again = ("test_child.py", "test_killed.py", "test_own_environment.py", "test_spawn.py",
+             "test_forkserver.py", "test_fork.py", "test_shell.py")
+    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None for name in (*kept, *again)] == [
+        *(True for _ in kept), *(False for _ in again)]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
@@ -251,10 +273,11 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
     run has measured runs alone with the lane's whole share, and so does one
-    that started a process; files with a measured peak run side by side,
-    each with its peak and headroom. A red row stays red: nothing is run
-    again. The rows join one verdict, each recorded as a task's are, and a
-    later lane reuses the green ones."""
+    that started a process it did not follow; files with a measured peak run
+    side by side, each with its peak and headroom, and one whose child took
+    its share's fraction holds a share more beside them (`gpu_needs`). A red
+    row stays red: nothing is run again. The rows join one verdict, each
+    recorded as a task's are, and a later lane reuses the green ones."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -306,21 +329,56 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
+    # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
     common = ci.shared("3.12")
-    for name, inputs in itertools.product(names, (None, common)):
+    for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
         at = ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]
-        stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
-                                 "peak": 4 * 2 ** 30}).encode()
+        stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
+                                 "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
     measured = [ran(Path(name).stem)[-1] for name in names]
     assert [share for share, *_ in measured] == [str(6 * 2 ** 30 / (81920 * 2 ** 20))] * len(names)
     assert 2 <= overlapping(measured) <= 4
-    assert [share for share, *_ in ran("test_spawner")] == ["0.5", "0.5"], "a spawner runs alone"
+    assert [share for share, *_ in ran("test_spawner")] == ["0.5", measured[0][0]]
+    assert overlapping([*measured, ran("test_spawner")[-1]]) >= 2, "a followed spawner packs with the rest"
+    gib, budget = 2 ** 30, 40 * 2 ** 30
+    assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget) == (budget, budget)
+    held = {"depends": [], "peak": 4 * gib, "shares": 2, "pools": gib}
+    assert ci.gpu_needs(held, budget) == (6 * gib, 19 * gib), "6 GiB, twice more for its children, and 1 GiB"
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+
+
+def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
+    """The children's records join the file that started them (`followed.gathered`): their files,
+    and the GPU they held, the children that took the parent's fraction as shares and the bytes of
+    those that named their own, counted only while they lived at once. A file is followed only
+    where every start it and its children saw left a record naming it and none started a process
+    it did not follow; one whose child left its start mark behind, killed before it wrote, is not."""
+    followed = load("followed", "tools/armada")
+    gib = 2 ** 30
+
+    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False):
+        (tmp_path / f"{index}.json").write_text(json.dumps({
+            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected,
+            "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
+
+    child(1, "tests/a.py", 0, 10, pool=6 * gib)
+    child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1)
+    child(3, "tests/a.py", 20, 30, pool=3 * gib, inherited=False)
+    child(4, "tests/a.py", 25, 35, pool=2 * gib, inherited=False)
+    child(5, "tests/a.py", 40, 41)
+    child(6, "tests/b.py", 0, 1)
+    child(7, "tests/c.py", 0, 1)
+    (tmp_path / "8.started").write_text("tests/c.py")
+    child(9, "tests/d.py", 0, 1, unfollowed=True)
+    found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
+    assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
+                                   "followed": True, "shares": 2, "pools": 5 * gib}
+    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):

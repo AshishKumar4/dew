@@ -130,7 +130,7 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
 SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
-          "tools/armada/executed.py", str(DURATIONS))
+          "tools/armada/executed.py", "tools/armada/followed.py", str(DURATIONS))
 """The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`)."""
@@ -147,8 +147,10 @@ def environment_files() -> list[str]:
                    for name in (environment.get("setup"), environment.get("install"),
                                 *environment.get("key", ()))
                    if name})
+RECORDERS = ("ci.py", "executed.py", "followed.py")
+"""The tools that write and read the records, beside each other."""
 CACHE_PREFIX = "testcache/" + hashlib.sha256(
-    Path(__file__).read_bytes() + Path(__file__).with_name("executed.py").read_bytes()).hexdigest()[:16]
+    b"".join(Path(__file__).with_name(name).read_bytes() for name in RECORDERS)).hexdigest()[:16]
 """Where records live: one namespace per version of the tools that write and read them, so a branch
 grading with a changed record format never overwrites or breaks main's records."""
 
@@ -567,7 +569,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
 
 def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
     """Keep each row a task ran with the files its tests executed, where they read the backend and
-    its peak memory on a GPU: `gpu_tier` reads the reads, `gpu_lane` the peak. A green row keeps
+    its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the
+    memory. A green row keeps
     its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
     an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
@@ -578,13 +581,13 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
     held = device_class()
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        ran = executed.get(name, {"depends": None, "reads": [], "peak": None})
+        ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           "peak": ran["peak"]}).encode()
+                           "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
         if written(cache_url(python, row_["name"], held, common), token, body):
@@ -673,44 +676,50 @@ GPU_HEADROOM = (1.25, 2 ** 30)
 fragmentation, which can leave a share its own size short of a block it needs."""
 
 
+def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
+    """The GPU share a test file's process is given, as `XLA_PYTHON_CLIENT_MEM_FRACTION` of it, and what
+    the file holds with its children, by its last run's `recorded` peak (tools/armada/executed.py's
+    `gpu_peak`) and `GPU_HEADROOM`: a child that took the share's fraction holds one more share, and
+    one that named its own fraction the pool it held. A file no run measured, one that started a
+    process it did not follow, and one whose last run left no report take all of `budget`."""
+    if recorded is None or recorded["depends"] is None or recorded["peak"] is None:
+        return budget, budget
+    factor, slack = GPU_HEADROOM
+    share = min(recorded["peak"] * factor + slack, budget)
+    return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
+
+
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
     own (`tested`), and write their verdict rows to `out`.
 
-    A file's process may hold the peak memory its last run on this GPU's class held
-    (tools/armada/executed.py's `gpu_peak`, green or red) and `GPU_HEADROOM`; files so measured
-    start heaviest first while their shares fit the share this process was given
-    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file no
-    run has measured, one that started another Python process (its children's memory is measured
-    nowhere, and they size what they run by the device they see) and one whose last run left no
-    report each run alone with the whole share. A file that runs out of a measured share is red: it took more
-    than its last run, whose peak its next run is given."""
+    A file's process is given the share its last run on this GPU's class measured, green or red,
+    and files start heaviest first while what they hold with their children (`gpu_needs`) fits
+    the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
+    most `processes` at once. A file that runs out of a measured share is red: it took more than
+    its last run, whose peak its next run is given."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def needs(name: str) -> float:
+    def needs(name: str) -> tuple[float, float]:
         record = cache_request(cache_url(python, row(python, name, ""), held), token)
-        recorded = json.loads(record) if record else {"depends": None, "peak": None}
-        peak = recorded["peak"]
-        if recorded["depends"] is None or peak is None:
-            return budget
-        factor, slack = GPU_HEADROOM
-        return min(peak * factor + slack, budget)
+        return gpu_needs(json.loads(record) if record else None, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        shares = dict(zip(tests, pool.map(needs, tests), strict=True))
+        shares, holds = (dict(zip(tests, column, strict=True))
+                         for column in zip(*pool.map(needs, tests), strict=True))
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
-    waiting = sorted(tests, key=lambda name: -shares[name])
+    waiting = sorted(tests, key=lambda name: -holds[name])
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
     running: dict[concurrent.futures.Future, str] = {}
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         while waiting or running:
-            free = budget - sum(shares[name] for name in running.values())
-            fits = next((name for name in waiting if shares[name] <= free), None)
+            free = budget - sum(holds[name] for name in running.values())
+            fits = next((name for name in waiting if holds[name] <= free), None)
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
