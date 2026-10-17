@@ -46,7 +46,8 @@ def test_joint_fla():
     online = {key: value for key, value in os.environ.items()
               if key not in ("HF_HUB_OFFLINE", "HF_ENDPOINT", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")}
     done = subprocess.run([str(python), "tools/joint_checkpoint_reference.py", "--fla"], cwd=ROOT,
-                          env={**online, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"},
+                          env={**online, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}",
+                               "TRITON_F32_DEFAULT": "ieee"},
                           capture_output=True, text=True, timeout=2400)
     lines.append(f"recorder exit {done.returncode} at {time.time() - started:.0f} s\n"
                  f"{(done.stdout + done.stderr)[-3000:]}")
@@ -55,7 +56,8 @@ def test_joint_fla():
         import numpy as np
 
         with np.load(out) as found, np.load(out.with_name("logits.npz")) as torch_math:
-            for key in found.files:
+            lines.append(f"precision {found['precision']}")
+            for key in (key for key in found.files if key != "precision"):
                 lines.append(f"{key}: max |fla - torch| {np.max(np.abs(found[key] - torch_math[key])):.3e}, "
                              f"|torch - f64| {np.max(np.abs(torch_math[key] - torch_math[key + '/f64'])):.3e}")
         lines.append("FILE logits_fla.npz " + base64.b64encode(lzma.compress(out.read_bytes())).decode())
