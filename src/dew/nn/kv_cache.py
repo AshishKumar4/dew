@@ -497,9 +497,6 @@ class KVStore:
                                    pages_per_compute_block=_pages_per_block(table.shape[1]))
 
         arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE))
-        mesh = jax.sharding.get_abstract_mesh()
-        if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-            return local(*arrays)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]

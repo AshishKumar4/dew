@@ -247,8 +247,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
         # The groups are expanded, so any split of the heads divides them.
         rows, split = grouped_heads(x.shape, heads)
         four, held = P(rows, None, split, None), P(rows, split, None, None)
-        scanned, final = _on_shards(kernel, (x, B, C, a, carried),
-                                    (four, four, four, P(rows, None, split), held), (four, held))
+        scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
+                                    (four, held))(x, B, C, a, carried)
     return (scanned + skip)[:, :length], final
 
 
@@ -294,19 +294,7 @@ def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
     rows, heads = grouped_heads(x.shape, B.shape[2])
     four, held = P(rows, None, heads, None), P(rows, heads, None, None)
     specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
-    return _on_shards(scan, operands, specs[:len(operands)], (four, held))
-
-
-def _on_shards(scan, operands, in_specs, out_specs):
-    """`scan` on each shard of `operands` a mesh splits them into
-    (`manual_map`, `in_specs` and `out_specs` the rows and heads it holds), or
-    whole off a mesh and inside one that already holds every axis manual:
-    the scans' kernels, mamba_ssm's on a GPU and the Pallas scan on a TPU,
-    whose Mosaic lowering refuses an axis left to the partitioner."""
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return scan(*operands)
-    return manual_map(scan, in_specs, out_specs)(*operands)
+    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)
 
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
