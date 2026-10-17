@@ -1014,6 +1014,19 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
     assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
 
 
+def test_metrics_without_a_cadence_are_scored_once_at_the_end():
+    """A metric costly enough to want once is scored by the pass every suite gets at the run's end
+    alone, where neither fit's eval_every nor the suite's every schedules another."""
+    from dew.training import EvalSuite
+
+    held = dataset(val=val_batches(2)).val
+    for options in ({"metrics": (Spread([]),)}, {"validation": {"val": EvalSuite(held, (Spread([]),))}}):
+        tracker = RecordingTracker()
+        make_trainer(objective=Features(), tracker=tracker).fit(
+            dataset(val=val_batches(2)), steps=4, log_every=2, **options)
+        assert [step for step, scores in tracker.scalars if "val/spread" in scores] == [4]
+
+
 def test_the_validation_split_is_the_one_suite_val():
     """`dataset.val` alone and a one-suite mapping of it are the same run."""
     from dew.training import EvalSuite
