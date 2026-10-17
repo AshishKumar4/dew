@@ -171,6 +171,27 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+@pytest.mark.parametrize(("name", "stale"), [
+    ("qwen2-tiny", {"use_mrope": True}),
+    ("mamba2-tiny", {"rms_norm": False, "intermediate_size": 3, "norm_before_gate": True}),
+    ("nemotron-h-tiny", {"mamba_num_groups": 7, "rms_norm_eps": 0.5}),
+])
+def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds(tmp_path, name, stale):
+    """A released config may carry fields its reference neither declares nor reads (a multimodal
+    rotary flag, mamba_ssm's own sizes, an older name for a field it reads under another), and
+    the reference computes the same model whatever they hold; so the checkpoint loads to its
+    reference logits however they disagree with the fields the reference reads."""
+    from shutil import copytree
+
+    directory = tmp_path / "checkpoint"
+    copytree(FIXTURES / name, directory)
+    (directory / "config.json").write_text(json.dumps({**fixture_config(name), **stale}))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_allclose(actual, np.load(FIXTURES / name / "logits.npy"), atol=1e-4, rtol=0)
+
+
 def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     """The rotary rule, on the release's own geometry and without its
     weights: `Olmo3RotaryEmbedding` calls `ROPE_INIT_FUNCTIONS['yarn']` for
