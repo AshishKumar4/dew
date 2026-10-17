@@ -690,7 +690,7 @@ class HarborSource:
                 reading = len(ready.get_map()) > 1
                 if not reading:
                     with self._lock:
-                        if process.poll() is not None:
+                        if True:
                             record.process = None
                             break
                 if deadline is not None and time.monotonic() >= deadline:
