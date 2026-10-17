@@ -1,7 +1,6 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
 from fractions import Fraction
-from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -17,9 +16,6 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
-
-import_module("dew.nn.multimodal")  # registers the fixture kind
-
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 

@@ -122,39 +122,6 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
 
 
-TRAINING = (1, 4096, 32, 128)
-"""Batch, length, heads, head width: Kimi Linear's KDA layer (32 heads of 128) at a 4096-token row."""
-
-
-def training_cases():
-    """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
-    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
-    from fla_gdn_support import KernelCase
-
-    batch, length, heads, width = TRAINING
-
-    def case(name, width, columns, heads):
-        def call():
-            keys = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
-            values = jax.ShapeDtypeStruct((batch, length, heads, columns), jnp.bfloat16)
-            decay = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.float32)
-            beta = jax.ShapeDtypeStruct((batch, length, heads), jnp.bfloat16)
-            state = jax.ShapeDtypeStruct((batch, heads, width, columns), jnp.float32)
-
-            def grads(q, k, v, g, beta, h0):
-                def loss(*args):
-                    out, final = fla_kda.chunk_kda(*args, None, width ** -0.5, 64, interpret=False)
-                    return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
-                return jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, beta, h0)
-
-            return grads, (keys, keys, values, decay, beta, state)
-
-        return KernelCase(name, call)
-
-    yield case("kda", width, width, heads)
-    yield case("kda/keys of 256", fla_gdn.WIDEST_KEYS, width, 4)
-
-
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
 def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
     """A bf16 KimiDeltaAttention at Kimi Linear's heads, forward and backward, compiled for this GPU:
