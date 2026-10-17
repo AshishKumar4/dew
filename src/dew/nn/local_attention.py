@@ -21,6 +21,7 @@ from .attention import (
     tensor_shards,
 )
 from .documents import with_documents
+from .inputs import valid_order
 from .sharding import HEADS, KV_HEADS, SEQUENCE_AXIS, logical_spec, manual_map, rows_spec, sequence_shards
 
 
@@ -43,9 +44,9 @@ def _banded(x, before=None):
 
 
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
-                    positions=None, segment_ids=None, max_segments=None, valid=None, dtype=None,
-                    precision=None, force_fp32_for_softmax=True, implementation='auto', sinks=None,
-                    softcap=None):
+                    positions=None, segment_ids=None, max_segments=None, valid=None,
+                    right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
+                    implementation='auto', sinks=None, softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
     memory linear in the sequence.
 
@@ -56,7 +57,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     set. `positions` `[S]` or `[B, S]` places the chunks (None is the row
     index), `segment_ids` keeps packed documents apart (0 is padding), at
     most `max_segments` a row (`Coordinates.max_segments`), and
-    `valid` `[B, S]` drops the keys it marks False.
+    `valid` `[B, S]` drops the keys it marks False; `right_padded` says each
+    row's valid slots come first (`AttentionMetadata.right_padded`).
 
     No `[S, S]` array is built above two spans. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
@@ -64,7 +66,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     Chunks that start at row multiples fold into the batch. Everything else
     runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
-    pads to whole spans, so at most two spans take the dense call.
+    pads to whole spans, so at most two spans take the dense call. A chunk
+    over a row with padding among its tokens runs on the real tokens alone
+    (`_compacted`), so its keys stay within the band.
     """
     if (window is None) == (chunk is None):
         raise ValueError("local attention takes exactly one of window and chunk")
@@ -77,6 +81,12 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
+    if chunk is not None and valid is not None and not right_padded:
+        return _compacted(
+            functools.partial(local_attention, chunk=chunk, max_segments=max_segments, right_padded=True,
+                              dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
+                              implementation=implementation, sinks=sinks, softcap=softcap),
+            query, key, value, positions, segment_ids, valid)
     whole = functools.partial(
         scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
@@ -139,6 +149,35 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
                             segment_ids=segment_ids, valid=valid,
                             implementation=implementation, masked=masked)
     return checkpoint_name(out, 'attention_output')
+
+
+def _compacted(attend, query, key, value, positions, segment_ids, valid):
+    """`attend` over each row's real tokens moved to its front in order, their
+    places and documents with them, and its outputs moved back to their slots.
+
+    A chunk spans `chunk` places, and padding among a row's tokens spreads
+    them over more slots than the band before a query holds: real slots 0, 3,
+    6 and 9 at places 0 to 3 are one chunk of 4 the band of slot 9 reads only
+    from slot 4 on. Compacted, a chunk's real tokens sit within `chunk`
+    consecutive slots. The places stay those given, the row index where none
+    are; the padding's outputs come back unspecified."""
+    batch, length = valid.shape
+    real = jnp.asarray(valid, bool)
+    order, count = valid_order(real)
+    # Each slot's column in that order: a real token's rank among the real, a padding slot's after them.
+    column = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1,
+                       count[:, None] + jnp.cumsum(~real, axis=1, dtype=jnp.int32) - 1)
+
+    def moved(x, to):
+        return jnp.take_along_axis(x, to.reshape(*to.shape, *(1,) * (x.ndim - 2)), axis=1,
+                                   mode='promise_in_bounds')
+
+    places = jnp.broadcast_to(jnp.arange(length) if positions is None else jnp.asarray(positions),
+                              (batch, length))
+    out = attend(*(moved(x, order) for x in (query, key, value)), positions=moved(places, order),
+                 segment_ids=None if segment_ids is None else moved(segment_ids, order),
+                 valid=moved(real, order))
+    return moved(out, column)
 
 
 def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, positions,
