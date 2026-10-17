@@ -32,7 +32,7 @@ from flax import linen as nn
 
 from dew.artifacts import TokenScores
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
-from dew.inference.tasks import MaskedGeneration
+from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
@@ -51,9 +51,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, documents_of, text_preview
-from dew.records import JSON
 from dew.sampling.sample import sample
-from dew.sampling.solvers import Solver
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -69,8 +67,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """
 
     saved_task = MaskedGeneration
-    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process', 'solver',
-                                  'sampling_steps'})
+    settings = MaskedSettings
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 
@@ -131,26 +128,20 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         geometry = FixedTokens(self.seq_len)
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
-    def task_record(self) -> Mapping[str, JSON]:
-        """The row length, response budget, tokenizer or source processor, process, solver and
-        sampling steps: the task's own."""
-        from dew.inference.tasks import recorded_processor, recorded_tokenizer
-        from dew.registry import to_record
-        return {'seq_len': self.seq_len, 'max_new_tokens': self.seq_len,
-                'tokenizer': recorded_tokenizer(self.processor),
-                'processor': recorded_processor(self.processor),
-                'process': to_record(self.process, DiscreteProcess), 'solver': to_record(self.solver, Solver),
-                'sampling_steps': self.steps}
+    def task_settings(self) -> MaskedSettings:
+        """The row length, response budget, process, solver, sampling steps, and tokenizer or
+        source processor: the task's own."""
+        return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
+                              solver=self.solver, sampling_steps=self.steps,
+                              tokenizer=recorded_tokenizer(self.processor),
+                              processor=recorded_processor(self.processor))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
         """Return the model over `variables` as a full-response MDLM task, with this
-        objective's solver, steps and row length as its budget, as `task_record` saves them."""
-        from dew.inference.tasks import MaskedGeneration
-
-        return MaskedGeneration(self.model, variables, self.process,
-                                self.processor if processor is OMITTED else processor,
-                                solver=self.solver, steps=self.steps, max_new_tokens=self.seq_len)
+        objective's solver, steps and row length as its budget, as `task_settings` saves them."""
+        return MaskedGeneration.from_settings(self.model, variables, self.task_settings(),
+                                              self.processor if processor is OMITTED else processor)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
