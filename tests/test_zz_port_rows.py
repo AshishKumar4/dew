@@ -43,7 +43,8 @@ def test_port_rows(monkeypatch):
                         # Only linear.py's kernels (the delta rule and the short conv) interpreted; the
                         # norm kernels and everything else compiled as on the port.
                         patched.setattr(linear, "generation", types.SimpleNamespace(
-                            **{name: getattr(generation, name) for name in dir(generation) if not name.startswith("__")},
+                            **{name: getattr(generation, name) for name in dir(generation)
+                               if not name.startswith("__") and name != "triton_runs"},
                             triton_runs=lambda: False))
                     runs[f"{rule_name} {layout}"] = jax.tree.map(np.asarray, jax.jit(
                         lambda v, laid=laid: t.gradient(objective, v, laid))(variables))
