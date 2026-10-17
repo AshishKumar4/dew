@@ -15,14 +15,13 @@ import functools
 from collections.abc import Mapping
 from typing import ClassVar
 
-import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed, _indexed_manifest
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
 from dew.records import record
 
@@ -288,16 +287,4 @@ class PackedSource:
         return None
 
     def manifest(self) -> ShardManifest:
-        size, location = len(self.plan), self.plan.location
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"{location}:{start}", location, start, min(start + 1024, size), min(1024, size - start)
-                )
-                for start in range(0, size, 1024)
-            ),
-            self._reader,
-        )
-
-    def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, self.plan.location, self.plan.location, 1024)

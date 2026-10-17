@@ -2162,3 +2162,70 @@ def test_provisioning_a_store_again_replaces_the_index_a_reader_has_mapped(tmp_p
     TokenFiles(str(tmp_path)).provision()
     assert os.stat(index).st_ino != original
     assert mapped.tolist() == np.load(index).tolist() == list(range(4, 257, 4))
+
+
+def _indexed_source(kind: str, root: Path):
+    """A source of `kind` that streams its indexed records, and the shards (id, location, start,
+    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into."""
+    from token_support import write_token_corpus
+
+    from dew.data.pipeline import Pack, Pipeline
+    from dew.data.sources import TFDS, TokenFiles
+
+    if kind == "memory":
+        return Memory([{"id": index} for index in range(7)], shard_rows=3), [
+            ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
+    if kind == "tfds":
+        tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+        path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
+        named = f"tfds:dew_images/None:None:all:{path}"
+        return TFDS("dew_images", path=path, split="all", shard_rows=8,
+                    decoders={"image": tfds.decode.SkipDecoding()}), [
+            (f"{named}:0", path, 0, 8, 8), (f"{named}:8", path, 8, 16, 8), (f"{named}:16", path, 16, 20, 4)]
+    if kind == "generation":
+        from dew.data.cache import Cache
+        from dew.data.compile import publish
+
+        generation = publish(Pipeline(Memory([{"id": index} for index in range(4100)])),
+                             Cache(str(root / "cache")), read="indexed",
+                             loading=Loading(workers=0, threads=1, read_buffer=0))
+        url = generation.url
+        return generation.source(), [(f"{url}:0", url, 0, 4096, 4096), (f"{url}:4096", url, 4096, 4100, 4)]
+    if kind == "planned":
+        from dew.data.packing import PackedSource
+
+        documents = [np.arange(3, dtype=np.int32) + index for index in range(1030)]
+        held = Memory({"text": documents, "length": [3] * 1030}, identity="documents")
+        return PackedSource.planned(held, Pack(4, bins=1)), [
+            ("memory:documents:0", "memory:documents", 0, 1024, 1024),
+            ("memory:documents:1024", "memory:documents", 1024, 1030, 6)]
+    write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
+    tokens = TokenFiles(str(root)).provision()
+    if kind == "tokens":
+        return tokens, [(f"{root}:train:0", str(root), 0, 1024, 1024),
+                        (f"{root}:train:1024", str(root), 1024, 1030, 6)]
+    from dew.data.steps.windows import WindowSource
+
+    windows = WindowSource(tokens, tokens.tokens, 4, 1)
+    named = f"{tokens.describe()} causal windows=4,stride=1"
+    return windows, [(f"{named}:0", named, 0, 1024, 1024), (f"{named}:1024", named, 1024, 2048, 1024),
+                     (f"{named}:2048", named, 2048, 2056, 8)]
+
+
+@pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
+def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
+    """A source read by index streams as consecutive shards of its records, each named by its
+    store and first row; a shard reads that slice of the indexed records, and the manifest
+    pickles, reader and all, for Grain's worker processes."""
+    source, expected = _indexed_source(kind, tmp_path)
+    manifest = source.manifest()
+    named = [(shard.id, shard.uri, shard.start, shard.stop, shard.rows) for shard in manifest.shards]
+    assert named == expected
+    reopened = pickle.loads(pickle.dumps(manifest))
+    records = source.records("indexed")
+    streamed_rows = [row for shard in reopened.shards for row in reopened.reader(shard)]
+    assert len(streamed_rows) == len(records)
+    for index, row in enumerate(streamed_rows):
+        assert row.keys() == records[index].keys()
+        for name, value in row.items():
+            np.testing.assert_array_equal(value, records[index][name])
