@@ -40,7 +40,7 @@ from dew.nn.text_encoders import (
     translate_t5_config,
 )
 from dew.objectives.base import FROZEN, Variables
-from dew.registry import dtype_name, encoders, resolve_dtype
+from dew.registry import dtype_name, encoders, import_path, resolve_dtype
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
@@ -126,6 +126,11 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     def to_json(self) -> dict:
         """Return the keyword fields that `from_pretrained` rebuilds this encoder from."""
 
+    def dependencies(self) -> Mapping[str, object]:
+        """What `tokenize` makes of raw data depends on: the encoder and the fields it is
+        rebuilt from, which hold its context length and its checkpoint's revision."""
+        return {"class": import_path(type(self)), "fields": self.to_json()}
+
 
 def rebuild(name: str, fields: Mapping[str, object], *,
             params: Variables | None = None) -> ConditionEncoder:
@@ -194,6 +199,14 @@ class _TextTower(ConditionEncoder[str, TextContext]):
     def recorded(self) -> dict:
         """The fields this tower records beyond the ones every tower has."""
         return {}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and its tokenizer's files, hashed as `HFTokenizer` pins them, so
+        a tokenizer that moved under an unpinned checkpoint name changes the identity too."""
+        from dew.data.text import pin_tokenizer
+
+        name = self.checkpoint if self.revision is None else f"{self.checkpoint}@{self.revision}"
+        return {**super().dependencies(), "tokenizer": pin_tokenizer(name, local_files_only=True).snapshot}
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.context,
