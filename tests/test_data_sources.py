@@ -532,13 +532,20 @@ def test_file_catalog_keeps_distinct_nested_names_including_underscore_directori
 
 
 def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
+    import csv
+
     text = "a" * 140_000 + "\n" + "b" * 140_000
     root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
     root.write(('id,text\n0,"' + text + '"\n').encode())
     files = Files(root.url)
-    assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
-    files.provision()
-    assert files.records("indexed")[0] == {"id": "0", "text": text}
+    # A field past Python's default limit reads under the limit its caller raises (`Files`).
+    previous = csv.field_size_limit(len(text) + 1)
+    try:
+        assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
+        files.provision()
+        assert files.records("indexed")[0] == {"id": "0", "text": text}
+    finally:
+        csv.field_size_limit(previous)
 
 
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
@@ -598,33 +605,39 @@ def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_p
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_csv_field_past_pythons_limit_reads_and_resumes_and_the_callers_limit_holds(tmp_path, read):
-    """A quoted CSV field of 200 KiB, past Python's default field limit, reads through a loader of
-    four reader threads at its provisioned offsets and resumes where it stopped, while the limit a
-    caller set for the process's own parsers holds throughout: a CSV source once raised it for
-    every parser in the process each time it opened a file."""
+def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_path, read):
+    """CSV is parsed by Python's csv module under the process's own field size limit, which a
+    source never changes: a 200 KiB quoted field is refused under the default limit, and under a
+    limit its caller raised it reads through a loader of four reader threads at its provisioned
+    offsets and resumes where it stopped. A source once raised the limit for every parser in the
+    process each time it opened a file."""
     import csv
 
     from dew.data.compile import compile
 
     texts = [f"row {index}" if index != 2 else "x" * (200 * 1024) + "\nand more" for index in range(6)]
+    expected = [(str(index), text) for index, text in enumerate(texts)]
     path = tmp_path / "rows.csv"
     with path.open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["id", "text"])
         writer.writerows([str(index), text] for index, text in enumerate(texts))
-    previous = csv.field_size_limit(4096)
+
+    def rows(reader) -> list[tuple[str, str]]:
+        return [(str(batch["id"][0]), str(batch["text"][0])) for batch in reader]
+
+    previous = csv.field_size_limit(128 * 1024)
     try:
+        refused = Files(str(path))
+        with pytest.raises(csv.Error):
+            list(refused.records("memory"))
+        csv.field_size_limit(1024 * 1024)
         Files(str(path)).provision()
         data = compile(Files(str(path)).repeat(1).batch(1), read=read,
                        loading=Loading(workers=0, threads=4, read_buffer=4))
-
-        def rows(reader) -> list[tuple[str, str]]:
-            return [(str(batch["id"][0]), str(batch["text"][0])) for batch in reader]
-
         whole = data.train(DataPartition())
         try:
-            assert rows(whole) == [(str(index), text) for index, text in enumerate(texts)]
+            assert rows(whole) == expected
         finally:
             whole.close()
         stopped = data.train(DataPartition())
@@ -636,19 +649,19 @@ def test_a_csv_field_past_pythons_limit_reads_and_resumes_and_the_callers_limit_
         resumed = data.train(DataPartition())
         try:
             resumed.set_state(state)
-            assert head + rows(resumed) == [(str(index), text) for index, text in enumerate(texts)]
+            assert head + rows(resumed) == expected
         finally:
             resumed.close()
-        assert csv.field_size_limit() == 4096
-        with pytest.raises(csv.Error):
-            list(csv.reader(path.open(newline="")))
+        assert csv.field_size_limit() == 1024 * 1024
     finally:
         csv.field_size_limit(previous)
 
 
-def test_a_fetch_from_a_server_that_trickles_its_body_ends_at_its_timeout():
-    """A server that sends a byte every tenth of a second holds a fetch no longer than its
-    timeout: the attempt is dropped as transient, where it once read on byte by byte."""
+@pytest.mark.parametrize("trickled", ["headers", "body"])
+def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
+    """A server that sends its headers or its body a byte every tenth of a second holds a fetch
+    no longer than its timeout: the attempt is dropped as transient, where it once read on byte
+    by byte, each byte inside the socket's timeout."""
     import http.server
     import time
 
@@ -657,9 +670,12 @@ def test_a_fetch_from_a_server_that_trickles_its_body_ends_at_its_timeout():
 
     class Trickle(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Length", "60")
-            self.end_headers()
+            if trickled == "headers":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", "60")
+                self.end_headers()
             for _ in range(60):
                 self.wfile.write(b"x")
                 self.wfile.flush()

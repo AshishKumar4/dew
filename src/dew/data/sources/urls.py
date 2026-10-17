@@ -9,6 +9,7 @@ import http.client
 import logging
 import socket
 import threading
+import time
 import types
 import urllib.error
 import urllib.request
@@ -20,14 +21,18 @@ _log = logging.getLogger(__name__)
 
 
 class _Deadline:
-    """One fetch attempt's deadline. A socket timeout bounds each receive, not a response a server
-    trickles a byte at a time, so when the deadline passes every connection the attempt opened,
-    a redirect's included, is shut down, which ends a receive that is waiting."""
+    """One fetch attempt's deadline, over every connection it opens (a redirect's included) from
+    the moment its socket exists: connecting, a proxy's tunnel, the TLS handshake and the body. A
+    socket timeout bounds each receive, not a response a server trickles a byte at a time, so when
+    the deadline passes each connection is shut down, which ends a wait in any of those stages.
+    The deadline shuts its own duplicate of each socket, which no close by urllib can hand to
+    another connection, and closes them only once its timer can no longer run."""
 
     def __init__(self, seconds: float):
-        self.seconds = seconds
-        self.passed = False
-        self._sockets: list[socket.socket] = []
+        self.at = time.monotonic() + seconds
+        self._passed = False
+        self._finished: float | None = None
+        self._handles: list[socket.socket] = []
         self._lock = threading.Lock()
         self._timer = threading.Timer(seconds, self._pass)
         self._timer.daemon = True
@@ -39,20 +44,54 @@ class _Deadline:
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  trace: types.TracebackType | None) -> None:
         self._timer.cancel()
-
-    def watch(self, connection: socket.socket) -> None:
         with self._lock:
-            self._sockets.append(connection)
-            passed = self.passed
-        if passed:
-            _shut(connection)
+            self._finished = time.monotonic()
+            handles, self._handles = self._handles, []
+        for handle in handles:
+            handle.close()
+
+    @property
+    def passed(self) -> bool:
+        """Whether the attempt outlasted its deadline: the timer shut it, or it ended late."""
+        return self._passed or (self._finished is not None and self._finished >= self.at)
+
+    def connection(self, address: tuple[str, int], timeout: float | None = None,
+                   source_address: tuple[str, int] | None = None) -> socket.socket:
+        """`socket.create_connection` under the deadline: each socket watched from before it
+        connects, and each wait at most the time the deadline leaves, in place of `timeout`."""
+        host, port = address
+        failure: OSError | None = None
+        for family, kind, protocol, _, target in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+            left = self.at - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"no time left to connect to {host}")
+            connection = socket.socket(family, kind, protocol)
+            self._watch(connection)
+            try:
+                connection.settimeout(left)
+                if source_address is not None:
+                    connection.bind(source_address)
+                connection.connect(target)
+            except OSError as error:
+                connection.close()
+                failure = error
+                continue
+            return connection
+        raise failure if failure is not None else OSError(f"{host} resolves to no address")
+
+    def _watch(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._handles.append(connection.dup())
+            if self._passed:
+                _shut(self._handles[-1])
 
     def _pass(self) -> None:
         with self._lock:
-            self.passed = True
-            connections = list(self._sockets)
-        for connection in connections:
-            _shut(connection)
+            if self._finished is not None:
+                return
+            self._passed = True
+            for handle in self._handles:
+                _shut(handle)
 
 
 def _shut(connection: socket.socket) -> None:
@@ -64,21 +103,14 @@ def _shut(connection: socket.socket) -> None:
 class _WatchedHTTP(http.client.HTTPConnection):
     def __init__(self, *arguments, deadline: _Deadline, **options):
         super().__init__(*arguments, **options)
-        self.deadline = deadline
-
-    def connect(self) -> None:
-        super().connect()
-        self.deadline.watch(self.sock)
+        # http.client's hook for how a connection opens its socket.
+        self._create_connection = deadline.connection
 
 
 class _WatchedHTTPS(http.client.HTTPSConnection):
     def __init__(self, *arguments, deadline: _Deadline, **options):
         super().__init__(*arguments, **options)
-        self.deadline = deadline
-
-    def connect(self) -> None:
-        super().connect()
-        self.deadline.watch(self.sock)
+        self._create_connection = deadline.connection
 
 
 class _HTTP(urllib.request.HTTPHandler):
