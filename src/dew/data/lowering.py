@@ -134,10 +134,6 @@ def _outputs(
         return (value,)
     if value is None:
         return (Rejected("missing"),)
-    if isinstance(stage, MapWithIndex):
-        if position is None:
-            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
-        return (stage.step(position, record(value, "indexed map input")),)
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
@@ -156,6 +152,10 @@ def _outputs(
     elif isinstance(stage, Map):
         step = stage.step
         output = step.map(value) if isinstance(step, pygrain.MapTransform) else step(record(value, "map"))
+    elif isinstance(stage, MapWithIndex):
+        if position is None:
+            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
+        output = stage.step(position, record(value, "indexed map input"))
     else:
         raise ValueError(f"{type(stage).__name__} is not a record stage")
     if isinstance(output, Rejected) and not stage.rejects:
@@ -762,6 +762,12 @@ class _Build:
             if empty:
                 rows = whole[:1]
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
+            after = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+            endless = any(isinstance(stage, Repeat) and stage.epochs is None for stage in after)
+            if endless and not len(batched):
+                # The repeat after the batch would replay a pass that holds no batch, forever.
+                raise ValueError(f"a pass of {_name(pipeline)} holds {len(rows)} rows, which fill no batch "
+                                 f"of {size}; repeat before the batch to fill one from its repeats")
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
