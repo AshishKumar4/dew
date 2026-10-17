@@ -1318,18 +1318,39 @@ def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
     return ""
 
 
-def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
-    """Every node that runs where `nodes` run: a nested function's or lambda's decorators, defaults
-    and annotations but not its body, which runs only where it is called, and a class's body, which
-    runs where the class is defined."""
+def _evaluated(definition: ast.AST) -> list[ast.AST]:
+    """The parts of a definition evaluated where it is defined: its decorators and defaults, and a
+    class's bases and keywords. An annotation is a type, not an operation (postponed under
+    `from __future__ import annotations`, and lazy since Python 3.14), so it is not among them."""
+    if isinstance(definition, ast.ClassDef):
+        return [*definition.decorator_list, *definition.bases, *definition.keywords]
+    if isinstance(definition, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+        signature = definition.args
+        defaults: list[ast.AST] = [*signature.defaults,
+                                   *(item for item in signature.kw_defaults if item is not None)]
+        return defaults if isinstance(definition, ast.Lambda) else [*definition.decorator_list, *defaults]
+    return []
+
+
+def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
+    """Every node that runs where `nodes` run, in `scope`, with the scope its names resolve in: a nested
+    function's or lambda's evaluated parts (`_evaluated`) but not its body, which runs only where it is
+    called, and a class's body, which runs where the class is defined, in the class's own namespace."""
     for node in nodes:
-        yield node
+        yield node, scope
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            yield from _executed(scopes.outside(node))
+            yield from _executed_in(_evaluated(node), scope)
         elif isinstance(node, ast.ClassDef):
-            yield from _executed([*scopes.outside(node), *node.body])
+            yield from _executed_in(_evaluated(node), scope)
+            yield from _executed_in(node.body, node)
         else:
-            yield from _executed(ast.iter_child_nodes(node))
+            yield from _executed_in(ast.iter_child_nodes(node), scope)
+
+
+def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
+    """Every node that runs where `nodes` run (`_executed_in`)."""
+    for node, _ in _executed_in(nodes, ast.Module(body=[], type_ignores=[])):
+        yield node
 
 
 def _loop_level(statements: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
@@ -1378,17 +1399,18 @@ def _retrying(loop: ast.For | ast.While) -> bool:
 
 
 class _Calls:
-    """The module's functions a call reaches, read from where it is made: a bare name through the
-    scopes that enclose the call (a class body's names reach none of its methods), to the function
-    that binds it there, if a definition binds it; `self.f` or `cls.f` the method of the calling
-    function's class or of a base of it the module defines; and `self.held.f`, through an attribute
-    of another object, any method `f` of the module's classes."""
+    """The module's functions a call reaches, read where it is made, as one module's lexical scopes
+    give them: a bare name through the scopes that enclose the call (a class body's names reach none
+    of its methods) to the definition that binds it there; `self.f` or `cls.f`, the receiver of the
+    method the call is in or closes over, to `f` in the method resolution order of that method's
+    class among the module's classes; and `self.held.f`, through an attribute of another object, to
+    any method `f` of the module's classes. Calls through other modules, callables passed in and
+    attributes set at run time are not followed."""
 
     def __init__(self, tree: ast.Module, parent: Sequence[str]):
         self.parent = parent
         self.enclosing: dict[int, ast.AST | None] = {}
         self.bindings: dict[int, dict[str, ast.AST | None]] = {}
-        self.classes: dict[str, ast.ClassDef] = {}
         self.named: dict[str, list[ast.AST]] = {}
         self._index(tree, None)
 
@@ -1396,67 +1418,102 @@ class _Calls:
         self.enclosing[id(scope)] = enclosing
         names: dict[str, ast.AST | None] = {}
 
-        def bind(name: str, definition: ast.AST | None) -> None:
+        def bind(name: str | None, definition: ast.AST | None) -> None:
             # A name bound twice in one scope, once otherwise, is no one definition's.
-            names[name] = definition if names.get(name, definition) is definition else None
+            if name is not None:
+                names[name] = definition if names.get(name, definition) is definition else None
 
         if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
             for argument in scopes.arguments(scope):
                 bind(argument.arg, None)
-        for node in scopes.own(scope):
+        own = list(scopes.own(scope))
+        # A comprehension's targets bind in its own implicit scope, not this one.
+        comprehended = {id(name) for node in own if isinstance(node, ast.comprehension)
+                        for name in ast.walk(node.target)}
+        for node in own:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                bind(node.id, None)
+                if id(node) not in comprehended:
+                    bind(node.id, None)
+            elif isinstance(node, ast.MatchAs | ast.MatchStar):
+                bind(node.name, None)
+            elif isinstance(node, ast.MatchMapping):
+                bind(node.rest, None)
             elif isinstance(node, ast.Import | ast.ImportFrom):
                 for name in scopes.bound_by(node, self.parent):
                     bind(name, None)
-            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
                 bind(node.name, node)
-                if isinstance(scope, ast.ClassDef):
+                if isinstance(scope, ast.ClassDef) and not isinstance(node, ast.ClassDef):
                     self.named.setdefault(node.name, []).append(node)
-            elif isinstance(node, ast.ClassDef):
-                bind(node.name, None)
-                self.classes.setdefault(node.name, node)
             if isinstance(node, scopes.SCOPES):
                 self._index(node, scope)
         self.bindings[id(scope)] = names
 
-    def _method(self, owner: ast.ClassDef, name: str, seen: set[int]) -> ast.AST | None:
-        seen.add(id(owner))
-        method = self.bindings[id(owner)].get(name)
-        if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
-            return method
-        for base in owner.bases:
-            inherited = self.classes.get(base.id) if isinstance(base, ast.Name) else None
-            if inherited is not None and id(inherited) not in seen:
-                method = self._method(inherited, name, seen)
-                if method is not None:
-                    return method
+    def _lookup(self, scope: ast.AST | None, name: str) -> ast.AST | None:
+        """What `name` stands for, read in `scope`: its own binding, else the enclosing scopes'
+        (a class's names reach no scope inside it)."""
+        start = scope
+        while scope is not None:
+            bound = self.bindings.get(id(scope), {})
+            if name in bound and (scope is start or not isinstance(scope, ast.ClassDef)):
+                return bound[name]
+            scope = self.enclosing.get(id(scope))
         return None
 
-    def reached(self, function: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call) -> list[ast.AST]:
+    def _order(self, owner: ast.ClassDef, seen: frozenset[int] = frozenset()) -> list[ast.ClassDef]:
+        """`owner`'s method resolution order among the module's classes (C3, as Python computes it),
+        a base the module does not define ending its line."""
+        if id(owner) in seen:
+            return [owner]
+        bases = [base for base in (self._lookup(self.enclosing.get(id(owner)), node.id)
+                                   for node in owner.bases if isinstance(node, ast.Name))
+                 if isinstance(base, ast.ClassDef)]
+        lines = [self._order(base, seen | {id(owner)}) for base in bases] + [bases]
+        order = [owner]
+        while any(lines):
+            for line in lines:
+                head = line[0] if line else None
+                if head is not None and not any(head in other[1:] for other in lines):
+                    break
+            else:
+                return order  # No consistent order: Python refuses the class; nothing more is read.
+            order.append(head)
+            lines = [line[1:] if line and line[0] is head else line for line in lines]
+        return order
+
+    def _method(self, function: ast.AST, receiver: str, name: str) -> ast.AST | None:
+        """The method `name` the receiver `receiver` of `function`, or of the method it closes
+        over, reaches: the first class in its method resolution order that binds `name`."""
+        scope: ast.AST | None = function
+        while isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            owner = self.enclosing.get(id(scope))
+            parameters = [argument.arg for argument in scopes.arguments(scope)]
+            if parameters[:1] == [receiver] and isinstance(owner, ast.ClassDef):
+                for cls in self._order(owner):
+                    if name in self.bindings[id(cls)]:
+                        return self.bindings[id(cls)][name]
+                return None
+            if receiver in self.bindings.get(id(scope), {}):
+                return None  # The closure binds a receiver of its own.
+            scope = owner
+        return None
+
+    def reached(self, scope: ast.AST, function: ast.AST, call: ast.Call) -> list[ast.AST]:
+        """The definitions `call`, made in `scope` inside `function`, reaches."""
         if isinstance(call.func, ast.Name):
-            scope: ast.AST | None = function
-            while scope is not None:
-                bound = self.bindings[id(scope)]
-                if call.func.id in bound:
-                    found = bound[call.func.id]
-                    return [] if found is None else [found]
-                scope = self.enclosing[id(scope)]
-                while isinstance(scope, ast.ClassDef):
-                    scope = self.enclosing[id(scope)]
-            return []
+            found = self._lookup(scope, call.func.id)
+            return [found] if isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef) else []
         if not isinstance(call.func, ast.Attribute):
             return []
         through, root = 0, call.func.value
         while isinstance(root, ast.Attribute):
             through, root = through + 1, root.value
-        if _named(root) not in ("self", "cls"):
+        if not isinstance(root, ast.Name) or root.id not in ("self", "cls"):
             return []
         if through:
             return self.named.get(call.func.attr, [])
-        owner = self.enclosing.get(id(function))
-        method = self._method(owner, call.func.attr, set()) if isinstance(owner, ast.ClassDef) else None
-        return [] if method is None else [method]
+        method = self._method(function, root.id, call.func.attr)
+        return [method] if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef) else []
 
 
 def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
@@ -1464,13 +1521,13 @@ def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[in
     """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
     a module, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
-    for node in _executed(function.body):
+    for node, scope in _executed_in(function.body, function):
         if isinstance(node, ast.Name | ast.Attribute):
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
         if isinstance(node, ast.Call):
-            for helper in calls.reached(function, node):
+            for helper in calls.reached(scope, function, node):
                 if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
                         and _leaves(helper, tables, calls, seen)):
                     return True

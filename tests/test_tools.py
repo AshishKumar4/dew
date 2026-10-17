@@ -960,9 +960,9 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     once is a deadline, a future's wait is the deadline of work handed elsewhere, a loop over items
     that skips the failed ones retries nothing, and a retry or a sleep beside a subprocess is at its
     boundary. A method or a function named like another, a definition only defined, a parameter
-    or a local import called, a helper of an enclosing function or of a base class, a class body
-    run where it is defined, and a nested loop's or a `match`'s exits are each read as what they
-    are; a failure that falls through to the loop's exit retries nothing."""
+    or a local import called, a helper of an enclosing function, a class body run where it is
+    defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
+    that falls through to the loop's exit retries nothing."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import concurrent.futures\n"
         "import subprocess\n"
@@ -1055,15 +1055,61 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "                case None:\n"
         "                    break\n"
         "        except ValueError:\n"
-        "            continue\n"
+        "            continue\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
+
+
+def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
+    """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
+    that binds `f` in its method resolution order, from a method or a closure in one; a name to its
+    binding, which a comprehension's own variable does not make and a pattern's capture or a class
+    body's assignment does. A sleep beside a call that reaches a subprocess is at its boundary."""
+    found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import subprocess\n"
+        "import time\n"
+        "def run(command):\n"
+        "    return subprocess.run(command, check=True)\n"
         "class Base:\n"
         "    def work(self):\n"
         "        subprocess.run(['true'])\n"
         "class Running(Base):\n"
         "    def spin(self):\n"
         "        self.work()\n"
+        "        time.sleep(1)\n"
+        "    def launch(self):\n"
+        "        def poll():\n"
+        "            self.work()\n"
+        "            time.sleep(1)\n"
+        "        poll()\n"
+        "def comprehended():\n"
+        "    doubled = [run * 2 for run in range(3)]\n"
+        "    run(doubled)\n"
+        "    time.sleep(1)\n"
+        "def matching(value, callback):\n"
+        "    match callback:\n"
+        "        case run:\n"
+        "            run(value)\n"
+        "    time.sleep(1)\n"
+        "def namespaced():\n"
+        "    class Local:\n"
+        "        run = abs\n"
+        "        run(-1)\n"
+        "    time.sleep(1)\n"
+        "class Pure(Base):\n"
+        "    def work(self):\n"
+        "        return 1\n"
+        "class Left(Base):\n"
+        "    pass\n"
+        "class Diamond(Left, Pure):\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "class Plain(Base):\n"
+        "    work = staticmethod(abs)\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
         "        time.sleep(1)\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44)]
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
