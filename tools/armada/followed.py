@@ -37,7 +37,11 @@ pytest is itself a followed child of a test that runs one."""
 PTH = "dew_followed.pth"
 GPUS = ("cuda", "rocm")
 OPENED = ("_init_backend", os.path.join("jax", "_src", "xla_bridge.py"))
-"""Where jax opens a backend, by its platform: a child that opens a GPU's holds a pool there."""
+"""Where jax opens a backend, by its platform argument: a child that opens a GPU's holds a pool there.
+jaxlib 0.11.2 announces no backend's opening in public: jax.monitoring records no event for it, and
+jax.extend.backend's `backends()` and `get_backend()` open every backend they report, so asking them
+would itself take a pool. This private function's name and its `platform` argument are the one private
+use of another library in tools/armada; the pool is then read through `jax.devices()`."""
 FRACTION = "XLA_PYTHON_CLIENT_MEM_FRACTION"
 decided: dict[types.CodeType, bool] = {}
 
@@ -154,9 +158,13 @@ def follow() -> None:
         return sys.monitoring.DISABLE
 
     def held() -> None:
-        from jax._src import xla_bridge
-        stats = [device.memory_stats() or {} for backend in list(xla_bridge._backends.values())
-                 for device in backend.local_devices() if device.platform == "gpu"]
+        import jax
+
+        try:
+            devices = jax.local_devices(backend="gpu")
+        except RuntimeError:  # the backend failed to open, and holds no pool
+            return
+        stats = [device.memory_stats() or {} for device in devices]
         record["pool"] = sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats)
 
     def audited(event, args):
