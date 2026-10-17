@@ -501,6 +501,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     """A fill that waits for spool room as a shard uploads is woken when the upload fails, after
     the cache's retries, and ends with the upload's error rather than waiting on bytes that will
     never free."""
+    import numpy as np
     from fsspec.implementations.memory import MemoryFileSystem
 
     attempts = []
@@ -519,7 +520,8 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
             raise OSError(f"the service refused {path}")
 
     fsspec.register_implementation("refusing", Refusing, clobber=True)
-    source = Memory([{"id": index, "blob": b"x" * 4096} for index in range(2)])
+    blobs = np.random.default_rng(0)
+    source = Memory([{"id": index, "blob": blobs.bytes(4096)} for index in range(2)])
     cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=6000, shard_bytes=1, on_full="block",
                   retry=1)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
