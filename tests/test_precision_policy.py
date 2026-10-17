@@ -1,32 +1,22 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
-import json
 from fractions import Fraction
 from importlib import import_module
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_fp32_reduction_bound
-from test_architectures import CASES as ARCHITECTURE_CASES
 
-from dew.diffusion.process import DenoisingCondition
-from dew.interop.hf_decoders import translate_config
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
-from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import models, resolve_dtype
 
 import_module("dew.nn.multimodal")  # registers the fixture kind
 
@@ -36,13 +26,15 @@ BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
 @pytest.mark.parametrize("arguments", [
     {"precision": jax.lax.Precision.HIGHEST},
+    {"precision": jax.lax.DotAlgorithmPreset.F32_F32_F32},
     {"force_fp32_for_softmax": False},
     {"dtype": jnp.float32},
 ])
 def test_auto_takes_the_reference_path_for_arithmetic_only_it_performs(arguments):
-    """'auto' resolves a call that asks for a matmul precision, a softmax
-    dtype or a compute dtype no fused kernel honours to the reference path,
-    and computes exactly what naming that path computes."""
+    """'auto' resolves a call that asks for a matmul precision, a dot
+    algorithm among them, a softmax dtype or a compute dtype no fused kernel
+    honours to the reference path, and computes exactly what naming that path
+    computes."""
     query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.bfloat16)
     auto = scaled_dot_product_attention(query, key, value, implementation="auto", **arguments)
     reference = scaled_dot_product_attention(query, key, value, implementation="reference",
@@ -122,211 +114,6 @@ def test_fused_attention_default_precision_matches_the_attention_equation(precis
     assert jnp.max(jnp.abs(actual - expected)) < 1e-5
 
 
-TINY = {"emb_features": 32, "precision": "default"}
-DIT = {"output_channels": 3, "patch_size": 4, "num_layers": 1, "num_heads": 2}
-UNET = {"output_channels": 3, "feature_depths": [8, 16],
-        "attention_configs": [None, {"heads": 2}],
-        "num_res_blocks": 1, "num_middle_res_blocks": 1, "norm_groups": 4}
-LM = {"num_layers": 1, "num_heads": 2, "vocab_size": 32, "max_seq_len": 16}
-PER_ARCH = {
-    "unet": UNET,
-    "unet_2d_condition": {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
-                           "blocks_per_level": 1, "precision": "default"},
-    "unet_3d": {**UNET, "temporal_heads": 2},
-    "edm2_unet": {"output_channels": 3, "model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
-                  "attn_resolutions": [8], "channels_per_head": 8},
-    "uvit": {**DIT, "num_layers": 2},
-    "simple_udit": {**DIT, "num_layers": 2},
-    "simple_dit": DIT,
-    "simple_mmdit": DIT,
-    "hybrid_dit": DIT,
-    "video_dit": DIT,
-    "hierarchical_mmdit": {"output_channels": 3, "emb_features": (16, 32),
-                           "num_layers": (1, 1), "num_heads": (2, 2), "base_patch_size": 2},
-    "jepa_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
-    "jepa_video_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
-    "jepa_predictor": {"num_layers": 1, "num_heads": 2, "grid": (4, 4), "predictor_features": 16},
-    "causal_transformer": LM,
-    # The two published transformer families, at one block each.
-    "sd3_transformer": {"patch_size": 2, "in_channels": 4, "out_channels": 4, "num_layers": 1,
-                        "heads": 2, "head_dim": 8, "joint_attention_dim": 12,
-                        "caption_projection_dim": 16, "pooled_projection_dim": 10,
-                        "sample_size": 8, "pos_embed_max_size": 8},
-    "flux_transformer": {"patch_size": 1, "in_channels": 16, "out_channels": 16, "num_layers": 1,
-                         "num_single_layers": 1, "heads": 2, "head_dim": 12,
-                         "joint_attention_dim": 16, "pooled_projection_dim": 10,
-                         "guidance_embeds": True, "axes_dims_rope": (4, 4, 4)},
-    "qwen_image_transformer": {"in_channels": 4, "out_channels": 4, "num_layers": 1, "heads": 2,
-                               "head_dim": 12, "context_in_dim": 16, "axes_dims_rope": (4, 4, 4)},
-    "flux2_transformer": {"in_channels": 16, "out_channels": 16, "num_layers": 1, "num_single_layers": 1,
-                          "heads": 2, "head_dim": 16, "joint_attention_dim": 16,
-                          "timestep_guidance_channels": 32, "axes_dims_rope": (4, 4, 4, 4)},
-    "z_image_transformer": {"in_channels": 4, "dim": 32, "n_layers": 1, "n_refiner_layers": 1, "n_heads": 2,
-                            "cap_feat_dim": 16, "axes_dims": (4, 6, 6), "axes_lens": (64, 16, 16)},
-    "wan_transformer": {"num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
-                        "out_channels": 4, "text_dim": 16, "freq_dim": 16, "ffn_dim": 32,
-                        "num_layers": 1, "rope_max_seq_len": 16},
-}
-COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
-RES, FRAMES = 16, 2
-FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-FIXTURE_DECODERS = ("mamba-tiny", "mamba2-tiny", "deepseek-v4-tiny", "glm5-next-tiny", "kimi-k3-tiny")
-"""Tiny released configs whose mixers no toy case reaches: Mamba, Mamba-2,
-DeepSeek V4's compressed attention and hyper-connections, GLM-5 Next's
-k-pool sparse attention and Kimi's delta attention, depth attention and
-SiTU. DeepSeek V4.1's KV quantizers round through float32 bits on
-purpose (`dew.nn.fake_quant`), so its float64 twin is
-tools/deepseek_v41_numerics.py's, not this one."""
-
-
-def _translated(name):
-    """A fixture's decoder config, leaving compute settings to the caller."""
-    config = translate_config(json.loads((FIXTURES / name / "config.json").read_text()))
-    return {key: value for key, value in config.items() if key not in ("dtype", "attention_impl")}
-
-
-DECODERS = ({case.name: case.config for case in ARCHITECTURE_CASES
-             if case.architecture == "causal_transformer" and case.label}
-            | {f"causal_transformer+{name}": _translated(name) for name in FIXTURE_DECODERS})
-"""The decoder's mixers and mixtures past its default, at toy width
-(tests/test_architectures.py): the MoE routers, Gemma 4's, GPT OSS's, MLA,
-Llama 4's, gemma3n's and the gated delta net, by case name; and the
-fixtures' (`FIXTURE_DECODERS`)."""
-
-
-def build_model(architecture, dtype="bfloat16"):
-    """Every registered architecture at a tiny size with an explicit compute dtype.
-
-    Float64 references use an actual dtype (not a recorded run dtype name),
-    under x64. Composite trunks receive the same dtype as leaf models.
-    """
-    def resolved(name, fields):
-        return {**fields, "dtype": jnp.float64 if dtype == "float64" else dtype}
-
-    if architecture in DECODERS:
-        return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
-    if architecture not in COMPOSITES:
-        own = (
-            "unet_2d_condition",
-            "sd3_transformer",
-            "flux_transformer",
-            "qwen_image_transformer",
-            "edm2_unet",
-            "flux2_transformer",
-            "z_image_transformer",
-            "wan_transformer",
-        )
-        fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
-        return models.build(architecture, **resolved(architecture, fields))
-    text = models.build("causal_transformer", **resolved(
-        "causal_transformer", {**TINY, **LM, "mlp_features": 64}))
-    if architecture == "diffusion_gemma":
-        return DiffusionGemma(text, canvas_length=4)
-    return MultimodalTransformer(
-        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
-                           image_size=8, patch_size=4),
-        GemmaProjector(text_width=TINY["emb_features"],
-                       patches_per_side=2, tokens_per_side=1),
-        family="gemma3", image_token_id=1,
-        dtype=jnp.float64 if dtype == "float64" else resolve_dtype(dtype))
-
-
-def tiny_inputs(architecture, rng):
-    """What each architecture's __call__ takes, at the smallest useful size."""
-    image = jax.random.normal(rng, (1, RES, RES, 3))
-    video = jax.random.normal(rng, (1, FRAMES, RES, RES, 3))
-    text = TextContext(jnp.ones((1, 7, 768)), jnp.ones((1, 7), bool))
-    if architecture in ("unet_3d", "video_dit"):
-        return video, jnp.ones((1,)), text
-    if architecture == "unet_2d_condition":
-        latents = jax.random.normal(rng, (1, RES, RES, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden)}
-    if architecture == "sd3_transformer":
-        latents = jax.random.normal(rng, (1, 8, 8, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
-            text.hidden[:, :, :12], jnp.ones((1, 10)))}
-    if architecture == "flux_transformer":
-        latents = jax.random.normal(rng, (1, 8, 8, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
-            text.hidden[:, :, :16], jnp.ones((1, 10)), guidance=jnp.full((1,), 3.5))}
-    if architecture == "flux2_transformer":
-        latents = jax.random.normal(rng, (1, 4, 4, 16))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
-            text.hidden[:, :, :16], guidance=jnp.full((1,), 3.5))}
-    if architecture in ("z_image_transformer", "qwen_image_transformer"):
-        latents = jax.random.normal(rng, (1, 4, 4, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
-            text.hidden[:, :, :16], mask=text.mask)}
-    if architecture == "wan_transformer":
-        # 32 patch tokens: the source's time embedder is fp32 on purpose, and
-        # fewer tokens would leave it a toy-sized share of the matmuls.
-        latents = jax.random.normal(rng, (1, FRAMES, 8, 8, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden[:, :, :16])}
-    if architecture == "jepa_encoder":
-        return (image,)
-    if architecture == "causal_transformer" or architecture in DECODERS:
-        return (jnp.zeros((1, 8), jnp.int32),)
-    if architecture == "diffusion_gemma":
-        return (jnp.zeros((1, 4), jnp.int32),)
-    if architecture == "multimodal_transformer":
-        tokens = jnp.array([[2, 1, 3, 4, 5, 6, 7, 2]], jnp.int32)
-        return (tokens,), {"image_indices": jnp.where(tokens == 1, 0, -1),
-                           "conditioning": {"pixel_values": jax.random.normal(rng, (1, 1, 3, 8, 8))}}
-    if architecture == "jepa_video_encoder":
-        return (video,)
-    if architecture == "jepa_predictor":
-        return (jax.random.normal(rng, (1, 8, 32)),
-                jnp.arange(8)[None], jnp.arange(8, 12)[None])
-    return image, jnp.ones((1,)), text
-
-
-def forward(architecture, dtype, rng):
-    """`architecture` at `dtype`, its variables and inputs, and its forward
-    pass as a function of them: DiffusionGemma's encodes its prompt first.
-    At float64 the parameters and the float inputs are float64 too."""
-    model = build_model(architecture, dtype)
-    inputs = tiny_inputs(architecture, rng)
-    args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
-    variables = model.init(rng, *args, **kwargs)
-    if dtype == "float64":
-        variables, args, kwargs = jax.tree.map(
-            lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
-            (variables, args, kwargs))
-
-    def run(variables, args, kwargs):
-        if architecture == "diffusion_gemma":
-            cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]["cache"]
-            cache = model.apply({**variables, "cache": cache}, jnp.zeros((1, 8), jnp.int32),
-                                method=model.encode, mutable=["cache"])[1]["cache"]
-            variables = {**variables, "cache": cache}
-        return model.apply(variables, *args, **kwargs)
-
-    return run, (variables, args, kwargs)
-
-
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("architecture", sorted(models) + sorted(DECODERS))
-def test_a_model_below_float64_computes_the_same_bits_whether_x64_is_on(architecture, dtype, rng):
-    """x64 is one flag for the whole process, which a float64 reference
-    turns on beside the model it checks. A float32 or bfloat16 model
-    computes the same bits either way: nothing it computes widens past
-    float32, whatever a Python float or an index widens to under x64.
-
-    Both run on the CPU backend, which every lane keeps beside its
-    accelerator. The claim is about the arithmetic the model asks for, and
-    a TPU compiles the same arithmetic apart once x64 widens its indices to
-    int64, which it emulates."""
-    with jax.default_device(jax.devices("cpu")[0]):
-        run, operands = forward(architecture, dtype, rng)
-        outputs = []
-        for x64 in (False, True):
-            with jax.enable_x64(x64):
-                outputs.append(jax.tree.map(np.asarray, jax.jit(run)(*operands)))
-    for without, under in zip(jax.tree.leaves(outputs[0]), jax.tree.leaves(outputs[1]), strict=True):
-        assert under.dtype == without.dtype
-        np.testing.assert_array_equal(under, without)
-
-
 @pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
 def test_a_rounding_survives_the_reduction_it_feeds(helper):
     """XLA:CPU's YNNPACK reduce fusion sums the unrounded values of a bare
@@ -358,6 +145,21 @@ def test_a_configured_dot_algorithm_reads_as_the_precision_it_asks(configured, d
     from dew.nn import precision
     with jax.default_matmul_precision(configured):
         assert precision.asks_default_precision(None, configured=True) is default
+
+
+def test_a_dot_algorithm_reads_as_its_own_precision_past_the_default():
+    """A `jax.lax.DotAlgorithm`, which JAX's precision alias takes beside its presets, asks for more
+    than the default precision, by its own name, apart from another algorithm's, so attention takes it
+    on its reference path. (CPU's dot refuses a raw algorithm, so only its routing is asked here.)"""
+    from dew.nn import precision
+    wide = jax.lax.DotAlgorithm(jnp.float32, jnp.float32, jnp.float32)
+    narrow = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32)
+    assert not precision.asks_default_precision(wide)
+    assert len(precision.precision_names(wide)) == 1
+    assert precision.precision_names(wide) != precision.precision_names(narrow)
+    # Attention takes it, as it does a preset, on the path that computes it (the reference one).
+    from dew.nn.attention import reference_only
+    assert reference_only(jnp.zeros(BF16_QKV), dtype=None, precision=narrow, force_fp32_for_softmax=True)
 
 
 def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():

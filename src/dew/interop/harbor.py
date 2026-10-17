@@ -357,9 +357,10 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
     `errors` the engine errors the gateway recorded for it, and `harness_exit`
     the harness's own exit status when it reports one. An engine that refused
     an overflowing prompt truncated the rollout; any other engine error makes
-    it infra, even when the harness retried and went on. A result whose
-    fields have the wrong JSON types is infra: nothing in it can be trusted
-    to score.
+    it infra, even when the harness retried and went on, and so does an
+    aborted call or a failed model client, whatever limit the trial also hit.
+    A result whose fields have the wrong JSON types is infra: nothing in it can
+    be trusted to score.
     """
     try:
         judged = _judged(trial)
@@ -367,12 +368,15 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
         return Status.INFRA_ERROR, None, {}, str(error)
     kind, detail, rewards = judged.kind, judged.detail, judged.rewards
     reward = rewards.get("reward", next(iter(rewards.values()), None))
-    if any(_OVERFLOW.search(error) for error in errors):
-        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
-    if errors:
-        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {errors[0]}"
+    broken = [error for error in errors if not _OVERFLOW.search(error)]
+    if broken:
+        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {broken[0]}"
     if any(call.finish_reason == "abort" for call in records):
         return Status.INFRA_ERROR, reward, rewards, "the engine aborted a call"
+    if harness_exit in _CLIENT_FAILURES:
+        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
+    if errors:
+        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
     if (kind in _TRUNCATIONS or harness_exit in _HARNESS_LIMITS
             or (records and records[-1].finish_reason == "length")):
         return (
@@ -383,8 +387,6 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
         )
     if not records:
         return Status.INFRA_ERROR, reward, rewards, detail or "no model call reached the gateway session"
-    if harness_exit in _CLIENT_FAILURES:
-        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
     if reward is not None and kind is None:
         return Status.COMPLETED, reward, rewards, ""
     if reward is not None and kind in _AGENT_FAILURES:

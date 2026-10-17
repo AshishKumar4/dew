@@ -194,13 +194,18 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
 
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
-    tokenizer the file carries, since the directory ships none."""
+    tokenizer the file carries, since the directory ships none. The directory
+    also ships a diffusion pipeline's index, and the selected file is still
+    what loads; a second payload selector beside it is refused."""
     from transformers import AutoModelForCausalLM
 
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
                hf_tensors("llama", rng), rng)
+    (tmp_path / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
 
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, gguf_file="model.gguf", single_file="model.safetensors")
     pretrained = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference",
                                  gguf_file="model.gguf")
     reference = AutoModelForCausalLM.from_pretrained(str(tmp_path), gguf_file="model.gguf",
