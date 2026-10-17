@@ -265,6 +265,30 @@ def test_chain_statistics_count_the_records_every_worker_read():
     assert published["data/attempted/rows"] == len(read) + published["data/rejected/rows/third"] > 16
 
 
+def test_corpus_counts_hold_through_grains_restore_into_a_smaller_cycle():
+    """Grain's elastic restore puts the positions of shards past a smaller cycle aside as future
+    states; the counts they carry are still the corpus's, so the published counts do not change."""
+    import grain.experimental as gx
+
+    from dew.data.mixing import Accepted, state_counts
+
+    def shard(number: int):
+        rows = [{"i": np.int32(10 * number + index)} for index in range(6)]
+        return Accepted(grain.MapDataset.source(rows).to_iter_dataset().map(reject_thirds), "rows")
+
+    def interleave(cycle: int):
+        return gx.InterleaveIterDataset([shard(number) for number in range(4)], cycle_length=cycle).__iter__()
+
+    read = interleave(4)
+    for _ in range(10):
+        next(read)
+    counts = {name: counted.metrics() for name, counted in state_counts(read.get_state()).items()}
+    restored = interleave(2)
+    restored.set_shard_states(read.get_shard_states())
+    assert {name: counted.metrics() for name, counted in state_counts(restored.get_state()).items()} == counts
+    assert counts["rows"]["data/accepted/rows"] == 10
+
+
 def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
     sources = [ObservedRows(end=64) for _ in range(2)]
     chain = mix([from_grain(source, name).filter_map(reject_thirds)
