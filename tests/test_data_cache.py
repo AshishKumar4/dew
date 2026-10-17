@@ -478,21 +478,30 @@ def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(t
     assert cache.publish(key, source)[0] == {"id": 99}
 
 
-def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path):
+def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path, monkeypatch):
     """This host's disk refuses a write for reasons a retry keeps, as its retention refusing room
-    for a shard does, so a blocking fill ends with that error at once, however many retries the
-    cache allows a remote store; it once slept through each of them."""
+    for a shard does, so a blocking fill ends with that error after one attempt, however many
+    retries the cache allows a remote store; it once tried and slept through each of them."""
+    import filelock
     import numpy as np
 
+    attempts = []
+    acquire = filelock.FileLock.acquire
+
+    def counted(lock, *arguments, **options):
+        if str(lock.lock_file).endswith(".retention.lock"):
+            attempts.append(lock.lock_file)
+        return acquire(lock, *arguments, **options)
+
+    monkeypatch.setattr(filelock.FileLock, "acquire", counted)
     source = Memory([{"id": 0, "blob": np.random.default_rng(0).bytes(200_000)}])
     cache = Cache(str(tmp_path), keep_local_bytes=64 * 1024, on_full="block", shard_bytes=1, retry=3)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
     try:
         assert rows[0]["id"] == 0
-        started = time.monotonic()
         with pytest.raises(OSError):
             rows.finish()
-        assert time.monotonic() - started < 1
+        assert len(attempts) == 1
     finally:
         rows.close()
 
@@ -500,14 +509,14 @@ def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path):
 def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     """A fill that waits for spool room as a shard uploads is woken when the upload fails, after
     the cache's retries, and ends with the upload's error rather than waiting on bytes that will
-    never free."""
+    never free. The service fails only once the fill is waiting."""
     import numpy as np
     from fsspec.implementations.memory import MemoryFileSystem
 
-    attempts = []
+    attempts, waiting = [], threading.Event()
 
     class Refusing(MemoryFileSystem):
-        """Memory objects behind a third-party conditional write that always fails."""
+        """Memory objects behind a third-party conditional write that fails once the fill waits."""
 
         protocol = "refusing"
 
@@ -517,7 +526,15 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
 
         def put_conditional(self, path, payload, version):
             attempts.append(path)
+            waiting.wait(20)
             raise OSError(f"the service refused {path}")
+
+    class Observed(threading.Condition):
+        """The writer's condition, noting when a thread waits on it."""
+
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout)
 
     fsspec.register_implementation("refusing", Refusing, clobber=True)
     blobs = np.random.default_rng(0)
@@ -525,6 +542,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=500_000, shard_bytes=1, on_full="block",
                   retry=1)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows.writer.lock = Observed(threading.RLock())
     raised: list[BaseException] = []
 
     def read() -> None:
@@ -540,6 +558,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
         assert not reader.is_alive()
         assert [type(error) for error in raised] == [OSError] and len(attempts) == 2
     finally:
+        waiting.set()
         rows.close()
 
 
