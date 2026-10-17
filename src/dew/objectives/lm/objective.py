@@ -580,10 +580,11 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
     `Objective.bind_model`), the row length `seq_len`, and how the head is
-    scored: `pad_id`, `head_chunks`, `head_tile` (`LMObjective` describes
-    each), `qk_stats` and `token_accuracy`. `samples` draws previews. A loss
-    built on it keeps no average unless it sets `ema`; `LMObjective` adds the
-    language-model terms and loss.
+    scored: `head_chunks`, `head_tile` and `qk_stats` (`LMObjective`
+    describes each). `samples` draws previews. A loss built on it keeps no
+    average unless it sets `ema`; `LMObjective` adds the language-model
+    terms and loss, and the options only they read, `pad_id` and
+    `token_accuracy`.
     """
 
     saved_task = TextGeneration
@@ -609,22 +610,26 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     mtp_weight: float | None = None
     """The multi-token prediction depths' weight (`LMObjective`); None trains none."""
 
-    def __init__(self, model, seq_len: int, *, pad_id: int | None = None, head_chunks: int = 4,
+    pad_id: int | None = None
+    """The id whose targets never count (`LMObjective`); None counts every id."""
+
+    token_accuracy: bool = False
+    """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
+    A policy or preference loss reports none, and asks for the marks where it scores them."""
+
+    def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
-                 qk_stats: bool = False, token_accuracy: bool = True,
-                 processor: Processor | None | Omitted = OMITTED):
+                 qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
         self.model = model
         self.seq_len = seq_len
-        self.pad_id = pad_id
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.qk_stats = qk_stats
-        self.token_accuracy = token_accuracy
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
@@ -1185,9 +1190,10 @@ class LMObjective(TokenScorer):
         processor: Processor | None | Omitted = OMITTED,
     ):
         """Build the objective; the class docstring describes each argument."""
-        super().__init__(model, seq_len, pad_id=pad_id, head_chunks=head_chunks, head_tile=head_tile,
-                         samples=samples, variables=variables, qk_stats=qk_stats,
-                         token_accuracy=token_accuracy, processor=processor)
+        super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
+                         variables=variables, qk_stats=qk_stats, processor=processor)
+        self.pad_id = pad_id
+        self.token_accuracy = token_accuracy
         _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
         self.balance_rate = balance_rate
