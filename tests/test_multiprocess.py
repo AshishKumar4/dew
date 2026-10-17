@@ -311,13 +311,13 @@ def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tm
 @pytest.mark.distributed
 def test_a_metric_reads_the_host_fields_of_every_process_share(tmp_path):
     """`tests/test_whole_validation.py`'s metric over host fields on a pool of two: each process
-    reads its share of every batch, and the root's metric reads every record's name and opaque note
+    reads its share of every batch, and the root's metric reads every record's name and its list of tags
     beside the label the objective produced for that record, each record once."""
     from test_whole_validation import RECORDS
 
     reports = run_pool("host_fields", tmp_path / "out", 2)
     seen = [tuple(read) for read in reports[0]["seen"]]
-    assert sorted(seen, key=lambda read: read[2]) == [(f"record {index}", index, index)
+    assert sorted(seen, key=lambda read: read[2]) == [(f"record {index}", index % 3 + 1, index)
                                                       for index in range(RECORDS)]
 
 
