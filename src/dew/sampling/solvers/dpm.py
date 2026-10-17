@@ -115,7 +115,8 @@ class DPMSolverMultistep:
         # A Heun or third-order coefficient divides by its own step's h too, but at an endpoint, where h
         # is a placeholder (`_lambda_step`); the midpoint one is 0 with h, and its step stays put.
         divides = [k == 3 or (k == 2 and self.solver_type == "heun") for k in orders]
-        spans = [(i, i + 1) for i, divided in enumerate(divides) if divided and sigma[i + 1] > 0 and alpha[i] != 0]
+        spans = [(i, i + 1) for i, divided in enumerate(divides)
+                 if divided and sigma[i + 1] > 0 and alpha[i] != 0]
         _check_gaps(levels, _history_gaps(orders) + spans, reason="DPM-Solver's higher orders divide by")
         return _multistep(x, times, self.order)
 
