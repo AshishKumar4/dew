@@ -67,7 +67,7 @@ import json
 import re
 import sys
 import tokenize
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -846,20 +846,48 @@ CAPTURED = {"readouterr", "text", "messages", "records"}
 """What pytest's capsys, capfd and caplog fixtures hand a test of the output it captured."""
 
 
-def _captured(node: ast.expr, names: set[str]) -> bool:
+def _captured(node: ast.expr, names: Set[str]) -> bool:
     """Is `node` output a test captured: `capsys.readouterr()`'s or capfd's, its `.out` or `.err`,
-    caplog's `.text`, `.messages` or `.records`, or a name a function bound to one of them?"""
-    if isinstance(node, ast.Name):
-        return node.id in names
+    caplog's `.text`, `.messages` or `.records`, or a name of `names`, bound to one of them, or its
+    `.out` or `.err`?"""
     if isinstance(node, ast.Attribute) and node.attr in ("out", "err"):
         node = node.value
+    if isinstance(node, ast.Name):
+        return node.id in names
     if isinstance(node, ast.Call):
         node = node.func
     return (isinstance(node, ast.Attribute) and node.attr in CAPTURED
             and isinstance(node.value, ast.Name) and node.value.id in ("capsys", "capfd", "caplog"))
 
 
-def _spelled_in_captured(node: ast.AST, names: set[str]) -> bool:
+def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
+    """The names bound to captured output (`_captured`) where each node of a function is: a name a
+    function binds to it, or unpacks it into, until it binds that name again to anything else (a
+    parse of it, say); added to, it stays captured."""
+    held: dict[int, frozenset[str]] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        # A binding takes effect once its statement's value has been read: at the statement's end.
+        binding = ast.Assign | ast.AnnAssign | ast.AugAssign
+        events = sorted(((node.end_lineno or node.lineno, node.end_col_offset or 0)
+                         if isinstance(node, binding) else (node.lineno, node.col_offset), id(node), node)
+                        for node in ast.walk(function) if isinstance(node, binding | ast.Compare | ast.Call))
+        names: set[str] = set()
+        for _, _, node in events:
+            if isinstance(node, ast.Compare | ast.Call):
+                held[id(node)] = frozenset(names)
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            bound = {name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)}
+            if node.value is not None and _captured(node.value, names):
+                names |= bound
+            elif not isinstance(node, ast.AugAssign):
+                names -= bound
+    return held
+
+
+def _spelled_in_captured(node: ast.AST, names: Set[str]) -> bool:
     """Does `node` look for a sentence in captured output: a string the source spells, compared
     with `in` against it, or counted in it?"""
     if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.In | ast.NotIn):
@@ -873,11 +901,9 @@ def _spelled_in_captured(node: ast.AST, names: set[str]) -> bool:
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
     warning's text matched, a sentence looked for in captured output, or source text read."""
-    # Names bound to captured output, in any function of the file: a test's name for what it captured.
-    held = {target.id for node in ast.walk(module.tree) if isinstance(node, ast.Assign) and _captured(
-        node.value, set()) for target in node.targets if isinstance(target, ast.Name)}
+    held = _held(module.tree)
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if _spelled_in_captured(node, held):
+        if _spelled_in_captured(node, held.get(id(node), frozenset())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           "looks for a sentence in captured output; assert the state it reports")
         if isinstance(node, ast.Call):

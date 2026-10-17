@@ -527,16 +527,28 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         ci, tmp_path, monkeypatch):
     """A test's inputs outside tests/ and src/ are its file's inputs too (executed.py): a documentation
     page its test reads, and the pages of a directory it lists, so a green row is reused while they
-    stay, and its file runs again once the page it trains from changes or a page is added. A file it
-    writes is no input, and nor is what the import system or pytest's collection lists."""
-    (tmp_path / "docs").mkdir()
+    stay, and its file runs again once the page it trains from changes or a page is added. So are a
+    directory `os.walk` lists, the checkout's own directory listed, and a page opened by its name in
+    a directory's descriptor. A file it writes is no input, and nor is what the import system or
+    pytest's collection lists."""
+    (tmp_path / "docs/guides").mkdir(parents=True)
     (tmp_path / "docs/model.md").write_text("width 4\n")
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes/plan.md").write_text("plan\n")
     (tmp_path / "tests/test_pages.py").write_text(
+        "import os\n"
         "from pathlib import Path\n"
         "def test_pages():\n"
         "    with Path('runs').open('a') as runs: runs.write('x')\n"
         "    assert Path('docs/model.md').read_text().startswith('width')\n"
-        "    assert sorted(path.name for path in Path('docs').glob('*.md'))\n")
+        "    assert sorted(path.name for path in Path('docs').glob('*.md'))\n"
+        "    assert [folder for folder, _, _ in os.walk('docs')]\n"
+        "    assert 'docs' in os.listdir('.')\n"
+        "    folder = os.open('notes', os.O_RDONLY)\n"
+        "    try:\n"
+        "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
+        "    finally:\n"
+        "        os.close(folder)\n")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -553,7 +565,9 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
     monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
-    out = tmp_path / "verdict.json"
+    # Beside the checkout's entries, not among them: the checkout's own directory is an input.
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
 
     def run():
@@ -579,6 +593,14 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     # Python bytecode a run leaves beside a page is no change to the directory's pages.
     (tmp_path / "docs/__pycache__").mkdir()
     assert run() == 3
+    (tmp_path / "docs/guides/serving.md").write_text("serve\n")
+    assert run() == 4
+    (tmp_path / "LICENSE").write_text("license\n")
+    assert run() == 5
+    assert run() == 5
+    (tmp_path / "notes/plan.md").write_text("plan again\n")
+    assert run() == 6
+    assert run() == 6
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
