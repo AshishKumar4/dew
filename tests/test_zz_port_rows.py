@@ -8,10 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import test_decision_packing as t
 from delta_rule_support import port_formula
 from reference_error import float64_terms
 
-import test_decision_packing as t
 from dew.nn import linear
 
 
@@ -40,23 +40,31 @@ def test_port_rows(monkeypatch):
         names = [jax.tree_util.keystr(p) for p, _ in jax.tree_util.tree_leaves_with_path(truth)]
         truth_l, terms_l = (jax.tree.leaves(x) for x in (truth, terms))
         flat = {label: jax.tree.leaves(g) for label, g in runs.items()}
-        ratios = {"packed": [], "rows": []}
+        labels = list(flat)
+        stats = []
         for index, name in enumerate(names):
             true = np.asarray(truth_l[index], np.float64)
             size = np.maximum(np.abs(true), np.asarray(terms_l[index], np.float64))
             ok = size > 0
             if not ok.any():
                 continue
-            worst = {label: float(np.max(np.abs(np.asarray(leaves[index], np.float64) - true)[ok] / size[ok]))
-                     for label, leaves in flat.items()}
+            scale = max(np.sqrt(np.mean(true ** 2)), 1e-300)
+            row = {}
+            for label in labels:
+                err = np.asarray(flat[label][index], np.float64) - true
+                row[label] = (float(np.sqrt(np.mean(err ** 2)) / scale), float(np.max(np.abs(err)[ok] / size[ok])))
+            stats.append((name, row))
+        for level, which in (("rms", 0), ("worst element", 1)):
             for layout in ("packed", "rows"):
-                ratios[layout].append((worst[f"port {layout}"] / max(worst[f"formula {layout}"], 1e-30), name,
-                                       worst[f"port {layout}"], worst[f"formula {layout}"]))
-        for layout in ("packed", "rows"):
-            values = np.array([r[0] for r in ratios[layout]])
-            lines.append(f"[{arm}] {layout}: port/formula worst-element ratio over {len(values)} leaves: "
-                         f"median {np.median(values):.2f}, p90 {np.percentile(values, 90):.2f}, max {values.max():.2f}, "
-                         f"leaves over 4: {int(np.sum(values > 4))}")
-            for ratio, name, port, formula in sorted(ratios[layout], reverse=True)[:5]:
-                lines.append(f"    {ratio:5.2f}  {name}  port {port:.2e} formula {formula:.2e}")
+                ratio = np.array([r[f"port {layout}"][which] / max(r[f"formula {layout}"][which], 1e-30)
+                                  for _, r in stats])
+                lines.append(f"[{arm}] {level}, {layout}: port/formula over {len(ratio)} leaves: median "
+                             f"{np.median(ratio):.2f}, p90 {np.percentile(ratio, 90):.2f}, max {ratio.max():.2f}, "
+                             f"over 2: {int(np.sum(ratio > 2))}, over 4: {int(np.sum(ratio > 4))}")
+            ratio = np.array([r["port rows"][which] / max(r["port packed"][which], 1e-30) for _, r in stats])
+            lines.append(f"[{arm}] {level}: port rows/port packed median {np.median(ratio):.2f}")
+        worst = sorted(stats, key=lambda s: -s[1]["port packed"][1] / max(s[1]["formula packed"][1], 1e-30))[:8]
+        for name, r in worst:
+            lines.append(f"    {name}: " + "  ".join(f"{label} rms {r[label][0]:.2e} el {r[label][1]:.2e}"
+                                                    for label in labels))
     pytest.fail("\n".join(lines))
