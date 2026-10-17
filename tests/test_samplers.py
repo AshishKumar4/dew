@@ -903,12 +903,11 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
                                          f"{kind} repeated model time, step {index}")
 
 
-@pytest.mark.parametrize("kind", ["UniPCMultistep", "DPMSolverMultistep", "EulerDiscrete"])
+@pytest.mark.parametrize("kind", ["UniPCMultistep", "DPMSolverMultistep"])
 def test_a_spacing_too_fine_for_its_table_is_refused_by_the_grid(kind):
-    """Four leading-spaced steps over a four-entry table land every step on one model time and one
-    sigma, intervals of no length that multistep coefficients divide by: the grid refuses them,
-    where the walk would otherwise end in NaN. Three steps over the same table walk distinct
-    sigmas."""
+    """A multistep source's four leading-spaced steps over a four-entry table give two of them one
+    sigma, an interval of no length that its coefficients divide by: the grid refuses it, where the
+    walk would otherwise end in NaN. Three steps over the same table walk distinct sigmas."""
     from dew.diffusion.schedules.source import SourceSchedule
 
     config = {"_class_name": kind + "Scheduler", "num_train_timesteps": 4, "timestep_spacing": "leading"}
