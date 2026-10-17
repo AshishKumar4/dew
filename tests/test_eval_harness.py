@@ -177,21 +177,21 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
-def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model(tmp_path):
+def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     """On the same weights, a request that samples under `top_k=1` draws what
     lm-eval's own model draws there and what greedy decoding draws; a beam
-    search of three under a length penalty, with and without a stop string
-    it reaches, which ends the search itself, a total `max_length`, a
+    search of three under a length penalty, a total `max_length`, a
     request's own EOS and an explicit zero temperature return lm-eval's own
-    answers. A sampled beam search, which no likelihood describes, a control
-    `generate` would not use, and sampling at temperature 0, which
-    `generate` refuses, raise instead of drawing."""
+    answers. A sampled beam search, which no likelihood describes, a beam
+    search under stop strings, which lm-eval's model ends for every beam
+    together, a control `generate` would not use, and sampling at
+    temperature 0, which `generate` refuses, raise instead of drawing."""
     ours, theirs = _pair(64)
     # Only printable ids are drawn, so no answer is cut at the EOS's replacement-character text.
     greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8,
               "suppress_tokens": [*range(32), *range(127, 256)]}
     sampled = {**greedy, "do_sample": True, "temperature": 1.0, "top_k": 1}
-    beams = {**greedy, "num_beams": 3, "length_penalty": 0.5}
+    beams = {**greedy, "num_beams": 3, "length_penalty": 0.5, "until": []}
 
     def asked(controls):
         return [instance("the quick ", controls, request_type="generate_until")]
@@ -205,18 +205,9 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model(tm
     eos = ours.tok_encode(answer[0][1], add_special_tokens=False)[0]
     ended = {**greedy, "eos_token_id": eos}
     assert ours.generate_until(asked(ended)) != answer
-    for controls in ({**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
+    for controls in (beams, {**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
-    # A beam search reads its stop strings through a tokenizer that lists its vocabulary. A stop the
-    # beams reach, the answer's third character under a stop they never reach, ends the search there.
-    listed, listed_theirs = _pair(64, tmp_path, bos="inserted")
-    searched = listed.generate_until(asked({**beams, "until": ["never said"]}))[0]
-    assert len(searched) > 3
-    for until in (["\n\n"], ["never said"], [searched[2]]):
-        request = asked({**beams, "until": until})
-        assert listed.generate_until(request) == listed_theirs.generate_until(request), until
-    assert len(listed.generate_until(asked({**beams, "until": [searched[2]]}))[0]) < len(searched)
-    for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
+    for refused in ({**sampled, "num_beams": 2}, {**beams, "until": ["\n\n"]}, {**greedy, "not_a_control": 1},
                     {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
         with pytest.raises(ValueError):
             ours.generate_until(asked(refused))

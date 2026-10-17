@@ -301,9 +301,10 @@ class DewLM(TemplateLM):
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
 
-        Under beam search the stop strings also end the search itself, as
-        `HFLM`'s stopping criteria do, so it ranks a hypothesis as it stopped;
-        that needs a tokenizer that lists its vocabulary.
+        A beam search ends at its EOS and budget; under stop strings beyond the
+        EOS's own text it raises ValueError, since `HFLM` ends every beam
+        together once its completion's text holds a stop, and no cut of
+        another search's answer reproduces that.
         A request's `max_length` is the total length `HFLM` hands `generate`,
         context included, in place of the budget. Its temperature is 0 where
         it names none, which decodes greedily unless the request asks to
@@ -327,11 +328,11 @@ class DewLM(TemplateLM):
             controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
             budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
             stops = handle_stop_sequences(controls.pop("until", None), eos=eos)
-            if int(controls.get("num_beams") or 1) > 1:
-                # A beam search ranks a hypothesis as it stopped, as HFLM's stopping criteria end it,
-                # so its stops end the search itself; a single draw's text is the same cut afterwards.
-                # The EOS's own text is the EOS id's, which ends the search already.
-                controls["stop_strings"] = [stop for stop in stops if stop and stop != eos]
+            if int(controls.get("num_beams") or 1) > 1 and any(stop and stop != eos for stop in stops):
+                raise ValueError(
+                    "a beam search under stop strings is refused: lm-eval's own model ends every beam "
+                    "together once its completion's text holds a stop, which a search that ranks "
+                    "each beam as it stopped, or a text cut afterwards, would answer differently")
             seed = int(controls.pop("seed", 0))
             total = controls.pop("max_length", None)
             # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
