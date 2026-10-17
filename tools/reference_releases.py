@@ -9,21 +9,36 @@ family a later transformers added, a release's remote code, diffusers' own
 Transformers 4 pipelines.
 """
 
+import re
+import tomllib
 from collections.abc import Mapping
 from importlib.metadata import version
+from pathlib import Path
+
+
+def tested(distribution: str) -> str:
+    """The release of `distribution` the reference suite pins in pyproject.toml's test extra, which
+    the locks and CI install: the release most fixtures are recorded against."""
+    extras = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    for requirement in extras["project"]["optional-dependencies"]["test"]:
+        pinned = re.fullmatch(rf"{re.escape(distribution)}==([^;\s]+)", requirement)
+        if pinned:
+            return pinned[1]
+    raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
+
 
 RELEASES: Mapping[str, Mapping[str, str]] = {
-    "transformers": {"transformers": "5.16.1"},
+    "transformers": {"transformers": tested("transformers")},
     # MiniMax-M2's rotary fix (transformers PR 48486) landed in 5.18.0.
     "minimax-m2": {"transformers": "5.18.0"},
     "qwen-image": {"transformers": "5.17.0", "torch": "2.14.0"},
     # Ouro's remote code imports names transformers 5 dropped.
     "ouro": {"transformers": "4.56.2"},
     "timm": {"timm": "1.0.29"},
-    "diffusers": {"diffusers": "0.34.0"},
+    "diffusers": {"diffusers": tested("diffusers")},
     # The pipelines diffusers 0.34.0 builds read transformers 4's text towers.
-    "diffusers-pipelines": {"diffusers": "0.34.0", "transformers": "4.49.0"},
-    "diffusers-limits": {"diffusers": "0.34.0", "mpmath": "1.3.0"},
+    "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
+    "diffusers-limits": {"diffusers": tested("diffusers"), "mpmath": "1.3.0"},
     "diffusers-0.40": {"diffusers": "0.40.0"},
     "rae": {"diffusers": "0.40.0", "transformers": "4.57.1"},
     "gptqmodel": {"gptqmodel": "7.5.0"},
@@ -31,7 +46,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "verl": {"verl": "0.9.0"},
 }
 """Each cohort's pins: the distribution and the public release of it, a local
-build label (`+cpu`) aside."""
+build label (`+cpu`) aside. The default cohorts' releases are the test extra's
+(`tested`), so the suite and its fixtures' writers pin one release; a cohort
+recorded against another names its own."""
 
 
 def require(*cohorts: str) -> dict[str, str]:

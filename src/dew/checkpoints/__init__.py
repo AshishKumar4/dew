@@ -1421,6 +1421,10 @@ class Checkpoints:
         # A snapshot before the first update holds the initial weights, with no
         # profile to fit.
         held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
+        # A step that made no update (accumulating a window, or rejected by a loss scaler) holds the
+        # averages of the step before it, whose identical rows would leave the solve singular: one
+        # snapshot an update count, the latest.
+        held = list({updates: (each, updates, stds) for each, updates, stds in held}.values())
         if not held or held[-1][0] != step:
             raise ValueError(f"the snapshot at step {step} was taken before the first update")
         weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
