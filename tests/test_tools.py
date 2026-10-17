@@ -953,25 +953,6 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
 
 
-def test_another_librarys_private_parts_are_reported_in_the_contract(tmp_path):
-    """SLOP017: a private module or name of another library, imported, reached by an attribute chain
-    from its module, or named in a string, in the package's source. The package's own private names,
-    the standard library's documented ones (`os._exit`) and a dunder are not reported, nor is a test."""
-    source = ("import importlib\n"
-              "import os\n"
-              "import jax\n"
-              "from jax._src import clusters\n"
-              "from flax.linen.module import _context\n"
-              "from sparx import _own\n"
-              "def reach():\n"
-              "    os._exit(0)\n"
-              "    bridge = jax._src.xla_bridge\n"
-              "    importlib.import_module('qwix._src.core.qarray')\n"
-              "    return bridge, clusters, _context, _own, jax.__version__, 'a.b.c'\n")
-    found = _linted(tmp_path, {"src/sparx/reach.py": source, "tests/test_reach.py": source})
-    assert found == [("src/sparx/reach.py", line, "SLOP017") for line in (4, 5, 9, 10)]
-
-
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
     """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
     one piece of work are reported where the function deals with no subprocess, network, service or

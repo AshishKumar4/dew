@@ -13,14 +13,13 @@ from dew.records import JSON
 class Vocabulary(Protocol):
     """The tokenizer surface `stop_strings` reads once, on the host.
 
-    These are a Transformers tokenizer's own public vocabulary methods plus
-    the piece-name lookup its slow and fast classes both expose. Nothing here
-    runs generation code; the tables are built from token strings.
+    These are a Transformers tokenizer's own public vocabulary methods.
+    Nothing here runs generation code; the tables are built from token strings.
     """
 
     def get_vocab(self) -> dict[str, int]: ...
     def convert_tokens_to_string(self, tokens: list[str]) -> str: ...
-    def _convert_id_to_token(self, index: int) -> str: ...
+    def convert_ids_to_tokens(self, ids: list[int], skip_special_tokens: bool = False) -> list[str]: ...
     def __call__(self, text: str, *, add_special_tokens: bool) -> Mapping[str, list[int]]: ...
 
 
@@ -139,8 +138,8 @@ def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
         from transformers.convert_slow_tokenizer import bytes_to_unicode
 
         alphabet = {char: byte for byte, char in bytes_to_unicode().items()}
-    base = [tokenizer._convert_id_to_token(token)
-            for token in tokenizer(prefix, add_special_tokens=False)["input_ids"]]
+    base = tokenizer.convert_ids_to_tokens(tokenizer(prefix, add_special_tokens=False)["input_ids"],
+                                           skip_special_tokens=False)
     pieces: list[str | bytes] = []
     ids: list[int] = []
     for token, index in tokenizer.get_vocab().items():

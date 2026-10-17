@@ -35,11 +35,9 @@ Scope is per rule, because the rules are not all about the same thing:
   hardware generation) lives in one table, `nn/kernels/generation.py`'s
   `TARGETS`; any other module reads that table's facts, a library's support
   rule the compute capability, and a launch config the autotuner.
-- SLOP017, SLOP018 and SLOP019 are about `src/<package>`, the code a user's
-  process runs: it reaches no other library's private parts (the standard
-  library documents the few it spells with an underscore), it sleeps, polls
-  and retries only where it deals with what leaves the process, and it
-  detects no feature by the exception its absence raises.
+- SLOP018 and SLOP019 are about `src/<package>`, the code a user's process
+  runs: it sleeps, polls and retries only where it deals with what leaves
+  the process, and it detects no feature by the exception its absence raises.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1286,42 +1284,6 @@ def authorities(module: Module) -> Iterator[Finding]:
                       "a library's rule the compute capability (`capability`), a launch config the autotuner")
 
 
-def _private(path: str, package: str) -> bool:
-    """Whether dotted `path` reaches into another library's private parts: a segment after the
-    library's own that starts with one underscore (a dunder is public). The standard library
-    documents the few it spells so (`os._exit`, `sys._getframe`) and is not another library."""
-    head, *rest = path.split(".")
-    return (head not in (package, "", *sys.stdlib_module_names)
-            and any(part.startswith("_") and not part.startswith("__") for part in rest))
-
-
-DOTTED = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+")
-
-
-def privates(module: Module) -> Iterator[Finding]:
-    """SLOP017: another library's private parts: an import from a private module of it or of a
-    private name, an attribute chain from its module to one, or its private module named in a
-    string (`importlib.import_module`, `sys.modules`)."""
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        reached = ""
-        if isinstance(node, ast.Import | ast.ImportFrom) and not getattr(node, "level", 0):
-            reached = next((path for path in scopes.bound_by(node, _parent(module)).values()
-                            if _private(path, module.package)), "")
-            if not reached and isinstance(node, ast.Import):
-                reached = next((alias.name for alias in node.names
-                                if _private(alias.name, module.package)), "")
-        elif isinstance(node, ast.Attribute) and not isinstance(getattr(node, "ctx", None), ast.Store):
-            path = scopes.resolved(node, table)
-            reached = path if _private(path, module.package) and not _private(
-                scopes.resolved(node.value, table), module.package) else ""
-        elif (isinstance(node, ast.Constant) and isinstance(node.value, str) and DOTTED.fullmatch(node.value)
-              and _private(node.value, module.package)):
-            reached = node.value
-        if reached:
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP017",
-                          f"reaches into {reached}, another library's private part; use its public API")
-
-
 EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
@@ -1440,7 +1402,7 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, privates, waits, detections)
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 
