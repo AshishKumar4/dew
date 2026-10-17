@@ -42,6 +42,7 @@ from dew.interop.generation_config import (
     eos_ids,
     generation_config_of,
     generation_limit,
+    masked_generation_config,
     pad_id,
     read_generation_config,
     return_sequences,
@@ -366,11 +367,12 @@ class Pretrained:
         model = model_config.build()
         kind = text(declaration['objective'], 'objective')
         variables = objectives[kind]._saved_variables(str(directory), step=step, ema=ema)
-        # The run's policy and budget, in the format the export's readers read.
+        # The run's task (its policy, budget, pad id and process), in the format the export's readers read.
         sampling = declaration.get('sampling')
         budget = declaration.get('max_new_tokens')
-        generation = None if not isinstance(sampling, dict) else generation_config_of(
-            Sampling(**sampling), budget if isinstance(budget, int) else None)
+        budget = budget if isinstance(budget, int) else None
+        pad = declaration.get('pad_token_id')
+        pad = pad if isinstance(pad, int) else None
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
         # A run over a source's own processor records its source, and the bundle writes its files.
@@ -379,19 +381,28 @@ class Pretrained:
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
+            masked = objectives[kind] is objectives['masked_diffusion']
+            generation = (masked_generation_config(budget, pad) if masked else
+                          None if not isinstance(sampling, dict) else
+                          generation_config_of(Sampling(**sampling), budget))
             bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                                           generation_config=generation), processor=processor)
-            if objectives[kind] is objectives['masked_diffusion']:
+            if masked:
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:
+            from dew.diffusion.block import BlockProcess
             from dew.interop import diffusion_gemma
             block = from_record(DiffusionGemma, model)
+            published = diffusion_gemma.published_config(block)
+            process = from_record(BlockProcess, record(declaration['process'], 'process'), dtypes=False)
+            generation = diffusion_gemma.generation_config_of(process, published, max_new_tokens=budget,
+                                                              pad_token_id=pad)
             bundle = PretrainedBlockDecoder(
-                block, variables, processor, diffusion_gemma.published_config(block), None,
-                model_config.fields, {}, export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
+                block, variables, processor, published, None, model_config.fields, generation,
+                export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
