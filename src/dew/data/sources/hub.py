@@ -10,6 +10,7 @@ from pathlib import Path
 import grain.python as grain
 import numpy as np
 
+from dew.cache import HubAnswer, hub_answer, recorded_hub_answer
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
@@ -38,28 +39,70 @@ class Hub(Dataset):
 
     @cached_property
     def commit(self) -> str:
-        from huggingface_hub import HfApi
-
-        commit = HfApi().dataset_info(self.repo, revision=self.revision).sha
-        if commit is None:
-            raise ValueError(f"HF {self.repo!r} did not resolve to a commit")
-        return commit
+        """The commit `revision` names, the default branch's where None, as the Hub last answered
+        (`dew.cache.hub_answer`): online its answer, recorded; offline (`HF_HUB_OFFLINE`) the
+        answer recorded online."""
+        return self._pinned.value
 
     @cached_property
+    def _pinned(self) -> HubAnswer[str]:
+        from huggingface_hub import HfApi
+
+        def ask() -> str:
+            commit = HfApi().dataset_info(self.repo, revision=self.revision).sha
+            if commit is None:
+                raise ValueError(f"HF {self.repo!r} did not resolve to a commit")
+            return commit
+
+        # A git revision is never named HEAD but the default branch is.
+        return hub_answer(("dataset commit", self.repo, self.revision or "HEAD"), ask)
+
+    @property
     def builder(self):
+        """`datasets`' builder of this split at `commit`. With the Hub offline, where `commit` is the
+        answer recorded online, `datasets` cannot rebuild a Hub dataset's builder, so it is
+        `datasets`' own builder of the cache it prepared the split in at that commit (`Cache`), at
+        the configuration and version the online builder recorded, and a split never prepared
+        raises."""
+        if self._builder is None:
+            raise FileNotFoundError(
+                f"{self.describe()} has no Arrow prepared in {self.cache_dir or 'the datasets cache'}, and "
+                "with the Hub offline (HF_HUB_OFFLINE) none can be: provision it online")
+        return self._builder
+
+    @cached_property
+    def _builder(self):
         try:
             from datasets import load_dataset_builder
         except ImportError as error:
             raise ImportError("HF Arrow reads need pip install 'dewml[streaming]'") from error
+        from datasets.naming import camelcase_to_snakecase
+        from datasets.packaged_modules.cache.cache import Cache
 
+        question = ("dataset builder", self.repo, self.commit, self.name or "", self.split)
+        if self._pinned.recorded:
+            # Never built online, so never prepared.
+            prepared = recorded_hub_answer(question)
+            if prepared is None:
+                return None
+            # Named as `datasets` names a Hub dataset's builder, which names the Arrow files.
+            built = Cache(cache_dir=self.cache_dir, repo_id=self.repo,
+                          dataset_name=camelcase_to_snakecase(self.repo.split("/")[-1]),
+                          config_name=prepared.value["configuration"], version=prepared.value["version"],
+                          hash=self.commit)
+            return built if Path(built.cache_dir, "dataset_info.json").is_file() else None
         pinned = {"name": self.name, "revision": self.commit, "cache_dir": self.cache_dir}
         whole = load_dataset_builder(self.repo, **pinned)
         # Only this split's own files, as the dataset's own configuration resolves
         # them: preparing the whole dataset would download every split to read one.
         splits = whole.config.data_files or {}
-        if len(splits) < 2 or self.split not in splits:
-            return whole
-        return load_dataset_builder(self.repo, **pinned, data_files={self.split: list(splits[self.split])})
+        built = whole if len(splits) < 2 or self.split not in splits else load_dataset_builder(
+            self.repo, **pinned, data_files={self.split: list(splits[self.split])})
+        # Where it prepares, `<owner>___<name>/<configuration>/<version>/<commit>`, which offline only
+        # this record names (`builder`).
+        configuration, version = Path(built.cache_dir).parts[-3:-1]
+        hub_answer(question, lambda: {"configuration": configuration, "version": version})
+        return built
 
     @property
     def streamed(self) -> str | None:
@@ -75,10 +118,14 @@ class Hub(Dataset):
         revision = self.commit
         paths, format = self._selected(revision)
         if not paths and self.revision is None:
-            converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
-            conversion = next(
-                (ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"), None
-            )
+
+            def converted() -> str | None:
+                converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
+                return next((ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"),
+                            None)
+
+            # The conversion of the default branch's commit, which the commit's answer pins.
+            conversion = hub_answer(("dataset conversion", self.repo, revision), converted).value
             if conversion is not None and conversion != revision:
                 revision = conversion
                 paths, format = self._selected(revision)
@@ -101,12 +148,52 @@ class Hub(Dataset):
             )
         revision, paths, format = selection
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in paths)
-        return Files(urls, format=format, columns=self.columns)
+        facts = self._facts(revision, paths, format)
+        return Files(urls, format=format, columns=self.columns, file_info=facts)
 
-    def _selected(self, revision: str) -> tuple[list[str], Format]:
+    def _facts(self, revision: str, paths: tuple[str, ...],
+               format: Format) -> Mapping[str, Mapping[str, object]]:
+        """Each shard's size, and the sha256 of its content where the Hub states one (an LFS
+        file's), else its git blob id, at `revision`, as the Hub last answered
+        (`dew.cache.hub_answer`), and so of each JSON lines shard's offset index the commit holds.
+        `Files` takes them as the files' own facts, so they keep their identity offline."""
+        from huggingface_hub import HfFileSystem
+
+        hub = HfFileSystem()
+
+        def stated(url: str) -> Mapping[str, object]:
+            facts = hub.info(url.removeprefix("hf://"))
+            stored = facts.get("lfs")
+            sha256 = stored.get("sha256") if isinstance(stored, Mapping) else None
+            return {"bytes": facts["size"], **({"sha256": sha256} if sha256 else {"ETag": facts["blob_id"]})}
+
+        root = f"hf://datasets/{self.repo}@{revision}/"
+        urls = [root + path for path in paths]
+        listed = set(self._listed(revision))
+        indexes = [index for index in (Files._index_url(url) for url in urls)
+                   if format == "jsonl" and index.removeprefix(root) in listed]
+        # A commit's files never change, so each answer stands for its file.
+        return {url: hub_answer(("dataset file", url), lambda url=url: stated(url)).value
+                for url in (*urls, *indexes)}
+
+    def _listed(self, revision: str) -> list[str]:
+        """Every file of the repo at `revision`, as the Hub last answered (`dew.cache.hub_answer`),
+        asked once per source: a commit's files never change, so its answer stands for it."""
         from huggingface_hub import HfApi
 
-        paths = HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
+        if revision not in self._listings:
+            self._listings[revision] = hub_answer(
+                ("dataset files", self.repo, revision),
+                lambda: HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision),
+            ).value
+        return self._listings[revision]
+
+    @cached_property
+    def _listings(self) -> dict[str, list[str]]:
+        return {}
+
+    def _selected(self, revision: str) -> tuple[list[str], Format]:
+        paths = self._listed(revision)
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
         # without reading it whole; such a split streams its Parquet conversion, or is prepared.
@@ -152,7 +239,7 @@ class Hub(Dataset):
     def supports(self, read: Read) -> bool:
         if read == "streamed":
             return self.streamed is not None
-        return Path(self.builder.cache_dir, "dataset_info.json").is_file()
+        return self._builder is not None and Path(self._builder.cache_dir, "dataset_info.json").is_file()
 
     def can_provision(self, read: Read) -> bool:
         return read != "streamed"

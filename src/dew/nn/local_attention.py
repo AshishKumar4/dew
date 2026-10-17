@@ -19,8 +19,8 @@ from .attention import (
     scaled_dot_product_attention,
     split_with_queries,
     tensor_shards,
-    with_documents,
 )
+from .documents import with_documents
 from .sharding import HEADS, KV_HEADS, SEQUENCE_AXIS, logical_spec, manual_map, rows_spec, sequence_shards
 
 

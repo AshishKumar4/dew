@@ -646,13 +646,35 @@ def _merged_call_counts(computation: _Computation,
 class StepFlops:
     """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
     once, and the `hardware`'s, every matmul the device runs. MFU is read off
-    the first and HFU off the second (PaLM's distinction)."""
+    the first and HFU off the second (PaLM's distinction). `unsized` counts
+    the kernel launches the step runs whose work neither holds: a Pallas
+    kernel lowers to a Triton call its HLO does not size (JAX's Triton
+    lowering drops the kernel's `CostEstimate`), so where any runs both are
+    lower bounds."""
 
     model: float
     hardware: float
+    unsized: float = 0.0
 
     def __add__(self, other: "StepFlops") -> "StepFlops":
-        return StepFlops(self.model + other.model, self.hardware + other.hardware)
+        return StepFlops(self.model + other.model, self.hardware + other.hardware,
+                         self.unsized + other.unsized)
+
+    def __rmul__(self, calls: int) -> "StepFlops":
+        """The FLOPs of `calls` such calls (a step split into microbatches)."""
+        return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
+
+    def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
+        """The interval's HLO utilizations of `steps` steps of `step_time` seconds each, of `peak`
+        (`model_flops_utilization`): train/hfu off `hardware` and train/hlo_flops_util off `model`,
+        both ending `_lower_bound` beside train/unsized_kernels, the launches a step, where any
+        launch's work went uncounted."""
+        bound = "_lower_bound" if self.unsized else ""
+        scalars = {f"train/{name}{bound}": utilization
+                   for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
+                   if (utilization := model_flops_utilization(counted / steps, step_time, peak))
+                   is not None}
+        return {**scalars, "train/unsized_kernels": self.unsized / steps} if bound else scalars
 
 
 NO_FLOPS = StepFlops(0.0, 0.0)
@@ -684,27 +706,41 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
 def hlo_flops(text: str) -> StepFlops | None:
     """Matmul and convolution FLOPs of one call of an optimized HLO module,
     parsed and weighted once: the forward a remat recomputes counted once in
-    `model` and each time it runs in `hardware`."""
+    `model` and each time it runs in `hardware`, beside the Triton launches it
+    runs, which neither counts (`StepFlops.unsized`)."""
     computations, entry = _parse(text)
     if entry is None:
         return None
     weights = _weights(computations, entry)
-    model = hardware = 0.0
+    model = hardware = unsized = 0.0
     for name, computation in computations.items():
+        if not weights[name]:
+            continue
         counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
                    for instruction in computation.instructions.values()]
+        launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
+        unsized += weights[name] * launches if launches else 0.0
         ran = sum(flops for flops, _ in counted)
-        if not ran or not weights[name]:
+        if not ran:
             continue
         hardware += weights[name] * ran
         model += weights[name] * sum(flops for flops, recomputed in counted if not recomputed)
-    return StepFlops(model, hardware) if math.isfinite(model) and math.isfinite(hardware) else None
+    totals = (model, hardware, unsized)
+    return StepFlops(*totals) if all(math.isfinite(total) for total in totals) else None
+
+
+def _unsized(instruction: _Instruction) -> bool:
+    """Whether `instruction` launches a kernel whose work the HLO does not size: a
+    Triton call, which a Pallas kernel lowers to."""
+    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
+    return target is not None and custom_call_kind(target.group(1)) == 'triton'
 
 
 def model_flops_utilization(
-    flops_per_step: float | None, step_time: float
+    flops_per_step: float | None, step_time: float, peak: float | None = None
 ) -> float | None:
-    """Fraction of one device's dense peak achieved by its executable.
+    """Fraction of one device's dense `peak` achieved by its executable, the
+    bf16 peak of device 0's kind by default.
 
     The optimized module is the program one device runs under SPMD, so its
     shapes are per-device and the denominator is one device's peak rather
@@ -712,7 +748,7 @@ def model_flops_utilization(
     """
     if not flops_per_step or step_time <= 0:
         return None
-    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak if peak is None else peak
     if peak is None:
         return None
     return flops_per_step / step_time / peak

@@ -226,6 +226,8 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
+                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
@@ -1101,7 +1103,7 @@ class Trainer(Generic[Loss, Effects]):
             self.program = candidate.program
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
-            self.step_flops = flops and StepFlops(split * flops.model, split * flops.hardware)
+            self.step_flops = flops and split * flops
             self.memory = memory_record(self.executable, self._local_devices(), candidate.held, fits=True)
             self.links = links
         return self._runner(planned, mesh)
@@ -2423,7 +2425,8 @@ class Trainer(Generic[Loss, Effects]):
         over the whole mesh's peak: 3*forward for full FT, explicit frozen/
         trainable matrix work for PEFT. train/hfu keeps hardware HLO
         work including remat; train/hlo_flops_util is the former HLO model
-        count with recomputation removed. No HLO count substitutes for MFU.
+        count with recomputation removed (`StepFlops.utilizations`). No HLO
+        count substitutes for MFU.
 
         `compiling` is the seconds the interval spent compiling the step for
         shapes it met for the first time (a bucket length, a ramp's stage).
@@ -2454,9 +2457,4 @@ class Trainer(Generic[Loss, Effects]):
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
                 scalars["train/mfu"] = utilization
-        for name, counted in (("hlo_flops_util", None if flops is None else flops.model),
-                              ("hfu", None if flops is None else flops.hardware)):
-            utilization = None if counted is None else model_flops_utilization(counted / steps, step_time)
-            if utilization is not None:
-                scalars[f"train/{name}"] = utilization
-        return scalars
+        return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}

@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
+from hub_support import stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -62,6 +63,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     with pytest.raises(FileNotFoundError):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
@@ -98,8 +100,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
 
     def header(self, path, **kwargs):
         payload = payloads[path]
-        return {"name": path, "type": "file", "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payload), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}}
 
     def refs(self, repo, *, repo_type):
         conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
@@ -152,8 +154,8 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
     }
 
     def header(self, path, **kwargs):
-        return {"name": path, "type": "file", "size": len(payloads[path]),
-                "sha256": hashlib.sha256(payloads[path]).hexdigest()}
+        return {"name": path, "type": "file", "size": len(payloads[path]), "blob_id": "blob",
+                "lfs": {"sha256": hashlib.sha256(payloads[path]).hexdigest(), "size": len(payloads[path])}}
 
     def listing(self, repo, *, repo_type, revision):
         return (["default/train/0000.parquet"] if revision == "converted"
@@ -329,6 +331,7 @@ def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
         HfApi, "dataset_info", lambda self, repo, revision=None: SimpleNamespace(sha=revision)
     )
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: [f"train.{format}"])
+    stated_shards(monkeypatch)
     native = Hub("owner/data", revision="pinned").files
     assert native.url == (f"hf://datasets/owner/data@pinned/train.{format}",)
     assert native.format == format
@@ -356,6 +359,7 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    stated_shards(monkeypatch)
     source = Hub("owner/data", revision=revision)
     commit = "original" if native else "converted"
     assert source.supports("streamed")
@@ -960,6 +964,90 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
     stored = Files(str(destination)).records("indexed")
     assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
 
+
+
+def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
+    """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
+    the rows of the commit each source pins: the commit is the answer the Hub gave online
+    (`dew.cache.hub_answer`), the default branch's the last given, and the Arrow is the cache
+    `datasets` prepared at that commit, which `datasets` itself does not find offline."""
+    import datasets
+    from hub_support import native_hub, offline
+
+    from dew.data import Hub
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    first, second = "0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"
+    cache = str(tmp_path / "cache")
+
+    def read(revision=None):
+        pipeline = Pipeline(Hub("acme/records", revision=revision, cache_dir=cache)).batch(4)
+        reader = compile(pipeline, read="indexed", loading=Loading(workers=0), provision=True).train(
+            DataPartition())
+        try:
+            return sorted(int(value) for _ in range(4) for value in next(reader)["id"])
+        finally:
+            reader.close()
+
+    for commit, start in ((first, 0), (second, 100)):
+        rows = datasets.Dataset.from_dict({"id": list(range(start, start + 16))})
+        with pytest.MonkeyPatch.context() as online:
+            native_hub(online, tmp_path / commit, "acme/records", {"train": rows}, commit)
+            assert read(commit) == list(range(start, start + 16))
+            assert read() == list(range(start, start + 16))
+    offline(monkeypatch)
+    assert read(first) == list(range(16))
+    assert read() == list(range(100, 116))
+    assert Hub("acme/records", cache_dir=cache).commit == second
+
+
+def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub_conversion, monkeypatch):
+    """A Hub split's streamed shards keep the identity a compiled cache is keyed by with the Hub
+    offline: the commit, the commit's files, its conversion and each shard's facts are the Hub's
+    answers, recorded online. A repo never answered online raises the offline error."""
+    from hub_support import offline
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew.data.sources import Hub
+
+    answered = Hub("owner/data").files
+    identity = answered.fingerprint()
+    offline(monkeypatch)
+    recorded = Hub("owner/data").files
+    assert recorded.url == answered.url
+    assert recorded.fingerprint() == identity
+    with pytest.raises(OfflineModeIsEnabled):
+        assert Hub("owner/elsewhere").commit
+
+
+def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
+    """A Hub split's JSON lines shard and the offset index its commit holds beside it keep, with the
+    Hub offline, the identity they had online, the index's facts among the shard's: an index the
+    offline Hub cannot confirm is not dropped from it."""
+    from types import SimpleNamespace
+
+    from hub_support import offline
+    from huggingface_hub import HfApi, HfFileSystem
+
+    from dew.data.sources import Hub
+
+    names = {"train.jsonl": 400, "train.index.npy": 96}
+    stated = {}
+    for index, (name, size) in enumerate(names.items()):
+        path = f"datasets/owner/lines@pinned/{name}"
+        stated[path] = {"name": path, "type": "file", "size": size, "blob_id": f"blob:{name}",
+                        "lfs": {"sha256": f"{index:064x}", "size": size}}
+    monkeypatch.setattr(HfApi, "dataset_info",
+                        lambda self, repo, revision=None: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: list(names))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **kwargs: stated[path])
+    identity = Hub("owner/lines", revision="pinned").files.fingerprint()
+    assert [facts["bytes"] for facts in identity["files"]] == [400, 96]
+    offline(monkeypatch)
+    # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")

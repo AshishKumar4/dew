@@ -34,11 +34,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, through
+from delta_rule_support import CHUNKED, port_formula, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
 
+from dew.nn import linear
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
@@ -143,13 +144,13 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
 @pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
 @pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
 def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
-    """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens
-    before a chunk's end and one spanning chunks: each document's output, the final memory and every
-    gradient as near the float64 recurrence run document by document as the chunked rule run on each
-    document alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from
-    the row's memory and every other from zero, for a decay per head (the gated delta net) and per key
-    dimension (Kimi's delta attention). At a strong decay (-4 a token) the chunk's earlier document
-    sits 96 below its last one's, past exp's fp32 range."""
+    """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens before a
+    chunk's end and one spanning chunks: each document's output, the final memory and every gradient
+    as near the float64 recurrence run document by document as the chunked rule run on each document
+    alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from the row's
+    memory and every other from zero, for a decay per head (the gated delta net) and per key dimension
+    (Kimi's delta attention), each sized by the packed rule's float64 terms. At a strong decay (-4 a
+    token) the chunk's earlier document sits 96 below its last one's, past exp's fp32 range."""
     batch, length, heads, width, chunk = 1, 160, 2, 8, 32
     begins = (0, 32, 60, 110)
     starts = np.zeros((batch, length), bool)
@@ -178,9 +179,62 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
         operands = widened((q, k, v, g, beta, h0, do, dht))
         want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
         want = widened(want)
-    assert_leaves_as_exact(got, reference, want, reductions=chunk)
+        _, terms = float64_terms(through(packed, *operands[6:]), *operands[:6])
+    assert_leaves_as_exact(got, reference, want, reductions=chunk, terms=terms)
     for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
         assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
+
+
+@pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
+@pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
+def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key):
+    """The port's output at each packed token and its gradients of the token's query, key and decay
+    (`linear.fla_rule`, a row of
+    documents as one sequence, each document's first token forgetting the memory by `linear.FORGET`)
+    as near the float64 recurrence run document by document as the port's formula in the portable
+    math (`port_formula`) on the same row, its every range two plain fp32 base-2 prefixes apart as
+    the port's: no token's gradient carries another document's. Per token, these hold what the
+    per-head decay parameters only sum: their gradients, `A_log`'s and `dt_bias`'s over a layer's few
+    heads, are two draws of sums of every token's prefix rounding, which a model's packed tests do
+    not hold (test_decision_packing, test_mixers). Documents of 40, 60, 1, 49, 40, 10 and 56
+    tokens, one of a single token and resets two apart in a chunk."""
+    batch, length, heads, width = 1, 256, 2, 64
+    begins = (0, 40, 100, 101, 150, 190, 200)
+    starts = np.zeros((batch, length), bool)
+    starts[0, list(begins[1:])] = True
+    keys = jax.random.split(jax.random.key(29), 6)
+    q = 0.3 * jax.random.normal(keys[0], (batch, length, heads, width))
+    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
+    v = jax.random.normal(keys[2], (batch, length, heads, width))
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (batch, length, heads, *(width,) * per_key)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    do = jax.random.normal(keys[5], v.shape)
+
+    def taken(rule):
+        def run(q, k, g):
+            def loss(q, k, g):
+                out = rule(q, k, v.astype(q.dtype), g, beta.astype(q.dtype))[0]
+                return jnp.sum(out * do.astype(q.dtype)), out
+            (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(q, k, g)
+            return {"out": out, **dict(zip(("q", "k", "g"), grads, strict=True))}
+        return run
+
+    def packed(rule):
+        return lambda *args: rule(*args, None, starts=jnp.asarray(starts))
+
+    def alone(q, k, v, g, beta):
+        decay = g if per_key else g[..., None]
+        out, _ = recurrence(q, k, v, decay, beta, jnp.zeros((batch, heads, width, width), q.dtype),
+                            cuts=(begins,))
+        return out, None
+
+    got = jax.jit(taken(packed(linear.fla_rule)))(q, k, g)
+    formula = jax.jit(taken(packed(port_formula)))(q, k, g)
+    with jax.enable_x64(new_val=True):
+        wide = widened((q, k, g))
+        want = widened(taken(alone)(*wide))
+        _, terms = float64_terms(taken(packed(port_formula)), *wide)
+    assert_leaves_as_exact(got, formula, want, reductions=CHUNKED, terms=terms)
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():

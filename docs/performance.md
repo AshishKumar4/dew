@@ -65,7 +65,11 @@ over the training mesh; the compiler's FLOPs remain per-device.
 `train/hfu` is still HLO hardware FLOPs utilization, including rematerialized work.
 The former HLO model count, with a recomputed forward counted once, is now
 `train/hlo_flops_util`; it is not MFU. Both HLO metrics keep their own compiler
-availability checks, independently of the analytical model count.
+availability checks, independently of the analytical model count. A Pallas kernel
+lowers to a Triton call whose work the HLO does not state (JAX's Triton lowering
+drops the kernel's `CostEstimate`), so a step that runs one reports both as
+`train/hfu_lower_bound` and `train/hlo_flops_util_lower_bound`, beside
+`train/unsized_kernels`, the launches a step that neither counts.
 
 MFU previously used the HLO model count. It now uses analytical real-token
 model work: old `train/mfu` and new `train/mfu` values are not directly comparable.
