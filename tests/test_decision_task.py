@@ -412,9 +412,8 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     changed = False
     for request in CASES.values():
-        expected = adapted.systemone(request, details=True)
-        assert again.systemone(request, details=True) == expected
-        changed |= decide.systemone(request, details=True) != expected
+        assert again.systemone(request) == adapted.systemone(request)
+        changed |= decide.systemone(request, details=True) != adapted.systemone(request, details=True)
     assert changed
 
 

@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -34,7 +34,6 @@ from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
 
-@runtime_checkable
 class TokenizerSpecials(Protocol):
     """What `Specials.of` reads off a tokenizer, as a transformers tokenizer
     holds it: its special tokens' ids, each None where it has none, and an id's
@@ -54,6 +53,11 @@ class TokenizerSpecials(Protocol):
     def pad_token_id(self) -> int | None: ...
 
     def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
+
+
+_SPECIAL_IDS = ("cls_token_id", "sep_token_id", "eos_token_id", "bos_token_id", "mask_token_id",
+                "pad_token_id")
+"""The special-token ids `TokenizerSpecials` declares."""
 
 
 class _Same:
@@ -111,7 +115,8 @@ class Specials:
         end token) as the marker, and its padding token or else its end token.
         """
         hf = tokenizer.tokenizer if isinstance(tokenizer, HFTokenizer) else tokenizer
-        if not isinstance(hf, TokenizerSpecials):
+        # Read, not looked up statically: a transformers tokenizer answers these through `__getattr__`.
+        if not all(hasattr(hf, name) for name in (*_SPECIAL_IDS, "convert_ids_to_tokens")):
             raise ValueError(f"Specials.of reads a tokenizer's special tokens, which this "
                              f"{type(hf).__name__} does not hold; give its Specials explicitly")
 
