@@ -186,7 +186,9 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     `generate` would not use, and sampling at temperature 0, which
     `generate` refuses, raise instead of drawing."""
     ours, theirs = _pair(64)
-    greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8}
+    # Only printable ids are drawn, so no answer is cut at the EOS's replacement-character text.
+    greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8,
+              "suppress_tokens": [*range(0, 32), *range(127, 256)]}
     sampled = {**greedy, "do_sample": True, "temperature": 1.0, "top_k": 1}
     beams = {**greedy, "num_beams": 3, "length_penalty": 0.5}
 
@@ -197,12 +199,12 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     answer = ours.generate_until(asked(sampled))
     assert answer == theirs.generate_until(asked(sampled))
     assert answer == ours.generate_until(asked(greedy))
-    # The weights end this greedy draw on their EOS at once; a request's own EOS lets it run on.
-    unstopped = {**greedy, "until": ["never said"], "eos_token_id": 254}
-    assert ours.generate_until(asked(greedy)) == [""]
-    assert ours.generate_until(asked(unstopped)) != [""]
-    for controls in (beams, {**greedy, "max_length": context + 2}, unstopped,
-                     {**greedy, "temperature": 0.0}):
+    # A request's own EOS, the greedy answer's second id, ends that answer early.
+    assert len(answer[0]) > 2
+    eos = ours.tok_encode(answer[0][1], add_special_tokens=False)[0]
+    ended = {**greedy, "eos_token_id": eos}
+    assert ours.generate_until(asked(ended)) != answer
+    for controls in (beams, {**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
     for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
                     {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
