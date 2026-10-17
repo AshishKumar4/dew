@@ -47,7 +47,8 @@ def tiny_decoder(**options):
     """The native decoder at test size: two layers of 16 features in float32,
     attention through XLA so the CPU runs the same kernel everywhere."""
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                             mlp_features=32, max_seq_len=64, dtype="float32", attention_impl="xla", **options)
+                             mlp_features=32, max_seq_len=64, dtype="float32", attention_impl="xla",
+                             **options)
 
 
 def make_objective(seq=SEQ, model=None, **kwargs):
