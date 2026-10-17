@@ -72,6 +72,8 @@ def main(config: Config):
             sampling=Sampling(temperature=0.8, top_k=40),
             decode=tokenizer.decode,
         ),
+        # Recorded with the run, so what loads it (examples/evaluate_and_serve.py) reads text.
+        processor=RunProcessor(tokenizer),
     )
 
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
@@ -80,7 +82,7 @@ def main(config: Config):
 
     # No reload is needed; the weights stay where the trainer placed them, and
     # the tokenizer decodes the rows.
-    task = objective.pipeline(state, processor=RunProcessor(tokenizer))
+    task = objective.pipeline(state)
     text = config.prompt + task(config.prompt, key=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)
