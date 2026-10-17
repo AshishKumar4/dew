@@ -448,7 +448,20 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading) -> Ro
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs)
     parent = _as_iter(rows, loading)
-    return gx.RepeatIterDataset(parent if epochs is not None else _Passes(parent, name), epochs)
+    return gx.RepeatIterDataset(parent, epochs) if epochs is not None else _Endless(parent, name)
+
+
+class _Endless(pygrain.IterDataset):
+    """Grain's endless repeat of `parent`, refusing a pass that yields no row. It is one node of the
+    dataset tree, as the repeat is, so a random step after it draws as it would after the repeat
+    (Grain seeds a step by its depth below the nearest seeded dataset)."""
+
+    def __init__(self, parent: pygrain.IterDataset, name: str):
+        super().__init__(parent)
+        self._rows, self._name = parent, name
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return gx.RepeatIterDataset(_Passes(self._rows, self._name), None).__iter__()
 
 
 class _Passes(pygrain.IterDataset):

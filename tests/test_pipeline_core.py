@@ -1344,12 +1344,15 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read):
+@pytest.mark.parametrize("batched", ["before", "after"])
+def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read, batched):
     """A position saved just as a pass of an endless repeat ends restores to that end, and the
     read goes on into the next pass as the uninterrupted one does, rather than taking the
-    restored end for a pass that read nothing."""
-    data = compile(Pipeline(Memory([{"id": np.int32(index)} for index in range(2)])).repeat().batch(2),
-                   read=read, loading=READ)
+    restored end for a pass that read nothing; a repeat after the batch reads its passes as a
+    stream in every read."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(2)]))
+    data = compile(rows.repeat().batch(2) if batched == "before" else rows.batch(2).repeat(), read=read,
+                   loading=READ)
 
     def ids(stream, count: int) -> list[int]:
         return [int(value) for batch in itertools.islice(stream, count) for value in batch["id"]]
@@ -1371,3 +1374,19 @@ def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read):
         assert head + ids(resumed, 2) == expected
     finally:
         resumed.close()
+
+
+def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
+    """A streamed repeat read endlessly guards its passes without changing what a random step
+    after it draws: the passes a finite repeat reads draw the same values."""
+    rows = Pipeline(source(2)).take(2)
+
+    def draws(chain) -> list[int]:
+        data = compile(chain.random_map(Draw()).batch(2), read="streamed", loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            return [int(value) for batch in itertools.islice(stream, 2) for value in batch["draw"]]
+        finally:
+            stream.close()
+
+    assert draws(rows.repeat()) == draws(rows.repeat(2))

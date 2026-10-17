@@ -173,21 +173,11 @@ class Chunked(pygrain.IterDataset[Record]):
 
 
 class _AcceptedIterator(_CountedIterator[Batch]):
-    _read: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch]
+    _read: pygrain.DatasetIterator[Batch]
 
-    def __init__(
-        self,
-        parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
-        predicate: _KeepAccepted,
-    ):
+    def __init__(self, parent: pygrain.DatasetIterator[Batch], predicate: _KeepAccepted):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
-
-    def __next__(self) -> Batch:
-        while True:
-            value = next(self._read)
-            if self._predicate(value):
-                return value
 
     def get_state(self) -> Mapping[str, object]:
         return {
@@ -203,8 +193,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """The records its parent accepts, as Grain's filter keeps them, with a named search budget and
-    checkpointed counts; its position is its parent's, as the filter's is."""
+    """Grain's filter, with a named search budget and checkpointed counts."""
 
     def __init__(
         self,
@@ -219,7 +208,7 @@ class Accepted(pygrain.IterDataset[Batch]):
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         predicate = _KeepAccepted(CorpusCounts(self._name), self._budget, self._tokens)
-        return _AcceptedIterator(iter(self._records), predicate)
+        return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 
 def token_weights(
