@@ -473,10 +473,10 @@ class _Branch:
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
         root = self.root
-        if context.method_name == "stochastic_input":
-            # A layer asks whether its submodule's input is drawn on this
-            # call (`MultiHeadLatentAttention.stochastic_input`): the
-            # branch's dropout is, on a target under a dropout stream.
+        if context.method_name == "nonlinear_input":
+            # A layer asks whether its submodule is linear in its input on
+            # this call (`MultiHeadLatentAttention.nonlinear_input`): the
+            # branch's dropout draws on it, on a target under a dropout stream.
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
