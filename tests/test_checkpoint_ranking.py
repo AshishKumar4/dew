@@ -401,7 +401,7 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     control = {'plateau:val/value': {'best': .2, 'bad': 1, 'step': 2,
                                     'rule': {'mode': 'min', 'evals': 3, 'min_delta': 0.}}}
     checkpoints = Checkpoints(path, local_directory=local, local_every=1)
-    checkpoints.save_local(2, state, position, control=control)
+    checkpoints.save_local(2, state, position, share=DataPartition(), control=control)
     checkpoints.wait()
     resumed = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
                        checkpoints=Checkpoints(path, local_directory=local, local_every=1))
