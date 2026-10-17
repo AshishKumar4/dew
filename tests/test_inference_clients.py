@@ -128,6 +128,19 @@ def test_a_policys_penalties_reach_the_wire_where_they_mean_the_same_and_refuse_
 
 
 @pytest.mark.parametrize("kind", ["ollama", "openai"])
+def test_a_policys_pad_id_is_local_and_sends_the_same_request(clients, kind):
+    """A remote completion comes back unpadded, so a policy's pad id only shapes Dew's own padded
+    rows: a policy naming the model's pad id sends exactly the request the same policy without it
+    does."""
+    reply = ((lambda http, request, body: http.Response(200, json={"response": "ok"})) if kind == "ollama"
+             else (lambda http, request, body: http.Response(200, json=response([choice(0, "ok")]))))
+    task, calls = clients(kind, reply)
+    task("prompt", 5, sampling=Sampling(temperature=0.5), key=3)
+    task("prompt", 5, sampling=Sampling(temperature=0.5, pad_token_id=7), key=3)
+    assert calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("kind", ["ollama", "openai"])
 def test_integer_and_jax_keys_reach_the_same_native_wire_seed(clients, kind):
     import jax
 
