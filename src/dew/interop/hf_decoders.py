@@ -498,7 +498,7 @@ def read_wrapper(
     model's leaves unread; the towers and projectors are small and read
     whole.
     """
-    sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
+    sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
     language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
@@ -520,9 +520,24 @@ def read_wrapper(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
         variables["audio_projector"] = {"params": audio_projector}
         placed["audio_projector"] = nested(audio_layouts, 0, "params")
-    # Each component's collections hold it under its own name in the wrapper's.
-    media = tuple(dataclasses.replace(layout, name=sources[group][layout.name])
-                  for group, layouts in placed.items() for layout in nested(layouts, 1, group))
+    # Each component's collections hold it under its own name in the wrapper's, and every
+    # spelling the source stores of one tensor (`_wrapper_sources` checked them equal) writes
+    # from its one leaf.
+    spellings: dict[str, set[str]] = {}
+    for earlier, later in aliases:
+        spellings.setdefault(later, set()).add(earlier)
+
+    def spelled(name: str) -> list[str]:
+        found, pending = {name}, [name]
+        while pending:
+            fresh = spellings.get(pending.pop(), set()) - found
+            found.update(fresh)
+            pending.extend(fresh)
+        return sorted(found)
+
+    media = tuple(dataclasses.replace(layout, name=name)
+                  for group, layouts in placed.items() for layout in nested(layouts, 1, group)
+                  for name in spelled(sources[group][layout.name]))
     return variables, readings, media
 
 

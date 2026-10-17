@@ -245,9 +245,12 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
         "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
     (source / "config.json").write_text(json.dumps(config))
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
+    from dew.interop import PretrainedDecoder
+
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     expected = np.asarray(loaded.model.apply(loaded.variables, ids))
-    loaded.save(tmp_path / "export")
+    # The native writer, which spells the config from the model, not the source's own file.
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), expected)
     reference = Olmo3ForCausalLM.from_pretrained(tmp_path / "export", torch_dtype=torch.float32).eval()

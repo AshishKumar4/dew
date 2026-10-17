@@ -45,11 +45,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = ("published", "variant")
 
 
-def placed(key: str, rank: int) -> tuple[str, ...]:
-    """Where `wan_path` places a tensor, whatever its rank."""
-    return wan_path(key)
-
-
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/wan_transformer.tar.xz",
@@ -69,7 +64,7 @@ def channels_last(value):
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = WanTransformer(**wan_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(source / name, "transformer"), placed)
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), wan_path)
     return model, params, layouts
 
 
@@ -131,7 +126,7 @@ def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(source, arrays, name
     in bfloat16 land ten to twenty times further."""
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = WanTransformer(**wan_fields(config, dtype="bfloat16", attention_impl="xla"))
-    params, _ = read_transformer(component_tensors(source / name, "transformer"), placed)
+    params, _ = read_transformer(component_tensors(source / name, "transformer"), wan_path)
     latents = jnp.asarray(channels_last(arrays[f"{name}.latents"]), jnp.bfloat16)
     context = DenoisingCondition(jnp.asarray(arrays[f"{name}.context"], jnp.bfloat16))
     flow = model.apply({"params": params}, latents, jnp.asarray(arrays[f"{name}.times"]), context)
@@ -158,7 +153,7 @@ def pipeline(walk):
 @pytest.fixture(scope="module")
 def streamed(walk):
     """The pipeline loaded onto a mesh, its weights streamed as recipes and
-    placed a leaf at a time (tests/test_pipeline_streaming.py)."""
+    wan_path a leaf at a time (tests/test_pipeline_streaming.py)."""
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 

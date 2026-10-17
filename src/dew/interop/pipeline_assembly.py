@@ -550,7 +550,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-    weights = _transformer_weights(directory, lambda name, rank: diffusion.flux_path(name))
+    weights = _transformer_weights(directory, diffusion.flux_path)
     return _transformer_denoiser(
         "flux_transformer", model, fields, config, dtype, weights,
         _TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
@@ -572,7 +572,7 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     model = fields.value
     return _transformer_denoiser(
         "qwen_image_transformer", model, fields, config, dtype,
-        _transformer_weights(directory, lambda name, rank: diffusion.qwen_image_path(name)), _QwenImageText(),
+        _transformer_weights(directory, diffusion.qwen_image_path), _QwenImageText(),
         patch=1, latent_input=model.in_channels, sample_size=(64, 64),
         context_width=model.context_in_dim, pipeline="QwenImage21Pipeline", origin="linspace")
 
@@ -589,7 +589,7 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
     guided = model.guidance_embeds
-    weights = _transformer_weights(directory, lambda name, rank: diffusion.flux2_path(name))
+    weights = _transformer_weights(directory, diffusion.flux2_path)
     return _transformer_denoiser(
         "flux2_transformer", model, fields, config, dtype, weights,
         _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
@@ -624,7 +624,7 @@ def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
 
     fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-    weights = _transformer_weights(directory, lambda name, rank: diffusion.wan_path(name))
+    weights = _transformer_weights(directory, diffusion.wan_path)
     return _transformer_denoiser(
         "wan_transformer", model, fields, config, dtype, weights,
         _WanText(), patch=model.patch_size[-1], latent_input=model.in_channels, sample_size=(60, 104),

@@ -108,13 +108,61 @@ def test_a_checkpoint_of_one_modelopt_algorithm_loads_as_that_algorithms_layers_
                                       np.asarray(mixed.model.apply(mixed.variables, ids)))
 
 
-@pytest.mark.parametrize('experts', ['num_experts', 'num_local_experts', 'n_routed_experts'])
-def test_a_modelopt_nvfp4_description_of_a_model_with_experts_is_read_by_its_stored_layers(experts):
-    """ModelOpt may leave a model's experts dense and quantize its projections; the quantized
-    layers are those whose scales are stored, so a uniform NVFP4 description of a model with
-    experts reads as one, and only an expert stack's input quantizers are refused, where the
-    weights bind."""
-    config = {'model_type': 'qwen3_moe', experts: 8,
-              'quantization_config': {'quant_method': 'modelopt', 'quant_algo': 'NVFP4', 'group_size': 16}}
-    assert codecs.source_quantization(config) is not None
+def nvfp4(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
+    """`weight` as ModelOpt's NVFP4 exporter stores it: E2M1 codes under one E4M3 scale per 16
+    inputs and one float32 global scale, beside the static input multiplier it calibrated."""
+    import ml_dtypes
 
+    stem = name.removesuffix('.weight')
+    overall = np.float32(np.abs(weight).max() / (6 * 448))
+    blocks = np.abs(weight).reshape(weight.shape[0], -1, 16).max(-1) / (6 * overall)
+    grid = {stem + '.weight_scale': blocks.astype(ml_dtypes.float8_e4m3fn),
+            stem + '.weight_scale_2': np.asarray(overall, np.float32),
+            stem + '.input_scale': np.asarray(0.05, np.float32),
+            name: np.zeros((weight.shape[0], weight.shape[1] // 2), np.uint8)}
+    quantization = {'quant_method': 'modelopt', 'quant_algo': 'NVFP4', 'group_size': 16}
+    codec = codecs.source_quantization({'quantization_config': quantization}, grid=grid)
+    assert codec is not None
+    return codec.encode(name, weight)
+
+
+@pytest.mark.parametrize('quantized', ['attention', 'experts'])
+def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_path, quantized):
+    """ModelOpt may quantize a model's attention and leave its experts dense: written as one
+    algorithm, it loads and computes, input quantizers and all, what the same layers listed
+    in a MIXED_PRECISION table compute. Quantized experts are refused either way, since an
+    expert stack's input quantizers are computed by no provider here."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    source = FIXTURE.parents[2] / 'hf' / 'qwen3-moe-tiny'
+    stored, config = read_weights(source), json.loads((source / 'config.json').read_text())
+    marker = '.self_attn.' if quantized == 'attention' else '.mlp.experts.0.'
+    tensors, layers = dict(stored), {}
+    for name, weight in stored.items():
+        if marker in name and name.endswith('_proj.weight'):
+            tensors.update(nvfp4(name, np.asarray(weight, np.float32)))
+            layers[name.removesuffix('.weight')] = {'quant_algo': 'NVFP4', 'group_size': 16}
+    producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
+
+    def written(directory, quantization):
+        quantization = {**quantization, 'kv_cache_quant_algo': None}
+        save_hf_layout(tensors, {**config, 'quantization_config': {
+            **quantization, 'producer': producer, 'quant_method': 'modelopt'}}, directory)
+        (directory / 'hf_quant_config.json').write_text(json.dumps({'producer': producer,
+                                                                   'quantization': quantization}))
+        return directory
+
+    uniform = written(tmp_path / 'uniform', {'quant_algo': 'NVFP4', 'group_size': 16})
+    mixed = written(tmp_path / 'mixed', {'quant_algo': 'MIXED_PRECISION', 'quantized_layers': layers})
+    load = {'dtype': 'float32', 'attention_impl': 'reference'}
+    if quantized == 'experts':
+        for directory in (uniform, mixed):
+            with pytest.raises(ValueError):
+                Pretrained.load(directory, **load)
+        return
+    ids = np.load(source / 'input_ids.npy')
+    single, table = Pretrained.load(uniform, **load), Pretrained.load(mixed, **load)
+    logits = np.asarray(single.model.apply(single.variables, ids))
+    np.testing.assert_array_equal(logits, np.asarray(table.model.apply(table.variables, ids)))
+    dense = Pretrained.load(source, **load)
+    assert np.abs(logits - np.asarray(dense.model.apply(dense.variables, ids))).max() > 0

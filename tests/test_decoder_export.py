@@ -1023,7 +1023,7 @@ def glm5_native_export_case(variant):
     ("gemma4-native-tiny", {"v_norm": False}),
     ("gemma4-native-tiny", {"qk_norm_scope": "full"}),
     ("gemma4-native-tiny", {"embedding_scale": False}),
-    ("gemma4-moe-tiny", {"mixture.score_function": "sigmoid"}),
+    ("gemma4-moe-tiny", {"mixture.capacity_factor": 1.25}),
     ("glm5-next-tiny", {"sandwich_norms": True}),
     ("glm5-next-tiny", {"mlp": "geglu"}),
     ("glm5-next-tiny", {"mixture.bias": False}),

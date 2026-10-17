@@ -483,7 +483,7 @@ _FLUX2_EMBEDDERS = {
 }
 
 
-def flux2_path(name: str) -> tuple[str, ...]:
+def flux2_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `Flux2Transformer` path for a published FLUX.2 tensor name."""
     parts = name.split(".")
     leaf, stem = parts[-1], ".".join(parts[:-1])
@@ -561,7 +561,7 @@ _Z_IMAGE_BLOCK = {
 }
 
 
-def z_image_path(name: str, ndim: int) -> tuple[str, ...]:
+def z_image_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `ZImageTransformer` path for a published Z-Image tensor
     name; a one-axis weight is a norm's scale."""
     if name in ("x_pad_token", "cap_pad_token"):
@@ -570,7 +570,7 @@ def z_image_path(name: str, ndim: int) -> tuple[str, ...]:
         return ("cap_norm", "scale")
     stem, _, leaf = name.rpartition(".")
     if leaf == "weight":
-        leaf = "kernel" if ndim == 2 else "scale"
+        leaf = "kernel" if rank == 2 else "scale"
     elif leaf != "bias":
         raise ValueError(f"unknown tensor name {name!r}")
     if stem in _Z_IMAGE_MODULES:
@@ -634,7 +634,7 @@ _WAN_MODULES = {
 }
 
 
-def wan_path(name: str) -> tuple[str, ...]:
+def wan_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `WanTransformer` path for a published Wan tensor name."""
     parts = name.split(".")
     if name == "scale_shift_table":
@@ -669,7 +669,7 @@ _FLUX_EMBEDDERS = {
 }
 
 
-def flux_path(name: str) -> tuple[str, ...]:
+def flux_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `FluxTransformer` path for a published Flux tensor name.
 
     A single-stream block's fused output projection is `proj_out` in the
@@ -775,7 +775,7 @@ _QWEN_IMAGE_EMBEDDERS = {
 _QWEN_IMAGE_MLP = {"gate_layer": "gate_proj", "proj": "up_proj", "out": "down_proj"}
 
 
-def qwen_image_path(name: str) -> tuple[str, ...]:
+def qwen_image_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `QwenImageTransformer` path for a published Qwen-Image 2.1 tensor name.
 
     The class holds no bias anywhere, so a bias is an unknown name. The text
