@@ -216,6 +216,8 @@ With `"auto"`, a call that asks for arithmetic no fused kernel performs takes th
 
 Qwix quantization is an optional, experimental training path with int8 and fp8 matmuls. It keeps full-precision master parameters and changes the numerics. In the RTX 4080 measurements on [Performance](../performance.md), fp8 did not make steps faster at the sizes tested.
 
+On a GPU, XLA's Triton GEMM fusion computes some int8 dots as two or four times their product, without an error ([openxla/xla#51016](https://github.com/openxla/xla/issues/51016)). So every program Dew compiles over a model quantized to int8 compiles its GEMMs on cuBLAS instead. A program you `jax.jit` yourself over such a model takes the same options: `jax.jit(f, compiler_options=dew.training.quantization.compiler_options(model))`. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100, a contraction of 16 or 48), and a program with one fails to compile instead of computing a wrong result.
+
 ## Several hosts
 
 The JAX process pool must be initialized before any device array or model is created; the built-in recipes do this first. Each host needs the same software, access to the data and a reachable coordinator. `dew launch` starts a pool over ssh or under Slurm, and `MeshSpec(replicas=N)` keeps `fsdp` inside a node while the data axis spans the nodes. [Multiple hosts](../guides/multi-node.md) covers both and how to rehearse them on one machine, and [Cloud TPUs](../tpu.md) covers TPU provisioning.

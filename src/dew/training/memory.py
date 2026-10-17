@@ -25,6 +25,7 @@ from dew.objectives.base import Batch, Objective, Variables
 from dew.records import JSON, integers, json_value
 from dew.telemetry.devices import gpu_free_bytes, xla_flag
 from dew.training.distributed import parameter_axes
+from dew.training.quantization import compiler_options
 from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
@@ -77,7 +78,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
     `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`).
+    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    (`dew.training.quantization.compiler_options`).
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
@@ -93,6 +95,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
+    options.update(compiler_options(*modules))
     return options or None
 
 

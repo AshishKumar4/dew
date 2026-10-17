@@ -705,6 +705,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             cached = (programs, {})
             self._program_cache = cached
         from dew.nn.sharding import trace_context
+        from dew.training.quantization import compiler_options
 
         key = (name, trace_context())
         if key not in cached[1]:
@@ -713,7 +714,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][key] = jax.jit(run, static_argnames=static_argnames)
+            cached[1][key] = jax.jit(run, static_argnames=static_argnames,
+                                     compiler_options=compiler_options(*(module for module, _ in programs)))
         return cached[1][key]
 
     @property

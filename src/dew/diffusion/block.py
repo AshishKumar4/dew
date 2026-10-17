@@ -245,11 +245,13 @@ class BlockProcess:
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)
             return prepared, (max_new_tokens, n, self, eos_token_ids, pad_token_id, model), None
 
+        from dew.training.quantization import compiler_options
+
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="canvas generation")
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        generation = _compiled(plan.sharding)(
+        generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
@@ -411,6 +413,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
 
 
 @functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None):
+def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The generation program over `rows`, compiled with the model's own XLA `options`
+    (`dew.training.quantization.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_generate, static_argnames=("model", "plan", "n"),
-                   in_shardings=(None, rows, None), out_shardings=rows)
+                   in_shardings=(None, rows, None), out_shardings=rows, compiler_options=dict(options))

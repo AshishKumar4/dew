@@ -11,6 +11,7 @@ scheduler in `serving` only feeds and reads them.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -439,19 +440,21 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: dict[str, str] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, str | bool] | None = None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
     copying it. `rows` places every leaf of an admission, whose rows come
     group by group, the way the slots are placed; None leaves them where they
-    are. `options` are the program's own XLA options (`decode_programs`); pass
-    XLA_FLAGS to change the backend's defaults. See docs/performance.md for
+    are. `options` are the program's own XLA options (`decode_programs`, the
+    model's `dew.training.quantization.compiler_options`); pass XLA_FLAGS to
+    change the backend's defaults. See docs/performance.md for
     the measurements.
     """
     return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
-                   out_shardings=(None, (resident, carried, None)), compiler_options=options)
+                   out_shardings=(None, (resident, carried, None)),
+                   compiler_options=None if options is None else dict(options))
 
 
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
@@ -474,7 +477,9 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else Format(Layout.AUTO, sharding),
                             half, shardings, is_leaf=lambda leaf: leaf is None)
 
-    program = _compiled(automatic(resident), automatic(carried), rows)
+    from dew.training.quantization import compiler_options
+
+    program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
                  grammar)
     tune(lambda: program.lower(*arguments))
@@ -487,7 +492,7 @@ def opened_in(formats: Formats) -> jax.stages.Wrapped:
     return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None],
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, bool], ...]],
                 tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
@@ -499,18 +504,20 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
-def decode_programs(formats: Formats, rows: NamedSharding | None
+def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool]
                     ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
-    """`_compiled` over `formats`, once per layout, for the decoding step and
+    """`_compiled` over `formats`, once per layout and model `options`
+    (`dew.training.quantization.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
     layout. The formats tree holds the cache mapping and is not hashable
     itself, so its leaves and its structure's text key the programs."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows)
+    key = (tuple(leaves), str(structure), rows, tuple(options.items()))
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = split_donated(formats)
-        options = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else None
-        programs = _PROGRAMS[key] = (_compiled(*halves, rows), _compiled(*halves, rows, options))
+        admission = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else {}
+        programs = _PROGRAMS[key] = (_compiled(*halves, rows, options or None),
+                                     _compiled(*halves, rows, {**admission, **options} or None))
     return programs

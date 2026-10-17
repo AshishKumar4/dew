@@ -473,10 +473,12 @@ class Server:
                                  f"which this model cannot take: {self.mixed_refusal}")
             else:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
+            from dew.training.quantization import compiler_options
+
             formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted)
+            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 

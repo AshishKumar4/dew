@@ -375,7 +375,10 @@ class Decide:
 
     @functools.cached_property
     def _forward(self):
-        return jax.jit(self.model.logits)
+        from dew.training.quantization import compiler_options
+
+        model = self.model
+        return jax.jit(model.logits, compiler_options=compiler_options(model.backbone, model.head))
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    group: int = 16) -> dict[str, Answer]:
