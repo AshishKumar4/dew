@@ -24,8 +24,9 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # Phi3Config resolves its record as the mixin does, a legacy rope_scaling
     # replacing rope_parameters whole (configuration_phi3.py:89-101).
     (field, parameters), sliding = rope_records(hf, PLAIN_SPELLING)
-    if sliding is not None or '.' in field:
-        refuse(field, 'Phi-3 reads one rotary record for every layer')
+    if sliding is not None:
+        # Phi3Config's model applies one rotary to every layer, so a second record has no layer to take it.
+        refuse(sliding[0], 'Phi-3 applies one rotary record to every layer')
     theta = records.number(parameters['rope_theta'], f'{field} rope_theta')
     partial = records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', 1.)),
                               'partial_rotary_factor')

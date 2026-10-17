@@ -32,9 +32,9 @@ class Residual(nn.Module):
 class Tagged(nn.Module):
     """A user module whose `tags` are plain JSON data, beside one layer it holds twice."""
 
-    tags: dict[str, object]
     later: nn.Dense
     earlier: nn.Dense
+    tags: dict[str, object]
 
     def __call__(self, x):
         return self.earlier(self.later(x))
@@ -85,18 +85,20 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
 def test_data_shaped_like_a_shared_module_stays_data_beside_a_real_one():
     """`tags` holds two mappings shaped like the definition of shared module
     0. They are data, so the record reads them back as written, and the real
-    shared layer takes another number. With its keys sorted, as a run's
-    record is written, the record refers to that layer (`earlier`) before
-    defining it (`later`), and still builds one layer with one set of weights."""
+    shared layer, written before them, still takes another number. With its
+    keys sorted, as a run's record is written, the record refers to that layer
+    (`earlier`) before defining it (`later`), and still builds one layer with
+    one set of weights."""
     from dew.registry import from_record
 
     shared = nn.Dense(8)
     tags = {"a": {"class": "row", "share": 0}, "b": {"class": "row", "share": 0}}
     assert from_record(dict[str, object], json.loads(json.dumps(to_record(tags, dict[str, object])))) == tags
-    model = Tagged(tags=tags, later=shared, earlier=shared)
+    model = Tagged(later=shared, earlier=shared, tags=tags)
     x = jax.random.normal(jax.random.key(1), (2, 8))
     params = model.init(jax.random.key(0), x)
     record = json.loads(json.dumps(to_record(ModelConfig.from_model(model), ModelConfig), sort_keys=True))
+    assert '"shared": 1' in json.dumps(record)
     rebuilt = ModelConfig.from_dict(record).build()
     assert rebuilt.tags == tags
     assert sorted(params["params"]) == ["later"]

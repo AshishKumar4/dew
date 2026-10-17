@@ -315,8 +315,6 @@ class TorchTableLM(TorchCausalLM):
         hold it, the parameter a loss keeps, with the forward's compute dtype,
         which casts the product's operands as the forward casts them whatever
         dtype the states arrive in (`head_product`)."""
-        if self.graph.head is None:
-            raise ValueError("this model's logits are not its plain head product; load it as TorchCausalLM")
         return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
                            precision=self.precision, compute=self.dtype)
 

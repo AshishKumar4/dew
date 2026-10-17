@@ -415,7 +415,7 @@ def to_record(value, annotation) -> JSON:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
             if isinstance(value, nn.Module) and id(value) in written.modules:
-                return _referred(written, written.modules[id(value)])
+                return _referred(written, id(value))
             fields = record_fields(value, type(value))
             record = (fields if type(value) is _unwrapped(annotation)
                       else {"class": import_path(type(value)), "fields": fields})
@@ -435,12 +435,8 @@ def to_record(value, annotation) -> JSON:
                    for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
         number = _sharing(mapping)
         if number is not None:
-            # Data shaped like a shared module's record keeps its number to itself, so
-            # a reader never takes one for the other (`_Shared`).
+            # Data shaped like a shared module's record keeps its number to itself.
             with recording() as written:
-                if number in written.numbered():
-                    raise TypeError(f"{mapping!r} has the shape and number of the record's shared module "
-                                    f"{number}, so a reader could take either for the other")
                 written.taken.add(number)
         return mapping
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -609,16 +605,24 @@ def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
 @dataclasses.dataclass
 class _Written:
     """The record being written: the Flax modules it holds, by identity, each
-    with its record, and the numbers that data shaped like a shared module's
-    record (`_sharing`) takes, which no shared module may take too."""
+    with its record; the references to each one it holds more than once; and
+    the numbers that data shaped like a shared module's record takes
+    (`_sharing`). The shared modules are numbered once the record is whole,
+    past every number its data takes, so a reader never takes one for the
+    other (`_Shared`)."""
 
     modules: dict[int, tuple[nn.Module, dict[str, JSON]]] = dataclasses.field(default_factory=dict)
+    references: dict[int, list[dict[str, JSON]]] = dataclasses.field(default_factory=dict)
     taken: set[int] = dataclasses.field(default_factory=set)
 
-    def numbered(self) -> set[int]:
-        """The numbers the record's shared modules take."""
-        return {number for _, record in self.modules.values()
-                if isinstance(number := record.get("share"), int)}
+    def number(self) -> None:
+        """Number each shared module's record and its references, in the order they were first referred to."""
+        free = (number for number in itertools.count() if number not in self.taken)
+        for key, references in self.references.items():
+            number = next(free)
+            self.modules[key][1]["share"] = number
+            for reference in references:
+                reference["shared"] = number
 
 
 _WRITTEN: contextvars.ContextVar[_Written | None] = contextvars.ContextVar("_WRITTEN", default=None)
@@ -638,23 +642,25 @@ def recording() -> Iterator[_Written]:
     token = _WRITTEN.set(opened)
     try:
         yield opened
+        opened.number()
     finally:
         _WRITTEN.reset(token)
 
 
-def _referred(written: _Written, first: tuple[nn.Module, dict[str, JSON]]) -> JSON:
-    """The reference to a module the record already holds: its first record
-    becomes a class record numbered `share`, in place, and the reference
-    names that number."""
-    module, record = first
-    if "share" not in record:
+def _referred(written: _Written, key: int) -> JSON:
+    """A reference to a module the record already holds: its first record
+    becomes a class record, in place, and both take the module's number when
+    the record is whole (`_Written.number`)."""
+    module, record = written.modules[key]
+    if key not in written.references:
         if "class" not in record:
             fields = dict(record)
             record.clear()
             record.update({"class": import_path(type(module)), "fields": fields})
-        used = written.numbered() | written.taken
-        record["share"] = next(number for number in itertools.count() if number not in used)
-    return {"shared": record["share"]}
+        written.references[key] = []
+    reference: dict[str, JSON] = {}
+    written.references[key].append(reference)
+    return reference
 
 
 @dataclasses.dataclass
