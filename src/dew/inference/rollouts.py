@@ -579,12 +579,11 @@ class OpenAIRolloutServer(_RequestServer):
         self._routing = routing
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
-        # The pad id shapes Dew's packed rows; it is not a request field.
         completion = self._completion(
             [list(prompt)],
             budget,
             key=seed,
-            sampling=replace(self._sampling, pad_token_id=0),
+            sampling=self._sampling,
             logprobs=0,
             extra_body=self._return_ids,
         )
