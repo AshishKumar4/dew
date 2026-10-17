@@ -251,7 +251,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
-                              budget=SearchBudget(consecutive=5, seconds=None)))
+                              budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
     counts = reader.get_state()["parents"][0]["counts"]
@@ -647,7 +647,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
-                              budget=SearchBudget(consecutive=3, seconds=None)))
+                              budget=SearchBudget(consecutive=3)))
     try:
         if tiny_targets:
             next(reader)

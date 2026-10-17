@@ -508,7 +508,7 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, source, transform=prefix)
+        cached = filled.mapped(stored, manifest, transform=prefix)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
@@ -529,7 +529,7 @@ class _Build:
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, shards, transform=prefix)
+            reader = filled.streamed(shards.reader, manifest, transform=prefix)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
@@ -662,7 +662,7 @@ class _Build:
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
             manifest = _cache_manifest(pipeline.source, prefix, self.read)
-            rows = _filled(stage).mapped(rows, manifest, pipeline.source)
+            rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
         return rows
