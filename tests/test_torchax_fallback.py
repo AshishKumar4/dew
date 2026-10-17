@@ -32,6 +32,7 @@ from dew.interop.torchax_fallback import TorchLayout
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
+from tools.diffusers_wan_reference import float64
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -208,12 +209,19 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
     dew = {"loss": np.asarray([value], np.float64)} | {
         name: np.asarray(grads[name], np.float64) for name in names}
     reference = torch_step(model, tokens)
-    truth = torch_step(model.double(), tokens)
-    with jax.enable_x64(new_val=True):
-        wide = replace(loaded, model=loaded.model.clone(dtype=jnp.float64),
-                       variables=widened(loaded.variables))
-        loss, params = step(wide)
-        _, (loss_terms, grad_terms) = float64_terms(loss, params)
+    # Truth: the same weights in a model built in float64, its float32 pins
+    # (the loss's logits.float(), an RMS norm's upcast) widened and its
+    # rotary tables rebuilt; Dew's own float64 terms under the same widening.
+    with float64():
+        wide_model = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                                   attn_implementation="eager").eval()
+        wide_model.load_state_dict(model.state_dict())
+        truth = torch_step(wide_model, tokens)
+        with jax.enable_x64(new_val=True):
+            wide = replace(loaded, model=loaded.model.clone(dtype=jnp.float64),
+                           variables=widened(loaded.variables))
+            loss, params = step(wide)
+            _, (loss_terms, grad_terms) = float64_terms(loss, params)
     terms = {"loss": np.asarray([loss_terms])} | {name: np.asarray(grad_terms[name]) for name in names}
     assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ, terms=terms)
     if head in ("zero bias", "bias"):
