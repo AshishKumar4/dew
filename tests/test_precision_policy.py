@@ -36,13 +36,15 @@ BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
 @pytest.mark.parametrize("arguments", [
     {"precision": jax.lax.Precision.HIGHEST},
+    {"precision": jax.lax.DotAlgorithmPreset.F32_F32_F32},
     {"force_fp32_for_softmax": False},
     {"dtype": jnp.float32},
 ])
 def test_auto_takes_the_reference_path_for_arithmetic_only_it_performs(arguments):
-    """'auto' resolves a call that asks for a matmul precision, a softmax
-    dtype or a compute dtype no fused kernel honours to the reference path,
-    and computes exactly what naming that path computes."""
+    """'auto' resolves a call that asks for a matmul precision, a dot
+    algorithm among them, a softmax dtype or a compute dtype no fused kernel
+    honours to the reference path, and computes exactly what naming that path
+    computes."""
     query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.bfloat16)
     auto = scaled_dot_product_attention(query, key, value, implementation="auto", **arguments)
     reference = scaled_dot_product_attention(query, key, value, implementation="reference",
@@ -362,13 +364,17 @@ def test_a_configured_dot_algorithm_reads_as_the_precision_it_asks(configured, d
 
 def test_a_dot_algorithm_reads_as_its_own_precision_past_the_default():
     """A `jax.lax.DotAlgorithm`, which JAX's precision alias takes beside its presets, asks for more
-    than the default precision, by its own name, apart from another algorithm's."""
+    than the default precision, by its own name, apart from another algorithm's, so attention takes it
+    on its reference path. (CPU's dot refuses a raw algorithm, so only its routing is asked here.)"""
     from dew.nn import precision
     wide = jax.lax.DotAlgorithm(jnp.float32, jnp.float32, jnp.float32)
     narrow = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32)
     assert not precision.asks_default_precision(wide)
     assert len(precision.precision_names(wide)) == 1
     assert precision.precision_names(wide) != precision.precision_names(narrow)
+    # Attention takes it, as it does a preset, on the path that computes it (the reference one).
+    from dew.nn.attention import reference_only
+    assert reference_only(jnp.zeros(BF16_QKV), dtype=None, precision=narrow, force_fp32_for_softmax=True)
 
 
 def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
