@@ -131,6 +131,18 @@ export class SnapshotPreparer extends DurableObject<Env> {
 		return (await this.ctx.storage.get<{ phase: string; at: number }>('phase')) ?? null;
 	}
 
+	/** What an operator reads of the job this preparer holds: its stage, its clock and how it ended, no secret. */
+	async held(): Promise<{ commit: string; stage: string; began: number | null; restores: number; alarm: number | null;
+		snapshot: string | null; outcome: string | null; registry: string; token: string } | null> {
+		const job = await this.ctx.storage.get<Job>('job');
+		if (!job) return null;
+		const outcome = job.outcome ? (job.outcome.generation ? `ready ${job.outcome.generation.snapshot.id}`
+			: `failed: ${job.outcome.failure?.slice(-500)}`) : null;
+		return { commit: job.commit, stage: job.stage, began: job.began ?? null, restores: job.restores ?? 1,
+			alarm: await this.ctx.storage.getAlarm(), snapshot: job.built?.snapshot.id ?? job.record?.id ?? null, outcome,
+			registry: job.reply.registry, token: job.reply.token };
+	}
+
 	// Whether an alarm runs now: one the runtime resets is gone, and with it this.
 	private alarming = false;
 
