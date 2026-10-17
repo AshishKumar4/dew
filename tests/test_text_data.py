@@ -275,8 +275,7 @@ def export_documents(documents, destination, *, tokenizer="byte", eos=False):
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sinks import export
-    from dew.data.steps.text import Tokenize
-    from dew.data.text import tokenizer_for
+    from dew.data.text import Tokenize, tokenizer_for
 
     vocabulary = tokenizer_for(tokenizer)
     pipeline = Pipeline(Memory([{"text": text} for text in documents])).filter(
@@ -543,7 +542,7 @@ def test_a_store_packs_its_documents_whole_unless_a_chunk_step_cuts_them(tmp_pat
     of the store's document lengths cuts alike, each piece a window of its own here."""
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
-    from dew.data.text import chunk
+    from dew.data.text import Chunks
 
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document; windows of 4
     stored = TokenFiles(str(tmp_path))
@@ -551,7 +550,7 @@ def test_a_store_packs_its_documents_whole_unless_a_chunk_step_cuts_them(tmp_pat
     with pytest.raises(ValueError):
         compile(Pipeline(stored).pack(4, bins=1).repeat().batch(1), read="indexed", provision=True,
                 loading=loading)
-    data = compile(Pipeline(stored).flat_map(chunk(4)).pack(4, bins=1).repeat().batch(1), read="indexed",
+    data = compile(Pipeline(stored).flat_map(Chunks(4)).pack(4, bins=1).repeat().batch(1), read="indexed",
                    provision=True, loading=loading)
     assert data.plan.lowering == "global"
     rows = [row["text"].tolist() for row in _read(data.train(DataPartition()), 3)]
@@ -971,8 +970,7 @@ def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_p
 
     import huggingface_hub
 
-    from dew.data.steps.text import Tokenize
-    from dew.data.text import load_tokenizer
+    from dew.data.text import Tokenize, load_tokenizer
 
     # The Hub cache keeps a commit's files in a directory named for it.
     files = tmp_path / "snapshots" / ("a" * 40)

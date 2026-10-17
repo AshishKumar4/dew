@@ -10,12 +10,17 @@ ids; anything else fails naming the row.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
+import grain.python as grain
+import numpy as np
+
 from dew.nn.inputs import token_id
+from dew.records import record
 
 if TYPE_CHECKING:
-    from dew.data.steps.chat import PreferencePair
+    from dew.data.dataset import Batch
 
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""
@@ -47,9 +52,32 @@ def _mask(values: object, name: str, length: int, where: str) -> list[int]:
     return mask
 
 
-def pair(seq_len: int = 256, *, pad_id: int = 0) -> PreferencePair:
-    """A record step that lays a chosen and a rejected completion's ids and
-    loss masks out as two `seq_len` rows."""
-    from dew.data.steps.chat import PreferencePair
+@dataclasses.dataclass(frozen=True)
+class PreferencePair(grain.MapTransform):
+    """A chosen and a rejected completion's ids and loss masks laid out as two
+    `seq_len` rows."""
 
-    return PreferencePair(seq_len, pad_id)
+    seq_len: int = 256
+    _: dataclasses.KW_ONLY
+    pad_id: int = 0
+
+    def __post_init__(self) -> None:
+        if self.seq_len < 1:
+            raise ValueError("preference seq_len must be positive")
+
+    def map(self, element: Batch) -> Batch:
+        element = record(element, "preference row")
+        if "chosen" not in element or "rejected" not in element:
+            raise ValueError("a preference pair needs both chosen and rejected ids")
+        ids = np.full((2, self.seq_len), self.pad_id, np.int32)
+        mask = np.zeros((2, self.seq_len), np.int32)
+        for row, name in enumerate(("chosen", "rejected")):
+            tokens = _ids(element.get(name), name, "preference")
+            if len(tokens) > self.seq_len:
+                raise ValueError(f"preference {name} has {len(tokens)} tokens for seq_len={self.seq_len}")
+            completion = _mask(
+                element.get(f"{name}_mask", [1] * len(tokens)), f"{name}_mask", len(tokens), "preference"
+            )
+            ids[row, : len(tokens)], mask[row, : len(tokens)] = tokens, completion
+        kept = {key: value for key, value in element.items() if key not in FIELDS}
+        return {**kept, IDS_KEY: ids, MASK_KEY: mask}

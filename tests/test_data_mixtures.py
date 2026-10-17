@@ -33,9 +33,9 @@ from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
 from dew.data.compile import compile, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
+from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -1119,7 +1119,8 @@ def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_ea
     """Published generations mix by tokens from the rows and valid targets each states, where
     the weighting once looked for a windows count no generation states."""
     from dew.data.cache import Cache
-    from dew.data.steps.text import CountTargets, Tokenize
+    from dew.data.steps.text import CountTargets
+    from dew.data.text import Tokenize
 
     def published(name: str, documents: int) -> Pipeline:
         texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)

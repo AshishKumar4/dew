@@ -33,7 +33,7 @@ class HF(Dataset):
     """A `datasets.Dataset`, read by index from its Arrow table, or an
     `IterableDataset`, read over its shards whose positions its own
     `state_dict` checkpoints; the `.map()`s it holds are already applied. An
-    image column reads as its encoded bytes, which `images.decode` decodes.
+    image column reads as its encoded bytes, which `images.DecodeImage` decodes.
     `name` is its identity in a run's plan, a cache's key and its logs, its
     fingerprint by default; a stream has no fingerprint of its content, so
     it is named, with its version, or refused.

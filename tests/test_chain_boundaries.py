@@ -159,7 +159,7 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
     originals = [{"id": index, "chosen": [1, 2, index + 3], "rejected": [1, index + 4],
                   "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1],
                   "catalog": {"tags": [str(index)]}} for index in range(3)]
-    rows = list(iterate(Memory(originals).map(preferences.pair(4)), read=read, loading=READ))
+    rows = list(iterate(Memory(originals).map(preferences.PreferencePair(4)), read=read, loading=READ))
     assert len(rows) == len(originals)
     for row, original in zip(rows, originals, strict=True):
         assert row["id"] == original["id"] and row["catalog"] == original["catalog"]
@@ -177,7 +177,7 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
 ])
 def test_encodings_still_validate_the_fields_they_read(read, row):
     stored = Memory([row])
-    chain = (stored.map(preferences.pair(4)) if "chosen" in row
+    chain = (stored.map(preferences.PreferencePair(4)) if "chosen" in row
              else stored.filter_map(prompts.encode("byte", max_prompt_len=4)))
     with pytest.raises(ValueError):
         list(iterate(chain, read=read, loading=READ))

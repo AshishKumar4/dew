@@ -27,11 +27,11 @@ from dew.data import Loading, Memory, images
 from dew.data.compile import compile, validation
 from dew.data.dataset import Checkpointable, DataPartition, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
+from dew.data.images import EncodeCaptions
 from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Torch, source as stored_source
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets

@@ -93,7 +93,8 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import Chunks, ValidTargets
+from dew.data.steps.text import ValidTargets
+from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, record
 
