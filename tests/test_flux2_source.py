@@ -225,3 +225,39 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
     for name, tensor in {**written, **retained}.items():
         stored = tensors[name.removeprefix("text_encoder/")]
         assert (tensor.dtype, tensor.tobytes()) == (stored.dtype, stored.tobytes()), name
+
+
+def test_a_mistral3_encoder_storing_a_tensor_twice_reads_once_and_writes_both(source, record, tmp_path):
+    """A checkpoint that stores its embedding under both of Mistral-3's
+    spellings (transformers 4.50's `language_model.model.` and 4.52's
+    `model.language_model.`) reads the equal copies once, conditions as the
+    checkpoint with one copy does, and writes each name back as it came."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop.pipeline_assembly import _hidden_states_conditioning
+
+    directory = tmp_path / "mistral3"
+    shutil.copytree(source / "mistral3", directory)
+    tensors = component_tensors(directory, "text_encoder")
+    name = next(name for name in tensors if name.endswith("embed_tokens.weight"))
+    spellings = ("model.language_model.", "language_model.model.")
+    alias = next(other + name.removeprefix(spelling) for spelling, other in (spellings, spellings[::-1])
+                 if name.startswith(spelling))
+    save_file({**tensors, alias: tensors[name]}, str(directory / "text_encoder" / "model.safetensors"))
+
+    def conditioned(where):
+        encoder, layouts, *_ = _hidden_states_conditioning(
+            where, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0, param_dtype="float32",
+            attention_impl="xla")
+        return encoder, layouts
+
+    (encoder, layouts), (single, _) = conditioned(directory), conditioned(source / "mistral3")
+    prompts = encoder.tokenize(record["pipeline"]["prompts"])
+    np.testing.assert_array_equal(np.asarray(encoder.encode(encoder.params, prompts).context),
+                                  np.asarray(single.encode(single.params, prompts).context))
+    variables = {"encoders": {"conditioning": encoder.params}}
+    written = {layout.name: layout.export(variables) for layout in layouts}
+    for each in (name, alias):
+        assert written[f"text_encoder/{each}"].tobytes() == tensors[name].tobytes(), each

@@ -34,7 +34,7 @@ The assistant span comes from prefix rendering, not from template markers:
 
 TRL's `assistant_only_loss` needs a template carrying `{% generation %}` markers. When the user's template lacks them, TRL swaps in a bundled template, which changes the rendered ids as well as the mask. verl tokenizes each message alone and concatenates the results, which equals whole-conversation tokenization only for templates that happen to be concatenation-safe. The prefix method is exact for any template and asserts it. TRL's mask is still the parity reference for the transform (§8).
 
-Packing reuses the existing machinery. `text_roles` joins as one more per-token feature in `FirstFitPackIterDataset` with its own `length_struct` and `padding_struct` entries. `DocumentChunks` cuts every per-token field of a document longer than the window, so ids and roles stay aligned. A conversation that starts with the assistant is refused, because the template gives no way to separate its opening header from its completion. Segment ids still stop attention at a document boundary.
+Packing reuses the existing machinery. `text_roles` joins as one more per-token feature in `FirstFitPackIterDataset` with its own `length_struct` and `padding_struct` entries. A chunk step over both fields (`Chunks`) cuts every per-token field of a document longer than the window, so ids and roles stay aligned. A conversation that starts with the assistant is refused, because the template gives no way to separate its opening header from its completion. Segment ids still stop attention at a document boundary.
 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |

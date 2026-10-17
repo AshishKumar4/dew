@@ -37,7 +37,7 @@ from dew.config.data import HoldOut, TextData, loader
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
 from dew.data.compile import iterate
 from dew.data.pipeline import Pipeline
-from dew.data.steps.text import Tokenize
+from dew.data.text import Tokenize
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMRunConfig, Perplexity
 from dew.training import Evaluation, MeshSpec

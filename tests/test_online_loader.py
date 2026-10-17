@@ -10,10 +10,10 @@ from PIL import Image
 from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
+from dew.data.images import DecodeImage, Resize
 from dew.data.mixing import SearchBudget
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
-from dew.data.steps.image import DecodeImage, Resize
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
@@ -25,7 +25,7 @@ def catalog(root: Path, count: int = 16) -> Pipeline:
         path = root / f"image-{index}.png"
         Image.fromarray(np.full((8, 8, 3), index + 1, np.uint8)).save(path)
         rows.append({"url": path.as_uri(), "caption": f"sample {index}", "label": index})
-    return Pipeline(Memory(rows)).filter_map(Fetch(output="image"), DecodeImage()).map(Resize(8))
+    return Pipeline(Memory(rows)).filter_map(Fetch(output="image"), DecodeImage("image")).map(Resize(8))
 
 
 def _on_white(rgba: np.ndarray) -> np.ndarray:
@@ -45,10 +45,10 @@ def test_a_fetched_grey_or_transparent_image_is_kept_as_rgb(tmp_path, pixels):
     Image.fromarray(pixels).save(path)
     fetched = Fetch(output="image")({"url": path.as_uri()})
     assert not isinstance(fetched, Rejected)
-    decoded = DecodeImage().map(fetched)
+    decoded = DecodeImage("image").map(fetched)
     assert not isinstance(decoded, Rejected)
     np.testing.assert_array_equal(decoded["image"], expected)
-    assert images.min_side(32)(decoded) and images.max_aspect(2.4)(decoded) and images.not_flat()(decoded)
+    assert images.MinSide(32)(decoded) and images.MaxAspect(2.4)(decoded) and images.NotFlat()(decoded)
     assert Resize(64).map(decoded)["image"].shape == (64, 64, 3)
 
 
@@ -65,7 +65,7 @@ def test_failed_fetches_are_counted_before_batches(tmp_path):
     rows = [{"url": (tmp_path / "missing").as_uri(), "label": -1},
             *prefix.source.records("indexed")]
     pipeline = Pipeline(Memory(rows)).shuffle(7).repeat().filter_map(
-        Fetch(output="image"), DecodeImage()).map(Resize(8)).batch(4)
+        Fetch(output="image"), DecodeImage("image")).map(Resize(8)).batch(4)
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:
@@ -91,9 +91,9 @@ def test_an_oversized_object_is_rejected_before_decode(tmp_path):
 
 def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
     pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().filter_map(
-        Fetch(output="image"), DecodeImage()).batch(4)
+        Fetch(output="image"), DecodeImage("image")).batch(4)
     data = compile(pipeline, read="indexed", loading=READ,
-                   budget=SearchBudget(consecutive=8, seconds=2))
+                   budget=SearchBudget(consecutive=8))
     stream = data.train(DataPartition())
     try:
         with pytest.raises(ValueError):
@@ -157,8 +157,8 @@ def rejected(stream) -> dict[str, float]:
 
 def worth_training_on(pipeline: Pipeline) -> Pipeline:
     """The old url loader's checks, as stages."""
-    return (pipeline.filter_map(images.decode()).filter(images.min_side(16)).filter(images.max_aspect(2.4))
-            .filter(images.not_flat()))
+    return (pipeline.filter_map(images.DecodeImage()).filter(images.MinSide(16)).filter(images.MaxAspect(2.4))
+            .filter(images.NotFlat()))
 
 
 def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reason(tmp_path):
@@ -217,7 +217,8 @@ def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
     (tmp_path / "broken.mp4").write_bytes(b"not a video")
     table = [{"url": clip.as_uri(), "caption": "a fade"}, {"url": (tmp_path / "broken.mp4").as_uri()}]
     pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().filter_map(video.fetch())
-                .random_filter_map(video.pick_clip(8 / FPS)).filter_map(video.decode(8, size=16)).batch(2))
+                .random_filter_map(video.PickClip(8 / FPS)).filter_map(video.DecodeVideo(8, size=16))
+                .batch(2))
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:

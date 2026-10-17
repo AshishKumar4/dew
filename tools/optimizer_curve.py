@@ -34,7 +34,9 @@ from dew.config import OptimConfig
 from dew.config.data import TextData, loader
 from dew.data import Loading
 from dew.data.dataset import DataPartition
+from dew.data.sources.tokens import TokenFiles
 from dew.objectives.lm import LMObjective
+from dew.records import integer
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
@@ -48,7 +50,7 @@ class Comparison:
     """One run of one solver."""
 
     dataset: str
-    """A directory written by `dew tokenize`."""
+    """A token store, as `dew data export --tokenizer` writes one."""
     out: str
     """Where the per-step losses are written, as JSON."""
     optimizer: Solver = "muon"
@@ -94,13 +96,13 @@ class Curve:
 
 
 def run(config: Comparison) -> Curve:
-    # The tokenizer run wrote the vocabulary beside the token files, which is
-    # where the recipe reads it from too.
-    meta = json.loads((Path(config.dataset) / "meta.json").read_text())
-    vocab_size = int(meta["vocab_size"])
+    # The store records its tokenizer's vocabulary and its token count.
+    stored = TokenFiles(config.dataset)
+    facts = stored.metadata()
+    vocab_size = integer(facts["vocab_size"], "vocab_size")
     # One worker and one read thread: the arms must see identical batches, and
     # a curve is not a throughput measurement.
-    data = loader(TextData(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size,
+    data = loader(TextData(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
         read="memory", seed=config.seed, loading=Loading(workers=0, threads=1, read_buffer=1,
                                         worker_buffer=1), validation_records=4 * (config.batch_size))
     fields = {"vocab_size": vocab_size, "emb_features": config.emb_features, "num_layers": config.num_layers,
@@ -135,7 +137,7 @@ def run(config: Comparison) -> Curve:
             steps=config.steps,
             tokens_per_step=config.batch_size * config.sequence_length,
             tokens=config.steps * config.batch_size * config.sequence_length,
-            corpus_tokens=int(meta["train_tokens"]),
+            corpus_tokens=integer(facts["tokens"], "tokens"),
             parameters=parameters,
             model=fields,
             seed=config.seed,

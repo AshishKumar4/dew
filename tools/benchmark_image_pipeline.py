@@ -35,7 +35,8 @@ from dew.config.data import Augment, ImageData, loader
 from dew.data import TFDS, Loading
 from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
-from dew.data.images import decode_image, resize_image
+from dew.data.image_codec import decode_image
+from dew.data.images import resize_image
 
 
 @dataclass
