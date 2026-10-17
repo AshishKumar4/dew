@@ -43,7 +43,7 @@ from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -196,7 +196,9 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
 def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, reference, tmp_path):
     """A real SGD step through the Trainer: the frozen collection comes back
     bitwise, every factor moves, and the logits and factors agree with the
-    reference's step on the adapter parameters."""
+    reference's step on the adapter parameters. The run records the
+    adapter's per-module ranks and alphas, so the adapter it rebuilds
+    computes the stepped logits and writes the same PEFT files."""
     adapter = _rebound(loaded, decoder.model, dropout=0.0)
     meta = json.loads((FIXTURES / "llama-tiny" / "meta.json").read_text())
     tokens = np.asarray(reference["input_ids"])
@@ -208,11 +210,13 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
         records=rows,
         batch=rows,
     )
+    checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(objective, optax.sgd(meta["learning_rate"]), key=jax.random.key(3),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                      mesh=MeshSpec(), layout=Layout(min_shard=2**30), checkpoints=checkpoints)
     initial = trainer.initial_state()
 
-    state = trainer.fit(data, steps=1, log_every=1)
+    state = trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
 
     for before, after in zip(
         jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
@@ -233,6 +237,12 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
             np.testing.assert_allclose(
                 exported[key.removeprefix("updated/")], reference[key], atol=1e-4, rtol=0
             )
+    rebuilt = Adapter.from_run(tmp_path / "run", ema=False)
+    assert rebuilt.targets == adapter.targets
+    np.testing.assert_array_equal(np.asarray(rebuilt.model.apply(rebuilt.variables, jnp.asarray(tokens))),
+                                  np.asarray(logits))
+    rebuilt.save(rebuilt.variables, tmp_path / "rebuilt")
+    _same_files(tmp_path / "rebuilt", tmp_path / "adapter")
     # The merged full export reloads as a plain source at the stepped logits.
     decoder.save(tmp_path / "merged", variables=adapter.merge(state.variables))
     reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
@@ -620,7 +630,7 @@ def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_pat
     bases. The file loads, and each component's base goes back out as it came in:
     saved, reloaded, and through a run's record of the adapter."""
     from dew.lora import AdapterRecord
-    from dew.registry import from_record, to_record
+    from dew.registry import from_record, to_record, wrapper_layers
 
     tensors, metadata = read_file(SD / lora.DIFFUSERS_WEIGHTS)
     header = json.loads(metadata[lora.DIFFUSERS_METADATA])
@@ -634,11 +644,10 @@ def test_a_pipeline_files_components_keep_the_bases_each_names(pipeline, tmp_pat
     loaded.save(loaded.variables, tmp_path / "again")
     again = LoRA.load(pipeline.model, pipeline.variables, tmp_path / "again", layouts=pipeline.layouts)
     assert again.bases == bases
-    # This file's components differ in rank, which no run records; a run's adapter of one rank keeps
-    # its components' bases through JSON.
-    record = AdapterRecord(rank=2, alpha=4.0, rslora=False, dropout=0.0, modules=("unet/conv_in",),
-                           layouts={}, bases=again.bases)
-    assert from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord)))).bases == bases
+    # This file's components differ in rank, which a run's record of the adapter keeps beside the bases.
+    record = wrapper_layers(type(again.model))[1][0]._dew_wrapper()
+    kept = from_record(AdapterRecord, json.loads(json.dumps(to_record(record, AdapterRecord))))
+    assert kept.bases == bases and kept.bound()[0] == again.targets
 
 
 def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
