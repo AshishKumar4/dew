@@ -688,7 +688,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
         return None
 
-    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, dict]:
+    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
         """The host's tokens and their fields, a packed batch's coordinates
         among them: what the loss reads."""
         raw = batch[TEXT_KEY]
