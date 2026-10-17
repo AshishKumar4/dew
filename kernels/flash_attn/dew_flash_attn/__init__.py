@@ -296,10 +296,16 @@ def _check(name: str, rank: int, query, key, value, sinks, *, own_keys: bool = F
     if query.dtype not in (jnp.bfloat16, jnp.float16) or not query.dtype == key.dtype == value.dtype:
         raise ValueError(f"{name} takes bf16 or fp16 inputs of one dtype, not {query.dtype}, {key.dtype} "
                          f"and {value.dtype}")
-    if (query.ndim != rank or (rank == 3 and not own_keys and query.shape[0] != key.shape[0])
-            or query.shape[-2] % key.shape[-2] or key.shape != value.shape or query.shape[-1] > 256):
-        raise ValueError(f"{name} takes rank-{rank} arrays whose key heads divide the query's and heads up "
-                         f"to 256 wide, not query {query.shape}, key {key.shape} and value {value.shape}")
+    # The kernels read every key and value stride off the query's batch and width, so a key or value of
+    # another batch, rank or width is read past its end.
+    packed_apart = rank == 3 and own_keys
+    if (query.ndim != rank or key.ndim != rank or key.shape != value.shape
+            or (not packed_apart and query.shape[0] != key.shape[0])
+            or query.shape[-1] != key.shape[-1] or not 0 < key.shape[-2] <= query.shape[-2]
+            or query.shape[-2] % key.shape[-2] or query.shape[-1] > 256):
+        raise ValueError(f"{name} takes rank-{rank} arrays of one batch and width, whose key heads "
+                         f"divide the query's and heads up to 256 wide, not query {query.shape}, key "
+                         f"{key.shape} and value {value.shape}")
     if sinks is not None and sinks.shape != query.shape[-2:-1]:
         raise ValueError(f"{name} takes one sink a query head, {query.shape[-2]}, not {sinks.shape}")
 

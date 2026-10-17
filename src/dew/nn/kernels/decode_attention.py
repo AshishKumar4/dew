@@ -101,9 +101,35 @@ def _paged_kernel(lengths_ref, table_ref, query_ref, key_ref, value_ref, out_ref
     out_ref[...] = out.astype(out_ref.dtype)
 
 
+@jax.custom_vjp
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the first `lengths` `[B]` of
-    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out."""
+    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out,
+    differentiated as the folded attention it stands in for is
+    (`dew.nn.attention.folded_attention`): its Pallas call has no transpose."""
+    return _attended(query, key, value, lengths)
+
+
+def _attend_fwd(query, key, value, lengths):
+    return attend(query, key, value, lengths), (query, key, value, lengths)
+
+
+def _attend_bwd(saved, cotangent):
+    # Imported here: dew.nn.attention imports this module.
+    from dew.nn.attention import folded_attention, with_key_lengths
+
+    query, key, value, lengths = saved
+    def folded(q, k, v):
+        return folded_attention(q, k, v, with_key_lengths(None, lengths, k.shape[-3]))
+
+    _, backward = jax.vjp(folded, query, key, value)
+    return (*backward(cotangent), None)
+
+
+attend.defvjp(_attend_fwd, _attend_bwd)
+
+
+def _attended(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
     from jax.experimental.pallas import triton as plgpu
 
     batch, positions, heads, width = query.shape

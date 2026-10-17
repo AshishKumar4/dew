@@ -811,6 +811,41 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
+def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
+    """`scaled_dot_product_attention` with key lengths on 'xla', which the decode kernel takes,
+    differentiates as the folded attention it stands in for: query, key and value gradients within
+    tests/reference_error.py's rule of the folded attention's against float64."""
+    from dew.nn.attention import folded_attention, with_key_lengths
+    from dew.nn.kernels import decode_attention
+
+    rng = np.random.default_rng(1)
+    lengths = jnp.asarray([1, 20, 64], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((3, 2, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
+    assert decode_attention.fits(query, key)
+    cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.float32)
+
+    def gradients(attend, *arrays):
+        def pulled(*a):
+            return jnp.sum(attend(*a) * cotangent.astype(a[0].dtype))
+
+        return jax.grad(pulled, argnums=(0, 1, 2))(*arrays)
+
+    found = jax.jit(lambda *a: gradients(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, implementation='xla', key_value_seq_lengths=lengths), *a))(query, key, value)
+
+    def folded(q, k, v):
+        return folded_attention(q, k, v, with_key_lengths(None, lengths, k.shape[-3]))
+
+    reference = jax.jit(lambda *a: gradients(folded, *a))(query, key, value)
+    with jax.enable_x64(new_val=True):
+        truth = gradients(folded, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    for name, got, want, exact in zip("qkv", found, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact),
+                                         f"the decode kernel's {name} gradient")
+
+
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("page_size", [16, 32])
 def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
     """`decode_attention.attend_paged` reads a row's pages through its table,
