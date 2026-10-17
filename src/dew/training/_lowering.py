@@ -24,17 +24,32 @@ host, so attention traces its XLA path.
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 
 import jax
+from jax.extend.mlir import ir
 
-_TRITON_CALL = re.compile(r'custom_call @__gpu\$xla\.gpu\.triton\(.*?\bname = "([^"]*)"')
+TRITON = "__gpu$xla.gpu.triton"
+"""The custom call Pallas lowers a Triton kernel to, its name in the call's backend config."""
 
 
 def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
-    """The Pallas-Triton kernels a lowered program calls, by name, with the call sites of each."""
-    return dict(sorted(Counter(_TRITON_CALL.findall(lowered.as_text(debug_info=False))).items()))
+    """The Pallas-Triton kernels a lowered program calls, by name, with the call sites of each: each
+    Triton custom call's `name`, read from the attributes Pallas set (`mhlo.backend_config`)."""
+    calls: Counter[str] = Counter()
+
+    def visit(operation: ir.Operation) -> ir.WalkResult:
+        attributes = operation.attributes
+        if (operation.name == "stablehlo.custom_call"
+                and ir.StringAttr(attributes["call_target_name"]).value == TRITON):
+            calls[ir.StringAttr(ir.DictAttr(attributes["mhlo.backend_config"])["name"]).value] += 1
+        return ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
+    with module.context:
+        module.operation.walk(visit)
+    return dict(sorted(calls.items()))
 
 
 class Lowered(SystemExit):
