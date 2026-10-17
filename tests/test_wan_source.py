@@ -153,7 +153,7 @@ def pipeline(walk):
 @pytest.fixture(scope="module")
 def streamed(walk):
     """The pipeline loaded onto a mesh, its weights streamed as recipes and
-    wan_path a leaf at a time (tests/test_pipeline_streaming.py)."""
+    placed a leaf at a time (tests/test_pipeline_streaming.py)."""
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
