@@ -26,8 +26,9 @@ limits on memory, CPU, process count and CPU time. Use it for hostile code.
 A program that fails returns an `Outcome`, and the reward decides what a
 timeout or a crash is worth. A runner raises only when it cannot start a
 program at all: an `OSError` when the process cannot start, and an
-`InfrastructureError` when a container runtime starts no container. A
-session source retries either as an infrastructure failure.
+`InfrastructureError` when a container runtime starts no container or
+stalls removing one. A session source retries either as an infrastructure
+failure.
 
 `MathReward` is a verifiable reward that runs no program. It reads the
 completion's final answer and compares it with the reference as an exact
@@ -466,7 +467,8 @@ class ContainerRunner:
     and the process count at `pids`, and it runs as `user`. At the wall
     deadline the runner kills the client process, then force-removes the
     container by name. A runtime that exits without creating the container
-    (no daemon, no permission, no image) raises `InfrastructureError`.
+    (no daemon, no permission, no image), or whose removal does not return
+    within 60 seconds, raises `InfrastructureError`.
     """
 
     image: str
@@ -511,6 +513,7 @@ class ContainerRunner:
             process = subprocess.Popen(self.command(program, limits, directory, name, cidfile),
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, start_new_session=True)
+            stalled: subprocess.TimeoutExpired | None = None
             try:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
             finally:
@@ -520,13 +523,20 @@ class ContainerRunner:
                     # still being created, created or running.
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
-                    subprocess.run(
-                        [self.runtime, "rm", "--force", name], capture_output=True, timeout=60, check=False
-                    )
+                    try:
+                        subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
+                                       timeout=60, check=False)
+                    except subprocess.TimeoutExpired as error:
+                        # A wedged runtime: raised once the client below is reaped and its pipes closed.
+                        stalled = error
             try:
                 outcome = _outcome(process, streams, stopped, started, deadline)
             finally:
                 _closed(process)
+            if stalled is not None:
+                raise InfrastructureError(
+                    f"{self.runtime} rm --force did not return in 60 s; container {name} may still run"
+                ) from stalled
             if stopped is None and not (os.path.exists(cidfile) and Path(cidfile).read_text().strip()):
                 # The client ended without creating a container: the runtime
                 # failed, and the program never ran to be scored.

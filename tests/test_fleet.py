@@ -7,7 +7,8 @@ its output, one killed by a signal, one whose forked child must not outlive
 the timeout, and one that sleeps quietly while its collector waits without
 polling. The verifiable rewards score completions through the
 same fleet. The container runner repeats the boundary checks when a Docker
-daemon and the image are present locally.
+daemon and the image are present locally; a runtime that starts no
+container or stalls removing one is an infrastructure failure either way.
 """
 
 import resource
@@ -195,6 +196,22 @@ def test_a_runtime_that_cannot_start_the_container_raises():
         pytest.raises(InfrastructureError),
     ):
         fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+
+
+def test_a_runtime_that_stalls_removing_the_container_is_an_infrastructure_failure(tmp_path):
+    """A wedged runtime: `run` never returns, so the program times out, and the `rm --force` that
+    cleans up after it hangs too. The removal's own bound ends in an InfrastructureError, which a
+    session source retries, with the timeout as its cause."""
+    runtime = tmp_path / "runtime"
+    runtime.write_text("#!/bin/sh\nexec sleep 300\n")
+    runtime.chmod(0o755)
+    with (
+        SandboxFleet(ContainerRunner(IMAGE, runtime=str(runtime)), limits=SandboxLimits(wall_seconds=1),
+                     workers=1) as fleet,
+        pytest.raises(InfrastructureError) as caught,
+    ):
+        fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
