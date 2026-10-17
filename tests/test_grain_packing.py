@@ -68,3 +68,23 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
 
     memory = windows("memory")
     assert memory and memory == windows("indexed")
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_window_with_no_target_is_left_out_whatever_the_read(read):
+    """A window that holds one token alone has nothing to predict; a memory read leaves it out,
+    and a read that packs as it streams leaves it out too, so the steps a run takes do not change
+    with how it reads."""
+    documents = Memory([{"text": np.asarray([1], np.int32)}, {"text": np.asarray([2, 3], np.int32)}])
+    pipeline = Pipeline(documents).pack(4, segments=1)
+
+    def windows(read):
+        reader = validation(pipeline, batch=1, read=read, loading=READ)(DataPartition())
+        try:
+            return [np.asarray(batch["text"]).tolist() for batch in reader]
+        finally:
+            reader.close()
+
+    memory = windows("memory")
+    assert memory == [[[2, 3, 0, 0]]]
+    assert windows(read) == memory

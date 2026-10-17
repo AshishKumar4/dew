@@ -17,7 +17,7 @@ import grain.python as pygrain
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Record, Rejected
-from dew.records import integer, integers, record
+from dew.records import boolean, integer, integers, record
 
 _log = logging.getLogger(__name__)
 
@@ -295,6 +295,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
                 )
             ],
             "delivered": list(self._delivered),
+            "primed": self._primed,
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -313,7 +314,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         self._delivered = list(delivered)
         self._pending = [None for _ in self._reads]
         self._pending_states = [None for _ in self._reads]
-        self._primed = False
+        # A corpus whose first row was read ahead is restored to before it, and reads it when chosen.
+        self._primed = boolean(state["primed"], "primed")
 
     def close(self) -> None:
         for parent in self._reads:
@@ -436,7 +438,9 @@ class _PrimedRead(pygrain.DatasetIterator[Batch]):
     """One corpus of a mix. The mix captures every corpus's position for each
     record it gives (a packer captures it before each record), and only the
     corpus that gave the record moved, so a corpus captures its position again
-    only after it reads or is restored."""
+    only after it reads or is restored. The position records whether the mix
+    had read every corpus's first row ahead, so a restored mix reads each
+    corpus on from it and starts none again."""
 
     def __init__(self, group: _PrimeReads, index: int):
         super().__init__(group.parents[index])
@@ -452,14 +456,14 @@ class _PrimedRead(pygrain.DatasetIterator[Batch]):
             before = self._group.before
             self._state = (before[self._index] if self._index in before
                            else self._group.parents[self._index].get_state())
-        return self._state
+        return {"parent": self._state, "primed": self._group.done}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._state = None
-        self._group.parents[self._index].set_state(state)
+        self._group.parents[self._index].set_state(record(state["parent"], "primed corpus"))
         self._group.pending.pop(self._index, None)
         self._group.before.pop(self._index, None)
-        self._group.done = False
+        self._group.done = boolean(state["primed"], "primed")
 
     def close(self) -> None:
         self._group.parents[self._index].close()
@@ -488,28 +492,63 @@ class PrimedMix(pygrain.IterDataset[Batch]):
 
 
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
-    """Read per-corpus counters through Grain's nested iterator checkpoints."""
-    counted: dict[str, CorpusCounts] = {}
+    """Read per-corpus counters through Grain's nested iterator checkpoints.
 
-    def visit(branch):
+    Within one iterator a corpus's counters are its stages': the outermost
+    counts what it accepted, the deepest what was attempted, and each its own
+    rejections. The iterators Grain interleaves, its worker processes or a
+    corpus's shards, each read records of their own, so their counts add,
+    a shard waiting past the cycle (a future state) included."""
+
+    def visit(branch) -> dict[str, CorpusCounts]:
+        counted: dict[str, CorpusCounts] = {}
         if isinstance(branch, Mapping):
             corpus, stored = branch.get("corpus"), branch.get("counts")
             if isinstance(corpus, str) and isinstance(stored, Mapping):
-                parsed = CorpusCounts(corpus)
-                parsed.restore(stored)
-                if corpus not in counted:
-                    counted[corpus] = CorpusCounts(corpus, accepted=parsed.accepted)
-                combined = counted[corpus]
-                combined.attempted = max(combined.attempted, parsed.attempted)
-                combined.truncated = max(combined.truncated, parsed.truncated)
-                combined.chunks = max(combined.chunks, parsed.chunks)
-                combined.chunk_records = max(combined.chunk_records, parsed.chunk_records)
-                combined.rejected.update(parsed.rejected)
-            for child in branch.values():
-                visit(child)
+                counted[corpus] = CorpusCounts(corpus)
+                counted[corpus].restore(stored)
+            interleaved = branch.get("iterators_in_use_states")
+            if isinstance(interleaved, list):
+                # A restored interleave keeps the positions of shards past its cycle as future states.
+                future = branch.get("future_states") or {}
+                independent: dict[str, CorpusCounts] = {}
+                for child in (*interleaved, *(future.values() if isinstance(future, Mapping) else ())):
+                    for counts in visit(child).values():
+                        _added(independent, counts)
+                _nested(counted, independent)
+            for name, child in branch.items():
+                if name not in ("iterators_in_use_states", "future_states"):
+                    _nested(counted, visit(child))
         elif isinstance(branch, (tuple, list)):
             for child in branch:
-                visit(child)
+                _nested(counted, visit(child))
+        return counted
 
-    visit(state)
-    return counted
+    return visit(state)
+
+
+def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts]) -> None:
+    """Fold the counters of a corpus's inner stages into its outer ones', in one iterator."""
+    for corpus, counts in inner.items():
+        if corpus not in counted:
+            counted[corpus] = counts
+            continue
+        combined = counted[corpus]
+        combined.attempted = max(combined.attempted, counts.attempted)
+        combined.truncated = max(combined.truncated, counts.truncated)
+        combined.chunks = max(combined.chunks, counts.chunks)
+        combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
+        combined.rejected.update(counts.rejected)
+
+
+def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
+    """Add a corpus's counts from an iterator that read records of its own."""
+    if counts.name not in counted:
+        counted[counts.name] = CorpusCounts(counts.name)
+    combined = counted[counts.name]
+    combined.attempted += counts.attempted
+    combined.accepted += counts.accepted
+    combined.truncated += counts.truncated
+    combined.chunks += counts.chunks
+    combined.chunk_records += counts.chunk_records
+    combined.rejected.update(counts.rejected)
