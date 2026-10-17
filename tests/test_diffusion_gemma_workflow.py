@@ -1,5 +1,6 @@
 """The general pretrained interface loads, generates, decodes and saves DiffusionGemma."""
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -223,6 +224,23 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
     task, saved = again.block_generation(), BlockGeneration.from_run(str(run), ema=False)
     assert (task.process, task.max_new_tokens, task.pad_token_id) == (
         saved.process, saved.max_new_tokens, saved.pad_token_id) and task.pad_token_id == 5
+
+
+def test_a_block_process_round_trips_through_transformers_generation_config():
+    """A process with integer thresholds and its own temperatures and step
+    budget writes a generation config transformers' class accepts, and reads
+    back as the same process."""
+    from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationConfig
+
+    from dew.interop.diffusion_gemma import generation_config_of, generation_process
+
+    config = json.loads((FIXTURE / "config.json").read_text())
+    canvas, vocab = config.get("canvas_length", 256), config["text_config"]["vocab_size"]
+    process = BlockProcess(canvas_length=canvas, vocab_size=vocab, t_max=1, t_min=0.25, entropy_bound=1,
+                           max_steps=12, stability_threshold=3, confidence_threshold=1)
+    written = generation_config_of(process, max_new_tokens=canvas, pad_token_id=0)
+    DiffusionGemmaGenerationConfig(**written)
+    assert generation_process(config, json.loads(json.dumps(written))) == process
 
 
 def test_a_model_the_published_config_cannot_carry_is_refused_by_field():
