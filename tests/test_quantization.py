@@ -18,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_fp32_reduction_bound
+from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 
 from dew.config import ObjectiveConfig, OptimConfig
 from dew.nn.sharding import pipeline_microbatches
@@ -461,19 +461,33 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
           f"whole continuations={int(matches.all(axis=1).sum())}/{matches.shape[0]}")
 
 
-@pytest.fixture(scope="module")
-def flux_task(tmp_path_factory):
-    """The tiny FLUX source's text-to-image task: a matmul-only denoiser
-    beside CLIP and T5 towers and a VAE."""
+FLUX_BLOCKS = (r".*transformer_blocks_\d+/(attn/(to_|add_).+|ff.*)",)
+"""The FLUX blocks' projections and feed-forwards, at `flux_task`'s 64 features."""
+
+
+def flux_source(root: Path):
+    """The tiny FLUX source's text-to-image task, unpacked under `root`: a
+    matmul-only denoiser beside CLIP and T5 towers and a VAE. Its denoiser
+    is widened to 64 features over freshly drawn weights: the source's 24
+    make int8 GEMMs cuBLAS 13 refuses on an A100, as do its 16-wide inputs
+    and outputs, which `FLUX_BLOCKS` leaves in float."""
     import tarfile
-    from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
 
-    root = tmp_path_factory.mktemp("flux")
     with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
         archive.extractall(root, filter="data")
-    return Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+    task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+    model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
+    example = task.prepare("", key=0, steps=1)
+    params = model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
+                        **example.conditions)["params"]
+    return dataclasses.replace(task, model=model, variables={**task.variables, "params": params})
+
+
+@pytest.fixture(scope="module")
+def flux_task(tmp_path_factory):
+    return flux_source(tmp_path_factory.mktemp("flux"))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -490,10 +504,10 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
 
     qwix = pytest.importorskip("qwix")
     task = flux_task
-    served = task.quantized(Quantization(dtype=dtype, weight_only=weight_only))
+    served = task.quantized(Quantization(dtype=dtype, weight_only=weight_only, patterns=FLUX_BLOCKS))
     qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
     fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
-    rules = [qwix.QuantizationRule(module_path=".*", weight_qtype=qtype,
+    rules = [qwix.QuantizationRule(module_path=FLUX_BLOCKS[0], weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
                                     methods=entry_methods(task.model))
@@ -865,14 +879,15 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
     from dew.objectives.lm import LMObjective
     from dew.training.quantization import quantize_trunk
 
+    # Every int8 GEMM 32 wide or more: cuBLAS 13 refuses 16-wide ones on an A100.
     def decoder():
-        return CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                                 max_seq_len=8)
+        return CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=2, mlp_features=128,
+                                 max_seq_len=32)
 
     student, teacher = decoder(), decoder()
     objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
     quantize_trunk(objective, Quantization())
-    tokens = jnp.arange(8, dtype=jnp.int32)[None]
+    tokens = jnp.arange(32, dtype=jnp.int32)[None]
     variables = student.init(jax.random.key(0), tokens)
     trained, frozen = (entry.module for entry in objective.program_key())
     assert float(jnp.max(jnp.abs(jax.jit(trained.apply)(variables, tokens)
@@ -898,3 +913,162 @@ def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():
     np.testing.assert_array_equal(pinned, plain)
     quantized, plain = outputs(None)
     assert not np.array_equal(quantized, plain)
+
+
+def assert_computed_as_on_the_host(run, label: str) -> None:
+    """`run(dtype)` under the default device in float32, held as exact as the same run on the host's
+    CPU in float32 to the host's float64 (`assert_as_exact_as_the_reference`).
+
+    The host computes an int8 product exactly in either dtype, so a device whose int8 GEMM returns
+    twice its product (XLA's Triton fusion, openxla/xla#51016) is further from float64 by orders of
+    magnitude, while one that rounds its float parts in another order is as exact as the host."""
+    cpu = jax.devices("cpu")[0]
+    found = np.asarray(run(jnp.float32), np.float64)
+    with jax.default_device(cpu):
+        reference = np.asarray(run(jnp.float32), np.float64)
+        with jax.enable_x64(new_val=True):
+            truth = np.asarray(run(jnp.float64), np.float64)
+    assert_as_exact_as_the_reference(found, reference, truth, label)
+
+
+def placed(tree, dtype):
+    """`tree`'s host arrays on the default device, its floating leaves in `dtype`."""
+    return jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype if np.issubdtype(leaf.dtype, np.floating)
+                                                 else leaf.dtype), tree)
+
+
+def with_triton_gemms(flow) -> None:
+    """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
+    two that keep XLA's Triton GEMM fusion out of a program: deterministic ops and
+    `--xla_gpu_enable_triton_gemm=false` (tests/lane_environment.py's `REPEATABLE_GPU_FLAGS`). Its pinned
+    autotuning then gives every GEMM a program leaves to Triton the fusion, as XLA's own autotuner
+    does at small contractions, where it computed int8 dots as two or four times their product
+    (openxla/xla#51016). XLA reads its flags once a process."""
+    pytest.importorskip("qwix")
+    here = Path(__file__).resolve().parent
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
+    script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
+                         cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
+                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+    assert run.returncode == 0, run.stderr[-4000:]
+
+
+def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
+    """`TextGeneration.quantized` in int8 draws greedily and scores each draw (its raw
+    log-probabilities) as the same task on the host does: the device's int8 products are its
+    operands' products. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(served_text_flow)
+
+
+def served_text_flow():
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+
+    prompt = token_batch()["text"][:, :4]
+    held = jax.device_get(tiny().init(jax.random.key(0), jnp.asarray(prompt)))
+
+    def run(dtype):
+        task = TextGeneration(tiny(dtype=dtype), placed(held, dtype), sampling=Sampling(temperature=0),
+                              max_new_tokens=4)
+        served = task.quantized(Quantization(patterns=(".*_proj",)))
+        return served(jnp.asarray(prompt), key=7).host().raw_log_probs
+
+    assert_computed_as_on_the_host(run, "an int8 text task's log-probabilities")
+
+
+def test_an_int8_image_task_walks_as_the_host_does():
+    """`TextToImage.quantized` in int8 walks a prompt's latents as the same task does on the host,
+    from the same quantized weights and encoded prompt. With Triton's GEMMs open to XLA
+    (`with_triton_gemms`)."""
+    with_triton_gemms(image_flow)
+
+
+def image_flow():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        task = flux_source(Path(root))
+    served = task.quantized(Quantization(patterns=FLUX_BLOCKS))
+    prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
+
+    def run(dtype):
+        walked = dataclasses.replace(served, model=served.model.clone(dtype=dtype),
+                                     variables=placed(held, dtype))
+        return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
+
+    assert_computed_as_on_the_host(run, "an int8 image task's latents")
+
+
+def test_an_int8_decision_task_answers_as_the_host_does():
+    """`Decide` over a backbone quantized to int8 gives each option the probability the same task
+    gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(decision_flow)
+
+
+def decision_flow():
+    from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER
+
+    from dew.decision import Decide, DecisionObjective
+    from dew.decision.model import DecisionModel
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                                 max_seq_len=128, attention_impl="xla")
+    base = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    held = jax.device_get(base.init(jax.random.key(0)))
+    spec = Quantization(patterns=(".*_proj",))
+
+    def run(dtype):
+        model = DecisionModel(spec.apply(backbone.clone(dtype=dtype)), base.model.head.clone(dtype=dtype))
+        task = Decide(model, placed(held, dtype), LAYOUT, TOKENIZER, SPECIALS)
+        return task("charged twice!", {"team": INTENT})["team"].probabilities
+
+    assert_computed_as_on_the_host(run, "an int8 decision task's probabilities")
+
+
+def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
+    """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
+    of its loss that the host computes, from its forward's int8 products. With Triton's GEMMs open
+    to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(training_flow)
+
+
+def training_flow():
+    from dew.config.data import RecordsData, loader
+    from dew.data import Loading
+    from dew.training.trainer import Trainer
+
+    # Eight rows, one on each of the host's eight test devices.
+    spec, length = Quantization(patterns=(".*_proj",)), 4
+    batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
+    held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
+    objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
+    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=8,
+                  loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
+    moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
+                         held["params"], jax.device_get(state.variables["params"]))
+
+    def gradient(dtype):
+        step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
+        program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
+        variables = placed(held, dtype)
+        def loss(params):
+            stats, _ = program.loss({**variables, "params": params}, {"text": jnp.asarray(batch["text"])},
+                                    step)
+            return program.reduce_loss(stats)[0]
+
+        return jax.grad(loss)(variables["params"])
+
+    def flat(tree):
+        return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
+
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        reference = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float32)))
+        with jax.enable_x64(new_val=True):
+            truth = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float64)))
+    assert_as_exact_as_the_reference(flat(moved), reference, truth, "an int8 training step's gradient")

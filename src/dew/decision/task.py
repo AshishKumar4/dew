@@ -5,7 +5,7 @@ import binascii
 import functools
 import io
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -54,7 +54,8 @@ from dew.decision.questions import (
 from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
-from dew.nn.inputs import RowPlan, mesh_of
+from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -373,9 +374,20 @@ class Decide:
         plan = RowPlan.over(mesh_of(self.variables), count)
         return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
 
+    def _forward(self, variables: Variables, inputs: DecisionInputs, *,
+                 media: ModelInputs | None = None) -> jax.Array:
+        """`model.logits`, compiled once for each set of XLA options the model takes where it runs
+        (`compiler_options`)."""
+        model = self.model
+        options = compiler_options(model.backbone, model.head)
+        key = tuple(options.items())
+        if key not in self._forwards:
+            self._forwards[key] = jax.jit(model.logits, compiler_options=options)
+        return self._forwards[key](variables, inputs, media=media)
+
     @functools.cached_property
-    def _forward(self):
-        return jax.jit(self.model.logits)
+    def _forwards(self) -> dict[tuple[tuple[str, bool], ...], Callable[..., jax.Array]]:
+        return {}
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    group: int = 16) -> dict[str, Answer]:
@@ -466,8 +478,8 @@ class Decide:
         return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, reader: Reader) -> list[Scored]:
-        """Each answered question of `reader`'s rows, with its raw logits in the
-        order the row shows its options and its label."""
+        """Each answered question of `reader`'s rows, with its raw logits and its
+        gold distribution in the order the row shows its options."""
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
@@ -478,7 +490,7 @@ class Decide:
             for row, slot in zip(*np.nonzero(answered), strict=True):
                 count = int(np.sum(batch["options"][row, slot]))
                 scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],
-                                     int(batch["labels"][row, slot])))
+                                     np.asarray(batch["targets"][row, slot, :count], np.float64)))
         return scored
 
     def gated(self, min_confidence: float | Mapping[str, float]) -> Self:

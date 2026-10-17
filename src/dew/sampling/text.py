@@ -46,6 +46,7 @@ from dew.nn.inputs import (
     real_slots,
     valid_order,
 )
+from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
@@ -700,9 +701,14 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
-    """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs."""
+def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray], max_new_tokens: int,
+                 sampling: Sampling, n: int, *, capacity: int | None = None) -> np.ndarray:
+    """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs.
+
+    `capacity` is the cache slots a row holds, which a prompt's real tokens
+    and `max_new_tokens` must fit: a server's own capacity, or the model's
+    `max_seq_len` where None.
+    """
     if isinstance(model, BlockDenoiser):
         raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
                         "token at a time; generate with BlockGeneration")
@@ -721,7 +727,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     valid = real_slots(fields, ids.shape, xp=np)
     if not np.all(valid.any(axis=1)):
         raise ValueError("each prompt must contain at least one valid token")
-    cache_len = model.max_seq_len if isinstance(model, Bounded) else None
+    cache_len = capacity if capacity is not None or not isinstance(model, Bounded) else model.max_seq_len
     if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
     vocab = model.vocab_size if isinstance(model, Bounded) else None
@@ -902,10 +908,12 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 
 
 @functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None):
+def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The generation program over `rows`, compiled with the model's own XLA `options`
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None, None),
-                   out_shardings=(None, rows))
+                   out_shardings=(None, rows), compiler_options=dict(options))
 
 
 _DEFAULT_SAMPLING = Sampling()
@@ -971,10 +979,10 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    failure, output = _compiled(plan.sharding)(model, decoding_storage(model, params),
-                                               plan.place(request.padded()), plan.keys(request.key),
-                                               jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                                               *components)
+    program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
+    failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
+                              plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                              *components)
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

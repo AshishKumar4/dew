@@ -456,6 +456,30 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     assert cache.generation(first_key) is None
 
 
+def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(tmp_path):
+    """A run that stops mid-fill closes its writer unsealed, and no generation ever reads its
+    shards; once no process holds it, retention reclaims its bytes, so fills stopped again and
+    again do not fill the cache until a new one is refused. A shard here is one 128 KiB block,
+    so the cache holds one."""
+
+    def rows(index: int) -> Memory:
+        return Memory([{"id": index * 10 + row} for row in range(2)])
+
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, retry=0)
+    for index in range(3):
+        source = rows(index)
+        stopped = cache.mapped(grain.MapDataset.source(source.records("indexed")),
+                               Manifest(json.dumps({"source": index}).encode()), source)
+        stopped[0]
+        stopped.close()
+    source, key = Memory([{"id": 99}]), Manifest(b'{"source":"kept"}')
+    filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    filled[0]
+    filled.finish()
+    filled.close()
+    assert cache.publish(key, source)[0] == {"id": 99}
+
+
 def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
     from fsspec.implementations.memory import MemoryFileSystem
 
