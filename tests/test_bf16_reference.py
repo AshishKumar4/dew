@@ -90,12 +90,21 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
         return -jnp.mean(chosen)
 
     gradients = jax.grad(loss)(loaded.variables)
-    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")]
+    # Llama's key bias sums gradients that cancel by the softmax's shift invariance, which RoPE
+    # breaks only in part, so its error measures the attention backward's key cotangents rather
+    # than this sum; that is held apart (findings ledger 621).
+    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")
+              and not (name == "llama-tiny" and layout.name.endswith("k_proj.bias"))]
     assert biases
+    over = []
     for layout in biases:
         exact = truth[layout.name]
         dew = np.asarray(layout.export(gradients), np.float64).reshape(exact.shape)
-        assert_as_exact_as_the_reference(dew, reference[layout.name], exact, f"{name} {layout.name}")
+        try:
+            assert_as_exact_as_the_reference(dew, reference[layout.name], exact, f"{name} {layout.name}")
+        except AssertionError as failure:
+            over.append(str(failure))
+    assert not over, "\n".join(over)
 
 
 def denoise(model, variables, prompt, canvas, **conditioning):

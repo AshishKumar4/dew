@@ -2,19 +2,16 @@
 
 `Dense` and `DenseGeneral` are flax's, parameters, names, initializers and
 the product's interception points alike, so checkpoints, LoRA and Qwix see
-the layers they did. Only the bias reaches the sum at fp32 (`fp32_bias`),
-which sums its gradient at fp32, and the sum rounds back to the product's
-dtype. A layer given its own `dot_general` keeps that product's result, which
-Dew's fp32-result products (`fp32_result_dot_general`, `head_dot_general`)
-already widen, the bias summed at fp32 with them.
+the layers they did. Only the bias reaches the sum at fp32 (`fp32_bias`,
+through flax's `promote_dtype` field), which sums its gradient at fp32, and
+the sum rounds back to the product's dtype. A layer given its own
+`dot_general` keeps that product's result, which Dew's fp32-result products
+(`fp32_result_dot_general`, `head_dot_general`) already widen, the bias
+summed at fp32 with them.
 
-Each call runs flax's own body (`inspect.unwrap` of its method) inside this
-one: calling `super().__call__` would enter flax's method wrapper a second
-time, and every method interceptor (an adapter, an input quantization) would
-run twice on one layer.
+flax 0.12's Dense and DenseGeneral carry no `preferred_element_type`, which
+would widen the product instead; its Einsum and ConvTranspose do.
 """
-
-import inspect
 
 import jax
 from flax import linen as nn
@@ -33,18 +30,16 @@ def _rounded_back(layer: nn.Dense | nn.DenseGeneral, inputs: Array, summed: jax.
     return summed.astype(product_dtype(inputs, layer.param_dtype, layer.dtype))
 
 
-_DENSE = inspect.unwrap(nn.Dense.__call__)
-_DENSE_GENERAL = inspect.unwrap(nn.DenseGeneral.__call__)
-
-
 class Dense(nn.Dense):
     """Flax's Dense, its bias gradient accumulated at fp32 (the module docstring)."""
 
     promote_dtype: PromoteDtypeFn = fp32_bias(promote_dtype)
 
-    @nn.compact
+    # flax's own call manages the layer's state and runs its method interceptors once; this one
+    # only rounds its result, outside them (`nn.nowrap`, for an overridden core method).
+    @nn.nowrap
     def __call__(self, inputs: Array) -> jax.Array:
-        return _rounded_back(self, inputs, _DENSE(self, inputs))
+        return _rounded_back(self, inputs, super().__call__(inputs))
 
 
 class DenseGeneral(nn.DenseGeneral):
@@ -52,6 +47,6 @@ class DenseGeneral(nn.DenseGeneral):
 
     promote_dtype: PromoteDtypeFn = fp32_bias(promote_dtype)
 
-    @nn.compact
+    @nn.nowrap
     def __call__(self, inputs: Array) -> jax.Array:
-        return _rounded_back(self, inputs, _DENSE_GENERAL(self, inputs))
+        return _rounded_back(self, inputs, super().__call__(inputs))
