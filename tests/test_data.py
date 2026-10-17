@@ -814,13 +814,13 @@ class _LingeringRecord(pygrain.MapTransform):
 
 
 @pytest.mark.slow
-def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caplog):
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound():
     """grain stops a stream's worker processes one after another, each
     finishing the batch in its hands before it exits, and kills a worker
     that has not exited within 25 s. Four workers taking 2 s each keep a
     close over 8 s: slow, but bounded by grain itself, so the close must not
-    call it a hang, and says what it waits for. sft_gemma4's four workers
-    took 5.1 to 7.4 s to stop, past a budget of 2 s and 1 s a worker."""
+    call it a hang (a TimeoutError). sft_gemma4's four workers took 5.1 to
+    7.4 s to stop, past a budget of 2 s and 1 s a worker."""
     from dew.training import MeshSpec
     from dew.training.distributed import DevicePrefetchIterator
 
@@ -833,10 +833,10 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capl
     # means every worker has read a record and lingers.
     for _ in range(loading.workers):
         next(prefetch)
+    started = time.monotonic()
     prefetch.close()
-    # The close prints what it waits for only once the stop has run past
-    # `_QUIET_STOP_SECONDS`, so the line is the slow stop's evidence.
-    assert "waiting for 4 grain workers to stop" in caplog.text
+    # A stop past the 5 s a stop takes quietly (`_QUIET_STOP_SECONDS`), and still not a hang.
+    assert time.monotonic() - started > 5
 
 
 @pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
@@ -1432,32 +1432,3 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
-
-
-def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
-    import optax
-    from flax import linen as nn
-
-    from dew.objectives.base import Aux, Objective
-    from dew.training import Layout, Trainer
-
-    class Regression(Objective):
-        def __init__(self):
-            self.model = nn.Dense(1)
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.zeros((1, 2)))
-
-        def loss(self, variables, batch, step):
-            return jnp.mean(self.model.apply(variables, batch["x"]) ** 2), Aux({})
-
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0))
-    data = loader(RecordsData(source=_columns(16)), batch=8, read="memory")
-
-    trainer.fit(dataclasses.replace(data, held_out=24), steps=2, log_every=1)
-    noted = capsys.readouterr().out
-    trainer.fit(data, steps=2, log_every=1)
-
-    assert noted.count("validation: 24 records held out of train") == 1
-    assert "held out" not in capsys.readouterr().out

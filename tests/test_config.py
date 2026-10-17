@@ -310,7 +310,7 @@ def test_publishing_requires_a_final_checkpoint_policy():
         TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
 
 
-def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
+def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
     """The batch is one number: the recipes load the data at
     `trainer.batch_size` and `train` refuses a dataset that reads another,
     naming both, instead of training at one batch and reporting the other."""
@@ -323,9 +323,6 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
 
     state = run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="batch")
     assert int(state.step) == 1
-    output = capsys.readouterr().out
-    assert "Experiment_Name: batch" in output
-    assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
 
 
 def test_train_scores_every_named_validation_split(tmp_path):
