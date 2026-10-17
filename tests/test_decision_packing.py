@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from delta_rule_support import DECAY_SUMS, port_formula
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
@@ -35,6 +36,7 @@ from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
 from dew.decision.objective import _ALONG_THE_QUESTIONS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
+from dew.nn import linear
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Step
 from dew.training.trainer import Trainer
@@ -128,6 +130,37 @@ def rows_of(batch) -> list[tuple[int, int]]:
             for row in range(1, int(segments.max()) + 1)]
 
 
+def at_offset(batch, window: int, row: int) -> dict:
+    """Row `row` of window `window` alone where the window packed it, its question slots first: the
+    tokens before it one document of token 0 with no questions, so the window keeps its real tokens
+    first as the layout's are, and none of the window's other rows; its tokens at their places; then
+    segment-0 padding."""
+    segments = batch["segments"][window]
+    mine = segments == row
+    before = np.arange(segments.size) < np.flatnonzero(mine)[0]
+    asked = np.flatnonzero(owners(batch)[window] == row)
+    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
+    one |= {name: np.where(mine.reshape(-1, *(1,) * (batch[name].ndim - 2)), batch[name][window], 0)[None]
+            for name in ("tokens", "slots") if name in batch}
+    if "positions" in batch:
+        filler = np.cumsum(before) - 1
+        one["positions"] = np.where(mine, batch["positions"][window], np.where(before, filler, 0))[None]
+    return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
+
+
+def in_place(batch, window: int, row: int) -> dict:
+    """`batch` with row `row` alone in window `window` where the window packed it (`at_offset`) and
+    every other window empty: the packed batch's shapes, so every product a row's tokens enter runs
+    at the packed run's shapes."""
+    one = {name: np.zeros_like(value) for name, value in batch.items()}
+    for name, value in at_offset(batch, window, row).items():
+        one[name][window, :value.shape[1]] = value[0]
+    if "option_slots" in batch:
+        one["option_slots"][window], one["slotted"][window] = compacted(one["options"][window],
+                                                                        batch["option_slots"].shape[1])
+    return one
+
+
 def apart(batch) -> dict:
     """Each row of the batch's windows in a window of its own, as the packer lays out a window that
     holds one row: the row, then segment-0 padding to the window's length, and its question slots
@@ -166,7 +199,16 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
-@pytest.mark.parametrize("arm", sorted(ARMS))
+ON_THE_PORT = pytest.mark.skipif(jax.default_backend() != "cpu", reason=(
+    "Qwen3.5's delta rule runs on the port on a GPU, where "
+    "test_the_port_runs_a_packed_window_by_its_own_formula holds a packed window"))
+"""The arms over Qwen3.5, whose packing contract runs on the host: packing is the same plumbing on
+every device, and the delta rule's port runs a window as one sequence, its rows' decay prefixes
+shifted by those before them (`linear.FORGET`)."""
+
+
+@pytest.mark.parametrize("arm", [pytest.param("joint", marks=ON_THE_PORT),
+                                 pytest.param("marker", marks=ON_THE_PORT), "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives in a window of its own, through
@@ -176,6 +218,37 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
                                           objective.model.head.clone(dtype=jnp.float64)))
+
+
+@pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
+@pytest.mark.parametrize("arm", ["joint", "marker"])
+def test_the_port_runs_a_packed_window_by_its_own_formula(arm, monkeypatch):
+    """A packed window's logits and gradients on the GPU, Qwen3.5's Gated DeltaNet on the port, as
+    near the float64 rows in windows of their own as the same window with the port's formula in the
+    portable math (`port_formula`: each row's decay prefix shifted by the rows before it in its
+    chunk, `linear.FORGET`, every range two plain fp32 base-2 prefixes apart), within the float64
+    gate. fla's own packed path rounds in TF32 (~1e-3 in fp32), so this bar sits well inside fla
+    parity.
+
+    But the decay parameters (`DECAY_SUMS`), whose tokens the per-token port test holds, and the
+    scorer's norm scale, which sums every option's normalised feature times its logit's cotangent,
+    a draw of every token's rounding on the rule: on an A100 [marker]'s sat 2.2e-6 from float64 on the
+    port, 8.1e-7 by the formula and 2.8e-7 with the rule in float64. Each token's rule output is held
+    by the same per-token test."""
+    objective = objective_for(arm)
+
+    def held(path: str) -> bool:
+        return not any(decay in path for decay in (*DECAY_SUMS, "['scorer_norm']['scale']"))
+
+    def by_the_formula(objective, variables, batch):
+        with monkeypatch.context() as patched:
+            patched.setattr(linear, "fla_rule", port_formula)
+            logits, grads = decided(objective, variables, batch, objective.bounds.segments)
+        return asked(batch, logits), grads
+
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+                                          objective.model.head.clone(dtype=jnp.float64)),
+                              held=held, reference=by_the_formula)
 
 
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
@@ -203,11 +276,34 @@ def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_determin
                               held=attending_in_the_head)
 
 
-def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -> None:
+def asked(batch, logits) -> np.ndarray:
+    """A packed batch's logits at each row's questions' options, in the order `apart` lays the rows."""
+    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
+    return np.concatenate([np.asarray(logits)[window][slots][batch["options"][window][slots]]
+                           for (window, _), slots in zip(rows_of(batch), order, strict=True)])
+
+
+def rows_alone(objective, variables, batch):
+    """The logits and gradients of `batch`'s rows, each alone where its window packed it in a batch of
+    the packed batch's shapes (`in_place`), the logits at their questions' options and the gradients
+    summed over the rows: the packed run's own arithmetic, its products' shapes, the rule's chunks
+    and attention's row length the window's, so the two differ only where another row enters, and in
+    how the rows' gradients add."""
+    logits, grads = [], None
+    for window, row in rows_of(batch):
+        one = in_place(batch, window, row)
+        row_logits, row_grads = decided(objective, variables, one, objective.bounds.segments)
+        logits.append(np.asarray(row_logits)[window][one["options"][window]])
+        grads = row_grads if grads is None else jax.tree.map(jnp.add, grads, row_grads)
+    return np.concatenate(logits), grads
+
+
+def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True, reference=rows_alone) -> None:
     """Two packed windows of the examples decide each row's questions as the row does in a window
     of its own, logits and the gradients of the leaves `held` names (by `jax.tree_util.keystr`)
     within the float64 gate, the truth `wide_modules`, the backbone and head in float64, over the
-    rows alone."""
+    rows alone. `reference(objective, variables, batch)` is the run the gate measures against, its
+    logits in `asked`'s order: the rows alone, or the window by another formula."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -217,11 +313,9 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     assert int(np.max(laid.segments)) <= laid.max_segments == segments
     variables = objective.init(jax.random.key(0))
     packed_logits, packed_grads = decided(objective, variables, batch, segments)
-    order = [owners(batch)[window] == row for window, row in rows_of(batch)]
-    packed = np.concatenate([np.asarray(packed_logits)[window][asked][batch["options"][window][asked]]
-                             for (window, _), asked in zip(rows_of(batch), order, strict=True)])
+    packed = asked(batch, packed_logits)
+    logits, grads = reference(objective, variables, batch)
     rows = apart(batch)
-    logits, grads = decided(objective, variables, rows, segments)
     with jax.enable_x64(new_val=True):
         wide = copy.copy(objective)
         wide.substitute(wide_modules)
@@ -232,7 +326,6 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
         # near-zero sizes, are their rounding's scale (tests/reference_error.py).
         truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
         truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
-    logits = np.asarray(logits)[rows["options"]]
 
     def kept(tree):
         return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
@@ -242,9 +335,10 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     packed_grads, grads, truth_grads, terms = (kept(tree)
                                                for tree in (packed_grads, grads, truth_grads, terms))
     assert packed_grads, "no gradient leaf held"
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": logits, "grads": grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=objective.layout.max_len,
-                           terms={"logits": truth, "grads": terms})
+    # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
+    # another order than the rows alone.
+    assert_leaves_as_exact(packed, logits, truth, reductions=objective.layout.max_len, terms=truth)
+    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
