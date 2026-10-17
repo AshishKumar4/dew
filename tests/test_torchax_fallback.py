@@ -13,6 +13,7 @@ captured head input through `chunked_cross_entropy`'s own logsumexp and
 lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 """
 
+import copy
 import math
 from dataclasses import replace
 
@@ -149,7 +150,11 @@ LLAMA = {**TINY, "num_key_value_heads": 2, "tie_word_embeddings": True}
 HEADS = {"zero bias": ("TorchCausalLM", "float32"), "bias": ("TorchCausalLM", "float32"),
          "softcap": ("TorchCausalLM", "float32"), "tied": ("TorchTableLM", "float32"),
          "bf16 tied": ("TorchTableLM", "bfloat16")}
-"""Each head below, the module it loads as and the dtype it is stored and computed in."""
+"""Each head below, the module it loads as and the dtype its checkpoint stores.
+Every one computes in float32. Over bf16 compute torchax's XLA ops and torch's
+part by their own bf16 roundings, which a scalar loss over 128 tokens cannot
+average out (measured: logits 8.3e-4 and 8.0e-4 from float64 in RMS, the
+losses 1.5e-4 and 3.0e-5)."""
 
 
 def head_model(head):
@@ -169,15 +174,16 @@ def head_model(head):
     return model
 
 
-def torch_step(model, tokens) -> dict[str, np.ndarray]:
+def torch_step(model, tokens, stored=torch.float32) -> dict[str, np.ndarray]:
     """transformers' own loss over `tokens` and torch autograd's gradient of
-    every parameter, in the model's dtype, as float64 arrays."""
+    every parameter, rounded to the `stored` dtype a parameter is kept in,
+    as float64 arrays."""
     ids = torch.from_numpy(tokens.astype(np.int64))
     model.zero_grad()
     loss = model(ids, labels=ids).loss
     loss.backward()
     return {"loss": np.asarray([loss.item()])} | {
-        name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()}
+        name: parameter.grad.to(stored).double().numpy() for name, parameter in model.named_parameters()}
 
 
 @pytest.mark.parametrize("head", HEADS)
@@ -186,15 +192,17 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
     now, loads as a model a loss scores whole; a plain head, tied or bf16,
     as one whose head input and weight it scores. Either way LMObjective's
     loss and its gradient of every parameter, the head bias included, are
-    as exact as transformers' own, both measured from transformers in
-    float64 (tests/reference_error.py). A leaf whose sum cancels by design
-    (a key bias's gradient, under the softmax's shift invariance) is sized
-    by its float64 terms, which Dew's own forward sums in float64."""
-    module, dtype = HEADS[head]
+    as exact as transformers' own over the same stored weights, both measured
+    from transformers in float64 (tests/reference_error.py); a bf16 store's
+    gradients round to bf16 on both sides, as the parameters they update are
+    kept. A leaf whose sum cancels by design (a key bias's gradient, under the
+    softmax's shift invariance) is sized by its float64 terms, which Dew's own
+    forward sums in float64."""
+    module, stored = HEADS[head]
     model = head_model(head)
     model.save_pretrained(tmp_path)
     with pytest.warns(UserWarning):
-        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype=dtype, param_dtype=dtype)
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32", param_dtype=stored)
     assert type(loaded.model).__name__ == module
 
     def step(source):
@@ -208,7 +216,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
     value, grads = loss(params)
     dew = {"loss": np.asarray([value], np.float64)} | {
         name: np.asarray(grads[name], np.float64) for name in names}
-    reference = torch_step(model, tokens)
+    reference = torch_step(copy.deepcopy(model).float(), tokens, getattr(torch, stored))
     # Truth: the same weights in a model built in float64, its float32 pins
     # (the loss's logits.float(), an RMS norm's upcast) widened and its
     # rotary tables rebuilt; Dew's own float64 terms under the same widening.
