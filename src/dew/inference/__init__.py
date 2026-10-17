@@ -8,6 +8,7 @@ from .nccl import NCCLPush
 from .pipeline import RunProcessor, pipeline
 from .rollouts import (
            Draw,
+           InfrastructureError,
            NativeRolloutServer,
            OpenAIRolloutServer,
            Publication,
@@ -24,6 +25,7 @@ __all__ = [
     "Completion",
     "DenoisingInputs",
     "Draw",
+    "InfrastructureError",
     "HeldBanks",
     "Images",
     "LayerBanks",

@@ -1,8 +1,8 @@
 """The rollout scheduler driving a real `Trainer`: a tiny model trains
-through two-turn in-process environments on Dew's own server. An
-environment that times out on a first attempt is an infrastructure failure
-the scheduler retries, and a verifier that returns a non-finite reward stops
-the run instead of being retried."""
+through two-turn in-process environments on Dew's own server. A sandboxed
+environment that runs past its wall clock on a first attempt is an
+infrastructure failure the scheduler retries, and a verifier that returns a
+non-finite reward stops the run instead of being retried."""
 
 import math
 from contextlib import contextmanager
@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from episode_support import environment as sandbox
 
 from dew.data.dataset import Loader
 from dew.inference import NativeRolloutServer, TextGeneration
@@ -29,17 +30,12 @@ WIDTH = 48
 
 
 class Tools:
-    """Two tool turns: each appends the action and one tool id, then the task completes.
+    """Two tool turns: each appends the action and one tool id, then the task completes."""
 
-    With `fail`, the reset raises the error a sandbox past its wall clock raises.
-    """
-
-    def __init__(self, task, fail=False):
-        self.context, self.steps, self.fail = (1, 2 + task % 3), 0, fail
+    def __init__(self, task):
+        self.context, self.steps = (1, 2 + task % 3), 0
 
     def reset(self):
-        if self.fail:
-            raise TimeoutError("sandbox exceeded wall_seconds")
         return Observation(self.context)
 
     def step(self, action):
@@ -148,16 +144,22 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
 
 
 def test_an_environment_timeout_is_retried_and_its_group_still_trains():
-    """The source's own deadline, not a scheduler clock, ends a hung environment;
-    the scheduler resubmits each sample it failed, and every group trains."""
+    """Each sample's first attempt runs in a sandboxed worker that hangs at reset. The sandbox's
+    own wall clock, not a scheduler clock, ends it; the scheduler resubmits each sample it failed,
+    and every group trains."""
     attempted = set()
+    hanging = sandbox("hang", wall_seconds=1)
 
     @contextmanager
     def flaky(task, identity):
         # A resubmission is a one-sample submit, so it is sample 0 of its task again.
         first = (task.id, identity.sample) not in attempted
         attempted.add((task.id, identity.sample))
-        yield Tools(int(task.id), fail=first)
+        if first:
+            with hanging(identity) as hung:
+                yield hung
+        else:
+            yield Tools(int(task.id))
 
     tasks = math.lcm(2, jax.device_count())
     _, state, [record], watched, _ = train(flaky, fives, tasks=tasks, steps=1, max_lag=0, ahead=0)
@@ -166,7 +168,7 @@ def test_an_environment_timeout_is_retried_and_its_group_still_trains():
     assert record.resubmitted == {"infra_error": 2 * tasks}
     failed = [rollout for rollout in watched.rollouts if rollout.status == Status.INFRA_ERROR]
     assert len(failed) == 2 * tasks
-    assert all("sandbox exceeded wall_seconds" in rollout.detail for rollout in failed)
+    assert all("TimeoutError" in rollout.detail and not rollout.calls for rollout in failed)
 
 
 def test_a_non_finite_reward_stops_the_run_instead_of_being_retried():

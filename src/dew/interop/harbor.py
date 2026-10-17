@@ -59,7 +59,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -404,13 +404,15 @@ class HarborSource:
       environment provider, timeouts and agent kwargs.
     - `workers` is how many trials run at once. Harbor's own sandbox limits
       apply inside each trial.
-    - `trial_timeout`, when set, bounds each trial's Harbor process in
-      seconds from its start. Harbor bounds the environment build, the
-      agent's setup and run, and the verifier itself (`--agent-timeout`,
-      `--verifier-timeout`, `--timeout-multiplier` in `arguments`), but no
-      option of its own bounds the whole trial. A trial past this deadline
-      is interrupted as `cancel` interrupts it, and resolves `INFRA_ERROR`,
-      which the scheduler retries.
+    - `trial_timeout`, when set, bounds each trial in seconds from its
+      start. Harbor bounds the environment build, the agent's setup and
+      run, and the verifier itself (`--agent-timeout`, `--verifier-timeout`,
+      `--timeout-multiplier` in `arguments`), but no option of its own
+      bounds the whole trial. A trial past this deadline is interrupted as
+      `cancel` interrupts it, and resolves `INFRA_ERROR`, which the
+      scheduler retries. Its output is read for one more `grace` after the
+      SIGKILL; output still open then is held by a process that left the
+      trial's group, and reading stops there.
 
     The harness must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
     Harbor's mini-swe-agent does.
@@ -529,25 +531,21 @@ class HarborSource:
                 self._interrupt(record)
 
     def _interrupt(self, record: _Trial) -> None:
-        """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock.
-
-        A trial is live until its output closes (`record.process` is None
-        after that), not until Harbor exits: a child left in its group can
-        hold the output open after Harbor is gone. Neither this nor the
-        escalation reaps Harbor, so its group id stays its own until then.
-        """
-        if record.timer is None and record.process is not None:
-            _signal(record.process, signal.SIGINT)
+        """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock."""
+        process = _live(record)
+        if record.timer is None and process is not None:
+            _signal(process, signal.SIGINT)
             record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
         """The trial's output stayed open for a whole grace period: signal the group again, SIGTERM then
         SIGKILL."""
         with self._lock:
-            if record.process is None:
+            process = _live(record)
+            if process is None:
                 return
-            _logger.warning("Harbor trial %d outlived its grace; sending %s", record.process.pid, sent.name)
-            _signal(record.process, sent)
+            _logger.warning("Harbor trial %d outlived its grace; sending %s", process.pid, sent.name)
+            _signal(process, sent)
             if sent is signal.SIGTERM:
                 record.timer = _timer(self._grace, self._escalate, record, signal.SIGKILL)
 
@@ -626,12 +624,13 @@ class HarborSource:
                 with self._lock:
                     record.expired = True
                     self._interrupt(record)
-                log, _ = process.communicate()
+                log = self._drained(process)
             with self._lock:
                 record.process = None
                 cancelled, expired = record.cancelled, record.expired
                 if record.timer is not None:
                     record.timer.cancel()
+            record.closed.set()
             try:
                 future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
                                                 cancelled, expired, version))
@@ -645,6 +644,22 @@ class HarborSource:
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)
+
+    def _drained(self, process: subprocess.Popen[str]) -> str:
+        """The rest of an interrupted trial's output, read until a `grace` after its group's SIGKILL.
+
+        Output still open then is held by a process outside the group, so
+        the pipe is closed instead and Harbor, killed with its group, is
+        reaped. The verdict of an expired trial does not read the log.
+        """
+        try:
+            log, _ = process.communicate(timeout=3 * self._grace)
+        except subprocess.TimeoutExpired:
+            assert process.stdout is not None
+            process.stdout.close()
+            process.wait()
+            return ""
+        return log
 
     def _verdict(self, ended: Callable[..., Session], session: str, trial: Path, log: str, returncode: int,
                  cancelled: bool, expired: bool, version: int) -> Session:
@@ -680,12 +695,27 @@ class HarborSource:
 @dataclass
 class _Trial:
     """What `cancel` and the deadline need of one submitted sample: whether it was cancelled or ran
-    past `trial_timeout`, its running Harbor, and the timer of its next escalation."""
+    past `trial_timeout`, its running Harbor, the timer of its next escalation, and whether its
+    output has closed."""
 
     cancelled: bool = False
     expired: bool = False
     process: subprocess.Popen[str] | None = None
     timer: threading.Timer | None = None
+    closed: threading.Event = field(default_factory=threading.Event)
+
+
+def _live(record: _Trial) -> subprocess.Popen[str] | None:
+    """The trial's Harbor while its output is open and Harbor unreaped; None after.
+
+    A trial is live until its output closes, not until Harbor exits: a child
+    left in its group can hold the output open after Harbor is gone. Harbor
+    is reaped only once the output closes, and until then its pid, the
+    group's id, cannot be given to another process, so signalling the group
+    reaches the trial's processes and no others.
+    """
+    process = record.process
+    return process if process is not None and process.returncode is None else None
 
 
 def _timer(seconds: float, action: Callable[[_Trial, signal.Signals], None], record: _Trial,
@@ -704,21 +734,22 @@ def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
 
 def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
     """At interpreter exit: cancel every trial, interrupt the live ones, and
-    kill their process groups after `grace`, as `ProcessRunner` kills a
-    program's group after it exits, so a child Harbor left behind dies too."""
+    kill the process group of each whose output is still open `grace`
+    seconds later, so a child Harbor left behind dies too."""
     with lock:
         live = []
         for record in records.values():
             record.cancelled = True
-            if record.process is not None:
-                live.append(record.process)
-    for process in live:
+            process = _live(record)
+            if process is not None:
+                live.append((record, process))
+    for _, process in live:
         _signal(process, signal.SIGINT)
     deadline = time.monotonic() + grace
-    for process in live:
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(max(0.0, deadline - time.monotonic()))
-        _signal(process, signal.SIGKILL)
+    for record, process in live:
+        # The trial's own thread reads its output and reaps Harbor, then marks it closed.
+        if not record.closed.wait(max(0.0, deadline - time.monotonic())) and process.returncode is None:
+            _signal(process, signal.SIGKILL)
 
 
 def _harness_exit(trial: Path) -> str | None:

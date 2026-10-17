@@ -16,17 +16,19 @@ one packer. Each call keeps the version its request was submitted under, so
 a session that spans a weight push carries both versions.
 
 The statuses follow the scheduler's failure policy. An infrastructure
-failure is an INFRA_ERROR session, retried and never scored: a failed draw,
-an environment that reports ERROR, and an `InfrastructureError` or
-`OSError` that the environment, the verifier or the reward raises. Those
-are a lost connection, a sandbox past its wall clock or with a dead worker
-(`SubprocessEnvironment`), a container runtime that started no container
-(`ContainerRunner`), and any boundary failure a callback reports as an
-`InfrastructureError`. A context, token or turn limit truncates, and only
-COMPLETED and TRUNCATED sessions reach the verifier. Any other error is
-broken code or a broken contract, such as a non-finite reward or an
-environment that returns no `Observation`: it fails the rollout's future,
-and the scheduler raises it.
+failure is an INFRA_ERROR session, retried and never scored: a draw the
+server cancelled, an environment that reports ERROR, and an
+`InfrastructureError` or `OSError` that the draw, the environment, the
+verifier or the reward fails with. Those are an engine that cannot be
+reached, times out or answers 5xx or 429 (the remote rollout servers), a
+lost connection, a sandbox past its wall clock or with a dead worker
+(`SubprocessEnvironment`), a container runtime that starts no container or
+stalls removing one (`ContainerRunner`), and any boundary failure a
+callback reports as an `InfrastructureError`. A context, token or turn
+limit truncates, and only COMPLETED and TRUNCATED sessions reach the
+verifier. Any other error is broken code or a broken contract, such as a
+non-finite reward or likelihood, or an environment that returns no
+`Observation`: it fails the rollout's future, and the scheduler raises it.
 
 `PromptSource` is the single-turn case: one call per sample, scored on
 decoded text by a reward on scorer threads as each draw finishes, so
@@ -46,7 +48,7 @@ from uuid import uuid4
 import jax
 import numpy as np
 
-from dew.inference.rollouts import Draw, RolloutServer
+from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
 from dew.objectives.base import Batch
 
 from .episodes import (
@@ -61,10 +63,10 @@ from .episodes import (
     step_action,
 )
 from .rollout import Reward, prompt_rows
-from .sessions import Call, InfrastructureError, Session, Status, Task
+from .sessions import Call, Session, Status, Task
 
 _INFRASTRUCTURE = (InfrastructureError, OSError)
-"""What a callback raises when its external boundary, not its code, failed."""
+"""What a draw or a callback fails with when its external boundary, not its code, failed."""
 
 
 def _failure(error: BaseException) -> str:
@@ -72,11 +74,19 @@ def _failure(error: BaseException) -> str:
 
 
 def _draw_failure(drawn: Future[Draw]) -> str | None:
-    """Why the server returned no draw on the finished `drawn`, or None when it returned one."""
+    """Why the server returned no draw on the finished `drawn`, or None when it returned one.
+
+    A draw the server cancelled, or one its infrastructure failed, is
+    missing; any other failure is a broken server or policy, and is raised.
+    """
     if drawn.cancelled():
         return "draw: cancelled by the server"
     failure = drawn.exception()
-    return None if failure is None else f"draw: {_failure(failure)}"
+    if failure is None:
+        return None
+    if isinstance(failure, _INFRASTRUCTURE):
+        return f"draw: {_failure(failure)}"
+    raise failure
 
 
 @dataclass
@@ -203,13 +213,24 @@ class EnvironmentSource:
         episode = EpisodeProgress(identity)
         draws: list[Draw] = []
         binding = uuid4().hex
+        broken = False
         try:
             with self.environment(task, identity) as environment:
-                self._play(episode, environment, key, handle, draws)
+                try:
+                    self._play(episode, environment, key, handle, draws)
+                except _INFRASTRUCTURE:
+                    raise
+                except BaseException:
+                    broken = True
+                    raise
             if episode.status not in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
                 episode.score(lambda finished: self.verifier(task, finished), version, binding)
         except _INFRASTRUCTURE as error:
-            # The environment's or the verifier's boundary failed: infrastructure, retried.
+            if broken:
+                # The environment's exit failed while broken code was raising: the failure carries
+                # that error as its context and is raised, not retried.
+                raise
+            # The draw's, the environment's or the verifier's boundary failed: infrastructure, retried.
             episode.abort(EpisodeStatus.ERROR, _failure(error))
         session = session_of(episode.episode(version, binding), group="")
         # An episode records what the environment saw; the engine records of
@@ -264,9 +285,10 @@ class PromptSource:
     `decode` turns the sampled ids into text, and `reward` scores that text,
     without the EOS, on `scorers` threads as soon as each draw finishes. A
     draw that ends on its token budget is TRUNCATED and still scored. A
-    failed draw, and an `InfrastructureError` or `OSError` the reward
-    raises, such as a container runtime that started no container, give an
-    INFRA_ERROR session. A non-finite reward and any other error of the
+    draw the server cancelled, and an `InfrastructureError` or `OSError`
+    the draw or the reward fails with, such as an unreachable engine or a
+    container runtime that started no container, give an INFRA_ERROR
+    session. A non-finite reward and any other error of the draw, the
     decode or the reward resolve the rollout's future with the exception, so
     no future is left pending.
     """

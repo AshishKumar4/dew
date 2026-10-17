@@ -219,7 +219,7 @@ def test_a_container_runtime_that_starts_no_container_is_an_infra_error_in_both_
         session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
         episodes.close()
     for failed in (rollout, session):
-        assert failed.status == Status.INFRA_ERROR and "created no container" in failed.detail
+        assert failed.status == Status.INFRA_ERROR and "InfrastructureError" in failed.detail
 
 
 def unreachable():
@@ -230,12 +230,13 @@ def unreachable():
 
 
 def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
-    """Two HTTP paths to a port nothing listens on. Dew's vLLM rollout server fails the draw,
-    and both sources retry the session. A verifier that judges over httpx reports its transport
-    error, which is not an OSError, as an InfrastructureError, and is retried as well."""
+    """Two HTTP paths to a port nothing listens on. Dew's vLLM rollout server fails the draw with
+    an InfrastructureError caused by httpx's ConnectError, and both sources retry the session. A
+    verifier that judges over httpx reports its transport error, which is not an OSError, as an
+    InfrastructureError, and is retried as well."""
     import httpx
 
-    from dew.objectives.rl import InfrastructureError
+    from dew.inference import InfrastructureError
 
     url = unreachable()
     engine = VLLMGenerateServer(url, Sampling(temperature=1.0, top_k=4, eos_token_ids=EOS),
@@ -251,7 +252,8 @@ def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
     finally:
         engine.close()
     for failed in (session, rollout):
-        assert failed.status == Status.INFRA_ERROR and "ConnectError" in failed.detail
+        assert failed.status == Status.INFRA_ERROR and "InfrastructureError" in failed.detail
+        assert "ConnectError" in failed.detail
 
     def judged(task, episode):
         try:
@@ -288,6 +290,43 @@ def test_a_contract_error_fails_the_rollouts_future_instead_of_being_retried():
     with pytest.raises(ValueError):
         garbled.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
     garbled.close()
+
+
+def test_a_draw_that_breaks_its_contract_fails_both_sources_rollouts():
+    """A draw future that fails with anything but an infrastructure error, as a native draw with
+    non-finite likelihoods does, is a broken server or policy: both sources raise it."""
+    class Broken(Server):
+        def submit(self, prompt, max_new_tokens, *, key):
+            future = Future()
+            future.set_exception(ValueError("drawn likelihoods must be finite"))
+            return future
+
+    episodes = source(Broken(), factory([], []))
+    with pytest.raises(ValueError):
+        episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    episodes.close()
+    [task] = prompt_tasks(prompt_batch())
+    prompts = PromptSource(Broken(), lambda *_: 1.0, decode=str, max_new_tokens=4)
+    with pytest.raises(ValueError):
+        prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
+    prompts.close()
+
+
+def test_an_environment_exit_that_fails_after_broken_code_does_not_turn_it_into_a_retry():
+    """The environment returns no Observation, then its exit fails with an OSError. The OSError
+    that `with` raises carries the broken code's error, and the rollout fails with it."""
+    @contextmanager
+    def environment(task, identity):
+        try:
+            yield Counter(fail="malformed")
+        finally:
+            raise ConnectionError("the sandbox was gone before its release")
+
+    episodes = source(Server(), environment)
+    with pytest.raises(ConnectionError) as caught:
+        episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    episodes.close()
+    assert isinstance(caught.value.__context__, TypeError)
 
 
 @pytest.mark.parametrize("server, options, calls, detail", [

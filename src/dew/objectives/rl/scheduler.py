@@ -38,10 +38,11 @@ replaced according to its status:
 
 The scheduler keeps no clock of its own: a deadline belongs to the
 operation that can stop when it passes. The remote rollout servers bound
-each request, a sandbox its `wall_seconds`, and `HarborSource` each trial
-(`trial_timeout`). A rollout that runs out of time there comes back with
-the status its source gives it, an INFRA_ERROR for a request, a sandboxed
-environment or a Harbor trial that timed out, which the scheduler retries.
+each request, a sandboxed environment (`SubprocessEnvironment`) its
+`wall_seconds`, and `HarborSource` each trial (`trial_timeout`). A rollout
+that runs out of time there comes back as an INFRA_ERROR, which the
+scheduler retries. A reward's program past its sandbox's wall clock is a
+TIMEOUT verdict that the reward scores, not a failure.
 
 A source that raises an exception instead of returning a status is broken.
 The scheduler cancels the batch's remaining rollouts and lets the exception

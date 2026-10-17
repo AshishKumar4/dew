@@ -20,7 +20,7 @@ import time
 import pytest
 from tool_support import load
 
-from dew.objectives.rl import InfrastructureError
+from dew.inference import InfrastructureError
 from dew.rl.sandbox import (
     ContainerRunner,
     MathReward,
