@@ -513,8 +513,11 @@ class InputQuantization:
     (`measured_fp8_sites`). LoRA packs their kernels from the base it
     freezes, the one place a kernel is known never to train."""
     measured_on: str | None = None
-    """The GPU generation `frozen_fp8` was measured on (`sm90`); a site runs
-    its FP8 product on that generation alone."""
+    """The GPU generation `frozen_fp8` was measured on (`sm90`): where its
+    sites measured faster in FP8, which another generation may not repeat.
+    The product is ordinary arithmetic on the stored codes and scales and
+    runs on any generation; measure that GPU's sites for its own speed
+    (LoRA.fp8_base)."""
 
     def __post_init__(self) -> None:
         if self.format == "modelopt" and not self.e4m3_scale:
@@ -571,16 +574,6 @@ class InputQuantization:
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
-    def refuse_other_fp8_generation(self, module: nn.Module) -> None:
-        """Refuse a frozen FP8 product on a GPU other than the one its sites
-        were measured on, by name: where FP8 pays differs by generation."""
-        from dew.nn.kernels.generation import device_generation
-
-        if device_generation() != self.measured_on:
-            raise ValueError(f"{'/'.join(module.path)} multiplies its frozen kernel in FP8 as measured on "
-                             f"{self.measured_on}, and this is {device_generation()}; measure this GPU's "
-                             "sites (LoRA.fp8_base)")
-
     def apply(self, model: nn.Module) -> nn.Module:
         """Return `model` quantizing each Linear's input to its declared format
         and back with its scales, before the layer's dot, and computing each
@@ -611,7 +604,6 @@ class InputQuantization:
             if quantizer is not None:
                 inputs = quantizer.qdq(inputs)
             if frozen:
-                record.refuse_other_fp8_generation(module)
                 return frozen_fp8_dense(module, inputs)
             if args:
                 return next_fun(inputs, *args[1:], **kwargs)
@@ -1051,9 +1043,6 @@ def _providers() -> tuple[type, type]:
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    dot_general = _qwix("qwix._src.core.dot_general")
-    einsum = _qwix("qwix._src.core.einsum")
     quantized = _qwix("qwix._src.providers.ptq").WithAux
     group_scaled = _group_scaled_convolution()
 
@@ -1113,9 +1102,9 @@ def _providers() -> tuple[type, type]:
 
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
-                _einsum_fn=_scaled_in_float32(einsum.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+                rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
+                _einsum_fn=_scaled_in_float32(qwix.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
             # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8

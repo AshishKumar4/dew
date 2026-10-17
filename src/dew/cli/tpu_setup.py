@@ -220,13 +220,18 @@ def tail(job: str, worker: int, follow: bool, lines: int = 200) -> str:
     return f"tail {following}-n {lines} {log_path(job, worker)}"
 
 
-def disk_startup_script() -> str:
-    """Mount an attached data disk on boot, and keep it mounted."""
+def disk_startup_script(read_only: bool = False) -> str:
+    """Mount an attached data disk on boot, and keep it mounted: opened to every user, or, attached
+    `read_only`, mounted read-only, as a disk several workers share is. A disk that does not mount
+    fails the script, before the boot disk's directory is opened up or named in fstab as the disk's:
+    writes under the mount would otherwise land on the boot disk, which the VM does not keep."""
     mount = DISK_MOUNT
+    options = "ro,nofail" if read_only else "defaults,nofail"
     return (
         "#!/bin/bash\n"
+        "set -euo pipefail\n"
         f"mkdir -p {mount}\n"
-        f"mountpoint -q {mount} || mount /dev/sdb {mount} || true\n"
-        f"chmod 777 {mount}\n"
-        f"grep -q ' {mount} ' /etc/fstab || echo '/dev/sdb {mount} ext4 defaults,nofail 0 2' >> /etc/fstab\n"
+        f"mountpoint -q {mount} || mount {'-o ro ' if read_only else ''}/dev/sdb {mount}\n"
+        + ("" if read_only else f"chmod 777 {mount}\n")
+        + f"grep -q ' {mount} ' /etc/fstab || echo '/dev/sdb {mount} ext4 {options} 0 2' >> /etc/fstab\n"
     )

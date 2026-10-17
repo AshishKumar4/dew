@@ -268,13 +268,14 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
     np.testing.assert_array_equal(np.asarray(output), np.asarray(expected.reshape(output.shape)))
 
 
-def test_a_record_runs_on_the_generation_it_was_measured_on_alone():
-    """A record measured on this process's generation runs here, and is refused by name on any
-    other: an A100's record on an H100, anything else's on an A100."""
+def test_a_record_runs_on_another_generation_than_it_was_measured_on():
+    """Where a record's sites were measured is provenance, not a bar: it computes here and on any
+    other generation alike, an A100's record on an H100 and anything else's on an A100."""
     _, fp8 = adapters()
-    jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    with assumed("sm90" if device_generation() == "sm80" else "sm80"), pytest.raises(ValueError):
-        jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
+    here = jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
+    with assumed("sm90" if device_generation() == "sm80" else "sm80"):
+        there = jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
+    assert there == here
 
 
 FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
