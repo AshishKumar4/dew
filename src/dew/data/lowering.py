@@ -788,8 +788,8 @@ class _Build:
     ) -> pygrain.DatasetIterator[Batch]:
         """This share's batches, through the stages after the batch."""
         batching = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
-        stream = self.batched(pipeline, partition, offset, fill=fill)
-        return iter(self.after_batch(stream, pipeline, partition, batching))
+        stream, applied = self.batched(pipeline, partition, offset, fill=fill)
+        return iter(self.after_batch(stream, pipeline, partition, batching, applied))
 
     def tuned(self, pipeline: Pipeline) -> _Build:
         """This build with automatic loading resolved on the whole order
@@ -802,7 +802,7 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         if loading.workers == "auto":
-            loading = loading.resolved(bare.batched(pipeline, DataPartition()))
+            loading = loading.resolved(bare.batched(pipeline, DataPartition())[0])
         if loading.worker_count and (not self.training or not self.lowering.endless):
             rows = bare.records(pipeline, DataPartition())
             if isinstance(rows, pygrain.MapDataset):
@@ -813,13 +813,16 @@ class _Build:
 
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
-    ) -> pygrain.IterDataset:
+    ) -> tuple[pygrain.IterDataset, int]:
         """This share's batches as the reader reads them, before the stages
         after the batch, which automatic loading also sizes its buffers by
-        (`Loading.resolved`). A global order is batched by index before the
-        reader starts, as Grain's own indexed pipelines are, so each read in
-        flight is a whole batch and each worker reads whole batches of its
-        own; any other order is batched as its rows arrive."""
+        (`Loading.resolved`), and how many of those stages it already ran. A
+        global order is batched by index before the reader starts, as Grain's
+        own indexed pipelines are, so each read in flight is a whole batch and
+        each worker reads whole batches of its own; any other order is batched
+        as its rows arrive. An endless repeat right after the batch repeats a
+        global order's batches by index too, so a resume `offset` records in
+        seeks into the repeated batches, not past the one pass of rows."""
         canonical = not self.training and not self.global_order
         rows = self.records(pipeline, DataPartition() if canonical else partition)
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
@@ -827,17 +830,24 @@ class _Build:
         size = batch_stage.size if canonical else shared_size
         drop = batch_stage.drop_remainder if self.training else False
         empty = False
+        after = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+        folded = 0
         if isinstance(rows, pygrain.MapDataset):
+            folded = int(self.global_order and bool(after) and isinstance(after[0], Repeat)
+                         and after[0].epochs is None)
             if self.training and self.lowering.endless and not self.lowering.repeated:
                 rows = _repeated(rows, None, _name(pipeline), self.loading)
             elif self.training and not self.lowering.endless and drop:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
             whole = rows
-            rows = rows[offset + partition.index :: partition.count]
+            rows = rows[(0 if folded else offset) + partition.index :: partition.count]
             empty = not self.training and not len(rows) and bool(len(whole))
             if empty:
                 rows = whole[:1]
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
+            if folded:
+                batched = _repeated(batched, None, _name(pipeline), self.loading)
+                batched = batched[offset // batch_stage.size :]
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
@@ -851,7 +861,7 @@ class _Build:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
-        return stream
+        return stream, folded
 
     def after_batch(
         self,
@@ -859,11 +869,12 @@ class _Build:
         pipeline: Pipeline,
         partition: DataPartition,
         batch_stage: BatchStage,
+        applied: int = 0,
     ) -> pygrain.IterDataset:
-        """The stages after the batch, each as `stage` lowers it, with the
-        loading's own workers last when the pipeline names none. Host steps
-        run in the reader that wraps this stream."""
-        stages = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+        """The stages after the batch past the `applied` ones `batched` ran, each as `stage` lowers
+        it, with the loading's own workers last when the pipeline names none. Host steps run in the
+        reader that wraps this stream."""
+        stages = pipeline.stages[pipeline.stages.index(batch_stage) + 1 + applied :]
         if self.loading.workers and _at(pipeline.stages, Workers) is None:
             stages = (*stages, Workers(self.loading.worker_count, self.loading.worker_buffer))
         for stage in stages:
