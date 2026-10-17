@@ -2,7 +2,8 @@
 
 A push lands between steps and later submissions report its version; the
 served tree keeps the server's precision; a refused request raises at
-submission and leaves the rest running; a submission does not wait for a
+submission and leaves the rest running; a draw that fails its checks fails
+its future instead of leaving it pending; a submission does not wait for a
 step.
 """
 
@@ -12,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from process_support import assert_exits_cleanly
 
 from dew.inference import NativeRolloutServer, TextGeneration
@@ -102,6 +104,32 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
         native_server.submit(list(range(1, 11)) * 6, 10, key=2)
     assert len(running.result(timeout=120).tokens) >= 1
     assert native_server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)
+
+
+def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
+    """A bigram policy so peaked that the model's own likelihood of every id but one underflows
+    to -inf, sampled hot enough to draw those ids. No `Draw` holds a non-finite likelihood, so
+    the draw's future fails with that error, where a check raised in the done-callback reached
+    no one and left the future pending."""
+    vocab = 64
+
+    def peaked():
+        table = np.full((vocab, vocab), -2e38, np.float32)
+        table[:, 0] = 2e38
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=peaked)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    # At this temperature the scores are 1 and -1, so the ids the model gives -inf are drawn.
+    sampling = Sampling(temperature=2e38, eos_token_ids=vocab - 1)
+    server = NativeRolloutServer(
+        Server.from_task(TextGeneration(model, params, None, sampling=sampling), slots=2, capacity=64)
+    )
+    try:
+        with pytest.raises(ValueError):
+            server.submit([1, 2, 3], BUDGET, key=5).result(timeout=60)
+    finally:
+        server.close()
 
 
 def test_a_submission_does_not_wait_for_the_step_under_way(native_server):

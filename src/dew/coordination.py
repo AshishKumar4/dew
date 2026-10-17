@@ -391,14 +391,17 @@ def withdraw_failure() -> None:
     _client().key_value_delete(FAILURE_KEY)
 
 
-def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *, timeout: float) -> Callable[[], None]:
+def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *,
+                 timeout: float | None) -> Callable[[], None]:
     """End `thread` before Python finalizes, and return what withdraws that.
 
     A thread still inside jaxlib when Python finalizes is ended with
     pthread_exit (CPython before 3.14), and the unwind through jaxlib's C++
     GIL guard aborts a finished program with SIGABRT. The handler calls
-    `stop` and waits up to `timeout` seconds; atexit runs it before jax's own,
-    registered earlier, so jax's clients are still open.
+    `stop` and waits up to `timeout` seconds, or until the thread ends where
+    it is None, as for a thread that `stop` ends only once its device work
+    returns; atexit runs it before jax's own, registered earlier, so jax's
+    clients are still open.
     """
 
     def finish() -> None:

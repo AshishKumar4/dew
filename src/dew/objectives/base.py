@@ -45,6 +45,7 @@ from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from flax import linen as nn
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
@@ -471,14 +472,16 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
+    settings: ClassVar[type[DataclassInstance] | None] = None
+    """The dataclass of what a saved run records beside its objective and model
+    (`task_settings`), the one list of those fields: the objective writes an
+    instance, its `saved_task` reads it back, and a record holding any other
+    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
-    inference_fields: ClassVar[frozenset[str]] = frozenset()
-    """The settings a saved run of this objective records beside its
-    `objective` and `model` (`inference_record`); a loader refuses a record
-    holding any other (`dew.inference.tasks.run_record`)."""
     _ema_is_reference: ClassVar[bool] = False
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the
@@ -1032,9 +1035,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self._model_tree(variables)
 
-    def task_record(self) -> Mapping[str, JSON] | None:
-        """Return the task settings a saved step records beside its model, or
-        None when the objective declares no inference contract.
+    def task_settings(self) -> DataclassInstance | None:
+        """Return the task settings a saved step records beside its model, an
+        instance of `settings`, or None when the objective declares no
+        inference contract.
 
         They are what the objective's task is built with and a loader cannot
         read off the model: a sampling policy, a token budget, a tokenizer, a
@@ -1042,21 +1046,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def recorded_model(self) -> nn.Module:
+        """The model a saved step's record names (`inference_record`): the objective's own."""
+        return self.model
+
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.
 
-        It records the objective's import path, its `model`'s record, and
-        `task_record`'s settings. An objective that declares no task settings
-        returns None; a custom research method can still restore its raw state.
+        It records the objective's import path, its `recorded_model`'s record,
+        and `task_settings`, field by field. An objective that declares no task
+        settings returns None; a custom research method can still restore its
+        raw state.
         """
         from dew.config import ModelConfig
-        from dew.registry import import_path, to_record
+        from dew.registry import import_path, record_fields, to_record
 
-        settings = self.task_record()
+        settings = self.task_settings()
         if settings is None:
             return None
         return {'objective': import_path(type(self)),
-                'model': to_record(ModelConfig.from_model(self.model), ModelConfig), **settings}
+                'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
+                **record_fields(settings, type(settings))}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:

@@ -599,6 +599,14 @@ class InputQuantization:
 
         def quantize_inputs(next_fun, args, kwargs, context):
             module = context.module
+            if context.method_name == "nonlinear_input":
+                # A layer asks whether its submodule is linear in its input
+                # (`MultiHeadLatentAttention.nonlinear_input`): one that
+                # rounds its input or multiplies in FP8 is not.
+                name = args[0] if args else kwargs["name"]
+                child = getattr(module, name)
+                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
+                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
             calls = context.method_name == "__call__"
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
@@ -1001,7 +1009,10 @@ def _group_scaled_convolution() -> type:
             unwrapped model after its zero-initialized fusion kernels'
             first update (ColabPlan-2, the RTX 4080)."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            if rule is None or rule.weight_qtype is None:
+            precision = inspect.signature(dew_conv._conv_general_dilated).bind(
+                lhs, rhs, *args, **kwargs).arguments.get("precision")
+            # One pinned past the default runs unquantized (`conv_general_dilated`), in Dew's own form.
+            if rule is None or rule.weight_qtype is None or not asks_default_precision(precision):
                 return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
             return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
@@ -1014,15 +1025,29 @@ def _group_scaled_convolution() -> type:
                                  precision: jax.lax.PrecisionLike = None,
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+            """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: one
+            that pins a precision past the default has no quantized form and runs unquantized at
+            it, and a quantized one returns the result dtype it asks for, its operands widened to it
+            first, which is exact for the narrower floats it accumulates."""
+            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
+            quantized = rule is not None and rule.weight_qtype is not None
+            if quantized and not asks_default_precision(precision):
+                return jax.lax.conv_general_dilated(
+                    lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                    feature_group_count, batch_group_count, precision=precision,
+                    preferred_element_type=preferred_element_type, out_sharding=out_sharding)
+            returned = jnp.dtype(preferred_element_type or lhs.dtype)
+            if quantized:
+                lhs, rhs = _widened((lhs, rhs), preferred_element_type)
             convolve = functools.partial(
                 super().conv_general_dilated,
                 rhs=rhs, window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
                 rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
                 feature_group_count=feature_group_count, batch_group_count=batch_group_count,
                 precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
-            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             if feature_group_count == 1 or rule is None or rule.act_qtype is None:
-                return convolve(lhs=lhs)
+                out = convolve(lhs=lhs)
+                return _honoured(out, preferred_element_type, None) if quantized else out
             _refuse_grouped_on_gpu()
             numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             scales = _group_scales(lhs, numbers, feature_group_count).astype(jnp.float32)
@@ -1030,9 +1055,7 @@ def _group_scaled_convolution() -> type:
             out = convolve(lhs=lhs.astype(jnp.float32)
                            / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
             batch, feature = numbers.out_spec[:2]
-            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(
-                lhs.dtype
-            )
+            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(returned)
 
     return GroupScaledConvolution
 

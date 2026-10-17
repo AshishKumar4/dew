@@ -16,9 +16,10 @@ from .base import Read, Shard, ShardManifest
 
 @dataclass(frozen=True, eq=False)
 class Grain(Dataset):
-    """A Grain `MapDataset`, read by index, or `IterDataset`, read as one
-    stream whose position Grain checkpoints. Grain states no store of its own,
-    so `name` declares its content version in a run's plan, a cache's key and its logs."""
+    """A Grain `MapDataset`, read by index or as one stream, or an
+    `IterDataset`, read as one stream whose position Grain checkpoints. Grain
+    states no store of its own, so `name` declares its content version in a
+    run's plan, a cache's key and its logs."""
 
     dataset: grain.MapDataset | grain.IterDataset
     name: str
@@ -30,7 +31,7 @@ class Grain(Dataset):
         return {"store": "grain", "identity_required": True, "identity": self.name, **self.metadata()}
 
     def supports(self, read: Read) -> bool:
-        return (read == "streamed") == isinstance(self.dataset, grain.IterDataset)
+        return read == "streamed" or isinstance(self.dataset, grain.MapDataset)
 
     def records(self, read: Read) -> Records:
         if not isinstance(self.dataset, grain.MapDataset):

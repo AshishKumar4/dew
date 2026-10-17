@@ -12,6 +12,7 @@ import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
 import { operatorAuthorized } from './operator';
 import { prunable } from './snapshot-ledger';
+import { warm } from './warm';
 
 export { Coordinator } from './coordinator';
 export { SharedHost } from './shared-host';
@@ -64,8 +65,16 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	// Any Kernel object answers with the image of the deploy it runs in.
 	const pool = env.POOL.get(env.POOL.idFromName('global'));
 	const image = await pool.image();
-	if (!image) return reply({ error: 'warming', message: 'The shared model is warming up. Try again in a minute.' },
-		503, cors, { 'Retry-After': '30' });
+	// The registry's generation is not this deploy's pinned commit (none, or the last deploy's, which no one warmed
+	// this one from), or the pool does not serve it: this request starts the pinned generation's preparation, leased,
+	// or hands the pool the generation, and the last generation serves meanwhile. Both are read through RPCs every
+	// build of the objects answers alike (README.md).
+	const active = await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).previous();
+	if (active?.commit !== env.SNAPSHOT_COMMIT || active.snapshot.id !== image) ctx.waitUntil(warm(env));
+	if (!image) {
+		return reply({ error: 'warming', message: 'The shared model is warming up. Try again in a minute.' },
+			503, cors, { 'Retry-After': '30' });
+	}
 	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now, image);
 	if (!opened.ok) {
 		return reply({ error: opened.reason, message: REFUSALS[opened.reason], retryAfter: opened.retryAfter }, 429, cors, {
@@ -135,10 +144,7 @@ export default {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const pool = env.POOL.get(env.POOL.idFromName('global'));
 			if (url.pathname.endsWith('/warm') && request.method === 'POST') {
-				const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));
-				const current = await registry.ensure(env.SNAPSHOT_COMMIT);
-				const generation = current.generation ?? await registry.previous();
-				if (generation) await pool.configure(generation);
+				await warm(env, { retryNow: true });
 			} else if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
 			return Response.json(await pool.status());
 		}

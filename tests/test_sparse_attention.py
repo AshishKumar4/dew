@@ -10,11 +10,14 @@ seven tokens exceed its top-k of four, so that parity test runs this path).
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels.generation import device_generation
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
+from dew.training.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
 
@@ -119,6 +122,41 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     trained = adapted.apply(variables, hidden, rngs=rngs)
     masked, _ = adapted.apply(variables, hidden, rngs=rngs, mutable=["qk"])
     np.testing.assert_allclose(np.asarray(trained), np.asarray(masked), atol=2e-5, rtol=0)
+
+
+@pytest.mark.parametrize("quantized", ["input", "frozen"])
+def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
+    """A checkpoint's FP8 input scale at kv_b_proj, or a frozen FP8 product
+    there, rounds the latents themselves. The absorbed path applies kv_b_proj
+    to the identity, where the rounding would land on the identity instead,
+    so such a call runs the masked kernel: its output and every gradient are
+    the same call's with `qk` open."""
+    layer = MultiHeadLatentAttention(
+        emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
+        qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
+        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
+    variables = layer.init(jax.random.key(3), hidden)
+    if quantized == "input":
+        record = InputQuantization(sites=(("kv_b_proj", "fp8"),))
+        held = {"kv_b_proj": {"fp8_input_scale": jnp.asarray(0.01, jnp.float32)}}
+    else:
+        record = InputQuantization(frozen_fp8=("kv_b_proj",), measured_on=device_generation())
+        held = record.packed(variables["params"])
+    model = record.apply(layer)
+    cotangent = jax.random.normal(jax.random.key(4), hidden.shape)
+
+    def run(*, qk: bool):
+        def loss(params, x):
+            tree = {"params": params, QUANTIZATION: held}
+            output = model.apply(tree, x, mutable=["qk"])[0] if qk else model.apply(tree, x)
+            return jnp.sum(output * cotangent), output
+
+        (_, output), gradients = jax.value_and_grad(loss, (0, 1), has_aux=True)(variables["params"], hidden)
+        return output, gradients
+
+    for sparse, masked in zip(jax.tree.leaves(run(qk=False)), jax.tree.leaves(run(qk=True)), strict=True):
+        np.testing.assert_array_equal(np.asarray(sparse), np.asarray(masked))
 
 
 def test_memory_follows_the_selection_not_the_sequence():

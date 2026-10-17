@@ -79,8 +79,18 @@ def gaussian_topk(x, sparsity: float):
     quantile = jax.scipy.special.erfinv(jnp.asarray(2.0 * sparsity - 1.0, at_least_fp32(x.dtype)))
     multiplier = (math.sqrt(2.0) * quantile).astype(x.dtype)
     mean = jnp.mean(x, axis=-1, keepdims=True)
-    std = jnp.sqrt(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
+    # A constant row (a padded row of zeros) has deviation zero, which takes a
+    # zero gradient, as torch's std backward gives it.
+    std = _root(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
     return nn.relu(x - (mean + std * multiplier))
+
+
+def _root(square):
+    """`sqrt(square)`, and zero with a zero gradient where `square` is zero:
+    sqrt's infinite derivative there would turn a masked row's zero upstream
+    gradient into NaN for every parameter it touches."""
+    positive = square > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, square, 1.0)), 0.0)
 
 
 def rescale_to(x, target):
@@ -88,13 +98,9 @@ def rescale_to(x, target):
 
     The mean square of `x` is floored at `MAGNITUDE_EPSILON` before its square
     root (the reference's `new_magnitude`). A zero target (a zero pad
-    embedding at a padded slot) gets magnitude zero with a zero gradient,
-    because sqrt's infinite derivative at zero would turn the masked slot's
-    zero upstream gradient into NaN for every parameter it touches.
+    embedding at a padded slot) gets magnitude zero with a zero gradient (`_root`).
     """
-    target_mean = jnp.mean(jnp.square(target), axis=-1, keepdims=True)
-    positive = target_mean > 0
-    target_magnitude = jnp.where(positive, jnp.sqrt(jnp.where(positive, target_mean, 1.0)), 0.0)
+    target_magnitude = _root(jnp.mean(jnp.square(target), axis=-1, keepdims=True))
     magnitude = jnp.sqrt(jnp.maximum(jnp.mean(jnp.square(x), axis=-1, keepdims=True),
                                      MAGNITUDE_EPSILON))
     return x * target_magnitude / magnitude
