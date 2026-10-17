@@ -17,7 +17,7 @@ uses; the preview hook limits itself to the display count.
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -70,9 +70,8 @@ from dew.objectives.base import (
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
-from dew.records import JSON
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.pipelines import TextToImage
+from dew.sampling.pipelines import ImageSettings, TextToImage
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
@@ -236,8 +235,7 @@ class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
     saved_task = TextToImage
-    inference_fields = frozenset({'process', 'inputs', 'autoencoder', 'solver', 'guidance', 'sampling_steps',
-                                  'end_to_end'})
+    settings = ImageSettings
     # A pipeline's own sampling policy, else DDIM, CFG(3.0) and `_DEFAULT_STEPS`.
     resolved = ("solver", "guidance", "steps")
 
@@ -247,8 +245,8 @@ class DiffusionObjective(Objective[Ratio]):
         """Each batch's captions tokenized for the conditions, on the host, as
         the step reads them, and the fields other conditions read (a clip's
         sound) encoded; without text conditions, captions are dropped."""
+        from dew.data.images import EncodeCaptions, EncodeFields
         from dew.data.pipeline import ObjectiveData
-        from dew.data.steps.image import EncodeCaptions, EncodeFields
 
         conditions = self.inputs.conditions.values()
         steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),
@@ -471,15 +469,14 @@ class DiffusionObjective(Objective[Ratio]):
     def _sample(self):
         return self.program('sample', self._sample_impl, static_argnames=("count",))
 
-    def task_record(self) -> Mapping[str, JSON]:
+    def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""
         from dew.registry import to_record
-        return {'process': to_record(self.process, Process), 'inputs': self.inputs.to_json(),
-                'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
-                'solver': to_record(self.solver, Solver),
-                'guidance': to_record(self.guidance, Guidance | None), 'sampling_steps': self.steps,
-                # A tuned autoencoder's weights and statistics sit in the run's own tree.
-                'end_to_end': None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd)}
+        return ImageSettings(self.process, self.inputs.to_json(),
+                             None if self.autoencoder is None else self.autoencoder.to_json(),
+                             self.solver, self.guidance, self.steps,
+                             # A tuned autoencoder's weights and statistics sit in the run's own tree.
+                             None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:

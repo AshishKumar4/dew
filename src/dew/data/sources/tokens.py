@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
 
-import grain.python as grain
 import numpy as np
 from fsspec.spec import AbstractFileSystem
 
@@ -16,7 +15,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, content_version, local
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, ShardManifest, _indexed_manifest
 from .files import Files
 from .index import ArrayIndex
 
@@ -440,19 +439,7 @@ class TokenFiles(Dataset):
         return None if self.tokens.eos_id is None else _document_ends(self.tokens)
 
     def manifest(self) -> ShardManifest:
-        count = len(self.records("indexed"))
-        size = 1024
-        return ShardManifest(
-            tuple(
-                Shard(f"{self.url}:{self.split}:{start}", self.url, start, min(start + size, count),
-                      min(size, count - start))
-                for start in range(0, count, size)
-            ),
-            self._read_shard,
-        )
-
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, f"{self.url}:{self.split}", self.url, 1024)
 
     def lengths(self) -> np.ndarray | None:
         ends = self.document_ends()
