@@ -1534,8 +1534,8 @@ class _Calls:
             current = owner
         return None
 
-    def reached(self, scope: ast.AST, function: ast.AST, call: ast.Call) -> list[ast.AST]:
-        """The definitions `call`, made in `scope` inside `function`, reaches."""
+    def reached(self, scope: ast.AST, call: ast.Call) -> list[ast.AST]:
+        """The definitions `call`, made in `scope`, reaches."""
         if isinstance(call.func, ast.Name):
             found = self._lookup(scope, call.func.id)
             return [found] if isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef) else []
@@ -1563,7 +1563,7 @@ def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[in
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
         if isinstance(node, ast.Call):
-            for helper in calls.reached(scope, function, node):
+            for helper in calls.reached(scope, node):
                 if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
                         and _leaves(helper, tables, calls, seen)):
                     return True
