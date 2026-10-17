@@ -9,9 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
+from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from kernel_compile import compile_kernels, failures
-from test_fla_kda import training_cases as delta_rule_cases
-from test_short_conv import TRAINING_SHAPES, training_cases as conv_cases
 
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 
@@ -127,7 +126,7 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
     compile bound and the block's shared memory."""
     pytest.importorskip("triton")
-    found = compile_kernels(delta_rule_cases(), target)
+    found = compile_kernels(kda_training_cases(), target)
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
 
@@ -138,6 +137,6 @@ def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_bl
     capability on this CPU (tests/kernel_compile.py), within the compile bound and the block's shared
     memory."""
     pytest.importorskip("triton")
-    found = compile_kernels(conv_cases(), target)
-    assert len(found) == 2 * len(TRAINING_SHAPES) + 2
+    found = compile_kernels(conv_training_cases(), target)
+    assert len(found) == 2 * len(CONV_SHAPES) + 2
     assert not failures(found), "\n".join(failures(found))
