@@ -2147,12 +2147,13 @@ class CausalTransformer(nn.Module):
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
         product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
-        holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
-        head = {} if self.tie_embeddings else self.lm_head.variables["params"]
-        if self.head_transform is not None or set(head) - {"kernel"}:
+        None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
+        parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
+        adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
+        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,

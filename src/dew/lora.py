@@ -360,8 +360,9 @@ class Adapter:
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
         as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
-        codes decode to (`frozen_fp8_kernel`), targeted or not. The result is one
-        `params` collection.
+        codes decode to (`frozen_fp8_kernel`), targeted or not, and the codes go,
+        since a model under the record would multiply them in the merged kernel's
+        place. The result is one `params` collection.
         """
         variables = thaw(variables)
         coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
@@ -380,8 +381,9 @@ class Adapter:
                 (*path, "kernel"),
                 (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
             )
-        factors = {(*path, factor) for path in self.targets for factor in FACTORS}
-        return select(overlay(variables, merged), lambda path: path not in factors)
+        dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
+                   | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
+        return select(overlay(variables, merged), lambda path: path not in dropped)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
         """Write the adapter's factors from `variables` under its own module names.
