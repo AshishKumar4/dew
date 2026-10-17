@@ -1044,9 +1044,12 @@ def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
         step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
         program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
         variables = placed(held, dtype)
-        return jax.grad(lambda params: program.loss({**variables, "params": params},
-                                                    {"text": jnp.asarray(batch["text"])}, step)[0].total)(
-            variables["params"])
+        def loss(params):
+            stats, _ = program.loss({**variables, "params": params}, {"text": jnp.asarray(batch["text"])},
+                                    step)
+            return program.reduce_loss(stats)[0]
+
+        return jax.grad(loss)(variables["params"])
 
     def flat(tree):
         return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
