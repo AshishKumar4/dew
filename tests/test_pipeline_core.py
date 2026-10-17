@@ -1312,18 +1312,32 @@ def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
         stream.close()
 
 
-def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats():
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
     and a run counted in steps reads it; a run counted in epochs is refused, since one pass
-    over the two records fills no batch."""
-    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(2)]))
-    for read in ("memory", "indexed"):
-        data = compile(rows.repeat().batch(8), read=read, loading=READ)
+    over the two records fills no batch. Repeated after the batch, a pass holds no batch to
+    replay, so that read is refused rather than replaying nothing forever; eight records make
+    a batch either way."""
+    for count, repeated in ((2, "before"), (2, "after"), (8, "after")):
+        rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(count)]))
+        chain = rows.repeat().batch(8) if repeated == "before" else rows.batch(8).repeat()
+        data = compile(chain, read=read, loading=READ)
+        if count < 8 and repeated == "after":
+            with pytest.raises(ValueError):
+                refused = data.train(DataPartition())
+                try:
+                    next(refused)
+                finally:
+                    refused.close()
+            continue
         stream = data.train(DataPartition())
         try:
-            assert sorted(int(value) for value in next(stream)["id"]) == [0, 0, 0, 0, 1, 1, 1, 1]
+            assert sorted(int(value) for value in next(stream)["id"]) == sorted(
+                index % count for index in range(8))
         finally:
             stream.close()
-        with pytest.raises(ValueError):
-            data.epoch_steps(1)
+        if count < 8:
+            with pytest.raises(ValueError):
+                data.epoch_steps(1)
 
