@@ -1631,7 +1631,7 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
 
     with pytest.raises(ValueError):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
-            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint())
         )
 
 

@@ -106,7 +106,7 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
     def expand(index, value):
         return tuple({"id": value["id"], "part": part} for part in range(index))
 
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source, transform=expand)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, transform=expand)
     cold = [rows[index] for index in range(len(rows))]
     rows.finish()
     rows.close()
@@ -137,7 +137,7 @@ def test_missing_input_completion_refuses_publication():
     refused; a second writer that reads it completes the generation."""
     source = Memory([{"id": index} for index in range(3)])
     cache, key = _cache(), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == {"id": 0}
     assert rows[2] == {"id": 2}
     rows.finish()
@@ -145,7 +145,7 @@ def test_missing_input_completion_refuses_publication():
     with pytest.raises(ValueError):
         cache.publish(key, source)
     assert cache.generation(key) is None
-    rest = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rest = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rest[1] == {"id": 1}
     rest.finish()
     rest.close()
@@ -155,7 +155,7 @@ def test_missing_input_completion_refuses_publication():
 def test_unsealed_writer_cannot_certify_coverage():
     source = Memory([{"id": 0}, {"id": 1}])
     cache, key = _cache(shard_bytes=1), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     with pytest.raises(ValueError):
         cache.publish(key, source)
@@ -171,8 +171,8 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
     are refused where they wrote different ones."""
     source = Memory([{"id": 0}])
     cache, key = _cache(), Manifest()
-    first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key, source)
-    second = cache.mapped(grain.MapDataset.source([second_row]), key, source)
+    first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key)
+    second = cache.mapped(grain.MapDataset.source([second_row]), key)
     first[0], second[0]
     first.finish()
     first.close()
@@ -188,7 +188,7 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
 def test_corrupt_shard_never_reaches_current():
     source = Memory([{"id": 0}])
     cache, key = _cache(), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
     rows.close()
@@ -206,7 +206,7 @@ def test_corrupt_shard_never_reaches_current():
 def test_corrupt_committed_index_is_an_error_without_fallback():
     source = Memory([{"id": 0}])
     cache, key = _cache(), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
     rows.close()
@@ -227,7 +227,7 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
     cannot be published; a spool that holds it publishes."""
     source = Memory([{"bytes": b"x" * 2048}])
     cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == source.records("indexed")[0]
     assert rows.writer.admitting is (spool_bytes > 2048)
     rows.finish()
@@ -243,9 +243,9 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
 def test_cache_identity_and_clean_revision_are_required(refused):
     source = Memory([{"id": 0}])
     rows = grain.MapDataset.source(source.records("indexed"))
-    _cache().mapped(rows, Manifest(), source).close()
+    _cache().mapped(rows, Manifest()).close()
     with pytest.raises(ValueError):
-        _cache().mapped(rows, Manifest(**refused), source)
+        _cache().mapped(rows, Manifest(**refused))
     assert Manifest().key != Manifest(b'{"revision":"changed"}').key
 
 
@@ -262,7 +262,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     fs.mkdir(bucket)
     cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
     source = Memory([{"id": index} for index in range(8)])
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     for index in range(len(rows)):
         rows[index]
     rows.finish()
@@ -301,7 +301,7 @@ def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
     cache, key = _cache(), Manifest()
     manifest = source.manifest()
-    reader = cache.streamed(manifest.reader, key, manifest)
+    reader = cache.streamed(manifest.reader, key)
     for shard in reversed(manifest.shards):
         iterator = iter(reader(shard))
         assert next(iterator)["id"] == shard.start
@@ -325,7 +325,7 @@ def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     source = Memory([{"id": index} for index in range(8)])
     cache, key = _cache(), Manifest()
     parent = grain.MapDataset.source(source.records("indexed"))
-    cold = cache.mapped(parent, key, source)
+    cold = cache.mapped(parent, key)
 
     def epochs(rows):
         return rows.repeat(2).seed(31).random_map(Draw()).to_iter_dataset()
@@ -386,7 +386,7 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
         [{"id": index, "_dew_length": index + 2, "_dew_valid_targets": index + 1} for index in range(4)]
     )
     cache, key = _cache(), Manifest()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     for index in range(len(rows)):
         rows[index]
     rows.finish()
@@ -408,7 +408,6 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     transient = cache.mapped(
         grain.MapDataset.source(source.records("indexed")),
         key,
-        source,
         transform=lambda index, row: (Rejected("transient", permanent=False),),
     )
     assert transient[0][0].reason == "transient"
@@ -419,7 +418,6 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     permanent = cache.mapped(
         grain.MapDataset.source(source.records("indexed")),
         key,
-        source,
         transform=lambda index, row: (Rejected("http_404"),) if index == 0 else (row,),
     )
     permanent[0], permanent[1]
@@ -433,14 +431,14 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
 
 def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
     source = Memory([{"id": 0}])
-    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, retry=0)
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
     first_key, second_key = Manifest(b'{"source":"one"}'), Manifest(b'{"source":"two"}')
-    first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key, source)
+    first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
     first[0]
     first.finish()
     first.close()
     generation = cache.publish(first_key, source)
-    second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
+    second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
     second[0]
     second.finish()
     second.close()
@@ -448,7 +446,7 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     with pytest.raises(ValueError):
         cache.publish(second_key, source)
     generation.close()
-    retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
+    retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
     retry[0]
     retry.finish()
     retry.close()
@@ -465,19 +463,82 @@ def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(t
     def rows(index: int) -> Memory:
         return Memory([{"id": index * 10 + row} for row in range(2)])
 
-    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, retry=0)
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
     for index in range(3):
         source = rows(index)
         stopped = cache.mapped(grain.MapDataset.source(source.records("indexed")),
-                               Manifest(json.dumps({"source": index}).encode()), source)
+                               Manifest(json.dumps({"source": index}).encode()))
         stopped[0]
         stopped.close()
     source, key = Memory([{"id": 99}]), Manifest(b'{"source":"kept"}')
-    filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     filled[0]
     filled.finish()
     filled.close()
     assert cache.publish(key, source)[0] == {"id": 99}
+
+
+def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path):
+    """This host's disk refuses a write for reasons a retry keeps, as its retention refusing room
+    for a shard does, so a blocking fill ends with that error at once, however many retries the
+    cache allows a remote store; it once slept through each of them."""
+    import numpy as np
+
+    source = Memory([{"id": 0, "blob": np.zeros(200_000, np.uint8)}])
+    cache = Cache(str(tmp_path), keep_local_bytes=64 * 1024, on_full="block", shard_bytes=1, retry=3)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    try:
+        assert rows[0]["id"] == 0
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            rows.finish()
+        assert time.monotonic() - started < 1
+    finally:
+        rows.close()
+
+
+def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
+    """A fill that waits for spool room as a shard uploads is woken when the upload fails, after
+    the cache's retries, and ends with the upload's error rather than waiting on bytes that will
+    never free."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    attempts = []
+
+    class Refusing(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write that always fails."""
+
+        protocol = "refusing"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("refusing://", "memory://", 1))
+
+        def put_conditional(self, path, payload, version):
+            attempts.append(path)
+            raise OSError(f"the service refused {path}")
+
+    fsspec.register_implementation("refusing", Refusing, clobber=True)
+    source = Memory([{"id": index, "blob": b"x" * 4096} for index in range(2)])
+    cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=6000, shard_bytes=1, on_full="block",
+                  retry=1)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    raised: list[BaseException] = []
+
+    def read() -> None:
+        try:
+            rows[0], rows[1]
+        except OSError as error:
+            raised.append(error)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(20)
+    try:
+        assert not reader.is_alive() and len(raised) == 1
+        assert len(attempts) == 2
+    finally:
+        rows.close()
 
 
 def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
@@ -510,7 +571,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
     fsspec.register_implementation("stalled", Stalled, clobber=True)
     source = Memory([{"id": 0}])
     cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest(), source)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
     try:
         assert rows[0] == {"id": 0}
         assert entered.wait(5)
@@ -541,7 +602,7 @@ def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
     )
     generation = cache.generation(key)
     if generation is None:
-        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
         for index in range(len(rows)):
             rows[index]
         rows.finish()
