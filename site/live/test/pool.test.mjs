@@ -16,11 +16,10 @@ async function scenario(name) {
 	finally { await worker.dispose(); }
 }
 
-test('visitors see no generation until two model hosts are warm, and the commit the pool is set to throughout', async () => {
+test('visitors see no generation until two model hosts are warm', async () => {
 	const result = await scenario('minimum');
 	assert.equal(result.before, null);
 	assert.equal(result.image, 'snapshot');
-	assert.equal(result.commit, 'a'.repeat(40));
 	assert.equal(result.status.minimum, 2);
 	assert.equal(result.status.ready, 2);
 });

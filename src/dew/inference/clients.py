@@ -180,8 +180,9 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     if sampling is not None:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.eos_token_ids is not None or sampling.pad != 0:
-            raise ValueError("Ollama text completion cannot implement native EOS-token or padding IDs")
+        # The pad id only shapes Dew's padded rows; a remote completion comes back unpadded.
+        if sampling.eos_token_ids is not None:
+            raise ValueError("Ollama text completion cannot implement native EOS-token IDs")
         unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
                                      "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
         if unmatched:
@@ -478,8 +479,7 @@ class OpenAICompletion:
             return fields
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.pad != 0:
-            raise ValueError("remote text completion does not implement padded token rows")
+        # The pad id only shapes Dew's padded rows; a remote completion comes back unpadded.
         unmatched = sampling.active(("no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
         if unmatched:
             raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "

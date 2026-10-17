@@ -119,12 +119,6 @@ def _inputs(features, mask, width: int) -> tuple[jax.Array, jax.Array]:
     return features, mask
 
 
-def _activation(x, name: str = "silu"):
-    if name not in ("silu", "gelu", "gelu_pytorch_tanh", "relu"):
-        raise ValueError(f"audio hidden_act {name!r} has no implementation")
-    return activation(name)(x)
-
-
 def _clip(x, bound: float):
     bound = min(bound, float(jnp.finfo(x.dtype).max))
     return jnp.clip(x, -bound, bound)
@@ -395,7 +389,7 @@ class AudioFeedForward(nn.Module):
     def __call__(self, x):
         residual = x
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="pre_layer_norm")(_clip(x, self.clipping))
-        x = _activation(self.linear(self.width * 4, name="ffw_layer_1")(x), self.activation)
+        x = activation(self.activation)(self.linear(self.width * 4, name="ffw_layer_1")(x))
         x = self.linear(self.width, name="ffw_layer_2")(x)
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="post_layer_norm")(_clip(x, self.clipping))
         return residual + x * self.residual_weight
@@ -431,7 +425,7 @@ class AudioLightConv(nn.Module):
             name="depthwise_conv1d",
         )(x)
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="conv_norm")(_clip(x, self.clipping))
-        return residual + self.linear(self.width, name="linear_end")(_activation(x, self.activation))
+        return residual + self.linear(self.width, name="linear_end")(activation(self.activation)(x))
 
 
 class Gemma3nConformerAttention(nn.Module):

@@ -34,20 +34,26 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
 jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
+def bundle(node) -> str:
+    """The shared cache's bundle of `node`'s test file in this execution partition (`remote_cache.bundle`)."""
+    return remote_cache.bundle(node.nodeid, node.config.getoption("ci_group", None),
+                               os.environ.get("PYTEST_XDIST_WORKER"))
+
+
 def pytest_collectstart(collector):
     if _remote is not None and isinstance(collector, pytest.Module):
-        _remote.opened(collector.nodeid)
+        _remote.opened(bundle(collector))
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Each file's programs join its bundle of the shared cache, written back after its last test."""
-    file = item.nodeid.split("::")[0]
+    """Each file's programs join its bundle of the shared cache, written back after each run of its
+    tests, every program they used so far."""
     if _remote is not None:
-        _remote.opened(file)
+        _remote.opened(bundle(item))
     yield
-    if _remote is not None and (nextitem is None or nextitem.nodeid.split("::")[0] != file):
-        _remote.closed(file)
+    if _remote is not None and (nextitem is None or bundle(nextitem) != bundle(item)):
+        _remote.closed(bundle(item))
 
 
 def pytest_sessionfinish(session, exitstatus):

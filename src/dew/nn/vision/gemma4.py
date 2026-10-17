@@ -35,7 +35,6 @@ from .common import (
     activation_name,
     head_width,
     projector_weight_path,
-    refuse_dropout,
     rope_base,
     trunk_geometry,
 )
@@ -336,7 +335,6 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     geometry = trunk_geometry(vision)
     if vision.get("attention_bias", False):
         raise ValueError("attention_bias=True needs biased maps this trunk lacks")
-    refuse_dropout(vision, "attention_dropout")
     if "output_proj_dims" in vision:
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
