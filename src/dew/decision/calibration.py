@@ -118,7 +118,10 @@ def _temperature(group: Sequence[Scored]) -> float:
     """The temperature minimizing mean log loss against the gold distributions
     over `group`, by Newton's method on its inverse, in which the loss is
     convex: its first derivative is the mean over answers of
-    E_p[z] - E_gold[z] and its second the mean of Var_p[z]. Rows of fewer
+    E_p[z] - E_gold[z] and its second the mean of Var_p[z]. Each gold is
+    read as a distribution, to unit mass, as `Example.distribution` reads a
+    target: a batch packs it in float32, a little short of unit mass, and the
+    shortfall would scale with the logits' common offset. Rows of fewer
     options pad with logits that take no mass."""
     width = max(len(held.logits) for held in group)
     z = np.zeros((len(group), width))
@@ -126,7 +129,7 @@ def _temperature(group: Sequence[Scored]) -> float:
     real = np.zeros((len(group), width), bool)
     for row, held in enumerate(group):
         z[row, :len(held.logits)] = held.logits
-        gold[row, :len(held.target)] = held.target
+        gold[row, :len(held.target)] = held.target / np.sum(held.target)
         real[row, :len(held.logits)] = True
     labelled = np.sum(gold * z, axis=1)
     inverse = 1.0

@@ -188,6 +188,20 @@ def test_calibrating_on_the_distributions_the_model_gives_keeps_its_temperatures
         assert temperature == pytest.approx(1.0, rel=1e-3)
 
 
+def test_a_temperature_fit_does_not_depend_on_a_common_logit_shift():
+    """Gold distributions packed in float32, as a batch packs them, hold a
+    little less than unit mass; read as they are, the fit's slope would grow
+    with every logit's common offset. Read as distributions, three answers
+    whose gold is their own softmax fit temperature 1 at any offset."""
+    from dew.decision.calibration import _temperature
+
+    logits = np.asarray([[0.0, 1.0, 2.0], [0.5, -1.0, 0.0], [2.0, 2.5, -0.5]])
+    for shift in (0.0, 1e7):
+        held = [Scored("choice", row + shift, softmax(row, 1.0).astype(np.float32).astype(np.float64))
+                for row in logits]
+        assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
+
+
 def test_abstention_keeps_the_accepted_answers_within_the_target_error():
     scored = synthetic(1.0, 2000, 4, seed=2)
     temperatures = Temperatures.fit(scored, bucket_minimum=100)
