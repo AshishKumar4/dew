@@ -824,7 +824,7 @@ class TrainerConfig:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
-        return dataset.steps_per_epoch
+        return dataset.epoch_steps()
 
 
 def _local_tracker(directory: str, name: str):

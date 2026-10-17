@@ -33,9 +33,9 @@ from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
 from dew.data.compile import compile, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
+from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -192,13 +192,10 @@ def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():
     assert read[:8] == [1000, 1001, 1002, 2000, 1003, 1004, 1005, 2001]
 
 
-@pytest.mark.parametrize("weights, message", [
-    ((1.0,), "at least two pipelines"),
-    ((1.0, 0.0), "finite and positive"),
-    ((1.0, -1.0), "finite and positive"),
-])
-def test_a_mixture_that_is_not_one_is_refused(weights, message):
-    corpora = [Pipeline(Memory(Indexed(tag, 8))) for tag in range(1, len(weights) + 1)]
+@pytest.mark.parametrize("count, weights", [(0, ()), (2, (1.0,)), (2, (1.0, 0.0)), (2, (1.0, -1.0))])
+def test_a_mixture_that_is_not_one_is_refused(count, weights):
+    """A mixture is one or more datasets with one finite, positive weight each."""
+    corpora = [Pipeline(Memory(Indexed(tag, 8))) for tag in range(1, count + 1)]
     with pytest.raises(ValueError):
         mix(corpora, weights=weights)
 
@@ -1119,7 +1116,8 @@ def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_ea
     """Published generations mix by tokens from the rows and valid targets each states, where
     the weighting once looked for a windows count no generation states."""
     from dew.data.cache import Cache
-    from dew.data.steps.text import CountTargets, Tokenize
+    from dew.data.steps.text import CountTargets
+    from dew.data.text import Tokenize
 
     def published(name: str, documents: int) -> Pipeline:
         texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)

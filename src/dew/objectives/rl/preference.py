@@ -59,7 +59,7 @@ class DPOObjective(LMObjective):
         self.beta = beta
 
     def data(self, tokenizer=None):
-        """No steps of its own: a preference record step (`preferences.pair`)
+        """No steps of its own: a preference record step (`preferences.PreferencePair`)
         lays out the pairs, which LM's text windows would cut."""
         from dew.data.pipeline import ObjectiveData
 

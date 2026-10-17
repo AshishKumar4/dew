@@ -65,7 +65,7 @@ flowchart TD
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
-Library stages are factories that return one of these shapes. `images.resize(256)` is a `RecordFn`, `images.flip(p=0.5)` a `RandomFn`, `images.min_side(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage.
+Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`, `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage.
 
 ## 2. Sources
 
@@ -91,7 +91,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.chunk(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
 | Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
@@ -146,24 +146,24 @@ from dew.data import Files, images, text
 
 aug = A.Compose([A.RandomResizedCrop((256, 256), scale=(0.6, 1)), A.HorizontalFlip()])
 ds = (Files("gs://bucket/laion/*.array_record")
-        .filter_map(images.decode())               # reads "jpg", writes "image"; bad bytes are counted
-        .filter(images.min_side(256))
-        .random_map(images.albumentations(aug))    # seeded per record: reproducible and resumable
-        .random_map(text.drop("caption", p=0.1)))  # caption dropout for guidance
+        .filter_map(images.DecodeImage())               # reads "jpg", writes "image"; bad bytes are counted
+        .filter(images.MinSide(256))
+        .random_map(images.Albumentations(aug))    # seeded per record: reproducible and resumable
+        .random_map(text.Dropped("caption", p=0.1)))  # caption dropout for guidance
 ```
 
 ### Augmenting on the GPU
 
 ```python
 ds = (Files("gs://bucket/laion/*.array_record")
-        .filter_map(images.decode())
-        .map(images.resize(256))
-        .random_map(images.augmentation_key())                      # each record draws its own key
+        .filter_map(images.DecodeImage())
+        .map(images.Resize(256))
+        .random_map(images.AugmentationKey())                      # each record draws its own key
         .batch(512)
-        .map(images.device_augment(256, crop_scale=(0.6, 1), jitter=True)))   # crop, flip, colour on the GPU
+        .map(images.DeviceAugment(256, crop_scale=(0.6, 1), jitter=True)))   # crop, flip, colour on the GPU
 ```
 
-The host only decodes and resizes. A device step like `device_augment` runs inside the compiled training step, on each device's shard of the batch: every accelerator crops, flips and colour-jitters its own rows, each image by the key its record drew, so the result is the same on every worker count and after a resume. On an 8-vCPU host this reads about 2.4× the images per second that host-side augmentation reads (512×384 JPEGs to 256 crops).
+The host only decodes and resizes. A device step like `DeviceAugment` runs inside the compiled training step, on each device's shard of the batch: every accelerator crops, flips and colour-jitters its own rows, each image by the key its record drew, so the result is the same on every worker count and after a resume. On an 8-vCPU host this reads about 2.4× the images per second that host-side augmentation reads (512×384 JPEGs to 256 crops).
 
 ### Several sources, one downloaded on the fly
 
@@ -175,7 +175,7 @@ cc12m = Hub("pixparse/cc12m-wds", columns=["url", "caption"]).filter_map(images.
 coco  = from_hf(load_dataset("detection-datasets/coco", split="train")).map(to_caption).named("coco")
 
 def prepare(ds):
-    return ds.filter_map(images.decode()).filter(images.min_side(256)).map(images.resize(256))
+    return ds.filter_map(images.DecodeImage()).filter(images.MinSide(256)).map(images.Resize(256))
 
 train = (mix([laion, cc12m, coco], weights=[0.6, 0.3, 0.1])
            .pipe(prepare)
@@ -188,7 +188,7 @@ flowchart LR
   L["laion<br/>Files"] --> M
   C["cc12m<br/>Hub + images.fetch"] --> M
   O["coco<br/>from_hf"] --> M
-  M["mix<br/>0.6 · 0.3 · 0.1<br/>each member keyed by name"] --> P["pipe(prepare)<br/>decode · min_side · resize"]
+  M["mix<br/>0.6 · 0.3 · 0.1<br/>each member keyed by name"] --> P["pipe(prepare)<br/>DecodeImage · MinSide · Resize"]
   P --> Sh["shuffle"] --> B["batch(512)"]
 ```
 
@@ -251,9 +251,9 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 ```python
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
-           .random_filter_map(video.pick_clip(seconds=2.0))  # writes one start/stop descriptor
-           .filter_map(video.decode(frames=32, fps=16, size=256))            # reads the descriptor
-           .filter_map(audio.decode(sample_rate=16_000, missing="silence")))  # reads the same descriptor
+           .random_filter_map(video.PickClip(seconds=2.0))  # writes one start/stop descriptor
+           .filter_map(video.DecodeVideo(frames=32, fps=16, size=256))            # reads the descriptor
+           .filter_map(audio.DecodeAudio(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
 
 Both decoders read one clip descriptor, so the frames and the waveform cover the same time window. With `missing="silence"`, a clip without sound gets a zero waveform and `audio_valid` false; the default, `"reject"`, drops it. Audio features come from the model's audio conditioner, not from a data step.
@@ -283,7 +283,7 @@ trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True),
 
 Training and validation use the same preset, so both are prepared the same way. Augmentation is off unless you ask for it, so a validation split never gets it by accident. There are no train or eval variants. Presets live in `dew.data.presets`; `images`, `text`, `chat`, `video` and `audio` hold only steps.
 
-The public image decoder also reads prepared ArrayRecord byte maps: `shape` holds two int32 dimensions, `image` holds RGB uint8 pixels, and `label` and UTF-8 `caption` are optional. It reads encoded `jpg`/`txt` byte maps through the same step. By default, `filter_map(images.decode())` counts and drops bad images; `.map(images.decode(rejects=False))` fails on bad bytes and keeps every source position, as the run-layer `ImageData` recipe does.
+The public image decoder also reads prepared ArrayRecord byte maps: `shape` holds two int32 dimensions, `image` holds RGB uint8 pixels, and `label` and UTF-8 `caption` are optional. It reads encoded `jpg`/`txt` byte maps through the same step. By default, `filter_map(images.DecodeImage())` counts and drops bad images; `.map(images.DecodeImage(rejects=False))` fails on bad bytes and keeps every source position, as the run-layer `ImageData` recipe does.
 
 `images.caption(template, classes=names)` formats a class label; `images.caption(columns=("description", "text"))` picks the first present column. To draw one of several templates per record, use `.random_map(images.caption(templates=("a {label}", "a photo of {}"), classes=names))`. `ImageData` composes these same decoding, resizing, caption and augmentation steps; its recorded run settings are unchanged.
 
@@ -297,7 +297,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
 - `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
-- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.albumentations(aug)`, which runs on the host right after the resize.
+- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.Albumentations(aug)`, which runs on the host right after the resize.
 - `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
 
 ### Where the rest of the chain goes
@@ -325,8 +325,8 @@ data = (train.shuffle(seed=0)
 from dew.data import Hub, images, presets
 
 photos = (Hub("user/photos", columns=["jpg", "caption", "id"])
-            .filter_map(images.decode())                     # shared by every split
-            .filter(images.min_side(256))
+            .filter_map(images.DecodeImage())                     # shared by every split
+            .filter(images.MinSide(256))
             .map(images.caption("a photo of {caption}")))
 train, val, test = photos.holdout(val=0.01, test=0.01, key="id")
 
@@ -353,8 +353,8 @@ train.pipe(flowers, 64, batch=16, augment=True)
 ```python
 ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism at the source
         .filter_map(images.fetch(threads=64))                # an IO stage's own thread pool
-        .filter_map(images.decode())
-        .random_map(images.albumentations(aug))
+        .filter_map(images.DecodeImage())
+        .random_map(images.Albumentations(aug))
         .workers(16)                                          # everything above runs in 16 processes per host
         .map(to_model_fields)                                 # cheap reshaping in the main process
         .prefetch(4)
@@ -409,11 +409,11 @@ The chain lowers one stage per Grain operator. On top of that, Dew fuses adjacen
 | Area | Status |
 |---|---|
 | `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`random_filter_map`/`flat_map`, `mix([..], weights=, by=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built |
-| `images.fetch`/`decode`, albumentations and torchvision adapters, `images.augmentation_key`/`device_augment` | Built |
-| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Built |
+| `images.fetch`/`DecodeImage`, albumentations and torchvision adapters, `images.AugmentationKey`/`DeviceAugment` | Built |
+| `video.PickClip`/`DecodeVideo`, `audio.DecodeAudio` on one clip descriptor | Built |
 | `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Built |
 | `fit(data, validation=, steps=/epochs=/tokens=)` | Built |
-| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `snapshot`, `text.chunk`, `text.normalize`, `stats` | Built |
+| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `snapshot`, `text.Chunks`, `text.Normalized`, `stats` | Built |
 | `mix` members keyed by name, `schedule` in tokens | Planned |
 | Elastic resume, `text.decontaminate`, `text.dedup_minhash`, language and quality filters, fusion, measured defaults, GPU decode | Planned |
 | Native `jax.Mesh` with any axes | Planned (training) |

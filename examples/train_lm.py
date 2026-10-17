@@ -1,8 +1,18 @@
-"""Train a byte-level language model on a directory of token files, then generate.
+"""Train a byte-level language model on a token store, then generate.
+
+The text is split into lines to train on and lines held out, and each is
+tokenized into a store of its own by `dew data export`: training validates on a
+slice of its own tokens, and the held-out store is what
+examples/evaluate_and_serve.py scores.
 
     curl -o data/shakespeare.txt --create-dirs \\
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    dew tokenize --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
+    head -n 36000 data/shakespeare.txt > data/shakespeare-train.txt
+    tail -n +36001 data/shakespeare.txt > data/shakespeare-val.txt
+    dew data export records data/shakespeare --fields '{"source": "data/shakespeare-train.txt"}' \\
+        --tokenizer byte --eos --read memory
+    dew data export records data/shakespeare-val --fields '{"source": "data/shakespeare-val.txt"}' \\
+        --tokenizer byte --eos --read memory
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """
@@ -62,6 +72,8 @@ def main(config: Config):
             sampling=Sampling(temperature=0.8, top_k=40),
             decode=tokenizer.decode,
         ),
+        # Recorded with the run, so what loads it (examples/evaluate_and_serve.py) reads text.
+        processor=RunProcessor(tokenizer),
     )
 
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
@@ -70,7 +82,7 @@ def main(config: Config):
 
     # No reload is needed; the weights stay where the trainer placed them, and
     # the tokenizer decodes the rows.
-    task = objective.pipeline(state, processor=RunProcessor(tokenizer))
+    task = objective.pipeline(state)
     text = config.prompt + task(config.prompt, key=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)

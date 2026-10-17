@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, TypedDict
@@ -38,13 +38,14 @@ from dew.inputs.diffusion import (
 )
 from dew.interop import decoder_parts, hf_decoders as decoders, sources
 from dew.interop.components import bind_component
+from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.processors import (
     HostProcessor as HostProcessor,
     Processor as Processor,
     ProcessorCall as ProcessorCall,
 )
 from dew.interop.streaming import LazyTree, WeightLayout
-from dew.interop.weights import AUTO, ParamTree
+from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
@@ -786,14 +787,20 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
                                                    "tie_word_embeddings")}
 
 
+_TEXT_ENCODER = ("encoders", "conditioning", "text_encoder")
+"""Where a pipeline holds its text encoder's variables."""
+
+
 def _bind_language_model[C: ConditionEncoder](
-        directory: Path, config: Mapping[str, object], decoder: CausalTransformer,
-        path: Callable[[str], tuple[str, ...] | None], conditioner: Callable[[Variables], C], *,
-        vision: tuple[str, ...], param_dtype: str, params: Variables | None, lazy: bool
-        ) -> tuple[C, tuple[WeightLayout, ...], dict[str, np.ndarray]]:
-    """Bind a language-model text encoder (`bind_component`) into the
-    conditioner its pipeline runs: supplied `params` as they are, or the
-    `text_encoder` component's tensors that `path` maps, with their layouts.
+        directory: Path, record: decoder_parts.DecoderFields, family: str, rename: Callable[[str], str],
+        conditioner: Callable[[Variables], C], *, vision: tuple[str, ...], param_dtype: str,
+        params: Variables | None, lazy: bool) -> tuple[C, tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+    """Bind a language-model text encoder into the conditioner its pipeline runs:
+    supplied `params` as they are, or the `text_encoder` component's tensors
+    read as their decoder `family` reads a decoder's checkpoint
+    (`hf_decoders.read_decoder`), `rename` giving each tensor its name there,
+    with their layouts in the pipeline under every name they are stored by
+    (`decoder_bindings.decoder_layouts`), an equal alias's too.
 
     The tensors under a `vision` prefix are a vision tower no text prompt
     reads, so they stay out of the variables and come back as stored, under
@@ -802,28 +809,37 @@ def _bind_language_model[C: ConditionEncoder](
     """
     from dew.interop import diffusion
 
-    stored = {} if params is not None else diffusion.component_tensors(directory, "text_encoder")
-    encoder, _, layouts, _ = bind_component(
-        directory / "text_encoder", "text_encoder", config, decoder, lambda name, rank: path(name),
-        lambda bound: conditioner(bound if params is not None else {"text_encoder": bound}),
-        prefix=("encoders", "conditioning", "text_encoder"), params=params, param_dtype=param_dtype,
-        lazy=lazy, tensors={name: tensor for name, tensor in stored.items() if not name.startswith(vision)})
-    return encoder, layouts, {f"text_encoder/{name}": tensor for name, tensor in stored.items()
-                              if name.startswith(vision)}
+    if params is not None:
+        return conditioner(params), (), {}
+    stored = diffusion.component_tensors(directory, "text_encoder")
+    # A checkpoint may store one tensor under two names (a Mistral-3 under both
+    # its spellings): equal copies read once, and each name keeps its binding.
+    aliases: dict[str, list[str]] = {}
+    owners: dict[tuple[str, ...], str] = {}
+    for name in stored:
+        if not name.startswith(vision):
+            local = rename(name)
+            source_alias(stored, owners, (local,), name)
+            aliases.setdefault(local, []).append(name)
+    variables, readings = decoders.read_decoder({local: stored[names[0]] for local, names in aliases.items()},
+                                                record, family, param_dtype=param_dtype, lazy=lazy)
+    layouts, kept = decoder_layouts(readings, record, family, variables,
+                                    place=lambda path: (*_TEXT_ENCODER, *path))
+    bound = tuple(replace(layout, name=f"text_encoder/{name}")
+                  for layout in layouts for name in aliases[layout.name])
+    retained = {f"text_encoder/{name}": tensor for local, tensor in kept.items() for name in aliases[local]}
+    retained.update({f"text_encoder/{name}": tensor for name, tensor in stored.items()
+                     if name.startswith(vision)})
+    return conditioner({"text_encoder": variables}), bound, retained
 
 
-def _qwen_text_path(record: decoder_parts.DecoderFields):
-    """Map a Qwen3-VL checkpoint's language model as the Qwen3 decoder's, its
-    head too."""
-    family = decoders.families()["qwen3"]
-
-    def path(name: str) -> tuple[str, ...] | None:
-        if name.startswith("model.language_model."):
-            return family.weight_path("model." + name.removeprefix("model.language_model."), record)
-        if name == "lm_head.weight":
-            return family.weight_path(name, record)
-        raise ValueError(f"unknown tensor name {name!r}")
-    return path
+def _qwen_text_name(name: str) -> str:
+    """A Qwen3-VL checkpoint's language-model tensor under the Qwen3 decoder's own name, its head too."""
+    if name.startswith("model.language_model."):
+        return "model." + name.removeprefix("model.language_model.")
+    if name == "lm_head.weight":
+        return name
+    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, *,
@@ -844,7 +860,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
     encoder, layouts, retained = _bind_language_model(
-        directory, config, decoder, _qwen_text_path(record),
+        directory, record, "qwen3", _qwen_text_name,
         lambda bound: QwenImageConditioner(decoder, load_tokenizer(str(directory / "processor")), bound,
                                            str(directory), tokens=tokens, param_dtype=param_dtype),
         vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy)
@@ -860,27 +876,27 @@ _MISTRAL3_VISION = ("vision_tower.", "multi_modal_projector.", "model.vision_tow
                     "model.multi_modal_projector.")
 """Where a Mistral-3 checkpoint keeps its vision tower and projector: at its
 root beside `language_model.model.`, or under `model.` beside
-`model.language_model.` (`_hidden_states_path`)."""
+`model.language_model.` (`_hidden_states_name`)."""
 
 
-def _hidden_states_path(record: decoder_parts.DecoderFields, family: str, multimodal: bool):
-    """Map a hidden-states text encoder's language model: a Qwen3's own
-    names, or a Mistral-3's as the Mistral decoder's. A Mistral-3 checkpoint
-    names its language model `language_model.model.` and its head
-    `language_model.lm_head` (transformers 4.50 and 5 write these), or
-    `model.language_model.` and `lm_head` (4.52 to 4.57)."""
-    decoder = decoders.families()[family]
+def _hidden_states_name(multimodal: bool) -> Callable[[str], str]:
+    """Name a hidden-states text encoder's tensor as its decoder's checkpoint
+    does: a Qwen3's own names, or a Mistral-3's language model as the
+    Mistral decoder's. A Mistral-3 checkpoint names its language model
+    `language_model.model.` and its head `language_model.lm_head` (transformers
+    4.50 and 5 write these), or `model.language_model.` and `lm_head` (4.52 to
+    4.57)."""
 
-    def path(name: str) -> tuple[str, ...] | None:
+    def name_of(name: str) -> str:
         if not multimodal or name == "lm_head.weight":
-            return decoder.weight_path(name, record)
+            return name
         if name == "language_model.lm_head.weight":
-            return decoder.weight_path("lm_head.weight", record)
+            return "lm_head.weight"
         for prefix in ("model.language_model.", "language_model.model."):
             if name.startswith(prefix):
-                return decoder.weight_path("model." + name.removeprefix(prefix), record)
+                return "model." + name.removeprefix(prefix)
         raise ValueError(f"unknown tensor name {name!r}")
-    return path
+    return name_of
 
 
 def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, *,
@@ -920,8 +936,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
                          "encoder does not have before its final norm")
     encoder, layouts, retained = _bind_language_model(
-        directory, config, decoder,
-        _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
+        directory, record, records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
         lambda bound: HiddenStatesConditioner(
             decoder, load_tokenizer(str(directory / "tokenizer")), bound, str(directory),
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,
