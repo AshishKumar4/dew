@@ -71,7 +71,9 @@ def test_a_dory_config_loads_as_its_looped_ngpt():
 
 
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
-    loaded = load()
+    """A loaded Dory saves its config and tensors as the released checkpoint names them, and the
+    saved checkpoint rebuilds the same model and tensors."""
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)
     assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'dory'

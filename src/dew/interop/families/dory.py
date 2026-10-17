@@ -115,16 +115,18 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
     return config
 
 
-_ATTENTION = {**{f'{name}.weight': ('self_attn', name, 'kernel')
-                 for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
-              'g_proj.weight': ('self_attn', 'gate_proj', 'kernel'),
-              'sqk': ('self_attn', 'sqk'), 's_gate': ('self_attn', 's_gate')}
+_ATTENTION: dict[str, tuple[str, ...]] = {
+    **{f'{name}.weight': ('self_attn', name, 'kernel') for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
+    'g_proj.weight': ('self_attn', 'gate_proj', 'kernel'),
+    'sqk': ('self_attn', 'sqk'), 's_gate': ('self_attn', 's_gate')}
 """An attention layer's tensors under `mixer.`, by their paths in its block."""
-_MLP = {**{f'{name}.weight': ('mlp', name, 'kernel') for name in ('gate_proj', 'up_proj', 'down_proj')},
-        'suv_gate': ('mlp', 'suv_gate'), 'suv_up': ('mlp', 'suv_up')}
+_MLP: dict[str, tuple[str, ...]] = {
+    **{f'{name}.weight': ('mlp', name, 'kernel') for name in ('gate_proj', 'up_proj', 'down_proj')},
+    'suv_gate': ('mlp', 'suv_gate'), 'suv_up': ('mlp', 'suv_up')}
 """An MLP layer's tensors under `mixer.`, by their paths in its block."""
-_TRUNK = {'backbone.embeddings.weight': ('embed_tokens', 'embedding'),
-          'lm_head.weight': ('lm_head', 'kernel'), 'lm_head.logit_scale': ('logit_scale',)}
+_TRUNK: dict[str, tuple[str, ...]] = {
+    'backbone.embeddings.weight': ('embed_tokens', 'embedding'),
+    'lm_head.weight': ('lm_head', 'kernel'), 'lm_head.logit_scale': ('logit_scale',)}
 _LAYER = re.compile(r'backbone\.layers\.(\d+)\.(.+)')
 
 
@@ -139,7 +141,7 @@ def _dory_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
     block = f'layers_{index // 2}'
     if rest == ('mlp_alpha' if index % 2 else 'attn_alpha'):
         return ('params', block, rest)
-    table: Mapping[str, tuple[str, ...]] = _MLP if index % 2 else _ATTENTION
+    table = _MLP if index % 2 else _ATTENTION
     tail = rest.removeprefix('mixer.')
     if not rest.startswith('mixer.') or tail not in table:
         raise ValueError(f'{name!r} is no tensor of a Dory {"mlp" if index % 2 else "attention"} layer')
