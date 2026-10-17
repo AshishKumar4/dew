@@ -1,5 +1,5 @@
-// Secrets are set with deploy.mjs's --secrets-file, which also warms the deployed pool with
-// OPERATOR_SECRET, so `wrangler types` cannot see them in wrangler.jsonc.
+// Secrets are set with `wrangler secret put` (or deploy.mjs's --secrets-file), so
+// `wrangler types` cannot see them in wrangler.jsonc.
 interface Env {
 	/** Authenticates the repository owners' model-pool controls; never passed into a container. */
 	OPERATOR_SECRET: string;
