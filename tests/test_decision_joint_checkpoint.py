@@ -13,7 +13,6 @@ import jax
 import numpy as np
 import optax
 import pytest
-from delta_rule_support import port_formula
 from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward
 from safetensors.numpy import load_file
@@ -39,7 +38,6 @@ from dew.decision.calibration import softmax
 from dew.decision.data import Decisions
 from dew.decision.images import Images
 from dew.decision.joint_checkpoint import StoredJointHead
-from dew.nn import linear
 from dew.nn.kernels.generation import measured_kernel
 from dew.training.trainer import Trainer
 
@@ -196,7 +194,7 @@ def joint_logits(decide) -> np.ndarray:
     return np.concatenate(found)
 
 
-def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
+def test_a_joint_release_answers_as_its_own_model(tmp_path):
     """`Decide.from_pretrained` reads a joint-head release, the Qwen 3.5
     backbone with the head beside it. Dew's backbone and head together are
     held to twice the release's own fp32 model's distance from its float64
@@ -205,16 +203,15 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
     logits give it, within the fourth decimal both round to.
 
     Where the device's target row names the delta rule's port, Dew's Gated
-    DeltaNet runs the port's formula, one plain fp32 decay prefix per chunk
-    as fla takes it, not the release's: on an A100 the port's logits sat 3.46
-    times the release's distance from float64, the portable math's 1.57. There
-    the reference is Dew's own model with the port's formula in the portable
-    math (`port_formula`), as a packed window's is (test_decision_packing)."""
+    DeltaNet runs fla's algorithm, one plain fp32 decay prefix per chunk, not
+    the release's torch math: there the reference is the same release with
+    HF's Qwen 3.5 on fla's own kernels (logits_fla.npz,
+    tools/joint_checkpoint_reference.py --fla)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
     layouts = json.loads((TINY / "layouts.json").read_text())
-    reference, truth = [], []
+    keys, reference, truth = [], [], []
     with np.load(TINY / "logits.npz") as logits:
         for case, request in CASES.items():
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
@@ -222,6 +219,7 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
             answers = decide.systemone(request)["answers"]
             for laid, kept in zip(row.questions, layouts[case]["questions"], strict=True):
                 key = f"{case}/{laid.name}"
+                keys.append(key)
                 reference.append(logits[key])
                 truth.append(logits[f"{key}/f64"])
                 probabilities = softmax(logits[key].astype(np.float64), 1.0)
@@ -232,13 +230,10 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
                     assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
-    found, reference = joint_logits(decide), np.concatenate(reference)
     if measured_kernel("gated_delta_rule", "xla") == "fla":
-        with monkeypatch.context() as patched:
-            patched.setattr(linear, "fla_rule", port_formula)
-            reference = joint_logits(decide)
-        assert not np.array_equal(reference, found), "the formula ran the port itself"
-    assert_as_exact_as_the_reference(found, reference, np.concatenate(truth),
+        with np.load(TINY / "logits_fla.npz") as on_fla:
+            reference = [on_fla[key] for key in keys]
+    assert_as_exact_as_the_reference(joint_logits(decide), np.concatenate(reference), np.concatenate(truth),
                                      "the joint head over Dew's Qwen 3.5")
 
 

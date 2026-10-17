@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import DECAY_SUMS, port_formula
 from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
@@ -269,22 +268,18 @@ def embedded(module, tokens):
     return module.scaled_embeddings(module.token_embeddings(tokens))
 
 
-DELTA_RULES = frozenset({"gated_delta_net", "kimi_delta_attention"})
-"""The registry's kinds on the delta rule, which a GPU runs on its port (`linear.fla_rule`)."""
-
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
-def test_no_token_reaches_another_document(kind, monkeypatch):
+def test_no_token_reaches_another_document(kind):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
     logits, the parameters' gradients of a loss on them alone and its gradient at the second's
     embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
-    information crossing a document boundary. The delta rule's port runs a row as one sequence, each
-    document's decay prefix shifted by the one before (`linear.FORGET`), so there the second
-    document's values move by that prefix's rounding: they are held to float64 within the distance of
-    the same changed row with the port's formula in the portable math (`port_formula`), whose ranges
-    round as the port's do, and which a token crossing the boundary would miss by orders of magnitude,
-    but the per-head decay parameters (`DECAY_SUMS`). The unchanged row is no reference there: the
-    first document's new decays redraw the second's.
+    information crossing a document boundary. The delta rules run their portable math here, chosen
+    through the kernel choice (`chosen`), which restarts each document's decays: their port
+    runs a row as one sequence, each document's decay prefix shifted by the one before
+    (`linear.FORGET`), so the first document's decays round the second's and no bitwise comparison
+    holds. The port's packed rows are held against fla's own packed sequences at the layer
+    (test_fla_gdn, test_fla_kda) and through the model (test_decision_packing).
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -306,7 +301,7 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
     weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-    def second_document(row, model=model, variables=variables):
+    def second_document(row):
         def loss(variables, inputs):
             logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
@@ -316,24 +311,10 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
             variables, inputs)
         return logits, grads, at_inputs[:, first:first + second]
 
-    moved = second_document(changed)
-    if kind in DELTA_RULES and linear.measured_kernel("gated_delta_rule", "xla") == "fla":
-        with monkeypatch.context() as patched:
-            patched.setattr(linear, "fla_rule", port_formula)
-            formula = second_document(changed)
-        with jax.enable_x64(new_val=True):
-            widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-            truth = second_document(tokens, model.clone(dtype=jnp.float64), widened)
-
-        def held(tree):
-            return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
-                                                  for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
-                    if not any(decay in name for decay in DECAY_SUMS)}
-
-        assert_leaves_as_exact(held(moved), held(formula), held(truth))
-        return
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved),
-                                    jax.tree.leaves(second_document(tokens)), strict=True):
+    with chosen(gated_delta_rule="xla"):
+        moved, kept = second_document(changed), second_document(tokens)
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(kept),
+                                    strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
                                       err_msg=jax.tree_util.keystr(path))
 

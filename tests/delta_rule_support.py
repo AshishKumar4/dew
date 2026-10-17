@@ -4,6 +4,7 @@ is run through (`through`), fla's own outputs and gradients, the ports' referenc
 float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's plain decay
 prefix and formula in the portable math where fla cannot run (`plain_prefix`, `port_formula`)."""
 
+import functools
 import itertools
 import os
 import subprocess
@@ -14,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms
+from reference_error import float64_terms, widened
 
 from dew.nn import linear
 from dew.nn.kernels import fla_gdn
@@ -219,6 +220,75 @@ def fla_decay_terms(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     return np.where(first[..., None, None], 0.0, terms)
 
 
+def math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule, value heads reading their key head, a decay per head `[B, T, H]` or per key
+    dimension `[B, T, H, K]`, a row's packed documents starting at `starts` (`[B, T]`), as the port
+    runs them."""
+    group = v.shape[2] // q.shape[2]
+    q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
+    starts = None if starts is None else jnp.asarray(starts)
+    return linear.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0, starts=starts)
+
+
+HEADS = 8
+"""The value heads `float64_truth` evaluates the portable math's terms over at once: fewer operations
+dispatched one by one, at a few GB of host memory a block for Kimi's decay per key dimension."""
+
+
+def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
+    so a head's backward fits, and each one's float64 terms, evaluated op by op on the host: what the
+    sums of Dew's portable math add on the whole row, its documents from their starts as the port runs
+    them (`float64_terms`, `HEADS` value heads at a time), and for a decay per key dimension's
+    gradient those of the parts Kimi's port sums besides (`fla_decay_terms`). A key head's gradients
+    and terms are summed over the value heads it serves."""
+    q, k, v, g, beta, h0, do, dht = inputs
+    group = v.shape[2] // q.shape[2]
+    rows = None if cuts is None else (cuts,)
+    host = jax.devices("cpu")[0]
+    starts = None
+    if cuts is not None:
+        starts = np.zeros(q.shape[:2], bool)
+        starts[0, list(cuts[1:])] = True
+    with jax.enable_x64(new_val=True):
+        run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
+            functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
+        heads, decay = [], []
+        for head in range(v.shape[2]):
+            keyed = slice(head // group, head // group + 1)
+            valued = slice(head, head + 1)
+            sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
+                              beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
+            heads.append([np.asarray(x) for x in run(*sliced)])
+            if g.ndim == 4:
+                with jax.default_device(host):
+                    decay.append(fla_decay_terms(*jax.device_put(sliced, host), starts=starts))
+        sizes = []
+        step, packed = max(1, HEADS // group), functools.partial(math, starts=starts)
+        with jax.default_device(host):
+            for first in range(0, q.shape[2], step):
+                keyed, valued = slice(first, first + step), slice(first * group, (first + step) * group)
+                block = jax.device_put(widened((
+                    q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
+                    h0[:, valued], do[:, :, valued], dht[:, valued])), host)
+                _, terms = float64_terms(through(packed, *block[6:]), *block[:6])
+                sizes.append([np.asarray(x) for x in terms])
+
+    def joined(leaves):
+        return [np.concatenate([each[i] for each in leaves], axis=axis)
+                for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+
+    def grouped(x):
+        return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
+
+    found, terms = joined(heads), joined(sizes)
+    if decay:
+        terms[5] = np.maximum(terms[5], np.concatenate(decay, axis=2))
+    for i in (2, 3):
+        found[i] = grouped(found[i])
+    return found, terms
+
+
 def plain_prefix(g, chunk: int = CHUNKED):
     """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
@@ -231,25 +301,3 @@ def plain_prefix(g, chunk: int = CHUNKED):
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
-
-
-DECAY_SUMS = ("['A_log']", "['dt_bias']", "['in_proj_a']")
-"""A delta rule layer's decay parameters and the projection to its decay: each gradient sums every
-token's decay gradient over a layer's few heads, and with it every token's prefix rounding on the
-port, two draws of which no ratio holds (on an A100 they sat 0.4 to 3 times the port's formula's);
-each token's is held by test_linear_attention's
-test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does."""
-
-
-def port_formula(query, key, value, g, beta, state=None, *, starts=None):
-    """`linear.fla_rule`'s formula in the portable math: each packed document's first token decays by
-    `linear.FORGET`, and every range is the difference of two plain fp32 prefixes per row-aligned
-    chunk (`plain_prefix`), as the port takes them. A second rounding sample of the port's own
-    formula, where fla, which restarts a varlen sequence's prefix, cannot run."""
-    if starts is not None:
-        forget = jnp.asarray(starts, bool).reshape(*starts.shape, *(1,) * (g.ndim - 2))
-        g = g + jnp.where(forget, linear.FORGET, 0.0)
-    group = value.shape[2] // key.shape[2]
-    query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-    decay = plain_prefix(g).reshape(*value.shape[:3], -1)
-    return linear.chunk_delta_rule(query, key, value, decay, beta, state)
