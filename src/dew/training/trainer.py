@@ -524,6 +524,8 @@ class Trainer(Generic[Loss, Effects]):
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
+        # Whether `fit` reads a batch ramp, whose stages change the batch's shape.
+        self._ramped = False
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
 
@@ -1220,6 +1222,10 @@ class Trainer(Generic[Loss, Effects]):
         shapes = None if self.step is not None else self._loss_shape(state, batch)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
+            if self._ramped and window > 1 and not isinstance(shapes[0], (Ratio, jax.ShapeDtypeStruct)):
+                raise ValueError("a loss of composite statistics replays its accumulation window's "
+                                 "batches, whose shape a batch ramp changes at each stage; ramp the batch "
+                                 "or accumulate")
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
         copies = self._narrow_copies(state, batch)
         if copies:
@@ -1651,10 +1657,10 @@ class Trainer(Generic[Loss, Effects]):
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
-            check_stream(run.source, mesh, self.microbatches, plan.dataset.batch,
-                         self.accumulation * (self._split or 1), rows=self.rollout is None,
+            check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            if isinstance(run.source, RampedStream):
+            self._ramped = isinstance(run.source, RampedStream)
+            if self._ramped:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
             self._rows = (plan.dataset.batch,)

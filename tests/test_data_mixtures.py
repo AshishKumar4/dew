@@ -937,14 +937,19 @@ def test_a_ramped_run_killed_mid_ramp_lands_where_the_run_nobody_stopped_lands(t
                 "the resumed ramp did not land on the uninterrupted run")
 
 
-def test_a_ramp_and_an_accumulation_window_are_refused_together():
+def test_a_ramp_pools_its_stages_batches_in_an_accumulation_window():
+    """An accumulation window pools a ramp's batches as it pools any: the loss a mean of the records a
+    window read, so two steps of eight records each and two of sixteen make two updates."""
     trainer = Trainer(
         Regression(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
         layout=Layout(min_shard=1, tolerance=1.0))
 
-    with pytest.raises(ValueError):
-        trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=16)),
-                    steps=2, log_every=100)
+    state = trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=16)),
+                        steps=4, log_every=100)
+
+    assert int(state.step) == 4
+    assert int(state.updates) == 2
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(parameters(state)))
 
 
 @pytest.mark.mesh
