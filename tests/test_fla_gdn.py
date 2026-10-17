@@ -662,7 +662,7 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
 @pytest.mark.parametrize("policy, memories, outputs", [
     (None, 1, 1),
     ({"recompute": ("delta_memory",)}, 2, 1),
-    ({"save": ("context", "delta_decay", "delta_inverse")}, 2, 1),
+    ({"save": ("context", "delta_decay", "delta_inverse")}, 2, 2),
 ])
 @generation.chosen(gated_delta_rule="fla")
 def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
@@ -672,9 +672,10 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     layers recomputing that name (`linear.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
-    where it is saved, again in the backward where it is recomputed, the output's (`fla_chunk_fwd_o`)
-    once where it is saved. Off a GPU each computes the gradients the layer computes without remat,
-    bitwise. A GPU
+    where it is saved and again in the backward where it is recomputed; the output's
+    (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
+    rule's forward, output and all. Off a GPU each computes the gradients the layer computes without
+    remat, bitwise. A GPU
     compiles the remat step as another program, whose roundings differ: on an H100 even the XLA
     math's A_log gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy

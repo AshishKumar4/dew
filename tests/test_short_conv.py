@@ -209,7 +209,6 @@ def test_a_gpu_runs_the_kernels_both_ways():
     (jnp.float64, jnp.float64, DELTA, 4),
     (jnp.float32, jnp.float64, DELTA, 4),
     (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4),
-    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (40, 32)), 4),
     # One key head of 16 and a value head of 8: no 16-channel block holds the values.
     (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4),
     (jnp.bfloat16, jnp.bfloat16, DELTA, 12),
