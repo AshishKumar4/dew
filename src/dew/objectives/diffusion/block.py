@@ -25,7 +25,7 @@ from flax import linen as nn, struct
 from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, token_layout
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -343,7 +343,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         tokens = tokens.astype(jnp.int32)
         fields = prepared.token_fields
         response = tokens[:, self.prompt_length:]
-        validity = fields.get("attention_mask")
+        validity, _ = token_layout(fields)
         response_valid = (
             response != self.pad_token_id if validity is None else validity[:, self.prompt_length :]
         )
