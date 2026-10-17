@@ -47,6 +47,20 @@ if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
 
 
+class InfrastructureError(RuntimeError):
+    """A rollout's infrastructure failed: a connection, an engine, a sandbox, a runtime or a service.
+
+    A session source turns it, like any `OSError`, into an `INFRA_ERROR`
+    session, which the scheduler retries; any other error is broken code or
+    a broken contract and fails the rollout. The remote rollout servers
+    raise it when the engine cannot be reached, times out, or answers 5xx
+    or 429, and Dew's sandbox runners when they cannot run a program. An
+    environment, verifier or reward raises it for a failure of its own
+    external boundary that is not an `OSError`, such as an httpx transport
+    error.
+    """
+
+
 @dataclass(frozen=True)
 class Draw:
     """One sampled continuation of one prompt.
@@ -422,12 +436,22 @@ def _vllm_publication(engines: Sequence[str], version: int, timeout: float,
 
 
 def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> httpx.Response:
-    """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true."""
+    """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true.
+
+    An engine that cannot be reached, times out, or answers 5xx or 429 raises
+    `InfrastructureError`; any other refusal raises RuntimeError.
+    """
     import httpx
 
-    response = httpx.post(root.rstrip("/") + path, json=body, timeout=timeout)
+    route = path.split("?")[0]
+    try:
+        response = httpx.post(root.rstrip("/") + path, json=body, timeout=timeout)
+    except httpx.TransportError as error:
+        raise InfrastructureError(f"{route} failed: {type(error).__name__}: {error}") from error
+    if response.status_code >= 500 or response.status_code == 429:
+        raise InfrastructureError(f"{route} answered {response.status_code}: {response.text}")
     if response.status_code != 200 or (reports and not _succeeded(response)):
-        raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
+        raise RuntimeError(f"{route} answered {response.status_code}: {response.text}")
     return response
 
 
@@ -584,15 +608,21 @@ class OpenAIRolloutServer(_RequestServer):
         self._routing = routing
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
-        # The pad id shapes Dew's packed rows; it is not a request field.
-        completion = self._completion(
-            [list(prompt)],
-            budget,
-            key=seed,
-            sampling=replace(self._sampling, pad_token_id=0),
-            logprobs=0,
-            extra_body=self._return_ids,
-        )
+        import openai
+
+        try:
+            # The pad id shapes Dew's packed rows; it is not a request field.
+            completion = self._completion(
+                [list(prompt)],
+                budget,
+                key=seed,
+                sampling=replace(self._sampling, pad_token_id=0),
+                logprobs=0,
+                extra_body=self._return_ids,
+            )
+        except (openai.APIConnectionError, openai.InternalServerError, openai.RateLimitError) as error:
+            # Unreachable, timed out, or 5xx or 429 after the client's own retries.
+            raise InfrastructureError(f"the completion failed: {type(error).__name__}: {error}") from error
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")

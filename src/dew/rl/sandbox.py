@@ -61,7 +61,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
-from dew.objectives.rl.sessions import InfrastructureError
+from dew.inference.rollouts import InfrastructureError
 from dew.records import JSON
 
 
@@ -455,6 +455,11 @@ class ProcessRunner:
                 _closed(process)
 
 
+_REMOVAL_SECONDS = 60
+"""How long `rm --force` may take: a responsive daemon removes a container in seconds, so a runtime
+that takes a minute is wedged."""
+
+
 @dataclass(frozen=True)
 class ContainerRunner:
     """Runs each program in a fresh container of `image` with no network.
@@ -467,8 +472,8 @@ class ContainerRunner:
     and the process count at `pids`, and it runs as `user`. At the wall
     deadline the runner kills the client process, then force-removes the
     container by name. A runtime that exits without creating the container
-    (no daemon, no permission, no image), or whose removal does not return
-    within 60 seconds, raises `InfrastructureError`.
+    (no daemon, no permission, no image), or that stalls removing it,
+    raises `InfrastructureError`.
     """
 
     image: str
@@ -525,7 +530,7 @@ class ContainerRunner:
                         os.killpg(process.pid, signal.SIGKILL)
                     try:
                         subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
-                                       timeout=60, check=False)
+                                       timeout=_REMOVAL_SECONDS, check=False)
                     except subprocess.TimeoutExpired as error:
                         # A wedged runtime: raised once the client below is reaped and its pipes closed.
                         stalled = error
@@ -535,7 +540,8 @@ class ContainerRunner:
                 _closed(process)
             if stalled is not None:
                 raise InfrastructureError(
-                    f"{self.runtime} rm --force did not return in 60 s; container {name} may still run"
+                    f"{self.runtime} rm --force did not return in {_REMOVAL_SECONDS} s; "
+                    f"container {name} may still run"
                 ) from stalled
             if stopped is None and not (os.path.exists(cidfile) and Path(cidfile).read_text().strip()):
                 # The client ended without creating a container: the runtime

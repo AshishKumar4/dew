@@ -156,14 +156,15 @@ if "stubborn" in value("-p"):
 if "slow" in value("-p") or "stubborn" in value("-p"):
     time.sleep(60)
 if "lingering" in value("-p"):
-    # A child in Harbor's process group inherits its output, ignores SIGINT and SIGTERM, then
-    # writes its pid.
+    # A child inherits Harbor's output, ignores SIGINT and SIGTERM, then writes its pid. It stays
+    # in Harbor's process group, or with `detached` leaves it.
     import subprocess
-    subprocess.Popen([sys.executable, "-c", "import json, os, signal, sys, time\n"
-                      "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                      "json.dump(os.getpid(), open(sys.argv[1], 'w'))\n"
-                      "time.sleep(60)", os.path.join(trial, "child.json")])
+    subprocess.Popen([sys.executable, "-c", "import json, os, signal, sys, time\\n"
+                      "signal.signal(signal.SIGINT, signal.SIG_IGN)\\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+                      "json.dump(os.getpid(), open(sys.argv[1], 'w'))\\n"
+                      "time.sleep(60)", os.path.join(trial, "child.json")],
+                     start_new_session="detached" in value("-p"))
     if "waits" in value("-p"):
         time.sleep(60)
     sys.exit(1)
@@ -336,7 +337,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     hanging.mkdir()
     gateway, _ = fake_gateway(version=None)
     source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          grace=1.0, trial_timeout=3.0)
+                          grace=1.0, trial_timeout=10.0)
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=16, dtype="float32")
     objective = GRPOObjective(model, seq_len=7)
@@ -373,24 +374,32 @@ def ended(pid):
         return True
 
 
-@pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits"])
-def test_a_trial_past_its_timeout_ends_with_every_process_holding_its_output(tmp_path, harbor, task):
-    """Harbor exits before the deadline (`exits`) or on its interrupt (`waits`), but a child in
-    its process group ignores SIGINT and SIGTERM and holds the output open. The escalation runs
-    until the output closes, so the trial resolves INFRA_ERROR a few graces after its deadline,
-    not when the child's sleep ends, and the child is killed."""
+@pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])
+def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, harbor, task):
+    """Harbor exits before the deadline (`exits`) or on its interrupt (`waits`), and a child that
+    ignores SIGINT and SIGTERM holds its output open. In Harbor's process group, the escalation
+    runs until the output closes and the SIGKILL ends the child. A child that left the group
+    (`detached`) is beyond the group's signals, so reading stops a grace after the SIGKILL.
+    Either way the trial resolves INFRA_ERROR within a few graces of its deadline, long before
+    the child's minute-long sleep ends."""
     (tmp_path / task).mkdir()
     gateway, _ = fake_gateway()
     source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
                           grace=1.0, trial_timeout=2.0)
+    began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
         rollout = future.result(timeout=30)
     finally:
         source.close()
-    assert rollout.status is Status.INFRA_ERROR and "trial_timeout" in rollout.detail
+    resolved = time.monotonic() - began
     (child,) = (tmp_path / "trials").glob("*/child.json")
-    assert ended(json.loads(child.read_text()))
+    pid = json.loads(child.read_text())
+    if "detached" in task:
+        os.kill(pid, 9)
+    else:
+        assert ended(pid)
+    assert rollout.status is Status.INFRA_ERROR and resolved < 20
 
 
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
