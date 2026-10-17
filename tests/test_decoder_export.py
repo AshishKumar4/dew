@@ -1019,6 +1019,39 @@ def glm5_native_export_case(variant):
     return model, variables, ids
 
 
+@pytest.mark.parametrize(("fixture", "changed"), [
+    ("gemma4-native-tiny", {"v_norm": False}),
+    ("gemma4-native-tiny", {"qk_norm_scope": "full"}),
+    ("gemma4-native-tiny", {"embedding_scale": False}),
+    ("gemma4-moe-tiny", {"mixture.score_function": "sigmoid"}),
+    ("glm5-next-tiny", {"sandwich_norms": True}),
+    ("glm5-next-tiny", {"mlp": "geglu"}),
+    ("glm5-next-tiny", {"mixture.groups_per_token": 7, "mixture.bias": False}),
+    ("gemma4-native-tiny", {"scale_after_cast": True}),
+    ("glm5-next-tiny", {"layer_scalar": "frozen"}),
+])
+def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, changed):
+    """A computation the family's config does not carry, a norm, an MLP or a router it fixes,
+    reads back as another model, so its export is refused wherever the config is written; so
+    is a way of running it the config does not record and the family fixes."""
+    from dew.interop import PretrainedDecoder
+    from dew.interop.hf_decoders import export_config
+
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    model = loaded.model
+    for name, value in changed.items():
+        if name.startswith("mixture."):
+            routed = dataclasses.replace(model.mixture, **{name.removeprefix("mixture."): value})
+            model = model.clone(mixture=routed)
+        else:
+            model = model.clone(**{name: value})
+    export_config(loaded.model)
+    with pytest.raises(ValueError):
+        export_config(model)
+    with pytest.raises(ValueError):
+        PretrainedDecoder.from_model(model, loaded.variables)
+
+
 @pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp

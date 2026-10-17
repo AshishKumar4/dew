@@ -600,7 +600,6 @@ class PretrainedDecoder(Pretrained):
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
         config = decoders.export_config(decoder)
-        decoders.refuse_lossy_export(decoder, config)
         built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(decoder, variables, None, config, None, built,

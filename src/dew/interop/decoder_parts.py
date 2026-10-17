@@ -258,18 +258,6 @@ def fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message:
             refuse(name, message.format(expected))
 
 
-def fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[str],
-                   detail: str) -> None:
-    """Refuse a mixture field outside `represented` that leaves its family's default.
-
-    `represented` names the fields the export writes back; nothing carries the
-    rest to a file, so they have to hold what `defaults` holds.
-    """
-    for entry in dataclasses.fields(mixture):
-        if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
-            refuse(f'mixture.{entry.name}', detail)
-
-
 type Llama3Ramp = NativeFields[RopeScaling]
 type YarnRamp = NativeFields[YarnScaling]
 
