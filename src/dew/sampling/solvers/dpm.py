@@ -112,8 +112,10 @@ class DPMSolverMultistep:
                 reason="sde-dpmsolver requires finite alpha and a lowered order at sigma zero")
         orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, self.euler_at_final)
         alpha, sigma, levels = _grid_levels(process, times)
-        # An order above one divides by its own step's h too, but at an endpoint (`_lambda_step`).
-        spans = [(i, i + 1) for i, k in enumerate(orders) if k > 1 and sigma[i + 1] > 0 and alpha[i] != 0]
+        # A Heun or third-order coefficient divides by its own step's h too, but at an endpoint, where h
+        # is a placeholder (`_lambda_step`); the midpoint one is 0 with h, and its step stays put.
+        spans = [(i, i + 1) for i, k in enumerate(orders)
+                 if (k == 3 or k == 2 and self.solver_type == "heun") and sigma[i + 1] > 0 and alpha[i] != 0]
         _check_gaps(levels, _history_gaps(orders) + spans, reason="DPM-Solver's higher orders divide by")
         return _multistep(x, times, self.order)
 
