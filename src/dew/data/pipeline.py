@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import itertools
 import math
 import types
@@ -48,7 +47,7 @@ class Rejecting(Protocol):
 
 @runtime_checkable
 class Reasoned(Protocol):
-    """A predicate that names what it drops (`images.min_side`'s "too_small")."""
+    """A predicate that names what it drops (`images.MinSide`'s "too_small")."""
 
     reason: str
 
@@ -283,7 +282,7 @@ class DeviceStep:
     """A step over the training batch that runs inside the compiled training
     step, on the accelerator, rather than in the reader: pure and traceable,
     a batch of arrays in and out, its randomness only from per-record key
-    fields (`images.augmentation_key`), so its draws are the same at any
+    fields (`images.AugmentationKey`), so its draws are the same at any
     split, microbatch or pool size and on resume. The reader leaves the fields
     it reads in the batch it delivers (`Loader.device`)."""
 
@@ -336,8 +335,10 @@ class Mixture:
     tokens: Callable[[Batch], int] | None = None
 
     def __post_init__(self) -> None:
-        if len(self.pipelines) != len(self.weights) or len(self.pipelines) < 2:
-            raise ValueError("mix needs at least two pipelines and one weight per pipeline")
+        if not self.pipelines:
+            raise ValueError("mix needs at least one dataset")
+        if len(self.weights) != len(self.pipelines):
+            raise ValueError(f"mix has {len(self.pipelines)} datasets and {len(self.weights)} weights")
         if any(not math.isfinite(weight) or weight <= 0 for weight in self.weights):
             raise ValueError("mix weights must be finite and positive")
 
@@ -467,7 +468,7 @@ class Dataset:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.decode` do."""
+        `images.DecodeImage` do."""
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
@@ -478,7 +479,7 @@ class Dataset:
         """One record to none or one, each step drawing from the record's
         generator (`fn(record, rng)` or a `grain.RandomMapTransform`) and
         returning its record's replacement or `Rejected(reason)`, which drops
-        it, counted by reason, as `video.pick_clip` drops a clip shorter than
+        it, counted by reason, as `video.PickClip` drops a clip shorter than
         its window. Its draws are keyed as `random_map`'s are, by the record's
         place in the run's order."""
         return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
@@ -495,15 +496,16 @@ class Dataset:
         slices carry it with the row, so it is the same in every read, under
         a cache, on resume and at any share or worker count. A row built from
         several (after pack, windows, group or batch) or a mixture of corpora
-        has no single position, so the step is refused there.
+        has no single position, so the step is refused there. A step that
+        drops rows says so with `rejects = True` and returns `Rejected(reason)`.
         """
-        return self.then(MapWithIndex(step, identity, _rejects(step)))
+        return self.then(MapWithIndex(step, identity, _declares_rejects(step)))
 
     def filter(
         self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None
     ) -> Pipeline:
         """Keep the records `predicate` accepts; the rest are counted under
-        `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
+        `reason`, by default the predicate's own (`images.MinSide`'s "too_small")."""
         return self.then(Filter(predicate, reason or _reason(predicate), identity))
 
     def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
@@ -771,11 +773,7 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
         tokens = ValidTargets(field)
     elif by != "records":
         raise ValueError(f"mix weighs records or tokens, not {by!r}")
-    if not datasets:
-        raise ValueError("mix needs at least one dataset")
     shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)
-    if len(shares) != len(datasets):
-        raise ValueError(f"mix has {len(datasets)} datasets and {len(shares)} weights")
     chains = tuple(dataset.chain() for dataset in datasets)
     return Pipeline(Mixture(chains, shares, tokens))
 
@@ -826,21 +824,7 @@ def _expands(step: ExpandStep | ColumnStep) -> TypeGuard[ExpandStep]:
     return isinstance(step, Expansion) or _reads_columns(step)
 
 
-def _declares_rejects(step: _Step) -> bool:
-    """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.decode`)."""
+def _declares_rejects(step: _Step | Callable[[int, Batch], Batch | Rejected]) -> bool:
+    """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.DecodeImage`).
+    A step that says nothing keeps every record, whatever its signature reads."""
     return isinstance(step, Rejecting) and bool(step.rejects)
-
-
-def _rejects(step: RecordStep | RandomStep | Callable[[int, Batch], Batch | Rejected]) -> bool:
-    if isinstance(step, Rejecting):
-        return step.rejects
-    if isinstance(step, pygrain.MapTransform):
-        method = step.map
-    elif isinstance(step, pygrain.RandomMapTransform):
-        method = step.random_map
-    else:
-        method = step
-    returned = inspect.signature(method).return_annotation
-    return "Rejected" in str(returned) or (
-        returned is inspect.Signature.empty and not isinstance(step, pygrain.RandomMapTransform)
-    )

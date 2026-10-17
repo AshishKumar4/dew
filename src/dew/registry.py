@@ -24,6 +24,7 @@ import datetime
 import functools
 import importlib
 import inspect
+import itertools
 import operator
 import sys
 import types
@@ -413,13 +414,13 @@ def to_record(value, annotation) -> JSON:
         return value.name if isinstance(value, jax.lax.DotAlgorithmPreset) else value.name.lower()
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
-            if isinstance(value, nn.Module) and id(value) in written:
-                return _referred(written, written[id(value)])
+            if isinstance(value, nn.Module) and id(value) in written.modules:
+                return _referred(written, id(value))
             fields = record_fields(value, type(value))
             record = (fields if type(value) is _unwrapped(annotation)
                       else {"class": import_path(type(value)), "fields": fields})
             if isinstance(value, nn.Module):
-                written[id(value)] = (value, record)
+                written.modules[id(value)] = (value, record)
             return record
     if isinstance(value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
         return {"function": import_path(value)}
@@ -430,8 +431,14 @@ def to_record(value, annotation) -> JSON:
     if isinstance(value, Mapping):
         entries = entry_types(annotation, len(value))
         keys = _key_type(annotation)
-        return {_record_key(key, keys): to_record(entry_value, entry)
-                for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
+        mapping = {_record_key(key, keys): to_record(entry_value, entry)
+                   for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
+        number = _sharing(mapping)
+        if number is not None:
+            # Data shaped like a shared module's record keeps its number to itself.
+            with recording() as written:
+                written.taken.add(number)
+        return mapping
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
@@ -595,10 +602,31 @@ def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
     return None
 
 
-type _Written = dict[int, tuple[nn.Module, dict[str, JSON]]]
+@dataclasses.dataclass
+class _Written:
+    """The record being written: the Flax modules it holds, by identity, each
+    with its record; the references to each one it holds more than once; and
+    the numbers that data shaped like a shared module's record takes
+    (`_sharing`). The shared modules are numbered once the record is whole,
+    past every number its data takes, so a reader never takes one for the
+    other (`_Shared`)."""
+
+    modules: dict[int, tuple[nn.Module, dict[str, JSON]]] = dataclasses.field(default_factory=dict)
+    references: dict[int, list[dict[str, JSON]]] = dataclasses.field(default_factory=dict)
+    taken: set[int] = dataclasses.field(default_factory=set)
+
+    def number(self) -> None:
+        """Number each shared module's record and its references, in the order they were first referred to."""
+        free = (number for number in itertools.count() if number not in self.taken)
+        for key, references in self.references.items():
+            number = next(free)
+            self.modules[key][1]["share"] = number
+            for reference in references:
+                reference["shared"] = number
+
 
 _WRITTEN: contextvars.ContextVar[_Written | None] = contextvars.ContextVar("_WRITTEN", default=None)
-"""The Flax modules the record being written holds, by identity, each with its record."""
+"""The record being written."""
 
 
 @contextlib.contextmanager
@@ -610,35 +638,50 @@ def recording() -> Iterator[_Written]:
     if held is not None:
         yield held
         return
-    opened: _Written = {}
+    opened = _Written()
     token = _WRITTEN.set(opened)
     try:
         yield opened
+        opened.number()
     finally:
         _WRITTEN.reset(token)
 
 
-def _referred(written: _Written, first: tuple[nn.Module, dict[str, JSON]]) -> JSON:
-    """The reference to a module the record already holds: its first record
-    becomes a class record numbered `share`, in place, and the reference
-    names that number."""
-    module, record = first
-    if "share" not in record:
+def _referred(written: _Written, key: int) -> JSON:
+    """A reference to a module the record already holds: its first record
+    becomes a class record, in place, and both take the module's number when
+    the record is whole (`_Written.number`)."""
+    module, record = written.modules[key]
+    if key not in written.references:
         if "class" not in record:
             fields = dict(record)
             record.clear()
             record.update({"class": import_path(type(module)), "fields": fields})
-        record["share"] = sum("share" in held for _, held in written.values())
-    return {"shared": record["share"]}
+        written.references[key] = []
+    reference: dict[str, JSON] = {}
+    written.references[key].append(reference)
+    return reference
 
 
 @dataclasses.dataclass
 class _Shared:
-    """The shared modules of the record being read: each one's defining
-    record, by number, and the module once it is built."""
+    """The shared modules of the record being read: by number, every mapping
+    shaped like one's definition, the module once it is built, and the record
+    it was built from.
 
-    defined: dict[int, Mapping[str, object]]
+    The shape alone does not make a definition: a field typed `object` or a
+    plain mapping keeps such a mapping as the data it is (`_rebuilt`). So the
+    scan only collects candidates, and a number becomes a module where the
+    walk reads it at a module's place: a definition is built from itself, and
+    a reference read before its definition (a record written with sorted
+    keys) from the one candidate it can mean. `to_record` never gives data and
+    a shared module one number, so only a record made by hand can leave a
+    reference more than one.
+    """
+
+    candidates: dict[int, list[Mapping[str, object]]]
     built: dict[int, Configured] = dataclasses.field(default_factory=dict)
+    sources: dict[int, Mapping[str, object]] = dataclasses.field(default_factory=dict)
 
 
 _READING: contextvars.ContextVar[_Shared | None] = contextvars.ContextVar("_READING", default=None)
@@ -652,15 +695,13 @@ def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
     if _READING.get() is not None:
         yield
         return
-    defined: dict[int, Mapping[str, object]] = {}
+    candidates: dict[int, list[Mapping[str, object]]] = {}
 
     def scan(node) -> None:  # any value a record holds, a record of records or not
         if isinstance(node, Mapping):
             number = _sharing(node)
             if number is not None and "share" in node:
-                if number in defined:
-                    raise ValueError(f"the record defines its shared module {number} twice")
-                defined[number] = {str(key): entry for key, entry in node.items() if key != "share"}
+                candidates.setdefault(number, []).append(node)
             for entry in node.values():
                 scan(entry)
         elif isinstance(node, (list, tuple)):
@@ -668,7 +709,7 @@ def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
                 scan(entry)
 
     scan(record)
-    token = _READING.set(_Shared(defined))
+    token = _READING.set(_Shared(candidates))
     try:
         yield
     finally:
@@ -691,10 +732,23 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     number = _sharing(value)
     if shared is None or number is None:
         raise ValueError(f"{value!r} is no shared module of a record being read")
-    if number not in shared.built:
-        if number not in shared.defined:
-            raise ValueError(f"the record refers to its shared module {number} and defines none")
-        shared.built[number] = _rebuilt(annotation, shared.defined[number], dtypes=dtypes)
+    if "share" in value:
+        source = value
+    elif number in shared.built:
+        return shared.built[number]
+    else:
+        found = shared.candidates.get(number, [])
+        if len(found) != 1:
+            raise ValueError(f"the record refers to its shared module {number} before defining it, and "
+                             f"holds {len(found) or 'no'} records numbered {number}")
+        source = found[0]
+    if number in shared.built:
+        if shared.sources[number] != source:
+            raise ValueError(f"the record defines its shared module {number} twice")
+        return shared.built[number]
+    shared.sources[number] = source
+    shared.built[number] = _rebuilt(annotation, {str(key): entry for key, entry in source.items()
+                                                 if key != "share"}, dtypes=dtypes)
     return shared.built[number]
 
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -36,10 +37,10 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.inference.tasks import TextGeneration, cache_ceiling
+from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import pad_token_rows
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import token_log_probs
-from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
@@ -299,6 +300,21 @@ class DewLM(TemplateLM):
         The stop strings cut the decoded text, so a stop sequence that spans
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
+
+        A beam search (`num_beams` above 1) raises ValueError. `HFLM` always
+        stops on its EOS's text as well as its stop strings, and its criterion
+        reads the leading candidate alone and ends every beam together, which
+        neither Dew's per-beam search nor a cut of its answer reproduces.
+        A request's `max_length` is the total length `HFLM` hands `generate`,
+        context included, in place of the budget. Its temperature is 0 where
+        it names none, which decodes greedily unless the request asks to
+        sample; sampling at 0 raises ValueError, as `generate` does. The other
+        controls are the ones `HFLM` hands Transformers' `generate`, and they
+        decode as a source's generation config does
+        (`dew.interop.generation_config.source_decoding`), over the task's own
+        EOS and pad ids where the request names none: sampling filters,
+        penalties and logits processors. One Dew has no counterpart for raises
+        ValueError, as `generate` refuses a keyword it does not use.
         """
         del disable_tqdm
         eos = None if self.task.sampling.eos_token_ids in (None, ()) else self.tok_decode([self.eot_token_id])
@@ -306,20 +322,36 @@ class DewLM(TemplateLM):
         for request in requests:
             arguments = list(request.args)
             context, raw = str(arguments[0]), dict(arguments[1])
-            # normalize_gen_kwargs sets the budget and the stop strings; the
-            # type leaves every key optional.
-            controls = normalize_gen_kwargs(raw, DEFAULT_BUDGET)
-            budget = controls.get("max_gen_toks", DEFAULT_BUDGET)
+            # normalize_gen_kwargs sets the budget and the stop strings, and
+            # makes do_sample=False greedy; the type leaves every key optional.
+            controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
+            budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
+            stops = handle_stop_sequences(controls.pop("until", None), eos=eos)
+            if int(controls.get("num_beams") or 1) > 1:
+                raise ValueError(
+                    "a beam search is refused: lm-eval's own model stops on its EOS's text and stop "
+                    "strings by the leading candidate alone and ends every beam together, which "
+                    "Dew's per-beam search would answer differently")
+            seed = int(controls.pop("seed", 0))
+            total = controls.pop("max_length", None)
+            # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
+            controls.setdefault("temperature", 0.0)
+            if controls["temperature"] == 0.0 and controls.get("do_sample") is None:
+                controls["do_sample"] = False
+            if controls.get("do_sample") and controls["temperature"] == 0.0:
+                raise ValueError("sampling at temperature 0 is refused, as Transformers' generate refuses it")
+            task_ids = {"eos_token_id": self.task.sampling.eos_token_ids,
+                        "pad_token_id": self.task.sampling.pad_token_id}
+            sampling, chain, strategy = source_decoding(task_ids, controls, self.task.model, 1, None)
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
-            sampling = Sampling(temperature=float(controls.get("temperature", 0.0)),
-                                eos_token_ids=self.task.sampling.eos_token_ids)
-            drawn = self.task([ids], budget, key=int(raw.get("seed", 0)), sampling=sampling)
-            stops = handle_stop_sequences(controls.get("until"), eos=eos)
-            answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
+            drawn_budget = budget if total is None else int(total) - len(ids)
+            text = "" if drawn_budget < 1 else self.task.decode(self.task(
+                [ids], drawn_budget, key=seed, sampling=sampling, logits=chain, strategy=strategy))[0]
+            answers.append(postprocess_generated_text(text, stops, None))
         return answers
 
 
