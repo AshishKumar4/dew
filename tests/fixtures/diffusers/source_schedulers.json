@@ -337,6 +337,12 @@
    "steps": 5,
    "guidance": 0.0,
    "latent_scale": 71.86064910888672
+  },
+  "euler.linspace_min": {
+   "scheduler": "EulerDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.39703369140625
   }
  },
  "refused": [
