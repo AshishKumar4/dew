@@ -121,6 +121,12 @@ class InputSpec:
             if condition.encoder.reads_captions
         }
 
+    def dependencies(self) -> Mapping[str, object]:
+        """What `tokenize` and `encode_fields` make of a batch depends on: each condition's field
+        and its encoder's own (`ConditionEncoder.dependencies`)."""
+        return {keyword: {"field": condition.field, "encoder": condition.encoder.dependencies()}
+                for keyword, condition in self.conditions.items()}
+
     def encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]:
         """Return the batch fields this run's other conditions read, each encoded from the rows its
         field holds: a clip's `audio` waveforms become the audio model's features, as `tokenize`

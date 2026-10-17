@@ -1134,3 +1134,64 @@ def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_ea
         assert len(list(itertools.islice(stream, 4))) == 4
     finally:
         stream.close()
+
+
+def _token_rows(name: str, tag: int, tokens: int, count: int = 200) -> Pipeline:
+    """`count` rows of `tokens` tokens each, so `tokens - 1` targets a row, whose ids name the member."""
+    from dew.data.steps.text import CountTargets
+
+    rows = [{"text": np.full(tokens, 3, np.int32), "id": np.int32(tag * 1000 + index)}
+            for index in range(count)]
+    return Pipeline(Memory(rows), name=name).filter_map(CountTargets())
+
+
+def test_a_token_mixture_recurring_in_a_later_phase_continues_each_member_where_it_stopped():
+    """Members weighted alike by tokens, one target a row against nine, read nine rows of the
+    first for each of the second; a later phase that mixes them again reads each member on from
+    the rows the first phase took, so no row repeats and none is skipped."""
+    from dew.data.pipeline import Phases
+
+    def members():
+        return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
+
+    data = compile(Pipeline(Phases((members(), members()), (10, None))).batch(1), read="memory",
+                   loading=READ)
+    read = [int(batch["id"][0]) for batch in itertools.islice(data.train(DataPartition()), 40)]
+    assert sum(value // 1000 == 1 for value in read[:10]) == 9
+    for tag in (1, 2):
+        member = [value % 1000 for value in read if value // 1000 == tag]
+        assert member == list(range(len(member)))
+
+
+@pytest.mark.parametrize(("by", "read"), [("tokens", "indexed"), ("tokens", "streamed"),
+                                          ("records", "streamed")])
+def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupted_one_reads(by, read):
+    """A mixture of finite members resumed at any step reads the rest of what the run that was
+    never stopped reads, the row a member had already started included, where a resume once
+    advanced every member again and ended on one that was done."""
+    first, second = _token_rows("a", 1, 3, count=1), _token_rows("b", 2, 8, count=3)
+    chain = mix([first.repeat(1), second.repeat(1)], weights=[1, 3], by=by).batch(1)
+    data = compile(chain, read=read, loading=READ)
+
+    def ids(stream) -> list[int]:
+        return [int(batch["id"][0]) for batch in stream]
+
+    whole = data.train(DataPartition())
+    try:
+        expected = ids(whole)
+    finally:
+        whole.close()
+    assert len(expected) > 1
+    for step in range(1, len(expected)):
+        stopped = data.train(DataPartition())
+        try:
+            assert ids(itertools.islice(stopped, step)) == expected[:step]
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert ids(resumed) == expected[step:]
+        finally:
+            resumed.close()

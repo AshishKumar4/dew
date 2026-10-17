@@ -139,8 +139,9 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     `A_t = delta_t + gamma * lam * A_{t+1}` (arXiv:1506.02438). A masked step
     contributes nothing and passes the running advantage and the next value
     through unchanged, so a padded tail does not discount the real steps
-    before it. Positions outside the mask hold the neighbouring step's
-    carry, as in both references, and the loss masks them again.
+    before it, and its reward and value are never read, so a NaN there
+    reaches no real step. Positions outside the mask hold the neighbouring
+    step's carry, as in both references, and the loss masks them again.
 
     The recursion runs in float32 whatever the caller's dtype, the way Tunix's
     GRPO loss casts its log-probabilities. A caller whitens the advantages
@@ -148,17 +149,17 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     these rather than from returns less values: at values far above the
     advantages, float32 rounds those differences away.
     """
-    rewards = jnp.asarray(token_rewards, jnp.float32)
-    values = jnp.asarray(values, jnp.float32)
-    keep = jnp.asarray(mask, jnp.float32)
+    keep = jnp.asarray(mask) != 0
+    rewards = jnp.where(keep, jnp.asarray(token_rewards, jnp.float32), 0)
+    values = jnp.where(keep, jnp.asarray(values, jnp.float32), 0)
 
     def step(carry, inputs):
         advantage, next_value = carry
         reward_t, value_t, keep_t = inputs
         delta = reward_t + gamma * next_value - value_t
         candidate = delta + gamma * lam * advantage
-        next_value = value_t * keep_t + (1 - keep_t) * next_value
-        advantage = candidate * keep_t + (1 - keep_t) * advantage
+        advantage = jnp.where(keep_t, candidate, advantage)
+        next_value = jnp.where(keep_t, value_t, next_value)
         return (advantage, next_value), advantage
 
     zeros = jnp.zeros(values.shape[0], jnp.float32)

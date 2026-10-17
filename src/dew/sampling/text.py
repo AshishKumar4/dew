@@ -701,9 +701,14 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
-    """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs."""
+def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray], max_new_tokens: int,
+                 sampling: Sampling, n: int, *, capacity: int | None = None) -> np.ndarray:
+    """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs.
+
+    `capacity` is the cache slots a row holds, which a prompt's real tokens
+    and `max_new_tokens` must fit: a server's own capacity, or the model's
+    `max_seq_len` where None.
+    """
     if isinstance(model, BlockDenoiser):
         raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
                         "token at a time; generate with BlockGeneration")
@@ -722,7 +727,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     valid = real_slots(fields, ids.shape, xp=np)
     if not np.all(valid.any(axis=1)):
         raise ValueError("each prompt must contain at least one valid token")
-    cache_len = model.max_seq_len if isinstance(model, Bounded) else None
+    cache_len = capacity if capacity is not None or not isinstance(model, Bounded) else model.max_seq_len
     if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
     vocab = model.vocab_size if isinstance(model, Bounded) else None
