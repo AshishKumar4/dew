@@ -169,7 +169,7 @@ def record(name: str) -> None:
 
 def opened(path, flags, mode=0o777, *, dir_fd=None):
     """`os.open`, whose audit event names a path relative to `dir_fd` without the descriptor: such an
-    open, once it has opened to read, is recorded here, in the directory the descriptor names."""
+    open, once it has opened to read, is recorded here, as what the descriptor it opened names."""
     if dir_fd is None:
         return OPEN(path, flags, mode)
     placing.relative = True
@@ -178,7 +178,7 @@ def opened(path, flags, mode=0o777, *, dir_fd=None):
     finally:
         placing.relative = False
     if flags & os.O_ACCMODE == os.O_RDONLY:
-        record(os.path.normpath(os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), os.fsdecode(path))))
+        record(os.readlink(f"/proc/self/fd/{descriptor}"))
     return descriptor
 
 
