@@ -597,20 +597,51 @@ def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_p
         list(Files(str(path), columns=("missing",)).records("memory"))
 
 
-def test_reading_a_csv_source_leaves_the_processes_csv_policy_as_its_caller_set_it(tmp_path):
-    """A caller's own `csv.field_size_limit` holds through a CSV source's reads, which once set the
-    limit for every parser in the process each time a source opened its file."""
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_csv_field_past_pythons_limit_reads_and_resumes_and_the_callers_limit_holds(tmp_path, read):
+    """A quoted CSV field of 200 KiB, past Python's default field limit, reads through a loader of
+    four reader threads at its provisioned offsets and resumes where it stopped, while the limit a
+    caller set for the process's own parsers holds throughout: a CSV source once raised it for
+    every parser in the process each time it opened a file."""
     import csv
 
+    from dew.data.compile import compile
+
+    texts = [f"row {index}" if index != 2 else "x" * (200 * 1024) + "\nand more" for index in range(6)]
     path = tmp_path / "rows.csv"
-    path.write_text("id,text\n0,short\n")
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "text"])
+        writer.writerows([str(index), text] for index, text in enumerate(texts))
     previous = csv.field_size_limit(4096)
     try:
-        files = Files(str(path))
-        assert list(files.records("memory")) == [{"id": "0", "text": "short"}]
-        files.provision()
-        assert files.records("indexed")[0] == {"id": "0", "text": "short"}
+        Files(str(path)).provision()
+        data = compile(Files(str(path)).repeat(1).batch(1), read=read,
+                       loading=Loading(workers=0, threads=4, read_buffer=4))
+
+        def rows(reader) -> list[tuple[str, str]]:
+            return [(str(batch["id"][0]), str(batch["text"][0])) for batch in reader]
+
+        whole = data.train(DataPartition())
+        try:
+            assert rows(whole) == [(str(index), text) for index, text in enumerate(texts)]
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = rows(itertools.islice(stopped, 3))
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert head + rows(resumed) == [(str(index), text) for index, text in enumerate(texts)]
+        finally:
+            resumed.close()
         assert csv.field_size_limit() == 4096
+        with pytest.raises(csv.Error):
+            list(csv.reader(path.open(newline="")))
     finally:
         csv.field_size_limit(previous)
 
