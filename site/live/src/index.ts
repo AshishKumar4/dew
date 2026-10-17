@@ -64,11 +64,13 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	const now = Date.now();
 	// Any Kernel object answers with the image of the deploy it runs in.
 	const pool = env.POOL.get(env.POOL.idFromName('global'));
-	const { image, commit } = await pool.image();
-	// The pool is set to another commit than this deploy pins: none (a cold pool), or the last deploy's, which no one
-	// warmed this one from or whose warm reached a Worker of the last. This request starts the pinned generation's
-	// preparation, leased, and the last generation serves until it is ready.
-	if (commit !== env.SNAPSHOT_COMMIT) ctx.waitUntil(warm(env));
+	const image = await pool.image();
+	// The registry's generation is not this deploy's pinned commit (none, or the last deploy's, which no one warmed
+	// this one from), or the pool does not serve it: this request starts the pinned generation's preparation, leased,
+	// or hands the pool the generation, and the last generation serves meanwhile. Both are read through RPCs every
+	// build of the objects answers alike (README.md).
+	const active = await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).previous();
+	if (active?.commit !== env.SNAPSHOT_COMMIT || active.snapshot.id !== image) ctx.waitUntil(warm(env));
 	if (!image) {
 		return reply({ error: 'warming', message: 'The shared model is warming up. Try again in a minute.' },
 			503, cors, { 'Retry-After': '30' });
@@ -99,7 +101,7 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 	const forwarded = new Request(request.url, request);
 	forwarded.headers.set(SESSION_HEADER, id);
 	const pool = env.POOL.get(env.POOL.idFromName('global'));
-	const { image } = await pool.image();
+	const image = await pool.image();
 	if (!image) return new Response('queued for a warm model host', { status: 503 });
 	const host = await pool.allocate(id, image);
 	const end = await coordinatorOf(env).started(id, Date.now(), image);

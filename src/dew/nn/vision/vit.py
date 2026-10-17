@@ -26,7 +26,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, checkpoint_array, placed
+from dew.interop.weights import ParamTree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
@@ -360,17 +360,19 @@ PATCH_CONVOLUTION = "patch_embed.proj.weight"
 def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
                           path_of: Callable[[str], tuple[str, ...] | None],
                           param_dtype: str = "float32") -> tuple[ParamTree, tuple[WeightLayout, ...]]:
-    """A trunk's parameters from its tensors through its family's `path_of`, the patch convolution
-    `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map over the processor's
-    channel, time and pixel order; with the layouts that write each tensor back (`placed`)."""
+    """A trunk's variables from its tensors through its family's `path_of`, rooted at the collection,
+    the patch convolution `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map
+    over the processor's channel, time and pixel order at `params/patch_embed/kernel`; with the
+    layouts that write each tensor back from them (`placed`)."""
     from dew.interop.streaming import WeightLayout
 
-    params, layouts = placed({name: tensor for name, tensor in hf_tensors.items()
-                              if name != PATCH_CONVOLUTION}, path_of, param_dtype)
+    variables, layouts = placed({name: tensor for name, tensor in hf_tensors.items()
+                                 if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
-        params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
-            conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+        dense = np.ascontiguousarray(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+        insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
         # The Dense map's transpose is the convolution, its input axes flattened.
-        layouts += (WeightLayout(PATCH_CONVOLUTION, (("patch_embed", "kernel"),), conv.shape, (1, 0)),)
-    return params, layouts
+        kernel = ("params", "patch_embed", "kernel")
+        layouts += (WeightLayout(PATCH_CONVOLUTION, (kernel,), conv.shape, (1, 0)),)
+    return variables, layouts

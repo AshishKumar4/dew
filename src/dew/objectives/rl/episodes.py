@@ -86,18 +86,19 @@ class Observation:
 class Action:
     """One actual model call, with its EOS and its likelihoods under both distributions.
 
-    `raw_log_probs` are the unmodified model's likelihoods, and
-    `behavior_log_probs` include the `Sampling` controls. EOS ends the model
-    turn, not the episode. Context and action ids are nonnegative integers.
-    An action stops at the first configured EOS, and `terminated` is true
-    exactly when its last token is that EOS; anything else raises
-    ValueError. Checking ids against the vocabulary size is left to the
-    caller, which knows the model.
+    `raw_log_probs` are the unmodified model's likelihoods, or None when
+    the server that drew the action does not report them, as vLLM and
+    SGLang do not. `behavior_log_probs` include the `Sampling` controls.
+    EOS ends the model turn, not the episode. Context and action ids are
+    nonnegative integers. An action stops at the first configured EOS, and
+    `terminated` is true exactly when its last token is that EOS; anything
+    else raises ValueError. Checking ids against the vocabulary size is
+    left to the caller, which knows the model.
     """
 
     context: tuple[int, ...]
     tokens: tuple[int, ...]
-    raw_log_probs: tuple[float, ...]
+    raw_log_probs: tuple[float, ...] | None
     behavior_log_probs: tuple[float, ...]
     terminated: bool
     policy_step: int
@@ -110,9 +111,10 @@ class Action:
                 raise ValueError(f"sampled action {name} must be nonempty")
             if any(type(token) is not int or token < 0 for token in ids):
                 raise ValueError(f"sampled action {name} must contain nonnegative integer token ids")
-        if len(self.tokens) != len(self.raw_log_probs) or len(self.tokens) != len(self.behavior_log_probs):
-            raise ValueError("every sampled action token needs raw and behavior likelihoods")
-        for probabilities in (self.raw_log_probs, self.behavior_log_probs):
+        if len(self.tokens) != len(self.behavior_log_probs) or (
+                self.raw_log_probs is not None and len(self.tokens) != len(self.raw_log_probs)):
+            raise ValueError("every sampled action token needs its likelihoods")
+        for probabilities in (self.raw_log_probs or (), self.behavior_log_probs):
             if not all(math.isfinite(value) for value in probabilities):
                 raise ValueError("sampled action likelihoods must be finite")
         if type(self.terminated) is not bool:
@@ -213,14 +215,32 @@ class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
 
 
+def finite_reward(value: float) -> float:
+    """Return a verifier's or reward's score as a float, refusing a non-finite one with ValueError."""
+    reward = float(value)
+    if not math.isfinite(reward):
+        raise ValueError(f"a reward must be a finite number, got {reward}")
+    return reward
+
+
 @dataclass
-class _Session:
+class EpisodeProgress:
+    """One episode while a driver runs it: what its environment showed, its calls and how it ended.
+
+    `EpisodeRollout` advances a cohort of these in lock step, and
+    `EnvironmentSource` one per session. Both adopt observations, apply the
+    turn and context limits, record each call with the observation that
+    followed it and score finished episodes through it. Each keeps its own
+    failure policy.
+    """
+
     identity: EpisodeId
     environment: Environment | None = None
     initial: Observation | None = None
     observation: Observation | None = None
     transitions: list[Transition] = field(default_factory=list)
     pending: Action | None = None
+    """A call already drawn whose observation is not in yet."""
     status: EpisodeStatus = EpisodeStatus.RUNNING
     detail: str = ""
     reward: float | None = None
@@ -239,17 +259,66 @@ class _Session:
             raise
 
     def observe(self, observation: Observation) -> None:
-        """Adopt an environment's observation as this slot's current state.
+        """Adopt an environment's observation as this episode's current state.
 
-        An explicit error or cancellation stops the slot here, so the
-        cohort aborts instead of sampling another turn from it.
+        Anything but an `Observation` raises TypeError.
         """
         if not isinstance(observation, Observation):
             raise TypeError("environment methods must return an Observation")
         self.observation = observation
         self.status, self.detail = observation.status, observation.detail
-        if self.status in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
-            raise _StatusStop(self.detail)
+
+    def begin(self, observation: Observation) -> None:
+        """Adopt the environment's first observation."""
+        self.observe(observation)
+        self.initial = observation
+
+    def next_context(self, *, max_prompt_tokens: int) -> tuple[int, ...] | None:
+        """Return the context of the episode's next call, or None when it makes no more calls.
+
+        A context longer than `max_prompt_tokens` truncates the episode here
+        instead of being drawn from. The driver bounds the number of calls,
+        and `score` truncates an episode that is still running after its
+        last one.
+        """
+        if self.status != EpisodeStatus.RUNNING:
+            return None
+        observation = self.observation
+        assert observation is not None
+        if len(observation.context) > max_prompt_tokens:
+            self.stop(EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens")
+            return None
+        return observation.context
+
+    def commit(self, action: Action, observation: Observation) -> None:
+        """Record `action`, the pending call, with the observation that followed it, and adopt that."""
+        self.observe(observation)
+        self.transitions.append(Transition(action, observation))
+        self.pending = None
+
+    def stop(self, status: EpisodeStatus, detail: str) -> None:
+        """End the episode at `status` without an observation, as a limit or a driver does."""
+        self.status, self.detail = status, detail
+
+    def abort(self, status: EpisodeStatus, detail: str) -> None:
+        """End the episode at a failure `status`, unscored. A pending call stays
+        on the record with the failure it met."""
+        self.stop(status, detail)
+        self.reward = None
+        if self.pending is not None:
+            self.transitions.append(Transition(self.pending, Observation((), status, detail)))
+            self.pending = None
+
+    def score(self, verifier: Verifier, policy_step: int, binding_id: str) -> None:
+        """Score the finished episode with `verifier`.
+
+        An episode still running made its last allowed call, so it is
+        truncated first and scored as the episode it produced. A
+        non-finite reward raises ValueError.
+        """
+        if self.status == EpisodeStatus.RUNNING:
+            self.stop(EpisodeStatus.TRUNCATED, "episode turn limit reached")
+        self.reward = finite_reward(verifier(self.episode(policy_step, binding_id)))
 
     def episode(self, policy_step: int, binding_id: str) -> Episode:
         """Freeze this slot's progress into an `Episode` record."""
@@ -257,19 +326,10 @@ class _Session:
                        self.status, self.detail, self.reward, _binding_id=binding_id)
 
 
-def turn_limit(
-    observation: Observation, turn: int, *, max_turns: int, max_prompt_tokens: int
-) -> Observation | None:
-    """The truncation that ends a running episode before its call `turn`, or None to draw it.
-
-    Every episode driver applies these limits: `turn` counts calls already
-    made, and a context the model cannot read is not drawn from.
-    """
-    if turn >= max_turns:
-        return Observation((), EpisodeStatus.TRUNCATED, "episode turn limit reached")
-    if len(observation.context) > max_prompt_tokens:
-        return Observation((), EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens")
-    return None
+def _halted(slot: EpisodeProgress) -> None:
+    """Abort the cohort at an explicit error or cancellation, instead of sampling another turn."""
+    if slot.status in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
+        raise _StatusStop(slot.detail)
 
 
 def step_action(environment: Environment, action: Action) -> Observation:
@@ -331,7 +391,7 @@ class EpisodeRollout:
         if self.sampling.eos_token_ids is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
-    def _persist(self, slot: _Session, run: JournalRun | None, policy_step: int, binding: str) -> None:
+    def _persist(self, slot: EpisodeProgress, run: JournalRun | None, policy_step: int, binding: str) -> None:
         """Commit one slot's turn and environment snapshot, when a journal is open."""
         if run is not None:
             environment = slot.environment
@@ -342,7 +402,7 @@ class EpisodeRollout:
                 raise TypeError("environment get_state must return bytes")
             slot.invoke(run.save, slot.episode(policy_step, binding), slot.pending, snapshot)
 
-    def _open(self, slots: list[_Session], stack: ExitStack, run: JournalRun | None,
+    def _open(self, slots: list[EpisodeProgress], stack: ExitStack, run: JournalRun | None,
               policy_step: int, binding: str) -> None:
         """Enter every slot's environment and put it at its starting observation.
 
@@ -356,8 +416,8 @@ class EpisodeRollout:
             saved = None if run is None else slot.invoke(run.load, slot.identity)
             if saved is None:
                 observation = slot.invoke(slot.environment.reset)
-                slot.initial = observation
-                slot.invoke(slot.observe, observation)
+                slot.invoke(slot.begin, observation)
+                slot.invoke(_halted, slot)
                 self._persist(slot, run, policy_step, binding)
             else:
                 if not isinstance(slot.environment, RecoverableEnvironment):
@@ -371,7 +431,7 @@ class EpisodeRollout:
                 )
                 slot.status, slot.detail = episode.status, episode.detail
 
-    def _inputs(self, slots: list[_Session], turn: int) -> ModelInputs:
+    def _inputs(self, slots: list[EpisodeProgress], turn: int) -> ModelInputs:
         """Pack this turn's contexts into one right-aligned cohort of rows.
 
         A slot that is finished, or whose context does not fit, still
@@ -381,21 +441,12 @@ class EpisodeRollout:
         tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad, np.int32)
         valid = np.zeros_like(tokens, bool)
         for row, slot in enumerate(slots):
-            if (
-                slot.status == EpisodeStatus.RUNNING
-                and len(slot.transitions) == turn
-                and slot.pending is None
-            ):
-                observation = slot.observation
-                assert observation is not None
-                length = len(observation.context)
-                limit = turn_limit(observation, turn, max_turns=self.max_turns,
-                                   max_prompt_tokens=self.max_prompt_tokens)
-                if limit is not None:
-                    slot.status, slot.detail = limit.status, limit.detail
-                else:
-                    tokens[row, -length:] = observation.context
-                    valid[row, -length:] = True
+            context = None
+            if len(slot.transitions) == turn and slot.pending is None:
+                context = slot.next_context(max_prompt_tokens=self.max_prompt_tokens)
+            if context is not None:
+                tokens[row, -len(context):] = context
+                valid[row, -len(context):] = True
             if not valid[row].any():
                 # Keep global row indices and collective shapes stable. The
                 # draw for a finished slot is discarded, never executed or trained.
@@ -405,7 +456,7 @@ class EpisodeRollout:
         fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
         return ModelInputs(jnp.asarray(tokens), fields)
 
-    def _advance(self, slots: list[_Session], generation: Generation, policy_step: int,
+    def _advance(self, slots: list[EpisodeProgress], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
         """Record this turn's draws, then step each slot's environment with them.
 
@@ -438,15 +489,12 @@ class EpisodeRollout:
             environment = slot.environment
             assert environment is not None
             observation = slot.invoke(step_action, environment, action)
-            if not isinstance(observation, Observation):
-                slot.invoke(slot.observe, observation)
-            slot.transitions.append(Transition(action, observation))
-            slot.pending = None
-            slot.invoke(slot.observe, observation)
+            slot.invoke(slot.commit, action, observation)
+            slot.invoke(_halted, slot)
             self._persist(slot, run, policy_step, binding_id)
 
     def _verify(
-        self, slots: list[_Session], policy_step: int, binding_id: str, run: JournalRun | None
+        self, slots: list[EpisodeProgress], policy_step: int, binding_id: str, run: JournalRun | None
     ) -> None:
         """Score every unscored slot with the verifier and persist the reward.
 
@@ -454,19 +502,11 @@ class EpisodeRollout:
         first, so it is scored as the episode it actually produced.
         """
         for slot in slots:
-            if slot.reward is not None:
-                continue
-            if slot.status == EpisodeStatus.RUNNING:
-                slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
-            def score(slot=slot) -> float:
-                reward = float(self.verifier(slot.episode(policy_step, binding_id)))
-                if not math.isfinite(reward):
-                    raise ValueError("episode verifier returned a non-finite reward")
-                return reward
-            slot.reward = slot.invoke(score)
-            self._persist(slot, run, policy_step, binding_id)
+            if slot.reward is None:
+                slot.invoke(slot.score, self.verifier, policy_step, binding_id)
+                self._persist(slot, run, policy_step, binding_id)
 
-    def _failed(self, slots: list[_Session], error: BaseException,
+    def _failed(self, slots: list[EpisodeProgress], error: BaseException,
                 policy_step: int, binding_id: str) -> None:
         """Abort the whole cohort and raise for the slot that failed first.
 
@@ -483,14 +523,8 @@ class EpisodeRollout:
         if explicit:
             cancelled = primary.status == EpisodeStatus.CANCELLED
         for slot in started:
-            slot.status = (
-                EpisodeStatus.ERROR if slot is primary and not cancelled else EpisodeStatus.CANCELLED
-            )
-            slot.detail = str(error) if explicit else f"{type(error).__name__}: {error}"
-            slot.reward = None
-            if slot.pending is not None:
-                slot.transitions.append(Transition(slot.pending, Observation((), slot.status, slot.detail)))
-                slot.pending = None
+            slot.abort(EpisodeStatus.ERROR if slot is primary and not cancelled else EpisodeStatus.CANCELLED,
+                       str(error) if explicit else f"{type(error).__name__}: {error}")
         records = tuple(slot.episode(policy_step, binding_id) for slot in started)
         def record() -> None:
             if self.record is not None:
@@ -542,7 +576,7 @@ class EpisodeRollout:
                       tuple(float(value) for value in behavior[:count]),
                       bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
 
-    def _slots(self, tasks, state: TrainState, key: jax.Array, rank: int) -> list[_Session]:
+    def _slots(self, tasks, state: TrainState, key: jax.Array, rank: int) -> list[EpisodeProgress]:
         """Build one session per task and group, each with its own identity.
 
         The identity is drawn from the cohort key and the sample's global
@@ -553,7 +587,7 @@ class EpisodeRollout:
             for group in range(self.groups):
                 sample = (rank * tasks.size + index) * self.groups + group
                 draw = jax.random.fold_in(key, sample)
-                slots.append(_Session(EpisodeId(int(task), int(state.step), int(sample),
+                slots.append(EpisodeProgress(EpisodeId(int(task), int(state.step), int(sample),
                     tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
         return slots
 
@@ -581,7 +615,7 @@ class EpisodeRollout:
         agreed("episode journal binding", lambda: run.align(bound))
         return run, bound
 
-    def _turns(self, slots: list[_Session], policy: EpisodeInference, key: jax.Array,
+    def _turns(self, slots: list[EpisodeProgress], policy: EpisodeInference, key: jax.Array,
                run: JournalRun | None, policy_step: int, binding_id: str) -> None:
         """Run the cohort turn by turn until every rank's slots are finished.
 
@@ -674,8 +708,9 @@ class EpisodeRollout:
         Every episode and action must keep the private binding id of the
         collection that produced it, because equal training step counts do
         not prove equal weight snapshots. Episodes from different
-        collections, incomplete groups, and episodes that are not verified
-        as completed or truncated raise ValueError.
+        collections, incomplete groups, episodes that are not verified as
+        completed or truncated, and an action without raw likelihoods raise
+        ValueError.
         """
         if not episodes or len(episodes) % self.groups:
             raise ValueError("projection requires complete episode groups")
@@ -707,8 +742,14 @@ class EpisodeRollout:
                     for index, episode in enumerate(episodes)]
         batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens,
                      rows=len(episodes) * self.max_turns)
-        batch[OLD_LOG_PROBS_KEY] = sampled_values(
-            batch, lambda index, number: episodes[index].transitions[number].action.raw_log_probs)
+
+        def raw(index: int, number: int) -> tuple[float, ...]:
+            likelihoods = episodes[index].transitions[number].action.raw_log_probs
+            if likelihoods is None:
+                raise ValueError("old_log_probs are each action's raw likelihoods, and one recorded none")
+            return likelihoods
+
+        batch[OLD_LOG_PROBS_KEY] = sampled_values(batch, raw)
         return batch
 
 

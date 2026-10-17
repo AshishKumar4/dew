@@ -44,13 +44,14 @@ tensors sit and which map reads them.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew.interop.weights import nested, placed
+from dew.interop.weights import placed
 from dew.objectives.base import Variables
 
 from .common import (
@@ -114,23 +115,53 @@ if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 
-# Where each tower and projector kind's tensors sit in a media checkpoint, and
-# the translators that read them.
-TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.", "gemma4": "vision_tower.",
-                "qwen3_5": "visual.", "gemma3n": "vision_tower.", "deepseek_v41": "vision.",
-                "mimo": "visual.", "muse_glimmer": "vision_tower."}
+@dataclasses.dataclass(frozen=True)
+class TowerLayout:
+    """Where one tower kind's tensors sit in a media checkpoint and the leaves they fill: `prefix`
+    before every name, and `path` from a name past it to its leaf, rooted at its collection
+    (`params`, and Gemma 4's `constants` beside it). `patch_dense` where the tower runs its patch
+    convolution as one Dense map (`translate_vit_weights`). Loading (`variables`), routing a
+    checkpoint's names (`hf_decoders`) and binding an export (`interop.pretrained`) read it alike."""
+
+    prefix: str
+    path: Callable[[str], tuple[str, ...] | None]
+    patch_dense: bool = False
+
+    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                  ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        """The tower's variables from its tensors, in the requested storage, and the layouts that
+        write each tensor it placed back from them (`placed`); a tensor the tower does not compute
+        with, as SigLIP's pooling head, has none."""
+        translate = translate_vit_weights if self.patch_dense else placed
+        return translate(hf_tensors, self.path, param_dtype)
+
+
+def _in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
+TOWERS = {
+    "siglip": TowerLayout("vision_tower.", _in_params(siglip_vision_path)),
+    "llama4": TowerLayout("vision_model.", _in_params(llama4_vision_path)),
+    "gemma4": TowerLayout("vision_tower.", gemma4_vision_path),
+    "qwen3_5": TowerLayout("visual.", _in_params(qwen35_vision_path), patch_dense=True),
+    "gemma3n": TowerLayout("vision_tower.", _in_params(gemma3n_vision_path)),
+    "deepseek_v41": TowerLayout("vision.", _in_params(deepseek_v41_vision_path)),
+    "mimo": TowerLayout("visual.", _in_params(mimo_vision_path), patch_dense=True),
+    "muse_glimmer": TowerLayout("vision_tower.", _in_params(muse_glimmer_vision_path)),
+}
+"""Each tower kind's checkpoint layout."""
 PROJECTOR_PREFIX: dict[str, str | tuple[str, ...]] = {
     "gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.", "gemma4": "embed_vision.",
     "qwen3_5": "visual.merger.", "gemma3n": "embed_vision.", "deepseek_v41": "aligner.",
     "mimo": "visual.merger.", "muse_glimmer": ("vision_adapter.", "vision_projection.")}
 """Where each projector kind's tensors sit: one prefix, or several whose tensors each keep the name
 past their own."""
-TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
-    "siglip": siglip_vision_path, "llama4": llama4_vision_path, "gemma4": gemma4_vision_path,
-    "qwen3_5": qwen35_vision_path, "gemma3n": gemma3n_vision_path, "deepseek_v41": deepseek_v41_vision_path,
-    "mimo": mimo_vision_path, "muse_glimmer": muse_glimmer_vision_path}
-# The Qwen-style towers reshape their patch convolution (`translate_vit_weights`), and three projectors check
-# their tensors; every other map reads one tensor to one leaf.
+# Three projectors check their tensors; every other map reads one tensor to one leaf.
 _PROJECTOR_WEIGHTS: dict[str, Callable[..., tuple[Variables, tuple[WeightLayout, ...]]]] = {
     "gemma": translate_gemma_projector_weights,
     "gemma4": translate_gemma4_projector_weights,
@@ -140,17 +171,11 @@ _PROJECTOR_WEIGHTS: dict[str, Callable[..., tuple[Variables, tuple[WeightLayout,
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
                     ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-    """One vision tower's variables, in the requested storage, and the layouts that write each
-    tensor it placed back from those variables (`placed`); a tensor the tower does not compute
-    with, as SigLIP's pooling head, has none."""
-    if kind in ("qwen3_5", "mimo"):
-        params, layouts = translate_vit_weights(hf_tensors, TOWER_PATHS[kind], param_dtype)
-        return {"params": params}, nested(layouts, 0, "params")
-    if kind not in TOWER_PATHS:
+    """One vision tower's variables, in the requested storage (`TOWERS`), and the layouts that
+    write its tensors back from them."""
+    if kind not in TOWERS:
         raise ValueError(f"tower kind {kind!r} has no weight map here")
-    tree, layouts = placed(hf_tensors, TOWER_PATHS[kind], param_dtype)
-    # Gemma 4's map names whole collections, its frozen buffers beside its params.
-    return (tree, layouts) if kind == "gemma4" else ({"params": tree}, nested(layouts, 0, "params"))
+    return TOWERS[kind].variables(hf_tensors, param_dtype)
 
 
 def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
