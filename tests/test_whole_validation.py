@@ -285,11 +285,10 @@ def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
     assert_the_metric_over_every_record(perplexity(windows, count), count)
 
 
-def test_a_metric_reads_the_fields_no_device_holds():
-    """A held record's name, a string no accelerator holds, reaches the
-    metrics with the rest of its batch: the objective's programs read what a
-    device holds, and a metric reads the whole batch, its last batch's
-    repeats left out."""
+def named_records(mesh=None) -> list[tuple[str, int]]:
+    """Each record a validation pass scored, as a metric read it: its name, a string no accelerator
+    holds, beside the label the objective produced from what the devices hold. The pass runs on
+    `mesh`, a pool's spanning its processes (`tests/test_multiprocess.py`), or this process's."""
     from affine_run import FEATURES, Features
 
     from dew.artifacts import Representations
@@ -321,5 +320,13 @@ def test_a_metric_reads_the_fields_no_device_holds():
             return accumulated[0] / accumulated[1]
 
     objective, names = Features(), Names()
-    Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(names,))
-    assert names.seen == [(f"record {index}", index) for index in range(RECORDS)]
+    Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(names,), mesh=mesh)
+    return names.seen
+
+
+def test_a_metric_reads_the_fields_no_device_holds():
+    """A held record's name, a string no accelerator holds, reaches the
+    metrics with the rest of its batch: the objective's programs read what a
+    device holds, and a metric reads the whole batch, its last batch's
+    repeats left out."""
+    assert named_records() == [(f"record {index}", index) for index in range(RECORDS)]
