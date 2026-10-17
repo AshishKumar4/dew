@@ -16,6 +16,12 @@ import test_decision_packing as t
 from dew.nn import linear
 
 
+def x3_formula(*args, **kwargs):
+    """port_formula with its dots at the port's product class, TF32x3."""
+    with jax.default_matmul_precision("TF32_TF32_F32_X3"):
+        return port_formula(*args, **kwargs)
+
+
 @pytest.mark.gpu(reason="the port runs on a GPU")
 def test_port_rows(monkeypatch):
     lines = []
@@ -25,18 +31,14 @@ def test_port_rows(monkeypatch):
         variables = objective.init(jax.random.key(0))
         rows = t.apart(batch)
         runs = {}
-        in_place = None
-        for window, row in t.rows_of(batch):
-            one = jax.tree.map(np.asarray, jax.jit(
-                lambda v, laid=t.in_place(batch, window, row): t.gradient(objective, v, laid))(variables))
-            in_place = one if in_place is None else jax.tree.map(np.add, in_place, one)
-        runs["port inplace"] = in_place
-        for rule_name in ("port", "formula"):
-            for layout, laid in (("packed", batch), ("rows", rows)):
+        for rule_name in ("port", "formula", "x3"):
+            for layout, laid in (("packed", batch),):
                 begun = time.time()
                 with monkeypatch.context() as patched:
                     if rule_name == "formula":
                         patched.setattr(linear, "fla_rule", port_formula)
+                    if rule_name == "x3":
+                        patched.setattr(linear, "fla_rule", x3_formula)
                     runs[f"{rule_name} {layout}"] = jax.tree.map(np.asarray, jax.jit(
                         lambda v, laid=laid: t.gradient(objective, v, laid))(variables))
                 lines.append(f"[{arm}] {rule_name} {layout}: {time.time() - begun:.0f} s")
@@ -64,15 +66,13 @@ def test_port_rows(monkeypatch):
                 row[label] = (float(np.sqrt(np.mean(err ** 2)) / scale), float(np.max(np.abs(err)[ok] / size[ok])))
             stats.append((name, row))
         for level, which in (("rms", 0), ("worst element", 1)):
-            for layout, against in (("packed", "formula"), ("rows", "formula"), ("packed", "inplace")):
-                ref = "port inplace" if against == "inplace" else f"{against} {layout}"
+            for layout, against in (("packed", "formula"), ("packed", "x3")):
+                ref = f"{against} {layout}"
                 ratio = np.array([r[f"port {layout}"][which] / r[ref][which] for _, r in stats if r[ref][which] > 0])
                 lines.append(f"[{arm}] {level}, {layout}: port/{against} over {len(ratio)} leaves: median "
                              f"{np.median(ratio):.2f}, p90 {np.percentile(ratio, 90):.2f}, max {ratio.max():.2f}, "
                              f"over 2: {int(np.sum(ratio > 2))}, over 4: {int(np.sum(ratio > 4))}")
-            ratio = np.array([r["port rows"][which] / max(r["port packed"][which], 1e-30) for _, r in stats])
-            lines.append(f"[{arm}] {level}: port rows/port packed median {np.median(ratio):.2f}")
-        worst = sorted(stats, key=lambda s: -s[1]["port packed"][1] / max(s[1]["port inplace"][1], 1e-30))[:6]
+        worst = sorted(stats, key=lambda s: -s[1]["port packed"][1] / max(s[1]["x3 packed"][1], 1e-30))[:8]
         for name, r in worst:
             lines.append(f"    {name}: " + "  ".join(f"{label} rms {r[label][0]:.2e} el {r[label][1]:.2e}"
                                                     for label in labels))
