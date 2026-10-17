@@ -62,14 +62,17 @@ function preparer({ failSmoke = false, failReport = 0, during = async () => {} }
 		if (id.startsWith('elsewhere')) throw new TypeError('Invalid Durable Object ID. The ID does not match this Durable Object class.');
 		return id;
 	};
-	const env = { SNAPSHOT_COMMIT: COMMIT, SNAPSHOTS: { idFromString, get: (registry) => ({ async prepared(outcome) {
+	const freed = [];
+	const env = { SNAPSHOT_COMMIT: COMMIT, SNAPSHOTS: { idFromString, idFromName: (name) => `named:${name}`, get: (registry) => ({
+		async freed() { freed.push(registry); },
+		async prepared(outcome) {
 		// A report that outlives its alarm is cut off with it: an alarm past those 15 minutes sends it again.
 		assert.ok(state.alarm > Date.now() + 15 * 60_000);
 		await during();
 		if (failReport-- > 0) throw new Error('registry unreachable');
 		reports.push([registry, outcome]);
 	} }) } };
-	return { runner: new SnapshotPreparer(ctx, env), container, starts, reports, execs, state, storage };
+	return { runner: new SnapshotPreparer(ctx, env), container, starts, reports, execs, state, storage, freed };
 }
 
 async function stages(prepared) {
@@ -77,8 +80,9 @@ async function stages(prepared) {
 	const fetched = [];
 	globalThis.fetch = async (url) => (fetched.push(String(url)), new Response('# trusted pinned installer'));
 	try {
-		await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
-		await assert.rejects(prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'other' }), /already running/);
+		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }), true);
+		// Holding a job, it takes no other, and says so: no error, as a preparer busy is no failure of the pin.
+		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'other' }), false);
 		prepared.fetched = fetched;
 		await prepared.runner.alarm();
 		const built = { job: prepared.storage.get('job'), starts: prepared.starts.length,
@@ -112,6 +116,8 @@ test('managed preparation snapshots in one alarm and validates its restore witho
 	assert.equal((await prepared.runner.status()).phase, 'complete');
 	const [[registry, outcome]] = prepared.reports;
 	assert.equal(registry, 'registry');
+	// Free again, it tells the registry, which runs a preparation it turned away meanwhile.
+	assert.deepEqual(prepared.freed, ['named:global']);
 	assert.equal(outcome.token, 'lease');
 	assert.equal(outcome.generation.commit, COMMIT);
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state, trial }) => [id, state, trial]), [['snapshot', 'ready', false]]);
@@ -168,7 +174,7 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 	prepared.storage.set('job', { record: { id: 'current', state: 'preparing' } });
 	prepared.state.alarm = Date.now() + 60_000;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'preparing']]);
-	await assert.rejects(prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }), /already running/);
+	assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }), false);
 	// The runtime gave up on the job's alarm: no alarm will run it again.
 	prepared.state.alarm = null;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'failed']]);
@@ -178,8 +184,7 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 test('a job an alarm runs, or will run, is running, so no other replaces it', async () => {
 	const refused = [];
 	const prepared = preparer({ during: async () => {
-		await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'next' })
-			.then(() => refused.push(false), () => refused.push(true));
+		refused.push(!(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'next' })));
 	} });
 	await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
 	prepared.storage.set('job', { ...prepared.storage.get('job'), stage: 'smoke', began: Date.now() - 6 * 60_000,
@@ -220,8 +225,9 @@ test('a job whose report names another namespace\'s registry is let go, and the 
 		await prepared.runner.prepare(COMMIT, { registry: 'elsewhere', token: 'stray' });
 		await prepared.runner.alarm();
 		await prepared.runner.alarm();
-		// Prepared, it reported to nothing, and holds the preparer no longer.
+		// Prepared, it reported to nothing, and holds the preparer no longer, which it tells the registry.
 		assert.deepEqual(prepared.reports, []);
+		assert.deepEqual(prepared.freed, ['named:global']);
 		assert.equal(prepared.storage.get('job'), undefined);
 		assert.equal(prepared.state.alarm, null);
 		await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
