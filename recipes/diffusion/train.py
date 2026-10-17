@@ -1,6 +1,6 @@
 """Train a diffusion model over images or latents.
 
-    python recipes/diffusion/train.py --data.path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
+    python recipes/diffusion/train.py --data.source tfds://oxford_flowers102 \\
         --data.image-size 128 --trainer.batch-size 32 --trainer.epochs 2000 \\
         --model simple_dit --model.patch-size 4 --model.emb-features 512 \\
         --model.num-layers 12 --model.num-heads 8

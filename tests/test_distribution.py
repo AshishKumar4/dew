@@ -825,6 +825,27 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed(tmp_path):
+    """fsdp across two processes over a mixture, every call recording its
+    routing and its sampler's support: the second share's tasks all
+    truncate, so its calls train on nothing and pack no record. It holds
+    the records' empty forms, so the pool hands the step one tree, and the
+    pool trains on the rows and moves the parameters one process does."""
+    pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2, "--records")
+    alone, single = scheduled(tmp_path, {"fsdp": 2}, 1, "--records")
+    assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
+    trained = handed(pool, 1)["response_mask"]
+    assert not trained.any(), "the second share was meant to train on nothing"
+    together = {name: np.concatenate(value) for name, value in pool["rows"].items()}
+    reference = {name: np.concatenate(value) for name, value in alone["rows"].items()}
+    order, expected = (np.lexsort(rows["input_ids"].T[::-1]) for rows in (together, reference))
+    for name in ("input_ids", "response_mask", "behavior_log_probs"):
+        np.testing.assert_array_equal(together[name][order], reference[name][expected])
+    for name, value in single.items():
+        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
+
+@pytest.mark.mesh(devices=2)
 def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp_path):
     """tensor across two processes: both read the one share, and their
     engines would draw differently (`--vary`). The first reader samples and
