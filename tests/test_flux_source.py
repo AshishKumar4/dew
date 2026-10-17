@@ -30,11 +30,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = ("schnell", "dev", "rect", "deep", "mixed")
 
 
-def placed(key: str, rank: int) -> tuple[str, ...]:
-    """Where `flux_path` places a tensor, whatever its rank."""
-    return flux_path(key)
-
-
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/flux_source.tar.xz", tmp_path_factory.mktemp("flux-source"))
@@ -52,7 +47,7 @@ def transformer_case(directory: Path, arrays, name: str, grid: tuple[int, int]):
     """The native model, its loaded parameters and the case's own inputs."""
     config = json.loads(str(arrays[f"{name}.config"]))
     model = FluxTransformer(**flux_fields(config, attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(directory / name, "transformer"), placed)
+    params, layouts = read_transformer(component_tensors(directory / name, "transformer"), flux_path)
     latent = jnp.asarray(unpacked(arrays[f"{name}.packed"], *grid))
     context = jnp.asarray(arrays[f"{name}.context"])
     pooled = jnp.asarray(arrays[f"{name}.pooled"])

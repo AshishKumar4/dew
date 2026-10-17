@@ -8,7 +8,8 @@ one tensor at a time, and encodes dense weights back into those parts for
 
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
-  beside `<m>.weight_scale_inv`, one float32 scale per square block.
+  beside `<m>.weight_scale_inv`, one float32 scale per block of the
+  configured rows and columns, square or not.
 - MiMo-V2.6's storage of that config under `store_dtype: mxfp4`: FP8 blocks,
   the fused qkv in runs over the key heads, and routed experts as MXFP4,
   `<m>.weight` beside `<m>.weight_scale`.
@@ -26,9 +27,10 @@ one tensor at a time, and encodes dense weights back into those parts for
   and FP8 codes under the one weights scheme a config declares, and
   `nvfp4-pack-quantized`, E2M1 codes in groups of 16 whose dynamic local
   input scales the checkpoint Qwix provider computes.
-- ModelOpt (`quant_method: modelopt`): NVFP4 with its stored input
-  multipliers, and the MIXED_PRECISION table that gives each layer NVFP4,
-  W4A16_NVFP4 or FP8 (`MODELOPT_ALGOS`).
+- ModelOpt (`quant_method: modelopt`): one algorithm for every quantized
+  layer, or the MIXED_PRECISION table that gives each layer its own, each
+  NVFP4 with its stored input multipliers, W4A16_NVFP4 or FP8
+  (`MODELOPT_ALGOS`).
 
 MLX's affine groups, which declare no `quant_method`, are refused by their
 shape, and any other `quant_method` by its name.

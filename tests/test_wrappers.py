@@ -72,3 +72,32 @@ def test_wrapper_tower_and_projector_match_the_reference():
         assert np.max(np.abs(np.asarray(
             projector.apply(variables["projector"], tower_ref))
             - projector_ref)) < tolerance
+
+
+def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(tmp_path):
+    """A checkpoint may store a vision tensor under two names that load to one leaf; a trained
+    leaf writes back under both, so the export reloads as the trained model, neither name kept
+    at its stale source value."""
+    import dataclasses
+    from shutil import copyfile
+
+    import jax
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("config.json",):
+        copyfile(FIXTURES / "gemma3-tiny-mm" / name, source / name)
+    tensors = load_file(FIXTURES / "gemma3-tiny-mm" / "model.safetensors")
+    spelled = "model.vision_tower.embeddings.patch_embedding.bias"
+    tensors[spelled.removeprefix("model.")] = tensors[spelled]
+    save_file(tensors, source / "model.safetensors")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    trained = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.25, loaded.variables))
+    trained.save(tmp_path / "export")
+    written = load_file(tmp_path / "export" / "model.safetensors")
+    np.testing.assert_array_equal(written[spelled], tensors[spelled] + 0.25)
+    np.testing.assert_array_equal(written[spelled.removeprefix("model.")], written[spelled])
+    Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")

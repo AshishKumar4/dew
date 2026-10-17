@@ -37,11 +37,6 @@ FORWARD = 1e-5
 GRADIENT = 1e-4
 
 
-def placed(key: str, rank: int) -> tuple[str, ...]:
-    """Where `flux2_path` places a tensor, whatever its rank."""
-    return flux2_path(key)
-
-
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/flux2_source.tar.xz",
@@ -61,7 +56,7 @@ def arrays(source):
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = Flux2Transformer(**flux2_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(source / name, "transformer"), placed)
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux2_path)
     return model, params, layouts
 
 

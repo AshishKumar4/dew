@@ -31,11 +31,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = ("square", "rect", "odd", "padded", "acausal", "eps")
 
 
-def placed(key: str, rank: int) -> tuple[str, ...]:
-    """Where `qwen_image_path` places a tensor, whatever its rank."""
-    return qwen_image_path(key)
-
-
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/qwen_image_source.tar.xz",
@@ -66,7 +61,7 @@ def transformer_case(source, arrays, name: str):
     directory = source / name
     config = json.loads((directory / "transformer" / "config.json").read_text())
     model = QwenImageTransformer(**qwen_image_fields(config, attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(directory, "transformer"), placed)
+    params, layouts = read_transformer(component_tensors(directory, "transformer"), qwen_image_path)
     return model, params, layouts
 
 
@@ -173,7 +168,7 @@ def test_every_declared_qwen_image_tensor_is_mapped(source):
     """Every stored tensor lands in the tree and writes back bit for bit; a
     name the class does not declare, a bias included, is refused."""
     tensors = component_tensors(source / "square", "transformer")
-    params, layouts = read_transformer(tensors, placed)
+    params, layouts = read_transformer(tensors, qwen_image_path)
     assert {entry.name for entry in layouts} == {f"transformer/{name}" for name in tensors}
     for entry in layouts:
         np.testing.assert_array_equal(entry.export({"params": params}),
@@ -182,7 +177,7 @@ def test_every_declared_qwen_image_tensor_is_mapped(source):
     for foreign in ("img_in.bias", "transformer_blocks.0.attn.add_q_proj.weight",
                     "transformer_blocks.0.norm1.linear.weight", "pos_embed.freqs"):
         with pytest.raises(ValueError):
-            read_transformer({foreign: weight}, placed)
+            read_transformer({foreign: weight}, qwen_image_path)
 
 
 @pytest.fixture(scope="module")
