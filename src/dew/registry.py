@@ -634,11 +634,20 @@ def _referred(written: _Written, first: tuple[nn.Module, dict[str, JSON]]) -> JS
 
 @dataclasses.dataclass
 class _Shared:
-    """The shared modules of the record being read: each one's defining
-    record, by number, and the module once it is built."""
+    """The shared modules of the record being read: by number, every mapping
+    shaped like one's definition, the module once it is built, and the record
+    it was built from.
 
-    defined: dict[int, Mapping[str, object]]
+    The shape alone does not make a definition: a field typed `object` or a
+    plain mapping keeps such a mapping as the data it is (`_rebuilt`). So the
+    scan only collects candidates, and a number becomes a module where the
+    walk reads it at a module's place: a definition is built from itself, and
+    a reference read before its definition from the one candidate it can mean.
+    """
+
+    candidates: dict[int, list[Mapping[str, object]]]
     built: dict[int, Configured] = dataclasses.field(default_factory=dict)
+    sources: dict[int, Mapping[str, object]] = dataclasses.field(default_factory=dict)
 
 
 _READING: contextvars.ContextVar[_Shared | None] = contextvars.ContextVar("_READING", default=None)
@@ -652,15 +661,13 @@ def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
     if _READING.get() is not None:
         yield
         return
-    defined: dict[int, Mapping[str, object]] = {}
+    candidates: dict[int, list[Mapping[str, object]]] = {}
 
     def scan(node) -> None:  # any value a record holds, a record of records or not
         if isinstance(node, Mapping):
             number = _sharing(node)
             if number is not None and "share" in node:
-                if number in defined:
-                    raise ValueError(f"the record defines its shared module {number} twice")
-                defined[number] = {str(key): entry for key, entry in node.items() if key != "share"}
+                candidates.setdefault(number, []).append(node)
             for entry in node.values():
                 scan(entry)
         elif isinstance(node, (list, tuple)):
@@ -668,7 +675,7 @@ def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
                 scan(entry)
 
     scan(record)
-    token = _READING.set(_Shared(defined))
+    token = _READING.set(_Shared(candidates))
     try:
         yield
     finally:
@@ -691,10 +698,23 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     number = _sharing(value)
     if shared is None or number is None:
         raise ValueError(f"{value!r} is no shared module of a record being read")
-    if number not in shared.built:
-        if number not in shared.defined:
-            raise ValueError(f"the record refers to its shared module {number} and defines none")
-        shared.built[number] = _rebuilt(annotation, shared.defined[number], dtypes=dtypes)
+    if "share" in value:
+        source = value
+    elif number in shared.built:
+        return shared.built[number]
+    else:
+        found = shared.candidates.get(number, [])
+        if len(found) != 1:
+            raise ValueError(f"the record refers to its shared module {number} before defining it, and "
+                             f"holds {len(found) or 'no'} records numbered {number}")
+        source = found[0]
+    if number in shared.built:
+        if shared.sources[number] != source:
+            raise ValueError(f"the record defines its shared module {number} twice")
+        return shared.built[number]
+    shared.sources[number] = source
+    shared.built[number] = _rebuilt(annotation, {str(key): entry for key, entry in source.items()
+                                                 if key != "share"}, dtypes=dtypes)
     return shared.built[number]
 
 
