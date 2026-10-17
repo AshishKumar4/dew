@@ -781,7 +781,8 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
 
 def export_config(model) -> Mapping[str, object]:
-    """Write a CausalTransformer's fields back into HF vocabulary."""
+    """Write a CausalTransformer's fields back into HF vocabulary, refusing a model the config
+    would read back as another computation (`refuse_lossy_export`)."""
     family = _family_for_model(model)
     exported = family.export_fields(model)
     chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
@@ -879,7 +880,9 @@ def export_config(model) -> Mapping[str, object]:
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
-    return {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    written = {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    refuse_lossy_export(model, written)
+    return written
 
 
 _RUNTIME_FIELDS = frozenset({
