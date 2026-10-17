@@ -264,6 +264,15 @@ _YARN_SOURCES = (
                                      "rope_scaling": {key: value for key, value
                                                       in config["rope_parameters"].items()
                                                       if key != "rope_theta"}}),
+    # Gemma4TextConfig installs proportional full-layer rotary at 1e6 and plain
+    # sliding rotary at 1e4 for an absent or null record, and GELU by default.
+    ("gemma4-moe-tiny", _without("rope_parameters", "hidden_activation")),
+    ("gemma4-moe-tiny", lambda config: {**config, "rope_parameters": None}),
+    # Phi3Config replaces rope_parameters with a legacy rope_scaling whole, and
+    # its own original_max_position_embeddings replaces the record's.
+    ("phi3-tiny", lambda config: {**config, "rope_parameters": {"rope_type": "default", "rope_theta": 500.0},
+                                  "rope_scaling": {**config["rope_parameters"],
+                                                   "original_max_position_embeddings": 16}}),
     # OLMo 3's class folds a legacy rope_scaling into the full layers' record.
     ("olmo3-yarn-tiny", lambda config: {
         **config,

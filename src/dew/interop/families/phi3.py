@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Packed,
@@ -13,14 +14,19 @@ from dew.interop.decoder_parts import (
     decoder_tensors,
     dew_path,
     refuse,
+    rope_records,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import LongRopeScaling
 
 
 def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    parameters = records.record(hf.get('rope_parameters') or hf.get('rope_scaling') or {}, 'rope_parameters')
-    theta = records.number(parameters.get('rope_theta', hf.get('rope_theta', 10000.)), 'rope_theta')
+    # Phi3Config resolves its record as the mixin does, a legacy rope_scaling
+    # replacing rope_parameters whole (configuration_phi3.py:89-101).
+    (field, parameters), sliding = rope_records(hf, PLAIN_SPELLING)
+    if sliding is not None or '.' in field:
+        refuse(field, 'Phi-3 reads one rotary record for every layer')
+    theta = records.number(parameters['rope_theta'], f'{field} rope_theta')
     partial = records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', 1.)),
                               'partial_rotary_factor')
     rotated = int(records.integer(hf.get('head_dim') or records.integer(hf['hidden_size'], 'hidden_size')
@@ -42,9 +48,9 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                           reads=frozenset({'sliding_window'}))
     rope_type = parameters.get('rope_type', parameters.get('type', 'default'))
     if rope_type in ('su', 'yarn', 'longrope'):
-        original = records.integer(parameters.get('original_max_position_embeddings',
-                                   hf.get('original_max_position_embeddings',
-                                          hf.get('max_position_embeddings', 4096))),
+        # The class's own field, 4096 when omitted, replaces whatever the record
+        # names (modeling_rope_utils.py:790-797, standardize_rope_params).
+        original = records.integer(hf.get('original_max_position_embeddings', 4096),
                                    'original_max_position_embeddings')
         rope = native_fields(LongRopeScaling)(
             rope_type='longrope',
