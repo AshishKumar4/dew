@@ -1979,6 +1979,7 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     attended = jax.vmap(example)(jnp.moveaxis(query, -2, -3) * scale,
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
+    # jax types every splash kernel's call as either variant, whatever save_residuals it was made with.
     if isinstance(attended, tuple):
         # Only a save_residuals=True kernel returns a pair, and this one is
         # built without it; the check narrows the kernel's union return type.
