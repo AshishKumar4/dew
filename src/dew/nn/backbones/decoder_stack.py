@@ -21,7 +21,7 @@ from flax.core import unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.objectives.base import merge
+from dew.objectives.base import Variables, merge
 
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
@@ -151,6 +151,10 @@ class Loop:
                 raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
 
 
+type Cursors = Mapping[tuple[str, ...], object]
+"""A cache tree's `cache_index` leaves, by their paths."""
+
+
 @dataclasses.dataclass
 class SharedPassView:
     """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
@@ -160,8 +164,8 @@ class SharedPassView:
     keys and values over the last pass's (`inside`), and it leaves the cursors as the first pass
     left them (`outside`): a pass that allocates the cache advances none (`cache_positions`), and
     the later ones, finding it allocated, must not either."""
-    before: dict = dataclasses.field(default_factory=dict)
-    after: dict = dataclasses.field(default_factory=dict)
+    before: Cursors = dataclasses.field(default_factory=dict)
+    after: Cursors = dataclasses.field(default_factory=dict)
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
         self.before = cursors_of(variables.get('cache', {}))
@@ -178,20 +182,20 @@ class SharedPassView:
         return self._placed(variables, self.after)
 
     @staticmethod
-    def _placed(variables: Mapping[str, Mapping], cursors: Mapping) -> dict:
+    def _placed(variables: Mapping[str, Mapping], cursors: Cursors) -> dict:
         cache = variables.get('cache')
         if cache is None:
             return dict(variables)
         return {**variables, 'cache': _with_cursors(cache, cursors)}
 
 
-def cursors_of(cache: Mapping[str, object]) -> dict[tuple[str, ...], object]:
+def cursors_of(cache: Mapping[str, object]) -> Cursors:
     """Every `cache_index` in a cache tree, by its path."""
     return {path: leaf for path, leaf in flatten_dict(unfreeze(dict(cache))).items()
             if path[-1] == 'cache_index'}
 
 
-def _with_cursors(cache: Mapping[str, object], cursors: Mapping[tuple[str, ...], object]) -> dict:
+def _with_cursors(cache: Mapping[str, object], cursors: Cursors) -> Variables:
     flat = flatten_dict(unfreeze(dict(cache)))
     return unflatten_dict({path: cursors.get(path, leaf) for path, leaf in flat.items()})
 
