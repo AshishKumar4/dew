@@ -12,6 +12,7 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -252,6 +253,7 @@ QUANTIZED_CONVOLUTION = """
 import sys
 
 import jax
+import lane_environment
 import jax.numpy as jnp
 import numpy as np
 import qwix
@@ -465,19 +467,16 @@ FLUX_BLOCKS = (r".*transformer_blocks_\d+/(attn/(to_|add_).+|ff.*)",)
 """The FLUX blocks' projections and feed-forwards, at `flux_task`'s 64 features."""
 
 
-@pytest.fixture(scope="module")
-def flux_task(tmp_path_factory):
-    """The tiny FLUX source's text-to-image task: a matmul-only denoiser
-    beside CLIP and T5 towers and a VAE. Its denoiser is widened to 64
-    features over freshly drawn weights: the source's 24 make int8 GEMMs
-    cuBLAS 13 refuses on an A100, as do its 16-wide inputs and outputs,
-    which `FLUX_BLOCKS` leaves in float."""
+def flux_source(root: Path):
+    """The tiny FLUX source's text-to-image task, unpacked under `root`: a
+    matmul-only denoiser beside CLIP and T5 towers and a VAE. Its denoiser
+    is widened to 64 features over freshly drawn weights: the source's 24
+    make int8 GEMMs cuBLAS 13 refuses on an A100, as do its 16-wide inputs
+    and outputs, which `FLUX_BLOCKS` leaves in float."""
     import tarfile
-    from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
 
-    root = tmp_path_factory.mktemp("flux")
     with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
         archive.extractall(root, filter="data")
     task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
@@ -486,6 +485,11 @@ def flux_task(tmp_path_factory):
     params = model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
                         **example.conditions)["params"]
     return dataclasses.replace(task, model=model, variables={**task.variables, "params": params})
+
+
+@pytest.fixture(scope="module")
+def flux_task(tmp_path_factory):
+    return flux_source(tmp_path_factory.mktemp("flux"))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -935,10 +939,30 @@ def placed(tree, dtype):
                                                  else leaf.dtype), tree)
 
 
+def under_xla_defaults(flow) -> None:
+    """Run `flow`, a function of this module, in a fresh process under the lane's flags without its
+    repeatable ones (`lane_environment.REPEATABLE_GPU_FLAGS`), as a run compiles. Those take Triton
+    out of XLA's GEMM configurations, and so hide what its Triton fusion computes; XLA reads its
+    flags once a process."""
+    here = Path(__file__).resolve().parent
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if flag not in lane_environment.REPEATABLE_GPU_FLAGS]
+    script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200, cwd=here,
+                         env={**os.environ, "XLA_FLAGS": " ".join(flags),
+                              "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                              "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+    assert run.returncode == 0, run.stderr[-4000:]
+
+
 def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
     """`TextGeneration.quantized` in int8 draws greedily and scores each draw (its raw
     log-probabilities) as the same task on the host does: the device's int8 products are its
-    operands' products."""
+    operands' products. Under XLA's defaults (`under_xla_defaults`)."""
+    under_xla_defaults(served_text_flow)
+
+
+def served_text_flow():
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
 
@@ -955,11 +979,19 @@ def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
     assert_computed_as_on_the_host(run, "an int8 text task's log-probabilities")
 
 
-def test_an_int8_image_task_walks_as_the_host_does(flux_task):
+def test_an_int8_image_task_walks_as_the_host_does():
     """`TextToImage.quantized` in int8 walks a prompt's latents as the same task does on the host,
-    from the same quantized weights and encoded prompt."""
+    from the same quantized weights and encoded prompt. Under XLA's defaults (`under_xla_defaults`)."""
+    under_xla_defaults(image_flow)
+
+
+def image_flow():
+    import tempfile
+
     pytest.importorskip("qwix")
-    served = flux_task.quantized(Quantization(patterns=FLUX_BLOCKS))
+    with tempfile.TemporaryDirectory() as root:
+        task = flux_source(Path(root))
+    served = task.quantized(Quantization(patterns=FLUX_BLOCKS))
     prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
 
     def run(dtype):
@@ -972,7 +1004,11 @@ def test_an_int8_image_task_walks_as_the_host_does(flux_task):
 
 def test_an_int8_decision_task_answers_as_the_host_does():
     """`Decide` over a backbone quantized to int8 gives each option the probability the same task
-    gives it on the host."""
+    gives it on the host. Under XLA's defaults (`under_xla_defaults`)."""
+    under_xla_defaults(decision_flow)
+
+
+def decision_flow():
     from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER
 
     from dew.decision import Decide, DecisionObjective
@@ -996,7 +1032,12 @@ def test_an_int8_decision_task_answers_as_the_host_does():
 
 def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
-    of its loss that the host computes, from its forward's int8 products."""
+    of its loss that the host computes, from its forward's int8 products. Under XLA's defaults
+    (`under_xla_defaults`)."""
+    under_xla_defaults(training_flow)
+
+
+def training_flow():
     from dew.config.data import RecordsData, loader
     from dew.data import Loading
     from dew.training.trainer import Trainer
