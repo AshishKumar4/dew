@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
@@ -388,6 +389,33 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
+    """A ModernBERT task whose backbone runs under LoRA, its factors moved off
+    zero, saves in Laya's layout with the factors merged into their kernels
+    (`Pretrained.bound`): the reloaded plain checkpoint answers every case as
+    the adapted task does, and differently from the task without the
+    adapter."""
+    from dew.decision.model import DecisionModel
+    from dew.lora import LoRA
+    from dew.objectives.base import joined, part
+
+    backbone = part(decide.variables, "backbone")
+    adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
+    moved = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + 0.05 if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
+    adapted = replace(decide, model=DecisionModel(adapter.model, decide.model.head),
+                      variables=joined({"backbone": moved, "head": part(decide.variables, "head")}))
+
+    adapted.save_pretrained(tmp_path)
+    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    changed = False
+    for request in CASES.values():
+        expected = adapted.systemone(request, details=True)
+        assert again.systemone(request, details=True) == expected
+        changed |= decide.systemone(request, details=True) != expected
+    assert changed
 
 
 def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_path):

@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import ClassVar, Protocol, runtime_checkable
 
 import jax.numpy as jnp
 import numpy as np
@@ -34,9 +34,11 @@ from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
 
+@runtime_checkable
 class TokenizerSpecials(Protocol):
-    """What `Specials.of` reads off a transformers tokenizer: its special
-    tokens' ids, each None where it has none, and an id's token text."""
+    """What `Specials.of` reads off a tokenizer, as a transformers tokenizer
+    holds it: its special tokens' ids, each None where it has none, and an id's
+    token text."""
 
     @property
     def cls_token_id(self) -> int | None: ...
@@ -101,18 +103,17 @@ class Specials:
 
     @classmethod
     def of(cls, tokenizer: Tokenizer | TokenizerSpecials) -> "Specials":
-        """Return a Hugging Face tokenizer's own special tokens, read off the
-        transformers tokenizer itself or the one an `HFTokenizer` loads.
+        """Return a tokenizer's own special tokens, read off any tokenizer that
+        holds them as `TokenizerSpecials` declares, a transformers tokenizer or
+        the one an `HFTokenizer` loads among them.
 
         That is [CLS] or its start token, [SEP] or its end token, [MASK] (or else its
         end token) as the marker, and its padding token or else its end token.
         """
-        from transformers import PreTrainedTokenizerBase
-
         hf = tokenizer.tokenizer if isinstance(tokenizer, HFTokenizer) else tokenizer
-        if not isinstance(hf, PreTrainedTokenizerBase):
-            raise ValueError("Specials.of reads a Hugging Face tokenizer's special tokens; "
-                             "give a ByteTokenizer's Specials explicitly")
+        if not isinstance(hf, TokenizerSpecials):
+            raise ValueError(f"Specials.of reads a tokenizer's special tokens, which this "
+                             f"{type(hf).__name__} does not hold; give its Specials explicitly")
 
         def first(*names: str) -> int | None:
             ids = [getattr(hf, name) for name in names]
