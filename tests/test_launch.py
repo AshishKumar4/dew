@@ -184,6 +184,72 @@ def running(pid: int) -> bool:
     return state != "Z"
 
 
+# ssh -tt as the launcher runs it, to a host that is this machine: the remote command runs under a
+# terminal of its own whose input is ssh's, and closing the connection, as ssh exiting does, hangs that
+# terminal up.
+SSH = """import os, pty, select, sys
+words, skipped = [], False
+for word in sys.argv[1:]:
+    if skipped or word == "-o":
+        skipped = not skipped
+    elif not word.startswith("-"):
+        words.append(word)
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execvp("sh", ["sh", "-c", " ".join(words[1:])])
+reading = True
+while True:
+    ready = select.select([terminal, *([0] if reading else [])], [], [])[0]
+    if 0 in ready:
+        typed = os.read(0, 1024)
+        reading = bool(typed)
+        if typed:
+            os.write(terminal, typed)
+    if terminal in ready:
+        try:
+            shown = os.read(terminal, 1024)
+        except OSError:
+            break
+        if not shown:
+            break
+        os.write(1, shown)
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+"""
+
+
+def test_a_rank_over_ssh_is_stopped_with_sigterm_and_its_connection_waits_for_it(tmp_path):
+    """A rank on another host, started over ssh -tt, takes a stopped launch as a
+    local rank does, SIGTERM, the notice a training run checkpoints on, not the
+    SIGHUP its connection closing would bring, and its connection stays open
+    while it writes its checkpoint, so it ends the checkpoint before the launch
+    exits 128 plus the signal."""
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    (binaries / "ssh.py").write_text(SSH)
+    (binaries / "ssh").write_text(f'#!/bin/sh\nexec {sys.executable} {binaries / "ssh.py"} "$@"\n')
+    (binaries / "ssh").chmod(0o755)
+    program = ("import os, pathlib, signal, sys, time\n"
+               "folder, rank = pathlib.Path(sys.argv[1]), os.environ['DEW_PROCESS_ID']\n"
+               "def stopped(signum, frame):\n"
+               "    (folder / f'signal{rank}').write_text(signal.Signals(signum).name)\n"
+               "    time.sleep(1)\n"
+               "    (folder / f'checkpoint{rank}').write_text('written')\n"
+               "    sys.exit(0)\n"
+               "signal.signal(signal.SIGTERM, stopped)\n"
+               "signal.signal(signal.SIGHUP, stopped)\n"
+               "(folder / f'rank{rank}').write_text(str(os.getpid()))\n"
+               "time.sleep(600)\n")
+    launch = launcher("--hosts", "node-a,node-b", "--processes-per-host", "1", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path),
+                      env={**ENV, "PATH": f"{binaries}:{ENV['PATH']}"})
+    started_ranks(tmp_path, 2)
+    launch.send_signal(signal.SIGTERM)
+    assert launch.wait(timeout=60) == 128 + signal.SIGTERM
+    for rank in range(2):
+        assert (tmp_path / f"signal{rank}").read_text() == "SIGTERM"
+        assert (tmp_path / f"checkpoint{rank}").read_text() == "written"
+
+
 def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "dew.cli.main", "launch", *arguments],
                           cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120)
