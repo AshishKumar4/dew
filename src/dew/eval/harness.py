@@ -301,9 +301,14 @@ class DewLM(TemplateLM):
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
 
-        The other controls are the ones `HFLM` hands Transformers' `generate`,
-        and they decode as a source's generation config does
-        (`dew.interop.generation_config.source_decoding`): sampling filters and
+        A request's `max_length` is the total length `HFLM` hands `generate`,
+        context included, in place of the budget. Its temperature is 0 where
+        it names none, which decodes greedily unless the request asks to
+        sample; sampling at 0 raises ValueError, as `generate` does. The other
+        controls are the ones `HFLM` hands Transformers' `generate`, and they
+        decode as a source's generation config does
+        (`dew.interop.generation_config.source_decoding`), over the task's own
+        EOS and pad ids where the request names none: sampling filters and
         penalties, logits processors, and beam search under `num_beams` with
         its `length_penalty` and `early_stopping`. One Dew has no counterpart
         for raises ValueError, as `generate` refuses a keyword it does not use.
@@ -320,17 +325,26 @@ class DewLM(TemplateLM):
             budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
             until = controls.pop("until", None)
             seed = int(controls.pop("seed", 0))
-            sampling, chain, strategy = source_decoding(
-                {}, {**controls, "eos_token_id": self.task.sampling.eos_token_ids,
-                     "pad_token_id": self.task.sampling.pad_token_id}, self.task.model, 1, None)
+            total = controls.pop("max_length", None)
+            # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
+            controls.setdefault("temperature", 0.0)
+            if controls["temperature"] == 0.0 and controls.get("do_sample") is None:
+                controls["do_sample"] = False
+            if controls.get("do_sample") and controls["temperature"] == 0.0:
+                raise ValueError("sampling at temperature 0 is refused, as Transformers' generate refuses it")
+            task_ids = {"eos_token_id": self.task.sampling.eos_token_ids,
+                        "pad_token_id": self.task.sampling.pad_token_id}
+            sampling, chain, strategy = source_decoding(task_ids, controls, self.task.model, 1, None)
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
-            drawn = self.task([ids], budget, key=seed, sampling=sampling, logits=chain, strategy=strategy)
+            drawn_budget = budget if total is None else int(total) - len(ids)
+            text = "" if drawn_budget < 1 else self.task.decode(self.task(
+                [ids], drawn_budget, key=seed, sampling=sampling, logits=chain, strategy=strategy))[0]
             stops = handle_stop_sequences(until, eos=eos)
-            answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
+            answers.append(postprocess_generated_text(text, stops, None))
         return answers
 
 

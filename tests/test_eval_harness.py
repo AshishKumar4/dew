@@ -179,10 +179,12 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
 
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     """On the same weights, a request that samples under `top_k=1` draws what
-    lm-eval's own model draws there and what greedy decoding draws, and a
-    beam search of three under a length penalty returns lm-eval's own
-    answer. A sampled beam search, which no likelihood describes, and a
-    control `generate` would not use raise instead of drawing without it."""
+    lm-eval's own model draws there and what greedy decoding draws; a beam
+    search of three under a length penalty, a total `max_length`, a
+    request's own EOS and an explicit zero temperature return lm-eval's own
+    answers. A sampled beam search, which no likelihood describes, a control
+    `generate` would not use, and sampling at temperature 0, which
+    `generate` refuses, raise instead of drawing."""
     ours, theirs = _pair(64)
     greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8}
     sampled = {**greedy, "do_sample": True, "temperature": 1.0, "top_k": 1}
@@ -191,11 +193,18 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     def asked(controls):
         return [instance("the quick ", controls, request_type="generate_until")]
 
+    context = len(ours.tok_encode("the quick "))
     answer = ours.generate_until(asked(sampled))
     assert answer == theirs.generate_until(asked(sampled))
     assert answer == ours.generate_until(asked(greedy))
-    assert ours.generate_until(asked(beams)) == theirs.generate_until(asked(beams))
-    for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1}):
+    # The greedy answer's third id ends it early under a request's own EOS.
+    assert len(answer[0]) > 3
+    eos = ours.tok_encode(answer[0][2], add_special_tokens=False)[0]
+    for controls in (beams, {**greedy, "max_length": context + 2}, {**greedy, "eos_token_id": eos},
+                     {**greedy, "temperature": 0.0}):
+        assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
+    for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
+                    {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
         with pytest.raises(ValueError):
             ours.generate_until(asked(refused))
 
