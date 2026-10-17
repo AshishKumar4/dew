@@ -376,7 +376,7 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     """
     from dew.nn.fake_quant import straight_through
 
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
     safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
@@ -386,11 +386,18 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
     broadcast_shape = (1,) * values.ndim
-    quantized = qarray.quantize_with_scale_zero_point(
-        quotients, jnp.float8_e4m3fn, jnp.ones(broadcast_shape, jnp.float32), None)
+    quantized = _cast(qwix, quotients, jnp.float8_e4m3fn)
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))
-    rounded = qarray.dequantize(quantized)
+    rounded = qwix.dequantize(quantized)
     return straight_through(x, rounded)
+
+
+def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
+    """`quotients`, already divided by their scales, cast to `qtype` as a Qwix QArray of unit scale:
+    a fixed range of the type's own bound gives a scale of exactly one (448 over E4M3's 448, 6 over
+    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale."""
+    bound = 448 if qtype == jnp.float8_e4m3fn else 6
+    return qwix.quantize(quotients, qtype, calibration_method=f"fixed,{bound}")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -416,13 +423,13 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     from dew.nn.fake_quant import straight_through
     from dew.nn.precision import rounded_operand
 
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
     if x.shape[-1] % 16:
         raise ValueError(f"NVFP4 input width must be divisible by 16, got {x.shape}")
     values = jax.lax.stop_gradient(x)
     groups = values.reshape(*x.shape[:-1], -1, 16)
     if spec.format == 'modelopt':
-        return _modelopt_input_qdq(x, spec, qarray)
+        return _modelopt_input_qdq(x, spec, qwix)
     largest = jnp.max(jnp.abs(groups), -1)
     divisor = jnp.full(largest.shape, 6, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
@@ -437,15 +444,14 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     scale = correctly_rounded_divide(scale, overall)
     expanded = jnp.broadcast_to(scale[..., None], groups.shape).reshape(x.shape)
     quotients = correctly_rounded_divide(values.astype(jnp.float32), expanded)
-    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(expanded), None)
-    quantized = quantized.replace(scale=expanded)
-    rounded = qarray.dequantize(quantized)
+    quantized = _cast(qwix, quotients, 'nvfp4').replace(scale=expanded)
+    rounded = qwix.dequantize(quantized)
     # CT adds its symmetric zero point before casting, so exact -0 is +0.
     rounded = jnp.where(values == 0, jnp.zeros_like(rounded), rounded)
     return straight_through(x, rounded)
 
 
-def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) -> jax.Array:
+def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) -> jax.Array:
     """ModelOpt's direct-RN E4M3 scale rule, with Qwix's E2M1 representation.
 
     fp4_kernel_hopper.py:76-99 widens before amax, rounds amax/(6*g) to
@@ -475,8 +481,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) 
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
     quotients = values * correctly_rounded_divide(jnp.ones_like(values), spread)
-    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(spread), None)
-    rounded = qarray.dequantize(quantized.replace(scale=spread))
+    rounded = qwix.dequantize(_cast(qwix, quotients, 'nvfp4').replace(scale=spread))
     return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
 
 
@@ -828,17 +833,24 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     (`GroupScaledConvolution`); its matmuls keep Qwix's scaling, and whether
     a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
     measured."""
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
+
+    def quantized(arg) -> bool:
+        return isinstance(arg, qwix.QArray)
 
     def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
-        operands = [arg for arg in args if isinstance(arg, qarray.QArray)]
+        operands = [arg for arg in jax.tree.leaves(args, is_leaf=quantized) if quantized(arg)]
         if len(operands) < 2:
             return op(*args, **kwargs)
-        _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
+        # The product's dtype as Qwix's rule gives it (qarray.get_accumulator_and_result_type): its
+        # operands' scales', an 8-bit or narrower one read as bfloat16, an integer one as int32.
+        dtype = jnp.result_type(*(
+            (jnp.int32 if "int" in operand.scale.dtype.name else jnp.bfloat16)
+            if operand.scale.dtype.itemsize <= 1 else operand.scale.dtype for operand in operands))
         rescaled = jax.tree.map(
-            lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+            lambda arg: arg.astype(jnp.float32) if quantized(arg) else arg,
             args,
-            is_leaf=lambda arg: isinstance(arg, qarray.QArray),
+            is_leaf=quantized,
         )
         return op(*rescaled, **kwargs).astype(dtype)
 
@@ -851,7 +863,6 @@ def _grouped_convolution_gradient() -> type:
     convolution; importing Qwix here keeps it optional."""
     qwix = _qwix()
     conv_general_qt = _qwix("qwix._src.core.conv_general_qt")
-    qarray = _qwix("qwix._src.core.qarray")
 
     @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
     def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
@@ -862,7 +873,7 @@ def _grouped_convolution_gradient() -> type:
 
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, residuals, g):
-        operands = [qarray.dequantize(operand) if isinstance(operand, qarray.QArray) else operand
+        operands = [qwix.dequantize(operand) if isinstance(operand, qwix.QArray) else operand
                     for operand in residuals]
 
         def convolve(lhs, rhs):

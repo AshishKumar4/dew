@@ -225,22 +225,25 @@ def _joined() -> None:
     multihost_utils.sync_global_devices("dew process pool joined")
 
 
+POOL_KEYS_ALIKE = "0.11.2.post3"
+"""The jax that keys a computation spanning processes alike on every one of them
+(jax-ml/jax#40940): constraints.txt's post-release of 0.11.2, its version saying so."""
+
+
 def _pool_keys_alike() -> bool:
     """Whether this jax keys a computation that spans processes alike on
-    every one of them (jax-ml/jax#40940).
+    every one of them (jax-ml/jax#40940), by the version that does.
 
     jax 0.11.2 keys an executable by the compiling process's own topology
     fingerprint, which on a GPU describes the device down to its NVLink
     links. In a pool across GPUs linked differently the processes keyed a
     step apart, and on the next run some loaded it while the others compiled
     it and waited for ever for their shares of its sharded autotuning. The
-    jax constraints.txt names hashes every process's fingerprint; the 0.11.2
-    release, which the published dewml installs, does not, so the private
-    module is asked at this boundary.
+    jax constraints.txt names (`POOL_KEYS_ALIKE`) hashes every process's
+    fingerprint; the 0.11.2 release, which the published dewml installs, does
+    not, nor any other until one with the fix is named here.
     """
-    from jax._src import cache_key
-
-    return hasattr(cache_key, "_shared_fingerprints")
+    return jax.__version__ == POOL_KEYS_ALIKE
 
 
 class Preempted(SystemExit):
