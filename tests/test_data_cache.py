@@ -521,8 +521,8 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
 
     fsspec.register_implementation("refusing", Refusing, clobber=True)
     blobs = np.random.default_rng(0)
-    source = Memory([{"id": index, "blob": blobs.bytes(4096)} for index in range(2)])
-    cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=6000, shard_bytes=1, on_full="block",
+    source = Memory([{"id": index, "blob": blobs.bytes(300_000)} for index in range(2)])
+    cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=500_000, shard_bytes=1, on_full="block",
                   retry=1)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
     raised: list[BaseException] = []
@@ -530,15 +530,15 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     def read() -> None:
         try:
             rows[0], rows[1]
-        except OSError as error:
+        except Exception as error:  # the test reads what ended the fill
             raised.append(error)
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     reader.join(20)
     try:
-        assert not reader.is_alive() and len(raised) == 1
-        assert len(attempts) == 2
+        assert not reader.is_alive()
+        assert [type(error) for error in raised] == [OSError] and len(attempts) == 2
     finally:
         rows.close()
 
