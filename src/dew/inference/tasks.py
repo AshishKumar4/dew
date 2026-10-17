@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -440,6 +440,9 @@ class _NativeTextTask:
         return replace(self, variables=variables)
 
     if TYPE_CHECKING:
+        # Each task is a dataclass, which `bind` replaces a field of.
+        __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
+
         # Each task loads its own kind of run; `from_pretrained` reads the Hub copy through it.
         @classmethod
         def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
