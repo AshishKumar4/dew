@@ -14,7 +14,8 @@ interface SnapshotEnv {
 	SNAPSHOT_COMMIT: string;
 	// Each queues a preparation, which the preparer's alarms run and report to `prepared`.
 	PREPARER: DurableObjectNamespace<DurableObject & {
-		prepare(commit: string, reply: Reply): Promise<void>;
+		// False where the preparer holds another job; a preparer of an earlier build throws instead.
+		prepare(commit: string, reply: Reply): Promise<boolean | void>;
 		trial(commit: string, reply: Reply): Promise<void>;
 	}>;
 	POOL?: DurableObjectNamespace<DurableObject & { configure(generation: SnapshotGeneration): Promise<void> }>;
@@ -152,13 +153,42 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			return true;
 		});
 		if (!acquired) return false;
+		let taken: boolean | void;
 		try {
-			await this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted')).prepare(commit,
+			taken = await this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted')).prepare(commit,
 				{ registry: this.ctx.id.toString(), token });
 		} catch (error) {
 			await this.failed(token, String(error));
+			return true;
 		}
+		if (taken === false) await this.waiting(token);
+		else await this.ctx.storage.delete('waiting');
 		return true;
+	}
+
+	/**
+	 * The preparer holds another job, which is no failure of `token`'s commit: the lease ends unfailed, its backoff
+	 * kept as it was, and the preparation waits for the preparer to say it is free (`freed`), or at the latest for as
+	 * long as any job of the preparer's may run.
+	 */
+	private async waiting(token: string): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			const lease = await storage.get<{ token: string }>('rebuild');
+			if (lease?.token !== token) return;
+			await storage.delete('rebuild');
+			await storage.put('waiting', true);
+			await storage.setAlarm(Date.now() + REBUILD_MS);
+		});
+	}
+
+	/** The trusted preparer is free: a preparation it turned away while it held another job runs now. */
+	async freed(): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			if (!(await storage.get<boolean>('waiting'))) return;
+			await storage.delete('waiting');
+			const lease = await storage.get<{ until: number }>('rebuild');
+			if (!lease || lease.until <= Date.now()) await storage.setAlarm(Date.now() + 1000);
+		});
 	}
 
 	/** A preparer's report of how a preparation it was handed ended. */

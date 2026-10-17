@@ -117,9 +117,12 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 }
 
 export class SnapshotPreparer extends DurableObject<Env> {
-	async prepare(commit: string, reply: Reply): Promise<void> {
+	/** Queue `commit`'s preparation: whether this preparer took it, false where it holds another job. */
+	async prepare(commit: string, reply: Reply): Promise<boolean> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
-		return this.queue(commit, false, reply);
+		if (await this.running()) return false;
+		await this.queue(commit, false, reply);
+		return true;
 	}
 
 	/** Any pushed commit, prepared and smoked as a deploy would be; the registry never promotes it. */
@@ -255,6 +258,7 @@ export class SnapshotPreparer extends DurableObject<Env> {
 			console.error('preparation report names no registry here; the job is let go', job.reply.registry, error);
 			await this.ctx.storage.delete('job');
 			await this.ctx.storage.deleteAlarm();
+			await this.free(job);
 			return;
 		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
@@ -269,5 +273,19 @@ export class SnapshotPreparer extends DurableObject<Env> {
 		}
 		await this.ctx.storage.delete('job');
 		await this.ctx.storage.deleteAlarm();
+		await this.free(job);
+	}
+
+	/**
+	 * Tell the registry the trusted preparer is free, should a preparation wait for it (`SnapshotRegistry.freed`).
+	 * A registry of an earlier build has no `freed`; its own alarm asks again, so that error is only logged.
+	 */
+	private async free(job: Job): Promise<void> {
+		if (job.trial) return;
+		try {
+			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromName('global')).freed();
+		} catch (error) {
+			console.error('the registry was not told the preparer is free', error);
+		}
 	}
 }

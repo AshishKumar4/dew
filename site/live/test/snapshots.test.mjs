@@ -24,6 +24,17 @@ test('concurrent renewals acquire one persisted preparation lease', async () => 
 	assert.ok(result.active.snapshot.id);
 	assert.equal(result.started.filter(Boolean).length, 1);
 });
+test('a preparer that holds another job is no failure of the pin, and wakes the registry when it frees', async () => {
+	const result = await scenario('busy');
+	assert.equal(result.waiting.calls, 0);
+	assert.equal(result.waiting.status.failure, null);
+	assert.equal(result.waiting.status.rebuild, null);
+	// It waits at most as long as any of the preparer's jobs may run, and once the preparer is free, a moment.
+	assert.ok(result.waiting.status.alarm > result.waiting.now + 30 * 60_000);
+	assert.ok(result.freed.status.alarm < result.freed.now + 5_000);
+	assert.ok(result.leased);
+	assert.equal(result.calls, 1);
+});
 test('a cold request schedules durable preparation instead of detaching a long RPC', async () => {
 	const result = await scenario('queued');
 	assert.equal(result.reply.generation, null);
