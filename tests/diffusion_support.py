@@ -20,6 +20,13 @@ def walk(solver, process, model, x_T, times, key=0):
     return latents
 
 
+def relative_gap(actual, expected) -> float:
+    """The largest entry of |actual - expected| over the larger of 1 and the
+    largest entry of |expected|, per leading index."""
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected, strict=True))
+
+
 def image_batch(loaded, prompts) -> dict:
     """One image a device, its pixels a ramp over the source's sample shape, with `prompts` in turn,
     so a device count that is odd, one GPU included, still gets a prompt for every image."""

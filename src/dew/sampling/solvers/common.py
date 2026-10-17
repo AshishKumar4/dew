@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
@@ -72,6 +74,37 @@ def _check_endpoint_domain(process: Process, times: jax.Array, *,
             raise ValueError("sigma=0 target has no finite update: " + reason)
 
 
+def _grid_levels(process: Process, times: jax.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The concrete grid's alpha, sigma and lambda = log(alpha) - log(sigma) at each point, on the
+    host, as the walk reads them in float32."""
+    with jax.ensure_compile_time_eval():
+        alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
+        return np.asarray(alpha), np.asarray(sigma), np.asarray(_half_log_snr(alpha, sigma))
+
+
+def _history_gaps(orders: Sequence[int]) -> list[tuple[int, int]]:
+    """The pairs of grid points a multistep update divides by the gap between: at step i of order k,
+    each two of the k points it interpolates, i - k + 1 through i."""
+    return [(i - m, i - n) for i, k in enumerate(orders) for m in range(k) for n in range(m + 1, k)]
+
+
+def _check_gaps(levels: np.ndarray, gaps: Iterable[tuple[int, int]], reason: str) -> None:
+    """Reject a grid on which the walk divides by a gap of no length, before the walk runs.
+
+    `levels` is the variable the updates take differences in, one per grid
+    point at the walk's precision (`_grid_levels`), so values distinct only
+    where the grid was built are caught too. `gaps` are the pairs of points
+    whose difference the updates the walk takes divide by, as each step's
+    order selects them. An interval no update divides by is not one of them:
+    a first-order step over an empty interval stays where it is, as the
+    source's does, while a higher order there is undefined, as the source's
+    is.
+    """
+    if any(levels[first] == levels[second] for first, second in gaps):
+        raise ValueError("two points of the grid have one noise level, an interval of no length that "
+                         + reason + "; take fewer steps, another spacing or a lower order")
+
+
 def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
     schedule = process.sampler_schedule
     if not isinstance(schedule, GeneralizedNoiseScheduler):
@@ -134,13 +167,19 @@ def _lambda_step(alpha_s, sigma_s, alpha_t, sigma_t):
     return terminal, jnp.where(endpoint, 1.0, h)
 
 
-def _tapered_order(order: int, history: Multistep, lower_order_final: bool,
-                   euler_at_final: bool):
+def _tapered_orders(order: int, steps: int, lower_order_final: bool, euler_at_final: bool) -> list[int]:
+    """Every step's `_tapered_order` over a walk of `steps`, on the host."""
+    with jax.ensure_compile_time_eval():
+        return [int(_tapered_order(order, taken, steps, lower_order_final, euler_at_final))
+                for taken in range(steps)]
+
+
+def _tapered_order(order: int, taken, steps, lower_order_final: bool, euler_at_final: bool):
     """The order a Diffusers multistep DPM-Solver takes at this step: it grows
     with the history up to `order`; the last step is first order under
     `euler_at_final`, and in a walk under 15 steps `lower_order_final` makes
-    the last step first order and caps the one before it at second."""
-    taken, steps = history.taken, history.steps
+    the last step first order and caps the one before it at second. `taken`
+    counts the steps before this one, of the walk's `steps`."""
     current = jnp.minimum(order, taken + 1)
     short = jnp.logical_and(lower_order_final, steps < 15)
     final = jnp.logical_and(taken == steps - 1, jnp.logical_or(euler_at_final, short))

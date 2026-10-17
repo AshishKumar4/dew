@@ -13,14 +13,13 @@ from dew.records import JSON
 class Vocabulary(Protocol):
     """The tokenizer surface `stop_strings` reads once, on the host.
 
-    These are a Transformers tokenizer's own public vocabulary methods plus
-    the piece-name lookup its slow and fast classes both expose. Nothing here
-    runs generation code; the tables are built from token strings.
+    These are a Transformers tokenizer's public vocabulary methods. Nothing
+    here runs generation code; the tables are built from token strings.
     """
 
     def get_vocab(self) -> dict[str, int]: ...
     def convert_tokens_to_string(self, tokens: list[str]) -> str: ...
-    def _convert_id_to_token(self, index: int) -> str: ...
+    def convert_ids_to_tokens(self, index: int) -> str: ...
     def __call__(self, text: str, *, add_special_tokens: bool) -> Mapping[str, list[int]]: ...
 
 
@@ -139,7 +138,7 @@ def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
         from transformers.convert_slow_tokenizer import bytes_to_unicode
 
         alphabet = {char: byte for byte, char in bytes_to_unicode().items()}
-    base = [tokenizer._convert_id_to_token(token)
+    base = [tokenizer.convert_ids_to_tokens(token)
             for token in tokenizer(prefix, add_special_tokens=False)["input_ids"]]
     pieces: list[str | bytes] = []
     ids: list[int] = []
@@ -174,15 +173,15 @@ def vocabulary_of(tokenizer: Vocabulary | Referencing | Tokenizing, reader: str)
     """The tokenizer as it stands, or beneath a processor's `reference` or
     `tokenizer` field."""
     source = tokenizer
-    for _ in range(3):
-        if isinstance(source, Vocabulary):
-            break
+    seen: set[int] = set()
+    while not isinstance(source, Vocabulary):
+        if id(source) in seen:
+            raise TypeError(f"{reader} found a cycle in tokenizer wrappers")
+        seen.add(id(source))
         if isinstance(source, Referencing):
             source = source.reference
         elif isinstance(source, Tokenizing):
             source = source.tokenizer
         else:
-            break
-    if not isinstance(source, Vocabulary):
-        raise TypeError(f"{reader} needs a tokenizer that can list its vocabulary")
+            raise TypeError(f"{reader} needs a tokenizer that can list its vocabulary")
     return source
