@@ -75,11 +75,12 @@ def reads_backend(code: types.CodeType) -> bool:
     return decided[code]
 
 
-def read(event: str, args: tuple, caller: str, root: str) -> str | None:
-    """The checkout's file or directory, relative to `root`, that a read event of code in file `caller`
-    names, or None: a file opened only to read (`open`'s mode, or its flags for `os.open`), or a
-    directory listed but by a listing tool (`listing_tool`). An open relative to a directory
-    descriptor is `opening`'s to place."""
+def read(event: str, args: tuple, root: str) -> str | None:
+    """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
+    opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
+    listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
+    calls this. An open relative to a directory descriptor is `opening`'s to place. An open has no
+    caller to ask about: the interpreter audits the main script's from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -89,7 +90,7 @@ def read(event: str, args: tuple, caller: str, root: str) -> str | None:
             flags & os.O_ACCMODE != os.O_RDONLY)
         if written or (mode is None and getattr(placing, "relative", False)):
             return None
-    elif listing_tool(caller):
+    elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
     return placed(os.path.abspath(os.fsdecode(path if path is not None else ".")), root)
 
@@ -244,7 +245,7 @@ def follow() -> None:
 
     def audited(event, args):
         if event in READS:
-            name = read(event, args, sys._getframe(1).f_code.co_filename, root)
+            name = read(event, args, root)
             if name is not None:
                 record["files"].add(name)
             return
