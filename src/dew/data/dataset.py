@@ -611,7 +611,8 @@ class Loader:
         return self.ramp.steps_for(self.records, self.batch)
 
     def epoch_steps(self, epochs: int = 1) -> int:
-        """Return the number of steps that `epochs` passes over the records take.
+        """Return the number of steps that `epochs` passes over the records take, refusing passes
+        too short to fill a batch.
 
         A batch ramp grows the batch over the run's first records once, so its
         smaller early steps count once across all the passes, not once a pass.
@@ -624,7 +625,12 @@ class Loader:
                 "without one, so give the run length in steps"
             )
         records = epochs * self.records
-        return records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
+        steps = records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
+        if steps == 0:
+            raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
+                             "are no steps at all: read more data, lower the batch, or count the run in "
+                             "steps")
+        return steps
 
 
 CAPTION = "caption"

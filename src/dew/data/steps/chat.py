@@ -13,7 +13,7 @@ import numpy as np
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _ids, _mask
+from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _mask
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
     INFO_KEY,
@@ -27,6 +27,7 @@ from dew.data.prompts import (
     _utf8,
 )
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
+from dew.nn.inputs import token_ids
 from dew.records import integer, record
 
 
@@ -180,7 +181,7 @@ class PreferencePair(grain.MapTransform):
         ids = np.full((2, self.seq_len), self.pad_id, np.int32)
         mask = np.zeros((2, self.seq_len), np.int32)
         for row, name in enumerate(("chosen", "rejected")):
-            tokens = _ids(element.get(name), name, "preference")
+            tokens = token_ids(element.get(name), where=f"preference: {name}")
             if len(tokens) > self.seq_len:
                 raise ValueError(f"preference {name} has {len(tokens)} tokens for seq_len={self.seq_len}")
             completion = _mask(

@@ -1,8 +1,8 @@
 """Preference pairs for DPO: chosen and rejected rows with their masks.
 
 A `PreferencePair` step reads records of
-`chosen` and `rejected` token-id lists, with `chosen_mask` and
-`rejected_mask` marking the completion tokens. Each batch stacks them in
+`chosen` and `rejected` token ids, lists or one-dimensional arrays, with
+`chosen_mask` and `rejected_mask` marking the completion tokens. Each batch stacks them in
 TRL's layout: chosen rows over rejected rows, padded to the longest row,
 with `completion_mask` alongside the ids. A mask must run as long as its
 ids; anything else fails naming the row.
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from dew.nn.inputs import token_id
+import numpy as np
 
 if TYPE_CHECKING:
     from dew.data.steps.chat import PreferencePair
@@ -26,21 +26,15 @@ MASK_KEY = "completion_mask"
 FIELDS = ("chosen", "rejected", "chosen_mask", "rejected_mask")
 
 
-def _ids(values: object, name: str, where: str) -> list[int]:
-    """One id list: integers only, non-empty."""
-    if not isinstance(values, list) or not values:
-        raise ValueError(f"{where}: {name} is a non-empty id list, got {values!r}")
-    return [token_id(token, where=f"{where}: {name}") for token in values]
-
-
 def _mask(values: object, name: str, length: int, where: str) -> list[int]:
-    """One 0/1 mask as long as its ids."""
-    if not isinstance(values, list) or len(values) != length:
+    """One 0/1 mask as long as its ids, a list, a tuple or a one-dimensional array as its ids are."""
+    marks = values.tolist() if isinstance(values, np.ndarray) and values.ndim == 1 else values
+    if not isinstance(marks, (list, tuple)) or len(marks) != length:
         raise ValueError(
             f"{where}: {name} runs as long as its ids ({length}), "
             f"got {values!r}")
     mask: list[int] = []
-    for mark in values:
+    for mark in marks:
         if mark not in (0, 1):
             raise ValueError(f"{where}: {name} marks completion tokens 0/1, got {mark!r}")
         mask.append(int(mark))

@@ -134,10 +134,6 @@ def _outputs(
         return (value,)
     if value is None:
         return (Rejected("missing"),)
-    if isinstance(stage, MapWithIndex):
-        if position is None:
-            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
-        return (stage.step(position, record(value, "indexed map input")),)
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
@@ -156,6 +152,10 @@ def _outputs(
     elif isinstance(stage, Map):
         step = stage.step
         output = step.map(value) if isinstance(step, pygrain.MapTransform) else step(record(value, "map"))
+    elif isinstance(stage, MapWithIndex):
+        if position is None:
+            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
+        output = stage.step(position, record(value, "indexed map input"))
     else:
         raise ValueError(f"{type(stage).__name__} is not a record stage")
     if isinstance(output, Rejected) and not stage.rejects:

@@ -1252,3 +1252,78 @@ def test_a_validation_pass_holds_every_record_whatever_size_training_rebatches_t
         valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["x"]), bool)))
         scored += [int(value) for value, kept in zip(np.asarray(batch["x"]), valid, strict=True) if kept]
     assert sorted(scored) == list(range(100, 116))
+
+
+def test_a_step_drops_records_only_when_it_says_so():
+    """A step keeps every record unless it declares `rejects`, whatever its annotations read: an
+    unannotated indexed step and an annotated one compile to one global order with an epoch
+    count, a step that declares `rejects` drops what it rejects, and one that rejects without
+    declaring it is refused, where an unannotated step was once taken to drop records."""
+
+    def unannotated(index, row):
+        return {**row, "at": np.int32(index)}
+
+    def annotated(index: int, row: dict) -> dict:
+        return {**row, "at": np.int32(index)}
+
+    @dataclasses.dataclass(frozen=True)
+    class EvenOnly:
+        rejects = True
+
+        def __call__(self, index: int, row: dict) -> dict | Rejected:
+            return row if index % 2 == 0 else Rejected("odd")
+
+    def undeclared(index, row):
+        return row if index % 2 == 0 else Rejected("odd")
+
+    rows = Pipeline(source(8))
+    for step in (unannotated, annotated):
+        data = compile(rows.map_with_index(step).batch(4), read="indexed", loading=READ)
+        assert data.records == 8
+    kept = compile(rows.map_with_index(EvenOnly()).repeat(1).batch(2), read="indexed", loading=READ)
+    stream = kept.train(DataPartition())
+    try:
+        assert sorted(int(value) for batch in stream for value in batch["id"]) == [0, 2, 4, 6]
+    finally:
+        stream.close()
+    refused = compile(rows.map_with_index(undeclared).repeat(1).batch(2), read="indexed", loading=READ)
+    stream = refused.train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            list(stream)
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
+    """A mixture whose members a run picks may come down to one, which reads as that member
+    alone, by records or by tokens, in every read."""
+    from dew.data.steps.text import CountTargets
+
+    rows = Memory([{"text": np.full(3, index, np.int32), "id": np.int32(index)} for index in range(6)])
+    member = Pipeline(rows, name="only").filter_map(CountTargets())
+    data = compile(mix([member.repeat(1)], by=by).batch(2), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert sorted(int(value) for batch in stream for value in batch["id"]) == list(range(6))
+    finally:
+        stream.close()
+
+
+def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats():
+    """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
+    and a run counted in steps reads it; a run counted in epochs is refused, since one pass
+    over the two records fills no batch."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(2)]))
+    for read in ("memory", "indexed"):
+        data = compile(rows.repeat().batch(8), read=read, loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            assert sorted(int(value) for value in next(stream)["id"]) == [0, 0, 0, 0, 1, 1, 1, 1]
+        finally:
+            stream.close()
+        with pytest.raises(ValueError):
+            data.epoch_steps(1)
+
