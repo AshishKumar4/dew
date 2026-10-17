@@ -253,7 +253,6 @@ QUANTIZED_CONVOLUTION = """
 import sys
 
 import jax
-import lane_environment
 import jax.numpy as jnp
 import numpy as np
 import qwix
@@ -948,8 +947,8 @@ def under_xla_defaults(flow) -> None:
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if flag not in lane_environment.REPEATABLE_GPU_FLAGS]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200, cwd=here,
-                         env={**os.environ, "XLA_FLAGS": " ".join(flags),
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
+                         cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                               "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
