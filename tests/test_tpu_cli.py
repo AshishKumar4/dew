@@ -423,12 +423,14 @@ def test_zone_cache_readers_never_observe_partial_writes(tmp_path, monkeypatch):
     assert json.loads((directory / "zones.json").read_text()) == expected
 
 
+@pytest.mark.parametrize("read_only", [False, True])
 @pytest.mark.parametrize("mounted", [True, False])
-def test_the_disk_script_opens_and_records_the_mount_only_once_the_disk_is_mounted(tmp_path, mounted):
+def test_the_disk_script_opens_and_records_the_mount_once_the_disk_is_mounted(tmp_path, mounted, read_only):
     """The attached disk's script (a VM's boot, and attach-disk on every worker) mounts the disk, then
-    opens the mount to every user and names it in fstab. A disk that does not mount fails the script
-    before either, so nothing writes to the boot disk's directory as though it were the disk. The
-    system's tools are stood in for on PATH, as no test runs as a TPU VM's root."""
+    opens the mount to every user and names it in fstab; a disk attached read-only, which several
+    workers share, it mounts read-only and leaves as it is. A disk that does not mount fails the
+    script before either, so nothing writes to the boot disk's directory as though it were the disk.
+    The system's tools are stood in for on PATH, as no test runs as a TPU VM's root."""
     import shutil
     import subprocess
 
@@ -443,12 +445,15 @@ def test_the_disk_script_opens_and_records_the_mount_only_once_the_disk_is_mount
         (tools / name).chmod(0o755)
     shell = shutil.which("bash")
     assert shell is not None
-    done = subprocess.run([shell, "-c", tpu_setup.disk_startup_script()], env={"PATH": str(tools)},
+    done = subprocess.run([shell, "-c", tpu_setup.disk_startup_script(read_only)], env={"PATH": str(tools)},
                           capture_output=True, text=True)
-    ran = [line.split()[0] for line in calls.read_text().splitlines()]
+    ran = calls.read_text().splitlines()
+    mount = "mount -o ro /dev/sdb /mnt/persist" if read_only else "mount /dev/sdb /mnt/persist"
     if mounted:
         assert done.returncode == 0, done.stderr
-        assert ran == ["mkdir", "mountpoint", "mount", "chmod", "grep"]
+        assert [line.split()[0] for line in ran] == ["mkdir", "mountpoint", "mount",
+                                                     *(() if read_only else ("chmod",)), "grep"]
+        assert mount in ran
     else:
         assert done.returncode == 32
-        assert ran == ["mkdir", "mountpoint", "mount"]
+        assert [line.split()[0] for line in ran] == ["mkdir", "mountpoint", "mount"]

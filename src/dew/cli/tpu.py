@@ -539,7 +539,7 @@ class AttachDisk(Named):
         if attached.returncode:
             return attached.returncode
         count, _ = _slice(tpu, cfg)
-        mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script())}"
+        mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script(self.read_only))}"
         return exit_code(tpu.fanout([(index, mount) for index in range(count)]))
 
 

@@ -288,6 +288,9 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
     if validation is None:
+        if metrics and dataset.val is None:
+            # Else the metrics would never be scored, and the run would not say so.
+            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
         # `val` is read only when a pass is scheduled; a dataset need not hold one.
         validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
     elif not validation:
@@ -966,6 +969,9 @@ class Trainer(Generic[Loss, Effects]):
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
+        if self._ramped and not shared:
+            raise ValueError("a loss of composite statistics replays its accumulation window's batches, "
+                             "whose shape a batch ramp changes at each stage; ramp the batch or accumulate")
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -1222,10 +1228,6 @@ class Trainer(Generic[Loss, Effects]):
         shapes = None if self.step is not None else self._loss_shape(state, batch)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
-            if self._ramped and window > 1 and not isinstance(shapes[0], (Ratio, jax.ShapeDtypeStruct)):
-                raise ValueError("a loss of composite statistics replays its accumulation window's "
-                                 "batches, whose shape a batch ramp changes at each stage; ramp the batch "
-                                 "or accumulate")
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
         copies = self._narrow_copies(state, batch)
         if copies:
