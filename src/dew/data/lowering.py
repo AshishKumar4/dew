@@ -762,6 +762,10 @@ class _Build:
             if empty:
                 rows = whole[:1]
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
+            if self.training and self.lowering.endless and not len(batched):
+                # A repeat after the batch would replay a pass that holds no batch, forever.
+                raise ValueError(f"a pass of {_name(pipeline)} holds {len(rows)} rows, which fill no batch "
+                                 f"of {size}; repeat before the batch to fill one from its repeats")
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
