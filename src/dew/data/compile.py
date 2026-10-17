@@ -80,6 +80,7 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
+    Rebatch,
     RecordStep,
     Repeat,
     Shuffle,
@@ -465,7 +466,9 @@ def _staged(
     batching = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
     if batching is None:
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = batching.size
+    # The rows each batch holds as the run reads it: the last rebatch's, else the batch's own.
+    batch = next((stage.size for stage in reversed(train.stages) if isinstance(stage, Rebatch)),
+                 batching.size)
     original = train
     if read == "memory":
         train = _materialize(train, counts)
