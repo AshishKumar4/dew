@@ -116,6 +116,32 @@ def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
     assert pushes == [({"params": {}}, 2)]
 
 
+@pytest.mark.parametrize("status", [429, 503])
+def test_an_engine_that_cannot_serve_fails_the_draw_with_an_infrastructure_error(status):
+    """A 429 or 5xx, once the client's own retries are spent, is the engine's boundary failing,
+    which a session source retries. An answer that breaks the draw's contract, a `stop` that
+    ends on no EOS, is a broken engine and fails the draw with ValueError instead."""
+    from dew.inference import InfrastructureError
+
+    def refusing(request):
+        return httpx2.Response(status, json={"error": {"message": "the engine is overloaded"}})
+
+    client = openai.OpenAI(base_url="http://fixture/v1", api_key="fixture", max_retries=0,
+                           http_client=httpx2.Client(transport=httpx2.MockTransport(refusing)))
+    broken, _ = engine("vllm", lambda _: choice("vllm", [3, 5], [-.5, -1.], "stop"))
+    servers = [OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed)
+               for completion in (OpenAICompletion("tiny", client, provider="vllm"), broken)]
+    try:
+        with pytest.raises(InfrastructureError) as caught:
+            servers[0].submit([1, 2], 4, key=0).result(timeout=30)
+        with pytest.raises(ValueError):
+            servers[1].submit([1, 2], 4, key=0).result(timeout=30)
+    finally:
+        for server in servers:
+            server.close()
+    assert isinstance(caught.value.__cause__, openai.APIStatusError)
+
+
 def test_sglang_ids_are_read_without_likelihoods():
     completion, _ = engine("sglang", lambda _: {"index": 0, "text": "", "finish_reason": "length",
                                                 "logprobs": None, "token_ids": [3, 5]})

@@ -598,6 +598,14 @@ class InputQuantization:
 
         def quantize_inputs(next_fun, args, kwargs, context):
             module = context.module
+            if context.method_name == "nonlinear_input":
+                # A layer asks whether its submodule is linear in its input
+                # (`MultiHeadLatentAttention.nonlinear_input`): one that
+                # rounds its input or multiplies in FP8 is not.
+                name = args[0] if args else kwargs["name"]
+                child = getattr(module, name)
+                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
+                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
             calls = context.method_name == "__call__"
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])

@@ -643,17 +643,19 @@ class MultiHeadLatentAttention(nn.Module):
     def _attends_sparsely(self, selection, total: int) -> bool:
         """Whether a whole-sequence pass runs `sparse_latent_attention`: when the
         selection is narrower than the keys. An open `qk` collection keeps the
-        masked kernel for its dense maxima, and so does a drawn `kv_b_proj` input
-        (`stochastic_input`), since the absorbed path would draw one mask for every
-        token.
+        masked kernel for its dense maxima, and so does a `kv_b_proj` that is not
+        linear in its input (`nonlinear_input`), since the absorbed path applies it
+        to the identity, not to the latents.
         """
         return (selection.shape[-1] < total and not self._qk_open()
-                and not self.stochastic_input("kv_b_proj"))
+                and not self.nonlinear_input("kv_b_proj"))
 
-    def stochastic_input(self, name: str) -> bool:
-        """Whether this call draws randomness on the input of the submodule
-        `name`. The layer draws none; a method interceptor that does, as
-        `dew.lora`'s dropout does on its targets, answers for itself."""
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` other than as a
+        linear map of its input. The layer's own Dense is linear; a method
+        interceptor that changes that answers for itself: `dew.lora`'s dropout
+        draws on its targets' inputs, and a checkpoint's input quantization
+        (`dew.training.quantization`) rounds them."""
         del name
         return False
 
@@ -677,10 +679,10 @@ class MultiHeadLatentAttention(nn.Module):
         the heads' context, `[B, S, H, v_head_dim]`.
 
         `kv_b_proj` applied to the identity is its matrix as the layer
-        computes it, dtype policy and any deterministic interceptor's branch
-        (a LoRA adapter without dropout in this call, a quantization rule)
-        included, so the absorbed weights are the ones the expanded path
-        multiplies by. The indexer's objective, when open, still reads the
+        computes it, dtype policy and any interceptor linear in its input
+        (a LoRA adapter without dropout in this call, a rule that quantizes
+        the weights alone) included, so the absorbed weights are the ones the
+        expanded path multiplies by (`_attends_sparsely`). The indexer's objective, when open, still reads the
         expanded keys over the selection mask.
         """
         heads, nope = self.num_heads, self.qk_nope_head_dim
