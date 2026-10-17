@@ -44,7 +44,7 @@ def test_joint_fla():
                                                                        "einops", "flash-linear-attention")))
     done = subprocess.run([str(python), "tools/joint_checkpoint_reference.py", "--fla"], cwd=ROOT,
                           env={**os.environ, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}",
-                               "TRITON_F32_DEFAULT": "ieee"},
+                               },
                           capture_output=True, text=True, timeout=2400)
     lines.append(f"recorder exit {done.returncode} at {time.time() - started:.0f} s\n"
                  f"{(done.stdout + done.stderr)[-3000:]}")
