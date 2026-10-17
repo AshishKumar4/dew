@@ -35,6 +35,11 @@ test('a preparer that holds another job is no failure of the pin, and wakes the 
 	assert.ok(result.leased);
 	assert.equal(result.calls, 1);
 });
+test('a preparer that frees before the registry hears its no is not waited for', async () => {
+	const result = await scenario('freed-early');
+	assert.equal(result.status.failure, null);
+	assert.ok(result.status.alarm < result.now + 5_000);
+});
 test('a cold request schedules durable preparation instead of detaching a long RPC', async () => {
 	const result = await scenario('queued');
 	assert.equal(result.reply.generation, null);

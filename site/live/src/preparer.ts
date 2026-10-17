@@ -117,10 +117,13 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 }
 
 export class SnapshotPreparer extends DurableObject<Env> {
-	/** Queue `commit`'s preparation: whether this preparer took it, false where it holds another job. */
-	async prepare(commit: string, reply: Reply): Promise<boolean> {
+	/**
+	 * Queue `commit`'s preparation. Where this preparer holds another job it throws, as it always has, unless the
+	 * caller asks for an `answer`: then it returns whether it took the job, false where it holds another.
+	 */
+	async prepare(commit: string, reply: Reply, { answer = false } = {}): Promise<boolean> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
-		if (await this.running()) return false;
+		if (answer && await this.running()) return false;
 		await this.queue(commit, false, reply);
 		return true;
 	}
