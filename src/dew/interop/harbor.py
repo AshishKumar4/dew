@@ -434,7 +434,7 @@ class HarborSource:
     you are done. A trainer that exits without either, for example on an
     uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
     threads, and an atexit hook cancels the queued trials and interrupts the
-    running ones, then kills any still running after `grace` seconds.
+    running ones, then kills their process groups after `grace` seconds.
     """
 
     def __init__(
@@ -516,8 +516,9 @@ class HarborSource:
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
         """Interrupt the given trials. Harbor tears down their sandboxes, and each resolves `CANCELLED`.
 
-        A trial still running `grace` seconds after the interrupt gets
-        SIGTERM, and SIGKILL after another `grace` seconds.
+        A trial whose output is still open `grace` seconds after the
+        interrupt gets SIGTERM, and SIGKILL after another `grace` seconds,
+        each sent to its whole process group.
         """
         with self._lock:
             for future in futures:
@@ -528,15 +529,22 @@ class HarborSource:
                 self._interrupt(record)
 
     def _interrupt(self, record: _Trial) -> None:
-        """Send a live trial's Harbor SIGINT, once, and arm its escalation. The caller holds the lock."""
-        if record.timer is None and record.process is not None and record.process.poll() is None:
+        """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock.
+
+        A trial is live until its output closes (`record.process` is None
+        after that), not until Harbor exits: a child left in its group can
+        hold the output open after Harbor is gone. Neither this nor the
+        escalation reaps Harbor, so its group id stays its own until then.
+        """
+        if record.timer is None and record.process is not None:
             _signal(record.process, signal.SIGINT)
             record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
-        """Harbor ignored the last signal for a whole grace period: send the next, SIGTERM then SIGKILL."""
+        """The trial's output stayed open for a whole grace period: signal the group again, SIGTERM then
+        SIGKILL."""
         with self._lock:
-            if record.process is None or record.process.poll() is not None:
+            if record.process is None:
                 return
             _logger.warning("Harbor trial %d outlived its grace; sending %s", record.process.pid, sent.name)
             _signal(record.process, sent)
@@ -695,13 +703,14 @@ def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
 
 
 def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
-    """At interpreter exit: cancel every trial, interrupt the live ones,
-    and kill any still alive after `grace`."""
+    """At interpreter exit: cancel every trial, interrupt the live ones, and
+    kill their process groups after `grace`, as `ProcessRunner` kills a
+    program's group after it exits, so a child Harbor left behind dies too."""
     with lock:
         live = []
         for record in records.values():
             record.cancelled = True
-            if record.process is not None and record.process.poll() is None:
+            if record.process is not None:
                 live.append(record.process)
     for process in live:
         _signal(process, signal.SIGINT)
@@ -709,8 +718,7 @@ def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grac
     for process in live:
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(max(0.0, deadline - time.monotonic()))
-        if process.poll() is None:
-            _signal(process, signal.SIGKILL)
+        _signal(process, signal.SIGKILL)
 
 
 def _harness_exit(trial: Path) -> str | None:
