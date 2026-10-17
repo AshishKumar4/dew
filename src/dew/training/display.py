@@ -402,7 +402,8 @@ class TrainingDisplay:
     def evaluation_rows(self) -> list[tuple[str, Row]]:
         """The latest metrics of each split, with their evaluation history."""
         rows = []
-        for split, history in self.evaluations.items():
+        # A snapshot: training adds a split's first evaluation while the redraw thread walks them.
+        for split, history in list(self.evaluations.items()):
             latest = history[-1]
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")

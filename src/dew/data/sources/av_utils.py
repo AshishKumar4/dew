@@ -1,4 +1,4 @@
-"""Frames and sound of a media file over a time window, which `video.pick_clip` draws once for both.
+"""Frames and sound of a media file over a time window, which `video.PickClip` draws once for both.
 
 moviepy is the reader because it is what the `av` extra installs and it
 reads from wheels alone; it drives ffmpeg, so nothing here holds a decoder
