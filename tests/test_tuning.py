@@ -15,11 +15,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 import tokamax
-from process_support import REPO_ROOT
+from process_support import REPO_ROOT, run_pool
 from reference_error import equations
 
 from dew.nn.attention import rms_normalized, stream_rms_normalized
-from dew.nn.kernels import norm_swiglu, tuning
+from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.moe import gated_product
 
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
@@ -219,6 +219,61 @@ def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_it
         step().lower(*operands(15))
     step().lower(*operands(15))
     assert raised == []
+
+
+DISTINCT = """
+import json
+import jax, tokamax
+from test_tuning import loss, operands, step
+from dew.nn.kernels import generation, tuning
+
+
+def layers(x, branch, scale, gate, up):
+    return loss(x, branch, scale, gate, up) + loss(2 * x, branch, scale, gate, up)
+
+
+def described(launches):
+    return sorted([type(ba.op).__name__, repr(sorted(ba.autotuning_cache_key.items()))]
+                  for ba in tokamax.autotuning.bound_args_from_json(launches))
+
+
+with generation.assumed("sm80"):
+    _, two = tuning.tune(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
+    _, one = tuning.tune(lambda: jax.make_jaxpr(step())(*operands(15)))
+print(json.dumps([described(two), described(one)]))
+"""
+
+
+def test_a_step_settles_each_distinct_launch_once(tmp_path):
+    """Two layers of one shape launch the same four kernels at the same keys.
+    Tuned as on a GPU, the two-layer step's launches are the one layer's,
+    each once: the pool decides each distinct launch once, and a measuring
+    pass measures it once, not once a layer."""
+    two, one = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
+    assert len(one) == 4 and two == one
+
+
+@pytest.mark.parametrize("holder", [0, 1])
+def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick(tmp_path, holder):
+    """A launch without a pick of its own takes the nearest stored pick, or its
+    heuristic, as process 0 resolves it, whatever another process stores. One
+    process of two stores an 8-token norm's pick, 4 rows a program and 2
+    warps, the other none; tuned for a 15-token step, both launch its norm as
+    the pick's 4 programs of 2 warps where process 0 stores it, and as the
+    heuristic's one program of 4 warps where process 1 does."""
+    # The 8-token launch as a step traced for the GPU keys it, which is how a measurement stores it.
+    with generation.assumed("sm80"), tuning.seen() as found:
+        jax.make_jaxpr(step())(*operands(8))
+    [norm] = [ba for op, ba in found if type(op) is norm_swiglu.RmsForward]
+    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                                   metadata={})
+    picks = tmp_path / "picks.json"
+    picks.write_text(tokamax.AutotuningResult(jax.devices()[0].device_kind, (
+        (norm, tuning.AutotuningData({norm_swiglu.RowsConfig(4, 2): timing})),)).dumps())
+    reports = run_pool("settle", tmp_path / "pool", 2, script=Path(__file__).with_name("tuning_worker.py"),
+                       cache=tmp_path / "cache", picks=picks, holder=holder)
+    expected = [[4], 2] if holder == 0 else [[1], 4]
+    assert [report["rms_norm_forward"] for report in reports] == [expected, expected]
 
 
 TRAINED = """
