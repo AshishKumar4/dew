@@ -539,9 +539,6 @@ class MetricScores[Statistics, Additions](Mapping):
         ):
             return self.scores['train/loss']
         if isinstance(metric, str):
-            if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
-                   for declared in self.metrics):
-                raise KeyError("index declared evaluation scores by metric object")
             return self.scores[metric]
         named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
         if not isinstance(named, TrainingScalar) and not any(declared is named for declared in self.metrics):

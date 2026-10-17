@@ -1051,9 +1051,6 @@ def _providers() -> tuple[type, type]:
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    dot_general = _qwix("qwix._src.core.dot_general")
-    einsum = _qwix("qwix._src.core.einsum")
     quantized = _qwix("qwix._src.providers.ptq").WithAux
     group_scaled = _group_scaled_convolution()
 
@@ -1113,9 +1110,9 @@ def _providers() -> tuple[type, type]:
 
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
-                _einsum_fn=_scaled_in_float32(einsum.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+                rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
+                _einsum_fn=_scaled_in_float32(qwix.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
             # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8
