@@ -301,8 +301,9 @@ class DewLM(TemplateLM):
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
 
-        The stop strings also end the search itself, as `HFLM`'s stopping
-        criteria do, so a beam search ranks a hypothesis as it stopped.
+        Under beam search the stop strings also end the search itself, as
+        `HFLM`'s stopping criteria do, so it ranks a hypothesis as it stopped;
+        that needs a tokenizer that lists its vocabulary.
         A request's `max_length` is the total length `HFLM` hands `generate`,
         context included, in place of the budget. Its temperature is 0 where
         it names none, which decodes greedily unless the request asks to
@@ -326,9 +327,11 @@ class DewLM(TemplateLM):
             controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
             budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
             stops = handle_stop_sequences(controls.pop("until", None), eos=eos)
-            # The stops end the search itself, as HFLM's stopping criteria do, so a beam that reached
-            # one is ranked as it stopped; the EOS's own text is the EOS id's, which ends it already.
-            controls["stop_strings"] = [stop for stop in stops if stop and stop != eos]
+            if int(controls.get("num_beams") or 1) > 1:
+                # A beam search ranks a hypothesis as it stopped, as HFLM's stopping criteria end it,
+                # so its stops end the search itself; a single draw's text is the same cut afterwards.
+                # The EOS's own text is the EOS id's, which ends the search already.
+                controls["stop_strings"] = [stop for stop in stops if stop and stop != eos]
             seed = int(controls.pop("seed", 0))
             total = controls.pop("max_length", None)
             # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
