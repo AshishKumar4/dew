@@ -1849,8 +1849,9 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        if (best is not None or restore_best) and self.checkpoints is None:
-            raise ValueError("best= and restore_best select among checkpoints; give the Trainer Checkpoints")
+        if restore_best and self.checkpoints is None:
+            # It would return the final weights as the best: the best is a checkpoint, restored.
+            raise ValueError("restore_best restores the best checkpoint; give the Trainer Checkpoints")
         splits = tuple(suites) or ('val',)
         # Each instance once, as `_FitPlan.scored`: two suites may each hold their own of one metric.
         metrics = tuple({id(metric): metric for metric in (*metrics, *(
@@ -1877,9 +1878,8 @@ class Trainer(Generic[Loss, Effects]):
                 return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
 
-        shown = _reported(None, metrics)
         selection = tuple(
-            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, shown, splits)
+            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, splits)
             for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
         )
         labels = [(choice.split, choice.metric) for choice in selection
@@ -1892,7 +1892,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise TypeError(
                     "Plateau selects a declared metric object, not a Best policy or score function"
                 )
-            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, shown, splits)
+            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, splits)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
