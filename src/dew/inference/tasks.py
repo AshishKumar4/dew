@@ -33,9 +33,10 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_c
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
 from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
-from dew.records import integer, json_value, record as named_fields, text as named
+from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
@@ -286,11 +287,94 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     objective = objectives[named(record['objective'], 'objective')]
-    stray = set(record) - {'objective', 'model', *objective.inference_fields}
+    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+    stray = set(record) - {'objective', 'model', *declared}
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")
     return SavedRun(record, step)
+
+
+def settings_fields(settings: type) -> frozenset[str]:
+    """The fields a saved run records beside its objective and model: those of its task's `settings`."""
+    return frozenset(field.name for field in dataclasses.fields(settings))
+
+
+def saved_settings[SettingsT](record: Mapping[str, object], settings: type[SettingsT]) -> SettingsT:
+    """The task `settings` a saved run's record holds, rebuilt through the record machinery
+    (`dew.registry.from_record`), each one it leaves out at its default."""
+    from dew.registry import from_record
+
+    return from_record(settings, {name: record[name] for name in settings_fields(settings) if name in record},
+                       dtypes=False)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TextSettings:
+    """What a causal decoder's run records beside its model, and its task is built with
+    (`TextGeneration.from_settings`).
+
+    `seq_len` is the decoder's training row length, `max_new_tokens` its
+    previews' budget (0 for none) and `sampling` their policy. `tokenizer`
+    names the run tokenizer (`recorded_tokenizer`) and `processor` a
+    checkpoint's own processor source (`recorded_processor`); either may be
+    None.
+    """
+
+    seq_len: int
+    max_new_tokens: int
+    sampling: Sampling
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaskedSettings:
+    """What a masked-diffusion run records beside its model, and its task is built with
+    (`MaskedGeneration.from_settings`): the row length, the response budget, the tokenizer or
+    source processor as `TextSettings` holds them, the masking process, the unmasking solver
+    and its step count."""
+
+    seq_len: int
+    max_new_tokens: int
+    process: DiscreteProcess
+    solver: Solver
+    sampling_steps: int
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+        integer(self.sampling_steps, "sampling_steps")
+        if not isinstance(self.solver, Unmask):
+            raise ValueError("a masked run's task unmasks with an Unmask solver")
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlockSettings:
+    """What a block-diffusion run records beside its model, and its task is built with
+    (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
+    source processor as `TextSettings` holds them, the block process and the pad id."""
+
+    seq_len: int
+    max_new_tokens: int
+    process: BlockProcess
+    pad_token_id: int
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+        integer(self.pad_token_id, "pad_token_id")
+
+
+def _budget_checked(budget: int) -> None:
+    """Refuse a recorded token budget that is not a nonnegative integer."""
+    if type(budget) is not int or budget < 0:
+        raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -324,36 +408,28 @@ def recorded_processor(processor: Processor | None) -> str | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def _saved_processor(record: Mapping[str, object], config: ModelConfig) -> Processor | None:
+def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
+                     config: ModelConfig) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
     from dew.interop.pretrained import load_processor
 
-    source = record.get('processor')
-    if source is not None:
-        return load_processor(named(source, "processor"), config.build())
-    tokenizer = record.get('tokenizer')
-    return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
+    if settings.processor is not None:
+        return load_processor(settings.processor, config.build())
+    return None if settings.tokenizer is None else RunProcessor(tokenizer_for(settings.tokenizer))
 
 
-def _saved_budget(record: Mapping[str, object]) -> int | None:
-    """Return how many tokens the run's own previews drew, where it drew any."""
-    budget = record.get("max_new_tokens")
-    if budget is None:
-        return None
-    if type(budget) is not int or budget < 0:
-        raise ValueError("max_new_tokens must be a nonnegative integer")
-    return budget
-
-
-def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, trust: Sequence[str]
-               ) -> tuple[Mapping[str, object], int, ModelConfig, Processor | None]:
-    """Read a run's record, the exact step it is, its model config at `dtype`, and its host processor."""
+def _saved_run[SettingsT: (TextSettings, MaskedSettings, BlockSettings)](
+        directory: str, settings: type[SettingsT], dtype: DTypeLike | None, step: int | str | None,
+        trust: Sequence[str]) -> tuple[Mapping[str, object], SettingsT, int, ModelConfig, Processor | None]:
+    """Read a run's record, its task `settings`, the exact step it is, its model config at
+    `dtype`, and its host processor."""
     record, step = run_record(directory, step, trust)
     config = saved_model(record, dtype)
-    return record, step, config, _saved_processor(record, config)
+    held = saved_settings(record, settings)
+    return record, held, step, config, _saved_processor(held, config)
 
 
 def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
@@ -379,18 +455,6 @@ def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
             raise ValueError("this generation has no prompt width")
         rows = generation.host()
         return decoded_rows(processor, rows.tokens, rows.lengths, generation.prompt_width)
-
-
-def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Sampling:
-    """Return the policy the run drew its previews under, or the basic one."""
-    controls = record.get("sampling")
-    if controls is None:
-        if budget:
-            raise ValueError("run.json lacks the sampling policy for its text previews")
-        return Sampling()
-    if not isinstance(controls, dict):
-        raise ValueError("the run's sampling policy must be a Sampling record")
-    return Sampling(**controls)
 
 
 @dataclass(frozen=True)
@@ -510,13 +574,20 @@ class TextGeneration:
         """
         from dew.registry import objectives
 
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
-        budget = _saved_budget(record)
+        record, settings, step, model_config, processor = _saved_run(directory, TextSettings, dtype, step,
+                                                                     trust)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        model = model_config.build()
-        return cls(model, variables, processor, sampling=_saved_sampling(record, budget),
-                   max_new_tokens=budget if budget else None)
+        return cls.from_settings(model_config.build(), variables, settings, processor)
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: TextSettings,
+                      processor: Processor | None) -> TextGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: the previews' policy and budget become its defaults. A live objective
+        (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        return cls(model, variables, processor, sampling=settings.sampling,
+                   max_new_tokens=settings.max_new_tokens or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -613,17 +684,23 @@ class BlockGeneration:
         the averaged weights, `mesh` and `layout` place them, and the two
         dtypes override computation and storage.
         """
-        from dew.diffusion.block import BlockProcess
-        from dew.registry import from_record, objectives
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
+        from dew.registry import objectives
+        record, settings, step, model_config, processor = _saved_run(directory, BlockSettings, dtype, step,
+                                                                     trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = from_record(BlockProcess, json_value(record['process'], 'process'), dtypes=False)
-        return cls(model, variables, process, processor,
-                   pad_token_id=integer(record['pad_token_id'], 'pad_token_id'),
-                   max_new_tokens=_saved_budget(record) or None)
+        return cls.from_settings(model, variables, settings, processor)
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
+                      processor: Processor | None) -> BlockGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: their process, pad id and canvas budget. A live objective
+        (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
+                   max_new_tokens=settings.max_new_tokens or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -712,30 +789,31 @@ class MaskedGeneration:
         The arguments work as in `TextGeneration.from_run`, and the run's
         preview budget becomes the response length a call omits.
         """
-        from dew.diffusion.discrete import DiscreteProcess
-        from dew.registry import from_record, objectives, solvers
+        from dew.registry import objectives
 
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
-        budget = _saved_budget(record)
+        record, settings, step, model_config, processor = _saved_run(directory, MaskedSettings, dtype, step,
+                                                                     trust)
         model = model_config.build()
         refuse_causal(model)
         mask_id = model.mask_token_id if isinstance(model, TokenModel) else None
         if type(mask_id) is not int:
             raise ValueError(f"a saved masked run requires a model that names its mask token "
                              f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
+        if settings.process.mask_id != mask_id:
+            raise ValueError("model and process mask token disagree")
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = from_record(DiscreteProcess, json_value(record['process'], 'process'), dtypes=False)
-        if process.mask_id != mask_id:
-            raise ValueError("model and process mask token disagree")
-        solver = named_fields(record['solver'], 'solver')
-        unmask = solvers.build(named(solver['class'], 'solver'), named_fields(solver['fields'], 'fields'))
-        if not isinstance(unmask, Unmask):
-            raise ValueError("a saved masked run requires an Unmask solver")
-        return cls(model, variables, process, processor, solver=unmask,
-                   steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
-                   max_new_tokens=budget or None)
+        return cls.from_settings(model, variables, settings, processor)
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
+                      processor: Processor | None) -> MaskedGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: their process, solver, step count and response budget. A live objective
+        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        assert isinstance(settings.solver, Unmask)
+        return cls(model, variables, settings.process, processor, solver=settings.solver,
+                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,

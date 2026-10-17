@@ -6,13 +6,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, ShardManifest, _indexed_manifest
 from .codec import fingerprint
 
 
@@ -91,23 +90,7 @@ class Memory(Dataset):
         return self.values
 
     def manifest(self) -> ShardManifest:
-        count = len(self.records("indexed"))
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"memory:{start}",
-                    "memory",
-                    start,
-                    min(start + self.shard_rows, count),
-                    min(self.shard_rows, count - start),
-                )
-                for start in range(0, count, self.shard_rows)
-            ),
-            self._read_shard,
-        )
-
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, "memory", "memory", self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:
         return {"rows": len(self.records("indexed"))}

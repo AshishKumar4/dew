@@ -74,7 +74,7 @@ Here is an abridged [`examples/train_flowers.py`](https://github.com/AshishKumar
 ```python
 from dew.data import Loading, TFDS
 from dew.config.data import Augment, loader
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from pathlib import Path
 
 import jax
@@ -209,12 +209,7 @@ In code, you build a model from its class (`from dew.nn.backbones import SimpleD
 
 DPO and GRPO train with the same `Trainer` as pretraining. `dew.rl` has PPO's advantage estimators and loss terms as separate functions, so you can build your own policy loop from them.
 
-`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention) or `"auto"`. With `"auto"`, Dew picks a kernel each time it traces an attention call, in this order:
-
-1. The reference path, if the call asks for arithmetic that no fused kernel does (a matmul precision above default, a softmax outside fp32, or a compute dtype different from the inputs'), has float64 inputs, or runs bf16 on a GPU older than sm80.
-2. cuDNN, on a supported GPU, if the call has no attention sinks.
-3. Splash attention, on a TPU, if the call qualifies: lengths of at least 512 tokens that it can tile, a mask it can describe, no additive bias, and whole sequences at the kernel.
-4. XLA otherwise.
+`attention_impl` selects the attention kernel. `AttentionImpl` in [`dew/nn/attention.py`](https://github.com/AshishKumar4/dew/blob/main/src/dew/nn/attention.py) names every kernel and states the order in which `"auto"`, the default, picks one each time it traces an attention call.
 
 The kernel never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
 
@@ -1056,7 +1051,7 @@ EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.config.data import loader
 from dew.data import TFDS
 from dew.config.data import Augment

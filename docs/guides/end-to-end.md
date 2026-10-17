@@ -97,11 +97,11 @@ The smoke run trains the committed tiny Qwen2 for two updates on the native back
 
 `--openai-base-url` and `--ollama-host` also send the same prompt to a served model, through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
 
-`data/shakespeare` is the token directory that the commands in [`train_lm.py`](../examples.md#train_lmpy) download and write.
+`runs/shakespeare/checkpoints` is the run, and `data/shakespeare-val` the held-out token store, that the commands in [`train_lm.py`](../examples.md#train_lmpy) write.
 
 ```bash
-python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
-    --tokens data/shakespeare --tasks hellaswag arc_easy --harness-limit 200 \
+python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \
+    --tokens data/shakespeare-val --tasks hellaswag arc_easy --harness-limit 200 \
     --image-run runs/flowers-tpu/checkpoints/flowers-256 \
     --reference-images data/flowers-heldout
 ```

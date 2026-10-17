@@ -15,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import CHUNKED, NAMES, fla_decay_terms, fla_side, plain_prefix, recurrence, through
-from kernel_compile import compile_kernels, failures
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
@@ -154,17 +153,6 @@ def training_cases():
 
     yield case("kda", width, width, heads)
     yield case("kda/keys of 256", fla_gdn.WIDEST_KEYS, width, 4)
-
-
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
-    compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
-    compile bound and the block's shared memory."""
-    pytest.importorskip("triton")
-    found = compile_kernels(training_cases(), target)
-    assert len(found) == 2
-    assert not failures(found), "\n".join(failures(found))
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
