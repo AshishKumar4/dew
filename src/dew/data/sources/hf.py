@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import grain.python as grain
 import numpy as np
@@ -17,11 +17,6 @@ from .memory import _record
 
 if TYPE_CHECKING:
     import datasets
-
-
-class _Examples(Protocol):
-    """A layer of an IterableDataset's examples, as `_buffer_shuffled` walks it: the layer it reads
-    (`ex_iterable`), or the several (`ex_iterables`), where it reads any."""
 
 
 @dataclass(frozen=True)
@@ -185,10 +180,11 @@ def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | No
     return HF(dataset, name)
 
 
-def _buffer_shuffled(layer: _Examples) -> bool:
+def _buffer_shuffled(layer: object) -> bool:
     """At the Hugging Face boundary: whether `layer`, an IterableDataset's
     examples, or any layer it reads (a map's one, an interleave's several) is
-    the shuffle buffer, whose rows and draws HF's `state_dict` leaves out."""
+    the shuffle buffer, whose rows and draws HF's `state_dict` leaves out.
+    `datasets` names no public type for a layer, so it is read by attribute."""
     from datasets.iterable_dataset import BufferShuffledExamplesIterable
 
     if isinstance(layer, BufferShuffledExamplesIterable):
