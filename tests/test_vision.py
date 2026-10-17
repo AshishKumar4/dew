@@ -87,6 +87,33 @@ def test_siglip_tower_matches_the_reference_implementation():
         - fixture["tower_ref"])) > 1e-2
 
 
+def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():
+    """A SigLIP config may name any activation the shared tower layer runs,
+    quick_gelu here, and an attention dropout, which only a training forward
+    draws: the tower loads and its features are as exact as the reference's,
+    both measured from the reference in float64."""
+    import torch
+    from transformers import SiglipVisionConfig, SiglipVisionModel
+
+    config = SiglipVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                                num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
+                                hidden_act="quick_gelu", attention_dropout=0.1, layer_norm_eps=1e-6)
+    torch.manual_seed(5)
+    reference = SiglipVisionModel(config).eval()
+    tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
+    pixels = np.random.default_rng(11).random((2, 3, 28, 28)).astype(np.float32)
+
+    def features(dtype):
+        with torch.no_grad():
+            output = reference.to(dtype)(pixel_values=torch.from_numpy(pixels).to(dtype))
+        return output.last_hidden_state.numpy()
+
+    theirs, truth = features(torch.float32), features(torch.float64)
+    tower = towers.from_record(siglip.translate_siglip_vision_config(config.to_dict())).build()
+    ours = np.asarray(tower.apply(tower_variables("siglip", tensors, "float32"), pixels))
+    assert_as_exact_as_the_reference(ours, theirs, truth, "siglip quick_gelu features")
+
+
 def test_gemma_projector_matches_the_reference_implementation():
     """fp32 parity on the tiny Gemma projector over the reference trunk
     output, and the norm is live: with its scale zeroed the soft tokens leave
