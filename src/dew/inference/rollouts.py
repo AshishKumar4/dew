@@ -39,7 +39,7 @@ from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
 from .clients import OpenAICompletion, decode_routed_experts
-from .serving import Server
+from .serving import Server, settled
 
 if TYPE_CHECKING:
     import httpx
@@ -151,9 +151,17 @@ class NativeRolloutServer:
     draw keeps both the raw and the behavior likelihoods the server records.
     If the program ends without `close`, an exit hook stops the stepping after
     the step in progress.
+
+    A draw ends on one of the policy's EOS ids or at its budget, which is
+    what `Draw.terminated` tells apart. A server whose task adds stopping
+    criteria of its own (stop strings, `MaxNewTokens`) would end draws a
+    rollout cannot tell from a truncation, so it raises ValueError.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
+        if len(server.stopping) != len(server.sampling.criteria()):
+            raise ValueError("a rollout's draws end on EOS or at their budget; serve a task without stop "
+                             "strings or stopping criteria of its own")
         self._server = server
         self._version = version
         # Reentrant, so a draw's callback may load weights from inside a step.
@@ -204,8 +212,8 @@ class NativeRolloutServer:
             if not self._claimed(future):  # failed with the stepping thread or by `close`
                 return
             failure = done.exception()
-            _completed(future, failure if failure is not None else
-                       _native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
+            settled(future, failure if failure is not None else
+                    _native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
 
         ticket.add_done_callback(resolve)
         self._arrived.set()
@@ -249,7 +257,7 @@ class NativeRolloutServer:
                     self._arrived.wait()
         except BaseException as failure:
             for future in self._detached(failure):
-                _completed(future, failure)
+                settled(future, failure)
 
     def _stop(self) -> None:
         with self._futures:
@@ -262,17 +270,7 @@ class NativeRolloutServer:
         self._withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
         for future in self._detached():
-            _completed(future, cancelled)
-
-
-def _completed(future: Future[Draw], outcome: Draw | BaseException) -> None:
-    """Complete a draw its one owner took, unless its caller cancelled it."""
-    if not future.set_running_or_notify_cancel():
-        return
-    if isinstance(outcome, BaseException):
-        future.set_exception(outcome)
-    else:
-        future.set_result(outcome)
+            settled(future, cancelled)
 
 
 def _served(variables: Variables, dtype: jnp.dtype) -> Variables:

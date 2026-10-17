@@ -84,6 +84,18 @@ def native_server():
     server.close()
 
 
+def test_a_task_whose_criteria_end_draws_before_eos_is_refused():
+    """A draw tells EOS from its budget alone; a task whose stop strings or
+    criteria would end it on neither cannot back a rollout server."""
+    from dew.sampling.decoding import MaxNewTokens
+
+    target = objective()
+    task = TextGeneration(target.model, target.init(jax.random.key(0)), None,
+                          sampling=Sampling(temperature=1.0, eos_token_ids=None), stopping=(MaxNewTokens(1),))
+    with pytest.raises(ValueError):
+        NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+
+
 def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(native_server):
     running = native_server.submit([1, 2, 3], 40, key=1)
     with pytest.raises(ValueError):
