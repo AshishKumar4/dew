@@ -178,21 +178,26 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
 
 
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
-    """A request that samples under `top_k=1` draws what lm-eval's own model
-    draws there and what greedy decoding draws, on the same weights; a beam
-    search, or a control `Sampling` has no name for, raises instead of
-    drawing without it."""
+    """On the same weights, a request that samples under `top_k=1` draws what
+    lm-eval's own model draws there and what greedy decoding draws, and a
+    beam search of three under a length penalty returns lm-eval's own
+    answer. A sampled beam search, which no likelihood describes, and a
+    control `generate` would not use raise instead of drawing without it."""
     ours, theirs = _pair(64)
-    sampled = {"until": ["\n\n"], "do_sample": True, "temperature": 1.0, "top_k": 1, "max_gen_toks": 8}
     greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8}
-    requests = [instance("the quick ", sampled, request_type="generate_until")]
-    answer = ours.generate_until(requests)
-    assert answer == theirs.generate_until(requests)
-    assert answer == ours.generate_until([instance("the quick ", greedy, request_type="generate_until")])
-    for control in ({"num_beams": 2}, {"length_penalty": 2.0}):
-        request = instance("the quick ", {**greedy, **control}, request_type="generate_until")
+    sampled = {**greedy, "do_sample": True, "temperature": 1.0, "top_k": 1}
+    beams = {**greedy, "num_beams": 3, "length_penalty": 0.5}
+
+    def asked(controls):
+        return [instance("the quick ", controls, request_type="generate_until")]
+
+    answer = ours.generate_until(asked(sampled))
+    assert answer == theirs.generate_until(asked(sampled))
+    assert answer == ours.generate_until(asked(greedy))
+    assert ours.generate_until(asked(beams)) == theirs.generate_until(asked(beams))
+    for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1}):
         with pytest.raises(ValueError):
-            ours.generate_until([request])
+            ours.generate_until(asked(refused))
 
 
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
