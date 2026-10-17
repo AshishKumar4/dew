@@ -1319,24 +1319,31 @@ def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
 
 
 def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
-    """Every node `nodes` run themselves: a nested function's, lambda's or class's body runs only
-    where it is called, so it is left out."""
+    """Every node that runs where `nodes` run: a nested function's or lambda's decorators, defaults
+    and annotations but not its body, which runs only where it is called, and a class's body, which
+    runs where the class is defined."""
     for node in nodes:
         yield node
-        if not isinstance(node, scopes.SCOPES):
-            yield from scopes.own(node)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            yield from _executed(scopes.outside(node))
+        elif isinstance(node, ast.ClassDef):
+            yield from _executed([*scopes.outside(node), *node.body])
+        else:
+            yield from _executed(ast.iter_child_nodes(node))
 
 
 def _loop_level(statements: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
-    """The statements of a loop's body that belong to that loop: through a branch, a `with` or a
-    `try`, but not into a nested loop or a definition, whose exits are their own."""
+    """The statements of a loop's body that belong to that loop: through a branch, a `with`, a
+    `try` or a `match`, but not into a nested loop or a definition, whose exits are their own."""
     for statement in statements:
         yield statement
         if isinstance(statement, ast.If | ast.With | ast.AsyncWith):
             yield from _loop_level([*statement.body, *getattr(statement, "orelse", [])])
-        elif isinstance(statement, ast.Try):
+        elif isinstance(statement, ast.Try | ast.TryStar):
             yield from _loop_level([*statement.body, *statement.orelse, *statement.finalbody,
                                     *(line for handler in statement.handlers for line in handler.body)])
+        elif isinstance(statement, ast.Match):
+            yield from _loop_level([line for case in statement.cases for line in case.body])
 
 
 def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
@@ -1349,57 +1356,95 @@ def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
 
 def _retrying(loop: ast.For | ast.While) -> bool:
     """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` (attempts, not
-    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it
-    at the loop's level) and goes round again where it fails (a handler that leaves by none)."""
+    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it)
+    and goes round again where it fails: a handler that continues the loop, or that leaves by no
+    exit where nothing after the `try` leaves either."""
     ranged = isinstance(loop, ast.For) and isinstance(loop.iter, ast.Call) and (
         _named(loop.iter.func) == "range")
     if isinstance(loop, ast.For) and not ranged:
         return False
     body = list(loop.body)
     for index, attempt in enumerate(body):
-        if not isinstance(attempt, ast.Try):
+        if not isinstance(attempt, ast.Try | ast.TryStar):
             continue
-        succeeds = (_exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return))
-                    or _exits(body[index + 1:], (ast.Break, ast.Return)))
-        fails_round = any(not _exits(handler.body, (ast.Raise, ast.Break, ast.Return))
-                          for handler in attempt.handlers)
-        if succeeds and fails_round:
+        after = _exits(body[index + 1:], (ast.Break, ast.Return))
+        succeeds = _exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return)) or after
+        again = any(any(isinstance(line, ast.Continue) for line in _loop_level(handler.body))
+                    or not (after or _exits(handler.body, (ast.Raise, ast.Break, ast.Return)))
+                    for handler in attempt.handlers)
+        if succeeds and again:
             return True
     return False
 
 
 class _Calls:
-    """The module's functions a call reaches, read from where it is made: a bare name that the
-    calling function neither takes nor binds names a function nested in it or the module's own;
-    `self.f` or `cls.f` the method of the calling function's class; and `self.held.f`, through an
-    attribute of another object, any method `f` of the module's classes."""
+    """The module's functions a call reaches, read from where it is made: a bare name through the
+    scopes that enclose the call (a class body's names reach none of its methods), to the function
+    that binds it there, if a definition binds it; `self.f` or `cls.f` the method of the calling
+    function's class or of a base of it the module defines; and `self.held.f`, through an attribute
+    of another object, any method `f` of the module's classes."""
 
-    def __init__(self, tree: ast.Module):
-        self.top: dict[str, ast.AST] = {node.name: node for node in tree.body
-                                        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
-        self.owner: dict[int, ast.ClassDef] = {}
-        self.methods: dict[int, dict[str, ast.AST]] = {}
+    def __init__(self, tree: ast.Module, parent: Sequence[str]):
+        self.parent = parent
+        self.enclosing: dict[int, ast.AST | None] = {}
+        self.bindings: dict[int, dict[str, ast.AST | None]] = {}
+        self.classes: dict[str, ast.ClassDef] = {}
         self.named: dict[str, list[ast.AST]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                own: dict[str, ast.AST] = {item.name: item for item in node.body
-                                           if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)}
-                self.methods[id(node)] = own
-                for name, item in own.items():
-                    self.owner[id(item)] = node
-                    self.named.setdefault(name, []).append(item)
+        self._index(tree, None)
+
+    def _index(self, scope: ast.AST, enclosing: ast.AST | None) -> None:
+        self.enclosing[id(scope)] = enclosing
+        names: dict[str, ast.AST | None] = {}
+
+        def bind(name: str, definition: ast.AST | None) -> None:
+            # A name bound twice in one scope, once otherwise, is no one definition's.
+            names[name] = definition if names.get(name, definition) is definition else None
+
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            for argument in scopes.arguments(scope):
+                bind(argument.arg, None)
+        for node in scopes.own(scope):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bind(node.id, None)
+            elif isinstance(node, ast.Import | ast.ImportFrom):
+                for name in scopes.bound_by(node, self.parent):
+                    bind(name, None)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                bind(node.name, node)
+                if isinstance(scope, ast.ClassDef):
+                    self.named.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.ClassDef):
+                bind(node.name, None)
+                self.classes.setdefault(node.name, node)
+            if isinstance(node, scopes.SCOPES):
+                self._index(node, scope)
+        self.bindings[id(scope)] = names
+
+    def _method(self, owner: ast.ClassDef, name: str, seen: set[int]) -> ast.AST | None:
+        seen.add(id(owner))
+        method = self.bindings[id(owner)].get(name)
+        if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+            return method
+        for base in owner.bases:
+            inherited = self.classes.get(base.id) if isinstance(base, ast.Name) else None
+            if inherited is not None and id(inherited) not in seen:
+                method = self._method(inherited, name, seen)
+                if method is not None:
+                    return method
+        return None
 
     def reached(self, function: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call) -> list[ast.AST]:
         if isinstance(call.func, ast.Name):
-            name = call.func.id
-            body = list(_executed(function.body))
-            nested = {node.name: node for node in body
-                      if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
-            if name in nested:
-                return [nested[name]]
-            bound = {argument.arg for argument in scopes.arguments(function)} | {
-                node.id for node in body if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
-            return [] if name in bound or name not in self.top else [self.top[name]]
+            scope: ast.AST | None = function
+            while scope is not None:
+                bound = self.bindings[id(scope)]
+                if call.func.id in bound:
+                    found = bound[call.func.id]
+                    return [] if found is None else [found]
+                scope = self.enclosing[id(scope)]
+                while isinstance(scope, ast.ClassDef):
+                    scope = self.enclosing[id(scope)]
+            return []
         if not isinstance(call.func, ast.Attribute):
             return []
         through, root = 0, call.func.value
@@ -1407,16 +1452,16 @@ class _Calls:
             through, root = through + 1, root.value
         if _named(root) not in ("self", "cls"):
             return []
-        owner = self.owner.get(id(function))
-        if through == 0:
-            method = None if owner is None else self.methods[id(owner)].get(call.func.attr)
-            return [] if method is None else [method]
-        return self.named.get(call.func.attr, [])
+        if through:
+            return self.named.get(call.func.attr, [])
+        owner = self.enclosing.get(id(function))
+        method = self._method(owner, call.func.attr, set()) if isinstance(owner, ast.ClassDef) else None
+        return [] if method is None else [method]
 
 
 def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
             calls: _Calls, seen: set[int]) -> bool:
-    """Whether `function` deals with what leaves the process (`EXTERNAL`): its own body names such
+    """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
     a module, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
     for node in _executed(function.body):
@@ -1437,7 +1482,7 @@ def waits(module: Module) -> Iterator[Finding]:
     process: one inside a function that deals with no subprocess, network, remote service or other
     process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
     work is ordered or woken, not waited on; a timed wait made once is a deadline."""
-    calls = _Calls(module.tree)
+    calls = _Calls(module.tree, _parent(module))
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
     for function in ast.walk(module.tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
