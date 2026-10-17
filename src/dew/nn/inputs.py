@@ -55,6 +55,17 @@ def token_id(value: object, *, where: str) -> int:
     return int(value)
 
 
+def token_ids(values: object, *, where: str) -> list[int]:
+    """`values` read as a nonempty row of token ids by `token_id`'s law: a list, a tuple or a
+    one-dimensional NumPy array, as a tokenizer, a dataset's column or a step of Dew's own
+    (`dew.data.text.Tokenize`) holds them."""
+    if isinstance(values, np.ndarray) and values.ndim == 1:
+        values = values.tolist()
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{where} holds a nonempty row of token ids, got {values!r}")
+    return [token_id(token, where=where) for token in values]
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
                    fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
