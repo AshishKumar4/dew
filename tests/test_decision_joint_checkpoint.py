@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from PIL import Image
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
@@ -108,29 +108,34 @@ def test_the_joint_layout_lays_out_what_the_release_does(tokenizer):
             assert [questions[laid.name].options[slot] for slot in laid.order] == reference["option_ids"]
 
 
-def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Dew's head, the release's fp32 head, and its float64 head, all on the same
-    fp32 backbone states, over every question of every case."""
+def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
+    """Dew's head, the release's fp32 head, its float64 head, and the terms
+    Dew's float64 head sums for each logit (`float64_forward`), all on the
+    same fp32 backbone states, over every question of every case."""
     loaded = StoredJointHead.load(TINY, attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    found, reference, truth = [], [], []
+    found, reference, truth, terms = [], [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
         for case, (_, row) in laid_out(tokenizer).items():
             inputs = DecisionInputs.collate([row], 0)
-            scores = loaded.head.apply({"params": loaded.params}, states[case][None], inputs, table)
+            given = ({"params": loaded.params}, states[case][None], inputs, table)
+            scores = loaded.head.apply(*given)
+            _, summed = float64_forward(loaded.head, *given)
             for slot, laid in enumerate(row.questions):
                 key = f"{case}/{laid.name}"
                 found.append(np.asarray(scores)[0, slot, :len(laid.options)])
+                terms.append(np.asarray(summed)[0, slot, :len(laid.options)])
                 reference.append(logits[key])
                 truth.append(logits[f"{key}/head64"])
-    return np.concatenate(found), np.concatenate(reference), np.concatenate(truth)
+    return tuple(map(np.concatenate, (found, reference, truth, terms)))
 
 
 def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
     """Every question of every case, read off the same fp32 backbone states,
     held to twice the release's own head's fp32 distance from its float64
     run (measured: 1.42 times)."""
-    assert_as_exact_as_the_reference(*head_logits(tokenizer), "stored joint head logits")
+    found, reference, truth, terms = head_logits(tokenizer)
+    assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
