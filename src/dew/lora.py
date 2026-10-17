@@ -55,6 +55,7 @@ from flax.nnx import bridge
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from dew.nn.protocols import (
     Counted,
@@ -424,7 +425,7 @@ class Adapter:
 
 def _refuse_unadaptable(model: nn.Module) -> None:
     """Refuse a model already adapted, and an NNX model behind Flax's bridge,
-    whose `nnx.Linear` makes no `nn.Dense` call the branch could join: its
+    whose `nnx.Linear` makes no `Dense` call the branch could join: its
     factors would train while its forward never read them."""
     if isinstance(type(model), AdaptedClass):
         raise ValueError("The model is already adapted")
@@ -484,10 +485,11 @@ class _Branch:
         target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
         if target is None:
             return next_fun(*args, **kwargs)
-        if type(module) not in (nn.Dense, nn.DenseGeneral):
+        # Dew's layers are flax's with the bias summed at fp32; a model built on flax's own adapts alike.
+        if type(module) not in (Dense, DenseGeneral, nn.Dense, nn.DenseGeneral):
             raise TypeError(
                 f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                "targets nn.Dense and nn.DenseGeneral kernels")
+                "targets Dense and DenseGeneral kernels")
         x = args[0] if args else kwargs["inputs"]
         output = next_fun(*args, **kwargs)
         if isinstance(module, nn.DenseGeneral):

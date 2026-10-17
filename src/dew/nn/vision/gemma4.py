@@ -16,6 +16,7 @@ from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
@@ -56,7 +57,7 @@ def clipped_linear(module: nn.Module, linear: Callable[[jax.Array], jax.Array], 
     return clamp(linear(clamp(inputs, "input")), "output")
 
 
-class Gemma4ClippableLinear(nn.Dense):
+class Gemma4ClippableLinear(Dense):
     """The reference linear map with optional nontrainable activation bounds.
 
     Subclassing Dense keeps the existing kernel path; HF's extra linear
@@ -103,7 +104,7 @@ class Gemma4VisionTransformer(nn.Module):
             raise ValueError(
                 f"num_heads ({cfg.num_heads}) must repeat num_key_value_heads "
                 f"({cfg.num_key_value_heads})")
-        self.patch_embed = nn.Dense(
+        self.patch_embed = Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="patch_embed")
         self.position_table = self.param(
@@ -229,7 +230,7 @@ class Gemma4ProjectorModule(nn.Module):
     def setup(self):
         self.pre_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
                                 dtype=self.dtype, name="pre_norm")
-        self.projection = nn.Dense(
+        self.projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="projection")
 

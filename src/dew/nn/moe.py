@@ -32,6 +32,8 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.dense import Dense
+
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
@@ -246,7 +248,7 @@ class Router(nn.Module):
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
-        # The kernel is the router's own parameter, not a nested nn.Dense, so
+        # The kernel is the router's own parameter, not a nested Dense, so
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
         self.kernel = self.param(
@@ -592,7 +594,7 @@ class ExpertLinear(nn.Module):
 
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
-        # every expert initialises like the matching nn.Dense of a dense MLP.
+        # every expert initialises like the matching Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
             normal_kernel(self.init_std, nn.initializers.variance_scaling(
@@ -1159,7 +1161,7 @@ class SparseMLP(nn.Module):
             init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.latent_features is not None:
-            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
             self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
             self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
             if self.latent_norm is not None:
@@ -1169,7 +1171,7 @@ class SparseMLP(nn.Module):
         if self.shared is not None:
             self.shared_experts = self.shared(name='shared_experts')
             if self.shared_gate:
-                self.shared_expert_gate = nn.Dense(
+                self.shared_expert_gate = Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
                     name='shared_expert_gate', **normal_kernel(self.init_std))
 

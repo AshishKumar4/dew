@@ -40,6 +40,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
+from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, held_scan
@@ -160,7 +161,7 @@ class Mamba(nn.Module):
                 f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
                              **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,

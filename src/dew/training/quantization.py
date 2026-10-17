@@ -62,7 +62,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import asks_default_precision, product_dtype
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -321,7 +321,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
         product = product + module.get_variable("params", "bias").astype(jnp.float32)
-    dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
+    dtype = product_dtype(inputs, module.param_dtype, module.dtype)
     return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
 
 

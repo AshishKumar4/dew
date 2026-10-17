@@ -21,6 +21,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, translate_parameters
+from dew.nn.dense import Dense
 from dew.registry import from_record
 
 from .activations import activation
@@ -128,7 +129,7 @@ def _clip(x, bound: float):
 
 def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """The encoders' bias-free linear map, its kernel drawn at `initializer_range`."""
-    return functools.partial(nn.Dense, use_bias=False, dtype=dtype, precision=precision,
+    return functools.partial(Dense, use_bias=False, dtype=dtype, precision=precision,
                              kernel_init=nn.initializers.normal(config.initializer_range))
 
 
@@ -139,7 +140,7 @@ class AudioLinear(nn.Module):
     (`dew.nn.vision.gemma4.clipped_linear`)."""
 
     features: int
-    dense: Callable[..., nn.Dense]
+    dense: Callable[..., Dense]
     use_clipped_linears: bool = False
 
     @nn.compact
@@ -543,7 +544,7 @@ class Gemma4AudioEncoder(nn.Module):
             x = Gemma4Conformer(cfg, dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(
                 x, mask
             )
-        x = nn.Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
+        x = Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
                      kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
         return AudioEncoding(x, mask)
 
