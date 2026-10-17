@@ -14,17 +14,21 @@ net's decode step on an H100 at one row, bf16 parameters: 45.4 against 38.1 us);
 are each their own call, which knows statically whether it normalises and which cotangent it reads,
 and writes its columns of one gradient, each taking the last one's as its output.
 
-The forward needs nothing past a token's window, so each of its programs takes a tile of `ROWS`
-tokens and loads their windows at the conv's K shifts at once (the overlap stays in L1 and L2), as
+The forward needs nothing past a token's window, so each of its programs takes a tile of tokens
+(`Tile`) and loads their windows at the conv's K shifts at once (the overlap stays in L1 and L2), as
 fla's causal_conv1d does (fla/modules/conv/triton/kernels.py, v0.5.2). The backward needs the
 pre-activation gradient at the K-1 rows past a tile, and a Triton program cannot shift a register
 tile: fla writes the pre-activation to memory in a separate pass and reads it back at each shift, and
 fusing the norm on top would recompute the conv, silu and norm K times a row. Each backward program
 instead walks time, as causal-conv1d's channel-last backward does (Dao-AILab/causal-conv1d,
 csrc/causal_conv1d_bwd.cu): a tile is `segments` rows, each the next token of its own run of `steps`
-tokens, and a loop steps all of them forward one token at a time, carrying the last K-1 inputs and
+tokens (`Walk`), and a loop steps all of them forward one token at a time, carrying the last K-1 inputs and
 pre-activation gradients, so each token's conv, silu, norm and their gradients are computed once. A
 run reads the K-1 tokens before it and computes K-1 past its end, `(K - 1) / steps` extra.
+
+Both launches are the tuner's (`dew.nn.kernels.tuning`): each takes the config measured for its GPU
+and shape where there is one, `TILE` and `WALK` without, and its float64 gate holds at every config
+of its space (tests/test_short_conv.py).
 
 The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype: the conv's
 products summed tap by tap, as XLA sums them, and the sigmoid's quotient and the norm's root and
@@ -38,25 +42,15 @@ than the gate asks for.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from . import generation
-
-ROWS = 16
-"""Tokens of a forward program's tile, each window loaded at once (`_forward_kernel`)."""
-
-SEGMENTS = 8
-"""Rows of a backward program's tile, each its own run of tokens: with a 128-channel block, 1024
-elements, eight an fp32 register of each of four warps' threads."""
-
-STEPS = 64
-"""Tokens of a run: its K-1 extra tokens are 5% of 64 at the K of 4 every mixer uses."""
-
-WARPS = 4
+from . import generation, tuning
 
 WIDEST_TAPS = 8
 """The longest conv the kernels unroll: each tap is a register tile the walk carries."""
@@ -304,10 +298,37 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         db_ref[0][local] = jnp.sum(totals[count], axis=0)
 
 
-def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, int]:
-    segments = SEGMENTS if segments is None else segments
-    steps = min(STEPS, pl.cdiv(length, segments)) if steps is None else steps
-    return segments, steps
+@dataclasses.dataclass(frozen=True)
+class Tile:
+    """The forward's tokens a program loads at once, and its warps."""
+    rows: int
+    warps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Walk:
+    """The backward's runs a program walks side by side, the tokens of each run, and its warps: runs
+    and tokens first, which order the tap gradients' sums."""
+    segments: int
+    steps: int
+    warps: int
+
+
+TILE = Tile(rows=16, warps=4)
+"""The forward's launch without a measurement: 16 tokens a tile, each window loaded at once."""
+
+TILES = frozenset(Tile(rows, warps) for rows in (8, 16, 32) for warps in (2, 4, 8))
+"""The forward's configs the tuner measures: each holds the float64 gate (tests/test_short_conv.py) and
+compiles within every GPU's block (tests/test_kernel_configs.py)."""
+
+WALK = Walk(segments=8, steps=64, warps=4)
+"""The backward's launch without a measurement, its runs no longer than a row's share: eight runs a
+tile, with a 128-channel block 1024 elements, eight an fp32 register of each of four warps' threads,
+and 64 tokens a run, whose K-1 extra tokens are 5% of it at the K of 4 every mixer uses."""
+
+WALKS = frozenset(Walk(segments, steps, warps) for segments in (4, 8, 16) for steps in (32, 64, 128)
+                  for warps in (4, 8))
+"""The backward's configs the tuner measures, held and compiled as `TILES` are."""
 
 
 def _inputs(x, w, bias, valid, documents):
@@ -335,54 +356,73 @@ def _pieces(parts):
         first += width
 
 
-def _params(warps: int | None, stages: int | None):
+def _params(warps: int):
     from jax.experimental.pallas import triton as plgpu
 
-    return plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
-                                num_stages=1 if stages is None else stages)
+    return plgpu.CompilerParams(num_warps=warps, num_stages=1)
 
 
-def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: float, dtype, interpret: bool,
-             rows: int | None = None, warps: int | None = None, stages: int | None = None):
-    """Every piece in one call (`_forward_kernel`): at one decoding row the conv's cost is its launches."""
-    batch, length, _ = x.shape
-    rows = ROWS if rows is None else rows
-    pieces, programs = [], 0
-    for first, width, head in _pieces(parts):
+@dataclasses.dataclass(frozen=True)
+class ConvForward(tuning.KernelOp):
+    """Every piece's forward in one launch (`_forward_kernel`): at one decoding row the conv's cost is
+    its launches. A program takes a `Tile`, `TILE` without a measurement."""
+
+    config_cls: ClassVar[type[Tile]] = Tile
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents')
+
+    def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
+             documents: jax.Array | None, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
+             eps: float, dtype: str, interpret: bool, config: Tile, return_residuals: bool = False):
+        batch, length, _ = x.shape
+        pieces, programs = [], 0
+        for first, width, head in _pieces(parts):
+            block = block_width(width, head)
+            pieces.append((programs, first, block, head is not None))
+            programs += width // block
+        specs, operands = _inputs(x, taps, bias, valid, documents)
+        kernel = functools.partial(
+            _forward_kernel, pieces=tuple(pieces), rows=config.rows, count=taps.shape[1], length=length,
+            has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
+            activation=activation, eps=eps, interpret=interpret)
+        widths = [width for width, _ in parts]
+        return tuple(pl.pallas_call(
+            kernel, grid=(programs, pl.cdiv(length, config.rows), batch), in_specs=specs,
+            out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
+            out_shape=[jax.ShapeDtypeStruct((batch, length, width), jnp.dtype(dtype)) for width in widths],
+            compiler_params=_params(config.warps), interpret=interpret, name="short_conv_forward",
+        )(*operands)), None
+
+    def _get_heuristics_config(self, ba) -> Tile:
+        return TILE
+
+    def _get_autotuning_configs(self, ba) -> set[Tile]:
+        return set(TILES)
+
+
+@dataclasses.dataclass(frozen=True)
+class ConvBackward(tuning.KernelOp):
+    """One piece's backward (`_backward_kernel`): the projection's gradient at the piece's columns,
+    written into the gradient the piece before wrote (`before`, aliased) where there is one, and each
+    tile's tap and bias gradients. A program walks a `Walk`, `WALK` without a measurement."""
+
+    config_cls: ClassVar[type[Walk]] = Walk
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents', 'before', 'dy')
+
+    def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
+             documents: jax.Array | None, before: jax.Array | None, dy: jax.Array, *, first: int,
+             head: int | None, activation: bool, eps: float, interpret: bool, config: Walk,
+             return_residuals: bool = False):
+        batch, length, channels = x.shape
+        count, width = taps.shape[1], dy.shape[-1]
         block = block_width(width, head)
-        pieces.append((programs, first, block, head is not None))
-        programs += width // block
-    specs, operands = _inputs(x, taps, bias, valid, documents)
-    kernel = functools.partial(
-        _forward_kernel, pieces=tuple(pieces), rows=rows, count=taps.shape[1], length=length,
-        has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
-        activation=activation, eps=eps, interpret=interpret)
-    widths = [width for width, _ in parts]
-    return tuple(pl.pallas_call(
-        kernel, grid=(programs, pl.cdiv(length, rows), batch), in_specs=specs,
-        out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
-        out_shape=[jax.ShapeDtypeStruct((batch, length, width), dtype) for width in widths],
-        compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_forward",
-    )(*operands))
-
-
-def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
-              interpret: bool, segments: int | None = None, steps: int | None = None,
-              warps: int | None = None, stages: int | None = None):
-    batch, length, channels = x.shape
-    count = taps.shape[1]
-    segments, steps = _config(length, segments, steps)
-    dx, dw, db = None, [], []
-    for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
-        block = block_width(width, head)
-        grid = (width // block, pl.cdiv(length, segments * steps), batch)
+        grid = (width // block, pl.cdiv(length, config.segments * config.steps), batch)
         specs, operands = _inputs(x, taps, bias, valid, documents)
         tiles = grid[1]
         kernel = functools.partial(
-            _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
-            steps=steps, count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
-            has_documents=documents is not None, aliased=dx is not None, activation=activation, eps=eps,
-            interpret=interpret)
+            _backward_kernel, first=first, normalised=head is not None, block=block, segments=config.segments,
+            steps=config.steps, count=count, length=length, has_bias=bias is not None,
+            has_valid=valid is not None, has_documents=documents is not None, aliased=before is not None,
+            activation=activation, eps=eps, interpret=interpret)
         whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
         out_specs = [whole, pl.BlockSpec((None, None, width, count), lambda c, t, b: (b, t, 0, 0))]
         out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -390,16 +430,42 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
         if bias is not None:
             out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
             out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
-        # Each piece writes its columns of one gradient: the calls after the first take the one before's.
-        before = [] if dx is None else [dx]
-        found = pl.pallas_call(
+        held = [] if before is None else [before]
+        return tuple(pl.pallas_call(
             kernel, grid=grid,
-            in_specs=[*specs, *([whole] if before else []),
+            in_specs=[*specs, *([whole] if held else []),
                       pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],
             out_specs=out_specs, out_shape=out_shape,
-            input_output_aliases={len(operands): 0} if before else {},
-            compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_backward",
-        )(*operands, *before, dy)
+            input_output_aliases={len(operands): 0} if held else {},
+            compiler_params=_params(config.warps), interpret=interpret, name="short_conv_backward",
+        )(*operands, *held, dy)), None
+
+    def _get_heuristics_config(self, ba) -> Walk:
+        return self._walk(ba, WALK)
+
+    def _get_autotuning_configs(self, ba) -> set[Walk]:
+        return {self._walk(ba, walk) for walk in WALKS}
+
+    @staticmethod
+    def _walk(ba, walk: Walk) -> Walk:
+        """`walk` with its runs no longer than a row's tokens shared among its segments."""
+        length = ba.arguments['x'].shape[1]
+        return dataclasses.replace(walk, steps=min(walk.steps, pl.cdiv(length, walk.segments)))
+
+
+def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: float, dtype, interpret: bool):
+    """Every piece in one call (`ConvForward`)."""
+    return ConvForward()(x, taps, bias, valid, documents, parts=tuple(parts), activation=activation, eps=eps,
+                         dtype=jnp.dtype(dtype).name, interpret=interpret)
+
+
+def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
+              interpret: bool):
+    """Each piece's call (`ConvBackward`), each writing its columns of one gradient."""
+    dx, dw, db = None, [], []
+    for (first, _, head), dy in zip(_pieces(parts), cotangents, strict=True):
+        found = ConvBackward()(x, taps, bias, valid, documents, dx, dy, first=first, head=head,
+                               activation=activation, eps=eps, interpret=interpret)
         dx = found[0]
         dw.append(jnp.sum(found[1], axis=(0, 1)))
         if bias is not None:
