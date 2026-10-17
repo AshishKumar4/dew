@@ -595,11 +595,9 @@ class HarborSource:
                     components: Mapping[str, float] | None = None, detail: str = "") -> Session:
             return Session(task.id, group, sample, 0, records, status, reward, components or {}, detail)
 
+        woken, wake = os.pipe()
         try:
             with contextlib.ExitStack() as held:
-                # The read's wake pipe exists before Harbor does, so a cancel never finds a running trial it
-                # cannot wake. Failing to make it settles the future as any other failure does.
-                woken, wake = os.pipe()
                 held.callback(os.close, wake)
                 held.callback(os.close, woken)
                 with self._lock:
