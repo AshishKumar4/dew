@@ -150,9 +150,15 @@ trial = os.path.join(value("--trials-dir"), value("--trial-name"))
 os.makedirs(trial)
 with open(os.path.join(trial, "seen.json"), "w") as seen:
     json.dump({"arguments": arguments, "agent": agent, "pid": os.getpid()}, seen)
-if "stubborn" in value("-p"):
+if "stubborn" in value("-p") or "quiet" in value("-p"):
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+if "quiet" in value("-p"):
+    # Harbor closes its output and runs on, ignoring the interrupt: only the deadline's
+    # escalation ends it.
+    os.close(1)
+    os.close(2)
+    time.sleep(60)
 if "slow" in value("-p") or "stubborn" in value("-p"):
     time.sleep(60)
 if "lingering" in value("-p"):
@@ -400,6 +406,26 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     else:
         assert ended(pid)
     assert rollout.status is Status.INFRA_ERROR and resolved < 20
+
+
+def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(tmp_path, harbor):
+    """Harbor closes its output, ignores the interrupt and runs on: the deadline still holds past
+    the output's close, its escalation's SIGTERM ends Harbor, and the trial resolves INFRA_ERROR
+    within a few graces, long before Harbor's minute-long sleep ends."""
+    task = "quiet"
+    (tmp_path / task).mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0, trial_timeout=2.0)
+    began = time.monotonic()
+    try:
+        (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    (seen,) = (tmp_path / "trials").glob("*/seen.json")
+    assert ended(json.loads(seen.read_text())["pid"])
+    assert rollout.status is Status.INFRA_ERROR and time.monotonic() - began < 20
 
 
 def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
