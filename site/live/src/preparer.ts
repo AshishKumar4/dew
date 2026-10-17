@@ -234,10 +234,21 @@ export class SnapshotPreparer extends DurableObject<Env> {
 			if (job.outcome.generation) await this.phase('complete');
 			await this.ctx.storage.put('job', job);
 		}
+		let registry: DurableObjectId;
+		try {
+			registry = this.env.SNAPSHOTS.idFromString(job.reply.registry);
+		} catch (error) {
+			// An ID another namespace minted (another script's registry) names no registry this preparer reaches, at
+			// this alarm or any later one: the job is let go, so it holds the preparer no longer.
+			console.error('preparation report names no registry here; the job is let go', job.reply.registry, error);
+			await this.ctx.storage.delete('job');
+			await this.ctx.storage.deleteAlarm();
+			return;
+		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
 		await this.ctx.storage.setAlarm(Date.now() + STAGE_MS);
 		try {
-			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
+			await this.env.SNAPSHOTS.get(registry).prepared(job.outcome);
 		} catch (error) {
 			// The job, its outcome kept, holds this preparer until a later alarm reports it.
 			console.error('preparation report failed', error);
