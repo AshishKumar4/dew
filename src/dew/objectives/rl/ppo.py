@@ -10,7 +10,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.coordination import agreed, from_every_process
-from dew.inference.tasks import Processor, TextGeneration
+from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
@@ -27,8 +27,6 @@ from dew.objectives.base import (
     joined,
     part,
 )
-from dew.records import JSON, json_value, record
-from dew.registry import import_path
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS, gae_advantages
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
@@ -106,7 +104,6 @@ class PPOObjective(Objective[Ratio, Variables]):
     shown: Mapping[str, Shown] = {"loss": Shown(), "critic/loss": Shown(better="lower")}
 
     saved_task = TextGeneration
-    inference_fields = GRPOObjective.inference_fields
     _ema_is_reference = True
     _model_part = "policy"
 
@@ -160,16 +157,14 @@ class PPOObjective(Objective[Ratio, Variables]):
         """Return the actor's episode inference task, whose `bind` reads only a tree's `policy` subtree."""
         return _Policy(self.actor.policy(part(variables, "policy")))
 
-    def inference_record(self) -> JSON:
-        """Return the actor's decoder record under PPO's import path, or None when the actor has none.
+    def task_settings(self) -> TextSettings | None:
+        """The actor's decoder settings; a loader rebuilds the decoder from them under PPO's
+        own record and takes the policy half of the saved tree."""
+        return self.actor.task_settings()
 
-        A loader rebuilds the decoder from it and takes the policy half of
-        the saved tree."""
-        actor = self.actor.inference_record()
-        if actor is None:
-            return None
-        return json_value({**record(actor, 'inference record'), 'objective': import_path(type(self))},
-                          'inference record')
+    def recorded_model(self) -> nn.Module:
+        """The actor's decoder, without the critic."""
+        return self.actor.recorded_model()
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
