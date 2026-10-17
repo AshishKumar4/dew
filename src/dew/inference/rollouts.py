@@ -211,9 +211,14 @@ class NativeRolloutServer:
         def resolve(done: Future[Generation[np.ndarray]]) -> None:
             if not self._claimed(future):  # failed with the stepping thread or by `close`
                 return
-            failure = done.exception()
-            settled(future, failure if failure is not None else
-                    _native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
+            try:
+                draw = _native_draw(ids, done.result(), version).check_stops(self.sampling.stops)
+            except BaseException as failure:
+                # The generation's own failure, or a draw that fails its checks, such as non-finite
+                # likelihoods: the claimed future takes it, since a done-callback's error reaches no one.
+                settled(future, failure)
+                return
+            settled(future, draw)
 
         ticket.add_done_callback(resolve)
         self._arrived.set()

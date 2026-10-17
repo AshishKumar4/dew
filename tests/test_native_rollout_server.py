@@ -2,7 +2,8 @@
 
 A push lands between steps and later submissions report its version; the
 served tree keeps the server's precision; a refused request raises at
-submission and leaves the rest running; a submission does not wait for a
+submission and leaves the rest running; a draw that fails its checks fails
+its future instead of leaving it pending; a submission does not wait for a
 step.
 """
 
@@ -102,6 +103,21 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
         native_server.submit(list(range(1, 11)) * 6, 10, key=2)
     assert len(running.result(timeout=120).tokens) >= 1
     assert native_server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)
+
+
+def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
+    """Weights gone non-finite sample with NaN likelihoods, which no `Draw` holds. The draw's
+    future fails with that error, where a check raised in the done-callback reached no one."""
+    target = objective()
+    params = jax.tree.map(lambda leaf: leaf * jnp.nan, target.init(jax.random.key(0)))
+    server = NativeRolloutServer(
+        Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING), slots=2, capacity=64)
+    )
+    try:
+        with pytest.raises(ValueError):
+            server.submit([1, 2, 3], BUDGET, key=5).result(timeout=60)
+    finally:
+        server.close()
 
 
 def test_a_submission_does_not_wait_for_the_step_under_way(native_server):
