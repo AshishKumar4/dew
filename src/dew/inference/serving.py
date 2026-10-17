@@ -109,6 +109,7 @@ from dew.inference.tasks import (
 )
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
+from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
@@ -476,7 +477,7 @@ class Server:
             formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted)
+            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 

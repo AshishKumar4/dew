@@ -52,7 +52,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -193,11 +193,19 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
     if held is not None:
         raise ValueError(f"{type(model).__name__} already computes under a Qwix quantization, which a "
                          f"second one would replace; quantize the model once")
-    wrapped = _qwix().quantize_model(model, provider, methods=entry_methods(model))
-    layer = type(wrapped)
+    wrapped = _quantized(model, provider, wrapper)
+    layer: Any = type(wrapped)
     layer._dew_wrapped = type(model)
     layer._dew_wrapper = staticmethod(lambda: wrapper)
     return wrapped
+
+
+def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
+    """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
+    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`)."""
+    quantized = _qwix().quantize_model(model, provider, methods=entry_methods(model))
+    type(quantized)._dew_quantization = spec
+    return quantized
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -1181,8 +1189,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     JAX parameters keep their placement through Qwix's operations.
     """
     rules = _rules(spec, training=False)
-    qwix = _qwix()
-    served = qwix.quantize_model(model, _providers()[1](rules), methods=entry_methods(model))
+    served = _quantized(model, _providers()[1](rules), spec)
     def initialized(scope: core.Scope, supplied: Variables):
         # Initialization lets Qwix annotate each weight with its quantization
         # recipe. Seed the scope first so data-dependent module layouts, such
