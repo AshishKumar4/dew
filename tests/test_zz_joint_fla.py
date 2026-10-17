@@ -38,7 +38,10 @@ def test_joint_fla():
     subprocess.run([uv, "pip", "install", "-q", "--python", str(python), "numpy", "safetensors",
                     "huggingface_hub", "pillow", f"transformers=={FLA_PINS['transformers']}",
                     f"fla-core=={FLA_PINS['fla-core']}"], check=True)
-    lines.append(f"env ready at {time.time() - started:.0f} s")
+    listed = subprocess.run([uv, "pip", "list", "--python", str(python)], capture_output=True, text=True).stdout
+    lines.append(f"env ready at {time.time() - started:.0f} s: " + ", ".join(
+        line for line in listed.splitlines() if line.split(" ")[0] in ("torch", "triton", "transformers", "fla-core",
+                                                                       "einops", "flash-linear-attention")))
     done = subprocess.run([str(python), "tools/joint_checkpoint_reference.py", "--fla"], cwd=ROOT,
                           env={**os.environ, "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}",
                                "TRITON_F32_DEFAULT": "ieee"},
