@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, equations
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms
 
 from dew.nn.kernels import generation
 from dew.nn.linear import GatedDeltaNet
@@ -26,17 +26,20 @@ def dots(function, *args) -> int:
 
 def assert_joined_as_exact(choice: str, run, arguments, wide_run):
     """`run(*arguments)` with `choice` joined, every leaf within tests/reference_error.py's rule of
-    the run with it apart, both measured from `wide_run`, the apart run in float64."""
+    the run with it apart, both measured from `wide_run`, the apart run in float64, each entry sized
+    by its float64 terms: a weight's gradient sums every token's product, which cancel."""
     with row_joins(choice, joins=False):
         apart = jax.jit(lambda *operands: run(*operands))(*arguments)
     with row_joins(choice):
         together = jax.jit(lambda *operands: run(*operands))(*arguments)
     with row_joins(choice, joins=False), jax.enable_x64(new_val=True):
-        truth = wide_run(*jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), arguments))
-    for (path, mine), theirs, want in zip(jax.tree_util.tree_leaves_with_path(together),
-                                          jax.tree.leaves(apart), jax.tree.leaves(truth), strict=True):
+        truth, terms = float64_terms(wide_run, *jax.tree.map(
+            lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), arguments))
+    for (path, mine), theirs, want, size in zip(jax.tree_util.tree_leaves_with_path(together),
+                                                jax.tree.leaves(apart), jax.tree.leaves(truth),
+                                                jax.tree.leaves(terms), strict=True):
         assert mine.dtype == theirs.dtype
-        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path))
+        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path), terms=size)
 
 
 def gradients(apply):

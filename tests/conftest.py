@@ -63,6 +63,13 @@ def own_rung_records(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
 
 
+@pytest.fixture(autouse=True)
+def own_hub_answers(monkeypatch, tmp_path_factory):
+    """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
+    stand-in answered is not another's offline record."""
+    monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
+
+
 @pytest.fixture(autouse=True, scope="module")
 def release_compilations():
     """Each test file's compiled executables are released when it ends.
