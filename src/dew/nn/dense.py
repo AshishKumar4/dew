@@ -14,7 +14,7 @@ offer no step between the two; its Dense, DenseGeneral and Conv carry no
 `preferred_element_type` (its Einsum and ConvTranspose do).
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable
 
 import jax
 import jax.numpy as jnp
@@ -52,9 +52,11 @@ def _promoted(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, b
     return inputs, kernel, bias
 
 
-def _axes(axes: Sequence[int] | int, ndim: int | None = None) -> tuple[int, ...]:
-    axes = tuple(axes) if isinstance(axes, Sequence) else (axes,)
-    return axes if ndim is None else tuple(sorted(axis % ndim for axis in axes))
+def _axes(axes: Iterable[int] | int, ndim: int | None = None) -> tuple[int, ...]:
+    """`axes` as a tuple, as flax canonicalizes them, and with `ndim` given, a negative axis
+    counted from the end and the whole sorted; an axis out of range stays out of range."""
+    axes = tuple(axes) if isinstance(axes, Iterable) else (axes,)
+    return axes if ndim is None else tuple(sorted(axis if axis >= 0 else ndim + axis for axis in axes))
 
 
 class Dense(nn.Dense):
