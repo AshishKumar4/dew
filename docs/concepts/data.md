@@ -67,7 +67,7 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 |---|---|---|---|
 | `Memory` records or columns | Materialize records | Direct random access | A physical shard manifest |
 | JSONL or text `Files` | Read the source | Producer offset index, or explicit provisioning | Newline-aligned byte ranges |
-| CSV `Files` | Read the source | Parse-aware offset index | Whole files |
+| CSV `Files` (fields within `csv.field_size_limit`) | Read the source | Parse-aware offset index | Whole files |
 | Parquet or Arrow `Files` | Read the selected records | Footer row groups | Physical row groups |
 | Produced ArrayRecord tokens | Materialize records | Producer length index | Physical shards |
 | `Hub` | Prepared Arrow | Prepared Arrow | Hub Parquet shards |
