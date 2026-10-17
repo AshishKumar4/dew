@@ -7,8 +7,8 @@ from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import Files, Loading, Memory, images
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
-from dew.data.steps.image import EncodeCaptions
 
 
 def pictures(count: int = 48) -> Memory:
@@ -21,14 +21,14 @@ def stage(kind: str):
     if kind == "albumentations":
         A = pytest.importorskip("albumentations")
 
-        return images.albumentations(A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0),
+        return images.Albumentations(A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0),
                                                 A.RandomCrop(16, 16)]))
     if kind == "torchvision":
         v2 = pytest.importorskip("torchvision.transforms.v2")
 
-        return images.torchvision(v2.Compose([v2.RandomHorizontalFlip(), v2.ColorJitter(0.4, 0.4, 0.4),
+        return images.Torchvision(v2.Compose([v2.RandomHorizontalFlip(), v2.ColorJitter(0.4, 0.4, 0.4),
                                               v2.RandomCrop(16)]))
-    return images.random_resized_crop(16, scale=(0.3, 1.0))
+    return images.RandomResizedCrop(16, scale=(0.3, 1.0))
 
 
 @pytest.mark.parametrize("kind", ["albumentations", "torchvision", "dew"])
@@ -77,8 +77,8 @@ def test_stages_holding_one_albumentations_pipeline_each_draw_their_own_record_s
     A = pytest.importorskip("albumentations")
 
     compose = A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0), A.RandomCrop(20, 20)])
-    chain = (pictures().shuffle(0).repeat().random_map(images.albumentations(compose))
-             .random_map(images.albumentations(compose)).batch(8))
+    chain = (pictures().shuffle(0).repeat().random_map(images.Albumentations(compose))
+             .random_map(images.Albumentations(compose)).batch(8))
 
     for one, many in zip(_read(chain, 1, 8), _read(chain, 8, 8), strict=True):
         np.testing.assert_array_equal(one["image"], many["image"])
@@ -136,7 +136,7 @@ def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(t
     train, held = source.holdout(records=4)
 
     def prepared(dataset):
-        chain = dataset.map(images.decode("image", rejects=False)).map(images.resize(16))
+        chain = dataset.map(images.DecodeImage("image", rejects=False)).map(images.Resize(16))
         if captions == "templates":
             return chain.random_map(images.caption(templates=settings["caption_templates"], classes=classes))
         if captions == "empty":
@@ -199,11 +199,38 @@ def test_host_image_augmentation_matches_across_workers_and_resumes_exactly():
 
 @pytest.mark.parametrize("size", [3, 1])
 def test_a_side_and_its_square_resize_alike(size):
-    """resize(n) and resize((n, n)) ask for one geometry, and by default pick one interpolation
+    """Resize(n) and Resize((n, n)) ask for one geometry, and by default pick one interpolation
     for it, cubic up and area down, so they make the same pixels."""
     row = {"image": np.array([[[64, 64, 64], [192, 192, 192]]], np.uint8)}
-    np.testing.assert_array_equal(images.resize(size).map(row)["image"],
-                                  images.resize((size, size)).map(row)["image"])
+    np.testing.assert_array_equal(images.Resize(size).map(row)["image"],
+                                  images.Resize((size, size)).map(row)["image"])
+
+
+def test_a_center_crop_cuts_a_large_image_s_central_square_and_grows_a_small_one_first():
+    """CenterCrop cuts the central square of an image at least its size as it is, and resizes a
+    smaller one bicubically until its shorter side is that size before cutting."""
+    large = np.arange(6 * 9 * 3, dtype=np.uint8).reshape(6, 9, 3)
+    small = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3) * 10
+    cropped = list(Memory([{"image": large}, {"image": small}]).map(images.CenterCrop(4)).iterate())
+    np.testing.assert_array_equal(cropped[0]["image"], large[1:5, 2:6])
+    grown = images.Resize((4, 6), "bicubic").map({"image": small})["image"]
+    np.testing.assert_array_equal(cropped[1]["image"], grown[:, 1:5])
+
+
+def test_an_image_processor_writes_its_pixel_values_beside_the_image_it_reads():
+    """Processor runs a Hugging Face image processor on the image in its field and writes the
+    processor's own pixel values under its output, keeping the image."""
+    pytest.importorskip("transformers")
+    from pathlib import Path
+
+    from transformers import CLIPImageProcessorPil
+
+    processor = CLIPImageProcessorPil.from_pretrained(str(Path(__file__).parent / "fixtures/clip/tiny"))
+    image = np.random.default_rng(0).integers(0, 256, (12, 10, 3), np.uint8)
+    (row,) = Memory([{"photo": image}]).map(images.Processor(processor, field="photo", to="pixels")).iterate()
+    np.testing.assert_array_equal(row["photo"], image)
+    expected = processor(images=image, return_tensors="np")["pixel_values"][0]
+    np.testing.assert_array_equal(row["pixels"], expected)
 
 
 def test_a_saved_position_is_refused_by_a_run_that_tokenizes_its_captions_otherwise():

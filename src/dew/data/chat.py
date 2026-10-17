@@ -38,13 +38,16 @@ from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
+import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
+
+from dew.data.text import HFTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.steps.chat import RenderChat
+    from dew.data.dataset import Batch
     from dew.data.steps.text import LengthPolicy
 
 ROLES_KEY = "text_roles"
@@ -505,14 +508,36 @@ def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: 
     return end
 
 
+@dataclasses.dataclass(frozen=True)
+class RenderChat(grain.MapTransform):
+    """The conversation in `column` rendered through the chat template of the
+    tokenizer `tokenizer` names: token ids under "text", each token's speaker
+    under "text_roles"."""
+
+    tokenizer: str
+    column: str = "messages"
+
+    @functools.cached_property
+    def vocabulary(self) -> HFTokenizer:
+        """The tokenizer and its template, resolved once as `Tokenize.vocabulary`."""
+        return HFTokenizer(self.tokenizer)
+
+    def dependencies(self) -> Mapping[str, object]:
+        return {"tokenizer": self.vocabulary.dependencies()}
+
+    def map(self, element: Batch) -> Batch:
+        messages = element.get(self.column, element.get("prompt"))
+        conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
+        ids, roles = render_conversation(self.vocabulary.tokenizer, conversation, self.tokenizer)
+        kept = {key: value for key, value in element.items() if key not in (self.column, "prompt", "tools")}
+        return {**kept, "text": ids, "text_roles": roles}
+
+
 def template(tokenizer: str | PreTrainedTokenizerBase, *, messages: str = "messages") -> RenderChat:
     """A record step that renders the conversation in `messages` through the
     tokenizer's chat template to token ids under "text" and each token's
     speaker under "text_roles", which an assistant-only loss reads.
     `tokenizer` is a Hub repo or directory, or a transformers tokenizer."""
-    from dew.data.steps.chat import RenderChat
-    from dew.data.text import tokenizer_name
-
     return RenderChat(tokenizer_name(tokenizer), messages)
 
 

@@ -136,7 +136,7 @@ def _memory_inputs(
     consumed = 0
     if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, source, transform=prefix)
+        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix)
         try:
             for index in range(len(cached)):
                 outputs = cached[index]
