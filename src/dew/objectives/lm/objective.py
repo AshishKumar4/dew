@@ -300,7 +300,8 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
 def prompt_batch(prompt: Sequence[int] | Sequence[Sequence[int]]) -> ModelInputs:
     """One prompt's ids, or several prompts of any lengths, as one left-padded
     request (`pad_token_rows`): its rows, and an attention mask where they differ."""
-    rows = [np.asarray(prompt)] if np.ndim(prompt[0]) == 0 else [np.asarray(row) for row in prompt]
+    rows = ([np.asarray(prompt).tolist()] if np.ndim(prompt[0]) == 0
+            else [np.asarray(row).tolist() for row in prompt])
     tokens, fields = pad_token_rows(rows)
     return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
@@ -367,11 +368,11 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
     if drawn is None:
         return None
     tokens, real, prompt = drawn
-    if decode is None:
-        return TextSamples(tokens=tokens)
     rows = np.asarray(tokens)
+    if decode is None:
+        return TextSamples(tokens=rows)
     kept = np.ones(rows.shape, bool) if real is None else np.asarray(real, bool)
-    return TextSamples(tokens=tokens, prompt="" if prompt is None else decode(np.asarray(prompt).tolist()),
+    return TextSamples(tokens=rows, prompt="" if prompt is None else decode(np.asarray(prompt).tolist()),
                        texts=tuple(decode(row[keep].tolist()) for row, keep in zip(rows, kept, strict=True)))
 
 
