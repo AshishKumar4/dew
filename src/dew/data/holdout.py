@@ -370,7 +370,8 @@ def _branches(
                 facts = source.metadata()
                 if "rows" not in facts:
                     raise ValueError(f"fraction HoldOut of {source.describe()} needs authoritative rows")
-                assert validation.fraction is not None  # HoldOut holds records or a fraction, exactly one
+                if validation.fraction is None:
+                    raise ValueError("fraction HoldOut needs fraction=")
                 count = int(integer(facts["rows"], "rows") * validation.fraction)
             train = Pipeline(_SliceRecords(source, count), prefix)
             held = _SliceRecords(source, 0, count) if count else None
