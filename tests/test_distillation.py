@@ -126,10 +126,12 @@ def widened_outputs(model, trainable, ids):
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     """Loss and every reported term as near float64 as the reference's own
-    float32 run is (`assert_as_exact_as_the_reference`): the truth runs the
-    reference in float64 on the student's float64 forward, the reference in
-    float32 on its float32 one. Padding sits in the batch, so the mask is
-    part of what agrees."""
+    float32 run is (`assert_leaves_as_exact`): the truth runs the reference in
+    float64 on the student's float64 forward, the reference in float32 on its
+    float32 one. Each is one number reduced from every logit, which Dew sums
+    in another order, so the reference's distance counts as at least that
+    many float32 roundings (`reductions`). Padding sits in the batch, so the
+    mask is part of what agrees."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
@@ -142,14 +144,16 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     with jax.enable_x64(new_val=True):
         wide, _ = widened_outputs(model, params["params"], ids)
         truth_loss, truth_terms, _ = reference_run(arrays, kind, wide, "float64")
-    assert_as_exact_as_the_reference(np.atleast_1d(np.float64(loss)), np.atleast_1d(rounded_loss),
-                                     np.atleast_1d(truth_loss), f"{kind} loss")
-    for metric, name in (("ce", "hard_loss"), ("distill/soft_loss", "soft_loss"),
-                         ("distill/kl", "kl_div_at_T"), ("distill/feature", "feature"),
-                         ("distill/teacher_loss", "teacher_loss")):
-        assert_as_exact_as_the_reference(np.atleast_1d(np.float64(aux.metrics[metric])),
-                                         np.atleast_1d(rounded_terms[name]),
-                                         np.atleast_1d(truth_terms[name]), f"{kind} {name}")
+    named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss",
+             "distill/kl": "kl_div_at_T", "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
+    reported = {**aux.metrics, "loss": loss}
+    rounded_terms, truth_terms = {**rounded_terms, "loss": rounded_loss}, {**truth_terms, "loss": truth_loss}
+
+    def terms(values):
+        return {metric: np.float64(values[name]) for metric, name in named.items()}
+
+    assert_leaves_as_exact({metric: np.float64(reported[metric]) for metric in named}, terms(rounded_terms),
+                           terms(truth_terms), reductions=int(np.size(arrays["student_logits"])), rows=False)
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
