@@ -46,6 +46,7 @@ from dew.nn.inputs import (
     real_slots,
     valid_order,
 )
+from dew.nn.kernels.generation import compiler_options
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
@@ -904,7 +905,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.training.quantization.compiler_options`), so a quantized model and another never share it."""
+    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None, None),
                    out_shardings=(None, rows), compiler_options=dict(options))
@@ -973,8 +974,6 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    from dew.training.quantization import compiler_options
-
     program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
     failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,

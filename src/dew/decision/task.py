@@ -55,6 +55,7 @@ from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
+from dew.nn.kernels.generation import compiler_options
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -375,8 +376,6 @@ class Decide:
 
     @functools.cached_property
     def _forward(self):
-        from dew.training.quantization import compiler_options
-
         model = self.model
         return jax.jit(model.logits, compiler_options=compiler_options(model.backbone, model.head))
 

@@ -176,7 +176,7 @@ def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(mod
                         stopping=(decoding.MaxNewTokens(budget), decoding.MaxLength(4 + budget)))
 
     first = draw(1.0, 4)
-    compiled = text._compiled(None)
+    compiled = text._compiled(None, ())
     traced = compiled._cache_size()
     second = draw(1.5, 5)
     assert compiled._cache_size() == traced

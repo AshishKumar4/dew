@@ -40,6 +40,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn.kernels.generation import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
@@ -705,8 +706,6 @@ class Objective(ABC, Generic[Loss, Effects]):
             cached = (programs, {})
             self._program_cache = cached
         from dew.nn.sharding import trace_context
-        from dew.training.quantization import compiler_options
-
         key = (name, trace_context())
         if key not in cached[1]:
             # A fresh callable gives JAX a fresh trace even for the same bound method.

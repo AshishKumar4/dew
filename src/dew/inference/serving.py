@@ -109,6 +109,7 @@ from dew.inference.tasks import (
 )
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
+from dew.nn.kernels.generation import compiler_options
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
@@ -473,8 +474,6 @@ class Server:
                                  f"which this model cannot take: {self.mixed_refusal}")
             else:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
-            from dew.training.quantization import compiler_options
-
             formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
