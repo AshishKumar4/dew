@@ -119,6 +119,7 @@ from .sessions import (
     SessionSource,
     Status,
     Task,
+    agreed_records,
     chain_lengths,
     check_truncation,
     pack,
@@ -519,18 +520,11 @@ class RolloutScheduler:
         rollouts, latencies, groups, tally, waited = agreed(
             "rollout admission", lambda: self._admitted(batch, updates))
         sampling = self._partition.reader == 0
-        packed = (
-            pack(
-                rollouts,
-                self.width,
-                rows=self.rows,
-                estimator=self.estimator,
-                truncation=self.truncation,
-                support_capacity=self.support_capacity,
-            )
-            if sampling
-            else {}
-        )
+        # A share's packing that fails (a support past its capacity) fails every process, not one.
+        packed = agreed("rollout packing", lambda: pack(
+            rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
+            support_capacity=self.support_capacity) if sampling else {})
+        packed = agreed_records(packed, self.support_capacity)
         mesh = mesh_of(state.variables)
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)

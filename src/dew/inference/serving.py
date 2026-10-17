@@ -109,6 +109,7 @@ from dew.inference.tasks import (
 )
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
+from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
@@ -157,7 +158,11 @@ class Ticket(Future):
     `tokens` are the ids the request has drawn so far, replaced whole each
     time the server reads a step's draws back, so a caller streams the
     request from them; the last value is the generation's own, and it is
-    set before the result."""
+    set before the result.
+
+    A request can be cancelled (`cancel`) while it waits in the queue: the
+    server drops it when it would seat it. A seated request runs to its end
+    and can no longer be cancelled."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -181,6 +186,20 @@ class Ticket(Future):
                 callback(self)
             except Exception as error:
                 _log.error("exception calling a tokens callback for %r", self, exc_info=error)
+
+
+def settled[T](future: Future[T], outcome: T | BaseException) -> None:
+    """Complete `future` with `outcome`, a result or an error, unless its caller cancelled it first.
+
+    A future its owner claimed (`set_running_or_notify_cancel`) can no
+    longer be cancelled; one still pending is claimed here.
+    """
+    if not future.running() and not future.set_running_or_notify_cancel():
+        return
+    if isinstance(outcome, BaseException):
+        future.set_exception(outcome)
+    else:
+        future.set_result(outcome)
 
 
 _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
@@ -228,6 +247,8 @@ class _Row:
     pages: list[int] = field(default_factory=list)
     prefilled: int = 0
     """Prompt tokens the cache holds for the row: shared prefix pages and pieces run."""
+    weights: int = 0
+    """The weights the row's prompt keys are written under: how many reloads came before its seat."""
     group: int = 0
     """The group of slots the row is seated in, whose part of a paged pool its pages are."""
 
@@ -261,7 +282,7 @@ class DenseRows:
             raise ValueError("a dense server's model keeps a paged cache; serve it with its KVCache")
 
     def refuse(self, length: int, budget: int) -> None:
-        """The capacity check `_validated` makes covers a dense row."""
+        """The capacity check `check_inputs` makes covers a dense row."""
 
     def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
         """Seat queued requests in order; `free` is each group's free slots."""
@@ -307,6 +328,8 @@ class PagedRows:
         """Pages in a row's table, capacity over the page size."""
         self.placement: Placement = Paged(len(pages), continuing=chunk is not None
                                           or any(part.prefix_cache for part in pages))
+        self.weights = 0
+        """How many reloads the rows have seen; a row seated before the last one keeps older keys."""
 
     def check(self, cache: Variables) -> None:
         """Every cached leaf has to be one of paged attention's: a paged server
@@ -340,6 +363,7 @@ class PagedRows:
                 reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget)
                 if reserved is not None:
                     row.pages, row.prefilled = reserved
+                    row.weights = self.weights
                     break
             else:
                 break
@@ -351,13 +375,17 @@ class PagedRows:
         return row.pages
 
     def prefilled(self, row: _Row) -> None:
-        """The row's prompt keys are written by the step this admission joins."""
-        self.pages[row.group].publish(row.prompt, row.pages)
+        """The row's prompt keys are written by the step this admission joins: its pages are shared
+        where every key came from the weights served now, and not where it was seated before a
+        reload and its earlier pieces kept the old weights' keys."""
+        if row.weights == self.weights:
+            self.pages[row.group].publish(row.prompt, row.pages)
 
     def release(self, row: _Row) -> None:
         self.pages[row.group].release(row.pages)
 
     def reloaded(self) -> None:
+        self.weights += 1
         for part in self.pages:
             part.forget()
 
@@ -476,7 +504,7 @@ class Server:
             formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted)
+            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 
@@ -707,7 +735,8 @@ class Server:
             raise ValueError("submit takes one prompt; call the server with a batch")
         # Sized before the padding goes, by the rows' width, as the task sizes the same rows.
         budget = generation_budget(max_new_tokens, self.default_budget, self.max_length, ids.shape[1])
-        valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
+        valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1,
+                             capacity=self.capacity).astype(bool)
         if positions is not None and (positions.shape != valid.shape or not np.array_equal(
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
@@ -775,6 +804,10 @@ class Server:
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
         for slot, row in seated:
+            if not row.ticket.set_running_or_notify_cancel():
+                # Cancelled while it waited: its slot stays free, and its reservation goes back.
+                self.rows.release(row)
+                continue
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row
@@ -884,7 +917,7 @@ class Server:
             self._rows.clear()
             self._queue.clear()
         for row in waiting:
-            row.ticket.set_exception(failure)
+            settled(row.ticket, failure)
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget
@@ -897,6 +930,6 @@ class Server:
         raw[0, :count] = row.raw
         decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
         row.ticket.finished = time.perf_counter()
-        row.ticket.set_result(Generation(
+        settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))

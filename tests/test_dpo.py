@@ -232,6 +232,28 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
         "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1]}
 
 
+def test_a_preference_dataset_trains_as_the_preference_config_does():
+    """`Trainer.fit` compiles a Dataset with the objective's own stages.
+    DPO adds none, so one step over `preferences.pair` rows moves the policy
+    exactly as one step over the same pairs through `PreferenceData`."""
+    import optax
+    from bank_support import identical
+
+    from dew.data import Memory, preferences
+    from dew.training import Layout, Trainer
+
+    pairs = [PAIR] * 8
+
+    def trained(data):
+        trainer = Trainer(DPOObjective(TinyHead(vocab_size=8), 3), optax.sgd(0.1), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        return trainer.fit(data, steps=1).variables
+
+    identical(trained(Memory(pairs).map(preferences.pair(4)).batch(8)),
+              trained(loader(PreferenceData(source=tuple(pairs), seq_len=4), batch=8, read="memory",
+                             loading=Loading(workers=0))))
+
+
 def test_a_ragged_pair_is_refused():
     row = dict(PAIR, chosen_mask=[0, 1, 1])
     with pytest.raises(ValueError):

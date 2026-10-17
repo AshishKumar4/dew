@@ -40,6 +40,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
@@ -705,15 +706,16 @@ class Objective(ABC, Generic[Loss, Effects]):
             cached = (programs, {})
             self._program_cache = cached
         from dew.nn.sharding import trace_context
-
-        key = (name, trace_context())
+        # The options follow where the program runs (`compiler_options`), so they key it too.
+        options = compiler_options(*(module for module, _ in programs))
+        key = (name, trace_context(), tuple(options.items()))
         if key not in cached[1]:
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][key] = jax.jit(run, static_argnames=static_argnames)
+            cached[1][key] = jax.jit(run, static_argnames=static_argnames, compiler_options=options)
         return cached[1][key]
 
     @property

@@ -67,7 +67,7 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 |---|---|---|---|
 | `Memory` records or columns | Materialize records | Direct random access | A physical shard manifest |
 | JSONL or text `Files` | Read the source | Producer offset index, or explicit provisioning | Newline-aligned byte ranges |
-| CSV `Files` | Read the source | Parse-aware offset index | Whole files |
+| CSV `Files` (fields within `csv.field_size_limit`) | Read the source | Parse-aware offset index | Whole files |
 | Parquet or Arrow `Files` | Read the selected records | Footer row groups | Physical row groups |
 | Produced ArrayRecord tokens | Materialize records | Producer length index | Physical shards |
 | `Hub` | Prepared Arrow | Prepared Arrow | Hub Parquet shards |
@@ -81,6 +81,8 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 A run that states no read (`--data-read`, `load(read=None)`) lets its sources choose: memory for records held in memory, indexed for a store that reads by index, streamed otherwise, and a mixture the least eager of its corpora's choices.
 
 `dew.data.load` provisions what its read needs, as Hugging Face `datasets` downloads on `load_dataset`: it prepares TFDS, a Hub Arrow cache or an offset index, logging the artifacts it prepares. Preparing can download data and take a long time. `provision=False` (the default of `compile`, spec `.load()` and run configurations) instead raises an error naming the missing artifact.
+
+A `Hub` source keeps, with the Hub offline (`HF_HUB_OFFLINE=1`), what an online read pinned: every answer it takes from the Hub (the commit a revision names, the commit's files, its Parquet conversion, each file's size and content hash) is recorded under Dew's cache (`$XDG_CACHE_HOME/dew/hub`, or `DEW_HUB_ANSWERS`), and offline the source reads those answers. A split prepared as Arrow online then reads offline from the cache `datasets` prepared at that commit, and a streamed split's shards keep the identity a compiled cache is keyed by. Shard bytes are not recorded: a streamed read that compiles no cache still needs the Hub. Offline nothing can be provisioned, and a source never read online raises the Hub's offline error. Streamed Hub shards are identified by their size and content hash, so caches compiled before Dew recorded them compile once more.
 
 For example, a prepared image source is:
 
