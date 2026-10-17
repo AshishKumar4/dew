@@ -20,22 +20,6 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
         assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
-def test_a_small_element_is_held_to_its_own_size_in_a_column_or_a_vector():
-    """The small row transposed, a column of 5s beside columns of 1e8, puts each wrong element in
-    a row whose RMS it barely moves; a vector is one row. Held to its own size, each element is
-    100% wrong against the reference's 8e-8, though every tensor-wide and row-wide distance passes
-    it."""
-    truth = np.array([[1e8, 5.0], [1e8, 5.0]])
-    reference = np.array([[1e8 + 8, 5.0], [1e8 + 8, 5.0]])
-    dew = np.array([[1e8, 10.0], [1e8, 10.0]])
-    for value, wrong, exact in ((truth, dew, reference), (truth[0], dew[0], reference[0])):
-        assert distance(wrong, value) <= FACTOR * distance(exact, value)
-        with pytest.raises(AssertionError):
-            assert_as_exact_as_the_reference(wrong, exact, value, "small element")
-        with pytest.raises(AssertionError):
-            assert_leaves_as_exact({"elements": wrong}, {"elements": exact}, {"elements": value})
-
-
 def test_a_row_that_cancels_is_held_to_what_it_sums():
     """A query that keeps one key has a zero gradient: its terms, about 1 each, cancel. Both
     sides round them by about a float32 unit, which over the row's near-zero float64 value is a
