@@ -1259,11 +1259,13 @@ def _media_wrapper(config: Mapping[str, object]) -> bool:
             and (family not in decoders.families() or decoders.bundles(config)))
 
 
-def _derived_weights(model: CausalTransformer, variables: Mapping[str, object],
-                     config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
-    """Write a loaded decoder through the decoder export's own encoder, under
-    the config its fields derive rather than the `config` it shipped."""
-    return decoders.export_decoder_weights(model, variables, decoders.export_config(model))
+def _source_weights(model: CausalTransformer, variables: Mapping[str, object],
+                    config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
+    """Write a loaded decoder through its source family's own encoder, under
+    the `config` it shipped, which `save` writes beside the tensors. A
+    multi-head GPTBigCode derives GPT-2's config and tensors from its fields
+    (`PretrainedDecoder.from_model`), but saved as itself it keeps its own."""
+    return decoders.export_decoder_weights(model, variables, config)
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
@@ -1351,10 +1353,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         if (isinstance(family, str) and family in decoders.families()
                 and not decoders.families()[family].preserve_source_layout
                 and source_quantization(config) is None):
-            # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
-            # leave the same weights. A quantized source keeps its packed format
-            # by going back over its source names (`weight_layouts`).
-            export_adapter = _derived_weights
+            # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
+            # through too. A quantized source keeps its packed format by going back
+            # over its source names (`weight_layouts`).
+            export_adapter = _source_weights
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
