@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from typing import overload
 
+import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 
@@ -59,10 +60,9 @@ class BlockShuffle(grain.MapDataset[Batch]):
         start = 0 if block == 0 else int(ends[block - 1])
         size = int(ends[block]) - start
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
-        picked = grain.MapDataset.range(size).shuffle(seed)[position - start]
-        if picked is None:
-            raise RuntimeError("Grain index shuffle filtered an integer range")
-        offset = int(picked)
+        # Grain's shuffle of an integer range, `MapDataset.range(size).shuffle(seed)`, at one index
+        # of its first epoch (`ShuffleMapDataset._shuffled_index`).
+        offset = gx.index_shuffle(position - start, max_index=size - 1, seed=seed, rounds=4)
         for member in members:
             if offset < self._sizes[member]:
                 return epoch * self._total + int(self._starts[member]) + offset
