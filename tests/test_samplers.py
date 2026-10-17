@@ -841,9 +841,10 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
     ("DPMSolverMultistep", {"solver_order": 1}),
 ])
 def test_source_grids_walk_repeated_initial_model_times(kind, extra):
-    """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does."""
+    """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does:
+    each walked latent is as near the source's float64 walk as its own float32 walk is. The float64
+    walk builds its tables in float64 (`float64_scheduler`), at the float32 walk's integer times."""
     import contextlib
-    import copy
 
     import torch
     from diffusers.schedulers import (
@@ -873,20 +874,21 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
                        times=times, final_denoise=False, record=lambda x, _: x)
 
-    prepared = getattr(module, kind + "Scheduler").from_config(config)
-    prepared.set_timesteps(6)
     precision = load("diffusers_wan_reference")
     reference = []
+    published = None
     for dtype in (torch.float32, torch.float64):
-        source = copy.deepcopy(prepared)
-        # A pipeline can choose its first sigma by index, without a model-time lookup.
-        source.set_begin_index(0)
-        if dtype == torch.float64:
-            for name, value in vars(source).items():
-                if isinstance(value, torch.Tensor) and value.is_floating_point():
-                    setattr(source, name, value.double())
         context = precision.float64_scheduler(module) if dtype == torch.float64 else contextlib.nullcontext()
         with context:
+            source = getattr(module, kind + "Scheduler").from_config(config)
+            source.set_timesteps(6)
+            # A pipeline can choose its first sigma by index, without a model-time lookup.
+            source.set_begin_index(0)
+            if published is None:
+                published = source.timesteps.clone()
+            elif not published.is_floating_point():
+                # Integer conditioning times are the published ones, not a float64 rounding of them.
+                source.timesteps = published
             x = torch.tensor(initial, dtype=dtype)
             latents = []
             for index, time in enumerate(source.timesteps):
