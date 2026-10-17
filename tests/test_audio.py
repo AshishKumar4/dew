@@ -92,6 +92,41 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
                                          data["encoded_bf16"][real], truth, "bf16 encoded")
 
 
+def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_reference_does():
+    """`hidden_act` may name any activation the shared table computes,
+    quick_gelu here, in both the feed-forward and the light convolution. The
+    reference pins its attention to float32, so it runs in no wider precision
+    and its float32 output is the truth: the bf16 tower's encoded frames are
+    as exact as the reference's bf16 tower's."""
+    import torch
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
+
+    from tools.audio_reference import audio_config as reference_config, perturb
+
+    config = reference_config("gemma4")
+    config.hidden_act = "quick_gelu"
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(314)
+    reference = Gemma4AudioModel(config).eval()
+    perturb(reference)
+    tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
+    data = np.load(FIXTURES / "gemma4" / "reference.npz")
+    features, mask = data["input_features"], data["input_features_mask"]
+
+    def encoded(dtype):
+        with torch.no_grad():
+            output = reference.to(dtype)(torch.from_numpy(features).to(dtype), torch.from_numpy(mask))
+        return output.last_hidden_state.float().numpy(), output.attention_mask.numpy()
+
+    (truth, valid), (theirs, _) = encoded(torch.float32), encoded(torch.bfloat16)
+    ours = audio_config(config.to_dict())
+    encoding = ours.build().clone(dtype=jnp.bfloat16).apply(
+        audio_weights(tensors, ours), input_features=features, input_features_mask=mask)
+    np.testing.assert_array_equal(np.asarray(encoding.mask), valid)
+    assert_as_exact_as_the_reference(np.asarray(encoding.features, np.float32)[valid], theirs[valid],
+                                     truth[valid], "quick_gelu bf16 encoded")
+
+
 @on_gpu
 def test_encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
     """Frame subsampling must leave no strided slice on a dot's operand chain.
