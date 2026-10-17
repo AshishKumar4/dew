@@ -187,13 +187,9 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
             if path[-1] == "kernel" and local != "mm_input_projection_weight":
                 transpose = (1, 0)
         elif group == "tower":
-            path = vision.TOWER_PATHS[tower_kind](local)
+            path = vision.TOWERS[tower_kind].path(local)
             if path is not None:
-                paths = (
-                    ((path[0], "tower", *path[1:]),)
-                    if tower_kind == "gemma4"
-                    else (("params", "tower", *path),)
-                )
+                paths = ((path[0], "tower", *path[1:]),)
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
