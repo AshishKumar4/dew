@@ -905,9 +905,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def task_settings(self) -> TextSettings:
         """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
         samples = self.samples
-        return TextSettings(self.seq_len, 0 if samples is None else samples.max_new_tokens,
-                            Sampling() if samples is None else samples.sampling,
-                            recorded_tokenizer(self.processor), recorded_processor(self.processor))
+        return TextSettings(seq_len=self.seq_len,
+                            max_new_tokens=0 if samples is None else samples.max_new_tokens,
+                            sampling=Sampling() if samples is None else samples.sampling,
+                            tokenizer=recorded_tokenizer(self.processor),
+                            processor=recorded_processor(self.processor))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextGeneration:

@@ -334,6 +334,16 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     raw = restored(["a", "bc"], 3, key=7, steps=3)
     assert raw.text == restored.decode(raw)
 
+    # A run recorded before its row length and budget were, given its budget per call, loads alike.
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    record = checkpoints.artifact()
+    assert isinstance(record, dict)
+    older = {name: value for name, value in record.items() if name not in ("seq_len", "max_new_tokens")}
+    checkpoints.save(int(resumed.step) + 1, resumed, artifact=older)
+    checkpoints.wait()
+    np.testing.assert_array_equal(pipeline(str(tmp_path / "run"), ema=False)(prompt, 8, key=7).host().tokens,
+                                  live(prompt, 8, key=7).host().tokens)
+
 
 def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_source):
     source, inputs = masked_source

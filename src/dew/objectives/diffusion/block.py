@@ -221,8 +221,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     def task_settings(self) -> BlockSettings:
         """The sequence length, canvas budget, block process, pad id, and tokenizer or source
         processor: the task's own."""
-        return BlockSettings(self.sequence_length, self.canvas_size, self._process(), self.pad_token_id,
-                             recorded_tokenizer(self.processor), recorded_processor(self.processor))
+        return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
+                             process=self._process(), pad_token_id=self.pad_token_id,
+                             tokenizer=recorded_tokenizer(self.processor),
+                             processor=recorded_processor(self.processor))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:

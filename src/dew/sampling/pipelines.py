@@ -228,10 +228,10 @@ class TextToImage:
         from dew.objectives.diffusion.objective import without_loss_heads
 
         autoencoder, variables = objective.published_autoencoder(variables)
-        settings = objective.task_settings()
-        return cls(objective.model, settings.process, objective.inputs,
+        # The live encoders and autoencoder need no record (`task_settings` writes theirs for a save).
+        return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
-                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver)
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
