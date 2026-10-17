@@ -1016,7 +1016,8 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
 
 def test_metrics_without_a_cadence_are_scored_once_at_the_end():
     """A metric costly enough to want once is scored by the pass every suite gets at the run's end
-    alone, where neither fit's eval_every nor the suite's every schedules another."""
+    alone, where neither fit's eval_every nor the suite's every schedules another. Metrics with no
+    validation data to score are refused before the run, which would otherwise never score them."""
     from dew.training import EvalSuite
 
     held = dataset(val=val_batches(2)).val
@@ -1025,6 +1026,8 @@ def test_metrics_without_a_cadence_are_scored_once_at_the_end():
         make_trainer(objective=Features(), tracker=tracker).fit(
             dataset(val=val_batches(2)), steps=4, log_every=2, **options)
         assert [step for step, scores in tracker.scalars if "val/spread" in scores] == [4]
+    with pytest.raises(ValueError):
+        make_trainer(objective=Features()).fit(dataset(val=None), steps=4, log_every=2, metrics=(Spread([]),))
 
 
 def test_the_validation_split_is_the_one_suite_val():

@@ -36,7 +36,7 @@ from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Lo
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.steps.image import EncodeCaptions
-from dew.objectives.base import VALID_ROWS, Aux, Objective
+from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -849,13 +849,30 @@ class Regression(Objective):
     def fresh_variables(self, key, held):
         return self.model.init(key, np.zeros((1, FEATURES), np.float32))
 
-    def loss(self, variables, batch, step):
+    def errors(self, variables, batch):
+        """Each record's mean squared error."""
         import jax.numpy as jnp
 
         features = jnp.stack([jnp.sin(batch["id"].astype(jnp.float32) * (index + 1))
                               for index in range(FEATURES)], axis=-1)
         target = jnp.stack([features[:, 0] * 2, features[:, 1] - 1], axis=-1)
-        return jnp.mean((self.model.apply(variables, features) - target) ** 2), Aux({})
+        return jnp.mean((self.model.apply(variables, features) - target) ** 2, axis=-1)
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        return jnp.mean(self.errors(variables, batch)), Aux({})
+
+
+class Pooled(Regression):
+    """`Regression` as its records' summed error and their count, which an accumulation window pools by
+    the records each batch read."""
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        errors = self.errors(variables, batch)
+        return Ratio(jnp.sum(errors), jnp.asarray(errors.shape[0], errors.dtype)), Aux({})
 
 
 def regression_trainer(directory: Path) -> Trainer:
@@ -937,19 +954,30 @@ def test_a_ramped_run_killed_mid_ramp_lands_where_the_run_nobody_stopped_lands(t
                 "the resumed ramp did not land on the uninterrupted run")
 
 
-def test_a_ramp_pools_its_stages_batches_in_an_accumulation_window():
-    """An accumulation window pools a ramp's batches as it pools any: the loss a mean of the records a
-    window read, so two steps of eight records each and two of sixteen make two updates."""
-    trainer = Trainer(
-        Regression(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
-        layout=Layout(min_shard=1, tolerance=1.0))
+def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp_path):
+    """An accumulation window pools a ramp's batches as it pools any, across a stage's change too: its
+    update is the one a batch of all its records takes, their errors' mean. Three steps of eight and
+    then sixteen, two to a window, land where a batch of sixteen and then one of twenty-four, the
+    same records in the same order, land."""
+    records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
+    ramp = Ramp(start=8, increment=8, samples=24)
+    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout).fit(
+        ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
 
-    state = trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=16)),
-                        steps=4, log_every=100)
+    def whole(stage: int, batch: int):
+        trainer = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout,
+                          checkpoints=Checkpoints(str(tmp_path / "stitched"), keep=8))
+        return trainer.fit(stitched_data(records, batch, seed), steps=stage + 1, log_every=100,
+                           checkpoint_every=None)
+
+    stitched = [whole(stage, batch) for stage, batch in enumerate([16, 24])][-1]
 
     assert int(state.step) == 4
-    assert int(state.updates) == 2
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(parameters(state)))
+    assert int(state.updates) == int(stitched.updates) == 2
+    pooled, batched = parameters(state), parameters(stitched)
+    assert set(pooled) == set(batched)
+    for name, value in batched.items():
+        np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
 
 @pytest.mark.mesh
