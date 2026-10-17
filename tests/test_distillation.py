@@ -23,7 +23,6 @@ import numpy as np
 import optax
 import pytest
 from flax.traverse_util import unflatten_dict
-
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
 from dew.data.dataset import Loader, replayed
@@ -149,7 +148,8 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     (`assert_leaves_as_exact`): the float64 truth pulls the reference's
     float64 cotangents back through the student run in float64, and the
     reference pulls its float32 cotangents back through the student in
-    float32."""
+    float32. The student's logits are as near its float64 forward as the
+    fixture's, which the reference read."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     batch = fixture_batch(arrays)
@@ -158,15 +158,15 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
 
     (logits, _), pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids),
                                     params["params"])
-    np.testing.assert_array_equal(np.asarray(logits), arrays["student_logits"])
     _, _, d_logits, d_features = reference_float32(arrays, kind)
     reference, = pullback((jnp.asarray(d_logits), jnp.asarray(d_features)))
     with jax.enable_x64(True):
         wide = model.clone(dtype=jnp.float64)
-        _, widened_pullback = jax.vjp(lambda trainable: student_outputs(wide, trainable, ids),
-                                      widened(params["params"]))
+        (wide_logits, _), widened_pullback = jax.vjp(lambda trainable: student_outputs(wide, trainable, ids),
+                                                     widened(params["params"]))
         truth, = widened_pullback((arrays[f"{kind}/d_student_logits"], arrays[f"{kind}/d_student_features"]))
-        truth = jax.tree.map(np.asarray, truth)
+        truth, wide_logits = jax.tree.map(np.asarray, (truth, wide_logits))
+    assert_as_exact_as_the_reference(np.asarray(logits), arrays["student_logits"], wide_logits, "logits")
     actual = jax.grad(lambda trainable: objective.scalar_loss(
         {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
