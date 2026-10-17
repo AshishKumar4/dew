@@ -1312,13 +1312,13 @@ def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
         stream.close()
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
     and a run counted in steps reads it; a run counted in epochs is refused, since one pass
     over the two records fills no batch. Repeated after the batch, a pass holds no batch to
-    replay, so that read is refused rather than replaying nothing forever; eight records make
-    a batch either way."""
+    replay, so the read is refused rather than replaying nothing forever, whatever limit
+    follows, in every read; eight records make a batch either way."""
     for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
                             (8, "after, then take")):
         rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(count)]))
@@ -1338,7 +1338,36 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
                 index % count for index in range(8))
         finally:
             stream.close()
-        if count < 8 and repeated == "before":
+        if count < 8:
             with pytest.raises(ValueError):
                 data.epoch_steps(1)
 
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read):
+    """A position saved just as a pass of an endless repeat ends restores to that end, and the
+    read goes on into the next pass as the uninterrupted one does, rather than taking the
+    restored end for a pass that read nothing."""
+    data = compile(Pipeline(Memory([{"id": np.int32(index)} for index in range(2)])).repeat().batch(2),
+                   read=read, loading=READ)
+
+    def ids(stream, count: int) -> list[int]:
+        return [int(value) for batch in itertools.islice(stream, count) for value in batch["id"]]
+
+    whole = data.train(DataPartition())
+    try:
+        expected = ids(whole, 3)
+    finally:
+        whole.close()
+    stopped = data.train(DataPartition())
+    try:
+        head = ids(stopped, 1)
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert head + ids(resumed, 2) == expected
+    finally:
+        resumed.close()
