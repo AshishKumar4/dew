@@ -430,23 +430,25 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
 
 
 @overload
-def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str,
-              loading: Loading) -> pygrain.MapDataset: ...
+def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str, loading: Loading, *,
+              reseed: bool = True) -> pygrain.MapDataset: ...
 
 
 @overload
-def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading) -> Rows: ...
+def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
+              reseed: bool = True) -> Rows: ...
 
 
-def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading) -> Rows:
-    """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An endless repeat of a
-    pass that holds or yields nothing would read nothing forever, so it is refused: an indexed
-    pass by its length, a streamed one when a pass ends without a row (`_Passes`), as a pass of
-    batches does when its records fill no batch."""
+def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True) -> Rows:
+    """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An indexed repeat draws
+    each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
+    passes replay the first. An endless repeat of a pass that holds or yields nothing would read
+    nothing forever, so it is refused: an indexed pass by its length, a streamed one when a pass
+    ends without a row (`_Passes`), as a pass of batches does when its records fill no batch."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
-        return rows.repeat(epochs)
+        return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
     return gx.RepeatIterDataset(parent, epochs) if epochs is not None else _Endless(parent, name)
 
@@ -846,7 +848,8 @@ class _Build:
                 rows = whole[:1]
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
             if folded:
-                batched = _repeated(batched, None, _name(pipeline), self.loading)
+                # The repeat after the batch replays its first pass, as a repeat of the batched stream does.
+                batched = _repeated(batched, None, _name(pipeline), self.loading, reseed=False)
                 batched = batched[offset // batch_stage.size :]
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:

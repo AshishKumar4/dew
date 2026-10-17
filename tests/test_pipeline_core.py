@@ -1390,3 +1390,33 @@ def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
             stream.close()
 
     assert draws(rows.repeat()) == draws(rows.repeat(2))
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
+    """A repeat after the batch repeats the batches the first pass made, a random step's draws
+    and all, in every read, and a resume reads on as the uninterrupted run does."""
+    data = compile(Pipeline(source(2)).random_map(Draw()).batch(2).repeat(), read=read, loading=READ)
+
+    def batches(stream, count: int) -> list[tuple[list[int], list[int]]]:
+        return [(np.asarray(batch["id"]).tolist(), np.asarray(batch["draw"]).tolist())
+                for batch in itertools.islice(stream, count)]
+
+    whole = data.train(DataPartition())
+    try:
+        expected = batches(whole, 3)
+    finally:
+        whole.close()
+    assert expected[0] == expected[1] == expected[2]
+    stopped = data.train(DataPartition())
+    try:
+        head = batches(stopped, 1)
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert head + batches(resumed, 2) == expected
+    finally:
+        resumed.close()
