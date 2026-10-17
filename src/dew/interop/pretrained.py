@@ -502,6 +502,8 @@ class Pretrained:
                              "tier 3 through transformers' PyTorch forward")
         selected = [name for name, given in (("gguf_file", gguf_file), ("single_file", single_file),
                                              ("dduf_file", dduf_file)) if given is not None]
+        if len(selected) > 1:
+            raise ValueError(f"{' and '.join(selected)} each name the whole payload to load; pass one")
         if fallback is not None and selected:
             raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
                              f"and weights describe, and {' and '.join(selected)} selects another payload; "
@@ -525,10 +527,13 @@ class Pretrained:
                                            param_dtype=param_dtype, attention_impl=attention_impl,
                                            max_seq_len=max_seq_len)
             loaded = replace(loaded, variables=placed(loaded.variables))
-        else:
+        elif gguf_file is None:
+            # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
             loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
                                       dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
                                       streaming=streaming)
+        else:
+            loaded = None
         if loaded is None:
             # Without its weights, a decoder's leaves are translated as streaming translates them, each
             # a view of its stored tensor that nothing reads.
@@ -1090,9 +1095,6 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
                                    attention_impl=attention_impl, param_dtype=param_dtype)
 
-    if single_file is not None and dduf_file is not None:
-        raise ValueError(f"single_file={single_file!r} and dduf_file={dduf_file!r} each name a whole "
-                         "pipeline; pass one")
     if dduf_file is not None:
         from dew.interop import dduf
         return pipeline(dduf.unpacked(sources.repo_file(name_or_dir, directory, dduf_file)))
