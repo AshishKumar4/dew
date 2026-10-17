@@ -128,13 +128,9 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
             if path[-1] == "kernel" and local != "mm_input_projection_weight":
                 transpose = (1, 0)
         elif group == "tower":
-            path = vision.TOWER_PATHS[tower_kind](local)
+            path = vision.TOWERS[tower_kind].path(local)
             if path is not None:
-                paths = (
-                    ((path[0], "tower", *path[1:]),)
-                    if tower_kind == "gemma4"
-                    else (("params", "tower", *path),)
-                )
+                paths = ((path[0], "tower", *path[1:]),)
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
@@ -349,12 +345,18 @@ class Pretrained:
         if not isinstance(bundle, cls):
             raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
-        if model_config.adapter is None:
-            return bundle
-        # The run's adapter, as `Adapter.from_run` rebuilds it, so `save`
-        # merges its factors and `adapter.save` writes them alone.
+        return bundle.bound(model, variables)
+
+    def bound(self, model: nn.Module, variables: Variables) -> Self:
+        """This bundle carrying the LoRA `model`'s record binds over `variables`, as
+        `Adapter.from_run` rebuilds it, so `export` and `save` merge its factors into
+        their kernels and `adapter.save` writes them alone; the bundle itself where
+        `model` carries none."""
+        from dew.config import ModelConfig
         from dew.lora import Adapter
-        return replace(bundle, adapter=Adapter.recorded(model, variables, model_config.adapter))
+
+        record = ModelConfig.from_model(model).adapter
+        return self if record is None else replace(self, adapter=Adapter.recorded(model, variables, record))
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,

@@ -113,12 +113,9 @@ export default {
 			return Response.json({ desired: (await pool.left()).pool!.desired.snapshot.id });
 		}
 		await pool.configure(generation);
-		const before = (await pool.image()).image;
+		const before = await pool.image();
 		await pool.runAlarm();
-		if (scenario === 'minimum') {
-			return Response.json({ before, status: await pool.status(), image: (await pool.image()).image,
-				commit: (await pool.image()).commit });
-		}
+		if (scenario === 'minimum') return Response.json({ before, status: await pool.status(), image: await pool.image() });
 		const hosts = await Promise.all(Array.from({ length: 6 }, (_, index) => pool.allocate(`session-${index}`, 'snapshot')));
 		const loaded = await pool.status();
 		await pool.runAlarm();

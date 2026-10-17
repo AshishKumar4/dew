@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
@@ -36,26 +37,30 @@ def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
 
 
+def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
+    """Two `systemone(details=True)` answers to `case` from logits that differ
+    by fp32 rounding: the same choices, and every reported number within one
+    unit of its fourth decimal, the rounding both apply."""
+    assert found["usage"]["input_tokens"] == expected["usage"]["input_tokens"]
+    for name, answer in found["answers"].items():
+        reference = expected["answers"][name]
+        assert answer["type"] == reference["type"]
+        if answer["type"] == "choice":
+            assert answer["choice"] == reference["choice"]
+        for field in ("noul", "score", "confidence"):
+            if field in reference and field in answer:
+                assert abs(answer[field] - reference[field]) <= 1e-4, (case, name, field)
+        for option, value in answer.get("probabilities", {}).items():
+            assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
+
+
 def test_systemone_answers_what_layas_agent_answers(decide):
     """Laya's `Agent.system_one` on every case (answers.json), with Laya's
-    entropy confidence selected: the same choice, and every reported number
-    within one unit of its fourth decimal, the rounding both apply to logits
-    that differ by fp32 rounding."""
+    entropy confidence selected (`assert_same_rounded_answers`)."""
     laya = replace(decide, confidence=EntropyConfidence())
     expected = json.loads((TINY / "answers.json").read_text())
     for case, request in CASES.items():
-        found = laya.systemone(request, details=True)
-        assert found["usage"]["input_tokens"] == expected[case]["usage"]["input_tokens"]
-        for name, answer in found["answers"].items():
-            reference = expected[case]["answers"][name]
-            assert answer["type"] == reference["type"]
-            if answer["type"] == "choice":
-                assert answer["choice"] == reference["choice"]
-            for field in ("noul", "score", "confidence"):
-                if field in reference and field in answer:
-                    assert abs(answer[field] - reference[field]) <= 1e-4, (case, name, field)
-            for option, value in answer.get("probabilities", {}).items():
-                assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
+        assert_same_rounded_answers(laya.systemone(request, details=True), expected[case], case)
 
 
 @pytest.mark.parametrize("request_body, message", [
@@ -388,6 +393,34 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
+    """A ModernBERT task whose backbone runs under LoRA, its factors moved off
+    zero, saves in Laya's layout with the factors merged into their kernels
+    (`Pretrained.bound`): the reloaded plain checkpoint answers every case as
+    the adapted task does, the merged sum rounded once into each kernel
+    (`assert_same_rounded_answers`), and differently from the task without the
+    adapter."""
+    from dew.decision.model import DecisionModel
+    from dew.lora import LoRA
+    from dew.objectives.base import joined, part
+
+    backbone = part(decide.variables, "backbone")
+    adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
+    moved = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + 0.05 if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
+    adapted = replace(decide, model=DecisionModel(adapter.model, decide.model.head),
+                      variables=joined({"backbone": moved, "head": part(decide.variables, "head")}))
+
+    adapted.save_pretrained(tmp_path)
+    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    changed = False
+    for case, request in CASES.items():
+        expected = adapted.systemone(request, details=True)
+        assert_same_rounded_answers(again.systemone(request, details=True), expected, case)
+        changed |= decide.systemone(request, details=True)["answers"] != expected["answers"]
+    assert changed
 
 
 def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_path):

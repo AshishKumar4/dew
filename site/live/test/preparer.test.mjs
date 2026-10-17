@@ -56,7 +56,13 @@ function preparer({ failSmoke = false, failReport = 0, during = async () => {} }
 		async put(key, value) { storage.set(key, structuredClone(value)); }, async get(key) { return structuredClone(storage.get(key)); },
 		async delete(key) { storage.delete(key); },
 	} };
-	const env = { SNAPSHOT_COMMIT: COMMIT, SNAPSHOTS: { idFromString: (id) => id, get: (registry) => ({ async prepared(outcome) {
+	// The runtime refuses an ID another namespace minted, as it does production's registry namespace a registry of another
+	// script's: here, any ID that starts 'elsewhere'.
+	const idFromString = (id) => {
+		if (id.startsWith('elsewhere')) throw new TypeError('Invalid Durable Object ID. The ID does not match this Durable Object class.');
+		return id;
+	};
+	const env = { SNAPSHOT_COMMIT: COMMIT, SNAPSHOTS: { idFromString, get: (registry) => ({ async prepared(outcome) {
 		// A report that outlives its alarm is cut off with it: an alarm past those 15 minutes sends it again.
 		assert.ok(state.alarm > Date.now() + 15 * 60_000);
 		await during();
@@ -204,4 +210,23 @@ test('a stage cut off fails the preparation, and a report the registry missed is
 	assert.deepEqual(prepared.reports.map(([, outcome]) => outcome.failure.match(/build was cut off/) !== null), [true]);
 	assert.equal(prepared.storage.get('job'), undefined);
 	assert.equal(prepared.state.alarm, null);
+});
+
+test('a job whose report names another namespace\'s registry is let go, and the next preparation runs', async () => {
+	const prepared = preparer();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response('# trusted pinned installer');
+	try {
+		await prepared.runner.prepare(COMMIT, { registry: 'elsewhere', token: 'stray' });
+		await prepared.runner.alarm();
+		await prepared.runner.alarm();
+		// Prepared, it reported to nothing, and holds the preparer no longer.
+		assert.deepEqual(prepared.reports, []);
+		assert.equal(prepared.storage.get('job'), undefined);
+		assert.equal(prepared.state.alarm, null);
+		await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
+		await prepared.runner.alarm();
+		await prepared.runner.alarm();
+		assert.deepEqual(prepared.reports.map(([registry, outcome]) => [registry, outcome.token]), [['registry', 'lease']]);
+	} finally { globalThis.fetch = originalFetch; }
 });
