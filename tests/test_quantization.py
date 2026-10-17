@@ -4,6 +4,7 @@ Qwix-dependent tests skip without the package; the value's refusals run
 everywhere, since construction never imports it.
 """
 
+import dataclasses
 import itertools
 import os
 import subprocess
@@ -11,7 +12,6 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
-import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -248,27 +248,6 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         assert 0.0 < float(jnp.linalg.norm(got_part - float_part) / jnp.linalg.norm(float_part)) < 0.02
 
 
-def compiled_as_a_run(script: str, *arguments) -> None:
-    """Run `script` with `arguments` in a fresh process under the lane's flags without its
-    repeatable ones (`lane_environment.REPEATABLE_GPU_FLAGS`), as a run compiles; XLA reads its flags
-    once a process.
-
-    Under them XLA leaves a cuDNN call the configuration it was emitted with, which cuDNN refuses
-    for an fp8 convolution on an H100 (CUDNN_STATUS_NOT_SUPPORTED); and deterministic ops leave an
-    int8 product no GEMM backend but cuBLASLt, which XLA hands, for a decoder's o_proj, an lhs
-    whose contracting dimension is major (`s8[16,8]{1,0}` over dim 0). cuBLAS 12.9.2
-    (locks/cuda12.txt) runs it and 13.8.1 (locks/cuda13.txt) refuses it on an A100
-    (`cublasLtMatmulAlgoGetHeuristic`: the requested functionality is not supported), int8 IMMA
-    taking TN operands; a run without them computes it as a Triton GEMM."""
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if flag not in lane_environment.REPEATABLE_GPU_FLAGS]
-    root = Path(__file__).resolve().parents[1]
-    run = subprocess.run([sys.executable, "-c", script, *map(str, arguments)], capture_output=True, text=True,
-                         env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": str(root / "src")},
-                         timeout=900)
-    assert run.returncode == 0, run.stderr[-3000:]
-
-
 QUANTIZED_CONVOLUTION = """
 import sys
 
@@ -323,9 +302,19 @@ def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
     product in bf16, and XLA:GPU failed to compile the int8 convolution
     (`UNIMPLEMENTED: Can't lower one or more integer convolutions`).
 
-    It compiles as a run compiles (`compiled_as_a_run`)."""
+    It runs in a fresh process under the lane's flags without
+    `--xla_gpu_autotune_level=0`, as a training run compiles: at level 0
+    XLA leaves a cuDNN call the configuration it was emitted with, which
+    cuDNN refuses for the fp8 convolution on an H100
+    (CUDNN_STATUS_NOT_SUPPORTED), and XLA reads its flags once a process."""
     pytest.importorskip("qwix")
-    compiled_as_a_run(QUANTIZED_CONVOLUTION, dtype)
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith("--xla_gpu_autotune_level")]
+    root = Path(__file__).resolve().parents[1]
+    run = subprocess.run([sys.executable, "-c", QUANTIZED_CONVOLUTION, dtype], capture_output=True, text=True,
+                         env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": str(root / "src")},
+                         timeout=600)
+    assert run.returncode == 0, run.stderr[-3000:]
 
 
 def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does():
@@ -472,73 +461,79 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
           f"whole continuations={int(matches.all(axis=1).sum())}/{matches.shape[0]}")
 
 
-QUANTIZED_IMAGE_TASK = """
-import dataclasses
-import functools
-import sys
-import tarfile
-from pathlib import Path
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-import qwix
-
-from dew.interop.pretrained import Pretrained
-from dew.training.quantization import Quantization, entry_methods
-
-fixture, root, dtype, weight_only = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4] == "True"
-with tarfile.open(fixture) as archive:
-    archive.extractall(root, filter="data")
-task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
-served = task.quantized(Quantization(dtype=dtype, weight_only=weight_only))
-qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
-fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
-rules = [qwix.QuantizationRule(module_path=".*", weight_qtype=qtype,
-                              act_qtype=None if weight_only else qtype, **fields)]
-reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules), methods=entry_methods(task.model))
-example = task.prepare("", key=0, steps=1)
-own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
-abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
-                                            jnp.zeros(example.noise.shape[:1]), **example.conditions))
-expected = {**own,
-            "params": qwix.quantize_params(jax.tree.map(jnp.asarray, own["params"]), abstract["params"])}
+FLUX_BLOCKS = (r".*transformer_blocks_\d+/(attn/(to_|add_).+|ff.*)",)
+"""The FLUX blocks' projections and feed-forwards, at `flux_task`'s 64 features."""
 
 
-def assert_same_leaves(found, wanted):
-    for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(wanted), strict=True):
-        np.testing.assert_array_equal(leaf, other)
+@pytest.fixture(scope="module")
+def flux_task(tmp_path_factory):
+    """The tiny FLUX source's text-to-image task: a matmul-only denoiser
+    beside CLIP and T5 towers and a VAE. Its denoiser is widened to 64
+    features over freshly drawn weights: the source's 24 make int8 GEMMs
+    cuBLAS 13 refuses on an A100, as do its 16-wide inputs and outputs,
+    which `FLUX_BLOCKS` leaves in float."""
+    import tarfile
+    from pathlib import Path
 
+    from dew.interop.pretrained import Pretrained
 
-assert_same_leaves(served.variables["params"], expected["params"])
-for frozen in ("encoders", "autoencoder"):
-    assert_same_leaves(served.variables[frozen], task.variables[frozen])
-latent = jax.random.normal(jax.random.key(3), example.noise.shape)
-times = jnp.full(example.noise.shape[:1], 0.6)
-served_denoiser = {name: tree for name, tree in served.variables.items() if name in own}
-prediction = jax.jit(served.model.apply)(served_denoiser, latent, times, **example.conditions)
-wanted = jax.jit(reference.apply)(expected, latent, times, **example.conditions)
-np.testing.assert_array_equal(prediction, wanted)
-unquantized = task.model.apply(own, latent, times, **example.conditions)
-assert float(jnp.abs(prediction - unquantized).max()) > 1e-3
-direct = dataclasses.replace(task, model=reference, variables={**task.variables, **expected})
-np.testing.assert_array_equal(served(["a red bird"], steps=2, key=1).host().images,
-                              direct(["a red bird"], steps=2, key=1).host().images)
-"""
+    root = tmp_path_factory.mktemp("flux")
+    with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
+        archive.extractall(root, filter="data")
+    task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+    model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
+    example = task.prepare("", key=0, steps=1)
+    params = model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
+                        **example.conditions)["params"]
+    return dataclasses.replace(task, model=model, variables={**task.variables, "params": params})
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 @pytest.mark.parametrize("weight_only", [False, True])
-def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(dtype, weight_only, tmp_path):
-    """Qwix 0.1.8 PTQ over the tiny FLUX source's denoiser, built from Qwix's
-    own rules, provider and `quantize_params`, is the reference for
+def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_task, dtype, weight_only):
+    """Qwix 0.1.8 PTQ over the task's denoiser, built here from Qwix's own
+    rules, provider and `quantize_params`, is the reference for
     `TextToImage.quantized`: the same quantized kernels, the denoiser's
     prediction bitwise, and a decoded two-step sample bitwise. The towers
-    and the VAE keep their weights, leaf for leaf. It compiles as a run
-    compiles (`compiled_as_a_run`)."""
-    pytest.importorskip("qwix")
-    compiled_as_a_run(QUANTIZED_IMAGE_TASK, Path(__file__).parent / "fixtures/flux_source.tar.xz", tmp_path,
-                      dtype, weight_only)
+    and the VAE keep their weights, leaf for leaf."""
+    import functools
+
+    from dew.training.quantization import entry_methods
+
+    qwix = pytest.importorskip("qwix")
+    task = flux_task
+    served = task.quantized(Quantization(dtype=dtype, weight_only=weight_only, patterns=FLUX_BLOCKS))
+    qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
+    fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
+    rules = [qwix.QuantizationRule(module_path=FLUX_BLOCKS[0], weight_qtype=qtype,
+                                  act_qtype=None if weight_only else qtype, **fields)]
+    reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
+                                    methods=entry_methods(task.model))
+    example = task.prepare("", key=0, steps=1)
+    own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
+    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
+                                                jnp.zeros(example.noise.shape[:1]), **example.conditions))
+    expected = {**own, "params": qwix.quantize_params(jax.tree.map(jnp.asarray, own["params"]),
+                                                      abstract["params"])}
+    def assert_same_leaves(found, wanted):
+        for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(wanted), strict=True):
+            np.testing.assert_array_equal(leaf, other)
+
+    assert_same_leaves(served.variables["params"], expected["params"])
+    for frozen in ("encoders", "autoencoder"):
+        assert_same_leaves(served.variables[frozen], task.variables[frozen])
+
+    latent = jax.random.normal(jax.random.key(3), example.noise.shape)
+    times = jnp.full(example.noise.shape[:1], 0.6)
+    served_denoiser = {name: tree for name, tree in served.variables.items() if name in own}
+    prediction = jax.jit(served.model.apply)(served_denoiser, latent, times, **example.conditions)
+    wanted = jax.jit(reference.apply)(expected, latent, times, **example.conditions)
+    np.testing.assert_array_equal(prediction, wanted)
+    unquantized = task.model.apply(own, latent, times, **example.conditions)
+    assert float(jnp.abs(prediction - unquantized).max()) > 1e-3
+    direct = dataclasses.replace(task, model=reference, variables={**task.variables, **expected})
+    np.testing.assert_array_equal(served(["a red bird"], steps=2, key=1).host().images,
+                                  direct(["a red bird"], steps=2, key=1).host().images)
 
 
 def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
@@ -872,42 +867,31 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 
-DISTILLED_STUDENT = """
-import jax
-import jax.numpy as jnp
-import numpy as np
-
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.distillation import DistillationObjective
-from dew.objectives.lm import LMObjective
-from dew.training.quantization import Quantization, quantize_trunk
-
-
-def decoder():
-    return CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                             max_seq_len=8)
-
-
-student, teacher = decoder(), decoder()
-objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
-quantize_trunk(objective, Quantization())
-tokens = jnp.arange(8, dtype=jnp.int32)[None]
-variables = student.init(jax.random.key(0), tokens)
-trained, frozen = (entry.module for entry in objective.program_key())
-assert float(jnp.max(jnp.abs(jax.jit(trained.apply)(variables, tokens)
-                             - jax.jit(student.apply)(variables, tokens)))) > 0.0
-np.testing.assert_array_equal(jax.jit(frozen.apply)(variables, tokens),
-                              jax.jit(teacher.apply)(variables, tokens))
-"""
-
-
 def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teacher():
     """The knob wraps the modules an objective trains (`ProgramModule.trained`):
     a distillation's student computes quantized, and its frozen teacher
-    keeps its own numerics bit for bit. It compiles as a run compiles
-    (`compiled_as_a_run`)."""
+    keeps its own numerics bit for bit."""
     pytest.importorskip("qwix")
-    compiled_as_a_run(DISTILLED_STUDENT)
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm import LMObjective
+    from dew.training.quantization import quantize_trunk
+
+    # Every int8 GEMM 32 wide or more: cuBLAS 13 refuses 16-wide ones on an A100.
+    def decoder():
+        return CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=2, mlp_features=128,
+                                 max_seq_len=32)
+
+    student, teacher = decoder(), decoder()
+    objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
+    quantize_trunk(objective, Quantization())
+    tokens = jnp.arange(32, dtype=jnp.int32)[None]
+    variables = student.init(jax.random.key(0), tokens)
+    trained, frozen = (entry.module for entry in objective.program_key())
+    assert float(jnp.max(jnp.abs(jax.jit(trained.apply)(variables, tokens)
+                                 - jax.jit(student.apply)(variables, tokens)))) > 0.0
+    np.testing.assert_array_equal(jax.jit(frozen.apply)(variables, tokens),
+                                  jax.jit(teacher.apply)(variables, tokens))
 
 
 def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():
@@ -971,28 +955,19 @@ def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
     assert_computed_as_on_the_host(run, "an int8 text task's log-probabilities")
 
 
-def test_an_int8_image_task_samples_as_the_host_does(tmp_path):
-    """`TextToImage.quantized` in int8 over the tiny FLUX source walks a prompt's latents as the
-    same task does on the host, from the same quantized weights and encoded prompt."""
-    import dataclasses
-    import tarfile
-
-    from dew.interop.pretrained import Pretrained
-
+def test_an_int8_image_task_walks_as_the_host_does(flux_task):
+    """`TextToImage.quantized` in int8 walks a prompt's latents as the same task does on the host,
+    from the same quantized weights and encoded prompt."""
     pytest.importorskip("qwix")
-    with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
-    with jax.default_device(jax.devices("cpu")[0]):
-        task = Pretrained.load(tmp_path / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
-        served = task.quantized(Quantization())
-        prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
+    served = flux_task.quantized(Quantization(patterns=FLUX_BLOCKS))
+    prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
 
     def run(dtype):
         walked = dataclasses.replace(served, model=served.model.clone(dtype=dtype),
                                      variables=placed(held, dtype))
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
-    assert_computed_as_on_the_host(run, "an int8 image task's samples")
+    assert_computed_as_on_the_host(run, "an int8 image task's latents")
 
 
 def test_an_int8_decision_task_answers_as_the_host_does():
@@ -1021,15 +996,13 @@ def test_an_int8_decision_task_answers_as_the_host_does():
 
 def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
-    of its loss that the host computes: the weight gradient contracts the batch's tokens, a small
-    contraction whose int8 GEMM XLA's Triton fusion returned twice over."""
+    of its loss that the host computes, from its forward's int8 products."""
     from dew.config.data import RecordsData, loader
     from dew.data import Loading
     from dew.training.trainer import Trainer
 
     pytest.importorskip("qwix")
-    # Eight rows of four tokens: one row on each of the host's eight test devices, and on one GPU a
-    # weight gradient over 32 tokens, a contraction XLA's autotuner gives the Triton fusion.
+    # Eight rows, one on each of the host's eight test devices.
     spec, length = Quantization(patterns=(".*_proj",)), 4
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
     held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
