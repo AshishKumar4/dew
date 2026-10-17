@@ -324,9 +324,11 @@ WALK = Walk(segments=8, steps=64, warps=4)
 tile, with a 128-channel block 1024 elements, eight an fp32 register of each of four warps' threads,
 and 64 tokens a run, whose K-1 extra tokens are 5% of it at the K of 4 every mixer uses."""
 
-WALKS = frozenset(Walk(segments, steps, warps) for segments in (4, 8, 16) for steps in (32, 64, 128)
+WALKS = frozenset(Walk(segments, steps, warps) for segments in (4, 8, 16) for steps in (32, 64)
                   for warps in (4, 8))
-"""The backward's configs the tuner measures, held and compiled as `TILES` are."""
+"""The backward's configs the tuner measures, held and compiled as `TILES` are. A run sums its taps'
+products token by token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap
+gradients 2.06 times as far from float64 as XLA's on an A100, past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
