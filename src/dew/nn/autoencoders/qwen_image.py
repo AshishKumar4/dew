@@ -245,8 +245,8 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
     """Read an `AutoencoderKLQwenImage21` config into `QwenImageVAE` fields.
 
     Refused: `is_residual: false`, whose stack is laid out differently (flat
-    down blocks, attention at `attn_scales`); a non-zero `dropout`; a
-    `patch_size`, whose patchify this module does not run; different input
+    down blocks, attention at `attn_scales`); a `patch_size`, whose
+    patchify this module does not run; different input
     and output channels; a `scale_factor_spatial` the levels do not produce;
     and widths the average and duplicate shortcuts cannot group. The
     residual stack reads no `attn_scales`, so it is accepted as the source
@@ -254,8 +254,6 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
     """
     if config.get("is_residual", True) is not True:
         raise ValueError("Only the residual Qwen-Image VAE stack (is_residual: true) is implemented")
-    if config.get("dropout", 0.0) != 0.0:
-        raise ValueError(f"The Qwen-Image VAE runs without dropout, got {config.get('dropout')!r}")
     if config.get("patch_size") is not None:
         raise ValueError(f"The Qwen-Image VAE's patchified layout is not implemented, got "
                          f"patch_size {config.get('patch_size')!r}")

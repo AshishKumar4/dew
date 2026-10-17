@@ -1046,29 +1046,29 @@ def image_flow():
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
 
 
-def test_an_int8_autoguidance_guide_walks_as_the_host_does():
-    """A float denoiser guided by a copy of itself quantized to int8 (`Autoguidance`) walks a prompt's
-    latents as the same task does on the host: the walk compiles for the guide's int8 products too.
-    With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
-    with_triton_gemms(autoguidance_flow)
+def test_an_int8_guide_walks_as_the_host_does():
+    """A float image task autoguided by its own denoiser quantized to int8 (`Autoguidance`) walks a
+    prompt's latents as the same task does on the host: the walk compiles for the guide it runs as
+    for the denoiser. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(autoguided_image_flow)
 
 
-def autoguidance_flow():
+def autoguided_image_flow():
     import tempfile
 
-    from dew.sampling.guidance import Autoguidance
+    from dew.sampling import Autoguidance
 
     with tempfile.TemporaryDirectory() as root:
         task = flux_source(Path(root))
     guide = task.quantized(Quantization(patterns=FLUX_BLOCKS))
-    prepared, held, guided = jax.device_get((task.prepare("a red bird", key=0, steps=2), task.variables,
-                                             guide.variables["params"]))
+    weaker = {name: tree for name, tree in guide.variables.items() if name not in ("encoders", "autoencoder")}
+    prepared, held = jax.device_get((task.prepare("a red bird", key=0, steps=2),
+                                     {**task.variables, "guide": weaker}))
 
     def run(dtype):
-        walked = dataclasses.replace(task, model=task.model.clone(dtype=dtype),
-                                     variables=placed({**held, "guide": {"params": guided}}, dtype))
-        guidance = Autoguidance(scale=2.0, model=guide.model.clone(dtype=dtype))
-        return walked(placed(prepared, dtype), steps=2, key=1, decode=False, guidance=guidance).host().latents
+        walked = dataclasses.replace(task, model=task.model.clone(dtype=dtype), variables=placed(held, dtype),
+                                     guidance=Autoguidance(2.0, guide.model.clone(dtype=dtype)))
+        return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
     assert_computed_as_on_the_host(run, "an int8 guide's latents")
 
