@@ -59,7 +59,7 @@ def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | 
     """
     hidden = Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
     return Dense(features, use_bias=bias, dtype=dtype, precision=precision,
-                    name=f"{name}_linear_2")(activation(hidden))
+                 name=f"{name}_linear_2")(activation(hidden))
 
 
 def embedding_axes(*names: str) -> dict[tuple[str, ...], tuple[str | None, ...]]:

@@ -92,7 +92,7 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
     adaLN-Zero's identity block at the start of training."""
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                    kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
+                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
         nn.silu(conditioning) if silu else conditioning)
 
 
@@ -381,7 +381,7 @@ class ResidualBlock(nn.Module):
         out = conv(name="conv1")(self.norm1(x))
 
         temb = DenseGeneral(features=self.features, name="temb_projection",
-                               dtype=self.dtype, precision=self.precision)(temb)
+                            dtype=self.dtype, precision=self.precision)(temb)
         out = out + temb[:, None, None, :]
 
         out = self.norm2(out)

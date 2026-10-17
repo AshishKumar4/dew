@@ -100,7 +100,7 @@ class FluxSingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype)(x), shift, scale)
         maps = self.projections()
         hidden = nn.gelu(Dense(maps['proj_mlp'][1], dtype=self.dtype,
-                                  precision=self.precision, name="proj_mlp")(normalized),
+                               precision=self.precision, name="proj_mlp")(normalized),
                          approximate=True)
         attended, _ = JointAttention(
             self.heads, self.head_dim, project=False, dtype=self.dtype, precision=self.precision,
@@ -110,7 +110,7 @@ class FluxSingleBlock(nn.Module):
         # names it apart from the model's own output projection, whose two
         # sides are the other way round.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], dtype=self.dtype,
-                                            precision=self.precision, name="proj_fused")(joined)
+                                         precision=self.precision, name="proj_fused")(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),

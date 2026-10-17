@@ -1046,7 +1046,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                            precision=self.precision, name=name)
+                         precision=self.precision, name=name)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

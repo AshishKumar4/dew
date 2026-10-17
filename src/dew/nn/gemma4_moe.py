@@ -48,7 +48,7 @@ class Gemma4TextRouter(nn.Module):
         scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
         logits = Dense(self.num_experts, use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name='proj')(scaled)
+                       precision=self.precision, name='proj')(scaled)
         probabilities = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
         indices = chosen_experts(lambda: jax.lax.top_k(probabilities, self.top_k)[1],
                                  (*probabilities.shape[:-1], self.top_k), routes)

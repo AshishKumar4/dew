@@ -193,7 +193,7 @@ class VisionTransformer(nn.Module):
         frame = place // area
 
         hidden = Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
-                          precision=self.precision, name="patch_embed")(pixels)
+                       precision=self.precision, name="patch_embed")(pixels)
         if lay.position_table:
             table = nn.Embed(lay.position_table, lay.hidden_size, dtype=self.dtype, name="position_table")
             hidden = hidden + resampled_positions(jnp.asarray(table.embedding, hidden.dtype), rows, columns,

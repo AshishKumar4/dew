@@ -76,14 +76,15 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
         model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32).bfloat16().to(dtype)
         tokens = torch.from_numpy(ids)
         model(tokens, labels=tokens).loss.backward()
-        return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()}
+        return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()
+                if parameter.grad is not None}
 
     truth, reference = torch_gradients(torch.float64), torch_gradients(torch.bfloat16)
     loaded = Pretrained.load(str(directory), dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference", max_seq_len=128)
 
     def loss(variables):
-        logits = loaded.model.apply(variables, jnp.asarray(ids, jnp.int32)).astype(jnp.float32)
+        logits = jnp.asarray(loaded.model.apply(variables, jnp.asarray(ids, jnp.int32)), jnp.float32)
         targets = jnp.asarray(ids[:, 1:])[..., None]
         chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), targets, -1)
         return -jnp.mean(chosen)

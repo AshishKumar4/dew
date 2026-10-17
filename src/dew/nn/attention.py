@@ -2126,7 +2126,7 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
         projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
     else:
         projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                    name=name)(x)
+                                 name=name)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -2143,7 +2143,7 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
         return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                           name=name)(attended)
+                        name=name)(attended)
 
 
 @logical_axes({
@@ -2459,7 +2459,7 @@ class TransformerBlock(nn.Module):
 
         def project(features: int, name: str):
             return Dense(features=features, use_bias=False, precision=self.precision,
-                            dtype=self.dtype, name=name)
+                         dtype=self.dtype, name=name)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head

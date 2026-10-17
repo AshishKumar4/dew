@@ -141,7 +141,7 @@ class DecisionHead(Head):
             name=f"layers_{index}") for index in range(self.layers)]
         self.scorer_norm = _layer_norm(self.dtype, "scorer_norm")
         self.scorer_hidden = Dense(self.features, dtype=self.dtype, precision=self.precision,
-                                      name="scorer_hidden")
+                                   name="scorer_hidden")
         self.scorer_out = Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
@@ -365,7 +365,7 @@ class JointSchemaHead(Head):
         self.field_norm = _layer_norm(self.dtype, "field_norm")
         self.option_norm = _layer_norm(self.dtype, "option_norm")
         self.scorer_hidden = Dense(self.width, dtype=self.dtype, precision=self.precision,
-                                      name="scorer_hidden")
+                                   name="scorer_hidden")
         self.scorer_out = Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
         self.prior_logit_scale = self.param("prior_logit_scale", nn.initializers.zeros_init(), ())
         self.joint_logit_scale = self.param("joint_logit_scale", nn.initializers.zeros_init(), ())

@@ -353,7 +353,7 @@ class IndexScorer(nn.Module):
     @nn.compact
     def __call__(self, query, keys, x):
         weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype,
-                           precision=self.precision, name='weights_proj')(x)
+                        precision=self.precision, name='weights_proj')(x)
         return index_scores(query, keys, weights, self.precision)
 
 
@@ -374,7 +374,7 @@ class LightningIndexer(CompressedEntries):
                 f"of width {self.width}, so the heads have to be wider")
         super().setup()
         self.q_b_proj = Dense(self.n_heads * self.width, use_bias=False,
-                                 dtype=self.dtype, precision=self.precision, name='q_b_proj')
+                              dtype=self.dtype, precision=self.precision, name='q_b_proj')
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 

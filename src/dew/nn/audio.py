@@ -545,7 +545,7 @@ class Gemma4AudioEncoder(nn.Module):
                 x, mask
             )
         x = Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
-                     kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
+                  kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
         return AudioEncoding(x, mask)
 
 
