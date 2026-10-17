@@ -299,6 +299,46 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
 
 
 @on_gpu
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(head_dim,
+                                                                                     without_deterministic_ops):
+    """Cross-attention between packed documents: sequence i's queries, packed by their own offsets,
+    attend sequence i's keys, packed by theirs, as a decision head's option slots read their own
+    row's tokens. Each document's output and its query, key and value gradients lie within
+    tests/reference_error.py's rule of FlashAttention's own on that document alone, both measured
+    from float64, a one-query document and an empty one among them; a document's keys no query
+    reads take no gradient."""
+    flash = flash_here()
+    queries, keys = [30, 1, 0, 45, 7], [700, 333, 50, 120, 64]
+    starts, key_starts = (np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
+                          for lengths in (queries, keys))
+    query = qkv((int(starts[-1]), 8, head_dim))[0]
+    _, key, value = qkv((int(key_starts[-1]), 2, head_dim), seed=1)
+    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
+    packed = output_and_gradients(
+        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
+                                               key_max_seqlen=max(keys)),
+        cotangent, query, key, value)
+    for (begin, end), (key_begin, key_end) in zip(itertools.pairwise(starts), itertools.pairwise(key_starts),
+                                                  strict=True):
+        if begin == end:
+            np.testing.assert_array_equal(packed[2][key_begin:key_end], 0)
+            np.testing.assert_array_equal(packed[3][key_begin:key_end], 0)
+            continue
+        pieces = (query[begin:end], key[key_begin:key_end], value[key_begin:key_end])
+        dense = output_and_gradients(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0],
+                                     cotangent[begin:end], *pieces)
+        with jax.enable_x64(new_val=True):
+            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
+            truth = output_and_gradients(lambda q, k, v: float64_attention(q, k, v, causal=False), wide[3],
+                                         *wide[:3])
+        rows = (slice(begin, end), slice(begin, end), slice(key_begin, key_end), slice(key_begin, key_end))
+        for name, got, at, theirs, want in zip(("o", "dq", "dk", "dv"), packed, rows, dense, truth,
+                                               strict=True):
+            assert_as_exact_as_the_reference(got[at], theirs, want, f"{name} of the document at {begin}")
+
+
+@on_gpu
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
 def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
@@ -409,6 +449,13 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
+def documents(lengths) -> np.ndarray:
+    """Packed rows' segment ids, each row's documents of `lengths[:-1]` tokens numbered from 1 and its
+    padding of `lengths[-1]` after them."""
+    return np.stack([np.concatenate([np.repeat(np.arange(1, len(row)), row[:-1]), np.zeros(row[-1], int)])
+                     for row in lengths]).astype(np.int32)
+
+
 @on_gpu
 @pytest.mark.parametrize("window, sinks", [(None, False), (128, True)])
 def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, sinks,
@@ -422,8 +469,7 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
     flash_here()
     rng = np.random.default_rng(23)
     lengths = [[700, 1, 220, 103], [129, 383, 400, 112]]
-    segments = np.stack([np.concatenate([np.repeat(np.arange(1, len(row)), row[:-1]),
-                                         np.zeros(row[-1], int)]) for row in lengths]).astype(np.int32)
+    segments = documents(lengths)
     real = segments != 0
     query = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
     key = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
@@ -468,6 +514,98 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
                                          terms=terms[index])
     if sinks:
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
+
+
+@on_gpu
+def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask(
+        without_deterministic_ops):
+    """A decision head's option slots read the window's tokens of their own row: queries packed by
+    their documents (`segment_ids`), keys by theirs (`key_segment_ids`), through flash as packed
+    sequences of their own lengths. Every real query's output and gradient, and every key and value
+    gradient, lie within tests/reference_error.py's rule of the xla kernel's under the document
+    mask, both measured from float64 per document; a document no query reads takes no gradient, and
+    a padding query, or one whose document holds no key, reads nothing."""
+    flash_here()
+    rng = np.random.default_rng(29)
+    queries = documents([[20, 1, 40, 35], [9, 0, 30, 57]])
+    # Row 0's second document has a query and no key.
+    keys = documents([[300, 0, 500, 224], [129, 383, 400, 112]])
+    real = queries != 0
+    query = jnp.asarray(rng.normal(size=(2, 96, 8, 64)), jnp.bfloat16)
+    key = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
+    value = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(2, 96, 8, 64)) * real[:, :, None, None], jnp.bfloat16)
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, segment_ids=jnp.asarray(queries),
+            key_segment_ids=jnp.asarray(keys), max_segments=3))
+
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
+    np.testing.assert_array_equal(fused[0][~real], 0)
+    np.testing.assert_array_equal(fused[0][0][queries[0] == 2], 0)
+    truth = [np.zeros_like(x, np.float64) for x in fused]
+    with jax.enable_x64(new_val=True):
+        for row in range(2):
+            for document in range(1, 4):
+                asking, read = queries[row] == document, keys[row] == document
+                if not asking.any() or not read.any():
+                    continue
+                pieces = (query[row][asking], key[row][read], value[row][read], cotangent[row][asking])
+                wide = [jnp.asarray(np.asarray(x, np.float64)) for x in pieces]
+                exact = output_and_gradients(lambda q, k, v: float64_attention(q, k, v, causal=False),
+                                             wide[3], *wide[:3])
+                for whole, part, at in zip(truth, exact, (asking, asking, read, read), strict=True):
+                    whole[row][at] = part
+    for name, index in (("o", 0), ("dq", 1)):
+        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
+    for name, index in (("dk", 2), ("dv", 3)):
+        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+
+
+@on_gpu
+def test_queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
+    """Queries packed by documents over a context of no tokens at all: every query reads nothing,
+    its output and gradient exactly zero on flash as on the reference kernel, and the empty keys
+    and values take empty gradients. Called outside jit, so the kernel launches over its empty keys,
+    whose length FA3 needs bounded by at least one."""
+    flash_here()
+    rng = np.random.default_rng(31)
+    queries = jnp.asarray(documents([[3, 2, 1]]))
+    query = jnp.asarray(rng.normal(size=(1, 6, 8, 64)), jnp.bfloat16)
+    key = value = jnp.zeros((1, 0, 8, 64), jnp.bfloat16)
+    for implementation in ("flash", "reference"):
+        out, pull = jax.vjp(lambda q, k, v, implementation=implementation: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, segment_ids=queries,
+            key_segment_ids=jnp.zeros((1, 0), jnp.int32), max_segments=2), query, key, value)
+        dq, dk, dv = pull(jnp.ones_like(out))
+        np.testing.assert_array_equal(np.asarray(out, np.float32), 0)
+        np.testing.assert_array_equal(np.asarray(dq, np.float32), 0)
+        assert dk.shape == dv.shape == key.shape
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+def test_a_query_reading_another_sequences_documents_reads_its_own_documents_keys_alone(implementation):
+    """Queries packed by documents read a context packed by its own (`key_segment_ids`): each query
+    attends its document's keys as a call over that document alone does, and a query whose document
+    the context does not hold, as one of padding, reads nothing, its output and gradient zero."""
+    with jax.enable_x64(new_val=True):
+        queries, keys = jnp.asarray([[1, 1, 2, 3, 0]]), jnp.asarray([[1, 1, 1, 3, 3, 0]])
+        query, key, value = (jax.random.normal(jax.random.key(seed), (1, length, 2, 8), jnp.float64)
+                             for seed, length in ((0, 5), (1, 6), (2, 6)))
+
+        def attend(q, k, v, **documents):
+            return scaled_dot_product_attention(q, k, v, implementation=implementation, **documents)
+
+        out, pull = jax.vjp(lambda q: attend(q, key, value, segment_ids=queries, key_segment_ids=keys,
+                                             max_segments=3), query)
+        np.testing.assert_array_equal(out[0, 2:3], 0)
+        np.testing.assert_array_equal(out[0, 4:], 0)
+        np.testing.assert_array_equal(pull(jnp.ones_like(out))[0][0, 2:3], 0)
+        for asking, read in ((slice(0, 2), slice(0, 3)), (slice(3, 4), slice(3, 5))):
+            np.testing.assert_allclose(out[:, asking], attend(query[:, asking], key[:, read], value[:, read]),
+                                       rtol=1e-12, atol=1e-14)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):

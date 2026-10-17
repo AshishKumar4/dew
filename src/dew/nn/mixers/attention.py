@@ -32,9 +32,9 @@ from dew.nn.attention import (
     open_kv_cache,
     reference_only,
     scaled_dot_product_attention,
-    with_documents,
 )
 from dew.nn.blocks import normal_kernel
+from dew.nn.documents import with_documents
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
 from dew.nn.kernels.generation import backend

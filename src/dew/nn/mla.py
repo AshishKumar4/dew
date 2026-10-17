@@ -31,11 +31,11 @@ from dew.nn.attention import (
     cache_positions,
     cached_validity,
     causal_attention_mask,
-    document_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
     scaled_dot_product_attention,
 )
+from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache

@@ -9,6 +9,7 @@ import queue
 import socket
 import socketserver
 import struct
+import sys
 import threading
 import time
 from pathlib import Path
@@ -212,8 +213,9 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         if error is not None:
             try:
                 request.sendall(json.dumps({"error": error}).encode() + b"\n")
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError) as gone:
+                print(f"a refused model request's client left before hearing why: {gone!r}", file=sys.stderr,
+                      flush=True)
             finally:
                 self.shutdown_request(request)
             return
@@ -289,10 +291,17 @@ class ModelRequest(socketserver.StreamRequestHandler):
             if release and ("result" in value or "error" in value):
                 self.server.release(uid, token)
             try:
-                self.wfile.write(json.dumps(value, allow_nan=False).encode() + b"\n")
+                try:
+                    line = json.dumps(value, allow_nan=False)
+                except ValueError as error:
+                    # A non-finite number has no JSON form: the client hears so in place of the reply.
+                    why = f"the model's reply holds a non-finite number: {error}"
+                    line = json.dumps({"error": {"name": "ValueError", "message": why}})
+                self.wfile.write(line.encode() + b"\n")
                 self.wfile.flush()
-            except (OSError, ValueError):
-                pass
+            except OSError as gone:
+                print(f"a model request's client left before its reply: {gone!r}", file=sys.stderr,
+                      flush=True)
             finally:
                 if "result" in value or "error" in value:
                     completed.set()

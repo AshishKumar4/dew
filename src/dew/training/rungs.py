@@ -145,11 +145,11 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     fingerprint = None if runtime is None else runtime.fingerprint
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
-    if named is not None and isinstance(counted, list) and counted[:1] == [named]:
+    if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:
         flops = StepFlops(*counted[1:])
     else:
         flops = step_flops(executable)
-    return flops, None if flops is None else [named, flops.model, flops.hardware]
+    return flops, None if flops is None else [named, flops.model, flops.hardware, flops.unsized]
 
 
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:
