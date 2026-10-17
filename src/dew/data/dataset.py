@@ -1002,11 +1002,13 @@ def _column(values: Sequence[object], *, shared: bool):
     if len(values) == 1:
         return jax.tree.map(lambda leaf: np.expand_dims(leaf, 0), values[0])
 
+    from grain.multiprocessing import SharedMemoryArray
+
     def stack(*leaves):
         if not shared:
             return np.stack(leaves)
         first = np.asanyarray(leaves[0])
-        return np.stack(leaves, out=pygrain.SharedMemoryArray((len(leaves), *first.shape), dtype=first.dtype))
+        return np.stack(leaves, out=SharedMemoryArray((len(leaves), *first.shape), dtype=first.dtype))
 
     try:
         return jax.tree.map(stack, *values)

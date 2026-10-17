@@ -65,13 +65,14 @@ def _empty(subtype, shape, dtype):
     return np.ndarray.__new__(subtype, shape, dtype)
 
 
-def _from_buffer(buffer, dtype, shape, order, axis_order=None):
+def _from_buffer(buffer, dtype, shape, order: str, axis_order=None):
     """An array a pickle carries out of band: numpy's `_frombuffer`, its bytes read as `dtype` and
-    laid out in `shape`."""
+    laid out in `shape`. numpy's reducer writes 'C' or 'F' for a contiguous array and 'K' with the
+    axis order that makes it one for any other."""
     array = np.frombuffer(buffer, dtype=dtype)
     if order == 'K' and axis_order is not None:
         return array.reshape(shape, order='C').transpose(axis_order)
-    return array.reshape(shape, order=order)
+    return array.reshape(shape, order='F' if order == 'F' else 'C')
 
 
 # Only what a pickle of numpy arrays needs to rebuild them, by the names the pickle stream gives
