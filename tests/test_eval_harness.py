@@ -188,7 +188,7 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     ours, theirs = _pair(64)
     # Only printable ids are drawn, so no answer is cut at the EOS's replacement-character text.
     greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8,
-              "suppress_tokens": [*range(0, 32), *range(127, 256)]}
+              "suppress_tokens": [*range(32), *range(127, 256)]}
     sampled = {**greedy, "do_sample": True, "temperature": 1.0, "top_k": 1}
     beams = {**greedy, "num_beams": 3, "length_penalty": 0.5}
 
