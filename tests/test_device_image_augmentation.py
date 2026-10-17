@@ -321,12 +321,12 @@ def test_a_host_step_written_after_a_device_step_is_refused_in_every_spelling():
         return {**batch, "seen": np.asarray(batch["image"]).sum(axis=(1, 2, 3))}
 
     rows = Memory([{"image": np.zeros((16, 16, 3), np.uint8)} for _ in range(8)])
-    keyed = rows.random_map(images.augmentation_key()).repeat().batch(4)
+    keyed = rows.random_map(images.AugmentationKey()).repeat().batch(4)
     with pytest.raises(ValueError):
-        keyed.map(images.device_augment(12), remember)
-    augmented = keyed.map(images.device_augment(12))
+        keyed.map(images.DeviceAugment(12), remember)
+    augmented = keyed.map(images.DeviceAugment(12))
     with pytest.raises(ValueError):
         augmented.map(remember)
     from dew.data.compile import compile
 
-    assert compile(keyed.map(remember).map(images.device_augment(12)), read="memory", loading=READ).device
+    assert compile(keyed.map(remember).map(images.DeviceAugment(12)), read="memory", loading=READ).device

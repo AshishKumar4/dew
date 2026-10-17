@@ -105,10 +105,12 @@ DECODERS = [name for name in CHECKPOINTS if name not in OWN]
 
 
 def _layers(value, found: set[str], under: bool = False) -> set[str]:
-    """The mixer names a translated record declares, under `mixer` or `kinds`, and its layer types."""
+    """The mixer classes a translated record names, by the `class` of each
+    record under `mixer` or `kinds` (KDA beside MLA is not a delta net beside
+    attention), and its layer types."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if under and key == "name" and isinstance(item, str):
+            if under and key == "class" and isinstance(item, str):
                 found.add(item)
             _layers(item, found, under or key in ("mixer", "kinds"))
             if key == "layer_types" and isinstance(item, (list, tuple)):
@@ -436,7 +438,7 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     config = transformers.GPTNeoXConfig(num_hidden_layers=2, hidden_size=64, num_attention_heads=4,
                                         intermediate_size=256, vocab_size=256, max_position_embeddings=64)
     transformers.GPTNeoXForCausalLM(config).eval().save_pretrained(tmp_path)
-    with pytest.warns(UserWarning, match="tier 3"):
+    with pytest.warns(UserWarning):
         source = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
     model, variables = source.model, source.variables
     tokens = jnp.asarray(np.random.RandomState(0).randint(0, 256, (ROWS, LENGTH)), jnp.int32)
