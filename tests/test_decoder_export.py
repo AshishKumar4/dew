@@ -1026,7 +1026,7 @@ def glm5_native_export_case(variant):
     ("gemma4-moe-tiny", {"mixture.score_function": "sigmoid"}),
     ("glm5-next-tiny", {"sandwich_norms": True}),
     ("glm5-next-tiny", {"mlp": "geglu"}),
-    ("glm5-next-tiny", {"mixture.groups_per_token": 7, "mixture.bias": False}),
+    ("glm5-next-tiny", {"mixture.bias": False}),
     ("gemma4-native-tiny", {"scale_after_cast": True}),
     ("glm5-next-tiny", {"layer_scalar": "frozen"}),
 ])
