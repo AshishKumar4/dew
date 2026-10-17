@@ -175,7 +175,9 @@ class NativeRolloutServer:
         self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
         self._thread.start()
         # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a poll's.
-        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=60.0)
+        # The stepping thread stops after the step in progress, which may be a long first compile;
+        # it holds no external call, so exit waits for it rather than finalizing under it.
+        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
 
     @property
     def sampling(self) -> Sampling:
