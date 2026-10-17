@@ -5,7 +5,7 @@ import binascii
 import functools
 import io
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -54,7 +54,7 @@ from dew.decision.questions import (
 from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
-from dew.nn.inputs import RowPlan, mesh_of
+from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.generation import compiler_options
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
@@ -374,10 +374,20 @@ class Decide:
         plan = RowPlan.over(mesh_of(self.variables), count)
         return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
 
-    @functools.cached_property
-    def _forward(self):
+    def _forward(self, variables: Variables, inputs: DecisionInputs, *,
+                 media: ModelInputs | None = None) -> jax.Array:
+        """`model.logits`, compiled once for each set of XLA options the model takes where it runs
+        (`compiler_options`)."""
         model = self.model
-        return jax.jit(model.logits, compiler_options=compiler_options(model.backbone, model.head))
+        options = compiler_options(model.backbone, model.head)
+        key = tuple(options.items())
+        if key not in self._forwards:
+            self._forwards[key] = jax.jit(model.logits, compiler_options=options)
+        return self._forwards[key](variables, inputs, media=media)
+
+    @functools.cached_property
+    def _forwards(self) -> dict[tuple[tuple[str, bool], ...], Callable[..., jax.Array]]:
+        return {}
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    group: int = 16) -> dict[str, Answer]:

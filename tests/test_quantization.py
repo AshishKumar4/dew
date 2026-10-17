@@ -944,6 +944,7 @@ def with_triton_gemms(flow) -> None:
     autotuning then gives every GEMM a program leaves to Triton the fusion, as XLA's own autotuner
     does at small contractions, where it computed int8 dots as two or four times their product
     (openxla/xla#51016). XLA reads its flags once a process."""
+    pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
@@ -966,7 +967,6 @@ def served_text_flow():
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
 
-    pytest.importorskip("qwix")
     prompt = token_batch()["text"][:, :4]
     held = jax.device_get(tiny().init(jax.random.key(0), jnp.asarray(prompt)))
 
@@ -989,7 +989,6 @@ def test_an_int8_image_task_walks_as_the_host_does():
 def image_flow():
     import tempfile
 
-    pytest.importorskip("qwix")
     with tempfile.TemporaryDirectory() as root:
         task = flux_source(Path(root))
     served = task.quantized(Quantization(patterns=FLUX_BLOCKS))
@@ -1016,7 +1015,6 @@ def decision_flow():
     from dew.decision.model import DecisionModel
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    pytest.importorskip("qwix")
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                                  max_seq_len=128, attention_impl="xla")
     base = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
@@ -1043,7 +1041,6 @@ def training_flow():
     from dew.data import Loading
     from dew.training.trainer import Trainer
 
-    pytest.importorskip("qwix")
     # Eight rows, one on each of the host's eight test devices.
     spec, length = Quantization(patterns=(".*_proj",)), 4
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}

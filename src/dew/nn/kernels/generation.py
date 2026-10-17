@@ -377,7 +377,10 @@ class QuantizedClass(Protocol):
 
 def compiler_options(*models: nn.Module) -> dict[str, bool]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`; every program Dew compiles over a model takes them.
+    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model or
+    autoencoder, or over an objective's modules, takes them. JAX takes compiler options on a
+    program's outermost jit alone, so a module's own jitted method runs under the options of the
+    program that calls it.
 
     XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
     (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
