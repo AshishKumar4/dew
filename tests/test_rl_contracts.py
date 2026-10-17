@@ -3,27 +3,79 @@
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 from process_support import run_pool
-from test_indexer_training import SEQ, deepseek_stack
+from test_indexer_training import SEQ, VOCAB, deepseek_stack
 
+from dew.data.preferences import MASK_KEY
 from dew.nn.backbones.decoder_block import Mixture
+from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective, GRPOObjective
+from dew.objectives.rl.sessions import (
+    ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
+    IDS_KEY,
+    OLD_LOG_PROBS_KEY,
+    POSITIONS_KEY,
+    RESPONSE_MASK_KEY,
+    SEGMENT_IDS_KEY,
+)
 
 WORKER = Path(__file__).with_name("rl_contracts_worker.py")
 
 
+def scored_batch(objective) -> tuple[dict, jax.Array]:
+    """Two rows of SEQ + 1 ids, each with a four-id prompt: a pair for DPO, two one-chain packed
+    rows with drawn likelihoods and advantages for GRPO. With them, the rows the loss scores."""
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, VOCAB, (2, SEQ + 1)).astype(np.int32)
+    mask = np.ones((2, SEQ + 1), np.float32)
+    mask[:, :4] = 0
+    if objective is DPOObjective:
+        pair = {IDS_KEY: jnp.asarray(ids[None]), MASK_KEY: jnp.asarray(mask[None], jnp.int32)}
+        return pair, jnp.asarray(ids)
+    drawn = np.where(mask != 0, -rng.random((2, SEQ + 1)), 0).astype(np.float32)
+    return {
+        IDS_KEY: jnp.asarray(ids),
+        SEGMENT_IDS_KEY: jnp.ones((2, SEQ + 1), jnp.int32),
+        POSITIONS_KEY: jnp.tile(jnp.arange(SEQ + 1, dtype=jnp.int32), (2, 1)),
+        OLD_LOG_PROBS_KEY: jnp.asarray(drawn),
+        BEHAVIOR_LOG_PROBS_KEY: jnp.asarray(drawn),
+        ADVANTAGES_KEY: jnp.asarray(np.where(mask != 0, rng.normal(0, 1, (2, SEQ + 1)), 0), jnp.float32),
+        RESPONSE_MASK_KEY: jnp.asarray(mask),
+    }, jnp.asarray(ids)
+
+
 @pytest.mark.parametrize("objective", [GRPOObjective, DPOObjective])
-def test_policy_losses_take_the_scorers_options_and_train_the_whole_decoder(objective):
-    """A policy or preference loss over a routed decoder with prediction depths takes the token
-    scorer's options alone: the head's chunks, tile, pad id and reports, and every parameter
-    trains, its reference frozen beside them where it reads one."""
+def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima(objective):
+    """A policy or preference loss over a routed decoder with prediction depths scores its tokens
+    through the token scorer. The head's chunks and tile change how the head runs, not the loss
+    or its gradient; `qk_stats` reports, for the optimizer's QK-Clip, the per-head logit maxima of
+    the policy's own forward, not of the frozen reference it also runs, and nothing without it."""
     model = deepseek_stack(None, mixture=Mixture(experts=4, top_k=2), num_nextn_predict_layers=1)
-    built = objective(model, SEQ, head_chunks=2, head_tile="tiled", pad_id=0, qk_stats=False,
-                      token_accuracy=False)
-    assert (built.head_chunks, built.pad_id, built.token_accuracy) == (2, 0, False)
-    variables = built.init(jax.random.key(0))
-    assert set(variables) == {"params"}
+    plain = objective(model, SEQ, 0.1)
+    variables = plain.init(jax.random.key(0))
+    reference = jax.tree.map(lambda leaf: leaf * 0.9, variables)
+    batch, rows = scored_batch(objective)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=reference)
+
+    def trained(built):
+        (loss, aux), gradient = jax.value_and_grad(built.scalar_loss, has_aux=True)(variables, batch, step)
+        return loss, gradient, aux.qk_stats
+
+    loss, gradient, qk = trained(plain)
+    assert qk is None
+    headed = objective(model, SEQ, 0.1, head_chunks=2, head_tile="whole", qk_stats=True)
+    headed_loss, headed_gradient, qk = trained(headed)
+    np.testing.assert_allclose(headed_loss, loss, rtol=1e-5)
+    jax.tree.map(lambda found, expected: np.testing.assert_allclose(found, expected, rtol=1e-4, atol=1e-6),
+                 headed_gradient, gradient)
+    own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
+    jax.tree.map(np.testing.assert_allclose, qk, own)
+    assert not all(np.allclose(found, other) for found, other in zip(
+        jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))
 
 
 @pytest.mark.mesh
