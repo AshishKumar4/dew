@@ -29,6 +29,17 @@ class Residual(nn.Module):
         return x + self.inner(self.norm(x))
 
 
+class Tagged(nn.Module):
+    """A user module whose `tags` are plain JSON data, beside one layer it holds twice."""
+
+    later: nn.Dense
+    earlier: nn.Dense
+    tags: dict[str, object]
+
+    def __call__(self, x):
+        return self.earlier(self.later(x))
+
+
 def models() -> dict[str, nn.Module]:
     shared = nn.Dense(8)
     return {"sequential": nn.Sequential([nn.Dense(16), nn.LayerNorm(), nn.Dense(8, use_bias=False)]),
@@ -69,3 +80,21 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
     assert done.returncode == 0, done.stderr[-2000:]
     assert json.loads(done.stdout.splitlines()[-1]) == expected
     assert expected["shared"][1] == ["layers_0"] and expected["separate"][1] == ["layers_0", "layers_1"]
+
+
+def test_data_shaped_like_a_shared_module_stays_data_beside_a_real_one():
+    """`tags` holds mappings shaped like shared-module definitions, the same
+    number twice and the number the real shared layer takes. They are data,
+    so the record reads them back as written; and with its keys sorted, the
+    record refers to the shared layer (`earlier`) before defining it
+    (`later`), and still builds one layer with one set of weights."""
+    shared = nn.Dense(8)
+    tags = {"a": {"class": "row", "share": 0}, "b": {"class": "row", "share": 0}}
+    model = Tagged(later=shared, earlier=shared, tags=tags)
+    x = jax.random.normal(jax.random.key(1), (2, 8))
+    params = model.init(jax.random.key(0), x)
+    record = json.loads(json.dumps(to_record(ModelConfig.from_model(model), ModelConfig), sort_keys=True))
+    rebuilt = ModelConfig.from_dict(record).build()
+    assert rebuilt.tags == tags
+    assert sorted(params["params"]) == ["later"]
+    np.testing.assert_array_equal(rebuilt.apply(params, x), model.apply(params, x))
