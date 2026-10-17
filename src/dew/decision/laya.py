@@ -135,6 +135,8 @@ class LayaCheckpoint:
         layout = MarkerLayout(
             max_len=records.integer(config.get("max_len", 512), "max_len"),
             head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
+            option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
+                                          "option_tokens"),
             parallel=config.get("option_layout", "sequential") == "parallel")
         tokenizer = HFTokenizer(str(directory / "tokenizer"), local_files_only=True)
         hf = tokenizer.tokenizer
@@ -182,7 +184,7 @@ class LayaCheckpoint:
         self.tokenizer.save_pretrained(root / "tokenizer")
         (root / CONFIG_FILE).write_text(json.dumps({
             "head_layers": head.layers, "max_len": self.layout.max_len,
-            "head_max_len": self.layout.head_max_len,
+            "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
             "option_layout": "parallel" if self.layout.parallel else "sequential",
             "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
         }, indent=2) + "\n")

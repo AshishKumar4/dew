@@ -478,8 +478,8 @@ class Decide:
         return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, reader: Reader) -> list[Scored]:
-        """Each answered question of `reader`'s rows, with its raw logits in the
-        order the row shows its options and its label."""
+        """Each answered question of `reader`'s rows, with its raw logits and its
+        gold distribution in the order the row shows its options."""
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
@@ -490,7 +490,7 @@ class Decide:
             for row, slot in zip(*np.nonzero(answered), strict=True):
                 count = int(np.sum(batch["options"][row, slot]))
                 scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],
-                                     int(batch["labels"][row, slot])))
+                                     np.asarray(batch["targets"][row, slot, :count], np.float64)))
         return scored
 
     def gated(self, min_confidence: float | Mapping[str, float]) -> Self:
