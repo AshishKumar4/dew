@@ -34,6 +34,8 @@ GENERAL = {
     "two-axes": (lambda general: general(4, axis=(-1, -2)), jnp.float32, (3, 5, 6)),
     "batch-dims": (lambda general: general(4, batch_dims=(0,), axis=-1), jnp.float32, (3, 5, 6)),
     "partitioned": (lambda general: general((2, 4), kernel_init=PARTITIONED), jnp.float32, (3, 5, 6)),
+    "array-axes": (lambda general: general(np.array([2, 4]), axis=np.array([-1, -2])),
+                   jnp.float32, (3, 5, 6)),
 }
 CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
          + [(f"general-{name}", DenseGeneral, nn.DenseGeneral, *case) for name, case in GENERAL.items()])
@@ -76,6 +78,13 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer):
     truth = terms.sum(0).reshape(got.shape)
     reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
     assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
+
+
+def test_dense_general_refuses_an_axis_beyond_its_input_as_flaxs_does():
+    x = jnp.ones((3, 6))
+    for general in (DenseGeneral, nn.DenseGeneral):
+        with pytest.raises((ValueError, IndexError, TypeError)):
+            general(4, axis=2).init(jax.random.key(0), x)
 
 
 class _Host(nn.Module):
