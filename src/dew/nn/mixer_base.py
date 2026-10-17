@@ -160,6 +160,12 @@ class MixerBase:
     would, or keeps no cache for it to read: one that does not read the
     call's layout would take its one row of tokens as one sequence."""
 
+    def mixed_refusal(self, ctx: MixerContext) -> str | None:
+        """Why the mixer this kind builds over `ctx` would not run a server's
+        mixed call as the separate calls would, or None: by default, unless
+        it declares `mixed_step`."""
+        return None if self.mixed_step else f"{type(self).__name__}'s cache, which a mixed step does not run"
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(

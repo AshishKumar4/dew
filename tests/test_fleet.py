@@ -3,12 +3,15 @@
 Every check runs an actual interpreter under the fleet's limits: a program
 that completes, one that fails, one that sleeps past the wall clock, one that
 spins past its CPU time, one that allocates past its memory, one that floods
-its output, one killed by a signal, and one whose forked child must not
-outlive the timeout. The verifiable rewards score completions through the
+its output, one killed by a signal, one whose forked child must not outlive
+the timeout, and one that sleeps quietly while its collector waits without
+polling. The verifiable rewards score completions through the
 same fleet. The container runner repeats the boundary checks when a Docker
-daemon and the image are present locally.
+daemon and the image are present locally; a runtime that starts no
+container or stalls removing one is an infrastructure failure either way.
 """
 
+import resource
 import shutil
 import subprocess
 import sys
@@ -17,7 +20,16 @@ import time
 import pytest
 from tool_support import load
 
-from dew.rl.sandbox import ContainerRunner, MathReward, Program, SandboxFleet, SandboxLimits, Verdict
+from dew.inference import InfrastructureError
+from dew.rl.sandbox import (
+    ContainerRunner,
+    MathReward,
+    ProcessRunner,
+    Program,
+    SandboxFleet,
+    SandboxLimits,
+    Verdict,
+)
 
 RLVR = load("train_rlvr", "examples")
 CodeReward, code_block = RLVR.CodeReward, RLVR.code_block
@@ -97,6 +109,17 @@ def test_a_signal_is_a_crash_and_a_flood_is_cut_off(fleet):
     assert len(flooded.stdout) <= SandboxLimits().message_bytes + 65536
 
 
+def test_a_quiet_program_does_not_wake_its_collector_until_it_ends():
+    """The runner waits on the program's pipes and its deadline, not on a polling interval: a
+    program that sleeps two seconds without output costs its collecting thread a handful of
+    wakeups (start, exit, reap), where a tenth-of-a-second poll would cost twenty."""
+    before = resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw
+    outcome = ProcessRunner()(program("import time\ntime.sleep(2)"), SandboxLimits(wall_seconds=10))
+    wakeups = resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw - before
+    assert outcome.verdict is Verdict.COMPLETED and outcome.seconds >= 2
+    assert wakeups < 10, f"the collector woke {wakeups} times while the program slept"
+
+
 def test_programs_run_concurrently_and_return_in_order():
     with SandboxFleet(limits=SandboxLimits(wall_seconds=20), workers=4) as fleet:
         began = time.monotonic()
@@ -170,9 +193,25 @@ def test_a_runtime_that_cannot_start_the_container_raises():
     # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
     with (
         SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet,
-        pytest.raises(RuntimeError),
+        pytest.raises(InfrastructureError),
     ):
         fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+
+
+def test_a_runtime_that_stalls_removing_the_container_is_an_infrastructure_failure(tmp_path):
+    """A wedged runtime: `run` never returns, so the program times out, and the `rm --force` that
+    cleans up after it hangs too. The removal's own bound ends in an InfrastructureError, which a
+    session source retries, with the timeout as its cause."""
+    runtime = tmp_path / "runtime"
+    runtime.write_text("#!/bin/sh\nexec sleep 300\n")
+    runtime.chmod(0o755)
+    with (
+        SandboxFleet(ContainerRunner(IMAGE, runtime=str(runtime)), limits=SandboxLimits(wall_seconds=1),
+                     workers=1) as fleet,
+        pytest.raises(InfrastructureError) as caught,
+    ):
+        fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")

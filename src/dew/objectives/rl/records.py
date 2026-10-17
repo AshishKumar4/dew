@@ -40,11 +40,11 @@ def action_record(value: Mapping[str, object]) -> Action:
     from dew.registry import from_record
 
     record = section(value, "action")
-    terminated = record["terminated"]
+    terminated, raw = record["terminated"], record["raw_log_probs"]
     if not isinstance(terminated, bool):
         raise ValueError("episode terminated must be a boolean")
     return Action(integers(record["context"], "context"), integers(record["tokens"], "tokens"),
-                  reals(record["raw_log_probs"], "raw_log_probs"),
+                  None if raw is None else reals(raw, "raw_log_probs"),
                   reals(record["behavior_log_probs"], "behavior_log_probs"),
                   terminated, integer(record["policy_step"], "policy_step"),
                   from_record(Sampling, section(record["sampling"], "sampling"), dtypes=False),

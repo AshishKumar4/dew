@@ -29,11 +29,11 @@ VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 
 
 def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
-              **fields) -> LMObjective:
+              parallel: bool = False, **fields) -> LMObjective:
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=LAYERS, num_heads=2, num_kv_heads=1,
         mlp_features=64, max_seq_len=SEQ_LEN, scan_layers=scan, dtype=dtype,
-        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, layers=layers), **fields)
+        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, layers=layers, parallel=parallel), **fields)
     return LMObjective(model, SEQ_LEN)
 
 
@@ -137,6 +137,53 @@ def test_the_gate_keeps_its_gradient_under_replay():
     numeric = (loss(kernel + step * direction) - loss(kernel - step * direction)) / (2 * step)
     assert float(jnp.abs(gradient).sum()) > 0
     np.testing.assert_allclose(float(jnp.vdot(gradient, direction)), float(numeric), rtol=2e-2)
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["router", "gemma4"])
+def test_a_replayed_pair_weighs_alike_however_far_below_the_routers_own_choice(parallel):
+    """Two replayed experts whose logits are equal share each token's weight
+    equally, whether every other expert's logit sits thousands above theirs
+    or all are zero: their weights are the softmax of their own two logits.
+    The full softmax's probabilities underflow to zero at that distance,
+    which Gemma 4's renormalization turned into NaN and the shared router's
+    into a dropped branch. The two experts are copies, so either router
+    scores the same losses and gradients, bit for bit, the router's own
+    gradient zero and the pair's not."""
+    obj = objective(parallel=parallel)
+    params = obj.init(jax.random.key(0))
+    tokens = tokens_of(2)
+    direction = jax.random.normal(jax.random.key(5), (32, 1))
+    pair = np.isin(np.arange(EXPERTS), (1, 2))
+    apart = 1e4 * direction / jnp.linalg.norm(direction) * np.where(pair, -1.0, 1.0)
+
+    def router(path) -> bool:
+        names = [entry.key for entry in path]
+        return names[-2:] == ["gate", "kernel"] or names[-3:] == ["router", "proj", "kernel"]
+
+    def expert(path) -> bool:
+        return "experts" in [entry.key for entry in path]
+
+    def routers(kernel):
+        # The pair's experts are copies of one another.
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: jnp.broadcast_to(kernel, leaf.shape) if router(path)
+            else leaf.at[2].set(leaf[1]) if expert(path) else leaf, params)
+
+    routed = np.broadcast_to(np.asarray([1, 2], np.uint8), (2, SEQ_LEN + 1, LAYERS, TOP_K))
+
+    def scored(tree):
+        def loss(variables):
+            log_probs = replayed_log_probs(obj, variables, tokens, (routed, None))
+            return jnp.sum(log_probs), log_probs
+        (_, log_probs), gradient = jax.value_and_grad(loss, has_aux=True)(tree)
+        return log_probs, gradient
+
+    far, near = scored(routers(apart)), scored(routers(jnp.zeros((32, EXPERTS))))
+    for got, want in zip(jax.tree.leaves(far), jax.tree.leaves(near), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    gradients = jax.tree_util.tree_leaves_with_path(far[1])
+    assert all(not np.any(np.asarray(leaf)) for path, leaf in gradients if router(path))
+    assert all(np.any(np.asarray(leaf)[1:3]) for path, leaf in gradients if expert(path))
 
 
 def test_tokens_without_a_record_keep_the_routers_own_choice():
