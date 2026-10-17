@@ -395,9 +395,12 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
 def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
     """`quotients`, already divided by their scales, cast to `qtype` as a Qwix QArray of unit scale:
     a fixed range of the type's own bound gives a scale of exactly one (448 over E4M3's 448, 6 over
-    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale."""
-    bound = 448 if qtype == jnp.float8_e4m3fn else 6
-    return qwix.quantize(quotients, qtype, calibration_method=f"fixed,{bound}")
+    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale. NVFP4
+    names its 16-wide blocks along the last axis, which Qwix requires of it and a fixed range,
+    always per tensor, leaves unread."""
+    if qtype == jnp.float8_e4m3fn:
+        return qwix.quantize(quotients, qtype, calibration_method="fixed,448")
+    return qwix.quantize(quotients, qtype, tiled_axes={quotients.ndim - 1: 16}, calibration_method="fixed,6")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
