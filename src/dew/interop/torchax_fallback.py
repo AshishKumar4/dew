@@ -138,8 +138,9 @@ class TorchGraph:
     """The transformers module torchax runs, as a function of its tensors.
 
     `head` names the output head's weight when the logits are exactly
-    `hidden @ head.T`, checked at load; None when the model adds anything
-    (a bias, a scale, a softcap). `persistent` names the buffers the source
+    `hidden @ head.T` and train as that product, checked at load
+    (`_plain_head`); None when the model adds anything after it (a bias,
+    zero or not, a scale, a softcap). `persistent` names the buffers the source
     checkpoint stores. A training forward runs the module's own training
     forward, its dropout and other draws taking `key` as torchax's random
     key; one that draws on the host instead (OPT's layer drop,
@@ -243,12 +244,11 @@ class TorchCausalLM(nn.Module):
     theirs. A training forward runs the module's own, its dropout drawing
     from the 'dropout' rng (`TorchGraph`).
 
-    `hidden_states` and `output_table` are the pair `LMObjective` scores
-    through, so the vocabulary-sized logits are never built whole. Only a
-    model whose logits are the plain head product (`TorchGraph`) has an
-    `output_table`. The reads take plain token rows:
-    transformers' forward runs with no packing columns and no cache, so a
-    packing field is refused by name and there is no cached decode.
+    A loss scores its whole logits (`Logits`). A model whose logits are the
+    plain head product loads as `TorchTableLM` instead, which `LMObjective`
+    scores through its head input and head weight. The reads take plain
+    token rows: transformers' forward runs with no packing columns and no
+    cache, so a packing field is refused by name and there is no cached decode.
     """
 
     graph: TorchGraph
@@ -276,27 +276,10 @@ class TorchCausalLM(nn.Module):
         logits, _ = self._run(tokens, train)
         return logits.astype(jnp.float32)
 
-    def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
-        """The states the output head reads, `[B, S, features]`."""
-        _refuse_packing(packing)
-        _, hidden = self._run(tokens, train)
-        return hidden
-
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The fp32 logits of the whole rows, as `__call__` returns them."""
         _refuse_packing(packing)
         return self(tokens, train=train)
-
-    def output_table(self) -> OutputTable | None:
-        """The output head's `[vocab, features]` torch weight as the bound params
-        hold it, the parameter a loss keeps, with the forward's compute dtype,
-        which casts the product's operands as the forward casts them whatever
-        dtype the states arrive in (`head_product`); or None when the logits are
-        not its plain product."""
-        if self.graph.head is None:
-            return None
-        return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
-                           precision=self.precision, compute=self.dtype)
 
     def _run(self, tokens, train: bool) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
@@ -314,6 +297,28 @@ class TorchCausalLM(nn.Module):
         if self.dtype is None or not jnp.issubdtype(value.dtype, jnp.floating):
             return value
         return value.astype(self.dtype)
+
+
+class TorchTableLM(TorchCausalLM):
+    """A `TorchCausalLM` whose logits are its head input times its head weight
+    (`TorchGraph.head`), the pair `LMObjective` scores through, so the
+    vocabulary-sized logits are never built whole."""
+
+    def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
+        """The states the output head reads, `[B, S, features]`."""
+        _refuse_packing(packing)
+        _, hidden = self._run(tokens, train)
+        return hidden
+
+    def output_table(self) -> OutputTable:
+        """The output head's `[vocab, features]` torch weight as the bound params
+        hold it, the parameter a loss keeps, with the forward's compute dtype,
+        which casts the product's operands as the forward casts them whatever
+        dtype the states arrive in (`head_product`)."""
+        if self.graph.head is None:
+            raise ValueError("this model's logits are not its plain head product; load it as TorchCausalLM")
+        return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
+                           precision=self.precision, compute=self.dtype)
 
 
 def _refuse_packing(packing: Mapping[str, object]) -> None:
@@ -387,7 +392,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, head_name, persistent)
-    module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
+    module = (TorchCausalLM if head_name is None else TorchTableLM)(graph, vocab, dtype=resolve_dtype(dtype))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
@@ -403,14 +408,28 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
 
 
 def _plain_head(model: PreTrainedModel, weight: torch.Tensor) -> bool:
-    """Whether `model`'s logits are exactly its head input times the head weight.
+    """Whether `model`'s logits are its head input times the head weight, in
+    value and in training.
 
-    Both sides run the same torch matmul on the same states, so any bias,
-    scale or cap the model applies breaks equality, and nothing else does.
+    Both sides run the same torch matmul on the same states, so a scale or a
+    cap the model applies breaks the values' equality. A term whose value
+    happens to vanish does not (Phi's lm_head.bias starts at zero), so the
+    gradients of one random weighting of the two must be equal too, for every
+    parameter: a bias, a trainable scale or anything past the head input
+    takes gradient through the logits and none through the product.
     """
     import torch
 
     tokens = torch.arange(min(8, int(weight.shape[0])))[None]
-    with torch.no_grad():
+    trained = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    with torch.enable_grad():
         logits, hidden = _forward(model, tokens)
-        return bool(torch.equal(logits, torch.nn.functional.linear(hidden, weight)))
+        product = torch.nn.functional.linear(hidden, weight)
+        if not torch.equal(logits, product):
+            return False
+        cotangent = torch.randn(logits.shape, generator=torch.Generator().manual_seed(0), dtype=logits.dtype)
+        through = torch.autograd.grad((logits * cotangent).sum(), trained, retain_graph=True,
+                                      allow_unused=True)
+        plain = torch.autograd.grad((product * cotangent).sum(), trained, allow_unused=True)
+    return all((a is None and b is None) or (a is not None and b is not None and torch.equal(a, b))
+               for a, b in zip(through, plain, strict=True))
