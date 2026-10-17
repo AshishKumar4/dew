@@ -185,7 +185,7 @@ class TextData(_Loadable):
             raise ValueError(
                 "token-store validation uses its named split; slice a windows Pipeline for HoldOut"
             )
-        if held is None and stored.metadata().get("val_tokens", 0):
+        if held is None and stored.holds("val"):
             held = _named_split(stored, "val")
         sources = (stored, None if held is None or isinstance(held, Pipeline) else _source(held))
 
