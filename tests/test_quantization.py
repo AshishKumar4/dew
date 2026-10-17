@@ -12,7 +12,6 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
-import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -938,27 +937,29 @@ def placed(tree, dtype):
                                                  else leaf.dtype), tree)
 
 
-def under_xla_defaults(flow) -> None:
-    """Run `flow`, a function of this module, in a fresh process under the lane's flags without its
-    repeatable ones (`lane_environment.REPEATABLE_GPU_FLAGS`), as a run compiles. Those take Triton
-    out of XLA's GEMM configurations, and so hide what its Triton fusion computes; XLA reads its
-    flags once a process."""
+def with_triton_gemms(flow) -> None:
+    """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
+    two that keep XLA's Triton GEMM fusion out of a program: deterministic ops and
+    `--xla_gpu_enable_triton_gemm=false` (tests/lane_environment.py's `REPEATABLE_GPU_FLAGS`). Its pinned
+    autotuning then gives every GEMM a program leaves to Triton the fusion, as XLA's own autotuner
+    does at small contractions, where it computed int8 dots as two or four times their product
+    (openxla/xla#51016). XLA reads its flags once a process."""
     here = Path(__file__).resolve().parent
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if flag not in lane_environment.REPEATABLE_GPU_FLAGS]
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
                          cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
-                              "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                              "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
 
 
 def test_a_served_int8_text_task_scores_its_draws_as_the_host_does():
     """`TextGeneration.quantized` in int8 draws greedily and scores each draw (its raw
     log-probabilities) as the same task on the host does: the device's int8 products are its
-    operands' products. Under XLA's defaults (`under_xla_defaults`)."""
-    under_xla_defaults(served_text_flow)
+    operands' products. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(served_text_flow)
 
 
 def served_text_flow():
@@ -980,8 +981,9 @@ def served_text_flow():
 
 def test_an_int8_image_task_walks_as_the_host_does():
     """`TextToImage.quantized` in int8 walks a prompt's latents as the same task does on the host,
-    from the same quantized weights and encoded prompt. Under XLA's defaults (`under_xla_defaults`)."""
-    under_xla_defaults(image_flow)
+    from the same quantized weights and encoded prompt. With Triton's GEMMs open to XLA
+    (`with_triton_gemms`)."""
+    with_triton_gemms(image_flow)
 
 
 def image_flow():
@@ -1003,8 +1005,8 @@ def image_flow():
 
 def test_an_int8_decision_task_answers_as_the_host_does():
     """`Decide` over a backbone quantized to int8 gives each option the probability the same task
-    gives it on the host. Under XLA's defaults (`under_xla_defaults`)."""
-    under_xla_defaults(decision_flow)
+    gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(decision_flow)
 
 
 def decision_flow():
@@ -1031,9 +1033,9 @@ def decision_flow():
 
 def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
-    of its loss that the host computes, from its forward's int8 products. Under XLA's defaults
-    (`under_xla_defaults`)."""
-    under_xla_defaults(training_flow)
+    of its loss that the host computes, from its forward's int8 products. With Triton's GEMMs open
+    to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(training_flow)
 
 
 def training_flow():
