@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from .common import _check_distinct_levels, _check_endpoint_domain, _push
+from .common import _check_endpoint_domain, _push
 
 
 class UniPCState(NamedTuple):
@@ -181,14 +181,16 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
-        # The corrector at point j divides by the interval before it, unless `disable_corrector` names it.
-        corrected = [j for j in range(1, times.shape[0] - 1) if j - 1 not in self.disable_corrector]
-        if self.order > 1 or corrected:
-            _check_distinct_levels(process, times, reason="UniPC's corrector and higher orders divide by")
         with jax.ensure_compile_time_eval():
             alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
+        # The tables hold every division a walk takes: one over an interval of no length is not finite.
+        with np.errstate(divide="ignore", invalid="ignore"):
             corrector, predictor = _unipc_tables(np.asarray(alpha, np.float64), np.asarray(sigma, np.float64),
                                                  self)
+        if not (np.isfinite(corrector).all() and np.isfinite(predictor).all()):
+            raise ValueError("two points of the grid have one noise level, an interval of no length that "
+                             "UniPC's corrector or higher orders divide by; take fewer steps, another "
+                             "spacing or a lower order")
         return UniPCState(jnp.zeros((self.order, *x.shape), x.dtype), x, jnp.zeros((), jnp.int32),
                           jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32),
                           jnp.asarray(times, jnp.float32), jnp.asarray(corrector, jnp.float32),

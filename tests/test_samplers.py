@@ -407,6 +407,30 @@ def test_video_samples_converge(solver):
     assert_gaussian_stats(generate(process, model, solver, steps=50, count=64, shape=(3, 8, 8, 3)))
 
 
+@pytest.mark.parametrize("solver, times, walks", [
+    (DPMSolverMultistep(order=2), [0.9, 0.9, 0.1], True),
+    (DEIS(order=2), [0.9, 0.9, 0.1], True),
+    (DPMSolverSinglestep(order=2), [0.9, 0.5, 0.5, 0.1], True),
+    (UniPC(order=1), [0.9, 0.9, 0.5, 0.1], True),
+    (DPMSolverMultistep(order=2, lower_order_final=False), [0.9, 0.9, 0.1], False),
+    (UniPC(order=2), [0.9, 0.9, 0.5, 0.1], False),
+], ids=["dpm_multi", "deis", "dpm_single", "unipc.order1", "dpm_multi.second_order", "unipc.order2"])
+def test_only_an_update_that_divides_by_an_empty_interval_refuses_it(solver, times, walks):
+    """A grid with two points at one level walks wherever no update divides by the gap between
+    them. A first-order step over it stays where it is: the multistep solvers' first step, which
+    has no history, the short walk's tapered last step, a singlestep group's second step, whose
+    anchor and target are apart, and a first-order UniPC's predictor and corrector, all walk to
+    finite latents. An update of higher order over the same interval divides by it, and refuses
+    the grid before the walk runs."""
+    process, model = flow_process()
+    x_T = jax.random.normal(jax.random.PRNGKey(0), (2, 4))
+    if walks:
+        assert np.isfinite(np.asarray(walk(solver, process, model, x_T, times))).all()
+    else:
+        with pytest.raises(ValueError):
+            walk(solver, process, model, x_T, times)
+
+
 def test_a_key_reproduces_a_trajectory():
     """Nothing lives on a solver between calls: a multistep solver's history
     travels in its state, so the same key gives the same samples twice."""
