@@ -459,10 +459,27 @@ def _relay(rank: int, stream: TextIO, tail: collections.deque[str]) -> None:
         emit(f"[{rank}] {text}")
 
 
+def _signalled(group: int, signum: int) -> bool:
+    """Send `signum` to process group `group`, whether a process of it was there to take it."""
+    try:
+        os.killpg(group, signum)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _held(child: subprocess.Popen) -> bool:
+    """Whether a rank's process group still holds a process: its own, or one it started, which its
+    exit leaves running on in the group (a data worker, a server). Its own exit is reaped first,
+    which a group of exited processes alone no longer counts."""
+    child.poll()
+    return _signalled(child.pid, 0)
+
+
 def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.Event) -> None:
-    """SIGTERM every process group still alive, give them `grace` seconds to
-    exit, or until `forced` is set, and SIGKILL those still alive, rank 0
-    last.
+    """SIGTERM every rank's process group that still holds a process, its rank
+    exited or not, give them `grace` seconds to exit, or until `forced` is set,
+    and SIGKILL those still held, rank 0 last.
 
     A JAX process of a pool takes SIGTERM as a preemption notice
     (jax_enable_preemption_service): `Trainer.fit` checkpoints at the step
@@ -471,17 +488,18 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     service, and a rank that outlives it aborts in XLA's error polling, with
     a Check failure that reads as a crash of its own.
     """
+    # Each rank leads a session of its own (`supervise`), whose group its pid names.
     for child in running:
-        if child.poll() is None:
-            os.killpg(child.pid, signal.SIGTERM)
+        if _held(child):
+            _signalled(child.pid, signal.SIGTERM)
     deadline = time.monotonic() + grace
     while (not forced.is_set() and time.monotonic() < deadline
-           and any(child.poll() is None for child in running)):
+           and any(_held(child) for child in running)):
         time.sleep(POLL_SECONDS)
     for child in (*running[1:], *running[:1]):
-        if child.poll() is None:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
+        if _held(child):
+            _signalled(child.pid, signal.SIGKILL)
+        child.wait()
 
 
 class Stopped(BaseException):
