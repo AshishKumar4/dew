@@ -25,7 +25,7 @@ from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
+from dew.objectives.base import Aux, EMASpec, Ratio, Shown, Variables, thaw
 from dew.objectives.lm.chunked import final_read, head_cross_entropy
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
@@ -36,9 +36,7 @@ from dew.rl.surrogate import (
     sequence_rejection_mask,
 )
 
-from ..lm import LMObjective
-from ..lm.objective import _shift_rows, _unpadded
-from ._lm import check_lm_terms
+from ..lm.objective import TokenScorer, _shift_rows, _unpadded
 from .sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -97,7 +95,7 @@ def _band(name: str, band) -> tuple[float, float] | None:
     return low, high
 
 
-class GRPOObjective(LMObjective):
+class GRPOObjective(TokenScorer):
     """Trains a policy on sampled rollouts with the GRPO loss (arXiv:2402.03300, equation 4).
 
     By default the loss is verl's: the dual-clipped surrogate, averaged over
@@ -108,10 +106,10 @@ class GRPOObjective(LMObjective):
 
     `beta` is the KL strength, and at 0.0 no frozen reference is allocated.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points.
-    `model` and `seq_len` are as in `LMObjective`, with `seq_len` one less
-    than the row width. An `ema_decay` other than None is refused, and so is
-    `loss_role`, because the response mask already says which targets count.
-    Auxiliary LM training terms are refused because this loss does not apply them.
+    `model`, `seq_len` and the scoring `options` are `TokenScorer`'s, with
+    `seq_len` one less than the row width; the response mask says which
+    targets count. A positive `beta` reads the starting policy, frozen at unit
+    decay, as the reference.
 
     `policy_loss` picks the surrogate:
 
@@ -165,37 +163,22 @@ class GRPOObjective(LMObjective):
 
     keeps_whole_logits = False
 
-    def data(self, tokenizer=None):
-        """No steps of its own: the batch holds the prompts or tasks a rollout
-        reads (`prompts.encode`, `task_id` rows), which LM's text windows would
-        cut, and the rollout packs the rows the loss scores."""
-        from dew.data.pipeline import ObjectiveData
-
-        return ObjectiveData()
-
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
                  dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",
                  behavior_importance: float | tuple[float, float] | None = None,
                  sequence_mask: tuple[float, float] | None = None,
                  geometric_mask: tuple[float, float] | None = None,
-                 sampling_temperature: float = 1.0, **kwargs):
+                 sampling_temperature: float = 1.0, **options):
         if beta < 0:
             raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
-        if kwargs.get("ema_decay") is not None:
-            raise ValueError(
-                "the GRPO reference is frozen at unit decay, so ema_decay is refused")
-        if kwargs.get("loss_role") is not None:
-            raise ValueError(
-                "the response mask already says which targets count, "
-                "so loss_role is refused on a GRPO objective")
-        check_lm_terms(kwargs)
         if policy_loss not in POLICY_LOSSES:
             raise ValueError(f"policy_loss must be one of {POLICY_LOSSES}, got {policy_loss!r}")
         if aggregation not in AGGREGATIONS:
             raise ValueError(f"aggregation must be one of {AGGREGATIONS}, got {aggregation!r}")
-        kwargs["ema_decay"] = 1.0 if beta > 0 else None
-        super().__init__(model, seq_len, **kwargs)
+        super().__init__(model, seq_len, **options)
+        # The reference is the starting policy, frozen at unit decay, where a KL term reads it.
+        self.ema = EMASpec.constant(1.0 if beta > 0 else None)
         # The batch is packed `input_ids` rows, not the LM's text windows.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (seq_len + 1,)))
         self.beta = beta

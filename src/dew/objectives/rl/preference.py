@@ -1,7 +1,7 @@
 """Direct preference optimization over chosen and rejected completions.
 
-A `DPOObjective` is an `LMObjective` whose loss is the preference term from
-`dew.rl` instead of the cross entropy: policy and reference log-probabilities
+A `DPOObjective` scores tokens as `LMObjective` does (`TokenScorer`), and its
+loss is the preference term from `dew.rl`: policy and reference log-probabilities
 as negated per-token cross entropies, summed under the shifted completion
 mask, through `preference_logsigmoid_terms`, averaged over pairs. The reference is the objective's own
 frozen tree, `step.ema` at unit decay, so the run carries no second model.
@@ -16,23 +16,21 @@ import jax.numpy as jnp
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, Variables
+from dew.objectives.base import Aux, EMASpec, Variables
 from dew.rl.surrogate import preference_logsigmoid_terms
 
-from ..lm import LMObjective
-from ._lm import check_lm_terms
+from ..lm.objective import TokenScorer
 
 
-class DPOObjective(LMObjective):
+class DPOObjective(TokenScorer):
     """Trains a policy on preference pairs with the DPO loss (arXiv:2305.18290, equation 7).
 
-    The reference is the starting policy, frozen. `beta` is the KL strength
-    and must be positive. `model` and `seq_len` are as in `LMObjective`, with
-    `seq_len` one less than the row width. The reference never moves, so an
-    `ema_decay` other than None is refused, and so is `loss_role`, because the
-    completion mask already says which targets count. Validation scores the
-    chosen responses' perplexity under the policy.
-    Auxiliary LM training terms are refused because this loss does not apply them.
+    The reference is the starting policy, frozen: the objective's average at
+    unit decay. `beta` is the KL strength and must be positive. `model`,
+    `seq_len` and the scoring `options` are `TokenScorer`'s, with `seq_len`
+    one less than the row width; the completion mask says which targets
+    count. Validation scores the chosen responses' perplexity under the
+    policy.
     """
 
     _ema_is_reference = True
@@ -41,29 +39,14 @@ class DPOObjective(LMObjective):
 
     keeps_whole_logits = False
 
-    def __init__(self, model, seq_len: int, beta: float = 0.1, **kwargs):
+    def __init__(self, model, seq_len: int, beta: float = 0.1, **options):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")
-        if kwargs.get("ema_decay") is not None:
-            raise ValueError(
-                "the DPO reference is frozen at unit decay, so ema_decay is refused")
-        if kwargs.get("loss_role") is not None:
-            raise ValueError(
-                "the completion mask already says which targets count, "
-                "so loss_role is refused on a DPO objective")
-        check_lm_terms(kwargs)
-        kwargs["ema_decay"] = 1.0
-        super().__init__(model, seq_len, **kwargs)
+        super().__init__(model, seq_len, **options)
+        self.ema = EMASpec.constant(1.0)
         # The batch is `input_ids` pairs, chosen then rejected, not text windows.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (2, seq_len + 1)))
         self.beta = beta
-
-    def data(self, tokenizer=None):
-        """No steps of its own: a preference record step (`preferences.pair`)
-        lays out the pairs, which LM's text windows would cut."""
-        from dew.data.pipeline import ObjectiveData
-
-        return ObjectiveData()
 
     def _halves(self, batch):
         """Split the batch into chosen and rejected halves with the shifted mask.
