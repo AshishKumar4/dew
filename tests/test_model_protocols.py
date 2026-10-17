@@ -436,7 +436,7 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     config = transformers.GPTNeoXConfig(num_hidden_layers=2, hidden_size=64, num_attention_heads=4,
                                         intermediate_size=256, vocab_size=256, max_position_embeddings=64)
     transformers.GPTNeoXForCausalLM(config).eval().save_pretrained(tmp_path)
-    with pytest.warns(UserWarning, match="tier 3"):
+    with pytest.warns(UserWarning):
         source = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
     model, variables = source.model, source.variables
     tokens = jnp.asarray(np.random.RandomState(0).randint(0, 256, (ROWS, LENGTH)), jnp.int32)

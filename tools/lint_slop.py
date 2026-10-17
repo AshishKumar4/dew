@@ -842,14 +842,51 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
+CAPTURED = {"readouterr", "text", "messages", "records"}
+"""What pytest's capsys, capfd and caplog fixtures hand a test of the output it captured."""
+
+
+def _captured(node: ast.expr, names: set[str]) -> bool:
+    """Is `node` output a test captured: `capsys.readouterr()`'s or capfd's, its `.out` or `.err`,
+    caplog's `.text`, `.messages` or `.records`, or a name a function bound to one of them?"""
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.Attribute) and node.attr in ("out", "err"):
+        node = node.value
+    if isinstance(node, ast.Call):
+        node = node.func
+    return (isinstance(node, ast.Attribute) and node.attr in CAPTURED
+            and isinstance(node.value, ast.Name) and node.value.id in ("capsys", "capfd", "caplog"))
+
+
+def _spelled_in_captured(node: ast.AST, names: set[str]) -> bool:
+    """Does `node` look for a sentence in captured output: a string the source spells, compared
+    with `in` against it, or counted in it?"""
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.In | ast.NotIn):
+        return (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+                and _captured(node.comparators[0], names))
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "count"
+            and _captured(node.func.value, names) and bool(node.args)
+            and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
+
+
 def wording(module: Module) -> Iterator[Finding]:
-    """SLOP011: a test that checks wording or source text instead of behaviour."""
+    """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
+    warning's text matched, a sentence looked for in captured output, or source text read."""
+    # Names bound to captured output, in any function of the file: a test's name for what it captured.
+    held = {target.id for node in ast.walk(module.tree) if isinstance(node, ast.Assign) and _captured(
+        node.value, set()) for target in node.targets if isinstance(target, ast.Name)}
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if _spelled_in_captured(node, held):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                          "looks for a sentence in captured output; assert the state it reports")
         if isinstance(node, ast.Call):
             called = scopes.resolved(node.func, table)
-            if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
+            if called in ("pytest.raises", "pytest.warns") and any(keyword.arg == "match"
+                                                                   for keyword in node.keywords):
+                raised = "an error" if called == "pytest.raises" else "a warning"
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                              "matches an error's wording; assert the refusal, not its text")
+                              f"matches {raised}'s wording; assert that it is raised, not its text")
             elif called in SOURCE_READERS:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "reads source text; test what the code does")

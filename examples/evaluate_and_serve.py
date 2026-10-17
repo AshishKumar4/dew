@@ -5,16 +5,16 @@ continuations, and, for a diffusion run, CLIPScore of a sampled grid against
 its prompts and FID against a reference set. Everything is read through `dew.pipeline`, so
 a run directory, a published checkpoint and a Hub repository all work.
 
-    python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
+    python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \\
         --tokens data/shakespeare-val --tasks hellaswag arc_easy --harness-limit 200
-    python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
+    python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \\
         --image-run runs/flowers-tpu/checkpoints/flowers-256 \\
         --reference-images data/flowers-heldout
 
 The same suites run from the command line, which is the harness's own entry
 point with Dew's model registered:
 
-    python -m dew.eval --model dew --model_args run=runs/shakespeare/lm-shakespeare \\
+    python -m dew.eval --model dew --model_args run=runs/shakespeare/checkpoints \\
         --tasks hellaswag --limit 200
 
 `--openai-base-url` adds a served comparison: the same prompts through the
