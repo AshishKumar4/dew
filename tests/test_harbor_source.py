@@ -513,8 +513,10 @@ def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp
         resolved = time.monotonic() - began
     finally:
         source.close()
+        # A trial that never resolved has waited the child out in `close`.
         for child in (tmp_path / "trials").glob("*/child.json"):
-            os.kill(json.loads(child.read_text()), 9)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(json.loads(child.read_text()), 9)
     assert rollout.status is Status.CANCELLED and resolved < 20
 
 
