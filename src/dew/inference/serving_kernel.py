@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
 from dew.nn.inputs import Admitted, ModelInputs
+from dew.nn.kernels.generation import compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
@@ -447,7 +448,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     copying it. `rows` places every leaf of an admission, whose rows come
     group by group, the way the slots are placed; None leaves them where they
     are. `options` are the program's own XLA options (`decode_programs`, the
-    model's `dew.training.quantization.compiler_options`); pass XLA_FLAGS to
+    model's `dew.nn.kernels.generation.compiler_options`); pass XLA_FLAGS to
     change the backend's defaults. See docs/performance.md for
     the measurements.
     """
@@ -477,8 +478,6 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else Format(Layout.AUTO, sharding),
                             half, shardings, is_leaf=lambda leaf: leaf is None)
 
-    from dew.training.quantization import compiler_options
-
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
                  grammar)
@@ -507,7 +506,7 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool]
                     ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
     """`_compiled` over `formats`, once per layout and model `options`
-    (`dew.training.quantization.compiler_options`), for the decoding step and
+    (`dew.nn.kernels.generation.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
     layout. The formats tree holds the cache mapping and is not hashable

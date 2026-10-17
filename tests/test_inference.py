@@ -228,12 +228,12 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    compiled = pipelines._run(None)._cache_size()
+    compiled = pipelines._run(None, ())._cache_size()
     for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
         assert not np.allclose(other, first)
     assert np.array_equal(draw(times=grid), first)
     assert np.array_equal(draw(), first)
-    assert pipelines._run(None)._cache_size() == compiled
+    assert pipelines._run(None, ())._cache_size() == compiled
 
 
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):

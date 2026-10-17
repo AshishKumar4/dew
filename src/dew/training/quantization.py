@@ -52,7 +52,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -61,9 +61,8 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.fake_quant import correctly_rounded_divide
-from dew.nn.kernels.generation import backend, gpu_target
+from dew.nn.kernels.generation import backend
 from dew.nn.precision import asks_default_precision
-from dew.telemetry.devices import xla_flag
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -201,39 +200,12 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
     return wrapped
 
 
-@runtime_checkable
-class QuantizedClass(Protocol):
-    """A model class Qwix made for a `Quantization` (`_quantized`), which `_dew_quantization`
-    names for the programs that run it (`compiler_options`); a wrapper's class over it inherits it."""
-
-    _dew_quantization: ClassVar[Quantization]
-
-
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec`."""
+    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.generation.compiler_options`)."""
     quantized = _qwix().quantize_model(model, provider, methods=entry_methods(model))
     type(quantized)._dew_quantization = spec
     return quantized
-
-
-def compiler_options(*models: nn.Module) -> dict[str, bool]:
-    """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`; every program Dew compiles over a model takes them.
-
-    XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
-    (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
-    that runs a model quantized to int8, forward or backward, therefore compiles its GEMMs on
-    cuBLAS. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100 a contraction of 16 or 48),
-    and then the program does not compile rather than compute wrong. A run that sets
-    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting.
-    """
-    specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, QuantizedClass)]
-    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
-    if (not int8 or backend() != "gpu" or gpu_target().int8_triton_gemm
-            or xla_flag("xla_gpu_enable_triton_gemm") is not None):
-        return {}
-    return {"xla_gpu_enable_triton_gemm": False}
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -1256,4 +1228,4 @@ def quantize_trunk[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec:
     objective.substitute([spec.apply(entry.module) if entry.trained else entry.module for entry in entries])
 
 
-__all__ = ["InputQuantization", "Quantization", "compiler_options"]
+__all__ = ["InputQuantization", "Quantization"]
