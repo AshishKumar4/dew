@@ -216,7 +216,7 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
         data, steps=2, checkpoint_every=1)
     checkpoints.wait()
     (adapter_record,) = checkpoints.artifact()['model']['wrappers']
-    assert adapter_record['fields']['modules'] == ['params/hidden', 'params/out']
+    assert sorted(adapter_record['fields']['targets']) == ['params/hidden', 'params/out']
     pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
     x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
     np.testing.assert_array_equal(np.asarray(pipe.model.apply(pipe.variables, x, t)),
