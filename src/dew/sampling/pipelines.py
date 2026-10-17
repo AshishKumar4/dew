@@ -637,7 +637,8 @@ class TextToImage:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        initial_state, spatial = _image_start(plan.sharding)(
+        options = () if self.autoencoder is None else tuple(compiler_options(self.autoencoder.model).items())
+        initial_state, spatial = _image_start(plan.sharding, options)(
             self.autoencoder, process, settled.shape, self.variables,
             plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
             settled.posterior, start)
@@ -685,7 +686,8 @@ class TextToImage:
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
             initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
-            walked = _run(plan.sharding, tuple(compiler_options(self.model).items()))
+            models = (self.model,) if self.autoencoder is None else (self.model, self.autoencoder.model)
+            walked = _run(plan.sharding, tuple(compiler_options(*models).items()))
             generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
                                solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
                                prepared.conditions, prepared.unconditional, prepared.noise, walk)
@@ -751,7 +753,9 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
 
 
 @functools.cache
-def _image_start(rows: jax.sharding.NamedSharding | None):
+def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The image a walk starts from over `rows`, compiled with the autoencoder's own XLA `options`
+    (`dew.nn.kernels.generation.compiler_options`)."""
     def prepare(autoencoder, process, shape, params, samples, keys, encode_key, start):
         spatial = {}
         pixels = samples.get("image")
@@ -777,7 +781,8 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
             )
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
-                   in_shardings=(None, rows, rows, None, None), out_shardings=rows)
+                   in_shardings=(None, rows, rows, None, None), out_shardings=rows,
+                   compiler_options=dict(options))
 
 
 
@@ -826,8 +831,8 @@ def _initial(rows: jax.sharding.NamedSharding | None):
 
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The walk over `rows`, compiled with the denoiser's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`), so a quantized denoiser and another never share it."""
+    """The walk over `rows`, compiled with its denoiser's and autoencoder's own XLA `options`
+    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
     # Rebinding weights must not change the static compilation identity, nor a
     # solver's or guidance's numbers, nor the grid's values: the solver and the
     # guidance are pytrees whose structure is static and whose numbers (a

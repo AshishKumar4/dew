@@ -37,6 +37,7 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, po
 
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.nn.inputs import pad_token_rows
+from dew.nn.kernels.generation import compiler_options
 from dew.objectives.base import token_log_probs
 from dew.sampling.text import Sampling
 
@@ -50,7 +51,13 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
+@functools.cache
+def _scoring(options: tuple[tuple[str, bool], ...]):
+    """`_scored` compiled with the model's own XLA `options` (`compiler_options`), so a quantized
+    model and another never share it."""
+    return jax.jit(_scored, static_argnums=(0,), compiler_options=dict(options))
+
+
 def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax.
 
@@ -247,8 +254,8 @@ class DewLM(TemplateLM):
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
-            probabilities, argmax = _scored(self.task.model, self.task.variables,
-                                            jnp.asarray(tokens))
+            scoring = _scoring(tuple(compiler_options(self.task.model).items()))
+            probabilities, argmax = scoring(self.task.model, self.task.variables, jnp.asarray(tokens))
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1

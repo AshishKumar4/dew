@@ -13,7 +13,6 @@ import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import Generic
 
 import jax
@@ -173,13 +172,20 @@ class BlockProcess:
                 mask: jax.typing.ArrayLike) -> jax.Array:
         return jnp.where(mask, accepted, self.noise(key, jnp.shape(accepted)))
 
-    @partial(jax.jit, static_argnames=("self", "model", "batch"))
     def refine(self, model: nn.Module, variables: Variables, cache: Variables,
                key: jax.Array, batch: int, finished: jax.Array,
                positions: jax.Array | None = None) -> CanvasState:
-        """Refines one canvas without updating its prefix cache. `positions`
-        `[B, canvas_length]` are its tokens' logical positions; None places
-        them on from the cache's cursor."""
+        """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
+        options (`compiler_options`). `positions` `[B, canvas_length]` are its tokens' logical
+        positions; None places them on from the cache's cursor."""
+        return _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key, batch,
+                                                                 finished, positions)
+
+    def refined(self, model: nn.Module, variables: Variables, cache: Variables,
+                key: jax.Array, batch: int, finished: jax.Array,
+                positions: jax.Array | None = None) -> CanvasState:
+        """`refine`'s canvas, traced into the program that calls it: JAX takes compiler options on
+        its outermost jit alone, which generation's is."""
         shape = (batch, self.canvas_length)
         initial = CanvasState(
             canvas=self.noise(jax.random.fold_in(key, 0), shape),
@@ -362,7 +368,7 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
     # A canvas is refined and committed at the same logical positions, so the
     # next one reads its keys where the prompt's coordinates put them.
     positions = None if state.positions is None else state.positions[:, None] + jnp.arange(length)
-    refined = process.refine(model, variables, cache, canvas_key, batch, generation.terminated, positions)
+    refined = process.refined(model, variables, cache, canvas_key, batch, generation.terminated, positions)
     available = jnp.minimum(length, plan.max_new_tokens - index * length)
     # A row that ended earlier emits nothing more: none of its canvas is available.
     available = jnp.where(generation.terminated, 0, available)
@@ -409,6 +415,13 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
     # row's draws depend on the rows placed with it exactly as they do for
     # one continuation.
     return prompt_major(jax.lax.map(continued, continuation_keys(key, n)))
+
+
+@functools.cache
+def _refining(options: tuple[tuple[str, bool], ...]):
+    """`BlockProcess.refined` as a program of its own, with the model's XLA `options`."""
+    return jax.jit(BlockProcess.refined, static_argnames=("self", "model", "batch"),
+                   compiler_options=dict(options))
 
 
 @functools.cache
