@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, TypedDict
@@ -45,7 +45,7 @@ from dew.interop.processors import (
     ProcessorCall as ProcessorCall,
 )
 from dew.interop.streaming import LazyTree, WeightLayout
-from dew.interop.weights import AUTO, ParamTree
+from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
@@ -799,8 +799,8 @@ def _bind_language_model[C: ConditionEncoder](
     supplied `params` as they are, or the `text_encoder` component's tensors
     read as their decoder `family` reads a decoder's checkpoint
     (`hf_decoders.read_decoder`), `rename` giving each tensor its name there,
-    with their layouts in the pipeline under the names they are stored by
-    (`decoder_bindings.decoder_layouts`).
+    with their layouts in the pipeline under every name they are stored by
+    (`decoder_bindings.decoder_layouts`), an equal alias's too.
 
     The tensors under a `vision` prefix are a vision tower no text prompt
     reads, so they stay out of the variables and come back as stored, under
@@ -812,18 +812,25 @@ def _bind_language_model[C: ConditionEncoder](
     if params is not None:
         return conditioner(params), (), {}
     stored = diffusion.component_tensors(directory, "text_encoder")
-    language = [name for name in stored if not name.startswith(vision)]
-    stored_as = {rename(name): name for name in language}
-    if len(stored_as) != len(language):
-        raise ValueError("the text encoder stores two tensors under one name of its decoder's checkpoint")
-    variables, readings = decoders.read_decoder({local: stored[name] for local, name in stored_as.items()},
+    # A checkpoint may store one tensor under two names (a Mistral-3 under both
+    # its spellings): equal copies read once, and each name keeps its binding.
+    aliases: dict[str, list[str]] = {}
+    owners: dict[tuple[str, ...], str] = {}
+    for name in stored:
+        if not name.startswith(vision):
+            local = rename(name)
+            source_alias(stored, owners, (local,), name)
+            aliases.setdefault(local, []).append(name)
+    variables, readings = decoders.read_decoder({local: stored[names[0]] for local, names in aliases.items()},
                                                 record, family, param_dtype=param_dtype, lazy=lazy)
-    layouts, retained = decoder_layouts(readings, record, family, variables,
-                                        place=lambda path: (*_TEXT_ENCODER, *path),
-                                        export_name=lambda local: f"text_encoder/{stored_as[local]}")
+    layouts, kept = decoder_layouts(readings, record, family, variables,
+                                    place=lambda path: (*_TEXT_ENCODER, *path))
+    bound = tuple(replace(layout, name=f"text_encoder/{name}")
+                  for layout in layouts for name in aliases[layout.name])
+    retained = {f"text_encoder/{name}": tensor for local, tensor in kept.items() for name in aliases[local]}
     retained.update({f"text_encoder/{name}": tensor for name, tensor in stored.items()
                      if name.startswith(vision)})
-    return conditioner({"text_encoder": variables}), layouts, retained
+    return conditioner({"text_encoder": variables}), bound, retained
 
 
 def _qwen_text_name(name: str) -> str:

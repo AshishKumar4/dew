@@ -137,10 +137,11 @@ class TorchLayout(Layout):
 class TorchGraph:
     """The transformers module torchax runs, as a function of its tensors.
 
-    `head` names the output head's weight when the logits are exactly
-    `hidden @ head.T` and train as that product, checked at load
-    (`_plain_head`); None when the model adds anything after it (a bias,
-    zero or not, a scale, a softcap). `persistent` names the buffers the source
+    `head` names the output head's weight when the logits are by
+    construction `hidden @ head.T`, which the loader establishes from the
+    model's structure (`_plain_head`); None when the head is anything else or
+    the model adds anything after it (a bias, a scale, a softcap, a cast).
+    `persistent` names the buffers the source
     checkpoint stores. A training forward runs the module's own training
     forward, its dropout and other draws taking `key` as torchax's random
     key; one that draws on the host instead (OPT's layer drop,
@@ -378,7 +379,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     if not isinstance(head_weight, torch.Tensor):
         raise ValueError(f"{type(model).__name__}'s output head holds no weight tensor")
     head_name = next((name for name, value in jittable.params.items() if value is head_weight), None)
-    if head_name is not None and not _plain_head(model, head_weight):
+    if head_name is not None and not _plain_head(model, head):
         head_name = None
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement.
@@ -405,29 +406,25 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
                               built, generation_config, export_adapter=graph.export, revision=revision)
 
 
-def _plain_head(model: PreTrainedModel, weight: torch.Tensor) -> bool:
-    """Whether `model`'s logits are its head input times the head weight, in
-    value and in training.
+def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
+    """Whether `model`'s logits are by construction its head input times its
+    head weight: the head a plain bias-free torch Linear, and the logits the
+    model returns the very tensor that Linear made, so nothing ran after it.
 
-    Both sides run the same torch matmul on the same states, so a scale or a
-    cap the model applies breaks the values' equality. A term whose value
-    happens to vanish does not (Phi's lm_head.bias starts at zero), so the
-    gradients of one random weighting of the two must be equal too, for every
-    parameter: a bias, a trainable scale or anything past the head input
-    takes gradient through the logits and none through the product.
+    Values cannot show this, nor gradients: a zero head weight makes a
+    softcapped model's logits and their first derivatives the plain
+    product's, and bf16 rounding can hide a small term. Structure can.
     """
     import torch
 
-    tokens = torch.arange(min(8, int(weight.shape[0])))[None]
-    trained = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    with torch.enable_grad():
-        logits, hidden = _forward(model, tokens)
-        product = torch.nn.functional.linear(hidden, weight)
-        if not torch.equal(logits, product):
-            return False
-        cotangent = torch.randn(logits.shape, generator=torch.Generator().manual_seed(0), dtype=logits.dtype)
-        through = torch.autograd.grad((logits * cotangent).sum(), trained, retain_graph=True,
-                                      allow_unused=True)
-        plain = torch.autograd.grad((product * cotangent).sum(), trained, allow_unused=True)
-    return all((a is None and b is None) or (a is not None and b is not None and torch.equal(a, b))
-               for a, b in zip(through, plain, strict=True))
+    if type(head) is not torch.nn.Linear or head.bias is not None:
+        return False
+    made: list[torch.Tensor] = []
+    hook = head.register_forward_hook(lambda _, __, output: made.append(output))
+    tokens = torch.arange(min(8, int(head.out_features)))[None]
+    try:
+        with torch.no_grad():
+            logits = model(input_ids=tokens, use_cache=False).logits
+    finally:
+        hook.remove()
+    return len(made) == 1 and logits is made[0]

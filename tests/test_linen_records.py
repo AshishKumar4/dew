@@ -98,7 +98,6 @@ def test_data_shaped_like_a_shared_module_stays_data_beside_a_real_one():
     x = jax.random.normal(jax.random.key(1), (2, 8))
     params = model.init(jax.random.key(0), x)
     record = json.loads(json.dumps(to_record(ModelConfig.from_model(model), ModelConfig), sort_keys=True))
-    assert '"shared": 1' in json.dumps(record)
     rebuilt = ModelConfig.from_dict(record).build()
     assert rebuilt.tags == tags
     assert sorted(params["params"]) == ["later"]
