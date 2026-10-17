@@ -280,7 +280,7 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     objective = rollout.objective
     objective.value_coefficient = coefficient
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    batch = rollout(state, {"task_id": np.arange(31, 35, dtype=np.int32)}, jax.random.key(23))
     old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
     batch = {**batch, OLD_LOG_PROBS_KEY: old,
              BEHAVIOR_LOG_PROBS_KEY: old - 2 * jnp.asarray(batch["response_mask"])}

@@ -10,7 +10,7 @@ from typing import Annotated
 import pytest
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.config.data import Augment, ImageData, TextData
+from dew.config.data import Augment, HoldOut, ImageData, TextData
 from dew.data import Files
 from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
@@ -121,7 +121,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path):
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=ImageData(source=TFDS("dew_images", path=str(
             REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"), split="all"),
-                       image_size=16, augment=None),
+                       image_size=16, augment=None, validation=HoldOut(records=4)),
         loading=Loading(workers=0), data_read="memory",
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=8, steps=1, log_every=1,
                               eval_every=1, checkpoint_every=None))
