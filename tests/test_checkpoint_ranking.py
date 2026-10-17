@@ -75,15 +75,17 @@ def trainer(path, keep=1):
 
 def test_a_score_object_names_one_recorded_score_live_and_in_a_checkpoint():
     """`best=` and `stop=` read a run's live scores, and a predicate a checkpoint's kept ones, by one
-    rule: a metric is its validation split's, `(split, metric)` that split's and a training scalar
-    the training split's. A metric with no validation score, recorded under another split alone, is
-    refused in both until its split is named, never resolved by guessing which split was meant."""
+    rule: a metric is its validation split's, `(split, metric)` that split's, a training scalar the
+    training split's and a recorded name itself. A metric with no validation score, recorded under
+    another split alone, is refused in both until its split is named, never resolved by guessing
+    which split was meant."""
     objective = Overfit()
     metric, other = Value('value', Shown(better='lower')), Value('other', Shown(better='lower'))
     scores = {'val/value': 1.0, 'test/value': 2.0, 'test/other': 3.0, 'train/loss': 4.0}
     live, kept = MetricScores([metric, other], scores, objective), Metrics(scores)
     for read in (live, kept):
         assert read[metric] == 1.0 and read[('test', metric)] == 2.0 and read[('test', other)] == 3.0
+        assert read['val/value'] == 1.0 and read['test/other'] == 3.0
         assert read[objective.scalars.loss] == 4.0
         with pytest.raises(KeyError):
             read[other]
@@ -106,11 +108,14 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
-def test_multiple_directions_and_threshold(tmp_path):
+@pytest.mark.parametrize('by_name', [False, True], ids=['object', 'name'])
+def test_multiple_directions_and_threshold(tmp_path, by_name):
+    """An aggregate score reads a metric by its object or by the name its score is recorded under."""
     metric = Value('accuracy', Shown(better='higher'))
+    key = 'val/accuracy' if by_name else metric
     run = trainer(tmp_path / 'run')
     run.fit(data(), steps=6, log_every=1, eval_every=1, checkpoint_every=6,
-            metrics=[metric], best=[Best(metric, top=2), Best(lambda m: abs(m[metric] - .5), threshold=.1)])
+            metrics=[metric], best=[Best(metric, top=2), Best(lambda m: abs(m[key] - .5), threshold=.1)])
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:val/accuracy') == 6
     assert run.checkpoints.resolve('best:aggregate:1') == 3
