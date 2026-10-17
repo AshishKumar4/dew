@@ -973,8 +973,7 @@ class CausalTransformer(nn.Module):
     def _layer_flops(self, lengths, counter) -> float:
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
         loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
@@ -1021,8 +1020,8 @@ class CausalTransformer(nn.Module):
     def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer()
-        blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
+        blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
+                                         BlockWiring())
         count = 0.0
         rows = self._prediction_rows(lengths, prediction_lengths)
         for block, (inputs, outputs) in zip(blocks, rows, strict=True):
@@ -1116,8 +1115,7 @@ class CausalTransformer(nn.Module):
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
-        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer_spec = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
@@ -2148,12 +2146,13 @@ class CausalTransformer(nn.Module):
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
         product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
-        holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
-        head = {} if self.tie_embeddings else self.lm_head.variables["params"]
-        if self.head_transform is not None or set(head) - {"kernel"}:
+        None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
+        parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
+        adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
+        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
@@ -2288,19 +2287,29 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, or a layer
-        whose mixer kind declares no `mixed_step`."""
+        whose mixer, over the context it is built with, would not run the mixed
+        call as the separate calls would (`MixerBase.mixed_refusal`)."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
-        default = self.mixer if self.mixer is not None else AttentionMixer()
-        for index, layer_type in enumerate(self.per_layer_types):
-            mixer = self.kind_of(layer_type).mixer or default
-            if not mixer.mixed_step:
-                return f"layer {index}'s cache is {type(mixer).__name__}'s, which a mixed step does not run"
+        types = self.per_layer_types
+        default = self.layer_mixer
+        for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
+            refusal = (spec.kind.mixer or default).mixed_refusal(
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
+            if refusal is not None:
+                return f"layer {index}: {refusal}"
         return None
+
+    @property
+    def layer_mixer(self) -> MixerBase:
+        """The mixer a layer whose kind names none builds: the model's own, else
+        attention rotated or not by its position embedding."""
+        return self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
 
     @property
     def declared_mixers(self) -> tuple[MixerBase, ...]:

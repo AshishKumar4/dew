@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.nn.activations import HIDDEN_ACT
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
@@ -188,8 +189,7 @@ def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> 
     merged = records.integer(hf_config.get("out_hidden_size", width * merge ** 2), "out_hidden_size")
     if merged != width * merge ** 2:
         raise ValueError(f"out_hidden_size ({merged}) is not the trunk's merge blocks ({width} x {merge}^2)")
-    activation = activation_name(hf_config, ("gelu", "gelu_pytorch_tanh", "quick_gelu", "silu", "relu"),
-                                 "gelu", ("projector_hidden_act",))
+    activation = activation_name(hf_config, HIDDEN_ACT, "gelu", ("projector_hidden_act",))
     return {"class": "muse_glimmer", "fields": {
         "vision_width": width,
         "merge_size": merge,

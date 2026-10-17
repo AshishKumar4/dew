@@ -361,8 +361,9 @@ class Adapter:
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
         as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
-        codes decode to (`frozen_fp8_kernel`), targeted or not. The result is one
-        `params` collection.
+        codes decode to (`frozen_fp8_kernel`), targeted or not, and the codes go,
+        since a model under the record would multiply them in the merged kernel's
+        place. The result is one `params` collection.
         """
         variables = thaw(variables)
         coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
@@ -381,8 +382,9 @@ class Adapter:
                 (*path, "kernel"),
                 (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
             )
-        factors = {(*path, factor) for path in self.targets for factor in FACTORS}
-        return select(overlay(variables, merged), lambda path: path not in factors)
+        dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
+                   | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
+        return select(overlay(variables, merged), lambda path: path not in dropped)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
         """Write the adapter's factors from `variables` under its own module names.
@@ -474,10 +476,10 @@ class _Branch:
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
         root = self.root
-        if context.method_name == "stochastic_input":
-            # A layer asks whether its submodule's input is drawn on this
-            # call (`MultiHeadLatentAttention.stochastic_input`): the
-            # branch's dropout is, on a target under a dropout stream.
+        if context.method_name == "nonlinear_input":
+            # A layer asks whether its submodule is linear in its input on
+            # this call (`MultiHeadLatentAttention.nonlinear_input`): the
+            # branch's dropout draws on it, on a target under a dropout stream.
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
@@ -660,8 +662,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     splits what it draws, the factors under `params` and the rest under
     `FROZEN`. `layouts` are the bindings the class's record (`AdapterRecord`)
     writes beside the targets, with the models its components were bound to
-    (`bound_to`); the record is written when a run asks for it, so an adapter
-    a run cannot record (a file's mixed ranks) still loads and computes.
+    (`bound_to`); the record is written when a run asks for it.
     """
     base = type(model)
     if isinstance(base, AdaptedClass):
@@ -706,27 +707,26 @@ class AdapterBinding:
 @dataclass(frozen=True)
 class AdapterRecord:
     """A bound adapter as a model's wrapper chain records it
-    (`ModelConfig.wrappers`): one rank and alpha, the targets' native module
-    paths, and each target's binding, so the run's adapter saves with no
-    source at hand. The checkpoint stores the factors."""
+    (`ModelConfig.wrappers`): each target's rank and alpha by its native
+    module path, as `Target` holds them, and each target's binding, so the
+    run's adapter, mixed ranks and all, saves with no source at hand. The
+    checkpoint stores the factors."""
 
-    rank: int
-    alpha: float
+    targets: Mapping[str, Target]
     rslora: bool
     dropout: float
-    modules: tuple[str, ...]
     layouts: Mapping[str, AdapterBinding]
     bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _rank("the adapter record", self.rank)
-        _alpha("the adapter record", self.alpha)
+        for module, target in self.targets.items():
+            _rank(f"the adapter record's {module}", target.rank)
+            _alpha(f"the adapter record's {module}", target.alpha)
         _dropout("the adapter record", self.dropout)
-        paths = [tuple(module.split('/')) for module in self.modules]
-        if (not paths or len(set(paths)) != len(paths)
-                or any(not name or name in ('.', '..') for path in paths for name in path)):
-            raise ValueError("adapter modules must be a nonempty list of distinct native module names")
-        if not set(self.layouts) <= set(self.modules):
+        if not self.targets or any(not name or name in ('.', '..')
+                                   for module in self.targets for name in module.split('/')):
+            raise ValueError("adapter targets must be keyed by native module names, at least one")
+        if not set(self.layouts) <= set(self.targets):
             raise ValueError("adapter layouts must be keyed by the adapter's own modules")
 
     def apply(self, model: nn.Module) -> nn.Module:
@@ -737,7 +737,7 @@ class AdapterRecord:
 
     def bound(self) -> tuple[dict[Path, Target], dict[str, WeightLayout]]:
         """The targets by native path and the bindings by the name a file writes them under."""
-        targets = {tuple(module.split('/')): Target(self.rank, self.alpha) for module in self.modules}
+        targets = {tuple(module.split('/')): target for module, target in self.targets.items()}
         layouts = {binding.name.removesuffix('.weight').replace('/', '.'): WeightLayout(
                        binding.name, ((*module.split('/'), 'kernel'),), binding.shape, binding.transpose)
                    for module, binding in self.layouts.items()}
@@ -746,14 +746,9 @@ class AdapterRecord:
 
 def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
             layouts: Mapping[str, WeightLayout], bases: Mapping[str, AdapterBase]) -> AdapterRecord:
-    """The bound adapter as a model record holds it. A mixed-rank adapter is refused."""
-    ranks = {target.rank for target in targets.values()}
-    alphas = {target.alpha for target in targets.values()}
-    if len(ranks) != 1 or len(alphas) != 1:
-        raise ValueError("a recorded LoRA requires one rank and alpha across its modules")
+    """The bound adapter as a model record holds it."""
     bindings = {layout.paths[0][:-1]: layout for layout in layouts.values()}
-    return AdapterRecord(next(iter(ranks)), next(iter(alphas)), rslora, dropout,
-                         tuple('/'.join(path) for path in sorted(targets)),
+    return AdapterRecord({'/'.join(path): targets[path] for path in sorted(targets)}, rslora, dropout,
                          {'/'.join(path): AdapterBinding(bindings[path].name, bindings[path].shape,
                                                          bindings[path].transpose)
                           for path in sorted(targets) if path in bindings}, dict(bases))

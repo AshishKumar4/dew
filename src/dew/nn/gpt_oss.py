@@ -20,6 +20,7 @@ from dew.nn.moe import (
     expert_dispatch,
     expert_projection,
     gather_expert_bias,
+    renormalized_softmax,
 )
 from dew.nn.sharding import LogicalAxes, logical_axes
 
@@ -132,10 +133,8 @@ class GptOssMLP(nn.Module):
                            precision=self.precision, name="router")(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
-        top_logits = jnp.take_along_axis(logits, indices, axis=-1)
-        weights = jax.nn.softmax(top_logits, axis=-1)
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
             implementation=self.implementation, dispatch=self.dispatch,
             capacity_factor=self.capacity_factor, dtype=self.dtype,
-            precision=self.precision, name="experts")(x, weights, indices)
+            precision=self.precision, name="experts")(x, renormalized_softmax(logits, indices), indices)

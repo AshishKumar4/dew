@@ -20,7 +20,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops
-from dew.nn.moe import ExpertMLP, GatedActivation, chosen_experts
+from dew.nn.moe import ExpertMLP, GatedActivation, chosen_experts, renormalized_softmax
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Routes
 from dew.nn.sharding import logical_axes
@@ -49,11 +49,10 @@ class Gemma4TextRouter(nn.Module):
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
         logits = Dense(self.num_experts, use_bias=False, dtype=self.dtype,
                        precision=self.precision, name='proj')(scaled)
-        probabilities = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
-        indices = chosen_experts(lambda: jax.lax.top_k(probabilities, self.top_k)[1],
-                                 (*probabilities.shape[:-1], self.top_k), routes)
-        weights = jnp.take_along_axis(probabilities, indices, axis=-1)
-        weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+        logits = logits.astype(at_least_fp32(logits.dtype))
+        indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
+                                 (*logits.shape[:-1], self.top_k), routes)
+        weights = renormalized_softmax(logits, indices)
         per_expert = self.param('per_expert_scale', nn.initializers.ones,
                                 (self.num_experts,), jnp.float32)
         return weights * per_expert[indices], indices

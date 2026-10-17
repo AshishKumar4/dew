@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_gdn_support import KernelCase
+from fla_gdn_support import CONV_SHAPES
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
 
 from dew.nn.kernels import generation, short_conv
@@ -163,24 +163,16 @@ def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason)
     assert refused is not None and reason in refused
 
 
-TRAINING_SHAPES = {
-    # Qwen3.5-0.8B: 16 key and 16 value heads of 128.
-    "0.8b": ((8, 3072), ((2048, 128), (2048, 128), (2048, None))),
-    # Qwen3.5-9B: 16 key heads, 32 value heads.
-    "9b": ((4, 3072), ((2048, 128), (2048, 128), (4096, None))),
-}
-
-
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("model", sorted(TRAINING_SHAPES))
+@pytest.mark.parametrize("model", sorted(CONV_SHAPES))
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
     XLA's own conv (`assert_as_exact_as_the_reference`). Two rows: a row's tokens are the distances'
     terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
-    (_, length), parts = TRAINING_SHAPES[model]
+    (_, length), parts = CONV_SHAPES[model]
     x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
     grads = cotangents(x, parts, dtype)
@@ -192,35 +184,6 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
                                           (*exact, *exact_grads[:2]), strict=True):
         assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
-
-
-def training_cases():
-    """Both kernels, through the conv's VJP, at each training shape: a delta net's bf16 conv into bf16
-    pieces over right-padded rows and over packed ones, and Mamba's fp32 output with a bias and no norm
-    over whole rows and packed ones."""
-    def case(name, shape, parts, out, bias, valid, packed):
-        def call():
-            x = jax.ShapeDtypeStruct((*shape, sum(width for width, _ in parts)), jnp.bfloat16)
-            weights = jax.ShapeDtypeStruct((x.shape[-1], 4), jnp.float32)
-            shift = jax.ShapeDtypeStruct((x.shape[-1],), jnp.float32) if bias else None
-            kept = jax.ShapeDtypeStruct(shape, jnp.int8) if valid else None
-            segments = jax.ShapeDtypeStruct(shape, jnp.int32) if packed else None
-
-            def grads(x, weights, shift, kept, segments):
-                def loss(x, weights, shift):
-                    out_ = short_conv.conv(x, weights, shift, kept, segments, parts, activation=True,
-                                           eps=1e-6, dtype=jnp.dtype(out), interpret=False)
-                    return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
-                return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
-            return grads, (x, weights, shift, kept, segments)
-        return KernelCase(name, call)
-
-    for model, (shape, parts) in sorted(TRAINING_SHAPES.items()):
-        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, bias=False, valid=True, packed=False)
-        yield case(f"{model}/packed", shape, parts, jnp.bfloat16, bias=False, valid=False, packed=True)
-    for packed in (False, True):
-        yield case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True,
-                   valid=False, packed=packed)
 
 
 @pytest.mark.mesh(devices=2)

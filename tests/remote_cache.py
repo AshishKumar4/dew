@@ -11,7 +11,9 @@ any program the bundle lacked, writes them back. Bundles are kept under jax's an
 versions, the backend, the Python minor and the device's kind, beside JAX's own key of each
 program and its flags.
 
-A bundle and not a program at a time, as a test that runs a model eagerly compiles thousands of
+A bundle is a file's in one execution partition (conftest's `bundle`): a split file's group, or an
+xdist worker, has its own, so partitions that compile apart never replace each other's programs. A
+bundle and not a program at a time, as a test that runs a model eagerly compiles thousands of
 programs of a few milliseconds each (14,068 of the A100 tier's 16,537, under 50 ms), quicker to
 compile than to ask a Worker for: asking about each one took a DeepSeek drafting test from 103 s to
 962 s. A file's bundle is its programs' few megabytes (the CPU lane's same-bits test, 6546
@@ -57,9 +59,9 @@ class RemoteCache:
         self.lock = threading.Lock()
         self.file: str | None = None
         self.used: dict[str, set[str]] = {}
-        """The programs each file compiled or read, by JAX's key."""
+        """The programs each bundle's tests compiled or read in this process, by JAX's key."""
         self.held: dict[str, set[str]] = {}
-        """The programs each file's bundle held as it was read."""
+        """The programs each bundle holds on the Worker, as read or last written."""
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
         self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
         threading.Thread(target=self._uploading, daemon=True, name="xla-cache").start()
@@ -106,7 +108,7 @@ class RemoteCache:
                 self.used.setdefault(self.file, set()).add(key)
 
     def opened(self, file: str) -> None:
-        """`file`'s bundle in the local cache, and the programs it compiles or reads from here on its."""
+        """Bundle `file` in the local cache, and the programs compiled or read from here on its."""
         self.file = file
         if file in self.held or not self.available:
             return
@@ -116,30 +118,32 @@ class RemoteCache:
             if answer is None:
                 return
             with answer as response:
-                bundle = response.read()
+                entries = unpacked(response.read(MAX_BYTES + 1))
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 self._failed(error)
             return
-        except Exception as error:  # a remote that cannot answer is a miss
+        except Exception as error:  # a remote that cannot answer, or answers no whole bundle, is a miss
             self._failed(error)
             return
         self._answered()
-        for key, value in unpacked(bundle):
+        for key, value in entries:
             self.base.put(key, value)
             self.held[file].add(key)
         with self.lock:
-            self.fetched += len(self.held[file])
+            self.fetched += len(entries)
 
     def closed(self, file: str) -> None:
-        """`file`'s bundle written back, where it used a program its bundle lacked."""
+        """Bundle `file` written back, where its tests used a program it lacked: every program they
+        used in this process, so a file whose tests ran apart (another file's between) sends them all."""
         with self.lock:
-            used = self.used.pop(file, set())
+            used = set(self.used.get(file, ()))
         if not used - self.held.get(file, set()) or not self.available:
             return
         entries = [(key, value) for key in sorted(used) if (value := self.base.get(key)) is not None]
         bundle = packed(entries)
         if len(bundle) <= MAX_BYTES:
+            self.held[file] = used
             self.uploads.put((file, bundle))
 
     def _uploading(self) -> None:
@@ -173,20 +177,39 @@ class RemoteCache:
             time.sleep(0.1)
 
 
+def bundle(node: str, group: str | None, worker: str | None) -> str:
+    """The bundle of test `node`'s file in its execution partition: a split file's group
+    (tools/armada/split.py's `G/N`) and an xdist worker compile apart, so each keeps its own."""
+    parts = (group and group.replace("/", "-of-"), worker)
+    return "/".join([node.split("::")[0], *(part for part in parts if part)])
+
+
+HEADER = struct.Struct(">IQ")
+"""A bundle entry's key's and value's lengths."""
+
+
 def packed(entries: list[tuple[str, bytes]]) -> bytes:
     """`entries` as one bundle: each key's and value's length, then the key and the value."""
-    return b"".join(struct.pack(">IQ", len(key.encode()), len(value)) + key.encode() + value
+    return b"".join(HEADER.pack(len(key.encode()), len(value)) + key.encode() + value
                     for key, value in entries)
 
 
-def unpacked(bundle: bytes):
-    """The `(key, value)` entries of a `packed` bundle."""
-    at = 0
+def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
+    """The `(key, value)` entries of a `packed` bundle, or ValueError where it is not one whole: more
+    than `MAX_BYTES`, or an entry its lengths run past."""
+    if len(bundle) > MAX_BYTES:
+        raise ValueError(f"a bundle of more than {MAX_BYTES} bytes")
+    entries, at = [], 0
     while at < len(bundle):
-        keyed, sized = struct.unpack_from(">IQ", bundle, at)
-        at += struct.calcsize(">IQ")
-        yield bundle[at:at + keyed].decode(), bundle[at + keyed:at + keyed + sized]
+        if at + HEADER.size > len(bundle):
+            raise ValueError(f"a bundle's entry header at {at} runs past its {len(bundle)} bytes")
+        keyed, sized = HEADER.unpack_from(bundle, at)
+        at += HEADER.size
+        if at + keyed + sized > len(bundle):
+            raise ValueError(f"a bundle's entry at {at} runs past its {len(bundle)} bytes")
+        entries.append((bundle[at:at + keyed].decode(), bundle[at + keyed:at + keyed + sized]))
         at += keyed + sized
+    return entries
 
 
 def prefix() -> str:
