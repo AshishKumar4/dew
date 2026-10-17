@@ -43,7 +43,7 @@ from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -216,15 +216,19 @@ def test_left_padding_changes_no_row(source):
     np.testing.assert_array_equal(batched[1], greedy(ModelInputs(ids[1:, :prompt - pad]))[0])
 
 
-def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(source):
+@pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
+def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(source, given):
     """Uncached, rows padded on the left by three tokens, a count no compression rate divides,
-    pool their compressed windows (CSA2's entries and index keys, HCA's) over their real tokens at
-    their ranks, as a cache appends them: the real tokens' logits lie within FACTOR of the
-    reference's rounding of the float64 truth of the rows unpadded."""
+    pool their compressed windows (CSA2's entries and index keys, HCA's) and hash their n-grams
+    (Engram) over their real tokens at their ranks, as a cache appends them, whether the padding
+    comes as a raw mask or as the tokens' coordinates alone: the real tokens' logits lie within
+    FACTOR of the reference's rounding of the float64 truth of the rows unpadded."""
     loaded, plain, reference = source
     ids, pad = jnp.asarray(reference["input_ids"]), 3
     valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
-    logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), attention_mask=valid)
+    padding = {"attention_mask": valid} if given == "attention_mask" else {
+        "coordinates": coordinates(valid=valid)}
+    logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), **padding)
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 

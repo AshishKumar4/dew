@@ -490,6 +490,24 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
+                                    {"layer_types": ("chunked_attention",),
+                                     "kinds": {"chunked_attention": {"chunk": 4}}}], ids=["alibi", "chunked"])
+def test_a_paged_server_serves_layers_that_read_their_keys_places(fields):
+    """ALiBi and a chunk read their keys' places, which a dense cache keeps
+    beside its keys; a paged server seats its rows at canonical positions,
+    where a key's slot is its place, so its pool keeps none. Over a pool of
+    pages every row is the lone task call's."""
+    model = decoder().clone(max_seq_len=128, **fields)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
                          ids=["dense", "paged"])
 def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
