@@ -34,9 +34,10 @@ def entry(name: str) -> bytes:
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch):
-    """No Worker at the URL: each file's bundle fails to arrive until `FAILURES`
-    have, the remote is then left alone, every read is a local miss and every
-    write stays local, and no call raises or asks the URL again."""
+    """No Worker at the URL: each file's bundle fails to arrive or leave until
+    `FAILURES` requests have, the remote is then left alone, every read is a
+    local miss and every write stays local, and no call raises or asks the URL
+    again."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -53,7 +54,8 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
         cache.closed(f"tests/test_{index}.py")
     cache.drain()
     assert time.monotonic() - began < 10
-    assert not cache.available and len(opened) == remote_cache.FAILURES
+    # An upload already under way as the remote was given up may be one request more.
+    assert not cache.available and remote_cache.FAILURES <= len(opened) <= remote_cache.FAILURES + 1
     assert all(cache.base.get(f"jit_step-{index}") == entry("step") for index in range(10))
 
 
