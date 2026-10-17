@@ -177,6 +177,24 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
+def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
+    """A request that samples under `top_k=1` draws what lm-eval's own model
+    draws there and what greedy decoding draws, on the same weights; a beam
+    search, or a control `Sampling` has no name for, raises instead of
+    drawing without it."""
+    ours, theirs = _pair(64)
+    sampled = {"until": ["\n\n"], "do_sample": True, "temperature": 1.0, "top_k": 1, "max_gen_toks": 8}
+    greedy = {"until": ["\n\n"], "do_sample": False, "max_gen_toks": 8}
+    requests = [instance("the quick ", sampled, request_type="generate_until")]
+    answer = ours.generate_until(requests)
+    assert answer == theirs.generate_until(requests)
+    assert answer == ours.generate_until([instance("the quick ", greedy, request_type="generate_until")])
+    for control in ({"num_beams": 2}, {"length_penalty": 2.0}):
+        request = instance("the quick ", {**greedy, **control}, request_type="generate_until")
+        with pytest.raises(ValueError):
+            ours.generate_until([request])
+
+
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
 def test_rolling_likelihood_scores_every_token_once_as_lm_eval_does(length, max_length):
     """lm-eval's rolling windows score all `length` tokens, the first one

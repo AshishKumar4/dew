@@ -23,8 +23,10 @@ slots that end one before the row's last token.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +47,11 @@ DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
 
 DEFAULT_BUDGET = 256
+
+FORWARDED = frozenset(field.name for field in dataclasses.fields(Sampling)) - {
+    "temperature", "eos_token_ids", "pad_token_id", "stop"}
+"""The generation controls a request may set that `Sampling` takes under the same names as
+Transformers' `generate`, which `HFLM` hands them to."""
 """The generation budget of a request that names none, `HFLM.max_gen_toks`."""
 
 TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
@@ -299,6 +306,12 @@ class DewLM(TemplateLM):
         The stop strings cut the decoded text, so a stop sequence that spans
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
+
+        The controls `HFLM` hands Transformers' `generate` that `Sampling`
+        takes under the same names (`top_k`, `top_p`, `min_p`, `typical_p`,
+        the penalties, `no_repeat_ngram_size`, `min_new_tokens`) shape the
+        draws; `num_beams` above 1, or any other control, raises ValueError
+        rather than draw without it.
         """
         del disable_tqdm
         eos = None if self.task.sampling.eos_token_ids in (None, ()) else self.tok_decode([self.eot_token_id])
@@ -306,19 +319,28 @@ class DewLM(TemplateLM):
         for request in requests:
             arguments = list(request.args)
             context, raw = str(arguments[0]), dict(arguments[1])
-            # normalize_gen_kwargs sets the budget and the stop strings; the
-            # type leaves every key optional.
-            controls = normalize_gen_kwargs(raw, DEFAULT_BUDGET)
-            budget = controls.get("max_gen_toks", DEFAULT_BUDGET)
+            # normalize_gen_kwargs sets the budget and the stop strings, and
+            # makes do_sample=False greedy; the type leaves every key optional.
+            controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
+            budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
+            until = controls.pop("until", None)
+            temperature = float(controls.pop("temperature", 0.0))
+            seed = int(controls.pop("seed", 0))
+            controls.pop("do_sample", None)
+            if controls.pop("num_beams", 1) != 1:
+                raise ValueError("generate_until draws one continuation a request; beam search is not served")
+            unknown = sorted(set(controls) - FORWARDED)
+            if unknown:
+                raise ValueError(f"generation controls {unknown} have no Sampling counterpart")
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
-            sampling = Sampling(temperature=float(controls.get("temperature", 0.0)),
-                                eos_token_ids=self.task.sampling.eos_token_ids)
-            drawn = self.task([ids], budget, key=int(raw.get("seed", 0)), sampling=sampling)
-            stops = handle_stop_sequences(controls.get("until"), eos=eos)
+            sampling = Sampling(temperature=temperature, eos_token_ids=self.task.sampling.eos_token_ids,
+                                **controls)
+            drawn = self.task([ids], budget, key=seed, sampling=sampling)
+            stops = handle_stop_sequences(until, eos=eos)
             answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
         return answers
 
