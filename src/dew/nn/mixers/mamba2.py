@@ -247,8 +247,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
         # The groups are expanded, so any split of the heads divides them.
         rows, split = grouped_heads(x.shape, heads)
         four, held = P(rows, None, split, None), P(rows, split, None, None)
-        scanned, final = _on_shards(kernel, (x, B, C, a, carried),
-                                    (four, four, four, P(rows, None, split), held), (four, held))
+        scanned, final = kernel(x, B, C, a, carried)
     return (scanned + skip)[:, :length], final
 
 
