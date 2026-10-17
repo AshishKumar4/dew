@@ -135,6 +135,29 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
         trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
 
 
+def test_a_best_policy_names_one_suites_instance_of_a_metric_two_suites_hold(tmp_path):
+    """Two suites may each score their own instance of one metric: a policy naming the first suite's
+    instance ranks on that suite's scores, though the other suite's instance has the same name."""
+    from dew.training import EvalSuite
+
+    often, rare = Value('value', Shown(better='higher')), Value('value', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=3, log_every=1, eval_every=1, metrics=[often], best=Best(often, split='often'),
+            validation={'often': data().val, 'rare': EvalSuite(data().val, (rare,), 1)})
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best:often/value') == 3
+
+
+def test_a_best_policy_or_restore_best_without_checkpoints_is_refused_before_training():
+    """A selection of the best step and its restoration both choose among checkpoints: a trainer that
+    writes none is refused before it trains, rather than handing back its final weights as the best."""
+    metric = Value('value', Shown(better='higher'))
+    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
+    for asked in ({'best': metric}, {'restore_best': True}):
+        with pytest.raises(ValueError):
+            unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], **asked)
+
+
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
     state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)

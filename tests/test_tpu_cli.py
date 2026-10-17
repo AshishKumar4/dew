@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
+from dew.cli.launch import remote_script
 
 #: Stands in for gcloud and rsync. Records every argv, answers from a state file.
 FAKE = '''#!/usr/bin/env python3
@@ -302,8 +303,9 @@ def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
     calls = only(fake.gcloud_calls(), "ssh")
     expected = []
     for slice_id, name in enumerate(("left", "right")):
-        command = ("exec env MEGASCALE_COORDINATOR_ADDRESS=10.0.0.1 MEGASCALE_PORT=8081 "
-                   f"MEGASCALE_NUM_SLICES=2 MEGASCALE_SLICE_ID={slice_id} python train.py")
+        env = {"MEGASCALE_COORDINATOR_ADDRESS": "10.0.0.1", "MEGASCALE_PORT": "8081",
+               "MEGASCALE_NUM_SLICES": "2", "MEGASCALE_SLICE_ID": str(slice_id)}
+        command = remote_script(("python", "train.py"), env, None)
         expected += [pool_ssh(0, name, command), pool_ssh(1, name, command)]
     assert sorted(calls) == sorted(expected)
 
