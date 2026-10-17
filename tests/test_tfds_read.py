@@ -39,7 +39,7 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         assert isinstance(record["image"], bytes)
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
-        result = next(Memory([record]).map(images.decode("image", rejects=False))
+        result = next(Memory([record]).map(images.DecodeImage("image", rejects=False))
                       .random_map(images.caption(templates=spec.caption_templates,
                                                  classes=("red", "blue"))).batch(1).iterate())
         caption, label = result["caption"][0], result["label"][0]

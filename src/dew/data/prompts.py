@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from dew.nn.inputs import token_id
+from dew.nn.inputs import token_ids
 
 from .chat import Conversation, render_prompt
 from .text import ByteTokenizer, HFTokenizer
@@ -90,8 +90,9 @@ def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: o
                 thinking: bool | None) -> list[int]:
     """Encodes a prompt, retaining structured messages until text rendering.
 
-    A row's prompt is a string, a list of token ids, or the messages of a
-    conversation. A list of anything else is read as messages, which is where
+    A row's prompt is a string, token ids (a list, a tuple or a
+    one-dimensional array, as `dew.data.text.Tokenize` makes them), or the
+    messages of a conversation. A list of anything else is read as messages, which is where
     a part that is not one is named. Tools belong to messages only.
     """
     if tools is not None and not isinstance(tools, (str, list)):
@@ -104,10 +105,11 @@ def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: o
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
         ids = tokenizer.encode(prompt, add_special_tokens=False)
-    elif isinstance(prompt, list) and all(isinstance(token, (int, np.integer)) for token in prompt):
+    elif isinstance(prompt, np.ndarray) or (isinstance(prompt, (list, tuple)) and all(
+            isinstance(token, (int, np.integer)) for token in prompt)):
         if tools is not None:
             raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
-        ids = [token_id(token, where=f"{origin}: a pretokenized prompt") for token in prompt]
+        ids = token_ids(prompt, where=f"{origin}: a pretokenized prompt")
     elif isinstance(prompt, list):
         conversation = Conversation.parse(prompt, tools, origin)
         if not isinstance(tokenizer, HFTokenizer):

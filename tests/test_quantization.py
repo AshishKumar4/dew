@@ -158,6 +158,50 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
 @pytest.mark.skipif(jax.default_backend() == "gpu",
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("groups", [1, 16])
+def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(groups):
+    """A quantized convolution keeps its call's contract, as a quantized matmul does: one pinned at
+    the highest precision, Dew's Conv and lax's alike, has no quantized form and runs unquantized at
+    it, bitwise the float convolution; one that asks for a float32 result from bf16 operands
+    returns float32, within int8's rounding of the float convolution. Before, both quantized and
+    returned the bf16 input's dtype."""
+    pytest.importorskip("qwix")
+    from flax import linen as nn
+
+    from dew.nn.conv import Conv
+
+    class Native(nn.Module):
+        """A convolution written as a lax call, asking for its own precision and result dtype."""
+        precision: jax.lax.Precision | None = None
+        preferred: jnp.dtype | None = None
+
+        @nn.compact
+        def __call__(self, x):
+            kernel = self.param("kernel", nn.initializers.lecun_normal(), (3, 3, 16 // groups, 16))
+            return jax.lax.conv_general_dilated(
+                x, kernel.astype(x.dtype), (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"),
+                feature_group_count=groups, precision=self.precision, preferred_element_type=self.preferred)
+
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, 16)).astype(jnp.bfloat16)
+    pinned = (Conv(features=16, kernel_size=(3, 3), padding="SAME", feature_group_count=groups,
+                   use_bias=False, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST),
+              Native(precision=jax.lax.Precision.HIGHEST))
+    for module in pinned:
+        variables = module.init(jax.random.key(1), x)
+        np.testing.assert_array_equal(Quantization().apply(module).apply(variables, x),
+                                      module.apply(variables, x))
+    wide = Native(preferred=jnp.float32)
+    variables = wide.init(jax.random.key(1), x)
+    got = Quantization().apply(wide).apply(variables, x)
+    with jax.default_matmul_precision("highest"):
+        want = wide.apply(variables, x)
+    assert got.dtype == want.dtype == jnp.float32
+    assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
+
+
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("group_width", [1, 4])
 def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(group_width, dilation):
@@ -1000,6 +1044,33 @@ def image_flow():
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
+
+
+def test_an_int8_guide_walks_as_the_host_does():
+    """A float image task autoguided by its own denoiser quantized to int8 (`Autoguidance`) walks a
+    prompt's latents as the same task does on the host: the walk compiles for the guide it runs as
+    for the denoiser. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(autoguided_image_flow)
+
+
+def autoguided_image_flow():
+    import tempfile
+
+    from dew.sampling import Autoguidance
+
+    with tempfile.TemporaryDirectory() as root:
+        task = flux_source(Path(root))
+    guide = task.quantized(Quantization(patterns=FLUX_BLOCKS))
+    weaker = {name: tree for name, tree in guide.variables.items() if name not in ("encoders", "autoencoder")}
+    prepared, held = jax.device_get((task.prepare("a red bird", key=0, steps=2),
+                                     {**task.variables, "guide": weaker}))
+
+    def run(dtype):
+        walked = dataclasses.replace(task, model=task.model.clone(dtype=dtype), variables=placed(held, dtype),
+                                     guidance=Autoguidance(2.0, guide.model.clone(dtype=dtype)))
+        return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
+
+    assert_computed_as_on_the_host(run, "an int8 guide's latents")
 
 
 def test_an_int8_decision_task_answers_as_the_host_does():

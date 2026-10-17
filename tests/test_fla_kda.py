@@ -15,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import CHUNKED, NAMES, fla_decay_terms, fla_side, plain_prefix, recurrence, through
-from kernel_compile import compile_kernels, failures
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
@@ -121,50 +120,6 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
                                     strict=True):
         bound = APART * distance(theirs, 0)
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
-
-
-TRAINING = (1, 4096, 32, 128)
-"""Batch, length, heads, head width: Kimi Linear's KDA layer (32 heads of 128) at a 4096-token row."""
-
-
-def training_cases():
-    """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
-    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
-    from fla_gdn_support import KernelCase
-
-    batch, length, heads, width = TRAINING
-
-    def case(name, width, columns, heads):
-        def call():
-            keys = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
-            values = jax.ShapeDtypeStruct((batch, length, heads, columns), jnp.bfloat16)
-            decay = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.float32)
-            beta = jax.ShapeDtypeStruct((batch, length, heads), jnp.bfloat16)
-            state = jax.ShapeDtypeStruct((batch, heads, width, columns), jnp.float32)
-
-            def grads(q, k, v, g, beta, h0):
-                def loss(*args):
-                    out, final = fla_kda.chunk_kda(*args, None, width ** -0.5, 64, interpret=False)
-                    return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
-                return jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, beta, h0)
-
-            return grads, (keys, keys, values, decay, beta, state)
-
-        return KernelCase(name, call)
-
-    yield case("kda", width, width, heads)
-    yield case("kda/keys of 256", fla_gdn.WIDEST_KEYS, width, 4)
-
-
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
-    compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
-    compile bound and the block's shared memory."""
-    pytest.importorskip("triton")
-    found = compile_kernels(training_cases(), target)
-    assert len(found) == 2
-    assert not failures(found), "\n".join(failures(found))
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")

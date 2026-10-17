@@ -378,4 +378,10 @@ class Guidance(Protocol):
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk: ...
 
 
+def guidance_modules(guidance: Guidance | None) -> tuple[nn.Module, ...]:
+    """The modules `guidance` runs besides its denoiser's model, autoguidance's guide, which a
+    program that walks it compiles for as it does for the denoiser (`compiler_options`)."""
+    return (guidance.model,) if isinstance(guidance, Autoguidance) else ()
+
+
 __all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Walk"]

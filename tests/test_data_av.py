@@ -10,7 +10,6 @@ and its bundled ffmpeg writes the fixtures, so nothing here depends on a
 binary on PATH.
 """
 
-import dataclasses
 import subprocess
 
 import numpy as np
@@ -88,9 +87,9 @@ def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
     with open(media["clip"], "rb") as file:
         clip = file.read()
     rows = [{"mp4": clip if index % 2 else media["clip"], "id": index} for index in range(8)]
-    chain = (Memory(rows).random_filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
-             .filter_map(video.decode(8, fps=FPS, size=32))
-             .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS))
+    chain = (Memory(rows).random_filter_map(video.PickClip(8 / FPS, margin=2 / FPS))
+             .filter_map(video.DecodeVideo(8, fps=FPS, size=32))
+             .filter_map(audio.DecodeAudio(SAMPLE_RATE, context=2 / FPS))
              .select_columns("clip", "video", "audio", "audio_valid"))
 
     records = _records(chain)
@@ -109,8 +108,8 @@ def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
 
 def test_a_sound_file_reads_through_the_same_stages(media):
     chain = (Memory([{"wav": media["sound"], "id": index} for index in range(4)])
-             .random_filter_map(video.pick_clip(0.5, field="wav"))
-             .filter_map(audio.decode(SAMPLE_RATE, field="wav")))
+             .random_filter_map(video.PickClip(0.5, field="wav"))
+             .filter_map(audio.DecodeAudio(SAMPLE_RATE, field="wav")))
 
     for record in _records(chain):
         assert record["audio"].shape == (SAMPLE_RATE // 2,) and record["audio_valid"].all()
@@ -132,7 +131,7 @@ def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
     context = 2 / FPS
 
     def read(missing):
-        chain = Memory(rows).filter_map(audio.decode(SAMPLE_RATE, context=context, missing=missing))
+        chain = Memory(rows).filter_map(audio.DecodeAudio(SAMPLE_RATE, context=context, missing=missing))
         return {int(record["id"]): record for record in _records(chain)}
 
     assert list(read("reject")) == [3]
@@ -158,21 +157,21 @@ def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
 def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_raise(media):
     rows = [{"mp4": media["clip"], "id": 0}, {"mp4": b"not a clip" * 64, "id": 1}]
 
-    assert _records(Memory(rows).random_filter_map(video.pick_clip(3.0))) == []
+    assert _records(Memory(rows).random_filter_map(video.PickClip(3.0))) == []
     with pytest.raises(ValueError):
-        dataclasses.replace(video.pick_clip(3.0), rejects=False).random_map(rows[0], np.random.default_rng(0))
-    picked = _records(Memory(rows).random_filter_map(video.pick_clip(1.0)))
+        video.PickClip(3.0, rejects=False).random_map(rows[0], np.random.default_rng(0))
+    picked = _records(Memory(rows).random_filter_map(video.PickClip(1.0)))
     assert [int(record["id"]) for record in picked] == [0]
     with pytest.raises(ValueError):
-        video.decode(10, fps=FPS).map({"mp4": media["clip"], "clip": np.asarray([0.0, 8 / FPS])})
+        video.DecodeVideo(10, fps=FPS).map({"mp4": media["clip"], "clip": np.asarray([0.0, 8 / FPS])})
 
 
 def test_a_clip_that_fits_its_window_exactly_is_read(media):
     """Twelve frames hold an eight-frame window two frames clear of either end in one place only."""
     chain = (Memory([{"mp4": media["exact"], "id": 0}])
-             .random_filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
-             .filter_map(video.decode(8, fps=FPS, size=32))
-             .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS)))
+             .random_filter_map(video.PickClip(8 / FPS, margin=2 / FPS))
+             .filter_map(video.DecodeVideo(8, fps=FPS, size=32))
+             .filter_map(audio.DecodeAudio(SAMPLE_RATE, context=2 / FPS)))
 
     (record,) = _records(chain)
 
@@ -185,7 +184,7 @@ def test_a_window_is_the_record_s_own_draw(media):
     """The same record draws the same window in any read, without the global generator."""
     np.random.seed(1234)
     state = np.random.get_state()[1].copy()
-    pick = video.pick_clip(0.4, margin=0.1)
+    pick = video.PickClip(0.4, margin=0.1)
 
     def draws():
         record = {"mp4": media["clip"]}
@@ -207,9 +206,9 @@ def test_the_clips_preset_batches_a_clip_and_its_sound_by_the_schema_and_passes_
 
     rows = [{"mp4": media["clip"], "id": 0}, {"mp4": media["silent"], "id": 1},
             {"mp4": b"not media", "id": 2}, {"mp4": media["clip"], "id": 3}]
-    written = (Memory(rows).random_filter_map(video.pick_clip(8 / FPS))
-               .filter_map(video.decode(8, fps=FPS, size=32))
-               .filter_map(audio.decode(SAMPLE_RATE, missing="silence"))
+    written = (Memory(rows).random_filter_map(video.PickClip(8 / FPS))
+               .filter_map(video.DecodeVideo(8, fps=FPS, size=32))
+               .filter_map(audio.DecodeAudio(SAMPLE_RATE, missing="silence"))
                .remove_columns("mp4", "clip").batch(2))
     batched = Memory(rows).pipe(presets.clips, 8 / FPS, frames=8, fps=FPS, size=32, batch=2,
                                 sample_rate=SAMPLE_RATE)

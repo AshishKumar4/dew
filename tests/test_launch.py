@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,171 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     ranks = [int(path.read_text()) for path in tmp_path.glob("rank*")]
     assert launch.returncode == 3
     assert not any(alive(pid) for pid in ranks)
+
+
+def test_a_failing_rank_leaves_none_of_its_own_processes_running(tmp_path):
+    """Rank 1 starts a worker of its own, as a data loader does, and fails; the
+    worker is in its rank's process group, which the launch stops though the
+    rank itself has exited, so nothing it started outlives the launch."""
+    program = ("import os, pathlib, subprocess, sys, time\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "pathlib.Path(sys.argv[1], 'rank' + rank).write_text(str(os.getpid()))\n"
+               "if rank == '1':\n"
+               "    worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+               "    pathlib.Path(sys.argv[1], 'worker').write_text(str(worker.pid))\n"
+               "    time.sleep(1)\n"
+               "    sys.exit(3)\n"
+               "time.sleep(600)\n")
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path))
+    try:
+        launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    assert launch.returncode == 3
+    worker = int((tmp_path / "worker").read_text())
+    deadline = time.monotonic() + 10
+    while running(worker) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not running(worker)
+
+
+def running(pid: int) -> bool:
+    """Whether `pid` runs: an exited process its new parent has not reaped yet (a zombie, state Z in
+    /proc) has stopped, though a signal still finds it."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
+
+
+# ssh -tt as the launcher runs it, to a host that is this machine: the remote command runs under a
+# terminal of its own whose input is ssh's, and closing the connection, as ssh exiting does, hangs that
+# terminal up.
+SSH = """import os, pty, select, signal, sys
+words, skipped = [], False
+for word in sys.argv[1:]:
+    if skipped or word == "-o":
+        skipped = not skipped
+    elif not word.startswith("-"):
+        words.append(word)
+pid, terminal = pty.fork()
+if pid == 0:
+    # sshd starts the remote shell with every signal at its default, whatever this process inherited.
+    for number in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(number, signal.SIG_DFL)
+    os.execvp(SHELL[0], [*SHELL, "-c", " ".join(words[1:])])
+reading = True
+while True:
+    ready = select.select([terminal, *([0] if reading else [])], [], [])[0]
+    if 0 in ready:
+        typed = os.read(0, 1024)
+        reading = bool(typed)
+        if typed:
+            os.write(terminal, typed)
+    if terminal in ready:
+        try:
+            shown = os.read(terminal, 1024)
+        except OSError:
+            break
+        if not shown:
+            break
+        os.write(1, shown)
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+"""
+
+
+def ssh_stand_in(tmp_path: Path, shell: Sequence[str] = ("sh",)) -> Path:
+    """A directory holding `ssh`, the stand-in `SSH` runs as, to put first on a PATH, whose remote
+    commands `shell` runs, as the remote user's login shell does."""
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    (binaries / "ssh.py").write_text(f"SHELL = {list(shell)!r}\n{SSH}")
+    (binaries / "ssh").write_text(f'#!/bin/sh\nexec {sys.executable} {binaries / "ssh.py"} "$@"\n')
+    (binaries / "ssh").chmod(0o755)
+    return binaries
+
+
+def test_a_rank_over_ssh_is_stopped_with_sigterm_and_its_connection_waits_for_it(tmp_path):
+    """A rank on another host, started over ssh -tt, takes a stopped launch as a
+    local rank does, SIGTERM, the notice a training run checkpoints on, not the
+    SIGHUP its connection closing would bring, and its connection stays open
+    while it writes its checkpoint, so it ends the checkpoint before the launch
+    exits 128 plus the signal."""
+    binaries = ssh_stand_in(tmp_path)
+    program = ("import os, pathlib, signal, sys, time\n"
+               "folder, rank = pathlib.Path(sys.argv[1]), os.environ['DEW_PROCESS_ID']\n"
+               "def stopped(signum, frame):\n"
+               "    (folder / f'signal{rank}').write_text(signal.Signals(signum).name)\n"
+               "    time.sleep(1)\n"
+               "    (folder / f'checkpoint{rank}').write_text('written')\n"
+               "    sys.exit(0)\n"
+               "signal.signal(signal.SIGTERM, stopped)\n"
+               "signal.signal(signal.SIGHUP, stopped)\n"
+               "(folder / f'rank{rank}').write_text(str(os.getpid()))\n"
+               "time.sleep(600)\n")
+    launch = launcher("--hosts", "node-a,node-b", "--processes-per-host", "1", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path),
+                      env={**ENV, "PATH": f"{binaries}:{ENV['PATH']}"})
+    started_ranks(tmp_path, 2)
+    launch.send_signal(signal.SIGTERM)
+    assert launch.wait(timeout=60) == 128 + signal.SIGTERM
+    for rank in range(2):
+        assert (tmp_path / f"signal{rank}").read_text() == "SIGTERM"
+        assert (tmp_path / f"checkpoint{rank}").read_text() == "written"
+
+
+def test_a_failing_rank_over_ssh_leaves_none_of_its_processes_on_its_host(tmp_path):
+    """Rank 1, on another host over ssh, starts a worker of its own and fails: the
+    launch exits with its code, and the worker, which no signal from this host
+    reaches once the connection closes, is stopped on its host before the
+    connection does."""
+    binaries = ssh_stand_in(tmp_path)
+    program = ("import os, pathlib, subprocess, sys, time\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "pathlib.Path(sys.argv[1], 'rank' + rank).write_text(str(os.getpid()))\n"
+               "if rank == '1':\n"
+               "    worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+               "    pathlib.Path(sys.argv[1], 'worker').write_text(str(worker.pid))\n"
+               "    time.sleep(1)\n"
+               "    sys.exit(3)\n"
+               "time.sleep(600)\n")
+    launch = launcher("--hosts", "node-a,node-b", "--processes-per-host", "1", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path),
+                      env={**ENV, "PATH": f"{binaries}:{ENV['PATH']}"})
+    try:
+        launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    assert launch.returncode == 3
+    assert not running(int((tmp_path / "worker").read_text()))
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_a_rank_over_ssh_stopped_through_its_terminal_exits_with_its_own_code(tmp_path, shell):
+    """The shell behind a rank's terminal waits again on a wait the stop cut
+    short, so a rank that takes the stop and exits at once, before the shell
+    looks again, still hands back its own code, not the shell's interrupted
+    wait's, under either login shell. strace holds the shell after each kill it
+    sends, so the rank has exited, and bash has reaped it, by the time the shell
+    looks."""
+    from dew.cli.launch import STOP_BYTE, remote_script
+
+    binaries = ssh_stand_in(tmp_path, ("strace", "-qq", "-o", "/dev/null", "-e", "trace=kill",
+                                       "-e", "inject=kill:delay_exit=300000", shell))
+    program = ("import signal, sys, time\n"
+               "signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(7))\n"
+               "print('up', flush=True)\n"
+               "time.sleep(600)\n")
+    ssh = subprocess.Popen([str(binaries / "ssh"), "-tt", "node-a",
+                            remote_script((sys.executable, "-c", program), {}, None)],
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert ssh.stdin is not None and ssh.stdout is not None
+    assert ssh.stdout.readline().strip() == "up"
+    ssh.stdin.write(STOP_BYTE)
+    ssh.stdin.flush()
+    assert ssh.wait(timeout=60) == 7
 
 
 def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
