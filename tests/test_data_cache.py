@@ -484,7 +484,7 @@ def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path):
     cache allows a remote store; it once slept through each of them."""
     import numpy as np
 
-    source = Memory([{"id": 0, "blob": np.zeros(200_000, np.uint8)}])
+    source = Memory([{"id": 0, "blob": np.random.default_rng(0).bytes(200_000)}])
     cache = Cache(str(tmp_path), keep_local_bytes=64 * 1024, on_full="block", shard_bytes=1, retry=3)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
     try:
