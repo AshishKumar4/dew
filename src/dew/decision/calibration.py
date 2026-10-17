@@ -38,12 +38,18 @@ class Scored:
     """One held-out answer, with its question's type and the model's raw logits.
 
     It holds the question's type (`Question.kind`), the model's raw logits over
-    its options, and the index of the right option.
+    its options, and the gold distribution over them (`Example.distribution`):
+    a target's, or all of the mass on the answer.
     """
 
     kind: str
     logits: np.ndarray
-    label: int
+    target: np.ndarray
+
+    @property
+    def label(self) -> int:
+        """The right option: the gold's most likely one, as `Example.labels` reads a target."""
+        return int(np.argmax(self.target))
 
     @property
     def bucket(self) -> str:
@@ -109,17 +115,24 @@ class Temperatures:
 
 
 def _temperature(group: Sequence[Scored]) -> float:
-    """The temperature minimizing mean log loss over `group`, by Newton's
-    method on its inverse, in which the loss is convex: its first derivative
-    is the mean over answers of E_p[z] - z_label and its second the mean of
-    Var_p[z]. Rows of fewer options pad with logits that take no mass."""
+    """The temperature minimizing mean log loss against the gold distributions
+    over `group`, by Newton's method on its inverse, in which the loss is
+    convex: its first derivative is the mean over answers of
+    E_p[z] - E_gold[z] and its second the mean of Var_p[z]. Each gold is
+    read as a distribution, to unit mass, as `Example.distribution` reads a
+    target: a batch packs it in float32, a little short of unit mass, and the
+    shortfall would scale with the logits' common offset. Rows of fewer
+    options pad with logits that take no mass."""
     width = max(len(held.logits) for held in group)
     z = np.zeros((len(group), width))
+    gold = np.zeros((len(group), width))
     real = np.zeros((len(group), width), bool)
     for row, held in enumerate(group):
         z[row, :len(held.logits)] = held.logits
+        target = np.asarray(held.target, np.float64)
+        gold[row, :len(target)] = target / np.sum(target)
         real[row, :len(held.logits)] = True
-    labelled = z[np.arange(len(group)), [held.label for held in group]]
+    labelled = np.sum(gold * z, axis=1)
     inverse = 1.0
     for _ in range(100):
         scaled = np.where(real, z * inverse, -np.inf)
