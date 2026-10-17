@@ -66,6 +66,7 @@ from ..inputs import (
     LayerInputs,
     PredictionPhase,
     coordinates as build_coordinates,
+    coordinates_of,
 )
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -1418,7 +1419,8 @@ class CausalTransformer(nn.Module):
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
                                    attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions)
+                                   image_groups=image_groups, rotary_positions=rotary_positions,
+                                   coordinates=coordinates)
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
@@ -1703,20 +1705,21 @@ class CausalTransformer(nn.Module):
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             coordinates)
-        if attention_metadata is not None and attention_metadata.coordinates is not None:
-            positions = attention_metadata.coordinates.positions
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
         x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
-            places = positions
+            # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
+            # caller gave them in; a cached call's continue from its cache's cursor.
+            tokens_at = coordinates_of(attention_metadata, *tokens.shape)
+            places = tokens_at.positions
             if places is None:
-                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
-                         if decode else None)
-                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
+                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
                 places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+                # A first cached call finds no cursor yet: its tokens start the row.
+                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
@@ -1779,8 +1782,8 @@ class CausalTransformer(nn.Module):
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
                 "call would attend across documents; prefill each document into a row of its own")
         engram_ids = (None if self.engram is None else self.engram_hashes(
-            tokens, attention_mask, None if coordinates is None else coordinates.positions, decode,
-            media_mask))
+            tokens, None if coordinates is None else coordinates.valid,
+            None if coordinates is None else coordinates.positions, decode, media_mask))
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):
