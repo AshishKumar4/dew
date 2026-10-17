@@ -1,9 +1,10 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
-float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's plain decay
-prefix and formula in the portable math where fla cannot run (`plain_prefix`, `port_formula`)."""
+float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), the portable math and its
+float64 terms (`math`, `float64_truth`), and the port's plain decay prefix (`plain_prefix`)."""
 
+import functools
 import itertools
 import os
 import subprocess
@@ -14,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms
+from reference_error import float64_terms, widened
 
 from dew.nn import linear
 from dew.nn.kernels import fla_gdn
@@ -228,6 +229,99 @@ def fla_decay_terms(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     return np.where(first[..., None, None], 0.0, terms)
 
 
+def math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule, value heads reading their key head, a decay per head `[B, T, H]` or per key
+    dimension `[B, T, H, K]`, a row's packed documents starting at `starts` (`[B, T]`), as the port
+    runs them."""
+    group = v.shape[2] // q.shape[2]
+    q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
+    starts = None if starts is None else jnp.asarray(starts)
+    return linear.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0, starts=starts)
+
+
+HEADS = 8
+"""The value heads `float64_truth` evaluates the portable math's terms over at once: fewer operations
+dispatched one by one, at a few GB of host memory a block for Kimi's decay per key dimension."""
+
+
+def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
+    so a head's backward fits, and each one's float64 terms, evaluated op by op on the host: what the
+    sums of Dew's portable math add (`float64_terms`, `HEADS` value heads at a time), and for a decay
+    per key dimension's gradient those of the parts Kimi's port sums besides (`fla_decay_terms`). A
+    key head's gradients and terms are summed over the value heads it serves.
+
+    Packed at `cuts`, the port and fla each run a document as a sequence of its own, chunked from its
+    start, the row's memory the first's and its final memory and cotangent the last's; the terms are
+    that layout's (`_per_document`), since a chunk's last token reads the inter-chunk sum whole (a dot
+    of its key with the state's gradient, which `float64_terms` sizes at that sum's value) and chunks
+    cut from the row's start would end at other tokens."""
+    q, k, v, g, beta, h0, do, dht = inputs
+    group = v.shape[2] // q.shape[2]
+    rows = None if cuts is None else (cuts,)
+    host = jax.devices("cpu")[0]
+    starts = None
+    if cuts is not None:
+        starts = np.zeros(q.shape[:2], bool)
+        starts[0, list(cuts[1:])] = True
+    with jax.enable_x64(new_val=True):
+        run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
+            functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
+        heads, decay = [], []
+        for head in range(v.shape[2]):
+            keyed = slice(head // group, head // group + 1)
+            valued = slice(head, head + 1)
+            sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
+                              beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
+            heads.append([np.asarray(x) for x in run(*sliced)])
+            if g.ndim == 4:
+                with jax.default_device(host):
+                    decay.append(fla_decay_terms(*jax.device_put(sliced, host), starts=starts))
+        sizes = []
+        step = max(1, HEADS // group)
+        with jax.default_device(host):
+            for first in range(0, q.shape[2], step):
+                keyed, valued = slice(first, first + step), slice(first * group, (first + step) * group)
+                block = jax.device_put(widened((
+                    q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
+                    h0[:, valued], do[:, :, valued], dht[:, valued])), host)
+                if cuts is None:
+                    _, terms = float64_terms(through(math, *block[6:]), *block[:6])
+                    sizes.append([np.asarray(x) for x in terms])
+                else:
+                    sizes.append(_per_document(block, cuts))
+
+    def joined(leaves):
+        return [np.concatenate([each[i] for each in leaves], axis=axis)
+                for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+
+    def grouped(x):
+        return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
+
+    found, terms = joined(heads), joined(sizes)
+    if decay:
+        terms[5] = np.maximum(terms[5], np.concatenate(decay, axis=2))
+    for i in (2, 3):
+        found[i] = grouped(found[i])
+    return found, terms
+
+
+def _per_document(block, cuts) -> list[np.ndarray]:
+    """The float64 terms of `block` (`float64_truth`'s operands and cotangents) with its packed
+    documents at `cuts` each a sequence of its own, chunked from its start: the row's memory the
+    first's and its final memory and cotangent the last's."""
+    q, k, v, g, beta, h0, do, dht = block
+    pieces = []
+    for start, end in itertools.pairwise([*cuts, q.shape[1]]):
+        memory = h0 if start == 0 else jnp.zeros_like(h0)
+        cotangent = dht if end == q.shape[1] else jnp.zeros_like(dht)
+        _, terms = float64_terms(through(math, do[:, start:end], cotangent),
+                                 *(x[:, start:end] for x in (q, k, v, g, beta)), memory)
+        pieces.append([np.asarray(x) for x in terms])
+    timed = [np.concatenate([piece[i] for piece in pieces], axis=1) for i in (0, 2, 3, 4, 5, 6)]
+    return [timed[0], pieces[-1][1], *timed[1:], pieces[0][7]]
+
+
 def plain_prefix(g, chunk: int = CHUNKED):
     """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
@@ -240,17 +334,3 @@ def plain_prefix(g, chunk: int = CHUNKED):
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
-
-
-def port_formula(query, key, value, g, beta, state=None, *, starts=None, max_segments=None):
-    """`linear.fla_rule`'s formula in the portable math over unpacked rows: every range the
-    difference of two plain fp32 prefixes per row-aligned chunk (`plain_prefix`), as the port takes
-    them. A second rounding sample of the port's own formula, where fla cannot run. Packed rows,
-    each document a sequence of its own on the port, it refuses: their formula is each document's."""
-    del max_segments
-    if starts is not None:
-        raise ValueError("port_formula takes unpacked rows")
-    group = value.shape[2] // key.shape[2]
-    query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-    decay = plain_prefix(g).reshape(*value.shape[:3], -1)
-    return linear.chunk_delta_rule(query, key, value, decay, beta, state)

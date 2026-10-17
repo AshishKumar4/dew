@@ -200,10 +200,15 @@ def decided(objective, variables, batch, segments: int):
 @pytest.mark.parametrize("arm", ["joint", "marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
-    question's logits and the parameters' gradients each row gives in a window of its own, through
-    Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within the
-    float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64."""
+    question's logits and the parameters' gradients each row gives alone where its window packed it,
+    through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within
+    the float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
+    truth is the rows in windows of their own in float64.
+
+    The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
+    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
+    parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
+    test_fla_kda)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
                                           objective.model.head.clone(dtype=jnp.float64)))
@@ -257,10 +262,10 @@ def rows_alone(objective, variables, batch):
 
 
 def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -> None:
-    """Two packed windows of the examples decide each row's questions as the row does in a window
-    of its own (`rows_alone`), logits and the gradients of the leaves `held` names (by
+    """Two packed windows of the examples decide each row's questions as the row does alone where its
+    window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
     `jax.tree_util.keystr`) within the float64 gate, the truth `wide_modules`, the backbone and head
-    in float64, over the rows alone."""
+    in float64, over the rows in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
