@@ -258,7 +258,7 @@ def follow() -> None:
         ended = {**record, "files": sorted(record["files"]), "reads": sorted(record["reads"]),
                  "ended": time.time()}
         # Whole or not at all, beside the mark, which stays: the parent may read either as this child ends.
-        partial = directory / f".{os.getpid()}.json"
+        partial = directory / f"{os.getpid()}.partial"
         partial.write_text(json.dumps(ended))
         partial.replace(directory / f"{os.getpid()}.json")
 
@@ -277,8 +277,9 @@ def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
     (`peak`), and the GPU pools they held at once, the parent's share counted apart (`shares`, the
     children that took its fraction) from the bytes of those that named their own. Records are read
     before marks, so a child that ends between the two counts as one without its record."""
-    records = [json.loads(path.read_text()) for path in directory.glob("*.json")]
-    ended = {path.stem for path in directory.glob("*.json")}
+    published = list(directory.glob("*.json"))
+    records = [json.loads(path.read_text()) for path in published]
+    ended = {path.stem for path in published}
     lost = {path.read_text() for path in directory.glob("*.started") if path.stem not in ended}
     found: dict[str, dict] = {}
     for name in {*expected, *(record["file"] for record in records)}:
