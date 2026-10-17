@@ -197,10 +197,13 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     answer = ours.generate_until(asked(sampled))
     assert answer == theirs.generate_until(asked(sampled))
     assert answer == ours.generate_until(asked(greedy))
-    # The greedy answer's third id ends it early under a request's own EOS.
-    assert len(answer[0]) > 3
-    eos = ours.tok_encode(answer[0][2], add_special_tokens=False)[0]
-    for controls in (beams, {**greedy, "max_length": context + 2}, {**greedy, "eos_token_id": eos},
+    # Unstopped, the greedy draw runs its budget; its third id, as a request's own EOS, ends it there.
+    unstopped = {**greedy, "until": ["never said"]}
+    drawn = ours.generate_until(asked(unstopped))[0]
+    assert len(drawn) > 3
+    eos = ours.tok_encode(drawn[2], add_special_tokens=False)[0]
+    assert ours.generate_until(asked({**unstopped, "eos_token_id": eos}))[0] != drawn
+    for controls in (beams, {**greedy, "max_length": context + 2}, {**unstopped, "eos_token_id": eos},
                      {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
     for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
