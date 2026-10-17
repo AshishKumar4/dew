@@ -162,7 +162,8 @@ def follow() -> None:
 
         try:
             devices = jax.local_devices(backend="gpu")
-        except RuntimeError:  # the backend failed to open, and holds no pool
+        except RuntimeError as error:  # the backend failed to open, and holds no pool
+            record["unopened"] = str(error)
             return
         stats = [device.memory_stats() or {} for device in devices]
         record["pool"] = sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats)
