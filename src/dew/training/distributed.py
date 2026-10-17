@@ -432,7 +432,7 @@ def check_batch(batch: int, mesh: Mesh, microbatches: int) -> None:
         f"microbatch's again; use {' or '.join(suggestions)}")
 
 
-def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int, *, rows: bool,
+def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: bool,
                  resumed: int | None) -> None:
     """Refuse a training stream a run cannot resume or cannot shard.
 
@@ -442,7 +442,8 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
-    batch whole, never in a `window` of more than one microbatch.
+    batch whole; an accumulation window pools its stages' batches as it pools
+    any, but for a loss that replays its window's batches (`Trainer._prepared`).
     """
     if resumed is not None and not isinstance(source, Checkpointable):
         raise ValueError(
@@ -454,12 +455,6 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
         if rows:
             check_batch(batch, mesh, microbatches)
         return
-    if window > 1:
-        raise ValueError(
-            f"a batch ramp grows the records a step reads, and an "
-            f"accumulation window of {window} pools "
-            f"microbatches of one shape into one update; ramp the "
-            f"batch or accumulate, not both")
     divisor = batch_divisor(mesh, microbatches)
     refused = [stage.batch for stage in source.stages if stage.batch % divisor]
     if refused:
