@@ -205,16 +205,17 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model(tm
     eos = ours.tok_encode(answer[0][1], add_special_tokens=False)[0]
     ended = {**greedy, "eos_token_id": eos}
     assert ours.generate_until(asked(ended)) != answer
-    for controls in (beams, {**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
+    for controls in ({**greedy, "max_length": context + 2}, ended, {**greedy, "temperature": 0.0}):
         assert ours.generate_until(asked(controls)) == theirs.generate_until(asked(controls)), controls
-    # A stop the beams reach, the unstopped answer's third character, ends the search there; stop
-    # strings in a search are read through a tokenizer that lists its vocabulary.
+    # A beam search reads its stop strings through a tokenizer that lists its vocabulary. A stop the
+    # beams reach, the answer's third character under a stop they never reach, ends the search there.
     listed, listed_theirs = _pair(64, tmp_path, bos="inserted")
-    searched = listed.generate_until(asked(beams))[0]
+    searched = listed.generate_until(asked({**beams, "until": ["never said"]}))[0]
     assert len(searched) > 3
-    stopped = asked({**beams, "until": [searched[2]]})
-    assert len(listed.generate_until(stopped)[0]) < len(searched)
-    assert listed.generate_until(stopped) == listed_theirs.generate_until(stopped)
+    for until in (["\n\n"], ["never said"], [searched[2]]):
+        request = asked({**beams, "until": until})
+        assert listed.generate_until(request) == listed_theirs.generate_until(request), until
+    assert len(listed.generate_until(asked({**beams, "until": [searched[2]]}))[0]) < len(searched)
     for refused in ({**sampled, "num_beams": 2}, {**greedy, "not_a_control": 1},
                     {**greedy, "do_sample": True}, {**greedy, "do_sample": True, "temperature": 0.0}):
         with pytest.raises(ValueError):
