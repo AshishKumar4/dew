@@ -21,8 +21,8 @@ _log = logging.getLogger(__name__)
 
 
 class _Deadline:
-    """One fetch attempt's deadline, over every connection it opens (a redirect's included) from
-    the moment its socket exists: connecting, a proxy's tunnel, the TLS handshake and the body. A
+    """One fetch attempt's deadline, over every connection it opens (a redirect's included):
+    resolving its host, connecting, a proxy's tunnel, the TLS handshake and the body. A
     socket timeout bounds each receive, not a response a server trickles a byte at a time, so when
     the deadline passes each connection is shut down, which ends a wait in any of those stages.
     The deadline shuts its own duplicate of each socket, which no close by urllib can hand to
@@ -61,7 +61,7 @@ class _Deadline:
         connects, and each wait at most the time the deadline leaves, in place of `timeout`."""
         host, port = address
         failure: OSError | None = None
-        for family, kind, protocol, _, target in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        for family, kind, protocol, _, target in _resolved(host, port, self.at - time.monotonic()):
             left = self.at - time.monotonic()
             if left <= 0:
                 raise TimeoutError(f"no time left to connect to {host}")
@@ -92,6 +92,28 @@ class _Deadline:
             self._passed = True
             for handle in self._handles:
                 _shut(handle)
+
+
+def _resolved(host: str, port: int, seconds: float) -> list[tuple]:
+    """`socket.getaddrinfo` for a stream to `host`, waited on at most `seconds`. The system resolver
+    takes no timeout, so it runs on a thread of its own, which a lookup the deadline gave up on
+    leaves to finish."""
+    answer: list[list[tuple] | OSError] = []
+
+    def resolve() -> None:
+        try:
+            answer.append(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+        except OSError as error:
+            answer.append(error)
+
+    lookup = threading.Thread(target=resolve, name="dew-fetch-resolve", daemon=True)
+    lookup.start()
+    lookup.join(max(seconds, 0.0))
+    if not answer:
+        raise TimeoutError(f"resolving {host} outlasted the fetch's deadline")
+    if isinstance(answer[0], OSError):
+        raise answer[0]
+    return answer[0]
 
 
 def _shut(connection: socket.socket) -> None:

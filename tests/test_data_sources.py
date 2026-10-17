@@ -657,6 +657,28 @@ def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_p
         csv.field_size_limit(previous)
 
 
+def test_a_fetch_whose_host_resolves_slowly_ends_at_its_timeout(monkeypatch):
+    """The system resolver takes no timeout; a fetch waits on a slow lookup no longer than its own
+    timeout, and drops the attempt as transient."""
+    import socket
+    import time
+
+    from dew.data.pipeline import Rejected
+    from dew.data.sources.urls import Fetch
+
+    resolve = socket.getaddrinfo
+
+    def slow(*arguments, **options):
+        time.sleep(3)
+        return resolve(*arguments, **options)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow)
+    began = time.monotonic()
+    fetched = Fetch(timeout=0.5)({"url": "http://localhost:9/"})
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert time.monotonic() - began < 1.0
+
+
 @pytest.mark.parametrize("trickled", ["headers", "body"])
 def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
     """A server that sends its headers or its body a byte every tenth of a second holds a fetch
