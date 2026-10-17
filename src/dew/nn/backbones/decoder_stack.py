@@ -17,6 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
@@ -172,19 +174,14 @@ class SharedPassView:
         return dict(variables)
 
 
-def cursors_of(cache: Mapping[str, object]) -> dict[str, object]:
-    """Every `cache_index` in a cache tree, by its path joined with '/'."""
-    return {'/'.join(str(getattr(key, 'key', key)) for key in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(dict(cache))[0]
-            if str(getattr(path[-1], 'key', path[-1])) == 'cache_index'}
+def cursors_of(cache: Mapping[str, object]) -> dict[tuple[str, ...], object]:
+    """Every `cache_index` in a cache tree, by its path."""
+    return {path: leaf for path, leaf in flatten_dict(unfreeze(cache)).items() if path[-1] == 'cache_index'}
 
 
-def _with_cursors(cache: Mapping[str, object], cursors: Mapping[str, object]):
-    def placed(path, leaf):
-        name = '/'.join(str(getattr(key, 'key', key)) for key in path)
-        return cursors.get(name, leaf)
-
-    return jax.tree_util.tree_map_with_path(placed, dict(cache))
+def _with_cursors(cache: Mapping[str, object], cursors: Mapping[tuple[str, ...], object]) -> dict:
+    flat = flatten_dict(unfreeze(cache))
+    return unflatten_dict({path: cursors.get(path, leaf) for path, leaf in flat.items()})
 
 
 @dataclasses.dataclass
