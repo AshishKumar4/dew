@@ -134,9 +134,8 @@ class DecisionRunConfig(RunConfig):
                              "attention_impl are choices")
         dtype = str(self.model.fields.get("dtype") or "float32")
         attention_impl = str(self.model.fields.get("attention_impl", "auto"))
-        stated = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                  "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens}
-        budgets = {name: value for name, value in stated.items() if value}
+        budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
+                   "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens}
         derived = {}
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
@@ -222,19 +221,22 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
     return dataclasses.replace(start, model=looped)
 
 
-def _fresh_layout(causal: bool, one_question: bool, budgets: dict[str, int]) -> Layout:
+def _fresh_layout(causal: bool, one_question: bool, budgets: dict[str, int | None]) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
     return _budgeted(default_layout(causal, one_question), budgets)
 
 
-def _budgeted(layout: Layout, budgets: dict[str, int]) -> Layout:
-    """`layout` with the stated `budgets`, refusing one it has no field for: a joint row has
-    no question budget, and a row per question no state budget, its state taking what is left."""
+def _budgeted(layout: Layout, budgets: dict[str, int | None]) -> Layout:
+    """`layout` with the `budgets` the run states, each but those left None, which keep the
+    layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
+    field for is refused: a joint row has no question budget, and a row per question no state
+    budget, its state taking what is left."""
+    stated = {name: value for name, value in budgets.items() if value is not None}
     fields = {field.name for field in dataclasses.fields(layout)}
-    unknown = sorted(f"--{name.replace('_', '-')}" for name in budgets if name not in fields)
+    unknown = sorted(f"--{name.replace('_', '-')}" for name in stated if name not in fields)
     if unknown:
         raise ValueError(f"{', '.join(unknown)} budget a row that {type(layout).__name__} does not lay out")
-    return dataclasses.replace(layout, **budgets)
+    return dataclasses.replace(layout, **stated)
 
 
 __all__ = ["DecisionRunConfig", "JointShape"]
