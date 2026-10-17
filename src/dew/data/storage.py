@@ -456,6 +456,12 @@ class Store:
             raise OSError(f"uploaded object did not verify: {self.url}")
         return {"bytes": len(payload), "sha256": digest}
 
+    @property
+    def remote(self) -> bool:
+        """Whether this object lives behind a network service, where a failed write may pass and a
+        retry is worth making; this host's disk and memory fail for reasons a retry keeps."""
+        return self._backend()[2] not in ("file", "memory")
+
     def put_immutable(self, payload: bytes) -> str:
         """Create this object from `payload`, or accept the byte-identical
         object an earlier attempt created, and return the stored version.

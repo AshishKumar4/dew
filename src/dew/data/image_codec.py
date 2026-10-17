@@ -6,7 +6,23 @@ import io
 
 import numpy as np
 
-from dew.data.images import as_rgb
+
+def as_rgb(pixels: np.ndarray) -> np.ndarray:
+    """Grey, grey and alpha, RGB or RGBA pixels, 8 or 16 bits, as RGB uint8.
+
+    Grey is replicated and a 16-bit sample kept to its high byte. An image
+    with transparency is composited onto white, as img2dataset does for the
+    url shards the online loader streams.
+    """
+    if pixels.dtype == np.uint16:
+        pixels = np.right_shift(pixels, 8).astype(np.uint8)
+    pixels = pixels.reshape(*pixels.shape[:2], -1)
+    if pixels.shape[-1] in (2, 4):
+        # c * a / 255 + 255 - a, rounded to nearest in integers; the exact
+        # quotient is k / 255, which is never a tie.
+        alpha = pixels[..., -1:].astype(np.uint32)
+        pixels = ((pixels[..., :-1] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
+    return np.ascontiguousarray(np.broadcast_to(pixels, (*pixels.shape[:2], 3)))
 
 
 def _header(encoded: bytes) -> tuple[int, int, bool]:

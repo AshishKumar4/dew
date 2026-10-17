@@ -31,33 +31,36 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
-def precision_names(precision: PrecisionLike) -> frozenset[str]:
-    """The canonical names a `PrecisionLike` spells, unordered.
+def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
+    """The canonical names a `jax.lax.PrecisionLike` spells, unordered.
 
-    flax's alias is None, a string, a `jax.lax.Precision`, a dot algorithm, or
-    a pair of precisions. A string is read as JAX reads
+    JAX's alias is None, a string, a `jax.lax.Precision`, a dot algorithm
+    preset or a dot algorithm, or a pair of precisions; flax's is the same
+    without the algorithms. A string is read as JAX reads
     `jax_default_matmul_precision`: a dot algorithm preset's name is that
     preset ('F32_F32_F32'), any other goes through `jax.lax.Precision`, so
-    'tensorfloat32' is 'HIGH' and 'bfloat16' is 'DEFAULT'; a dot algorithm
-    keeps its own name.
+    'tensorfloat32' is 'HIGH' and 'bfloat16' is 'DEFAULT'; a preset keeps its
+    own name, and a dot algorithm, which has none, is named by its fields.
     """
     if precision is None:
         return frozenset()
     written = (precision,) if isinstance(
-        precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset) else precision
-    return frozenset(_read(one).name for one in written if one is not None)
+        precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm) else precision
+    return frozenset(_name(one) for one in written if one is not None)
 
 
-def _read(precision):
-    """One precision `precision_names` takes, a string read as JAX reads one."""
+def _name(precision: str | jax.lax.Precision | jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm) -> str:
+    """The name of one precision `precision_names` takes, a string read as JAX reads one."""
+    if isinstance(precision, jax.lax.DotAlgorithm):
+        return repr(precision)
     if not isinstance(precision, str):
-        return precision
+        return precision.name
     if precision in jax.lax.DotAlgorithmPreset.__members__:
-        return jax.lax.DotAlgorithmPreset[precision]
-    return jax.lax.Precision(precision)
+        return jax.lax.DotAlgorithmPreset[precision].name
+    return jax.lax.Precision(precision).name
 
 
-def asks_default_precision(precision: PrecisionLike, *, configured: bool = False) -> bool:
+def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool = False) -> bool:
     """Whether `precision` asks for no more than the default. With
     `configured`, an unset precision reads `jax_default_matmul_precision`,
     the default a product without one gets."""

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
+import pickle
 import sys
 import time
 import types
@@ -324,7 +326,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                             loss=loss, evaluate=bool(metrics), score_key=score_key))
                     loss_sums.add(statistics)
                     if metrics:
-                        produced = _merged(produced, batch, held, scored, metrics=metrics,
+                        produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
@@ -394,9 +396,10 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
 
 def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
-    is the batch's rows: an array, or a per-row tuple of captions or texts."""
-    if isinstance(leaf, tuple) and len(leaf) == keep.size:
-        return tuple(text for text, kept in zip(leaf, keep, strict=True) if kept)
+    is the batch's rows: an array, a per-row tuple of captions or texts, or a
+    per-row list of opaque records (`dew.data.dataset.take_batch`)."""
+    if isinstance(leaf, list | tuple) and len(leaf) == keep.size:
+        return type(leaf)(row for row, kept in zip(leaf, keep, strict=True) if kept)
     array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
     return array[keep] if array is not None and array.ndim and array.shape[0] == keep.size else leaf
 
@@ -408,9 +411,11 @@ def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
 
 
 def _real_batch(batch: Batch, keep: np.ndarray) -> Batch:
-    """`batch` cut to the real rows, without `VALID_ROWS`."""
+    """`batch` cut to the real rows, without `VALID_ROWS`: a column of opaque records, a list, is
+    cut as one column, as `dew.data.dataset.take_batch` selects its rows."""
     return jax.tree.map(lambda leaf: _cut(leaf, keep),
-                        {name: leaf for name, leaf in batch.items() if name != VALID_ROWS})
+                        {name: leaf for name, leaf in batch.items() if name != VALID_ROWS},
+                        is_leaf=lambda leaf: isinstance(leaf, list))
 
 
 def _dispatched(objective: Objective[Loss, Effects], variables: Variables, batch: Batch, context: Step,
@@ -430,7 +435,7 @@ def _as_placed(leaf) -> np.ndarray:
     return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
 
 
-def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequence[Metric],
+def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
             summaries: _Accumulators, root: bool):
     """Merge one batch into every metric's accumulator on root, returning what
     the objective produced, hosted.
@@ -438,16 +443,23 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequenc
     The artifacts come home, and so does the batch the metrics read: on one
     process that is the host batch it was placed from, as the devices hold
     it, so nothing copies back; a batch spread over processes comes home
-    with the artifacts. One agreement covers every metric, so a failure on
-    root stops its peers there.
+    with the artifacts, its host fields from every share (`_shares_host`).
+    One agreement covers every metric, so a failure on root stops its peers
+    there.
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
         device, host = split_fields(held)
         home = with_host(jax.tree.map(_as_placed, device), host)
     else:
-        device, _ = split_fields(batch)
-        produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
+        device, host = split_fields(batch)
+        if host:
+            rows = rows_of(held)
+            produced, home, origins = collective_host(
+                (produced, device, _origins(mesh, rows)), phase=f"scoring batch {index}")
+            home = with_host(home, _shares_host(mesh, host, np.asarray(origins), rows))
+        else:
+            produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
 
     def merge() -> None:
         if not root:
@@ -462,6 +474,42 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequenc
 
     agreed(f"metrics batch {index}", merge)
     return produced
+
+
+def _origins(mesh: Mesh, rows: int) -> jax.Array:
+    """Each row of the batch placed on `mesh`, numbered by where it came from, `share * rows + row`:
+    this process's `rows` rows of its share (`DataPartition.of`), placed as the batch's are
+    (`shard_batch`), so the gathered numbers say which share's row each row of the batch is."""
+    share = DataPartition.of(mesh).index
+    return shard_batch(mesh, {"origin": share * rows + np.arange(rows, dtype=np.int32)})["origin"]
+
+
+def _shares_host(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Batch:
+    """The host fields of a batch spread over processes, each row where `origins` places it: every
+    share's own rows, from its first reader, which no device carries, so they meet on the host
+    (`from_every_process`). Every process takes part; the fields are whole on each."""
+    partition = DataPartition.of(mesh)
+    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
+    # waiting for its fields.
+    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
+                  if partition.reader == 0 else "")
+    shares = {index: pickle.loads(base64.b64decode(word))
+              for index, word in from_every_process([partition.index, told]) if word}
+    ordered = [shares[index] for index in range(len(shares))]
+    share, row = np.divmod(origins, rows)
+
+    def gathered(*columns):
+        first = columns[0]
+        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
+        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
+        if not rowed:
+            return first
+        values = [columns[position][place] for position, place in zip(share, row, strict=True)]
+        if not isinstance(first, np.ndarray):
+            return values
+        return np.asarray(values, dtype=object) if first.dtype == object else np.asarray(values)
+
+    return jax.tree.map(gathered, *ordered, is_leaf=lambda column: not isinstance(column, Mapping))
 
 
 def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,

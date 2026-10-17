@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -93,7 +93,8 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import Chunks, ValidTargets
+from dew.data.steps.text import ValidTargets
+from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, record
 
@@ -134,10 +135,6 @@ def _outputs(
         return (value,)
     if value is None:
         return (Rejected("missing"),)
-    if isinstance(stage, MapWithIndex):
-        if position is None:
-            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
-        return (stage.step(position, record(value, "indexed map input")),)
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
@@ -156,6 +153,10 @@ def _outputs(
     elif isinstance(stage, Map):
         step = stage.step
         output = step.map(value) if isinstance(step, pygrain.MapTransform) else step(record(value, "map"))
+    elif isinstance(stage, MapWithIndex):
+        if position is None:
+            raise ValueError(f"map_with_index step {_identity(stage).name} read a row without its position")
+        output = stage.step(position, record(value, "indexed map input"))
     else:
         raise ValueError(f"{type(stage).__name__} is not a record stage")
     if isinstance(output, Rejected) and not stage.rejects:
@@ -429,14 +430,90 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
                   max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
 
 
-def _reordered(stage: Shuffle | Repeat | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
+@overload
+def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str, loading: Loading, *,
+              reseed: bool = True) -> pygrain.MapDataset: ...
+
+
+@overload
+def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
+              reseed: bool = True) -> Rows: ...
+
+
+def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True) -> Rows:
+    """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An indexed repeat draws
+    each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
+    passes replay the first. An endless repeat of a pass that holds or yields nothing would read
+    nothing forever, so it is refused: an indexed pass by its length, a streamed one when a pass
+    ends without a row (`_Passes`), as a pass of batches does when its records fill no batch."""
+    if isinstance(rows, pygrain.MapDataset):
+        if epochs is None and not len(rows):
+            raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
+        return rows.repeat(epochs, reseed_each_epoch=reseed)
+    parent = _as_iter(rows, loading)
+    return gx.RepeatIterDataset(parent, epochs) if epochs is not None else _Endless(parent, name)
+
+
+class _Endless(pygrain.IterDataset):
+    """Grain's endless repeat of `parent`, refusing a pass that yields no row. It is one node of the
+    dataset tree, as the repeat is, so a random step after it draws as it would after the repeat
+    (Grain seeds a step by its depth below the nearest seeded dataset)."""
+
+    def __init__(self, parent: pygrain.IterDataset, name: str):
+        super().__init__(parent)
+        self._rows, self._name = parent, name
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return gx.RepeatIterDataset(_Passes(self._rows, self._name), None).__iter__()
+
+
+class _Passes(pygrain.IterDataset):
+    """A stream an endless repeat reads pass after pass, refusing a pass that yields no row."""
+
+    def __init__(self, parent: pygrain.IterDataset, name: str):
+        super().__init__(parent)
+        self._rows, self._name = parent, name
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _PassesIterator(self._rows.__iter__(), self._name)
+
+
+class _PassesIterator(pygrain.DatasetIterator):
+    """Its parent's rows and position. A pass that ends without a row is refused; the repeat
+    restarts a pass by restoring the parent right after one ends, and any other restore lands
+    inside a pass the run already read from."""
+
+    def __init__(self, parent: pygrain.DatasetIterator, name: str):
+        super().__init__(parent)
+        self._rows, self._name = parent, name
+        self._yielded = self._ended = False
+
+    def __next__(self):
+        try:
+            value = next(self._rows)
+        except StopIteration:
+            if not self._yielded:
+                raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads nothing "
+                                 "forever") from None
+            self._ended = True
+            raise
+        self._yielded = True
+        return value
+
+    def get_state(self):
+        return self._rows.get_state()
+
+    def set_state(self, state) -> None:
+        self._rows.set_state(state)
+        self._yielded, self._ended = not self._ended, False
+
+
+def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
     """An order stage over an indexed dataset."""
     if isinstance(stage, Shuffle):
         if stage.window is None:
             return rows.shuffle(stage.seed)
         return gx.WindowShuffleMapDataset(rows, window_size=stage.window, seed=stage.seed)
-    if isinstance(stage, Repeat):
-        return rows.repeat(stage.epochs)
     if isinstance(stage, Slice):
         return rows.slice(stage.selection)
     return rows[: min(stage.count, len(rows))]
@@ -508,7 +585,7 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, source, transform=prefix)
+        cached = filled.mapped(stored, manifest, transform=prefix)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
@@ -529,7 +606,7 @@ class _Build:
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, shards, transform=prefix)
+            reader = filled.streamed(shards.reader, manifest, transform=prefix)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
@@ -556,7 +633,9 @@ class _Build:
         if self.global_order or not self.training:
             return rows
         rows = rows[partition.index :: partition.count]
-        return (rows if self.lowering.repeated else rows.repeat(None)).seed(self.seed)
+        if not self.lowering.repeated:
+            rows = _repeated(rows, None, _name(pipeline), self.loading)
+        return rows.seed(self.seed)
 
     def streamed(
         self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition
@@ -605,7 +684,9 @@ class _Build:
             return self.record_stage(rows, stage, pipeline)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
-        if isinstance(stage, (Shuffle, Repeat, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
+        if isinstance(stage, Repeat):
+            return _repeated(rows, stage.epochs, _name(pipeline), self.loading)
+        if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
             rows = gx.WindowShuffleIterDataset(
@@ -614,8 +695,6 @@ class _Build:
         elif isinstance(stage, (Shuffle, Slice)):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
-        elif isinstance(stage, Repeat):
-            rows = gx.RepeatIterDataset(_as_iter(rows, self.loading), stage.epochs)
         elif isinstance(stage, Limit):
             rows = gx.LimitIterDataset(_as_iter(rows, self.loading), stage.count)
         elif isinstance(stage, Prefetch):
@@ -662,7 +741,7 @@ class _Build:
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
             manifest = _cache_manifest(pipeline.source, prefix, self.read)
-            rows = _filled(stage).mapped(rows, manifest, pipeline.source)
+            rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
         return rows
@@ -712,8 +791,8 @@ class _Build:
     ) -> pygrain.DatasetIterator[Batch]:
         """This share's batches, through the stages after the batch."""
         batching = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
-        stream = self.batched(pipeline, partition, offset, fill=fill)
-        return iter(self.after_batch(stream, pipeline, partition, batching))
+        stream, applied = self.batched(pipeline, partition, offset, fill=fill)
+        return iter(self.after_batch(stream, pipeline, partition, batching, applied))
 
     def tuned(self, pipeline: Pipeline) -> _Build:
         """This build with automatic loading resolved on the whole order
@@ -726,7 +805,7 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         if loading.workers == "auto":
-            loading = loading.resolved(bare.batched(pipeline, DataPartition()))
+            loading = loading.resolved(bare.batched(pipeline, DataPartition())[0])
         if loading.worker_count and (not self.training or not self.lowering.endless):
             rows = bare.records(pipeline, DataPartition())
             if isinstance(rows, pygrain.MapDataset):
@@ -737,13 +816,16 @@ class _Build:
 
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
-    ) -> pygrain.IterDataset:
+    ) -> tuple[pygrain.IterDataset, int]:
         """This share's batches as the reader reads them, before the stages
         after the batch, which automatic loading also sizes its buffers by
-        (`Loading.resolved`). A global order is batched by index before the
-        reader starts, as Grain's own indexed pipelines are, so each read in
-        flight is a whole batch and each worker reads whole batches of its
-        own; any other order is batched as its rows arrive."""
+        (`Loading.resolved`), and how many of those stages it already ran. A
+        global order is batched by index before the reader starts, as Grain's
+        own indexed pipelines are, so each read in flight is a whole batch and
+        each worker reads whole batches of its own; any other order is batched
+        as its rows arrive. An endless repeat right after the batch repeats a
+        global order's batches by index too, so a resume `offset` records in
+        seeks into the repeated batches, not past the one pass of rows."""
         canonical = not self.training and not self.global_order
         rows = self.records(pipeline, DataPartition() if canonical else partition)
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
@@ -751,17 +833,25 @@ class _Build:
         size = batch_stage.size if canonical else shared_size
         drop = batch_stage.drop_remainder if self.training else False
         empty = False
+        after = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+        folded = 0
         if isinstance(rows, pygrain.MapDataset):
+            folded = int(self.global_order and bool(after) and isinstance(after[0], Repeat)
+                         and after[0].epochs is None)
             if self.training and self.lowering.endless and not self.lowering.repeated:
-                rows = rows.repeat(None)
+                rows = _repeated(rows, None, _name(pipeline), self.loading)
             elif self.training and not self.lowering.endless and drop:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
             whole = rows
-            rows = rows[offset + partition.index :: partition.count]
+            rows = rows[(0 if folded else offset) + partition.index :: partition.count]
             empty = not self.training and not len(rows) and bool(len(whole))
             if empty:
                 rows = whole[:1]
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
+            if folded:
+                # The repeat after the batch replays its first pass, as a repeat of the batched stream does.
+                batched = _repeated(batched, None, _name(pipeline), self.loading, reseed=False)
+                batched = batched[offset // batch_stage.size :]
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
@@ -775,7 +865,7 @@ class _Build:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
-        return stream
+        return stream, folded
 
     def after_batch(
         self,
@@ -783,11 +873,12 @@ class _Build:
         pipeline: Pipeline,
         partition: DataPartition,
         batch_stage: BatchStage,
+        applied: int = 0,
     ) -> pygrain.IterDataset:
-        """The stages after the batch, each as `stage` lowers it, with the
-        loading's own workers last when the pipeline names none. Host steps
-        run in the reader that wraps this stream."""
-        stages = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+        """The stages after the batch past the `applied` ones `batched` ran, each as `stage` lowers
+        it, with the loading's own workers last when the pipeline names none. Host steps run in the
+        reader that wraps this stream."""
+        stages = pipeline.stages[pipeline.stages.index(batch_stage) + 1 + applied :]
         if self.loading.workers and _at(pipeline.stages, Workers) is None:
             stages = (*stages, Workers(self.loading.worker_count, self.loading.worker_buffer))
         for stage in stages:
