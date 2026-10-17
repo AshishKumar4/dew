@@ -335,31 +335,33 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
 
 def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
                            query: int, backward: bool) -> float:
-    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query and
-    key it is given, the operands at `query` and the one after it, and the
-    pairs of them its mask computes (`_reached`).
+    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query,
+    key and value it is given, the operands at `query` and the two after it,
+    and the pairs of them its mask computes (`_reached`).
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
     (checked against the calls XLA emits for `jax.nn.dot_product_attention`,
     including grouped-query and cross attention, where the key carries its own
-    head count and sequence, and against dew_flash_attn's). Both products of
-    the forward pass, `Q K^T` and `P V`, cost one multiply-add per pair, head
-    and width; the backward pass runs four such products, for dV, dP, dQ and
-    dK. A causal mask leaves the kernels about half the square, which is what
-    they compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads
-    x 4096 x 128 counted the whole square, twice its work, before this read
-    the mask.
+    head count and sequence, and against dew_flash_attn's). The forward pass's
+    `Q K^T` costs one multiply-add per pair, head and query width, and its
+    `P V` one per pair, head and value width, which a model may set apart
+    (MiMo's 192 and 128). The backward pass runs each product's two
+    transposes: dP and dV at the value's width, dQ and dK at the query's. A
+    causal mask leaves the kernels about half the square, which is what they
+    compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads x 4096
+    x 128 counted the whole square, twice its work, before this read the mask.
     """
-    if len(instruction.operands) < query + 2:
+    if len(instruction.operands) < query + 3:
         return 0.0
-    queries = shapes.get(instruction.operands[query])
-    key = shapes.get(instruction.operands[query + 1])
-    if queries is None or key is None or len(queries) != 4 or len(key) != 4:
+    queries, key, value = (shapes.get(instruction.operands[query + offset]) for offset in range(3))
+    if any(operand is None or len(operand) != 4 for operand in (queries, key, value)):
         return 0.0
+    assert queries is not None and key is not None and value is not None
     batch, length, heads, width = queries
-    products = 4 if backward else 2
-    return products * _MAC * batch * heads * _reached(length, key[1], instruction.attributes) * width
+    passes = 2 if backward else 1
+    pairs = _reached(length, key[1], instruction.attributes)
+    return passes * _MAC * batch * heads * pairs * (width + value[3])
 
 
 def custom_call_kind(target: str) -> str | None:

@@ -521,11 +521,12 @@ PLAIN_SPELLING = RopeSpelling()
 """The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
 
 
-def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
+def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
                   ) -> tuple[tuple[str, dict], tuple[str, dict] | None]:
     """The full layers' and the sliding layers' effective rope records, each
-    with the field it is read under, in the order the class resolves them;
-    None where one record serves every layer."""
+    with the field it is read under and its rope_theta filled in, in the order
+    the class resolves them; None where one record serves every layer. A family
+    that parses a ramp of its own (Phi-3's LongRoPE) reads its record here."""
     scaling, parameters = hf_config.get('rope_scaling'), hf_config.get('rope_parameters')
     base = hf_config.get('rope_theta')
     stated = hf_config.get('layer_types')
@@ -577,7 +578,7 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
     if spelling.local_field is not None:
         used.add(spelling.local_field)
-    (full_field, full_record), sliding = _rope_records(hf_config, spelling)
+    (full_field, full_record), sliding = rope_records(hf_config, spelling)
     if not per_kind and '.' in full_field:
         refuse(full_field, 'this family reads one rotary record for every layer')
     full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)

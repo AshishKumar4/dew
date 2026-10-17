@@ -98,8 +98,8 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
     """A dataset's and a request's token ids are read alike (`token_id`): a Python or NumPy integer
     from 0 through int32's largest passes as an int, and a bool, a negative id or one past int32 is
     refused, where the parsers once disagreed on all three."""
+    from dew.data.preferences import PreferencePair
     from dew.data.prompts import _prompt_ids
-    from dew.data.steps.chat import PreferencePair
     from dew.data.text import ByteTokenizer
     from dew.inference.clients import _token_rows
     from dew.inference.rollouts import _prompt

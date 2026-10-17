@@ -153,3 +153,11 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     assert reloaded.model.mask_token_id == source.model.mask_token_id
     np.testing.assert_array_equal(tool.logits(reloaded, reloaded.variables, ids),
                                   tool.logits(source, state.variables, ids))
+
+    # The export generates with the run's response budget, through no KV cache.
+    from dew.inference.tasks import MaskedGeneration
+
+    task, saved = reloaded.text_generation(), MaskedGeneration.from_run(str(tmp_path / "run"))
+    assert (task.max_new_tokens, task.pad_token_id) == (saved.max_new_tokens, saved.pad_token_id)
+    assert task.max_new_tokens == int(ids.shape[1])
+    assert task(ids[:1, :4], 4, key=0).tokens.shape[-1] == 8

@@ -25,6 +25,7 @@ from dew.interop.decoder_parts import (
     renamed_path,
 )
 from dew.interop.families.gemma import (
+    GEMMA4_DEFAULTS,
     gemma4_config,
     gemma4_export_path,
     gemma4_export_weights,
@@ -334,6 +335,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     packed=FUSED_EXPERTS,
     export_weights=gemma4_export_weights,
     preserve_source_layout=False,
+    defaults=GEMMA4_DEFAULTS,
 )
 
 DREAM = DecoderFamily(
