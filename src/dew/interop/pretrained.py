@@ -1071,13 +1071,6 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
         config = records.record(json.load(handle), "config.json")
-    # A GGUF file holds no kimi_k25 wrapper, so only a config.json can carry this.
-    text_config = config.get("text_config")
-    if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
-            and text_config.get("quantization_config") is not None):
-        raise ValueError(
-            "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
-            "provide dequantized text weights and remove that quantization descriptor")
     return config, None
 
 
