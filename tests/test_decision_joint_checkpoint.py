@@ -216,7 +216,8 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
             patched.setattr(linear, "fla_rule", port_formula)
             reference = joint_logits(decide)
         assert not np.array_equal(reference, found), "the formula ran the port itself"
-    assert_as_exact_as_the_reference(found, reference, np.concatenate(truth), "the joint head over Dew's Qwen 3.5")
+    assert_as_exact_as_the_reference(found, reference, np.concatenate(truth),
+                                     "the joint head over Dew's Qwen 3.5")
 
 
 def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
