@@ -273,8 +273,7 @@ def plan_step[LossT, EffectsT](
     """The first of `candidates` (`splits`) and the objective's rungs to fit
     the devices (`planned`), each lowered by `lower` at the objective's
     current rung once, and compiled under its
-    `options`, or under XLA's defaults on the half rung above, which keep
-    the options the modules need to compute right (`compiler_options`), the head
+    `options`, or under XLA's defaults and `compiler_options` on the half rung above, the head
     returning to the run's own tile `base` at each remat rung
     (`recompute_more`). Where a split does not fit at a rung whose models
     have a half rung above it (`remat_half`, a decoder's delta rule
@@ -305,6 +304,8 @@ def plan_step[LossT, EffectsT](
     """The remat rungs (`recompute_record`) the search has asked as half rungs."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
+    # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
+    required = compiler_options(*(entry.module for entry in objective.program_key())) or None
 
     def rung() -> str:
         return json.dumps(rung_record(objective, xla_defaults), sort_keys=True)
@@ -338,7 +339,7 @@ def plan_step[LossT, EffectsT](
         if key not in lowered:
             lowered[key] = lower(split)
         candidate = lowered[key]
-        chosen = required() if xla_defaults else options(candidate)
+        chosen = required if xla_defaults else options(candidate)
         executable = compiled_if_it_fits(candidate.program, chosen, refusals)
         fit, headroom = step_fits(executable, mesh, candidate.held)
         stats = None if executable is None else executable.memory_analysis()
@@ -354,18 +355,11 @@ def plan_step[LossT, EffectsT](
             resumed = None
         return fit
 
-    def required() -> jax.stages.CompilerOptions | None:
-        """The options every rung keeps, XLA's defaults' included: those a program over the
-        objective's modules needs to compute right (`compiler_options`), not to run faster."""
-        return compiler_options(*(entry.module for entry in objective.program_key())) or None
-
     def climb() -> bool:
-        # XLA's default options are the half rung above the step's own,
-        # where those are another program: the Triton GEMM fusions they
-        # keep can take fewer temporaries (sm89 at 8192 tokens). Its
-        # program keeps the options the modules need to compute right.
+        # XLA's default options, but `required`, are the half rung above the step's own where those
+        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
         nonlocal xla_defaults
-        if not xla_defaults and chosen != required():
+        if not xla_defaults and chosen != required:
             xla_defaults = True
             return True
         xla_defaults = False
