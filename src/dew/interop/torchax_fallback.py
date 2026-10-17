@@ -28,7 +28,7 @@ import json
 import math
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -137,19 +137,14 @@ class TorchLayout(Layout):
 class TorchGraph:
     """The transformers module torchax runs, as a function of its tensors.
 
-    `head` names the output head's weight when the logits are by
-    construction `hidden @ head.T`, which the loader establishes from the
-    model's structure (`_plain_head`); None when the head is anything else or
-    the model adds anything after it (a bias, a scale, a softcap, a cast).
-    `persistent` names the buffers the source
-    checkpoint stores. A training forward runs the module's own training
-    forward, its dropout and other draws taking `key` as torchax's random
-    key; one that draws on the host instead (OPT's layer drop,
-    `torch.rand([])`) is decided once at trace time, and is refused.
+    `persistent` names the buffers the source checkpoint stores. A training
+    forward runs the module's own training forward, its dropout and other
+    draws taking `key` as torchax's random key; one that draws on the host
+    instead (OPT's layer drop, `torch.rand([])`) is decided once at trace
+    time, and is refused.
     """
 
     module: JittableModule
-    head: str | None
     persistent: tuple[str, ...]
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
@@ -301,9 +296,12 @@ class TorchCausalLM(nn.Module):
 
 
 class TorchTableLM(TorchCausalLM):
-    """A `TorchCausalLM` whose logits are its head input times its head weight
-    (`TorchGraph.head`), the pair `LMObjective` scores through, so the
-    vocabulary-sized logits are never built whole."""
+    """A `TorchCausalLM` whose logits are by construction its head input
+    times the weight `head` names, which the loader establishes from the
+    model's structure (`_plain_head`): the pair `LMObjective` scores through,
+    so the vocabulary-sized logits are never built whole."""
+
+    head: str = field(kw_only=True)
 
     def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`."""
@@ -316,7 +314,7 @@ class TorchTableLM(TorchCausalLM):
         hold it, the parameter a loss keeps, with the forward's compute dtype,
         which casts the product's operands as the forward casts them whatever
         dtype the states arrive in (`head_product`)."""
-        return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
+        return OutputTable(self.variables["params"][self.head], vocab_major=True,
                            precision=self.precision, compute=self.dtype)
 
 
@@ -390,8 +388,9 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     vocab = int(head_weight.shape[0])
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, head_name, persistent)
-    module = (TorchCausalLM if head_name is None else TorchTableLM)(graph, vocab, dtype=resolve_dtype(dtype))
+    graph = TorchGraph(jittable, persistent)
+    module = (TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype)) if head_name is None
+              else TorchTableLM(graph, vocab, dtype=resolve_dtype(dtype), head=head_name))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
@@ -419,7 +418,7 @@ def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
 
     if type(head) is not torch.nn.Linear or head.bias is not None:
         return False
-    made: list[torch.Tensor] = []
+    made: list[object] = []
     hook = head.register_forward_hook(lambda _, __, output: made.append(output))
     tokens = torch.arange(min(8, int(head.out_features)))[None]
     try:
