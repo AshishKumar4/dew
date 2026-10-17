@@ -177,14 +177,13 @@ class CausalSelfAttention(nn.Module):
     """No positional encoding: q and k enter the kernel unrotated, and the
     logits keep their scale (lm-engine's `position_embedding_type="nope"`)."""
     alibi: bool = False
-    """Linear key-position bias on unrotated queries and keys, as in BLOOM."""
+    """Linear key-position bias added to the logits, after any rotation of the
+    queries and keys; BLOOM's are unrotated (`nope`)."""
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078): each head's output loses its component along
     the token's own value vector before the output projection."""
 
     def setup(self):
-        if self.alibi and not self.nope:
-            raise ValueError('ALiBi requires unrotated attention (nope=True)')
         if self.rotary_per_axis and self.rotary_axes is None:
             raise ValueError('rotary_per_axis turns each of the rotary_axes in its own halves, '
                              'so it needs rotary_axes')
@@ -1043,7 +1042,7 @@ class AttentionMixer(MixerBase):
     logits keep their scale (lm-engine's `position_embedding_type="nope"`,
     Granite 4.0-H)."""
     alibi: bool = False
-    """Per-head linear key-position bias; requires unrotated attention."""
+    """Per-head linear key-position bias (`CausalSelfAttention.alibi`)."""
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
@@ -1058,8 +1057,6 @@ class AttentionMixer(MixerBase):
     mixed_step = True
 
     def __post_init__(self):
-        if self.alibi and not self.nope:
-            raise ValueError("ALiBi requires unrotated attention (nope=True)")
         if self.mrope_section is not None:
             object.__setattr__(self, "mrope_section", tuple(self.mrope_section))
             if len(self.mrope_section) != 3 or any(value < 0 for value in self.mrope_section):
