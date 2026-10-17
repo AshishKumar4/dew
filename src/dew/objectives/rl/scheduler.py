@@ -35,11 +35,13 @@ replaced according to its status:
   discarded and resubmitted. A rollout still running when its submission
   falls past that bound is cancelled without waiting for it to finish,
   because its first call was made under the submission's version.
-- A rollout still running `timeout` seconds after its submission is
-  cancelled and resubmitted as a failed attempt, like an INFRA_ERROR.
-  Cancelling only asks the source to stop. The scheduler cannot reclaim a
-  thread stuck inside an environment step, so environments must bound
-  their own step time.
+
+The scheduler keeps no clock of its own: a deadline belongs to the
+operation that can stop when it passes. The remote rollout servers bound
+each request, a sandbox its `wall_seconds`, and Harbor its agent and
+verifier. A rollout that runs out of time there comes back with the status
+its source gives it, such as an INFRA_ERROR for a request or a sandboxed
+environment that timed out, which the scheduler retries.
 
 A source that raises an exception instead of returning a status is broken.
 The scheduler cancels the batch's remaining rollouts and lets the exception
@@ -152,9 +154,9 @@ class SchedulerRecord:
       how many updates it is behind `updates`.
     - `groups` counts the admitted groups.
     - `resubmitted` counts resubmissions by cause (`infra_error`,
-      `cancelled`, `stale`, `timeout`, `unscored`).
+      `cancelled`, `stale`, `unscored`).
     - `cancelled` counts in-flight rollouts cancelled because they were
-      surplus, stale, past their `timeout` or in an abandoned group.
+      surplus, stale or in an abandoned group.
     - `abandoned` counts groups given up after `max_attempts` failures.
     - `cut` counts complete groups left out because their chains did not
       fit the batch's `rows` beside the groups admitted before them.
@@ -242,7 +244,6 @@ class RolloutScheduler:
 
     - `tasks` turns one registered batch into its tasks (`task_ids` for
       integer `task_id` rows).
-    - `timeout` is each rollout's deadline in seconds from its submission.
     - `width` and `rows` fix the packed batch shape. `rows` is this
       process's share of a multi-process trainer's batch.
     - `estimator` and `truncation` are `pack`'s advantage family and
@@ -269,7 +270,7 @@ class RolloutScheduler:
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
-                 timeout: float | None = None, estimator: str = "group", truncation: str = "mask",
+                 estimator: str = "group", truncation: str = "mask",
                  support_capacity: int | None = None, log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
@@ -277,10 +278,6 @@ class RolloutScheduler:
                                    ("max_attempts", max_attempts, 1)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
-        if timeout is not None and not timeout > 0:
-            raise ValueError(
-                "timeout must be a positive number of seconds, or None to wait without a deadline"
-            )
         check_truncation(truncation)
         if admit is not None and (type(admit) is not int or admit < 1):
             raise ValueError("admit must be a positive number of groups, or None to admit every task")
@@ -307,7 +304,7 @@ class RolloutScheduler:
             sync_every,
             max_attempts,
         )
-        self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
+        self.estimator, self.truncation, self.log = estimator, truncation, log
         self.support_capacity = support_capacity
         self.metrics: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -406,21 +403,14 @@ class RolloutScheduler:
         A group stops taking rollouts once it is full or abandoned; its
         remaining samples are left for `_admit`'s final cancel.
         """
-        now = time.perf_counter()
-        overdue = {}
-        for sample in group.live:
-            if sample.future.done():
-                continue
-            if updates - sample.submitted > self.max_lag:
-                overdue[sample] = "stale"
-            elif self.timeout is not None and now - sample.started >= self.timeout:
-                overdue[sample] = "timeout"
-        if overdue:
-            tally.cancelled += len(overdue)
-            self._cancel(list(overdue))
-            group.live = [sample for sample in group.live if sample not in overdue]
+        stale = [sample for sample in group.live
+                 if not sample.future.done() and updates - sample.submitted > self.max_lag]
+        if stale:
+            tally.cancelled += len(stale)
+            self._cancel(stale)
+            group.live = [sample for sample in group.live if sample not in stale]
         finished = [(sample, None) for sample in group.live if sample.future.done()]
-        for sample, cause in [*finished, *overdue.items()]:
+        for sample, cause in [*finished, *((sample, "stale") for sample in stale)]:
             if group.abandoned or len(group.done) >= self.groups:
                 return
             if cause is not None:
@@ -493,10 +483,8 @@ class RolloutScheduler:
                 ]
                 if len(entry.complete) >= target or not pending:
                     break
-                live = [sample for group in pending for sample in group.live]
-                deadline = None if self.timeout is None else max(
-                    min(sample.started for sample in live) + self.timeout - time.perf_counter(), 0.0)
-                wait([sample.future for sample in live], timeout=deadline, return_when=FIRST_COMPLETED)
+                live = [sample.future for group in pending for sample in group.live]
+                wait(live, return_when=FIRST_COMPLETED)
         finally:
             leftover = [sample for group in entry.groups for sample in group.live]
             tally.cancelled += len(leftover)
