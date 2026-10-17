@@ -16,6 +16,7 @@ from .flops import projection_flops
 from .gemma3n import gaussian_topk
 from .joined import joined_dense, joins
 from .moe import GatedActivation, Situ, gated_product, packed_gated_product
+from .ngpt import NGPT, gain, unit
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
 
@@ -63,6 +64,10 @@ class GatedMLP(nn.Module):
     packed: bool = False
     linear: Callable[..., nn.Dense] = nn.Dense
     dropout_rate: float = 0.0
+    ngpt: NGPT | None = None
+    """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the gate and the up projection each
+    take a learned per-feature gain (`suv_gate`, `suv_up`) and the gated product is unit-normed before
+    the down projection; None for none."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -101,6 +106,14 @@ class GatedMLP(nn.Module):
         self.down_proj = dense(projections['down_proj'][1], name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
         self.dropout = nn.Dropout(rate=self.dropout_rate)
+        if self.ngpt is not None:
+            if not self._gated() or self.swiglu_limit is not None or self.activation_sparsity:
+                raise ValueError("an nGPT feed-forward is a plain gated product: it takes no clamp, "
+                                 "activation sparsity or ungated activation")
+            # Each gain starts where the normalized transformer starts it, at 1.
+            start = nn.initializers.constant(1 / self.ngpt.hidden)
+            self.suv_gate = self.param('suv_gate', start, (self.hidden_features,), jnp.float32)
+            self.suv_up = self.param('suv_up', start, (self.hidden_features,), jnp.float32)
 
     @property
     def reads_train(self) -> bool:
@@ -115,6 +128,8 @@ class GatedMLP(nn.Module):
         if not isinstance(activation, (str, Situ)):
             return self._down(activation(checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')),
                               train)
+        if self.ngpt is not None:
+            return self._ngpt_down(x, activation, train)
         # A SiTU, the clamp and the gate's top-k take the halves apart.
         if isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity:
             gate_up = self._gate_up(x)
@@ -134,6 +149,20 @@ class GatedMLP(nn.Module):
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+
+    def _ngpt_down(self, x, activation, train: bool):
+        """nGPT's feed-forward: the gate and up projections times their gains in fp32, their gated
+        product in fp32, unit-normed in the activations' dtype, then projected down
+        (dory.py:188-197)."""
+        assert self.ngpt is not None
+        gate, up = self._group().split(self.gate_up_proj(x)) if self._packed() else (
+            self.gate_proj(x), self.up_proj(x))
+        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
+        gate = (gate.astype(jnp.float32) * gain(self.suv_gate, self.ngpt.hidden)).astype(gate.dtype)
+        up = (up.astype(jnp.float32) * gain(self.suv_up, self.ngpt.hidden)).astype(up.dtype)
+        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(jnp.float32), up.astype(jnp.float32))
+        return self._down(unit(hidden.astype(gate.dtype)), train)
 
     def _down(self, hidden, train: bool):
         hidden = self.dropout(hidden, deterministic=not train)

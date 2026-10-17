@@ -74,6 +74,7 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
+from ..ngpt import NGPT, gain, unit
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
@@ -101,7 +102,16 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
+from .decoder_stack import (
+    WRITTEN,
+    DecoderBank,
+    Loop,
+    PassView,
+    SharedPassView,
+    StackView,
+    run_pipeline,
+    run_stack,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -283,6 +293,12 @@ class CausalTransformer(nn.Module):
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
+    ngpt: NGPT | None = None
+    """The normalized transformer (`dew.nn.ngpt.NGPT`), NVIDIA's Dory: every hidden state on the
+    unit sphere, each block stepping its residual along it (`BlockWiring.ngpt`), the attention and
+    feed-forward unit-norming their products and scaling them by learned gains, no norm with a
+    weight anywhere, a unit norm between a loop's passes, no norm before the head, and the logits
+    times a learned per-token gain (`logit_scale`). None for none."""
     head_transform: Literal['gelu', 'gelu_exact'] | None = None
     """The activation of a BERT-style prediction head between the final norm
     and the vocabulary projection: a bias-free dense layer, this activation and
@@ -863,7 +879,7 @@ class CausalTransformer(nn.Module):
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit,
+                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
@@ -1120,7 +1136,7 @@ class CausalTransformer(nn.Module):
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                             shared_parallel_norm=self.shared_parallel_norm)
+                             shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1156,10 +1172,16 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = decoder_norm(
-            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)(name='norm')
+        if self.ngpt is not None:
+            # nGPT's states are unit vectors; a loop's step norm is the unit norm itself.
+            self.norm = unit
+            self.logit_scale = self.param('logit_scale', nn.initializers.constant(1 / self.ngpt.logits),
+                                          (self.vocab_size,), jnp.float32)
+        else:
+            self.norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1457,6 +1479,8 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
+        if self.ngpt is not None:
+            logits = logits * gain(self.logit_scale, self.ngpt.logits)
         return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
                              self.final_logit_softcap)
 
@@ -1740,7 +1764,7 @@ class CausalTransformer(nn.Module):
             attention_metadata=attention_metadata,
         )
         streams, x = self._collapse(residual)
-        hidden = constrain(self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
@@ -1813,17 +1837,25 @@ class CausalTransformer(nn.Module):
         run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = run_block(self, x, **dynamic)
+        injected = x
+        shared = SharedPassView() if loop.shared_cache else None
+        first_pass = run_block if shared is None else nn.map_variables(
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, mutable=True)
+        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
             x = normed if loop.step_norm else x
+            if loop.reinject:
+                x = self.norm(x + injected)
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
-            view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
+            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
             run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
             x = run(self, x, **dynamic)
+        if loop.reinject:
+            x = self.norm(x)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x

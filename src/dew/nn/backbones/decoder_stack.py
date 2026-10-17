@@ -107,10 +107,20 @@ class Loop:
     pass: with both enabled, the pass recomputes twice, once to recover the
     layers' inputs and again inside the layers' backward passes.
 
+    With `reinject`, every pass reads the block's input added to the last
+    pass's state under the step norm, the first pass's state that input
+    itself, and the state a pass leaves is its output under the step norm,
+    which the layers after the block read: Dory's looped nGPT
+    (vllm-project/vllm#60149, dory.py:254-280). It needs `step_norm`.
+
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
-    stack that is `layers_{t L + i}`, as Ouro's cache indexes them.
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. With
+    `shared_cache` every pass reads and writes its layers' one entry, each
+    pass overwriting the step's keys and values the pass before wrote, so
+    a step's earlier tokens read the last pass's (Dory's last-loop cache):
+    a pass's cursor starts where the first pass's started (`SharedPassView`).
     """
     steps: int
     step_norm: bool = True
@@ -118,10 +128,15 @@ class Loop:
     exit_gate: bool = False
     layers: tuple[int, int] | None = None
     remat: bool = False
+    reinject: bool = False
+    shared_cache: bool = False
 
     def __post_init__(self):
         if self.steps < 1:
             raise ValueError(f"a loop runs its stack at least once, got steps={self.steps}")
+        if self.reinject and (not self.step_norm or self.exit_gate):
+            raise ValueError("a reinjecting loop norms each pass's state (step_norm) and exits at "
+                             "the last pass")
         if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
             raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
                              f"got {self.backprop_steps}")
@@ -132,6 +147,44 @@ class Loop:
                 raise ValueError(f"a loop's block is layers [first, end), first < end, not {self.layers}")
             if self.exit_gate:
                 raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
+
+
+@dataclasses.dataclass
+class SharedPassView:
+    """A pass of a `Loop` with `shared_cache`, over its block's own cache entries. The first pass
+    records the layers' cursors (`cache_index`) as it finds them (`first`); a later pass sees every
+    entry as the pass before left it but the cursors, which start where the first pass's started,
+    so it writes the step's keys and values over the last pass's. Each pass keeps the cursors it
+    advanced, which are the first pass's after its step."""
+    cursors: dict = dataclasses.field(default_factory=dict)
+
+    def first(self, variables: Mapping[str, Mapping]) -> dict:
+        self.cursors = cursors_of(variables.get('cache', {}))
+        return dict(variables)
+
+    def inside(self, variables: Mapping[str, Mapping]) -> dict:
+        cache = variables.get('cache')
+        if cache is None:
+            return dict(variables)
+        return {**variables, 'cache': _with_cursors(cache, self.cursors)}
+
+    def outside(self, variables: Mapping[str, Mapping]) -> dict:
+        return dict(variables)
+
+
+def cursors_of(cache: Mapping[str, object]) -> dict[str, object]:
+    """Every `cache_index` in a cache tree, by its path joined with '/'."""
+    return {'/'.join(str(getattr(key, 'key', key)) for key in path): leaf
+            for path, leaf in jax.tree_util.tree_flatten_with_path(dict(cache))[0]
+            if str(getattr(path[-1], 'key', path[-1])) == 'cache_index'}
+
+
+def _with_cursors(cache: Mapping[str, object], cursors: Mapping[str, object]):
+    def placed(path, leaf):
+        name = '/'.join(str(getattr(key, 'key', key)) for key in path)
+        return cursors.get(name, leaf)
+
+    return jax.tree_util.tree_map_with_path(placed, dict(cache))
 
 
 @dataclasses.dataclass

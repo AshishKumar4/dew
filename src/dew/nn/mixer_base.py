@@ -23,6 +23,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
+from dew.nn.ngpt import NGPT
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
 
@@ -99,6 +100,10 @@ class MixerContext:
     force_fp32_for_softmax: bool = True
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`)."""
+    ngpt: NGPT | None = None
+    """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the attention unit-norms each
+    rotated query and key head, scales the query by its learned gain, scales the output gate's
+    logits by theirs and unit-norms its gated output; None for none."""
     output_gate: bool = False
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half
