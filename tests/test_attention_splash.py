@@ -155,7 +155,10 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     error is of their size, sum |out dout|, however far their sum cancels: a
     query that keeps one key beside a sink, whose output is a rounded share of
     the value, shows it. Its terms are therefore P (|dP| + sum |out dout|),
-    and such a row is held to that rounding, not to its own zero."""
+    and such a row is held to that rounding, not to its own zero. Given
+    sinks, a fifth entry holds each head's sink gradient's terms: a sink's
+    logit has no value, so its gradient sums -P delta over every query, and
+    delta's rounding, P sum |out dout|, is all of each one's."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
@@ -176,6 +179,8 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
                  jnp.einsum('bhqk,bkhd->bqhd', logit_terms, jnp.abs(k[:, :, group])),
                  per_key_head(jnp.einsum('bhqk,bqhd->bkhd', logit_terms, jnp.abs(q))),
                  per_key_head(jnp.einsum('bhqk,bqhd->bkhd', weights, jnp.abs(dout))))
+        if sunk is not None:
+            terms += (jnp.sum((1 - jnp.sum(weights, axis=-1)) * delta[..., 0], axis=(0, 2)),)
         return [np.asarray(x) for x in terms]
 
 

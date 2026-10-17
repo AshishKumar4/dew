@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 from fla_gdn_support import KernelCase
 from kernel_compile import compile_kernels
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_rounds_where_the_reference_does,
+    float64_terms,
+    within,
+)
 
 from dew.nn.kernels import generation, short_conv
 from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
@@ -187,12 +192,16 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     grads = cotangents(x, parts, dtype)
     got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
+    # Each entry sized by its float64 terms: a tap's gradient sums every token's product, which cancel.
+    with jax.enable_x64(new_val=True):
+        (exact, exact_grads), (terms, grad_terms) = float64_terms(
+            lambda x, weights: truth(x, weights, None, None, parts, grads, segments=segments), x, weights)
     labels = ("q", "k", "v", "dx", "dtaps")
     # The gradients of the projection and the taps; there is no bias.
-    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                          (*exact, *exact_grads[:2]), strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
+    for label, mine, theirs, value, summed in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
+                                                  (*exact, *exact_grads[:2]), (*terms, *grad_terms[:2]),
+                                                  strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}", terms=summed)
 
 
 def training_cases():
