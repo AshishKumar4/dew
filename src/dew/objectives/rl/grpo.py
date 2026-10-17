@@ -165,6 +165,14 @@ class GRPOObjective(LMObjective):
 
     keeps_whole_logits = False
 
+    def data(self, tokenizer=None):
+        """No steps of its own: the batch holds the prompts or tasks a rollout
+        reads (`prompts.encode`, `task_id` rows), which LM's text windows would
+        cut, and the rollout packs the rows the loss scores."""
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData()
+
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
                  dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",

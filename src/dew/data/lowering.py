@@ -93,7 +93,7 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import Chunks
+from dew.data.steps.text import Chunks, ValidTargets
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, record
 
@@ -650,11 +650,13 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, Pack):
-            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.packed)), stage)
+            rows = self.targeted(_packed(_as_iter(rows, self.loading).map(Fields(stage.packed)), stage),
+                                 stage.fields[0], pipeline)
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows
 
-            rows = CausalWindows(_as_iter(rows, self.loading), stage)
+            windows = CausalWindows(_as_iter(rows, self.loading), stage)
+            rows = self.targeted(windows, stage.fields[0], pipeline)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
@@ -664,6 +666,12 @@ class _Build:
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
         return rows
+
+    def targeted(self, windows: pygrain.IterDataset, field: str, pipeline: Pipeline) -> pygrain.IterDataset:
+        """The windows that hold a target of their token `field`, as a memory read's and a packing
+        plan's are (`materialize._targeted`, `packing.plan_windows`): one with nothing to predict
+        is counted as zero_targets and left out, so how a run reads does not change its steps."""
+        return Accepted(windows, _name(pipeline), budget=self.budget, tokens=ValidTargets(field))
 
     def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
         from dew.data.ordering import BlockShuffle
