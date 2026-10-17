@@ -1,0 +1,4 @@
+{
+  "reference": "vllm-project/vllm#60149 vllm/model_executor/models/dory.py at 55076950b6c155f384d6766d63563c3bc20a0e3f, transcribed in tools/dory_reference.py",
+  "released_config": "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 at b366b87f762ea334ba3eb55912031baba1515810"
+}

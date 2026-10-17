@@ -156,7 +156,8 @@ class DoryReference:
             return slerp_alpha(h, self.mlp(j, h), alpha, self.alpha_scale)
         n_in, n_rec = self.c['n_input_layers'], self.c['n_recurrent_layers']
         recurrent = n_in <= j < n_in + n_rec
-        key = (j, loop if recurrent and self.c.get('recurrent_kv_cache_mode', 'per_loop') == 'per_loop' else 0)
+        per_loop = self.c.get('recurrent_kv_cache_mode', 'per_loop') == 'per_loop'
+        key = (j, loop if recurrent and per_loop else 0)
         out, own = self.attention(j, h, positions, caches.get(key) if caches is not None else None, loop)
         if caches is not None:
             pending = caches.setdefault('pending', {})
