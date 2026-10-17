@@ -972,8 +972,7 @@ class CausalTransformer(nn.Module):
     def _layer_flops(self, lengths, counter) -> float:
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
         loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
@@ -1020,8 +1019,8 @@ class CausalTransformer(nn.Module):
     def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer()
-        blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
+        blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
+                                         BlockWiring())
         count = 0.0
         rows = self._prediction_rows(lengths, prediction_lengths)
         for block, (inputs, outputs) in zip(blocks, rows, strict=True):
@@ -1115,8 +1114,7 @@ class CausalTransformer(nn.Module):
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
-        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer_spec = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
@@ -2287,19 +2285,29 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, or a layer
-        whose mixer kind declares no `mixed_step`."""
+        whose mixer, over the context it is built with, would not run the mixed
+        call as the separate calls would (`MixerBase.mixed_refusal`)."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
-        default = self.mixer if self.mixer is not None else AttentionMixer()
-        for index, layer_type in enumerate(self.per_layer_types):
-            mixer = self.kind_of(layer_type).mixer or default
-            if not mixer.mixed_step:
-                return f"layer {index}'s cache is {type(mixer).__name__}'s, which a mixed step does not run"
+        types = self.per_layer_types
+        default = self.layer_mixer
+        for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
+            refusal = (spec.kind.mixer or default).mixed_refusal(
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
+            if refusal is not None:
+                return f"layer {index}: {refusal}"
         return None
+
+    @property
+    def layer_mixer(self) -> MixerBase:
+        """The mixer a layer whose kind names none builds: the model's own, else
+        attention rotated or not by its position embedding."""
+        return self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
 
     @property
     def declared_mixers(self) -> tuple[MixerBase, ...]:
