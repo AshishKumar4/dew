@@ -6,16 +6,29 @@ one request at a time, so turns of different sessions interleave in the
 engine's continuous batch instead of waiting on a lock-step cohort.
 
 `EnvironmentSource` runs the in-process `Environment` protocol that
-`EpisodeRollout` runs, one session per sample on a worker thread, with
-`EpisodeRollout`'s own per-turn limits (`turn_limit`, `step_action`). Each
-turn submits the observation's context and steps the environment with the
-drawn action; the episode becomes a `Session` through `session_of`, the
-converter `EpisodeRollout` packs with, so both paths feed one packer. Each call keeps
-the version its request was submitted under, so a session that spans a
-weight push carries both versions. The statuses follow the scheduler's
-failure policy: an environment that raises or reports ERROR is an
-infrastructure failure, retried and never scored; a context, token or turn
-limit truncates; only COMPLETED and TRUNCATED sessions reach the verifier.
+`EpisodeRollout` runs, one session per sample on a worker thread, through
+the same per-episode state, `EpisodeProgress`: its context limit, its
+record of each call with the observation that followed it, and its finite
+verifier reward. Each turn submits the observation's context and steps the
+environment with the drawn action; the episode becomes a `Session` through
+`session_of`, the converter `EpisodeRollout` packs with, so both paths feed
+one packer. Each call keeps the version its request was submitted under, so
+a session that spans a weight push carries both versions.
+
+The statuses follow the scheduler's failure policy. An infrastructure
+failure is an INFRA_ERROR session, retried and never scored: a draw the
+server cancelled, an environment that reports ERROR, and an
+`InfrastructureError` or `OSError` that the draw, the environment, the
+verifier or the reward fails with. Those are an engine that cannot be
+reached, times out or answers 5xx or 429 (the remote rollout servers), a
+lost connection, a sandbox past its wall clock or with a dead worker
+(`SubprocessEnvironment`), a container runtime that starts no container or
+stalls removing one (`ContainerRunner`), and any boundary failure a
+callback reports as an `InfrastructureError`. A context, token or turn
+limit truncates, and only COMPLETED and TRUNCATED sessions reach the
+verifier. Any other error is broken code or a broken contract, such as a
+non-finite reward or likelihood, or an environment that returns no
+`Observation`: it fails the rollout's future, and the scheduler raises it.
 
 `PromptSource` is the single-turn case: one call per sample, scored on
 decoded text by a reward on scorer threads as each draw finishes, so
@@ -25,7 +38,6 @@ verification overlaps generation.
 from __future__ import annotations
 
 import hashlib
-import math
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
@@ -36,7 +48,7 @@ from uuid import uuid4
 import jax
 import numpy as np
 
-from dew.inference.rollouts import Draw, RolloutServer
+from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
 from dew.objectives.base import Batch
 
 from .episodes import (
@@ -44,30 +56,37 @@ from .episodes import (
     Environment,
     Episode,
     EpisodeId,
+    EpisodeProgress,
     EpisodeStatus,
-    Observation,
-    Transition,
+    finite_reward,
     session_of,
     step_action,
-    turn_limit,
 )
 from .rollout import Reward, prompt_rows
 from .sessions import Call, Session, Status, Task
 
-
-def _scored(value: float) -> float:
-    reward = float(value)
-    if not math.isfinite(reward):
-        raise ValueError("the verifier returned a non-finite score")
-    return reward
+_INFRASTRUCTURE = (InfrastructureError, OSError)
+"""What a draw or a callback fails with when its external boundary, not its code, failed."""
 
 
 def _failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-class _Refused(ValueError):
-    """A configuration error found inside a session; it fails the rollout's future."""
+def _draw_failure(drawn: Future[Draw]) -> str | None:
+    """Why the server returned no draw on the finished `drawn`, or None when it returned one.
+
+    A draw the server cancelled, or one its infrastructure failed, is
+    missing; any other failure is a broken server or policy, and is raised.
+    """
+    if drawn.cancelled():
+        return "draw: cancelled by the server"
+    failure = drawn.exception()
+    if failure is None:
+        return None
+    if isinstance(failure, _INFRASTRUCTURE):
+        return f"draw: {_failure(failure)}"
+    raise failure
 
 
 @dataclass
@@ -86,10 +105,9 @@ class EnvironmentSource:
     server batches their calls. The server's sampling policy must set an EOS
     id. `cancel` stops a session at its next turn or during a draw, but
     never inside `environment.step`. So an environment must bound its own
-    step time, or a hung step holds its worker until it returns.
-    Environments see the draw's raw likelihoods when the server reports
-    them, and its behavior likelihoods otherwise; the two are the same
-    distribution only for a sampling policy without transforms.
+    step time, as `SubprocessEnvironment` does with its wall clock, or a hung
+    step holds its worker until it returns. An action carries the draw's raw
+    likelihoods when the server reports them, and None when it does not.
     """
 
     def __init__(self, server: RolloutServer,
@@ -151,8 +169,8 @@ class EnvironmentSource:
         with self._lock:
             self._handles.pop(future, None)
 
-    def _draw(self, context: tuple[int, ...], key: jax.Array, handle: _Handle) -> Draw | None:
-        """One call on the server, or None when the session is cancelled while it runs."""
+    def _draw(self, context: tuple[int, ...], key: jax.Array, handle: _Handle) -> Future[Draw] | None:
+        """One call on the server, finished, or None when the session is cancelled while it runs."""
         handle.wake.clear()
         if handle.cancelled:
             return None
@@ -161,66 +179,60 @@ class EnvironmentSource:
         handle.wake.wait()
         if handle.cancelled and not pending.done():
             return None
-        return pending.result()
+        return pending
 
     def _action(self, draw: Draw, context: tuple[int, ...]) -> Action:
-        sampling = self.server.sampling
-        raw = draw.raw_log_probs
-        if raw is None:
-            if sampling.transforms():
-                raise _Refused("the server reports no raw likelihoods and its sampling transforms them")
-            raw = draw.behavior_log_probs
         if draw.prompt != context:
-            raise _Refused("the server returned a draw for another context")
-        return Action(
-            context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling
-        )
+            raise ValueError("the server returned a draw for another context")
+        return Action(context, draw.tokens, draw.raw_log_probs, draw.behavior_log_probs, draw.terminated,
+                      draw.version, self.server.sampling)
+
+    def _play(self, episode: EpisodeProgress, environment: Environment, key: jax.Array, handle: _Handle,
+              draws: list[Draw]) -> None:
+        """Run the episode's turns, each a draw on the server and an environment step, appending each draw."""
+        episode.begin(environment.reset())
+        for turn in range(self.max_turns):
+            context = episode.next_context(max_prompt_tokens=self.max_prompt_tokens)
+            if context is None:
+                return
+            drawn = self._draw(context, jax.random.fold_in(key, turn), handle)
+            if drawn is None:
+                episode.stop(EpisodeStatus.CANCELLED, "cancelled by the scheduler")
+                return
+            failed = _draw_failure(drawn)
+            if failed is not None:
+                episode.stop(EpisodeStatus.ERROR, failed)
+                return
+            draw = drawn.result()
+            action = self._action(draw, context)
+            draws.append(draw)
+            episode.pending = action
+            episode.commit(action, step_action(environment, action))
 
     def _run(self, task: Task, identity: EpisodeId, version: int, key: jax.Array, handle: _Handle) -> Session:
-        initial: Observation | None = None
-        transitions: list[Transition] = []
+        episode = EpisodeProgress(identity)
         draws: list[Draw] = []
-        pending: Action | None = None
-        status, detail = EpisodeStatus.RUNNING, ""
+        binding = uuid4().hex
+        broken = False
         try:
             with self.environment(task, identity) as environment:
-                observation = environment.reset()
-                initial = observation
-                for turn in range(self.max_turns + 1):
-                    if not isinstance(observation, Observation):
-                        raise TypeError("environment methods must return an Observation")
-                    status, detail = observation.status, observation.detail
-                    if status != EpisodeStatus.RUNNING:
-                        break
-                    limit = turn_limit(observation, turn, max_turns=self.max_turns,
-                                       max_prompt_tokens=self.max_prompt_tokens)
-                    if limit is not None:
-                        status, detail = limit.status, limit.detail
-                        break
-                    draw = self._draw(observation.context, jax.random.fold_in(key, turn), handle)
-                    if draw is None:
-                        status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
-                        break
-                    pending = self._action(draw, observation.context)
-                    draws.append(draw)
-                    observation = step_action(environment, pending)
-                    transitions.append(Transition(pending, observation))
-                    pending = None
-        except _Refused:
-            raise
-        except Exception as error:
-            status, detail = EpisodeStatus.ERROR, _failure(error)
-            if pending is not None:
-                # The call was made; it stays on the record with the failure it met.
-                transitions.append(Transition(pending, Observation((), status, detail)))
-        episode = Episode(identity, version, initial, tuple(transitions), status, detail, None,
-                          _binding_id=uuid4().hex)
-        if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
-            try:
-                episode = replace(episode, reward=_scored(self.verifier(task, episode)))
-            except Exception as error:
-                episode = replace(episode, status=EpisodeStatus.ERROR, detail=f"verifier: {_failure(error)}")
-        session = session_of(episode, group="")
+                try:
+                    self._play(episode, environment, key, handle, draws)
+                except _INFRASTRUCTURE:
+                    raise
+                except BaseException:
+                    broken = True
+                    raise
+            if episode.status not in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
+                episode.score(lambda finished: self.verifier(task, finished), version, binding)
+        except _INFRASTRUCTURE as error:
+            if broken:
+                # The environment's exit failed while broken code was raising: the failure carries
+                # that error as its context and is raised, not retried.
+                raise
+            # The draw's, the environment's or the verifier's boundary failed: infrastructure, retried.
+            episode.abort(EpisodeStatus.ERROR, _failure(error))
+        session = session_of(episode.episode(version, binding), group="")
         # An episode records what the environment saw; the engine records of
         # each call (routing, sampling support) come from its draw.
         calls = tuple(replace(call, routed_experts=draw.routed_experts, support=draw.support)
@@ -272,10 +284,13 @@ class PromptSource:
 
     `decode` turns the sampled ids into text, and `reward` scores that text,
     without the EOS, on `scorers` threads as soon as each draw finishes. A
-    draw that ends on its token budget is TRUNCATED and still scored, and a
-    failed draw or reward gives an INFRA_ERROR session. Any other failure
-    resolves the rollout's future with the exception, so no future is left
-    pending.
+    draw that ends on its token budget is TRUNCATED and still scored. A
+    draw the server cancelled, and an `InfrastructureError` or `OSError`
+    the draw or the reward fails with, such as an unreachable engine or a
+    container runtime that started no container, give an INFRA_ERROR
+    session. A non-finite reward and any other error of the draw, the
+    decode or the reward resolve the rollout's future with the exception, so
+    no future is left pending.
     """
 
     def __init__(
@@ -308,10 +323,10 @@ class PromptSource:
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
-        try:
-            draw = drawn.result()
-        except Exception as error:
-            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
+        failed = _draw_failure(drawn)
+        if failed is not None:
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
+        draw = drawn.result()
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
                            f"draw: served by version {draw.version}, submitted under {version}")
@@ -325,14 +340,15 @@ class PromptSource:
             support=draw.support,
         )
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
+        text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
         try:
-            text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.info))
-        except Exception as error:
+            score = self.reward(prompt.source, text, prompt.truth, prompt.info)
+        except _INFRASTRUCTURE as error:
+            # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
             return Session(
                 task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"
             )
-        return Session(task.id, "", 0, 0, (call,), status, score)
+        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score))
 
     def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
@@ -344,7 +360,7 @@ class PromptSource:
             try:
                 rollout = self._rollout(task, prompt, version, drawn)
             except BaseException as failure:
-                # Not a failure of the draw or the reward: a broken source, which the scheduler raises.
+                # Broken code or a broken contract, not infrastructure: the scheduler raises it.
                 with suppress(InvalidStateError):  # cancelled while scoring
                     scored.set_exception(failure)
                 return

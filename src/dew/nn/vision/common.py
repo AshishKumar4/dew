@@ -176,11 +176,6 @@ def activation_name(config: Mapping[str, object], runs: Collection[str], default
     return name
 
 
-def refuse_dropout(vision: Mapping[str, object], *fields: str) -> None:
-    """Refuse a nonzero dropout among `fields`: the trunks run eval."""
-    for field in fields:
-        if records.number(vision.get(field, 0.0), field):
-            raise ValueError(f"{field} is training-time; this trunk runs eval")
 
 
 def rope_base(vision: Mapping[str, object], default: float) -> float:

@@ -69,6 +69,23 @@ def test_a_transformers_tokenizer_gives_the_special_tokens_its_dew_wrapper_gives
     assert parameter_type(Specials.of, "tokenizer") == Tokenizer | TokenizerSpecials
 
 
+def test_any_tokenizer_holding_the_special_tokens_gives_them(tokenizer):
+    """A tokenizer of no transformers class that holds the ids and token text
+    `TokenizerSpecials` declares gives the same Specials as the transformers
+    tokenizer it copies; one that holds none, a ByteTokenizer, is refused."""
+    from types import SimpleNamespace
+
+    from dew.data.text import ByteTokenizer
+
+    hf = tokenizer.tokenizer
+    names = ("cls_token_id", "sep_token_id", "eos_token_id", "bos_token_id", "mask_token_id", "pad_token_id")
+    own = SimpleNamespace(**{name: getattr(hf, name) for name in names},
+                          convert_ids_to_tokens=hf.convert_ids_to_tokens)
+    assert Specials.of(own) == Specials.of(tokenizer)
+    with pytest.raises(ValueError):
+        Specials.of(ByteTokenizer())
+
+
 @pytest.mark.parametrize("zero", ["[PAD]", "[MASK]"])
 def test_a_special_token_at_id_zero_is_the_tokenizers_own(zero):
     """A vocabulary may put its padding or mask token at id 0, as BERT's puts
