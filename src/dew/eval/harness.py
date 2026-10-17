@@ -23,7 +23,6 @@ slots that end one before the row's last token.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 from collections.abc import Sequence
 from typing import Any
@@ -38,20 +37,15 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.inference.tasks import TextGeneration, cache_ceiling
+from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import pad_token_rows
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import token_log_probs
-from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
 
 DEFAULT_BUDGET = 256
-
-FORWARDED = frozenset(field.name for field in dataclasses.fields(Sampling)) - {
-    "temperature", "eos_token_ids", "pad_token_id", "stop"}
-"""The generation controls a request may set that `Sampling` takes under the same names as
-Transformers' `generate`, which `HFLM` hands them to."""
 """The generation budget of a request that names none, `HFLM.max_gen_toks`."""
 
 TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
@@ -307,11 +301,12 @@ class DewLM(TemplateLM):
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
 
-        The controls `HFLM` hands Transformers' `generate` that `Sampling`
-        takes under the same names (`top_k`, `top_p`, `min_p`, `typical_p`,
-        the penalties, `no_repeat_ngram_size`, `min_new_tokens`) shape the
-        draws; `num_beams` above 1, or any other control, raises ValueError
-        rather than draw without it.
+        The other controls are the ones `HFLM` hands Transformers' `generate`,
+        and they decode as a source's generation config does
+        (`dew.interop.generation_config.source_decoding`): sampling filters and
+        penalties, logits processors, and beam search under `num_beams` with
+        its `length_penalty` and `early_stopping`. One Dew has no counterpart
+        for raises ValueError, as `generate` refuses a keyword it does not use.
         """
         del disable_tqdm
         eos = None if self.task.sampling.eos_token_ids in (None, ()) else self.tok_decode([self.eot_token_id])
@@ -324,22 +319,16 @@ class DewLM(TemplateLM):
             controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
             budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
             until = controls.pop("until", None)
-            temperature = float(controls.pop("temperature", 0.0))
             seed = int(controls.pop("seed", 0))
-            controls.pop("do_sample", None)
-            if controls.pop("num_beams", 1) != 1:
-                raise ValueError("generate_until draws one continuation a request; beam search is not served")
-            unknown = sorted(set(controls) - FORWARDED)
-            if unknown:
-                raise ValueError(f"generation controls {unknown} have no Sampling counterpart")
+            sampling, chain, strategy = source_decoding(
+                {}, {**controls, "eos_token_id": self.task.sampling.eos_token_ids,
+                     "pad_token_id": self.task.sampling.pad_token_id}, self.task.model, 1, None)
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
-            sampling = Sampling(temperature=temperature, eos_token_ids=self.task.sampling.eos_token_ids,
-                                **controls)
-            drawn = self.task([ids], budget, key=seed, sampling=sampling)
+            drawn = self.task([ids], budget, key=seed, sampling=sampling, logits=chain, strategy=strategy)
             stops = handle_stop_sequences(until, eos=eos)
             answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
         return answers
