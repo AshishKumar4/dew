@@ -35,6 +35,11 @@ Scope is per rule, because the rules are not all about the same thing:
   hardware generation) lives in one table, `nn/kernels/generation.py`'s
   `TARGETS`; any other module reads that table's facts, a library's support
   rule the compute capability, and a launch config the autotuner.
+- SLOP017, SLOP018 and SLOP019 are about `src/<package>`, the code a user's
+  process runs: it reaches no other library's private parts (the standard
+  library documents the few it spells with an underscore), it sleeps, polls
+  and retries only where it deals with what leaves the process, and it
+  detects no feature by the exception its absence raises.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -47,6 +52,9 @@ dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
 scope (tools/lint_scopes.py).
+SLOP018 reads one module: a function deals with what leaves the process where
+it names such a module (`EXTERNAL`) or calls a function of the module, or a
+method reached from `self`, that does; work handed to a future is another's.
 SLOP016 follows the device's generation through the names one file binds, in
 statement order: both arms of a branch in turn and a loop's body once, so a
 name an arm rebinds counts as rebound after it.
@@ -1278,7 +1286,161 @@ def authorities(module: Module) -> Iterator[Finding]:
                       "a library's rule the compute capability (`capability`), a launch config the autotuner")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities)
+def _private(path: str, package: str) -> bool:
+    """Whether dotted `path` reaches into another library's private parts: a segment after the
+    library's own that starts with one underscore (a dunder is public). The standard library
+    documents the few it spells so (`os._exit`, `sys._getframe`) and is not another library."""
+    head, *rest = path.split(".")
+    return (head not in (package, "", *sys.stdlib_module_names)
+            and any(part.startswith("_") and not part.startswith("__") for part in rest))
+
+
+DOTTED = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+")
+
+
+def privates(module: Module) -> Iterator[Finding]:
+    """SLOP017: another library's private parts: an import from a private module of it or of a
+    private name, an attribute chain from its module to one, or its private module named in a
+    string (`importlib.import_module`, `sys.modules`)."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        reached = ""
+        if isinstance(node, ast.Import | ast.ImportFrom) and not getattr(node, "level", 0):
+            reached = next((path for path in scopes.bound_by(node, _parent(module)).values()
+                            if _private(path, module.package)), "")
+            if not reached and isinstance(node, ast.Import):
+                reached = next((alias.name for alias in node.names
+                                if _private(alias.name, module.package)), "")
+        elif isinstance(node, ast.Attribute) and not isinstance(getattr(node, "ctx", None), ast.Store):
+            path = scopes.resolved(node, table)
+            reached = path if _private(path, module.package) and not _private(
+                scopes.resolved(node.value, table), module.package) else ""
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str) and DOTTED.fullmatch(node.value)
+              and _private(node.value, module.package)):
+            reached = node.value
+        if reached:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP017",
+                          f"reaches into {reached}, another library's private part; use its public API")
+
+
+EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
+            "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
+            "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
+            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.")
+"""What leaves the process: a subprocess, the network, a remote service, another process."""
+
+
+WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
+"""The methods that block on in-process synchronization (an event, a condition, a lock, a queue, a
+thread) until a timeout they are given. A future's (`result`, `concurrent.futures.wait`) is not
+among them: its work is handed elsewhere, a thread, a process or a service, whose deadline it is."""
+
+
+def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
+    """What `node` waits on: "a sleep", or "a timed wait", a blocking call (`WAITS`) given a
+    timeout (one of no time asks without waiting); "" else."""
+    if not isinstance(node, ast.Call):
+        return ""
+    called = scopes.resolved(node.func, table)
+    if called in ("time.sleep", "asyncio.sleep"):
+        return "a sleep"
+    method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+    if method not in WAITS:
+        return ""
+    # A positional timeout is read where the method is unambiguous (a string's join is not a wait).
+    positional = node.args[:1] if method == "wait" else node.args[1:2] if method == "wait_for" else []
+    timeouts = [*positional, *(keyword.value for keyword in node.keywords if keyword.arg == "timeout")]
+    if any(not (isinstance(value, ast.Constant) and value.value in (None, 0)) for value in timeouts):
+        return "a timed wait"
+    return ""
+
+
+def _retrying(loop: ast.For | ast.While) -> bool:
+    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` (attempts, not
+    items), whose body tries the work, leaves the loop where it succeeds, and goes round again
+    where it fails."""
+    attempts = isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range" if isinstance(
+        loop, ast.For) else True
+    if not attempts:
+        return False
+
+    def leaves(nodes: Sequence[ast.AST], exits: tuple[type, ...]) -> bool:
+        return any(isinstance(child, exits) for node in nodes for child in ast.walk(node))
+
+    return any(isinstance(node, ast.Try) and leaves((*node.body, *node.orelse), (ast.Break, ast.Return))
+               and any(not leaves([handler], (ast.Raise, ast.Break, ast.Return)) for handler in node.handlers)
+               for node in loop.body)
+
+
+def _leaves(function: ast.AST, tables: Mapping[int, Mapping[str, str]], local: Mapping[str, ast.AST],
+            seen: set[int]) -> bool:
+    """Whether `function` deals with what leaves the process (`EXTERNAL`): it names such a module,
+    or calls a function or method of the module that does."""
+    seen.add(id(function))
+    for node in ast.walk(function):
+        if isinstance(node, ast.Name | ast.Attribute):
+            path = scopes.resolved(node, tables.get(id(node), {}))
+            if path and f"{path}.".startswith(EXTERNAL):
+                return True
+        if isinstance(node, ast.Call):
+            # A function of the module by name, or a method reached from `self` (`self.gcloud.nodes`).
+            root = node.func.value if isinstance(node.func, ast.Attribute) else None
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            name = (node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+                    if isinstance(node.func, ast.Attribute) and _named(root) in ("self", "cls") else "")
+            helper = local.get(name)
+            if helper is not None and id(helper) not in seen and _leaves(helper, tables, local, seen):
+                return True
+    return False
+
+
+def waits(module: Module) -> Iterator[Finding]:
+    """SLOP018: a sleep, a poll (a timed wait round a loop) or a retry where nothing leaves the
+    process: one inside a function that deals with no subprocess, network, remote service or other
+    process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
+    work is ordered or woken, not waited on; a timed wait made once is a deadline."""
+    local = {node.name: node for node in ast.walk(module.tree)
+             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
+    for function in local.values():
+        external = None
+        looped = {id(inner) for loop in scopes.own(function) if isinstance(loop, ast.For | ast.While)
+                  for inner in ast.walk(loop)}
+        for node in scopes.own(function):
+            what = _waiting(node, tables.get(id(node), {}))
+            if what == "a timed wait":
+                # Once, it is a deadline; round a loop, a poll.
+                what = "a poll" if id(node) in looped else ""
+            if not what and isinstance(node, ast.For | ast.While) and _retrying(node):
+                what = "a retry"
+            if not what:
+                continue
+            if external is None:
+                external = _leaves(function, tables, local, set())
+            if not external:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP018",
+                              f"{what} where nothing leaves the process; order the work or wake the waiter")
+
+
+DETECTED = {"ImportError", "ModuleNotFoundError", "AttributeError"}
+
+
+def detections(module: Module) -> Iterator[Finding]:
+    """SLOP019: a feature detected by the exception its absence raises: a handler of ImportError,
+    ModuleNotFoundError or AttributeError that carries on instead of raising."""
+    for node in ast.walk(module.tree):
+        if not isinstance(node, ast.ExceptHandler) or node.type is None:
+            continue
+        caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+        kinds = [_named(kind) for kind in caught]
+        if any(kind.rsplit(".", 1)[-1] in DETECTED for kind in kinds) and not any(
+                isinstance(child, ast.Raise) for child in ast.walk(node)):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP019",
+                          f"detects a feature by `except {'/'.join(kinds)}`; require it, or ask for it by "
+                          "the version that has it")
+
+
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, privates, waits, detections)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 

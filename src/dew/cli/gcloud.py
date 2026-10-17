@@ -12,9 +12,15 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterable, Sequence
 
 from dew.records import JSON
+
+DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
+"""The states a TPU does not come back from to READY."""
+READY_TIMEOUT = 1800
+POLL_SECONDS = 10
 
 #: The binary every command in this module goes through.
 GCLOUD = "gcloud"
@@ -229,6 +235,24 @@ class Tpu:
         """This TPU as its zone lists it, or None where the zone has none of its name: not created
         yet, or deleted."""
         return next((node for node in self.gcloud.nodes(self.zone) if node.name == self.name), None)
+
+    def ready(self) -> Node | None:
+        """This TPU once its zone lists it READY, asked every POLL_SECONDS for up to READY_TIMEOUT
+        (none in a dry run): a queued resource lists its node only once it is provisioned."""
+        if self.gcloud.dry_run:
+            return None
+        deadline = time.monotonic() + READY_TIMEOUT
+        while True:
+            node = self.describe()
+            state = node.state if node else "PENDING"
+            if state == "READY":
+                return node
+            if state in DEAD_STATES:
+                raise SystemExit(f"{self.name} is {state}")
+            if time.monotonic() >= deadline:
+                raise SystemExit(f"{self.name} is still {state} after {READY_TIMEOUT}s")
+            emit(f"{self.name} is {state}")
+            time.sleep(POLL_SECONDS)
 
     def fanout(self, jobs: Sequence[tuple[int, str]], *, capture: bool = False,
                ssh_flags: Sequence[str] = ()) -> list[subprocess.CompletedProcess[str]]:
