@@ -24,7 +24,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.weights import ParamTree, checkpoint_array, insert, translate_parameters
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
@@ -357,9 +357,11 @@ def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
                           param_dtype: str = "float32") -> ParamTree:
     """A trunk's variables from its tensors through its family's `path_of`, rooted at the collection,
     the patch convolution `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map
-    over the processor's channel, time and pixel order."""
-    tensors = dict(hf_tensors)
-    if PATCH_CONVOLUTION in tensors:
-        conv = np.asarray(tensors[PATCH_CONVOLUTION])
-        tensors[PATCH_CONVOLUTION] = conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0])
-    return translate_parameters(tensors, path_of, param_dtype)
+    over the processor's channel, time and pixel order at `params/patch_embed/kernel`."""
+    variables = translate_parameters({name: tensor for name, tensor in hf_tensors.items()
+                                      if name != PATCH_CONVOLUTION}, path_of, param_dtype)
+    if PATCH_CONVOLUTION in hf_tensors:
+        conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
+        dense = np.ascontiguousarray(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+        insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
+    return variables
