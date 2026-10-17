@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, Protocol, runtime_checkable
+from typing import Literal, NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -665,9 +665,21 @@ class DecoderBlock(nn.Module):
         """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
         return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
 
-    def __call__(self, x, train: bool = False, decode: bool = False, kv_store=None,
+    @overload
+    def __call__(self, x: jax.Array, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
-                 prediction_phase: PredictionPhase = "ordinary"):
+                 prediction_phase: PredictionPhase = "ordinary") -> jax.Array: ...
+
+    @overload
+    def __call__(self, x: Carried, train: bool = False, decode: bool = False, kv_store=None,
+                 per_layer_input=None, attention_metadata=None,
+                 prediction_phase: PredictionPhase = "ordinary") -> Carried: ...
+
+    def __call__(self, x: jax.Array | Carried, train: bool = False, decode: bool = False, kv_store=None,
+                 per_layer_input=None, attention_metadata=None,
+                 prediction_phase: PredictionPhase = "ordinary") -> jax.Array | Carried:
+        """The residual the next block reads, in the form `x` came in: an array (the plain stream,
+        AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`."""
         if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
             with recomputing(() if self.remat is None else self.remat.recompute):
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,

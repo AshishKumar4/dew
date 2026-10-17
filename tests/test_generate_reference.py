@@ -108,6 +108,31 @@ def test_greedy_generation_emits_transformers_tokens(family):
     np.testing.assert_array_equal(np.asarray(again.tokens), np.asarray(result.tokens))
 
 
+def test_source_bad_words_holding_only_eos_loads_as_an_identity_policy(tmp_path):
+    """Loading an EOS-only bad-word list keeps the source's tokens, scores and termination unchanged."""
+    import json
+    import shutil
+
+    directory = FIXTURES / "llama-tiny"
+    source = tmp_path / "source"
+    shutil.copytree(directory, source)
+    with np.load(directory / "generate.npz") as stored:
+        fixture = {name: stored[name] for name in stored.files}
+    eos = int(fixture["greedy_tokens"][0, 0])
+    config = {"do_sample": False, "eos_token_id": eos, "pad_token_id": 0, "max_new_tokens": 6}
+    path = source / "generation_config.json"
+    path.write_text(json.dumps(config))
+    plain = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+    expected = plain(prompts(fixture), key=0).host()
+    assert expected.lengths[0] == 1 and expected.terminated[0]
+
+    path.write_text(json.dumps({**config, "bad_words_ids": [[eos]]}))
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+    actual = loaded(prompts(fixture), key=0).host()
+    for name in ("tokens", "lengths", "terminated", "raw_log_probs", "behavior_log_probs"):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+
+
 def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_tokens(family):
     """Three requests through a two-slot server, admitted one a step and
     finishing at different budgets so rows leave and join mid-flight, each

@@ -17,9 +17,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import walk
+from diffusion_support import relative_gap, walk
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -50,7 +50,6 @@ from dew.sampling import (
     TCD,
     Consistency,
     DPMSolverMultistep,
-    DPMSolverSDE,
     DPMSolverSinglestep,
     Euler,
     Heun,
@@ -408,6 +407,34 @@ def test_video_samples_converge(solver):
     assert_gaussian_stats(generate(process, model, solver, steps=50, count=64, shape=(3, 8, 8, 3)))
 
 
+@pytest.mark.parametrize("solver, times, walks", [
+    (DPMSolverMultistep(order=2), [0.9, 0.9, 0.1], True),
+    (DEIS(order=2), [0.9, 0.9, 0.1], True),
+    (DPMSolverSinglestep(order=2), [0.9, 0.5, 0.5, 0.1], True),
+    (UniPC(order=1), [0.9, 0.9, 0.5, 0.1], True),
+    (DPMSolverMultistep(order=2), [0.9, 0.5, 0.5, 0.1], True),
+    (DPMSolverMultistep(order=2, lower_order_final=False), [0.9, 0.9, 0.1], False),
+    (DPMSolverMultistep(order=2, solver_type="heun"), [0.9, 0.5, 0.5, 0.1], False),
+    (UniPC(order=2), [0.9, 0.9, 0.5, 0.1], False),
+], ids=["dpm_multi", "deis", "dpm_single", "unipc.order1", "dpm_multi.midpoint", "dpm_multi.second_order",
+        "dpm_multi.heun", "unipc.order2"])
+def test_only_an_update_that_divides_by_an_empty_interval_refuses_it(solver, times, walks):
+    """A grid with two points at one level walks wherever no update divides by the gap between
+    them. A first-order step over it stays where it is: the multistep solvers' first step, which
+    has no history, the short walk's tapered last step, a singlestep group's second step, whose
+    anchor and target are apart, and a first-order UniPC's predictor and corrector, all walk to
+    finite latents, as does DPM-Solver's second-order midpoint step, whose coefficient is 0 over
+    it. An update that divides by the interval, a second-order step whose history spans it, a
+    Heun step over it, refuses the grid before the walk runs."""
+    process, model = flow_process()
+    x_T = jax.random.normal(jax.random.PRNGKey(0), (2, 4))
+    if walks:
+        assert np.isfinite(np.asarray(walk(solver, process, model, x_T, times))).all()
+    else:
+        with pytest.raises(ValueError):
+            walk(solver, process, model, x_T, times)
+
+
 def test_a_key_reproduces_a_trajectory():
     """Nothing lives on a solver between calls: a multistep solver's history
     travels in its state, so the same key gives the same samples twice."""
@@ -517,13 +544,6 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
                       sampling=KarrasVENoiseScheduler(edm["sigma_min"], edm["sigma_max"], edm["rho"],
                                                       edm["sigma_data"]))
     return process, KarrasOracle(sigma_data=edm["sigma_data"])
-
-
-def relative_gap(actual, expected) -> float:
-    """The largest entry of |actual - expected| over the larger of 1 and the
-    largest entry of |expected|, per leading index."""
-    actual, expected = np.asarray(actual), np.asarray(expected)
-    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected, strict=True))
 
 
 @pytest.mark.parametrize("name", sorted(DIFFUSERS_CASES))
@@ -659,200 +679,6 @@ def test_empty_guidance_interval_generates_the_unguided_samples():
                       key=jax.random.PRNGKey(4))
 
     assert jnp.allclose(run(CFG(3.0, interval=(0.9, 0.1))), run(None), atol=1e-5)
-
-
-############################################################################################################
-# Published scheduler files, reconstructed by SourceSchedule from their own configs
-############################################################################################################
-
-SOURCE = json.loads((DIFFUSERS_FIXTURES / "source_schedulers.json").read_text())
-SOURCE_ARRAYS = np.load(DIFFUSERS_FIXTURES / "source_schedulers.npz")
-SOURCE_ROUNDING = np.load(DIFFUSERS_FIXTURES / "source_rounding.npz")
-
-
-class SourceOracle(nn.Module):
-    """The model `tools/diffusers_source_reference.py` runs on both sides: a
-    bounded nonlinear function of the scaled input and the model time, so a
-    trajectory and its Jacobian depend on every scheduler decision the config
-    carries and on nothing else."""
-
-    @nn.compact
-    def __call__(self, x, temb):
-        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001
-
-
-class ConditionalSourceOracle(nn.Module):
-    """The same model offset by its condition, so a guided walk reads back the
-    combination that was applied."""
-
-    @nn.compact
-    def __call__(self, x, temb, label):
-        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
-
-
-def source_case(name: str):
-    """The reconstructed process, grid and solver of a fixture case, with the
-    initial latent the reference walked from."""
-    from dew.diffusion.schedules.source import SourceSchedule
-
-    config = json.loads(str(SOURCE_ARRAYS[f"{name}.config"]))
-    schedule = SourceSchedule.from_config(config)
-    process, times = schedule.sampling(SOURCE["cases"][name]["steps"])
-    return schedule, process, times, jnp.asarray(SOURCE_ARRAYS[f"{name}.x_T"])
-
-
-def source_gradient_over_orders(final, initial, cotangent) -> None:
-    """Pixel permutations move CFG's variance reductions alone.
-
-    The pointwise oracle and the per-sample quantile commute with the same
-    permutation of input and cotangent. The generating tool checks the
-    float64 VJP's invariance and records each reference distance. A single
-    draw concentrates on the few unclipped entries; 52 orders average the
-    reference's reduction roundings before the factor-two comparison. The
-    measured RMS ratios are 0.90/0.60/0.90 on default/AVX/Ice Lake CPU codegen.
-    """
-    gradient = jax.jit(lambda value, cot: jax.vjp(final, value)[1](cot)[0])
-    truth = SOURCE_ARRAYS["cfg.epsilon.grad"]
-    distances = []
-    for order in SOURCE_ROUNDING["orders"]:
-        def moved(value, order=order):
-            return np.asarray(value).reshape(initial.shape[0], -1)[:, order].reshape(initial.shape)
-        actual = gradient(jnp.asarray(moved(initial)), jnp.asarray(moved(cotangent)))
-        distances.append(distance(actual, moved(truth)))
-    assert_as_exact_over_orders(distances, SOURCE_ROUNDING["cfg.epsilon.distances"], "cfg.epsilon")
-
-
-@pytest.mark.parametrize("name", sorted(name for name in SOURCE["cases"] if not name.startswith("dpm_sde.")))
-def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
-    """Every published scheduler file the reference tool saved, rebuilt from
-    that file alone: its beta table, the standard deviation its
-    `init_noise_sigma` draws, the model time at each grid point, the latent
-    after every interval and the vector-Jacobian product of the last one
-    through the whole trajectory.
-
-    The reference calls the actual scheduler class, saves its config before
-    `set_timesteps` and walks every call a pipeline makes, so a spacing,
-    sigma transformation, terminal sigma, clipping order or stage placement
-    that this reconstruction read differently would move the trajectory.
-    A stochastic class integrates the exact draws `sample` folds per step, and
-    `DPMSolverSDEScheduler`'s walk integrates the draws its own `torchsde`
-    tree answered, whose interval the reconstruction is checked to prepare.
-    Every native walk and VJP runs in float32.
-
-    The VJP is held to twice the source's own RMS distance from its
-    float64 evaluation, using reference_error's common rounding rule.
-    The source fixture widens every scheduler table and retains that
-    gradient in float64, so its oracle shares no float32 arithmetic with
-    the reference whose rounding it measures. Five pointwise cases average
-    32 independent copies (768 gradient entries) in source_rounding.npz:
-    pixel permutations reproduce the same draw on both sides. A 256-copy
-    pilot's disjoint original-size subsets reached ratio 3.52, while every
-    32-copy subset stayed below 1.40 on default/AVX/Ice Lake CPU codegen.
-    The chosen new draws reach 1.43. Thresholding's maximum is 1 in these
-    cases, so the quantile is clamped to a constant and the limit is a
-    pointwise clip. CFG epsilon instead averages 52 pixel orders of its
-    per-sample variance reductions.
-    """
-    schedule, process, times, x_T = source_case(name)
-    rescale = SOURCE["cases"][name]["guidance"]
-    if f"{name}.betas" in SOURCE_ARRAYS:
-        np.testing.assert_allclose(schedule.betas, SOURCE_ARRAYS[f"{name}.betas"],
-                                   atol=1e-5, rtol=1e-5)
-    expected_times = SOURCE_ARRAYS[f"{name}.grid_times"]
-    model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
-    assert model_times.shape == expected_times.shape
-    np.testing.assert_allclose(model_times, expected_times, atol=1e-3, rtol=1e-6)
-    prior = float(process.sampler_schedule.prior_scale())
-    assert abs(prior - float(SOURCE_ARRAYS[f"{name}.prior"])) < 1e-5 * max(prior, 1.0)
-    expected = SOURCE_ARRAYS[f"{name}.latents"]
-    cotangent = jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"])
-    if rescale is None:
-        model = SourceOracle()
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {})
-        solver = schedule.solver
-        def run(value):
-            return walk(solver, process, model, value, times)
-        latents = run(x_T)
-        assert latents.shape == expected.shape
-        assert relative_gap(latents, expected) < 1e-4
-        def final(value):
-            return run(value)[-1]
-    else:
-        model = ConditionalSourceOracle()
-        rows = x_T.shape[0]
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])),
-                            jnp.ones((1,)), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), SOURCE["label"])},
-                                   {"label": jnp.zeros((rows,))})
-        guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
-
-        def final(value):
-            return sample(denoise, value, solver=schedule.solver, guidance=guidance,
-                          key=jax.random.PRNGKey(0), times=times, final_denoise=False)
-
-        assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
-    if name == "cfg.epsilon":
-        source_gradient_over_orders(final, x_T, cotangent)
-    elif f"{name}.x_T" in SOURCE_ROUNDING:
-        gradient = jax.jit(lambda value, cot: jax.vjp(final, value)[1](cot)[0])(
-            jnp.asarray(SOURCE_ROUNDING[f"{name}.x_T"]), jnp.asarray(SOURCE_ROUNDING[f"{name}.cotangent"]))
-        assert_as_exact_as_the_reference(
-            gradient, SOURCE_ROUNDING[f"{name}.grad_float32"], SOURCE_ROUNDING[f"{name}.grad"], name)
-    else:
-        (gradient,) = jax.vjp(final, x_T)[1](cotangent)
-        assert_as_exact_as_the_reference(
-            gradient, SOURCE_ARRAYS[f"{name}.grad_float32"], SOURCE_ARRAYS[f"{name}.grad"], name)
-
-
-@pytest.mark.parametrize("config", [
-    {"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 3.0},
-    "euler.default", "kdpm2.default", "dpm_multi.default"],
-    ids=lambda config: config if isinstance(config, str) else "flow.shift3")
-def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
-    """A prompt alone walks where its row of a batch walks, on the flow, sigma,
-    stage and VP grids.
-
-    One row is the walk XLA compiles differently: each grid read becomes a
-    dynamic slice rather than a gather. On a GPU (the cuda lane) XLA's
-    DynamicSliceAnnotator failed that compile while the lookups searched
-    the grid with jnp.interp's bisection loop inside the scan, which is how
-    every published flow-matching checkpoint first failed on one prompt.
-    """
-    from dew.diffusion.schedules.source import SourceSchedule
-
-    if isinstance(config, str):
-        config = json.loads(str(SOURCE_ARRAYS[f"{config}.config"]))
-    schedule = SourceSchedule.from_config(config)
-    process, times = schedule.sampling(6)
-    model = SourceOracle()
-    x_T = jax.random.normal(jax.random.PRNGKey(3), (2, 3, 4))
-    denoise = process.denoiser(model, model.init(jax.random.PRNGKey(1), x_T[:1], jnp.ones((1,))), {})
-    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
-                                       times=times, final_denoise=False))
-    batch = run(x_T)
-    for row in range(2):
-        np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
-
-
-def test_a_source_noise_sampler_seed_pins_the_brownian_path():
-    """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
-    walks with different keys integrate one path; without it the walk's own
-    key decides, as the source's unseeded tree draws its entropy per run."""
-
-    _, process, times, x_T = source_case("dpm_sde.default")
-    model = SourceOracle()
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-
-    def run(solver, seed):
-        return sample(denoise, x_T, solver=solver, key=jax.random.PRNGKey(seed), times=times,
-                      final_denoise=False)
-
-    pinned = DPMSolverSDE(seed=7)
-    np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
-    free = DPMSolverSDE()
-    assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)
 
 
 ############################################################################################################
