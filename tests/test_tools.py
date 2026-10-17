@@ -917,8 +917,9 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
 def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_report_is_not(tmp_path):
     """SLOP011: a sentence the test spells, looked for in the output pytest captured, however the test
     holds it (`capsys.readouterr()`'s `.out`, a name for the capture or its `.out`, the pair unpacked,
-    added to), proves wording. A name bound again to a parse of the output, and the same name in a
-    test that captured nothing, hold data, and are not reported."""
+    added to), proves wording. A name bound again to a parse of the output, the same name in a test
+    that captured nothing or only in a function it defines, and a mapping an item of the output is
+    put in, hold data, and are not reported."""
     found = _linted(tmp_path, {"tests/test_report.py": (
         "import json\n"
         "def test_direct(capsys):\n"
@@ -939,7 +940,16 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
         "    assert 'tokens' in report\n"
         "def test_unrelated():\n"
         "    out = {'tokens': 8}\n"
-        "    assert 'tokens' in out\n")})
+        "    assert 'tokens' in out\n"
+        "def test_nested(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    def later():\n"
+        "        report = capsys.readouterr().out\n"
+        "    assert 'tokens' in report\n"
+        "def test_item(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    report['err'] = capsys.readouterr().err\n"
+        "    assert 'tokens' in report\n")})
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
 
 

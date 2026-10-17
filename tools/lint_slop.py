@@ -861,25 +861,28 @@ def _captured(node: ast.expr, names: Set[str]) -> bool:
 
 
 def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
-    """The names bound to captured output (`_captured`) where each node of a function is: a name a
-    function binds to it, or unpacks it into, until it binds that name again to anything else (a
-    parse of it, say); added to, it stays captured."""
+    """The names bound to captured output (`_captured`) where each node of a function's own scope is:
+    a name the function binds to it, or unpacks it into, until it binds that name again to anything
+    else (a parse of it, say); added to, it stays captured. An item or attribute assigned binds no
+    name."""
     held: dict[int, frozenset[str]] = {}
     for function in ast.walk(tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         # A binding takes effect once its statement's value has been read: at the statement's end.
         binding = ast.Assign | ast.AnnAssign | ast.AugAssign
+        nodes = [node for node in scopes.own(function) if isinstance(node, binding | ast.Compare | ast.Call)]
         events = sorted(((node.end_lineno or node.lineno, node.end_col_offset or 0)
                          if isinstance(node, binding) else (node.lineno, node.col_offset), id(node), node)
-                        for node in ast.walk(function) if isinstance(node, binding | ast.Compare | ast.Call))
+                        for node in nodes)
         names: set[str] = set()
         for _, _, node in events:
             if isinstance(node, ast.Compare | ast.Call):
                 held[id(node)] = frozenset(names)
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            bound = {name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)}
+            bound = {name.id for target in targets for name in ast.walk(target)
+                     if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)}
             if node.value is not None and _captured(node.value, names):
                 names |= bound
             elif not isinstance(node, ast.AugAssign):
