@@ -15,7 +15,7 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -23,9 +23,9 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.artifacts import TokenScores
-from dew.inference.tasks import BlockGeneration
+from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, token_layout
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -45,7 +45,6 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, model_logits
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -152,8 +151,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """
 
     saved_task = BlockGeneration
-    inference_fields = frozenset({'seq_len', 'max_new_tokens', 'tokenizer', 'processor', 'process',
-                                  'pad_token_id'})
+    settings = BlockSettings
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
@@ -215,21 +213,18 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def _process(self):
         """The task's process, over the canvas the model generates on: the one `build_task` samples
-        with and `task_record` saves."""
+        with and `task_settings` saves."""
         from dew.diffusion.block import BlockProcess
 
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
-    def task_record(self) -> Mapping[str, JSON]:
-        """The sequence length, canvas budget, tokenizer or source processor, block process and pad id:
-        the task's own."""
-        from dew.diffusion.block import BlockProcess
-        from dew.inference.tasks import recorded_processor, recorded_tokenizer
-        from dew.registry import to_record
-        return {'seq_len': self.sequence_length, 'max_new_tokens': self.canvas_size,
-                'tokenizer': recorded_tokenizer(self.processor),
-                'processor': recorded_processor(self.processor),
-                'process': to_record(self._process(), BlockProcess), 'pad_token_id': self.pad_token_id}
+    def task_settings(self) -> BlockSettings:
+        """The sequence length, canvas budget, block process, pad id, and tokenizer or source
+        processor: the task's own."""
+        return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
+                             process=self._process(), pad_token_id=self.pad_token_id,
+                             tokenizer=recorded_tokenizer(self.processor),
+                             processor=recorded_processor(self.processor))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
@@ -238,11 +233,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         The sampler keeps the published defaults, and the caller sets the
         tokenizer's EOS ids.
         """
-        from dew.inference.tasks import BlockGeneration
-
-        return BlockGeneration(self.model, variables, self._process(),
-                               self.processor if processor is OMITTED else processor,
-                               pad_token_id=self.pad_token_id, max_new_tokens=self.canvas_size)
+        return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
+                                             self.processor if processor is OMITTED else processor)
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -343,7 +335,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         tokens = tokens.astype(jnp.int32)
         fields = prepared.token_fields
         response = tokens[:, self.prompt_length:]
-        validity = fields.get("attention_mask")
+        validity, _ = token_layout(fields)
         response_valid = (
             response != self.pad_token_id if validity is None else validity[:, self.prompt_length :]
         )

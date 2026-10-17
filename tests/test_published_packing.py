@@ -11,8 +11,7 @@ from dew.data.compile import compile, publish
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline
 from dew.data.sources.memory import Memory
-from dew.data.steps.text import Tokenize
-from dew.data.text import chunk
+from dew.data.text import Chunks, Tokenize
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -24,7 +23,7 @@ SIZES = (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
     prefix = Pipeline(source).map(Tokenize())
-    policy = prefix.flat_map(chunk(9)).pack(9, bins=3)
+    policy = prefix.flat_map(Chunks(9)).pack(9, bins=3)
     generation = publish(policy, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                       shard_bytes=256 * 1024), read="indexed", loading=READ)
     warm = compile(Pipeline(source).cache(generation).pack(9, bins=3).shuffle(3).repeat().batch(4),
@@ -97,9 +96,9 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     with pytest.raises(ValueError):
         compile(Pipeline(source).cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
                 loading=READ)
-    chunked = compile(Pipeline(source).cache(generation).flat_map(chunk(9)).pack(9, bins=3).repeat().batch(4),
-                      read="indexed", loading=READ)
-    cold = compile(prefix.flat_map(chunk(9)).pack(9, bins=3).repeat().batch(4), read="memory", loading=READ)
+    chunked = compile(Pipeline(source).cache(generation).flat_map(Chunks(9)).pack(9, bins=3).repeat()
+                      .batch(4), read="indexed", loading=READ)
+    cold = compile(prefix.flat_map(Chunks(9)).pack(9, bins=3).repeat().batch(4), read="memory", loading=READ)
     left, right = chunked.train(DataPartition()), cold.train(DataPartition())
     try:
         for ours, old in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):

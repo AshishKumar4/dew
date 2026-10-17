@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from torchax.interop import JittableModule
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.processors import AutoAudioProcessor
+    from dew.data.processors import FeatureExtractor
     from dew.data.text import PinnedTokenizer
 
 Raw = TypeVar("Raw")
@@ -416,7 +416,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
     Every waveform is cut or zero-padded to `seconds`, so every clip has the
     same length, including the constant the unconditional branch is encoded
-    from. A run's batches carry the waveform under the condition's field (a
+    from, and the checkpoint's feature extractor (`extractor`) reads them at
+    its own sampling rate and padding, as Whisper's pads to 30 seconds. A
+    run's batches carry the waveform under the condition's field (a
     clip's `audio`), which the objective encodes through `tokenize` on the host
     (`InputSpec.encode_fields`), so this encoder reads no captions.
     """
@@ -425,7 +427,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     seconds: float
     module: JittableModule
     params: Variables
-    audio: AutoAudioProcessor
+    extractor: FeatureExtractor
     dtype: Dtype | None = None
     param_dtype: str = "float32"
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
@@ -435,7 +437,6 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
                         dtype=None, param_dtype: str = "float32",
                         params: Variables | None = None) -> HFAudio:
-        from dew.data.processors import AutoAudioProcessor
         from dew.interop.pickles import host_view
         from dew.interop.torchax_fallback import INSTALL
 
@@ -443,7 +444,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             import torch
             from torch.nn.utils import parametrize
             from torchax.interop import JittableModule, extract_all_buffers
-            from transformers import AutoConfig, AutoModel
+            from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
         except ImportError as error:
             raise ImportError(
                 f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
@@ -470,18 +471,20 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # Torch's copies are no longer read: the forward runs on the arrays above.
         torch.nn.Module.to(model, "meta")
         return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
-                   audio=AutoAudioProcessor(modelname=checkpoint), dtype=resolve_dtype(dtype),
+                   extractor=AutoFeatureExtractor.from_pretrained(checkpoint), dtype=resolve_dtype(dtype),
                    param_dtype=param_dtype)
 
     @property
     def input_name(self) -> str:
         """The name of the extractor's array that the model reads."""
-        return self.audio.processor.model_input_names[0]
+        return self.extractor.model_input_names[0]
 
     @property
     def samples(self) -> int:
         """The number of samples every waveform is cut or padded to."""
-        return round(self.seconds * self.audio.sampling_rate)
+        from dew.data.processors import sampling_rate
+
+        return round(self.seconds * sampling_rate(self.extractor))
 
     def waveform(self, row: AudioRow) -> np.ndarray:
         """Return one row as a float32 waveform `samples` long.
@@ -500,7 +503,10 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         return np.pad(wave, (0, self.samples - len(wave)))
 
     def tokenize(self, texts: Sequence[AudioRow]) -> dict[str, np.ndarray]:
-        features = self.audio([self.waveform(row) for row in texts])
+        from dew.data.processors import sampling_rate
+
+        waveforms = [self.waveform(row) for row in texts]
+        features = self.extractor(waveforms, sampling_rate=sampling_rate(self.extractor), return_tensors="np")
         return {self.input_name: np.asarray(features[self.input_name], np.float32)}
 
     def encode(self, params, tokens) -> TextContext:
