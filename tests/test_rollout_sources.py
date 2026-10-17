@@ -4,23 +4,30 @@ The server is scripted: each draw is fixed ids at the version it was
 submitted under, and a held draw waits for the test. The checks: a
 multi-turn session records one call per turn with each call's own version,
 and its calls merge into one packed chain; the failure policy separates
-infrastructure failures (environment errors, raised steps, verifier
-crashes, failed draws) from truncations, which are still scored; a
+infrastructure failures (an environment's ERROR or OS error, Dew's own
+sandbox past its wall clock or dead, a verifier's or reward's OS error, a
+failed draw) from truncations, which are still scored, and from contract
+errors (a non-finite reward, an environment or sandbox worker that breaks
+its protocol, a failing decode), which fail the rollout's future; a
 cancelled session stops mid-draw and releases its environment; a server
-that reports no raw likelihood under a transforming policy is refused; and
-the prompt source scores decoded text and components per draw.
+that reports no raw likelihood records none, and its sessions still train;
+and the prompt source scores decoded text and components per draw.
 """
 
+import json
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
+from dataclasses import asdict
 
 import jax
 import numpy as np
 import pytest
+from episode_support import environment as sandbox
 
 from dew.inference import Draw
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
+from dew.objectives.rl.records import episode_from_record
 from dew.objectives.rl.sessions import Status, Task, pack
 from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
 from dew.sampling import Sampling
@@ -76,6 +83,8 @@ class Counter:
             raise ConnectionError("sandbox went away")
         if self.fail == "report":
             return Observation((), EpisodeStatus.ERROR, "container exited")
+        if self.fail == "malformed":
+            return {"context": [1, 2]}
         self.context = action.context + action.tokens + (4,)
         if self.steps == self.turns:
             return Observation((), EpisodeStatus.COMPLETED, "tests passed")
@@ -177,6 +186,41 @@ def test_a_verifier_crash_is_an_infra_error():
     assert rollout.status == Status.INFRA_ERROR and "verifier sandbox timed out" in rollout.detail
 
 
+@pytest.mark.parametrize("mode, detail", [("hang", "TimeoutError"), ("crash", "ChildProcessError")])
+def test_a_sandbox_past_its_wall_clock_or_dead_is_an_infra_error(mode, detail):
+    """Dew's own sandbox bounds its session: its deadline and its worker's death come back as
+    infrastructure failures, which the scheduler retries."""
+    worker = sandbox(mode, wall_seconds=1)
+    episodes = source(Server(), lambda task, identity: worker(identity))
+    rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
+    episodes.close()
+    assert rollout.status == Status.INFRA_ERROR and detail in rollout.detail and not rollout.calls
+
+
+def test_a_contract_error_fails_the_rollouts_future_instead_of_being_retried():
+    """A non-finite reward, an environment that returns no Observation, and a sandbox worker that
+    answers with something other than JSON are broken code, not infrastructure: the future fails
+    with the error, and the environment is still released."""
+    def nan(task, episode):
+        return float("nan")
+
+    entered, exited = [], []
+    episodes = source(Server(), factory(entered, exited), verifier=nan)
+    with pytest.raises(ValueError):
+        episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    episodes.close()
+    broken = source(Server(), factory(entered, exited, fail="malformed"))
+    with pytest.raises(TypeError):
+        broken.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    broken.close()
+    assert len(entered) == 2 and exited == entered
+    worker = sandbox("garbage")
+    garbled = source(Server(), lambda task, identity: worker(identity))
+    with pytest.raises(ValueError):
+        garbled.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
+    garbled.close()
+
+
 @pytest.mark.parametrize("server, options, calls, detail", [
     (Server(tokens=(5, 6, 7, 8)), {}, 1, "token limit"),
     (Server(), {"max_turns": 2}, 2, "turn limit"),
@@ -203,16 +247,28 @@ def test_a_cancelled_session_stops_mid_draw_and_releases_its_environment():
     assert rollout.status == Status.CANCELLED and not rollout.calls and exited == entered
 
 
-def test_a_server_without_raw_likelihoods_under_a_transforming_policy_is_refused():
-    server = Server(raw=False, sampling=Sampling(temperature=0.7, eos_token_ids=EOS))
-    episodes = source(server, factory([], []))
-    with pytest.raises(ValueError):
-        episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+@pytest.mark.parametrize("raw", [True, False])
+def test_a_transforming_server_with_or_without_raw_likelihoods_runs_and_records_what_it_reported(raw):
+    """vLLM and SGLang report no raw likelihood. Their actions record none, the record reads
+    back the same, and the session trains on its behavior likelihoods as any other."""
+    seen = []
+
+    def verifier(task, episode):
+        seen.append(episode)
+        return 1.0
+
+    server = Server(raw=raw, sampling=Sampling(temperature=0.7, top_k=4, eos_token_ids=EOS))
+    episodes = source(server, factory([], []), verifier=verifier)
+    rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
-    # At temperature one without filters the behavior likelihoods are the raw ones.
-    episodes = source(Server(raw=False), factory([], []))
-    assert episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10).status == Status.COMPLETED
-    episodes.close()
+    assert rollout.status == Status.COMPLETED and len(rollout.calls) == 3
+    [episode] = seen
+    for turn in episode.transitions:
+        assert turn.action.raw_log_probs == ((-.4, -.4) if raw else None)
+        assert turn.action.behavior_log_probs == (-.5, -.5)
+    assert episode_from_record(json.loads(json.dumps(asdict(episode), allow_nan=False))) == episode
+    batch = pack([rollout], 16)
+    np.testing.assert_array_equal(batch["behavior_log_probs"][batch["response_mask"] > 0], -.5)
 
 
 def prompt_batch():
@@ -268,35 +324,47 @@ def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch(
     assert (batch[ROUTED_EXPERTS_KEY][:, :3] == 3).all()
 
 
-def test_a_failed_draw_or_reward_is_an_infra_error():
+def test_a_failed_draw_or_a_rewards_os_error_is_an_infra_error():
     class Failing(Server):
         def submit(self, prompt, max_new_tokens, *, key):
             future = Future()
             future.set_exception(ConnectionError("engine restarted"))
             return future
 
+    def unreachable(*_):
+        raise TimeoutError("reward sandbox timed out")
+
     [task] = prompt_tasks(prompt_batch())
     drawn = PromptSource(Failing(), lambda *_: 1.0, decode=str, max_new_tokens=4)
     rollout = drawn.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "engine restarted" in rollout.detail
-    scored = PromptSource(Server(), lambda *_: float("nan"), decode=str, max_new_tokens=4)
+    scored = PromptSource(Server(), unreachable, decode=str, max_new_tokens=4)
     rollout = scored.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
-    assert rollout.status == Status.INFRA_ERROR and "non-finite" in rollout.detail
+    assert rollout.status == Status.INFRA_ERROR and "reward sandbox timed out" in rollout.detail
+    assert len(rollout.calls) == 1
     drawn.close()
     scored.close()
 
 
-def test_a_prompt_source_failure_outside_the_reward_resolves_the_future_instead_of_hanging():
-    # A decode that raises something other than Exception escapes the reward's handler.
-    class Interrupted(BaseException):
-        pass
+class Interrupted(BaseException):
+    pass
 
-    def decode(ids):
-        raise Interrupted
 
+def unreadable(ids):
+    raise ValueError("not a token id of this tokenizer")
+
+
+def interrupted(ids):
+    raise Interrupted
+
+
+@pytest.mark.parametrize("decode, reward, failure", [
+    (unreadable, 1.0, ValueError), (interrupted, 1.0, Interrupted), (str, float("nan"), ValueError)])
+def test_a_non_finite_reward_or_a_failing_decode_fails_the_prompt_rollouts_future(decode, reward, failure):
+    """Neither is an infrastructure failure to retry: the future resolves with the error instead of
+    a session, and never hangs, whatever the error's class."""
     [task] = prompt_tasks(prompt_batch())
-    prompts = PromptSource(Server(), lambda *_: 1.0, decode=decode, max_new_tokens=4)
-    future = prompts.submit(task, 1, version=0, key=KEY)[0]
-    with pytest.raises(Interrupted):
-        future.result(timeout=10)
+    prompts = PromptSource(Server(), lambda *_: reward, decode=decode, max_new_tokens=4)
+    with pytest.raises(failure):
+        prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     prompts.close()
