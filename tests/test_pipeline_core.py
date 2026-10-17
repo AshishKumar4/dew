@@ -1223,3 +1223,16 @@ def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
         for column in batch.values():
             if isinstance(column, SharedMemoryArray):
                 column.unlink_on_del()
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_rebatched_loader_declares_the_rows_its_batches_hold(read):
+    """A loader's batch is the rows of the batches it yields, the last rebatch's size, which the
+    trainer's preflight and microbatch checks read; it once declared the first batch's."""
+    rows = Memory([{"x": np.int32(index)} for index in range(32)])
+    data = compile(Pipeline(rows).repeat().batch(8).rebatch(4), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert [len(next(stream)["x"]) for _ in range(3)] == [data.batch] * 3 == [4] * 3
+    finally:
+        stream.close()
