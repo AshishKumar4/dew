@@ -1057,7 +1057,6 @@ def _providers() -> tuple[type, type]:
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
     qwix = _qwix()
-    quantized = _qwix("qwix._src.providers.ptq").WithAux
     group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
@@ -1121,14 +1120,19 @@ def _providers() -> tuple[type, type]:
                 _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
-            # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8
-            # (`flax_util.update_boxed` accepts boxes and arrays only).
+            # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
+            # the QArray inside it (`flax_util.update_boxed` accepts boxes and arrays only): the
+            # QArray's scales take the dtype, wherever the wrapper holds it.
             promoted = super().promote_dtype(*args, **kwargs)
             dtype = kwargs.get("dtype")
             if dtype is None:
                 return promoted
-            return [value.replace(array=nn.unbox(value.array).astype(dtype))
-                    if isinstance(value, quantized) else value for value in promoted]
+
+            def quantized(value) -> bool:
+                return isinstance(value, qwix.QArray)
+
+            return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
+                                promoted, is_leaf=quantized)
 
     return QtProvider, PtqProvider
 
