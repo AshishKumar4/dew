@@ -562,6 +562,20 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     return values
 
 
+def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None
+                             ) -> dict[str, JSON]:
+    """The generation_config.json a masked-diffusion export writes: no KV cache,
+    the response budget and the pad id, which `audit_masked` accepts and
+    `PretrainedMaskedDecoder.text_generation` reads back. Dew's solver and
+    step count have no field there, so the reader's MDLM defaults stand."""
+    values: dict[str, JSON] = {"use_cache": False}
+    if max_new_tokens:
+        values["max_new_tokens"] = max_new_tokens
+    if pad_token_id is not None:
+        values["pad_token_id"] = pad_token_id
+    return values
+
+
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
                      model: nn.Module, rows: int, override: Sampling | None
                      ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None, Strategy | None]:

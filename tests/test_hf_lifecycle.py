@@ -50,6 +50,15 @@ class Export:
     bound: float | None = None
     masked: bool = False
 
+    @property
+    def label(self) -> str:
+        return self.fixture if self.derived or self.fixture not in DERIVED else f'{self.fixture}-saved'
+
+
+# The sources a derived export writes, which their own `save` writes too, as themselves.
+DERIVED = ('gpt-bigcode-tiny', 'gpt-bigcode-mha-tiny', 'starcoder2-tiny', 'falcon-tiny', 'falcon-mha-tiny',
+           'gptj-tiny', 'phi-tiny', 'phi3-tiny', 'mamba-tiny')
+
 
 EXPORTS = (
     Export('gpt-bigcode-tiny', derived=True),
@@ -69,10 +78,11 @@ EXPORTS = (
     Export('mimo-v2-flash-tiny'),
     Export('mamba-tiny', derived=True),
     Export('modernbert-tiny', masked=True),
+    *(Export(name) for name in DERIVED),
 )
 
 
-@pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.fixture)
+@pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.label)
 def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case, tmp_path):
     """The export names its family and holds the source's tensors byte for
     byte, unless it writes another family's. Transformers reads it on eager

@@ -333,9 +333,10 @@ class _FitPlan:
 
     @property
     def scored(self) -> tuple[Metric, ...]:
-        """Fit's metrics and every suite's, each once."""
+        """Fit's metrics and every suite's, each instance once: two suites' instances of one metric
+        are both a selection's to name."""
         every = (*self.metrics, *(metric for suite in self.suites.values() for metric in suite.metrics))
-        return tuple({metric.name: metric for metric in every}.values())
+        return tuple({id(metric): metric for metric in every}.values())
 
     @property
     def cadenced(self) -> bool:
@@ -1857,9 +1858,11 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        splits = tuple(suites) or ('val',)
-        metrics = tuple({metric.name: metric for metric in (*metrics, *(
-            metric for suite in suites.values() for metric in suite.metrics))}.values())
+        if restore_best and self.checkpoints is None:
+            # It would return the final weights as the best: the best is a checkpoint, restored.
+            raise ValueError("restore_best restores the best checkpoint; give the Trainer Checkpoints")
+        # Each split's own metrics: two suites may each hold their own instance of one metric.
+        scored = {name: tuple(suite.metrics) for name, suite in suites.items()} or {'val': tuple(metrics)}
         raw = (
             ()
             if best is None
@@ -1882,9 +1885,8 @@ class Trainer(Generic[Loss, Effects]):
                 return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
 
-        shown = _reported(None, metrics)
         selection = tuple(
-            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, shown, splits)
+            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(scored)
             for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
         )
         labels = [(choice.split, choice.metric) for choice in selection
@@ -1897,7 +1899,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise TypeError(
                     "Plateau selects a declared metric object, not a Best policy or score function"
                 )
-            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, shown, splits)
+            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(scored)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")

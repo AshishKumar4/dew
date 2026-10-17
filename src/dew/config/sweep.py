@@ -66,9 +66,12 @@ class GridSearch(Search):
 class OptunaSearch(Search):
     """Asks Optuna's TPE sampler for the next point in the space.
 
-    Each call builds a new study from the finished trials, seeded with
-    `seed`, so a resumed sweep asks from the same trials as a sweep that
-    never stopped.
+    Each call builds a new study from the finished trials, its sampler seeded
+    with `seed` and the trial's number, as `RandomSearch` draws, so a resumed
+    sweep asks from the same trials as a sweep that never stopped, and each
+    trial draws apart: TPE draws its first trials at random, and a study's
+    finished trials are added to it without drawing, so one seed would give
+    every such trial the same point.
     """
 
     seed: int = 0
@@ -79,7 +82,8 @@ class OptunaSearch(Search):
         distributions: dict[str, optuna.distributions.BaseDistribution] = {
             path: optuna.distributions.CategoricalDistribution(list(values))
             for path, values in space.items()}
-        study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=self.seed))
+        seed = int(np.random.SeedSequence([self.seed, len(finished)]).generate_state(1)[0])
+        study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=seed))
         for trial in finished:
             study.add_trial(optuna.trial.create_trial(
                 params=dict(trial.overrides), distributions=distributions, value=trial.value))
