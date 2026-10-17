@@ -179,7 +179,8 @@ def test_prompt_and_preference_encodings_read_token_arrays_as_they_read_lists(re
     native = [{name: kind(np.asarray(value, np.int32)) for name, value in row.items()} for row in lists]
 
     def first(rows):
-        chain = Memory(rows).filter_map(prompts.encode("byte", max_prompt_len=4)).map(preferences.PreferencePair(4))
+        chain = Memory(rows).filter_map(prompts.encode("byte", max_prompt_len=4))
+        chain = chain.map(preferences.PreferencePair(4))
         return next(iter(iterate(chain, read=read, loading=READ)))
 
     encoded = [first(rows) for rows in (lists, native)]
