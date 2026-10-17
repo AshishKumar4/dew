@@ -1,4 +1,4 @@
-"""Conversation, prompt and preference record encodings."""
+"""Block-diffusion response rows of rendered conversations, and prompt record encodings."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
-from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
+from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _ids, _mask
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
     INFO_KEY,
@@ -28,27 +27,6 @@ from dew.data.prompts import (
 )
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
 from dew.records import integer, record
-
-
-@dataclasses.dataclass(frozen=True)
-class RenderChat(grain.MapTransform):
-    tokenizer: str
-    column: str = "messages"
-
-    @functools.cached_property
-    def vocabulary(self) -> HFTokenizer:
-        """The tokenizer and its template, resolved once as `Tokenize.vocabulary`."""
-        return HFTokenizer(self.tokenizer)
-
-    def dependencies(self) -> Mapping[str, object]:
-        return {"tokenizer": self.vocabulary.dependencies()}
-
-    def map(self, element: Batch) -> Batch:
-        messages = element.get(self.column, element.get("prompt"))
-        conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
-        ids, roles = render_conversation(self.vocabulary.tokenizer, conversation, self.tokenizer)
-        kept = {key: value for key, value in element.items() if key not in (self.column, "prompt", "tools")}
-        return {**kept, "text": ids, "text_roles": roles}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,30 +140,3 @@ class ConfigurePrompt:
             self.long,
             self.thinking,
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class PreferencePair(grain.MapTransform):
-    seq_len: int = 256
-    pad_id: int = 0
-
-    def __post_init__(self) -> None:
-        if self.seq_len < 1:
-            raise ValueError("preference seq_len must be positive")
-
-    def map(self, element: Batch) -> Batch:
-        element = record(element, "preference row")
-        if "chosen" not in element or "rejected" not in element:
-            raise ValueError("a preference pair needs both chosen and rejected ids")
-        ids = np.full((2, self.seq_len), self.pad_id, np.int32)
-        mask = np.zeros((2, self.seq_len), np.int32)
-        for row, name in enumerate(("chosen", "rejected")):
-            tokens = _ids(element.get(name), name, "preference")
-            if len(tokens) > self.seq_len:
-                raise ValueError(f"preference {name} has {len(tokens)} tokens for seq_len={self.seq_len}")
-            completion = _mask(
-                element.get(f"{name}_mask", [1] * len(tokens)), f"{name}_mask", len(tokens), "preference"
-            )
-            ids[row, : len(tokens)], mask[row, : len(tokens)] = tokens, completion
-        kept = {key: value for key, value in element.items() if key not in PREFERENCE_FIELDS}
-        return {**kept, IDS_KEY: ids, MASK_KEY: mask}

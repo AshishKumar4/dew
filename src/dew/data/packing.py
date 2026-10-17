@@ -15,14 +15,13 @@ import functools
 from collections.abc import Mapping
 from typing import ClassVar
 
-import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed, _indexed_manifest
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
 from dew.records import record
 
@@ -35,12 +34,12 @@ def refuse_overlong(lengths, pack: Pack, described: str) -> None:
     """Refuse documents of `lengths` that a first-fit or best-fit `pack` would
     have to cut to fit its windows: a pack places documents whole, and a run
     that means to cut them says so with a chunk step before it
-    (`dew.data.text.chunk`). A concatenating pack splits by design."""
+    (`dew.data.text.Chunks`). A concatenating pack splits by design."""
     longest = int(np.max(lengths, initial=0))
     if pack.policy != "concat" and longest > pack.seq_len:
         raise ValueError(
             f"{described} holds a document of {longest} tokens, longer than the {pack.seq_len}-token "
-            f"windows it packs into; cut documents first with flat_map(dew.data.text.chunk({pack.seq_len}))"
+            f"windows it packs into; cut documents first with flat_map(dew.data.text.Chunks({pack.seq_len}))"
         )
 
 
@@ -48,7 +47,7 @@ def chunks_for(step: ExpandStep, pack: Pack) -> bool:
     """Whether `step`, just before `pack`, cuts each document into the pieces a
     plan of lengths cuts it into (`chunk_table`): consecutive pieces of the
     window's length, the same cut in every field the pack places."""
-    from dew.data.steps.text import Chunks
+    from dew.data.text import Chunks
 
     return (isinstance(step, Chunks) and step.length == pack.seq_len and step.overlap == 0
             and set(pack.fields) <= set(step.fields))
@@ -139,7 +138,7 @@ class _Published:
         if self.generation.plan(plan_name(self.pack, "offsets")).any():
             raise ValueError(
                 f"{self.generation.url} published windows that cut its documents, which its pack "
-                f"places whole; read it with flat_map(dew.data.text.chunk({self.pack.seq_len})) "
+                f"places whole; read it with flat_map(dew.data.text.Chunks({self.pack.seq_len})) "
                 f"before the pack, as it was published"
             )
 
@@ -288,16 +287,4 @@ class PackedSource:
         return None
 
     def manifest(self) -> ShardManifest:
-        size, location = len(self.plan), self.plan.location
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"{location}:{start}", location, start, min(start + 1024, size), min(1024, size - start)
-                )
-                for start in range(0, size, 1024)
-            ),
-            self._reader,
-        )
-
-    def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, self.plan.location, self.plan.location, 1024)

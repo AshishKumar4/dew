@@ -56,11 +56,16 @@ export class ModelPool extends DurableObject<Env> {
 			hosts: Object.fromEntries(ready.map((host, index) => [host.id, health[index]])) };
 	}
 
-	async image(): Promise<string | null> {
+	/**
+	 * The image a new session runs on, where a ready host of the serving generation has room, and the commit the
+	 * pool is set to (its newest generation, which may still be starting while an older one serves).
+	 */
+	async image(): Promise<{ image: string | null; commit: string | null }> {
 		const pool = await this.state();
 		const load = (id: string) => Object.values(pool.sessions).filter((host) => host === id).length;
-		return pool.hosts.some((host) => host.ready && !host.retiring && host.generation.snapshot.id === pool.serving && load(host.id) < HOST_CAPACITY)
-			? pool.serving! : null;
+		const room = pool.hosts.some((host) => host.ready && !host.retiring && host.generation.snapshot.id === pool.serving
+			&& load(host.id) < HOST_CAPACITY);
+		return { image: room ? pool.serving! : null, commit: pool.desired?.commit ?? null };
 	}
 
 	async allocate(session: string, image: string): Promise<string> {
