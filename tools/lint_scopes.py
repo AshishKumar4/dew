@@ -109,6 +109,10 @@ def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence
              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
     local |= {node.name for node in nodes
               if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+    # An exception's name and a pattern's capture bind without a stored Name.
+    local |= {node.name for node in nodes if isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar)
+              and node.name}
+    local |= {node.rest for node in nodes if isinstance(node, ast.MatchMapping) and node.rest}
     imported: dict[str, str] = {}
     for node in nodes:
         if isinstance(node, ast.Import | ast.ImportFrom):

@@ -1332,6 +1332,18 @@ def _evaluated(definition: ast.AST) -> list[ast.AST]:
     return []
 
 
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _comprehended(comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+                  ) -> list[ast.AST]:
+    """What a comprehension evaluates in its own scope: every part but its first iterable."""
+    first, *rest = comprehension.generators
+    elements = [comprehension.key, comprehension.value] if isinstance(comprehension, ast.DictComp) else [
+        comprehension.elt]
+    return [*first.ifs, *(part for generator in rest for part in (generator.iter, *generator.ifs)), *elements]
+
+
 def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
     """Every node that runs where `nodes` run, in `scope`, with the scope its names resolve in: a nested
     function's or lambda's evaluated parts (`_evaluated`) but not its body, which runs only where it is
@@ -1343,6 +1355,12 @@ def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast
         elif isinstance(node, ast.ClassDef):
             yield from _executed_in(_evaluated(node), scope)
             yield from _executed_in(node.body, node)
+        elif isinstance(node, COMPREHENSIONS):
+            # Its first iterable is evaluated where it stands; the rest runs in its own scope, where its
+            # targets bind: at once for a list, a set or a dict, and only as it is consumed for a generator.
+            yield from _executed_in([node.generators[0].iter], scope)
+            if not isinstance(node, ast.GeneratorExp):
+                yield from _executed_in(_comprehended(node), node)
         else:
             yield from _executed_in(ast.iter_child_nodes(node), scope)
 
@@ -1431,6 +1449,8 @@ class _Calls:
         comprehended = {id(name) for node in own if isinstance(node, ast.comprehension)
                         for name in ast.walk(node.target)}
         for node in own:
+            if isinstance(node, COMPREHENSIONS):
+                self._comprehension(node, scope)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 if id(node) not in comprehended:
                     bind(node.id, None)
@@ -1438,6 +1458,8 @@ class _Calls:
                 bind(node.name, None)
             elif isinstance(node, ast.MatchMapping):
                 bind(node.rest, None)
+            elif isinstance(node, ast.ExceptHandler):
+                bind(node.name, None)
             elif isinstance(node, ast.Import | ast.ImportFrom):
                 for name in scopes.bound_by(node, self.parent):
                     bind(name, None)
@@ -1448,6 +1470,20 @@ class _Calls:
             if isinstance(node, scopes.SCOPES):
                 self._index(node, scope)
         self.bindings[id(scope)] = names
+
+    def _comprehension(self, node: ast.AST, enclosing: ast.AST) -> None:
+        """Index a comprehension, which `_index` meets in the scope that holds it, as a scope of its own: its
+        targets bind there, and a comprehension it holds encloses in it."""
+        if id(node) in self.bindings:
+            return
+        assert isinstance(node, COMPREHENSIONS)
+        self.enclosing[id(node)] = enclosing
+        self.bindings[id(node)] = {name.id: None for generator in node.generators
+                                   for name in ast.walk(generator.target) if isinstance(name, ast.Name)}
+        for part in _comprehended(node):
+            for inner in ast.walk(part):
+                if isinstance(inner, COMPREHENSIONS):
+                    self._comprehension(inner, node)
 
     def _lookup(self, scope: ast.AST | None, name: str) -> ast.AST | None:
         """What `name` stands for, read in `scope`: its own binding, else the enclosing scopes'

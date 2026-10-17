@@ -1062,8 +1062,10 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
     """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
     that binds `f` in its method resolution order, from a method or a closure in one; a name to its
-    binding, which a comprehension's own variable does not make and a pattern's capture or a class
-    body's assignment does. A sleep beside a call that reaches a subprocess is at its boundary."""
+    binding, which a comprehension's own variable does not make outside it but does inside, and a
+    pattern's capture, an exception's name or a class body's assignment does. A generator's element
+    runs only as it is consumed. A sleep beside a call that reaches a subprocess, a list built of
+    them included, is at its boundary."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import subprocess\n"
         "import time\n"
@@ -1108,8 +1110,24 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "    work = staticmethod(abs)\n"
         "    def spin(self):\n"
         "        self.work()\n"
-        "        time.sleep(1)\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44)]
+        "        time.sleep(1)\n"
+        "def inline():\n"
+        "    [run(-1) for run in (abs,)]\n"
+        "    time.sleep(1)\n"
+        "def deferred():\n"
+        "    pending = (subprocess.run(['true']) for _ in range(3))\n"
+        "    time.sleep(1)\n"
+        "    return pending\n"
+        "def handled():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as subprocess:\n"
+        "        subprocess.add_note('local')\n"
+        "    time.sleep(1)\n"
+        "def eager():\n"
+        "    [subprocess.run(['true']) for _ in range(3)]\n"
+        "    time.sleep(1)\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57)]
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
