@@ -44,7 +44,7 @@ from dew.interop.processors import (
     Processor as Processor,
     ProcessorCall as ProcessorCall,
 )
-from dew.interop.streaming import LazyTree, WeightLayout
+from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -490,15 +490,16 @@ def pipeline_denoiser(directory: Path, *, dtype: str | None, attention_impl: str
     return builder(config, directory, dtype=dtype, attention_impl=attention_impl)
 
 
-def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
+def _transformer_weights(directory: Path, path_of: Callable[[str, int], tuple[str, ...] | None]
                          ) -> Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]:
     """Read a transformer denoiser's parameters, and their layouts, from its
-    component; `lazy` leaves them `SourceLeaf`s for a placement to read."""
+    component, each where its family's `path_of(name, rank)` places it;
+    `lazy` leaves them `SourceLeaf`s for a placement to read."""
     from dew.interop import diffusion
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = translate(diffusion.component_tensors(directory, "transformer"),
-                                    param_dtype=param_dtype, lazy=lazy)
+        params, layouts = diffusion.read_transformer(diffusion.component_tensors(directory, "transformer"),
+                                                     path_of, param_dtype=param_dtype, lazy=lazy)
         return {"params": params}, layouts
     return weights
 
@@ -549,7 +550,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-    weights = _transformer_weights(directory, diffusion.translate_flux_weights)
+    weights = _transformer_weights(directory, diffusion.flux_path)
     return _transformer_denoiser(
         "flux_transformer", model, fields, config, dtype, weights,
         _TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
@@ -571,7 +572,7 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     model = fields.value
     return _transformer_denoiser(
         "qwen_image_transformer", model, fields, config, dtype,
-        _transformer_weights(directory, diffusion.translate_qwen_image_weights), _QwenImageText(),
+        _transformer_weights(directory, diffusion.qwen_image_path), _QwenImageText(),
         patch=1, latent_input=model.in_channels, sample_size=(64, 64),
         context_width=model.context_in_dim, pipeline="QwenImage21Pipeline", origin="linspace")
 
@@ -588,7 +589,7 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
     guided = model.guidance_embeds
-    weights = _transformer_weights(directory, diffusion.translate_flux2_weights)
+    weights = _transformer_weights(directory, diffusion.flux2_path)
     return _transformer_denoiser(
         "flux2_transformer", model, fields, config, dtype, weights,
         _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
@@ -606,7 +607,7 @@ def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, atten
 
     fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-    weights = _transformer_weights(directory, diffusion.translate_z_image_weights)
+    weights = _transformer_weights(directory, diffusion.z_image_path)
     return _transformer_denoiser(
         "z_image_transformer", model, fields, config, dtype, weights,
         _HiddenStatesText("z_image"), patch=2, latent_input=model.in_channels, sample_size=(128, 128),
@@ -623,7 +624,7 @@ def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
 
     fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-    weights = _transformer_weights(directory, diffusion.translate_wan_weights)
+    weights = _transformer_weights(directory, diffusion.wan_path)
     return _transformer_denoiser(
         "wan_transformer", model, fields, config, dtype, weights,
         _WanText(), patch=model.patch_size[-1], latent_input=model.in_channels, sample_size=(60, 104),

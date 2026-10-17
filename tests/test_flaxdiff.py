@@ -73,6 +73,14 @@ def test_simple_udit_computes_what_flaxdiff_computed(reference):
     assert np.max(np.abs(dew_output(model_config, weights, data) - data["output"])) < TOLERANCE
 
 
+def test_a_hilbert_scan_simple_udit_computes_what_flaxdiff_computed():
+    """FlaxDiff's `use_hilbert` SimpleUDiT, whose patches run along a Hilbert
+    curve through `hilbert_projection`, is Dew's `scan_order="hilbert"`."""
+    model_config, weights, data = read_reference(FIXTURE / "hilbert")
+    assert model_config["use_hilbert"] and simple_udit_fields(model_config)["scan_order"] == "hilbert"
+    assert np.max(np.abs(dew_output(model_config, weights, data) - data["output"])) < TOLERANCE
+
+
 def test_hybrid_dit_computes_what_flaxdiff_computed(hybrid_reference):
     """S5, 2D fusion, zigzag order and attention compute the trained architecture."""
     # CPU fp32 max error is 1.12e-8. Project-then-pool in the reference and

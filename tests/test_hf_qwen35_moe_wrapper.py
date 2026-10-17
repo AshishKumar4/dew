@@ -57,3 +57,24 @@ def test_published_qwen35_moe_tiny_checkpoint_logits_and_generation(tmp_path):
 
     check_checkpoint('trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6',
                      tmp_path / 'measurement.json', revision='57faabc3b49ec3ae69b8d6158130ce19496bc2d3')
+
+
+def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(tmp_path):
+    """A Qwen 3.5 config may omit vision_config.spatial_merge_size, whose reference default is 2;
+    the tower and merger are built at that default, so the processor places the images at it too
+    and the model computes the conditional reference's logits."""
+    from shutil import copytree
+
+    checkpoint = tmp_path / 'checkpoint'
+    copytree(DIRECTORY, checkpoint)
+    config = json.loads((checkpoint / 'config.json').read_text())
+    del config['vision_config']['spatial_merge_size']
+    (checkpoint / 'config.json').write_text(json.dumps(config))
+    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
+    assert loaded.processor is not None
+    images = np.load(DIRECTORY / 'raw_images.npy')
+    inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
+                              images=[[images[0]], [images[1], images[2]]])
+    valid = np.asarray(inputs.token_fields['attention_mask'])
+    actual = np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
+    np.testing.assert_allclose(actual[valid], np.load(DIRECTORY / 'logits.npy')[valid], atol=1e-4, rtol=0)

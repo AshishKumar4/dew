@@ -5,8 +5,8 @@ value, the block without a feed-forward as `mlp_features=0`, the norms'
 epsilon and the head's tying. The tensors share Mamba-2's `backbone` trunk
 (`dew.interop.mamba2.TRUNK`) under the selective mixer's names. The
 state-spaces/mamba-*-hf conversions keep mamba_ssm's own fields beside
-the reference's, which `decoder_parts._INERT_FIELDS` accepts where they
-repeat it.
+the reference's, which the reference does not read and
+`decoder_parts._INERT_FIELDS` accepts.
 """
 
 from __future__ import annotations
