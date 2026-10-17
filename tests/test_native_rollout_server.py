@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from process_support import assert_exits_cleanly
 
 from dew.inference import NativeRolloutServer, TextGeneration
@@ -106,12 +107,23 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
 
 
 def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
-    """Weights gone non-finite sample with NaN likelihoods, which no `Draw` holds. The draw's
-    future fails with that error, where a check raised in the done-callback reached no one."""
-    target = objective()
-    params = jax.tree.map(lambda leaf: leaf * jnp.nan, target.init(jax.random.key(0)))
+    """A bigram policy so peaked that the model's own likelihood of every id but one underflows
+    to -inf, sampled hot enough to draw those ids. No `Draw` holds a non-finite likelihood, so
+    the draw's future fails with that error, where a check raised in the done-callback reached
+    no one and left the future pending."""
+    vocab = 64
+
+    def peaked():
+        table = np.full((vocab, vocab), -2e38, np.float32)
+        table[:, 0] = 2e38
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=peaked)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    # At this temperature the scores are 1 and -1, so the ids the model gives -inf are drawn.
+    sampling = Sampling(temperature=2e38, eos_token_ids=vocab - 1)
     server = NativeRolloutServer(
-        Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING), slots=2, capacity=64)
+        Server.from_task(TextGeneration(model, params, None, sampling=sampling), slots=2, capacity=64)
     )
     try:
         with pytest.raises(ValueError):
