@@ -3,12 +3,14 @@
 Every check runs an actual interpreter under the fleet's limits: a program
 that completes, one that fails, one that sleeps past the wall clock, one that
 spins past its CPU time, one that allocates past its memory, one that floods
-its output, one killed by a signal, and one whose forked child must not
-outlive the timeout. The verifiable rewards score completions through the
+its output, one killed by a signal, one whose forked child must not outlive
+the timeout, and one that sleeps quietly while its collector waits without
+polling. The verifiable rewards score completions through the
 same fleet. The container runner repeats the boundary checks when a Docker
 daemon and the image are present locally.
 """
 
+import resource
 import shutil
 import subprocess
 import sys
@@ -17,7 +19,15 @@ import time
 import pytest
 from tool_support import load
 
-from dew.rl.sandbox import ContainerRunner, MathReward, Program, SandboxFleet, SandboxLimits, Verdict
+from dew.rl.sandbox import (
+    ContainerRunner,
+    MathReward,
+    ProcessRunner,
+    Program,
+    SandboxFleet,
+    SandboxLimits,
+    Verdict,
+)
 
 RLVR = load("train_rlvr", "examples")
 CodeReward, code_block = RLVR.CodeReward, RLVR.code_block
@@ -95,6 +105,17 @@ def test_a_signal_is_a_crash_and_a_flood_is_cut_off(fleet):
     assert crashed.verdict is Verdict.CRASHED
     assert flooded.verdict is Verdict.OUTPUT_LIMIT
     assert len(flooded.stdout) <= SandboxLimits().message_bytes + 65536
+
+
+def test_a_quiet_program_does_not_wake_its_collector_until_it_ends():
+    """The runner waits on the program's pipes and its deadline, not on a polling interval: a
+    program that sleeps two seconds without output costs its collecting thread a handful of
+    wakeups (start, exit, reap), where a tenth-of-a-second poll would cost twenty."""
+    before = resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw
+    outcome = ProcessRunner()(program("import time\ntime.sleep(2)"), SandboxLimits(wall_seconds=10))
+    wakeups = resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw - before
+    assert outcome.verdict is Verdict.COMPLETED and outcome.seconds >= 2
+    assert wakeups < 10, f"the collector woke {wakeups} times while the program slept"
 
 
 def test_programs_run_concurrently_and_return_in_order():
