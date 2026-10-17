@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_rounds_where_the_reference_does,
+    equations,
+    within,
+)
 from tuned import each_config
 
 from dew.nn.kernels import generation, short_conv, tuning
@@ -200,21 +205,41 @@ def test_a_gpu_runs_the_kernels_both_ways():
         assert not kernels(jax.grad(loss), x)
 
 
-@pytest.mark.parametrize("dtype, out, parts, taps, reason", [
-    (jnp.float64, jnp.float64, DELTA, 4, "float64"),
-    (jnp.float32, jnp.float64, DELTA, 4, "into float64"),
-    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4, "its block"),
-    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (40, 32)), 4, "its block"),
+@pytest.mark.parametrize("dtype, out, parts, taps", [
+    (jnp.float64, jnp.float64, DELTA, 4),
+    (jnp.float32, jnp.float64, DELTA, 4),
+    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4),
+    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (40, 32)), 4),
     # One key head of 16 and a value head of 8: no 16-channel block holds the values.
-    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4, "its block"),
-    (jnp.bfloat16, jnp.bfloat16, DELTA, 12, "12 taps"),
+    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4),
+    (jnp.bfloat16, jnp.bfloat16, DELTA, 12),
 ])
-def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason):
+def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, taps):
+    """On a GPU whose row names the kernels, a conv they do not take (`conv_refusal`: float64, a piece
+    off its block, more taps than they hold) runs XLA's conv: the same values and gradients, and no
+    kernel launch."""
     with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
-        x = jnp.zeros((1, 8, sum(width for width, _ in parts)), dtype)
+        keys = jax.random.split(jax.random.key(89), 3)
+        x = jax.random.normal(keys[0], (1, 8, sum(width for width, _ in parts))).astype(dtype)
+        taps = 0.3 * jax.random.normal(keys[1], (x.shape[-1], taps))
+        probe = [jax.random.normal(key, (1, 8, width)) for key, (width, _) in zip(
+            jax.random.split(keys[2], len(parts)), parts, strict=True)]
+
+        def loss(conv):
+            def run(x, taps):
+                return sum(jnp.sum(piece.astype(jnp.float32) * weight) for piece, weight in zip(
+                    conv(x, taps, parts=parts, dtype=out), probe, strict=True))
+            return jax.value_and_grad(run, argnums=(0, 1))
+
         with generation.assumed("sm80"):
-            refused = conv_refusal(x, jnp.zeros((x.shape[-1], taps), jnp.float32), parts, out)
-    assert refused is not None and reason in refused
+            assert conv_refusal(x, taps, parts, out) is not None
+            launched = [equation for equation in equations(jax.make_jaxpr(loss(causal_conv1d))(x, taps))
+                        if equation.primitive.name == "pallas_call"]
+            got = jax.jit(loss(causal_conv1d))(x, taps)
+        want = jax.jit(loss(xla_conv1d))(x, taps)
+    assert not launched
+    for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
