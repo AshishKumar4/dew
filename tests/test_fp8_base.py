@@ -31,7 +31,7 @@ from reference_error import assert_leaves_as_exact, float64_terms
 from dew import cache
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
-from dew.lora import LoRA
+from dew.lora import LoRA, unadapted
 from dew.nn.kernels.generation import assumed, device_generation, gpu_target
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
@@ -50,12 +50,13 @@ from dew.training.quantization import (
 
 VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
-FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj")
+FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj", "lm_head")
+"""The FP8 sites, the untargeted vocabulary head among them."""
 
 
 def decoder(**overrides):
     fields = {**TINY_DECODER, "vocab_size": VOCAB, "emb_features": FEATURES, "mlp_features": MLP,
-              "dtype": "bfloat16"}
+              "dtype": "bfloat16", "tie_embeddings": False}
     return models.build("causal_transformer", **{**fields, **overrides})
 
 
@@ -222,6 +223,22 @@ def test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_mo
         for path, value in flatten_dict(tree, sep="/").items():
             np.testing.assert_array_equal(np.asarray(value).view(np.uint8),
                                           np.asarray(before[path]).view(np.uint8))
+
+
+def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():
+    """A merge decodes each FP8 site's kernel and adds its trained delta, and
+    the codes go with the kernel they stood for: the model without its
+    adapter computes the merged tree as the plain decoder computes its
+    kernels, which the trained deltas moved off the decoded base. The head is
+    tied, so no packed vocabulary head plays a part."""
+    model = decoder(tie_embeddings=True)
+    _, fp8 = adapters(model)
+    state = fit(fp8, 3)
+    merged = fp8.merge(state.variables)
+    expected = np.asarray(model.apply({"params": merged["params"]}, ids()), np.float32)
+    np.testing.assert_array_equal(np.asarray(unadapted(fp8.model).apply(merged, ids()), np.float32), expected)
+    base = fp8.merge(fp8.variables)["params"]
+    assert np.abs(expected - np.asarray(model.apply({"params": base}, ids()), np.float32)).max() > 1e-3
 
 
 def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):

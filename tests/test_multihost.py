@@ -42,7 +42,7 @@ if WORLD < 2:
 
 POOLS = count()
 """The pools this run has started: the n-th is the same pool on every rank, at the same ports."""
-COORDINATOR, EXCHANGE = 20000, 21000
+COORDINATOR, EXCHANGE, START = 20000, 21000, 22000
 KILL_AFTER = 60
 """Seconds into a pool's run that one of its hosts dies: past the join, in compilation or training."""
 
@@ -52,17 +52,18 @@ ANSWER_SECONDS = 60
 between containers holds a connection to a port nobody listens on yet open rather than refusing it."""
 
 
-def exchange(sequence: int, mine: object) -> list:
-    """What every rank gave for the `sequence`-th exchange, in rank order: each rank hands rank 0 its part,
-    and rank 0 hands every rank the whole, which the rank acknowledges. A rank that hears nothing asks again
-    on a new connection, so rank 0 answers every connection it holds once it holds every part, and goes on
-    only once every rank acknowledged the whole, or none asked again for twice a rank's wait."""
+def exchange(sequence: int, mine: object, base: int = EXCHANGE) -> list:
+    """What every rank gave for the `sequence`-th exchange, in rank order, at port `base` + `sequence`: each
+    rank hands rank 0 its part, and rank 0 hands every rank the whole, which the rank acknowledges. A rank
+    that hears nothing asks again on a new connection, so rank 0 answers every connection it holds once it
+    holds every part, and goes on only once every rank acknowledged the whole, or none asked again for twice
+    a rank's wait."""
     if RANK == 0:
-        return _gathered(sequence, mine)
+        return _gathered(base + sequence, mine)
     deadline = time.monotonic() + 900
     while True:
         try:
-            with socket.create_connection(("rank0", EXCHANGE + sequence), timeout=ANSWER_SECONDS) as conn:
+            with socket.create_connection(("rank0", base + sequence), timeout=ANSWER_SECONDS) as conn:
                 sent = json.dumps([RANK, mine]).encode()
                 conn.sendall(len(sent).to_bytes(8, "big") + sent)
                 whole = json.loads(_read(conn))
@@ -76,10 +77,10 @@ def exchange(sequence: int, mine: object) -> list:
             time.sleep(1)
 
 
-def _gathered(sequence: int, mine: object) -> list:
-    """Rank 0's side of `exchange`."""
+def _gathered(port: int, mine: object) -> list:
+    """Rank 0's side of `exchange`, at `port`."""
     parts, acknowledged, asking = {0: mine}, {0}, []
-    with socket.create_server(("0.0.0.0", EXCHANGE + sequence)) as server:
+    with socket.create_server(("0.0.0.0", port)) as server:
         server.settimeout(900)
         while len(acknowledged) < WORLD:
             try:
@@ -126,6 +127,14 @@ def _exact(conn: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+def together(sequence: int) -> None:
+    """Every rank at the `sequence`-th pool's start before any starts its processes. The ranks come to a test
+    apart, by however far one's pytest runs behind another's (rank 0's started a pool 30 s after rank 1's,
+    batch ad), and a pool's budget, its processes' timeout or its time to a host's death, counts from each
+    rank's own start: a late rank 0, whose process holds the pool's coordinator, spent it for the others."""
+    exchange(sequence, None, base=START)
+
+
 def placed(processes: int) -> list[int]:
     """The pool's processes this rank runs: process p runs on rank p mod WORLD."""
     return [index for index in range(processes) if index % WORLD == RANK]
@@ -138,6 +147,7 @@ def gang_pool(mode, directory: Path, processes: int, *, timeout=600, start=spawn
     sequence = next(POOLS)
     directory.mkdir(parents=True, exist_ok=True)
     coordinator = f"rank0:{COORDINATOR + sequence}"
+    together(sequence)
     outs = {index: directory / f"process{index}.json" for index in placed(processes)}
     running = {index: start(mode, out, processes=processes, process_id=index, coordinator=coordinator,
                             **flags) for index, out in outs.items()}
@@ -170,6 +180,7 @@ def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
     """A host that dies while its pool trains (its process killed outright) ends the pool's process
     on the other host with an error, rather than leaving it waiting for ever on a peer that is gone."""
     sequence = next(POOLS)
+    together(sequence)
     if RANK >= 2:
         exchange(sequence, None)
         return
@@ -200,6 +211,7 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     sequence = next(POOLS)
     env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
            "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
+    together(sequence)
     ran = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
     exits = exchange(sequence, ran.returncode)
     assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"

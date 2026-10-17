@@ -488,7 +488,7 @@ class Server:
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
             # None selects the one mixed forward of `_mixed_step`.
-            self.mixed_refusal = mixed_refusal(model, self.variables, shapes, rows.placement, rows.width)
+            self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
 
             The mixed forward covers each row's last draw and the admitted
