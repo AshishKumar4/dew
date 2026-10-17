@@ -151,6 +151,7 @@ class ImageSettings:
     solver: Solver
     guidance: Guidance | None
     sampling_steps: int
+    # dewml/hybrid-dit-176m's published record predates the field.
     end_to_end: JSON = None
 
     def __post_init__(self) -> None:

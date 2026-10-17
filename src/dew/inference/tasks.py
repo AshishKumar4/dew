@@ -315,23 +315,20 @@ class TextSettings:
     (`TextGeneration.from_settings`).
 
     `seq_len` is the decoder's training row length, `max_new_tokens` its
-    previews' budget (0 or None for none) and `sampling` their policy, which a
-    run with a budget must record. `tokenizer` names the run tokenizer
-    (`recorded_tokenizer`) and `processor` a checkpoint's own processor
-    source (`recorded_processor`); either may be None. A record written
-    before a field was recorded reads as its default.
+    previews' budget (0 for none) and `sampling` their policy. `tokenizer`
+    names the run tokenizer (`recorded_tokenizer`) and `processor` a
+    checkpoint's own processor source (`recorded_processor`); either may be
+    None.
     """
 
-    seq_len: int | None = None
-    max_new_tokens: int | None = None
-    sampling: Sampling | None = None
-    tokenizer: str | None = None
-    processor: str | None = None
+    seq_len: int
+    max_new_tokens: int
+    sampling: Sampling
+    tokenizer: str | None
+    processor: str | None
 
     def __post_init__(self) -> None:
         _budget_checked(self.max_new_tokens)
-        if self.sampling is None and self.max_new_tokens:
-            raise ValueError("run.json lacks the sampling policy for its text previews")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -341,13 +338,13 @@ class MaskedSettings:
     source processor as `TextSettings` holds them, the masking process, the unmasking solver
     and its step count."""
 
-    seq_len: int | None = None
-    max_new_tokens: int | None = None
+    seq_len: int
+    max_new_tokens: int
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
-    tokenizer: str | None = None
-    processor: str | None = None
+    tokenizer: str | None
+    processor: str | None
 
     def __post_init__(self) -> None:
         _budget_checked(self.max_new_tokens)
@@ -362,21 +359,21 @@ class BlockSettings:
     (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
     source processor as `TextSettings` holds them, the block process and the pad id."""
 
-    seq_len: int | None = None
-    max_new_tokens: int | None = None
+    seq_len: int
+    max_new_tokens: int
     process: BlockProcess
     pad_token_id: int
-    tokenizer: str | None = None
-    processor: str | None = None
+    tokenizer: str | None
+    processor: str | None
 
     def __post_init__(self) -> None:
         _budget_checked(self.max_new_tokens)
         integer(self.pad_token_id, "pad_token_id")
 
 
-def _budget_checked(budget: int | None) -> None:
-    """Refuse a recorded token budget that is not a nonnegative integer, or None for none."""
-    if budget is not None and (type(budget) is not int or budget < 0):
+def _budget_checked(budget: int) -> None:
+    """Refuse a recorded token budget that is not a nonnegative integer."""
+    if type(budget) is not int or budget < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
@@ -589,7 +586,7 @@ class TextGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: the previews' policy and budget become its defaults. A live objective
         (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, processor, sampling=settings.sampling or Sampling(),
+        return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None)
 
     @classmethod
