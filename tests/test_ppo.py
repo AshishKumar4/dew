@@ -24,9 +24,10 @@ from flax import linen as nn
 from rl_support import clipped_surrogate, token_mean
 
 from dew.data.dataset import Loader
-from dew.objectives.base import Step
+from dew.objectives.base import Ratio, Step, part
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
+from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY
 from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
 from dew.training import Trainer
 
@@ -40,9 +41,9 @@ class TokenFeatures(nn.Module):
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
 
-def build_ppo(verifier=verify, gamma=.97):
+def build_ppo(verifier=verify, gamma=.97, **policy_options):
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
-                             critic=ValueHead(TokenFeatures()), beta=.03)
+                             critic=ValueHead(TokenFeatures()), beta=.03, **policy_options)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19))
     source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
                             PROMPT, RESPONSE, TURNS, sampling=SAMPLING, groups=GROUPS)
@@ -225,3 +226,69 @@ def test_composite_objective_and_parameter_gradients_match_verl():
         for name, value in observed.items():
             difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
+
+
+@pytest.mark.parametrize("options", [
+    {},
+    {"aggregation": "session-mean"},
+    {"sequence_mask": (.8, 1.2)},
+    {"geometric_mask": (.8, 1.2)},
+    {"aggregation": "session-mean", "sequence_mask": (.8, 1.2), "geometric_mask": (.8, 1.2)},
+], ids=["default", "sessions", "sequence", "geometric", "combined"])
+def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(options):
+    trainer, rollout = build_ppo(**options)
+    objective = rollout.objective
+    state = trainer.initial_state()
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
+    mask = jnp.asarray(batch["response_mask"])
+    batch = {**batch, OLD_LOG_PROBS_KEY: old, BEHAVIOR_LOG_PROBS_KEY: old - 2 * mask}
+    step = Step(jnp.array(0), jax.random.key(1), state.averaged)
+    policy_step = Step(step.step, step.key, part(step.ema, "policy"))
+
+    def expected(params):
+        variables = {**state.variables, "params": params}
+        actor, _ = objective.actor.loss(part(variables, "policy"), batch, policy_step)
+        terms = clipped_value_loss_terms(objective.values(variables, batch), batch[RETURNS_KEY],
+                                         batch[OLD_VALUES_KEY], objective.value_clip)
+        critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
+        if not options:
+            return Ratio(actor.total + objective.value_coefficient * critic.total, actor.mass).mean()[0]
+        return actor.mean()[0] + objective.value_coefficient * critic.mean()[0]
+
+    def actual(params):
+        return objective.scalar_loss({**state.variables, "params": params}, batch, step)[0]
+
+    want, want_gradient = jax.value_and_grad(expected)(state.variables["params"])
+    got, got_gradient = jax.value_and_grad(actual)(state.variables["params"])
+    np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+    for observed, reference in zip(jax.tree.leaves(got_gradient), jax.tree.leaves(want_gradient), strict=True):
+        np.testing.assert_allclose(observed, reference, rtol=1e-6, atol=1e-7)
+    _, aux = objective.scalar_loss(state.variables, batch, step)
+    critic = token_mean(clipped_value_loss_terms(objective.values(state.variables, batch),
+                        batch[RETURNS_KEY], batch[OLD_VALUES_KEY], objective.value_clip), mask)
+    np.testing.assert_allclose(aux.metrics["critic/loss"], critic, rtol=1e-6)
+    if "sequence_mask" in options or "geometric_mask" in options:
+        assert float(aux.metrics["pg"]) == 0
+        np.testing.assert_allclose(got, objective.value_coefficient * critic, rtol=1e-6)
+
+
+@pytest.mark.parametrize("coefficient", [0., .5])
+def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficient):
+    trainer, rollout = build_ppo(sequence_mask=(.8, 1.2))
+    objective = rollout.objective
+    objective.value_coefficient = coefficient
+    state = trainer.initial_state()
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
+    batch = {**batch, OLD_LOG_PROBS_KEY: old,
+             BEHAVIOR_LOG_PROBS_KEY: old - 2 * jnp.asarray(batch["response_mask"])}
+    before = jax.tree.map(np.asarray, state.variables["params"])
+    state, _, _, _, accepted, _ = trainer.compile(state, batch)(state, batch)
+    assert bool(accepted) == (coefficient > 0)
+    for start, end in zip(jax.tree.leaves(before["policy"]),
+                          jax.tree.leaves(state.variables["params"]["policy"]), strict=True):
+        np.testing.assert_array_equal(start, end)
+    changed = any(not np.array_equal(start, end) for start, end in zip(
+        jax.tree.leaves(before["critic"]), jax.tree.leaves(state.variables["params"]["critic"]), strict=True))
+    assert changed == (coefficient > 0)
