@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.nn.attention import scaled_dot_product_attention
 
@@ -26,6 +27,40 @@ def test_xla_sink_attention_keeps_causal_window_and_gradients():
     assert bool(jnp.all(gradient < 0))
     without = attend(jnp.full_like(arrays["sinks"], -jnp.inf))
     assert float(jnp.max(jnp.abs(without - arrays["output"]))) > 0.5
+
+
+@pytest.mark.parametrize("dropout_rate", [0.0, 0.25])
+def test_sinks_a_softcap_and_dropout_compose_on_one_reference_path(dropout_rate):
+    """Sinks, Gemma 2's softcap and probability dropout ride one score
+    pipeline (`reference_attention`): run in float64, a grouped causal call
+    with all three, training or not, computes the float64 oracle (the scaled
+    logits capped, the causal mask, a softmax a sink joins, the weights the
+    draw keeps over the keep rate, the value product) within float64
+    rounding."""
+    with jax.enable_x64(new_val=True):
+        keys = jax.random.split(jax.random.key(0), 4)
+        query = jax.random.normal(keys[0], (2, 6, 4, 8), jnp.float64)
+        key, value = (jax.random.normal(drawn, (2, 6, 2, 8), jnp.float64) for drawn in keys[1:3])
+        sinks = jax.random.normal(keys[3], (4,), jnp.float64)
+        rng = jax.random.key(1)
+
+        def attend(query, key, value, sinks):
+            return scaled_dot_product_attention(
+                query, key, value, sinks=sinks, softcap=2.0, causal=True, implementation="xla",
+                dropout_rate=dropout_rate, dropout_rng=rng, deterministic=False)
+
+        group = jnp.arange(4) // 2
+        raw = jnp.einsum("bqhd,bkhd->bhqk", query, key[:, :, group]) / np.sqrt(8)
+        logits = jnp.where(jnp.tril(jnp.ones((6, 6), bool)), 2.0 * jnp.tanh(raw / 2.0), -jnp.inf)
+        sink = jnp.broadcast_to(sinks[None, :, None, None], (2, 4, 6, 1))
+        weights = jax.nn.softmax(jnp.concatenate([logits, sink], -1), axis=-1)[..., :-1]
+        if dropout_rate:
+            kept = jax.random.bernoulli(rng, 1 - dropout_rate, weights.shape)
+            weights = weights * kept / (1 - dropout_rate)
+        truth = jnp.einsum("bhqk,bkhd->bqhd", weights, value[:, :, group])
+        assert_computes_the_oracle(
+            np.asarray(attend(query, key, value, sinks)), np.asarray(truth), "sinks, softcap and dropout",
+            roundings=chain_roundings(jax.make_jaxpr(attend)(query, key, value, sinks)))
 
 
 @pytest.mark.parametrize("implementation", ["cudnn", "tpu"])
