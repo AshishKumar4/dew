@@ -131,7 +131,12 @@ class Files(Dataset):
 
     Parquet partitions are discovered with Arrow's Hive partitioning. A
     predicate runs within each streamed fragment; indexed predicates need
-    a provisioned accepted-row index and are refused here.
+    a provisioned accepted-row index and are refused here. `columns`
+    selects the fields of every format's rows.
+
+    CSV is parsed by Python's `csv` module under the process's field size
+    limit, 128 KiB a field by default; a source with longer fields reads
+    once its caller raises `csv.field_size_limit`.
     """
 
     url: str | tuple[str, ...]
@@ -447,7 +452,10 @@ class Files(Dataset):
                 "index with dew data provision, or choose read='streamed'"
             )
         if self.kind == "files":
-            return _Paths(self.paths)
+            return self._projected(_Paths(self.paths))
+        if read == "memory" and self.kind != "array_record":
+            # Each shard as its reader reads it: an Arrow fragment as `where` filters it, a file's lines.
+            return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
         if self.kind in ("parquet", "arrow"):
             rows = _ArrowRecords(self)
         elif self.kind == "array_record":
@@ -461,11 +469,16 @@ class Files(Dataset):
                 record_codec=committed is not None and committed.get("codec") == 1,
                 counts=counts,
             )
-        elif read == "memory":
-            return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
         else:
             rows = _IndexedLines(self)
+        rows = self._projected(rows)
         return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+
+    def _projected(self, rows: Records) -> Records:
+        """`rows` cut to `columns`, which an Arrow source's own reader selects."""
+        if self.columns is None or self.kind in ("parquet", "arrow"):
+            return rows
+        return _ProjectedRows(rows, _Projection(self.columns, self.describe()))
 
     @cached_property
     def arrow(self) -> ds.Dataset:
@@ -515,6 +528,10 @@ class Files(Dataset):
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
         if self.kind in ("parquet", "arrow"):
             return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
+        rows = self._shard_rows(shard)
+        return rows if self.columns is None else rows.map(_Projection(self.columns, self.describe()))
+
+    def _shard_rows(self, shard: Shard) -> grain.IterDataset:
         if self.kind == "array_record":
             from .records import ArrayRecords
 
@@ -611,6 +628,38 @@ class Files(Dataset):
                 if index.dtype.names and "length" in index.dtype.names:
                     return index["length"]
         return None
+
+
+@dataclass(frozen=True)
+class _Projection:
+    """A mapping row's `columns`, as an Arrow reader's projection selects them: a row that is not
+    a mapping, or lacks a column, is refused."""
+
+    columns: tuple[str, ...]
+    described: str
+
+    def __call__(self, row: Batch | bytes | None) -> Batch | None:
+        if row is None:
+            return None
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                f"{self.described} reads {type(row).__name__} rows, which have no columns to select")
+        missing = [name for name in self.columns if name not in row]
+        if missing:
+            raise ValueError(f"{self.described} has a row without the columns {missing}")
+        return {name: row[name] for name in self.columns}
+
+
+@dataclass(frozen=True)
+class _ProjectedRows:
+    rows: Records
+    projection: _Projection
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> Batch | None:
+        return self.projection(self.rows[index])
 
 
 @dataclass(frozen=True)
@@ -738,7 +787,6 @@ class _IndexedLines:
 
 class _CsvLines(Iterator[str]):
     def __init__(self, file: BinaryIO):
-        csv.field_size_limit(2**31 - 1)
         self.file = file
 
     def __next__(self) -> str:

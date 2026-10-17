@@ -18,11 +18,14 @@ def _euler_step(x, denoised, source, target):
     Returns `(x at the target level, the derivative, the x_0 coefficient,
     the interval)`. A second-order method re-evaluates the derivative at the
     end of this step and needs the coefficient and the interval it was taken
-    over.
+    over. A step between equal levels, which a grid that ends where its
+    final sigma repeats takes (`final_sigmas_type="sigma_min"`), has no
+    length and leaves x as it is, as the source's `x + derivative * dt` does.
     """
     (alpha_t, sigma_t), (alpha_s, sigma_s) = source, target
     dt = sigma_s - sigma_t
-    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
+    # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
+    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
     derivative = (x - x_0_coeff * denoised) / sigma_t
     # A step to sigma 0 lands on the clean prediction. As x + derivative dt, the sum XLA computes with the
     # reciprocal of sigma_t left x a gradient of an ulp where the prediction is clipped and the source's
