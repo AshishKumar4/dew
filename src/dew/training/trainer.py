@@ -1406,8 +1406,6 @@ class Trainer(Generic[Loss, Effects]):
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
-        if metrics and eval_every is None and validation is None:
-            raise ValueError("metrics need eval_every to schedule their validation pass")
         self._preflight(loader, stop, suites, preview=preview,
                         loss=self.checkpoints is not None and not selection)
         preview = preview and self.tracker is not None
@@ -1986,8 +1984,6 @@ class Trainer(Generic[Loss, Effects]):
         for name, suite in suites.items():
             if loss and not any(metric.name == 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
-            if suite.metrics and suite.every is None:
-                raise ValueError(f"{name}'s metrics need eval_every or EvalSuite.every to schedule its pass")
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 self._check_validation_is_read(name, suite, preview=preview)
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
