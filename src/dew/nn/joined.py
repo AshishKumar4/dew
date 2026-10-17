@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.core import meta
 
 from dew.nn.dense import Dense
+from dew.nn.precision import biased
 
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
@@ -82,5 +83,5 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
                             precision=projections[0].precision)
     if not projections[0].use_bias:
         return y
-    # Each Dense's promotion holds its bias at fp32, and its sum rounds back to the product's dtype.
-    return (y + jnp.stack([bias for _, _, bias in promoted], axis=axis + 2)).astype(y.dtype)
+    # Added as each Dense adds its own (`dew.nn.dense`).
+    return biased(y, jnp.stack([bias for _, _, bias in promoted], axis=axis + 2))
