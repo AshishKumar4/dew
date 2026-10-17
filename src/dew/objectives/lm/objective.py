@@ -299,8 +299,8 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
 def prompt_batch(prompt: Sequence[int] | Sequence[Sequence[int]]) -> ModelInputs:
     """One prompt's ids, or several prompts of any lengths, as one left-padded
     request (`pad_token_rows`): its rows, and an attention mask where they differ."""
-    rows = [prompt] if all(isinstance(token, (int, np.integer)) for token in prompt) else list(prompt)
-    tokens, fields = pad_token_rows(rows)
+    rows = [prompt] if np.ndim(prompt[0]) == 0 else list(prompt)
+    tokens, fields = pad_token_rows([np.asarray(row) for row in rows])
     return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
 

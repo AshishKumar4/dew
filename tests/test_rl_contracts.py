@@ -2,36 +2,28 @@
 
 from pathlib import Path
 
+import jax
 import pytest
 from process_support import run_pool
 from test_indexer_training import SEQ, deepseek_stack
 
 from dew.nn.backbones.decoder_block import Mixture
-from dew.objectives.lm import IndexerTraining
 from dew.objectives.rl import DPOObjective, GRPOObjective
 
 WORKER = Path(__file__).with_name("rl_contracts_worker.py")
 
 
 @pytest.mark.parametrize("objective", [GRPOObjective, DPOObjective])
-@pytest.mark.parametrize("options", [
-    {"balance_rate": 1e-3}, {"aux_loss_alpha": .01}, {"mtp_weight": .1},
-    {"z_loss": 1e-4}, {"router_z_loss": .01},
-    {"indexer": IndexerTraining("warmup")}, {"indexer": IndexerTraining("sparse")},
-])
-def test_policy_losses_refuse_unapplied_lm_training_terms(objective, options):
-    indexer = options.get("indexer")
-    model = deepseek_stack(4 if indexer is not None and indexer.phase == "sparse" else None,
-                           mixture=Mixture(experts=4, top_k=2), num_nextn_predict_layers=1)
-    with pytest.raises(ValueError):
-        objective(model, SEQ, **options)
-
-
-@pytest.mark.parametrize("objective", [GRPOObjective, DPOObjective])
-def test_policy_losses_accept_explicit_lm_training_defaults(objective):
-    built = objective(deepseek_stack(None), SEQ, balance_rate=None, aux_loss_alpha=None,
-                      mtp_weight=None, z_loss=0., router_z_loss=0., indexer=None)
-    assert built.phase is None and built.z_loss == built.router_z_loss == 0
+def test_policy_losses_take_the_scorers_options_and_train_the_whole_decoder(objective):
+    """A policy or preference loss over a routed decoder with prediction depths takes the token
+    scorer's options alone: the head's chunks, tile, pad id and reports, and every parameter
+    trains, its reference frozen beside them where it reads one."""
+    model = deepseek_stack(None, mixture=Mixture(experts=4, top_k=2), num_nextn_predict_layers=1)
+    built = objective(model, SEQ, head_chunks=2, head_tile="tiled", pad_id=0, qk_stats=False,
+                      token_accuracy=False)
+    assert (built.head_chunks, built.pad_id, built.token_accuracy) == (2, 0, False)
+    variables = built.init(jax.random.key(0))
+    assert set(variables) == {"params"}
 
 
 @pytest.mark.mesh

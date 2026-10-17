@@ -91,7 +91,8 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
 
 
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
-    """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder."""
+    """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
+    and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""
     with tarfile.open(FIXTURES / "rae.tar.xz") as archive:
         archive.extractall(tmp_path / "representation", filter="data")
     alignment = Alignment("proj_out", source=str(tmp_path / "representation" / "dinov2_plain"),
@@ -118,6 +119,11 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
     for actual, expected in zip(jax.tree.leaves(task.variables["autoencoder"][TUNED_WEIGHTS]),
                                  jax.tree.leaves(trained.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(actual, expected)
+
+    metadata = tmp_path / "metadata"
+    shutil.copytree(pipelines / "sd3" / "pipeline", metadata, ignore=shutil.ignore_patterns("*.safetensors"))
+    rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=trained.variables)
+    assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
 
 
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])

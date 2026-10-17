@@ -354,7 +354,11 @@ class DiffusionRunConfig(RunConfig):
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
-            source = self._source(variables)
+            # A REPA-E run keeps its tuned autoencoder under `params`, where the pipeline's
+            # metadata binds it at the pipeline's own `autoencoder`; the trained tree is kept whole.
+            trained = variables
+            source = self._source(None if variables is None else
+                                  {**variables, "autoencoder": self._autoencoder_params(variables)})
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's
                 # weights, so the objective trains its factors alone.
@@ -365,7 +369,7 @@ class DiffusionRunConfig(RunConfig):
                 raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
                                  "on masks an image dataset does not carry")
             model, conditions, autoencoder = source.model, dict(source.inputs.conditions), source.autoencoder
-            variables, convention = source.variables, source.process
+            variables, convention = source.variables if trained is None else trained, source.process
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
