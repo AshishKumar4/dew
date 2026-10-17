@@ -45,7 +45,14 @@ from dew.inference.tasks import Processor, TextSettings, recorded_processor, rec
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
-from dew.nn.inputs import COORDINATES_FIELD, Coordinates, ModelInputs, real_slots, token_layout
+from dew.nn.inputs import (
+    COORDINATES_FIELD,
+    Coordinates,
+    ModelInputs,
+    pad_token_rows,
+    real_slots,
+    token_layout,
+)
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
@@ -289,24 +296,20 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     )
 
 
-def prompt_batch(prompt) -> jax.Array:
-    """Build `[B, P]` int32 ids from one prompt, or several of the same length."""
-    try:
-        ids = np.asarray(prompt)
-    except ValueError as ragged:
-        raise ValueError("sample prompts have to be of equal length") from ragged
-    if ids.ndim == 1:
-        ids = ids[None]
-    if ids.ndim != 2 or ids.shape[1] == 0:
-        raise ValueError(f"a sample prompt is non-empty [P] or [B, P] ids, got {ids.shape}")
-    return jnp.asarray(ids, jnp.int32)
+def prompt_batch(prompt: Sequence[int] | Sequence[Sequence[int]]) -> ModelInputs:
+    """One prompt's ids, or several prompts of any lengths, as one left-padded
+    request (`pad_token_rows`): its rows, and an attention mask where they differ."""
+    rows = [prompt] if all(isinstance(token, (int, np.integer)) for token in prompt) else list(prompt)
+    tokens, fields = pad_token_rows(rows)
+    return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
 
 @dataclass(frozen=True)
 class Samples:
     """Settings for the text preview drawn once per event.
 
-    Prompts hold token IDs; several prompts must have equal lengths. This display
+    Prompts hold token IDs; several prompts may differ in length, and are
+    left-padded together (`pad_token_rows`). This display
     count does not limit the teacher-forced scoring population. A budget of 0
     draws no preview but keeps `sampling` as the policy the run records and
     publishes.
@@ -348,24 +351,27 @@ def batch_text(batch) -> ModelInputs:
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
-                     generate: Callable[[S], tuple[jax.Array, jax.Array | None]],
+                     generate: Callable[[S], tuple[jax.Array, jax.Array | None, jax.Array | None]],
                      decode: Callable[[list[int]], str] | None) -> TextSamples | None:
-    """A text preview, on every process: agree on `setup`, generate the rows
-    and the prompt they continue (None for none) from what it returns, gather
-    both to process zero's host (`collective_host`, held by the first), and
-    decode them into `TextSamples` there. The other processes return None,
-    as every process does when `setup` returns None, which draws no preview.
+    """A text preview, on every process: agree on `setup`, generate from what
+    it returns the rows, which of their slots are real (None for all), and the
+    ids of the prompt they continue (None for none), gather them to process
+    zero's host (`collective_host`, held by the first), and decode each row's
+    real ids into `TextSamples` there. The other processes return None, as
+    every process does when `setup` returns None, which draws no preview.
     Without `decode`, the artifact holds the ids alone."""
     prepared = agreed(f"{phase} setup", setup)
     drawn = agreed(f"{phase} generation", lambda: None if prepared is None else generate(prepared))
     drawn = collective_host(drawn, phase=phase, held_by="first")
     if drawn is None:
         return None
-    tokens, prompt = drawn
+    tokens, real, prompt = drawn
     if decode is None:
         return TextSamples(tokens=tokens)
-    return TextSamples(tokens=tokens, prompt="" if prompt is None else decode(np.asarray(prompt)[0].tolist()),
-                       texts=tuple(decode(row.tolist()) for row in np.asarray(tokens)))
+    rows = np.asarray(tokens)
+    kept = np.ones(rows.shape, bool) if real is None else np.asarray(real, bool)
+    return TextSamples(tokens=tokens, prompt="" if prompt is None else decode(np.asarray(prompt).tolist()),
+                       texts=tuple(decode(row[keep].tolist()) for row, keep in zip(rows, kept, strict=True)))
 
 
 # The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
@@ -1046,7 +1052,13 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
 
         def generate(prepared):
             policy, prompt, max_new_tokens = prepared
-            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
+            tokens = policy(prompt, max_new_tokens, key=step.key).host().tokens
+            given = prompt.token_fields.get("attention_mask")
+            asked = np.ones(prompt.tokens.shape, bool) if given is None else np.asarray(given, bool)
+            # The prompt's padding is no text; every drawn column is shown, as it was drawn.
+            drawn = np.ones((asked.shape[0], tokens.shape[1] - asked.shape[1]), bool)
+            real = np.concatenate([asked, drawn], axis=1)
+            return tokens, real, np.asarray(prompt.tokens)[0][asked[0]]
 
         return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
