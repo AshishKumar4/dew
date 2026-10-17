@@ -565,99 +565,17 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & (roles[:, span:] == role)
     return counted
 
-class LMObjective(Objective[Ratio | LMStatistics, Variables]):
-    """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
+class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
+    """Scores a causal decoder's tokens: the machinery the LM, preference and
+    policy losses share, without a loss of its own.
 
-    `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
-    auxiliary term below is off until its argument is set; the other options
-    trade memory for time.
-
-    `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
-    `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
-    objective that keeps the whole logits (`keeps_whole_logits`) and
-    the generation's tile on one that does not. Whole logits are the
-    fastest head where they fit: on one A100, a Qwen3-0.6B step at 4 x 1024
-    tokens took 142 ms against 163 ms tiled, at the cost of 5.3 GiB more
-    peak memory. A trainer whose compiled step does not fit the devices
-    moves it to the generation's tile (`chunked.chunked_tile`) before it
-    recomputes any block. A pass with no backward (evaluation, scoring)
-    runs the tiled forward either way, so it never holds the logits
-    whole.
-
-    `head_chunks` is the number of vocabulary slices a tiled head scores in.
-    Four slices cost 2.2% of the step and save 1.2 GiB of peak memory at
-    vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one slice is
-    the full pass. It also slices the forward pass of an evaluation or a
-    scoring pass.
-
-    `ema_decay` keeps an exponential moving average of the trained leaves
-    at that decay, and evaluation and previews then read the average. None,
-    the default, keeps no average, so there is no second copy of the weights
-    and validation scores the weights that trained.
-
-    The trainer takes its whole initial state from `init`, which starts
-    from `variables` (described below).
-
-    `balance_rate` moves each sparse layer's routing bias against its load
-    by this much every step, which is DeepSeek's aux-loss-free balancing. The
-    model has to have that bias (`bias=True` on the CausalTransformer's
-    mixture). Unset, the bias does not change.
-
-    `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
-    (`dew.nn.moe.global_router_loss`), summed over every sparse
-    layer, and `seq_aux` chooses its per-sequence form
-    (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
-    under these names. Unset, it adds nothing. A packed row's sequences are
-    its documents, each balanced alone and their losses averaged, as DeepSeek
-    defines it for the sequences its model trains on; Megatron-LM and MaxText
-    balance a packed row as one sequence, so their packed loss differs.
-
-    `loss_role` counts only the targets whose `text_roles` entry matches
-    it, for SFT on the chat data path (`dew.data.chat.Role`). None
-    counts every target the pad and segment weights keep. A batch
-    without the `text_roles` column raises.
-
-    `mtp_weight` scales DeepSeek V3's multi-token prediction loss
-    (arXiv 2412.19437, eq. 24). The loss adds this weight times the
-    mean cross entropy over the model's prediction depths, so the
-    model needs `num_nextn_predict_layers` above zero. Unset leaves
-    the term out and the depths untrained.
-
-    `qk_stats` opens the `qk` collection where the attention layers record
-    their per-head logit maxima, and reports them for the optimizer's
-    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset, the
-    collection stays closed and costs no extra matmul.
-
-    `indexer` trains DeepSeek-V3.2's lightning indexer, one
-    `IndexerTraining` phase at a time, on a model whose mla mixer has the
-    indexer. The warm-up phase keeps only the indexer in
-    the `params` collection and the rest of the model under `frozen`,
-    which is what `init` returns and a checkpoint stores. A
-    starting tree for that phase may omit the indexer's weights, as
-    a dense checkpoint does, and the fresh init fills them. The sparse
-    phase reads a whole tree, either layout. The warm-up trains nothing
-    but the indexer, so the terms of the main loss (`balance_rate`,
-    `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
-
-    `z_loss` adds PaLM's auxiliary to the cross entropy: this
-    coefficient times the squared log partition of every counted
-    prediction (MaxText's `z_loss_multiplier`; PaLM used 1e-4). It
-    keeps the logits from drifting away from normalised log
-    probabilities. Zero adds nothing.
-
-    `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
-    2202.08906): this coefficient times the squared log partition of
-    every router's gate logits, averaged over the positions each router saw
-    in the step and summed over the routers (`router_z_terms`). It is added
-    next to the balance loss. lm-engine's MoE adds 0.1 of it to its switch
-    loss before `router_aux_loss_coef`, which corresponds to
-    `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
-
-    `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
-    `variables` and `processor` override its own (`Objective.bind_model`).
-
-    `token_accuracy` reports the argmax accuracy; False skips the pass
-    over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+    It holds the decoder (`model`, a loaded source among them, with
+    `variables` and `processor` overriding its own through
+    `Objective.bind_model`), the row length `seq_len`, and how the head is
+    scored: `pad_id`, `head_chunks`, `head_tile` (`LMObjective` describes
+    each), `qk_stats` and `token_accuracy`. `samples` draws previews. A loss
+    built on it keeps no average unless it sets `ema`; `LMObjective` adds the
+    language-model terms and loss.
     """
 
     saved_task = TextGeneration
@@ -676,6 +594,32 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     counts_tokens: ClassVar[bool] = True
+
+    loss_role: Role | None = None
+    """The role whose targets alone count (`LMObjective`); None counts every target."""
+
+    mtp_weight: float | None = None
+    """The multi-token prediction depths' weight (`LMObjective`); None trains none."""
+
+    def __init__(self, model, seq_len: int, *, pad_id: int | None = None, head_chunks: int = 4,
+                 head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
+                 samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
+                 qk_stats: bool = False, token_accuracy: bool = True,
+                 processor: Processor | None | Omitted = OMITTED):
+        """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
+        model = self.bind_model(model, variables=variables, processor=processor)
+        _check_reads(model)
+        self.model = model
+        self.seq_len = seq_len
+        self.pad_id = pad_id
+        self.head_chunks = head_chunks
+        self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
+        self.samples = samples
+        self.qk_stats = qk_stats
+        self.token_accuracy = token_accuracy
+        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
+        if samples is not None and samples.max_new_tokens > 0:
+            self._prompt = prompt_batch(samples.prompt)
 
     def _missing_flops(self, model) -> str | None:
         """What the forward and training counts both lack, or None."""
@@ -792,63 +736,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         scored = self._scored(np, tokens, *token_layout(fields, xp=np), self._batch_roles(batch, np), depth)
         return np.sum(scored, axis=-1, dtype=np.int64)
 
-    def __init__(
-        self,
-        model,
-        seq_len: int,
-        *,
-        ema_decay: float | None = None,
-        pad_id: int | None = None,
-        head_chunks: int = 4,
-        head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
-        samples: Samples | None = None,
-        variables: Variables | None | Omitted = OMITTED,
-        balance_rate: float | None = None,
-        aux_loss_alpha: float | None = None,
-        seq_aux: bool = True,
-        loss_role: Role | None = None,
-        mtp_weight: float | None = None,
-        z_loss: float = 0.0,
-        router_z_loss: float = 0.0,
-        qk_stats: bool = False,
-        indexer: IndexerTraining | None = None,
-        token_accuracy: bool = True,
-        processor: Processor | None | Omitted = OMITTED,
-    ):
-        """Build the objective; the class docstring describes each argument."""
-        model = self.bind_model(model, variables=variables, processor=processor)
-        _check_reads(model)
-        self.model = model
-        self.seq_len = seq_len
-        self.pad_id = pad_id
-        self.head_chunks = head_chunks
-        self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
-        self.samples = samples
-        self.balance_rate = balance_rate
-        _check_terms(model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
-                     router_z_loss=router_z_loss)
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        self.loss_role = loss_role
-        self.mtp_weight = mtp_weight
-        self.z_loss = z_loss
-        self.router_z_loss = router_z_loss
-        self.qk_stats = qk_stats
-        self.token_accuracy = token_accuracy
-        self.indexer = indexer
-        self.phase = _phase_filter(model, indexer, {
-            "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
-            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
-            "router_z_loss": router_z_loss or None})
-        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        self.ema = EMASpec.constant(ema_decay)
-        if samples is not None and samples.max_new_tokens > 0:
-            self._prompt = prompt_batch(samples.prompt)
-
-    @property
-    def _warmup(self) -> bool:
-        return self.indexer is not None and self.indexer.phase == "warmup"
-
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
@@ -858,28 +745,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-
-    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
-        """Split the tree as the indexer phase trains it.
-
-        An indexer phase decides its own split, the warm-up the indexer alone
-        and the sparse phase the whole tree, so it starts from the tree
-        whole. The warm-up may start from a dense checkpoint that has no
-        indexer yet, and a fresh init supplies exactly those weights.
-        """
-        if self.indexer is not None:
-            tree = thaw(tree)
-            drawn = jax.eval_shape(self.fresh_variables, key, None)
-            missing = _leaves(drawn["params"]).keys() - _leaves(tree["params"]).keys()
-            if self._warmup and missing:
-                outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
-                if outside:
-                    raise ValueError(
-                        "the warm-up initialises the indexer and nothing else, but the "
-                        f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
-                tree = merge(self.fresh_variables(key, None), tree)
-        return tree if self.phase is None else freeze(tree, self.phase)
-
 
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
         """Return the model over this training tree as a generation task.
@@ -1027,18 +892,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
 
-    def data(self, tokenizer=None):
-        from dew.data.pipeline import ObjectiveData
-        from dew.data.steps.text import CountTargets, FixedTokens
-
-        geometry = FixedTokens(self.seq_len, extra=1)
-        if self.loss_role is None and self.pad_id is None:
-            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
-        counted = CountTargets(
-            role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
-        )
-        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
-
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
         with `loss_role` one role's targets alone."""
@@ -1169,6 +1022,210 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             real = real & (prepared.tokens[:, :-1] != self.pad_id)
         return real.astype(dtype)
 
+    def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
+        """Split a `[B, seq_len + 1]` batch into its inputs and shifted targets."""
+        if tokens.shape[-1] != self.seq_len + 1:
+            raise ValueError(
+                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
+                f"so the targets can be the shifted input, got {tokens.shape[-1]}")
+        return tokens[:, :-1], tokens[:, 1:]
+
+    def preview(self, params, batch, step: Step, *, scored=None):
+        """Sample the configured prompt once, then decode only on process zero.
+
+        An objective whose EMA holds a frozen reference draws from the live
+        policy instead, which is what `_ema_is_reference` says.
+        """
+        settings = self.samples
+
+        def setup():
+            if settings is None or settings.max_new_tokens <= 0:
+                return None
+            weights = self.evaluation_variables(params, step)
+            return self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens
+
+        def generate(prepared):
+            policy, prompt, max_new_tokens = prepared
+            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
+
+        return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
+
+
+class LMObjective(TokenScorer):
+    """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
+
+    `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
+    auxiliary term below is off until its argument is set; the other options
+    trade memory for time.
+
+    `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
+    `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
+    objective that keeps the whole logits (`keeps_whole_logits`) and
+    the generation's tile on one that does not. Whole logits are the
+    fastest head where they fit: on one A100, a Qwen3-0.6B step at 4 x 1024
+    tokens took 142 ms against 163 ms tiled, at the cost of 5.3 GiB more
+    peak memory. A trainer whose compiled step does not fit the devices
+    moves it to the generation's tile (`chunked.chunked_tile`) before it
+    recomputes any block. A pass with no backward (evaluation, scoring)
+    runs the tiled forward either way, so it never holds the logits
+    whole.
+
+    `head_chunks` is the number of vocabulary slices a tiled head scores in.
+    Four slices cost 2.2% of the step and save 1.2 GiB of peak memory at
+    vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one slice is
+    the full pass. It also slices the forward pass of an evaluation or a
+    scoring pass.
+
+    `ema_decay` keeps an exponential moving average of the trained leaves
+    at that decay, and evaluation and previews then read the average. None,
+    the default, keeps no average, so there is no second copy of the weights
+    and validation scores the weights that trained.
+
+    The trainer takes its whole initial state from `init`, which starts
+    from `variables` (described below).
+
+    `balance_rate` moves each sparse layer's routing bias against its load
+    by this much every step, which is DeepSeek's aux-loss-free balancing. The
+    model has to have that bias (`bias=True` on the CausalTransformer's
+    mixture). Unset, the bias does not change.
+
+    `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
+    (`dew.nn.moe.global_router_loss`), summed over every sparse
+    layer, and `seq_aux` chooses its per-sequence form
+    (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
+    under these names. Unset, it adds nothing. A packed row's sequences are
+    its documents, each balanced alone and their losses averaged, as DeepSeek
+    defines it for the sequences its model trains on; Megatron-LM and MaxText
+    balance a packed row as one sequence, so their packed loss differs.
+
+    `loss_role` counts only the targets whose `text_roles` entry matches
+    it, for SFT on the chat data path (`dew.data.chat.Role`). None
+    counts every target the pad and segment weights keep. A batch
+    without the `text_roles` column raises.
+
+    `mtp_weight` scales DeepSeek V3's multi-token prediction loss
+    (arXiv 2412.19437, eq. 24). The loss adds this weight times the
+    mean cross entropy over the model's prediction depths, so the
+    model needs `num_nextn_predict_layers` above zero. Unset leaves
+    the term out and the depths untrained.
+
+    `qk_stats` opens the `qk` collection where the attention layers record
+    their per-head logit maxima, and reports them for the optimizer's
+    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset, the
+    collection stays closed and costs no extra matmul.
+
+    `indexer` trains DeepSeek-V3.2's lightning indexer, one
+    `IndexerTraining` phase at a time, on a model whose mla mixer has the
+    indexer. The warm-up phase keeps only the indexer in
+    the `params` collection and the rest of the model under `frozen`,
+    which is what `init` returns and a checkpoint stores. A
+    starting tree for that phase may omit the indexer's weights, as
+    a dense checkpoint does, and the fresh init fills them. The sparse
+    phase reads a whole tree, either layout. The warm-up trains nothing
+    but the indexer, so the terms of the main loss (`balance_rate`,
+    `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
+
+    `z_loss` adds PaLM's auxiliary to the cross entropy: this
+    coefficient times the squared log partition of every counted
+    prediction (MaxText's `z_loss_multiplier`; PaLM used 1e-4). It
+    keeps the logits from drifting away from normalised log
+    probabilities. Zero adds nothing.
+
+    `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
+    2202.08906): this coefficient times the squared log partition of
+    every router's gate logits, averaged over the positions each router saw
+    in the step and summed over the routers (`router_z_terms`). It is added
+    next to the balance loss. lm-engine's MoE adds 0.1 of it to its switch
+    loss before `router_aux_loss_coef`, which corresponds to
+    `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
+
+    `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
+    `variables` and `processor` override its own (`Objective.bind_model`).
+
+    `token_accuracy` reports the argmax accuracy; False skips the pass
+    over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+    """
+
+    def __init__(
+        self,
+        model,
+        seq_len: int,
+        *,
+        ema_decay: float | None = None,
+        pad_id: int | None = None,
+        head_chunks: int = 4,
+        head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
+        samples: Samples | None = None,
+        variables: Variables | None | Omitted = OMITTED,
+        balance_rate: float | None = None,
+        aux_loss_alpha: float | None = None,
+        seq_aux: bool = True,
+        loss_role: Role | None = None,
+        mtp_weight: float | None = None,
+        z_loss: float = 0.0,
+        router_z_loss: float = 0.0,
+        qk_stats: bool = False,
+        indexer: IndexerTraining | None = None,
+        token_accuracy: bool = True,
+        processor: Processor | None | Omitted = OMITTED,
+    ):
+        """Build the objective; the class docstring describes each argument."""
+        super().__init__(model, seq_len, pad_id=pad_id, head_chunks=head_chunks, head_tile=head_tile,
+                         samples=samples, variables=variables, qk_stats=qk_stats,
+                         token_accuracy=token_accuracy, processor=processor)
+        _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
+                     router_z_loss=router_z_loss)
+        self.balance_rate = balance_rate
+        self.aux_loss_alpha = aux_loss_alpha
+        self.seq_aux = seq_aux
+        self.loss_role = loss_role
+        self.mtp_weight = mtp_weight
+        self.z_loss = z_loss
+        self.router_z_loss = router_z_loss
+        self.indexer = indexer
+        self.phase = _phase_filter(self.model, indexer, {
+            "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
+            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
+            "router_z_loss": router_z_loss or None})
+        self.ema = EMASpec.constant(ema_decay)
+
+    @property
+    def _warmup(self) -> bool:
+        return self.indexer is not None and self.indexer.phase == "warmup"
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Split the tree as the indexer phase trains it.
+
+        An indexer phase decides its own split, the warm-up the indexer alone
+        and the sparse phase the whole tree, so it starts from the tree
+        whole. The warm-up may start from a dense checkpoint that has no
+        indexer yet, and a fresh init supplies exactly those weights.
+        """
+        if self.indexer is not None:
+            tree = thaw(tree)
+            drawn = jax.eval_shape(self.fresh_variables, key, None)
+            missing = _leaves(drawn["params"]).keys() - _leaves(tree["params"]).keys()
+            if self._warmup and missing:
+                outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
+                if outside:
+                    raise ValueError(
+                        "the warm-up initialises the indexer and nothing else, but the "
+                        f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
+                tree = merge(self.fresh_variables(key, None), tree)
+        return tree if self.phase is None else freeze(tree, self.phase)
+
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import CountTargets, FixedTokens
+
+        geometry = FixedTokens(self.seq_len, extra=1)
+        if self.loss_role is None and self.pad_id is None:
+            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+        counted = CountTargets(
+            role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
+        )
+        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
+
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
         the number of queries it counted.
@@ -1214,14 +1271,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         assert self.indexer is not None
         total, mass = self._indexer_term(sown, prepared, batch)
         return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
-
-    def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
-        """Split a `[B, seq_len + 1]` batch into its inputs and shifted targets."""
-        if tokens.shape[-1] != self.seq_len + 1:
-            raise ValueError(
-                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
-                f"so the targets can be the shifted input, got {tokens.shape[-1]}")
-        return tokens[:, :-1], tokens[:, 1:]
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
@@ -1435,26 +1484,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             statistics, _, scores = self._scored_loss(params, batch, step, train=False, predict=True)
         assert scores.correct is not None
         return statistics, TokenScores(scores.losses, scores.weights, scores.correct)
-
-    def preview(self, params, batch, step: Step, *, scored=None):
-        """Sample the configured prompt once, then decode only on process zero.
-
-        An objective whose EMA holds a frozen reference draws from the live
-        policy instead, which is what `_ema_is_reference` says.
-        """
-        settings = self.samples
-
-        def setup():
-            if settings is None or settings.max_new_tokens <= 0:
-                return None
-            weights = self.evaluation_variables(params, step)
-            return self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens
-
-        def generate(prepared):
-            policy, prompt, max_new_tokens = prepared
-            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
-
-        return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
 
 class Perplexity:
