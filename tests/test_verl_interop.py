@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
 from dew.config.data import PromptData
 from dew.data import Loading
@@ -65,6 +66,18 @@ def test_native_rows_round_trip_through_rollouts():
     assert (first.finish_reason, second.finish_reason) == ("tool_calls", "stop")
     assert first.version == second.version == 7
     assert trajectories[1].extras["mm_processor_output"] == rows[1]["mm_processor_output"]
+
+
+@pytest.mark.parametrize("count", [0, -1, 3])
+def test_a_session_that_spans_no_rows_or_more_than_remain_is_refused(count):
+    """A row Dew wrote names how many rows its session spans; a count of
+    none, below none, or past the rows given is refused rather than read
+    (a count of none once never advanced and read forever)."""
+    rows = json.loads(json.dumps(to_verl(from_verl(native_rows(), media=True))))
+    assert [row["extra_fields"]["dew"]["chains"] for row in rows] == [1, 1]
+    rows[0]["extra_fields"]["dew"]["chains"] = count
+    with pytest.raises(ValueError):
+        from_verl(rows, media=True)
 
 
 def test_packed_native_rows_match_verls_tensor_mapping():

@@ -140,6 +140,27 @@ def test_gae_reads_nothing_behind_the_mask(reference):
                           np.asarray(poisoned_returns)[keep])
 
 
+@pytest.mark.parametrize("padding", [math.nan, math.inf], ids=["nan", "inf"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+def test_gae_reads_no_nonfinite_padding(reference, padding, compiled):
+    """Padding the mask drops holds NaN or infinity, as an uninitialised
+    buffer can: every advantage and return the loss reads is the one
+    finite padding gives, eager and compiled."""
+    mask = jnp.asarray(reference["response_mask"])
+    rewards = jnp.asarray(reference["token_rewards"])
+    values = jnp.asarray(reference["values"])
+    keep = mask > 0
+    assert not bool(jnp.all(keep)), "the reference batch has no padding to fill"
+    run = jax.jit(gae, static_argnames=("gamma", "lam")) if compiled else gae
+
+    advantages, returns = run(rewards, values, mask, gamma=0.99, lam=0.95)
+    padded, padded_returns = run(jnp.where(keep, rewards, padding), jnp.where(keep, values, padding),
+                                 mask, gamma=0.99, lam=0.95)
+
+    assert np.array_equal(np.asarray(advantages)[keep], np.asarray(padded)[keep])
+    assert np.array_equal(np.asarray(returns)[keep], np.asarray(padded_returns)[keep])
+
+
 def test_gae_matches_the_references(reference):
     advantages, returns = gae(jnp.asarray(reference["token_rewards"]),
                               jnp.asarray(reference["values"]),
