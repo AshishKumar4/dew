@@ -140,6 +140,54 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
+PHI = {**TINY}
+GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
+          "final_logit_softcapping": 2.0, "query_pre_attn_scalar": 16}
+WHOLE_GRADIENT = 2.9e-6
+"""Twice the worst leaf's max |Δgrad| over its max |grad| measured on CPU for
+the heads below, 1.43e-6 at Gemma 2's second-layer k_proj; their losses land
+within `LOSS` (4.8e-7 at most)."""
+
+
+def head_model(head):
+    """A random causal LM whose logits are more than its head product: Phi's
+    lm_head with its bias as initialized (zero) or drawn, or Gemma 2's softcap."""
+    torch.manual_seed(0)
+    if head == "softcap":
+        return transformers.Gemma2ForCausalLM(transformers.Gemma2Config(**GEMMA2)).eval()
+    model = transformers.PhiForCausalLM(transformers.PhiConfig(**PHI)).eval()
+    if head == "bias":
+        with torch.no_grad():
+            model.lm_head.bias.normal_(0, 0.5)
+    return model
+
+
+@pytest.mark.parametrize("head", ["zero bias", "bias", "softcap"])
+def test_a_head_past_the_plain_product_trains_as_transformers_does(head, tokens, tmp_path):
+    """A head that adds to the product, even a bias that is zero now, is not
+    scored as the product: LMObjective's loss over the whole logits is
+    transformers' own, and its gradient is torch autograd's leaf for leaf,
+    the head bias included."""
+    model = head_model(head)
+    model.save_pretrained(tmp_path)
+    with pytest.warns(UserWarning):
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    ids = torch.from_numpy(tokens.astype(np.int64))
+    model.zero_grad()
+    expected = model(ids, labels=ids).loss
+    expected.backward()
+    loss, grads = jax.value_and_grad(lambda params: objective_loss(
+        objective, {**loaded.variables, "params": params}, tokens, scalar=True))(
+        {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()})
+    assert abs(float(loss) - float(expected)) <= LOSS
+    for name, parameter in model.named_parameters():
+        wanted = parameter.grad.numpy()
+        assert np.abs(np.asarray(grads[name]) - wanted).max() <= WHOLE_GRADIENT * np.abs(wanted).max(), name
+    if head != "softcap":
+        assert np.abs(np.asarray(grads["lm_head.bias"])).max() > 0
+
+
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     """The saved directory is a transformers checkpoint of the given weights."""
     variables = {**loaded.variables, "params": {name: np.asarray(leaf) * 0.5
