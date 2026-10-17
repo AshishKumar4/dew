@@ -422,11 +422,14 @@ def test_a_family_reads_quantized_weights_through_the_shared_codec(tmp_path, nam
     from dew.interop import codecs
     from dew.interop.safetensors_io import read_weights, save_hf_layout
 
-    codec = codecs.source_quantization({'quantization_config': FP8_TENSORS})
-    assert codec is not None
     stored, dense = {}, {}
     for key, value in read_weights(FIXTURES / name).items():
         if quantized in key and key.endswith('.weight') and value.ndim == 2:
+            # One E4M3 scale over the whole tensor, as compressed-tensors calibrates it.
+            scale = np.asarray(np.abs(value).max() / 448, np.float32)
+            codec = codecs.source_quantization({'quantization_config': FP8_TENSORS},
+                                               grid={key.removesuffix('weight') + 'weight_scale': scale})
+            assert codec is not None
             encoded = dict(codec.encode(key, value))
             stored.update(encoded)
             dense[key] = codec.decode(encoded, key)
