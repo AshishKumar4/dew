@@ -157,21 +157,12 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
         confidence_threshold=_number(generation, "confidence_threshold", 0.005))
 
 
-def generation_config_of(process: BlockProcess, config: Mapping[str, object], *,
-                         max_new_tokens: int | None = None, pad_token_id: int | None = None
-                         ) -> dict[str, object]:
+def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
+                         pad_token_id: int | None = None) -> dict[str, object]:
     """The generation_config.json transformers' DiffusionGemmaGenerationConfig
-    reads, and `generation_process` reads back under `config` as `process`:
-    its inverse. The canvas and vocabulary are `config`'s, so a process over
-    another is refused, and so is one whose temperatures transformers' config
-    cannot hold (it requires t_max > t_min)."""
-    named = (_integer(config, "canvas_length", 256), _integer(text_config(config), "vocab_size"))
-    if (process.canvas_length, process.vocab_size) != named:
-        raise ValueError(f"the process samples a canvas of {process.canvas_length} over {process.vocab_size} "
-                         f"tokens, and the model's config names {named[0]} over {named[1]}")
-    if process.t_max <= process.t_min:
-        raise ValueError("transformers' DiffusionGemmaGenerationConfig requires t_max > t_min, "
-                         f"and the process sets {process.t_max} and {process.t_min}")
+    reads, and `generation_process` reads back as `process`: its inverse. The
+    canvas and vocabulary are the model's in both, as a block run's process
+    takes them from its model (`BlockDiffusionObjective`)."""
     values: dict[str, object] = {
         "max_denoising_steps": process.max_steps, "t_min": process.t_min, "t_max": process.t_max,
         "stability_threshold": process.stability_threshold,

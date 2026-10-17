@@ -338,7 +338,7 @@ class Pretrained:
             block = from_record(DiffusionGemma, model)
             published = diffusion_gemma.published_config(block)
             process = from_record(BlockProcess, record(declaration['process'], 'process'), dtypes=False)
-            generation = diffusion_gemma.generation_config_of(process, published, max_new_tokens=budget,
+            generation = diffusion_gemma.generation_config_of(process, max_new_tokens=budget,
                                                               pad_token_id=pad)
             bundle = PretrainedBlockDecoder(
                 block, variables, processor, published, None, model_config.fields, generation,
