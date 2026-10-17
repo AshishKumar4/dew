@@ -26,9 +26,6 @@ from dew.cli import config, ssh_config, tpu_setup
 from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
 #: States a create never recovers from.
-DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
-READY_TIMEOUT = 1800
-POLL_SECONDS = 10
 
 #: What a job name may contain: it is a directory under ~/dew-runs.
 JOB_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -188,24 +185,6 @@ def _worker_table(node: Node | None) -> None:
         (str(index), internal, node.ips[index] if index < len(node.ips) else "-")
         for index, internal in enumerate(node.internal_ips)
     ])
-
-
-def _wait_ready(tpu: Tpu) -> Node | None:
-    """Poll until the TPU answers READY. Returns the node it saw."""
-    if tpu.gcloud.dry_run:
-        return None
-    deadline = time.monotonic() + READY_TIMEOUT
-    while True:
-        node = tpu.describe()
-        state = node.state if node else "PENDING"
-        if state == "READY":
-            return node
-        if state in DEAD_STATES:
-            raise SystemExit(f"{tpu.name} is {state}")
-        if time.monotonic() >= deadline:
-            raise SystemExit(f"{tpu.name} is still {state} after {READY_TIMEOUT}s")
-        emit(f"{tpu.name} is {state}")
-        time.sleep(POLL_SECONDS)
 
 
 def _git_root() -> Path:
@@ -375,7 +354,7 @@ class Create(Named):
 
         tpu = Tpu(gcloud, self.name, zone, cfg.ssh_user)
         emit(f"{self.name} in {zone}: {api_type} on {config.worker_count(kind)} worker(s)")
-        _worker_table(_wait_ready(tpu))
+        _worker_table(tpu.ready())
         return 0
 
 
@@ -416,7 +395,7 @@ class Start(Named):
         _, gcloud, tpu = self.opened()
         code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).returncode
         if not code:
-            _worker_table(_wait_ready(tpu))
+            _worker_table(tpu.ready())
         return code
 
 

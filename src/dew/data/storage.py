@@ -456,14 +456,26 @@ class Store:
             raise OSError(f"uploaded object did not verify: {self.url}")
         return {"bytes": len(payload), "sha256": digest}
 
-    def put_immutable(self, payload: bytes) -> str:
+    def put_immutable(self, payload: bytes, retries: int = 0) -> str:
         """Create this object from `payload`, or accept the byte-identical
         object an earlier attempt created, and return the stored version.
 
-        Other bytes already at the URL are refused with a ValueError. An
-        object this call created that reads back otherwise is an OSError, so
-        a caller that retries uploads tries it again.
+        Other bytes already at the URL are refused with a ValueError. A failed
+        transfer, or an object this call created that reads back otherwise, is
+        an OSError, tried again up to `retries` times, a longer wait before
+        each, before it is raised.
         """
+        for attempt in range(retries + 1):
+            try:
+                return self._put_immutable(payload)
+            except OSError:
+                if attempt == retries:
+                    raise
+                time.sleep(min(0.25 * 2**attempt, 10))
+        raise AssertionError("the last attempt returns or raises")
+
+    def _put_immutable(self, payload: bytes) -> str:
+        """One attempt of `put_immutable`."""
         try:
             self.put_if_absent(payload)
         except PreconditionFailed:

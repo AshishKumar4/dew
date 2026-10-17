@@ -953,6 +953,91 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
 
 
+def test_another_librarys_private_parts_are_reported_in_the_contract(tmp_path):
+    """SLOP017: a private module or name of another library, imported, reached by an attribute chain
+    from its module, or named in a string, in the package's source. The package's own private names,
+    the standard library's documented ones (`os._exit`) and a dunder are not reported, nor is a test."""
+    source = ("import importlib\n"
+              "import os\n"
+              "import jax\n"
+              "from jax._src import clusters\n"
+              "from flax.linen.module import _context\n"
+              "from sparx import _own\n"
+              "def reach():\n"
+              "    os._exit(0)\n"
+              "    bridge = jax._src.xla_bridge\n"
+              "    importlib.import_module('qwix._src.core.qarray')\n"
+              "    return bridge, clusters, _context, _own, jax.__version__, 'a.b.c'\n")
+    found = _linted(tmp_path, {"src/sparx/reach.py": source, "tests/test_reach.py": source})
+    assert found == [("src/sparx/reach.py", line, "SLOP017") for line in (4, 5, 9, 10)]
+
+
+def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
+    """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
+    one piece of work are reported where the function deals with no subprocess, network, service or
+    other process, itself or through the module's functions it calls. A timed wait made once is a
+    deadline, a loop over items that skips the failed ones retries nothing, and a retry or a sleep
+    beside a subprocess is at its boundary."""
+    found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import subprocess\n"
+        "import time\n"
+        "def poll(done):\n"
+        "    while not done.wait(0.1):\n"
+        "        pass\n"
+        "def nap():\n"
+        "    time.sleep(1)\n"
+        "def deadline(done):\n"
+        "    return done.wait(5)\n"
+        "def retry(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "    return None\n"
+        "def each(steps):\n"
+        "    for step in steps:\n"
+        "        try:\n"
+        "            step()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "def run(command):\n"
+        "    return subprocess.run(command, check=True)\n"
+        "def external(command):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return run(command)\n"
+        "        except subprocess.CalledProcessError:\n"
+        "            time.sleep(1)\n"
+        "    return None\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (4, 7, 11)]
+
+
+def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
+    """SLOP019: a handler of the ImportError, ModuleNotFoundError or AttributeError a missing feature
+    raises that carries on instead of raising, in the package's source. One that raises, naming
+    what to install, requires the feature and is not reported."""
+    found = _linted(tmp_path, {"src/sparx/features.py": (
+        "def optional():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        yaml = None\n"
+        "    return yaml\n"
+        "def required():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ModuleNotFoundError as error:\n"
+        "        raise RuntimeError('install sparx[yaml]') from error\n"
+        "    return yaml\n"
+        "def attribute(module):\n"
+        "    try:\n"
+        "        return module.fast\n"
+        "    except AttributeError:\n"
+        "        return module.slow\n")})
+    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (4, 16)]
+
+
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
     """SLOP012: a script that replaces or deletes the package's own functions,
     by any assignment or `setattr`, and a library that does so to anything it

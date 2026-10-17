@@ -301,10 +301,10 @@ class _Writer:
             if self.cache.on_full == "stop":
                 self.admitting = False
                 break
-            self.lock.wait(0.1)
             for future in self.futures:
                 if future.done():
                     future.result()
+            self.lock.wait()
         if self.admitting:
             self.pending[row_key] = payload
             self.pending_bytes += len(payload)
@@ -354,7 +354,9 @@ class _Writer:
         self.index.commit()
         self.pending.clear()
         self.pending_bytes = 0
-        self.futures.append(self.pool.submit(self._upload, number, path, entries, actual))
+        future = self.pool.submit(self._upload, number, path, entries, actual)
+        future.add_done_callback(self._settled)
+        self.futures.append(future)
 
     def _reserve_shard(self, actual: int, provisional: int, path: Path) -> bool:
         if actual > self.cache.spool_limit:
@@ -375,10 +377,11 @@ class _Writer:
                 self.admitting = False
                 _log.warning("cache %s stopped admission at its spool budget", self.root.url)
                 return False
-            self.lock.wait(0.1)
+            # A failed upload frees no spool: its error ends the wait.
             for future in self.futures:
                 if future.done():
                     future.result()
+            self.lock.wait()
         self.spool_bytes += actual - provisional
         return True
 
@@ -387,33 +390,31 @@ class _Writer:
         payload = path.read_bytes()
         shard = f"shards/{self.writer}/{number:06d}.array_record"
         segment = f"segments/{self.writer}/{number:06d}.json"
-        for attempt in range(self.cache.retry + 1):
-            if self.closed:
-                raise RuntimeError("cache upload was cancelled")
-            try:
-                self.root.child(shard).put_immutable(payload)
-                encoded = _json(
-                    {
-                        "schema": 1,
-                        "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
-                        "completions": entries,
-                    }
-                )
-                if self.closed:
-                    raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
-                self.root.child(segment).put_immutable(encoded)
-                with self.lock:
-                    self.spool_bytes -= used
-                    self.uploaded_bytes += used
-                    self.upload_seconds += time.monotonic() - started
-                    self.lock.notify_all()
-                path.unlink(missing_ok=True)
-                return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
-            except OSError:
-                if attempt == self.cache.retry:
-                    raise
-                time.sleep(min(0.25 * 2**attempt, 10))
-        raise RuntimeError("cache upload retry budget exhausted")
+        if self.closed:
+            raise RuntimeError("cache upload was cancelled")
+        self.root.child(shard).put_immutable(payload, retries=self.cache.retry)
+        encoded = _json(
+            {
+                "schema": 1,
+                "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
+                "completions": entries,
+            }
+        )
+        if self.closed:
+            raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
+        self.root.child(segment).put_immutable(encoded, retries=self.cache.retry)
+        with self.lock:
+            self.spool_bytes -= used
+            self.uploaded_bytes += used
+            self.upload_seconds += time.monotonic() - started
+            self.lock.notify_all()
+        path.unlink(missing_ok=True)
+        return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
+
+    def _settled(self, _: Future) -> None:
+        """An upload's end, done or failed, wakes whoever waits for the spool it held."""
+        with self.lock:
+            self.lock.notify_all()
 
     def metrics(self) -> CacheStats:
         with self.lock:
