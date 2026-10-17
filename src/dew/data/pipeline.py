@@ -48,7 +48,7 @@ class Rejecting(Protocol):
 
 @runtime_checkable
 class Reasoned(Protocol):
-    """A predicate that names what it drops (`images.min_side`'s "too_small")."""
+    """A predicate that names what it drops (`images.MinSide`'s "too_small")."""
 
     reason: str
 
@@ -283,7 +283,7 @@ class DeviceStep:
     """A step over the training batch that runs inside the compiled training
     step, on the accelerator, rather than in the reader: pure and traceable,
     a batch of arrays in and out, its randomness only from per-record key
-    fields (`images.augmentation_key`), so its draws are the same at any
+    fields (`images.AugmentationKey`), so its draws are the same at any
     split, microbatch or pool size and on resume. The reader leaves the fields
     it reads in the batch it delivers (`Loader.device`)."""
 
@@ -467,7 +467,7 @@ class Dataset:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.decode` do."""
+        `images.DecodeImage` do."""
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
@@ -478,7 +478,7 @@ class Dataset:
         """One record to none or one, each step drawing from the record's
         generator (`fn(record, rng)` or a `grain.RandomMapTransform`) and
         returning its record's replacement or `Rejected(reason)`, which drops
-        it, counted by reason, as `video.pick_clip` drops a clip shorter than
+        it, counted by reason, as `video.PickClip` drops a clip shorter than
         its window. Its draws are keyed as `random_map`'s are, by the record's
         place in the run's order."""
         return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
@@ -503,7 +503,7 @@ class Dataset:
         self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None
     ) -> Pipeline:
         """Keep the records `predicate` accepts; the rest are counted under
-        `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
+        `reason`, by default the predicate's own (`images.MinSide`'s "too_small")."""
         return self.then(Filter(predicate, reason or _reason(predicate), identity))
 
     def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
@@ -827,7 +827,7 @@ def _expands(step: ExpandStep | ColumnStep) -> TypeGuard[ExpandStep]:
 
 
 def _declares_rejects(step: _Step) -> bool:
-    """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.decode`)."""
+    """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.DecodeImage`)."""
     return isinstance(step, Rejecting) and bool(step.rejects)
 
 

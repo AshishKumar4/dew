@@ -814,7 +814,7 @@ def test_webdataset_groups_members_and_restores_inside_shard():
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
-    from dew.data.steps.text import Tokenize
+    from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
     original = b"first\r\nsecond\n\nlast without newline"

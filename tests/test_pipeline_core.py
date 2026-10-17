@@ -525,7 +525,7 @@ def test_causal_windows_reject_per_document_field_drift_in_every_read(read):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 @pytest.mark.parametrize("filtered", [False, True])
 def test_chunk_statistics_count_fanout_per_input_document_and_resume(read, filtered):
-    from dew.data.steps.text import Chunks
+    from dew.data.text import Chunks
 
     stored = Memory([
         {"text": np.arange(1, 8, dtype=np.int32)},
@@ -995,7 +995,7 @@ def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     """A typed recipe given a generation with a published packing plan reads
     that plan, and shuffles its windows, instead of packing again online."""
     from dew.config.data import TextData, loader
-    from dew.data.steps.text import Chunks, Tokenize
+    from dew.data.text import Chunks, Tokenize
 
     stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
     published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
@@ -1121,7 +1121,7 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     documents' lengths: the indexed order is global, and its windows are the
     ones a memory read packs from the same documents."""
     from dew.data.sources.tokens import TokenFiles
-    from dew.data.text import chunk
+    from dew.data.text import Chunks
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
@@ -1132,12 +1132,12 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     store = TokenFiles(str(tmp_path)).provision()
 
     def windows(pipeline, read):
-        rows = iterate(pipeline.flat_map(chunk(8)).pack(8, bins=2), read=read, loading=READ)
+        rows = iterate(pipeline.flat_map(Chunks(8)).pack(8, bins=2), read=read, loading=READ)
         return [{name: np.asarray(value).tolist() for name, value in row.items() if name[:5] != "_dew_"}
                 for row in rows]
 
     # The 10-token document is cut where the chunk step says, which the plan of lengths cuts alike.
-    lowering = compile(Pipeline(store).flat_map(chunk(8)).pack(8, bins=2).batch(2), read="indexed",
+    lowering = compile(Pipeline(store).flat_map(Chunks(8)).pack(8, bins=2).batch(2), read="indexed",
                        loading=READ).plan.lowering
     assert lowering == "global"
     memory = Pipeline(Memory([{"text": document} for document in documents]))
