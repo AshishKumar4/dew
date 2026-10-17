@@ -607,17 +607,14 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     reads as no record. The routing's `[layers, top_k]` and dtype come from
     the processes that packed it, which must agree. A process that packed
     nothing, a share's later reader, keeps nothing. Every process calls
-    this, in the order of its other collectives.
+    this, in the order of its other coordination rounds.
     """
-    if jax.process_count() == 1:
-        return packed
-    from jax.experimental import multihost_utils
+    from dew.coordination import from_every_process
 
     routed = packed.get(ROUTED_EXPERTS_KEY)
-    layout = (0, 0, 0) if routed is None else (*routed.shape[2:], ord(routed.dtype.char))
-    mine = np.asarray([routed is not None, *layout, SUPPORT_KEY in packed], np.int64)
-    pool = np.asarray(multihost_utils.process_allgather(mine)).reshape(-1, mine.size)
-    layouts = {tuple(int(value) for value in row[1:4]) for row in pool if row[0]}
+    pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],
+                               "support": SUPPORT_KEY in packed})
+    layouts = {tuple(share["routing"]) for share in pool if share["routing"] is not None}
     if len(layouts) > 1:
         raise ValueError(f"the pool's routed_experts disagree on [layers, top_k] or dtype: {sorted(layouts)}")
     if not packed:
@@ -625,10 +622,10 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     shape = np.shape(packed[IDS_KEY])
     filled = dict(packed)
     if layouts and routed is None:
-        (layers, top_k, code), = layouts
-        filled[ROUTED_EXPERTS_KEY] = np.zeros((*shape, layers, top_k), np.dtype(chr(code)))
+        (layers, top_k, dtype), = layouts
+        filled[ROUTED_EXPERTS_KEY] = np.zeros((*shape, layers, top_k), np.dtype(dtype))
         filled[ROUTED_KEY] = np.zeros(shape, bool)
-    if pool[:, 4].any() and SUPPORT_KEY not in packed:
+    if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
         filled[SUPPORT_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
         filled[SUPPORT_COLUMNS_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
