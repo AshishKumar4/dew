@@ -101,7 +101,7 @@ def conftest(name: str) -> bool:
 
 def audited(event, args):
     if event in followed.READS:
-        read = followed.read(event, args, sys._getframe(1).f_code.co_filename, root)
+        read = followed.read(event, args, root)
         if read is not None:
             current[-1].add(read)
         return
