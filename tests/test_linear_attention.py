@@ -38,9 +38,11 @@ from delta_rule_support import CHUNKED, port_formula, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
+from tuned import each_config
 
 from dew.nn import linear
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.kernels import tuning
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -697,31 +699,46 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
-@pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("rows", [3, 32])
-def test_the_decode_kernel_steps_as_the_recurrence_does(rows, held):
+@pytest.mark.parametrize("rows, heads, width", [
+    pytest.param(3, 2, 64, id="small"),
+    pytest.param(3, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-3"),
+    pytest.param(32, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-32"),
+])
+def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held):
     """One decode token through `dew.nn.kernels.delta_rule` (one read and one
-    write of the state) gives the reference recurrence's output and state,
-    at Qwen3.5-0.8B's widths (16 heads, 128 wide). A state held in bf16 is
-    read and stepped in fp32 and written back rounded once, stochastically."""
+    write of the state) gives the recurrence's output and state at every
+    config of the launch's space (`tuning.pinned`): an fp32 state's within
+    the float64 gate of the fp32 recurrence's, at Qwen3.5-0.8B's widths (16
+    heads, 128 wide) on a GPU and interpreted at a small width. A state held
+    in bf16 is read and stepped in fp32 and written back rounded once,
+    stochastically: within one bf16 step of the fp32 one."""
+    from dew.nn.kernels import delta_rule
     from dew.nn.linear import decode_gated_delta_rule
 
     rng = np.random.default_rng(0)
-    H, D = 16, 128
-    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
     query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, held)
-    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta, state.astype(jnp.float32))
-    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
-    assert got_state.dtype == held
-    np.testing.assert_allclose(got, want, atol=2e-6)
-    # A bf16 state is rounded stochastically: within one bf16 step of the fp32 one.
-    np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state,
-                               atol=2e-6, rtol=2 ** -7 if held == jnp.bfloat16 else 0)
+    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
+    operands = (query, key, value, g, beta, state.astype(jnp.float32))
+    want, want_state = recurrent_gated_delta_rule(*operands)
+    with jax.enable_x64(new_val=True):
+        truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
+    found = each_config(delta_rule.DeltaStep, decode_gated_delta_rule, query, key, value, g, beta, state)
+    assert len(found) > 1
+    for config in found:
+        with tuning.pinned({delta_rule.DeltaStep: config}):
+            got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+        assert got_state.dtype == held
+        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], f"{config} out")
+        if held == jnp.float32:
+            assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
+                                             f"{config} state")
+        else:
+            np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
