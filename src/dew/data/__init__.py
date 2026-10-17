@@ -5,7 +5,7 @@ PyTorch dataset brought in) is a `Dataset`, and every verb returns a new
 one: `map`, `random_map`, `filter` and `flat_map` per record, `shuffle`,
 `repeat`, `pack` and `batch` across records, `mix` and `holdout` across
 datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
-`prompts`, `preferences`) are factories of the functions those verbs take.
+`prompts`, `preferences`) hold the steps those verbs take.
 `Trainer.fit` reads a dataset as the run's mesh shares it.
 """
 

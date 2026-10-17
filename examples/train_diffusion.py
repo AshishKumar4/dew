@@ -16,7 +16,7 @@ from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
 from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import TFDS
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout

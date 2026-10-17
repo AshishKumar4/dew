@@ -74,7 +74,7 @@ Here is an abridged [`examples/train_flowers.py`](https://github.com/AshishKumar
 ```python
 from dew.data import Loading, TFDS
 from dew.config.data import Augment, loader
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from pathlib import Path
 
 import jax
@@ -1056,7 +1056,7 @@ EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.config.data import loader
 from dew.data import TFDS
 from dew.config.data import Augment

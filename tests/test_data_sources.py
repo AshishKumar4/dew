@@ -814,7 +814,7 @@ def test_webdataset_groups_members_and_restores_inside_shard():
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
-    from dew.data.steps.text import Tokenize
+    from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
     original = b"first\r\nsecond\n\nlast without newline"
@@ -1631,7 +1631,7 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
 
     with pytest.raises(ValueError):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
-            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint())
         )
 
 
@@ -2229,3 +2229,52 @@ def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, ki
         assert row.keys() == records[index].keys()
         for name, value in row.items():
             np.testing.assert_array_equal(value, records[index][name])
+
+
+def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member():
+    """A Grain `MapDataset` and a Hugging Face `Dataset` read as one stream each, as they read by
+    index, so either mixes with a member that only streams (a Grain `IterDataset`), and the
+    mixture resumes where it stopped."""
+    import grain.python as grain
+    from datasets import Dataset as Arrow
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import mix
+    from dew.data.sources.grain import from_grain
+    from dew.data.sources.hf import from_hf
+
+    indexed = from_grain(grain.MapDataset.source([{"id": index} for index in range(6)]), "indexed")
+    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), name="table")
+    stream = grain.MapDataset.source([{"id": 20 + index} for index in range(6)]).to_iter_dataset()
+    streamed = from_grain(stream, "streamed")
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+
+    def ids(reader, count: int) -> list[int]:
+        return [int(value) for batch in itertools.islice(reader, count) for value in batch["id"]]
+
+    for native in (indexed, table):
+        alone = compile(native.repeat(1).batch(2), read="streamed", loading=loading).train(DataPartition())
+        try:
+            assert sorted(int(value) for batch in alone for value in batch["id"]) == sorted(
+                int(native.records("indexed")[index]["id"]) for index in range(6))
+        finally:
+            alone.close()
+        data = compile(mix([native.repeat(), streamed.repeat()]).batch(2), read="streamed", loading=loading)
+        whole = data.train(DataPartition())
+        try:
+            expected = ids(whole, 6)
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = ids(stopped, 3)
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert head + ids(resumed, 3) == expected
+        finally:
+            resumed.close()
+
