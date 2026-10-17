@@ -16,7 +16,7 @@ Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -24,12 +24,15 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, checkpoint_array, translate_parameters
+from dew.interop.weights import ParamTree, checkpoint_array, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.text_encoders import clip_layer
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 Attention = Literal["full", "band", "window"]
 Order = Literal["patches", "columns", "windows"]
@@ -354,14 +357,18 @@ PATCH_CONVOLUTION = "patch_embed.proj.weight"
 
 def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
                           path_of: Callable[[str], tuple[str, ...] | None],
-                          param_dtype: str = "float32") -> ParamTree:
+                          param_dtype: str = "float32") -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """A trunk's parameters from its tensors through its family's `path_of`, the patch convolution
     `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map over the processor's
-    channel, time and pixel order."""
-    params = translate_parameters({name: tensor for name, tensor in hf_tensors.items()
-                                   if name != PATCH_CONVOLUTION}, path_of, param_dtype)
+    channel, time and pixel order; with the layouts that write each tensor back (`placed`)."""
+    from dew.interop.streaming import WeightLayout
+
+    params, layouts = placed({name: tensor for name, tensor in hf_tensors.items()
+                              if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
         params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
             conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
-    return params
+        # The Dense map's transpose is the convolution, its input axes flattened.
+        layouts += (WeightLayout(PATCH_CONVOLUTION, (("patch_embed", "kernel"),), conv.shape, (1, 0)),)
+    return params, layouts
