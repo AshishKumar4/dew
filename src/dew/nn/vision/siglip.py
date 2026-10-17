@@ -15,7 +15,13 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer, tower_activation
+from dew.nn.text_encoders import (
+    TOWER_ACTIVATIONS,
+    _encoder_layer_path,
+    checked_image,
+    clip_layer,
+    tower_activation,
+)
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -28,7 +34,6 @@ from .common import (
     _vision_section,
     activation_name,
     head_width,
-    refuse_dropout,
     trunk_geometry,
 )
 
@@ -204,18 +209,18 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A SiglipVisionConfig into a SiglipVision value's fields.
 
     Reads the vision_config of a multimodal wrapper or a bare vision config.
-    Only square images map; anything but tanh or exact gelu refuses with its
-    name, and a nonzero dropout refuses as training-only.
+    Only square images map, and an activation the trunk does not compute
+    (`TOWER_ACTIVATIONS`) refuses with its name. Dropout, which the eval trunk
+    never applies, is left unread.
     """
     vision = _vision_section(hf_config)
-    refuse_dropout(vision, "attention_dropout")
     return {
         "class": "siglip", "fields": {
         **trunk_geometry(vision),
         "image_size": _side(vision.get("image_size", 224), "image_size"),
         "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
+        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh",
                                       ("hidden_act", "hidden_activation")),
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
