@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import bisect
-import functools
+import csv
 import hashlib
-import importlib.util
 import io
 import itertools
 import json
 import posixpath
 import threading
-import types
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -133,7 +131,12 @@ class Files(Dataset):
 
     Parquet partitions are discovered with Arrow's Hive partitioning. A
     predicate runs within each streamed fragment; indexed predicates need
-    a provisioned accepted-row index and are refused here.
+    a provisioned accepted-row index and are refused here. `columns`
+    selects the fields of every format's rows.
+
+    CSV is parsed by Python's `csv` module under the process's field size
+    limit, 128 KiB a field by default; a source with longer fields reads
+    once its caller raises `csv.field_size_limit`.
     """
 
     url: str | tuple[str, ...]
@@ -361,7 +364,8 @@ class Files(Dataset):
             offsets = []
             with _open_lines(fs, path) as file:
                 if self.kind == "csv":
-                    reader = _CsvRows(_CsvLines(file))
+                    reader = csv.DictReader(_CsvLines(file))
+                    _ = reader.fieldnames
                     while True:
                         start = file.tell()
                         try:
@@ -754,7 +758,7 @@ class _IndexedLines:
         for url in self.source.paths:
             fs, path = Store(url, self.source.storage_options).resolve()
             with _open_lines(fs, path) as file:
-                headers.append(tuple(_CsvRows(_CsvLines(file)).fieldnames))
+                headers.append(tuple(next(csv.reader(_CsvLines(file)))))
         return tuple(headers)
 
     def __len__(self) -> int:
@@ -777,43 +781,8 @@ class _IndexedLines:
         else:
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
         if names is not None:
-            return next(_CsvRows(io.StringIO(payload.decode()), fieldnames=names))
+            return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
         return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
-
-
-@functools.cache
-def _csv_parser() -> types.ModuleType:
-    """The standard library's CSV parser as a module of Dew's own, whose field size limit is raised
-    without touching the process's (`csv.field_size_limit`), so a quoted field of any length reads.
-    PEP 489: a multi-phase extension module, as `_csv` is, may be loaded again with its own state."""
-    spec = importlib.util.find_spec("_csv")
-    if spec is None or spec.loader is None:
-        raise ImportError("the standard library's _csv parser is missing")
-    parser = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(parser)
-    parser.field_size_limit(2**31 - 1)
-    return parser
-
-
-class _CsvRows(Iterator[dict]):
-    """`csv.DictReader` over Dew's own parser (`_csv_parser`): each row's values under the header's
-    names (`fieldnames`, the first row unless given), a blank line skipped, a short row's missing
-    values None and a long row's extra ones listed under None."""
-
-    def __init__(self, lines: Iterator[str], fieldnames: Sequence[str] | None = None):
-        self.reader = _csv_parser().reader(lines)
-        self.fieldnames = list(next(self.reader, []) if fieldnames is None else fieldnames)
-
-    def __next__(self) -> dict:
-        row = next(self.reader)
-        while row == []:
-            row = next(self.reader)
-        values: dict = dict(zip(self.fieldnames, row, strict=False))
-        if len(row) > len(self.fieldnames):
-            values[None] = row[len(self.fieldnames):]
-        for name in self.fieldnames[len(row):]:
-            values[name] = None
-        return values
 
 
 class _CsvLines(Iterator[str]):
@@ -848,8 +817,10 @@ class _LineIterator(grain.DatasetIterator):
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True
-        self.csv = _CsvRows(_CsvLines(self.file)) if source.kind == "csv" else None
-        if self.csv is None and shard.start:
+        self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
+        if self.csv is not None:
+            _ = self.csv.fieldnames
+        elif shard.start:
             self.file.seek(shard.start - 1)
             if self.file.read(1) != b"\n":
                 self.file.readline()
@@ -882,7 +853,7 @@ class _LineIterator(grain.DatasetIterator):
             self.file.close()
             self.file = _open_lines(self.fs, self.path)
             if self.csv is not None:
-                self.csv = _CsvRows(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
+                self.csv = csv.DictReader(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
         _seek_lines(self.file, offset)
 
     def close(self) -> None:
