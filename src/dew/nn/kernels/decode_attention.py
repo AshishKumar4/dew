@@ -15,7 +15,9 @@ dots, so a Mosaic GPU port takes it as is.
 The arithmetic is jax.nn's but for the order of its sums: fp32 logits of
 the operands, the scale after, an fp32 softmax, its probabilities in the
 value's dtype for the value product, which accumulates in fp32 and is
-normalized at the end rather than before the product.
+normalized at the end rather than before the product. Both products of fp32
+operands are fp32 products: Triton's default for them is one TF32 product,
+which XLA's dots at the default precision are not.
 
 `attend_paged` is the same kernel over a paged cache: a program takes one
 row and one key head with the query heads that share it, and reads the row's
@@ -52,6 +54,10 @@ def fits(query: jax.Array, key: jax.Array) -> bool:
             and 16 <= width <= 256 and key.shape[1] % BLOCK == 0 and query.dtype == key.dtype)
 
 
+FULL = jax.lax.Precision.HIGHEST
+"""Each product's precision: IEEE fp32 for fp32 operands, and bf16's or fp16's own product for those."""
+
+
 def _attend(query: jax.Array, length: jax.Array, read, block: int, scale: float) -> jax.Array:
     """`query` `[QUERIES, D]` over the first `length` keys, `block` at a time,
     `read(step)` giving a step's keys and values `[block, D]`: an online
@@ -63,13 +69,13 @@ def _attend(query: jax.Array, length: jax.Array, read, block: int, scale: float)
     def body(step, carry):
         out, peak, total = carry
         key, value = read(step)
-        logits = plgpu.dot(query, key.T).astype(jnp.float32) * scale              # [QUERIES, block]
+        logits = plgpu.dot(query, key.T, precision=FULL).astype(jnp.float32) * scale  # [QUERIES, block]
         reads = step * block + jnp.arange(block) < length
         logits = jnp.where(reads[None, :], logits, -0.7 * float(jnp.finfo(jnp.float32).max))
         new_peak = jnp.maximum(peak, logits.max(axis=-1))
         correction = jnp.exp(peak - new_peak)
         weights = jnp.exp(logits - new_peak[:, None])
-        product = plgpu.dot(weights.astype(value.dtype), value).astype(jnp.float32)
+        product = plgpu.dot(weights.astype(value.dtype), value, precision=FULL).astype(jnp.float32)
         out = correction[:, None] * out + product
         return out, new_peak, correction * total + weights.sum(axis=-1)
 

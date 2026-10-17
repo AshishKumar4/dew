@@ -66,6 +66,27 @@ def flash_here():
     return flash
 
 
+@on_gpu
+def test_flash_refuses_keys_and_values_of_another_batch_rank_or_width():
+    """The wheel's kernels read every key and value stride off the query's batch and width, so keys or
+    values of another batch, rank or width would be read past their end: each is refused by name,
+    batched and packed, before the kernel runs."""
+    flash = flash_here()
+    query = jnp.ones((2, 32, 2, 64), jnp.bfloat16)
+    for key, value in ((jnp.ones((1, 32, 2, 64), jnp.bfloat16),) * 2,
+                       (jnp.ones((2, 32, 2, 32), jnp.bfloat16),) * 2,
+                       (jnp.ones((2, 32, 2, 64), jnp.bfloat16), jnp.ones((2, 16, 2, 64), jnp.bfloat16)),
+                       (jnp.ones((2, 32, 4, 64), jnp.bfloat16),) * 2):
+        with pytest.raises(ValueError, match="one batch and width"):
+            flash.flash_mha(query, key, value)
+    packed = jnp.ones((64, 2, 64), jnp.bfloat16)
+    offsets = jnp.asarray([0, 32, 64], jnp.int32)
+    for shape in ((64, 2, 32), (2, 32, 2, 64)):
+        other = jnp.ones(shape, jnp.bfloat16)
+        with pytest.raises(ValueError, match="one batch and width"):
+            flash.flash_mha_varlen(packed, other, other, offsets, 32)
+
+
 def qkv(shape, seed=0):
     keys = jax.random.split(jax.random.PRNGKey(seed), 3)
     return tuple(jax.random.normal(key, shape, jnp.bfloat16) for key in keys)
@@ -808,6 +829,24 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
     assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
                                      "decode kernel")
+
+
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
+def test_fp32_attention_the_decode_kernel_takes_keeps_fp32_products_at_the_default_precision():
+    """At the default matmul precision, fp32 attention with key lengths on 'xla', which the decode
+    kernel takes, returns a value carrying 2**-12 exactly, as XLA's own dots do: one visible key of
+    value 1 + 2**-12 under zero queries and keys. A TF32 product rounds it to 1."""
+    from dew.nn.kernels import decode_attention
+
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 32, 1, 16), jnp.float32)
+    value = jnp.full((1, 32, 1, 16), 1 + 2.0**-12, jnp.float32)
+    assert decode_attention.fits(query, key)
+    lengths = jnp.asarray([1], jnp.int32)
+    with jax.default_matmul_precision("default"):
+        out = jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, implementation='xla', key_value_seq_lengths=lengths))(query, key, value)
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, 16), 1 + 2.0**-12, np.float32))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
