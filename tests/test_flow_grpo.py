@@ -18,6 +18,8 @@ from flax import linen as nn
 from recording import RecordingTracker
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
+from dew.diffusion.presets import JiT
+from dew.diffusion.transforms import VPredictionTransform
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
@@ -77,6 +79,39 @@ def trajectory_batch(trajectory, advantages, mask=None):
         "transition_mask": trajectory.stochastic if mask is None else jnp.asarray(mask),
         "advantages": jnp.asarray(advantages),
     }
+
+
+@pytest.mark.parametrize("prediction", ["clean", "v"])
+def test_flow_objective_uses_converted_predictions(prediction):
+    """JiT and other parameterizations share the rectified transition and its rescored density."""
+    process = JiT() if prediction == "clean" else Process(FlowMatchingScheduler(), VPredictionTransform())
+    model = AffineVelocity()
+    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=None)
+    variables = objective.init(jax.random.key(30))
+    initial = jnp.asarray([[0.2, -0.5], [-0.1, 0.7]])
+    denoise = objective.process.denoiser(model, variables, {})
+    trajectory = objective.sde.trajectory(denoise, initial, 5, key=31)
+    for index, (t, s) in enumerate(zip(trajectory.times[:-1], trajectory.times[1:], strict=True)):
+        t, s = float(t), float(s)
+        x = np.asarray(trajectory.states[:, index], np.float64)
+        raw = 0.25 * x + 0.1 * t
+        if prediction == "clean":
+            velocity = (x - raw) / t
+        else:
+            variance = (1 - t)**2 + t**2
+            velocity = ((2 * t - 1) * x + np.sqrt(variance) * raw) / variance
+        dt = s - t
+        g_squared = 0.5**2 * t / (1 - (s if t == 1 else t))
+        mean = x + (velocity + g_squared / (2 * t) * (x + (1 - t) * velocity)) * dt
+        variance = g_squared * -dt
+        action = np.asarray(trajectory.states[:, index + 1], np.float64)
+        expected = -0.5 * (((action - mean)**2 / variance) + np.log(2 * math.pi * variance)).sum(1)
+        np.testing.assert_allclose(trajectory.log_probs[:, index], expected, atol=3e-6, rtol=2e-6)
+    batch = trajectory_batch(trajectory, [-1, 1])
+    np.testing.assert_allclose(objective.log_probs(variables, batch), trajectory.log_probs, atol=3e-6)
+    loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(32), None))
+    assert np.isfinite(float(loss))
 
 
 def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
