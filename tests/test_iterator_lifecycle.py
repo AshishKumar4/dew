@@ -243,6 +243,28 @@ def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host
     assert final["data/rejected/grain:observed/third"] == sum(index % 3 == 0 for index in range(source.end))
 
 
+def test_chain_statistics_count_the_records_every_worker_read():
+    """Two worker processes each read part of a pass; the published counts are the pass's, every
+    worker's records summed, where the first worker's once stood for all of them."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"i": np.int32(index)} for index in range(24)]
+    chain = Pipeline(Memory(rows), name="rows").repeat(1).filter_map(reject_thirds).batch(2)
+    data = compile(chain, read="streamed", loading=Loading(workers=2, threads=1, read_buffer=1,
+                                                           worker_buffer=1))
+    reader = data.train(DataPartition())
+    try:
+        read = [int(value) for batch in reader for value in np.asarray(batch["i"])]
+    finally:
+        reader.close()
+    assert sorted(read) == [index for index in range(24) if index % 3]
+    published = data.statistics()
+    assert published["data/accepted/rows"] == len(read)
+    assert published["data/attempted/rows"] == 24
+    assert published["data/rejected/rows/third"] == 24 - len(read)
+
+
 def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
     sources = [ObservedRows(end=64) for _ in range(2)]
     chain = mix([from_grain(source, name).filter_map(reject_thirds)
