@@ -164,7 +164,6 @@ class AudioTokenizerEncoder(nn.Module):
             places = jnp.broadcast_to(jnp.arange(valid.shape[1]), valid.shape)
             x = block(x, attention_metadata=AttentionMetadata(
                 coordinates=coordinates(segments=valid.astype(jnp.int32), positions=places)))
-            assert isinstance(x, jax.Array)
             if cfg.encoder_skip_layer_id is not None and index == cfg.encoder_skip_layer_id - 1:
                 skip = x
         if skip is not None:
@@ -236,7 +235,6 @@ class MiMoAudioCodeEncoder(nn.Module):
         for index in range(cfg.input_local_layers):
             x = DecoderBlock(attention, mlp, cfg.input_local_dim, BlockWiring(), norm_eps=cfg.rms_norm_eps,
                              dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(x)
-            assert isinstance(x, jax.Array)
         if cfg.add_post_norm:
             x = RMSNorm(epsilon=cfg.rms_norm_eps, dtype=self.dtype, name="norm")(x)
         x = x.reshape(batch, groups, cfg.group_size * cfg.input_local_dim)
