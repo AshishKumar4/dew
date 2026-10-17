@@ -925,7 +925,20 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
     through `dew.nn.kernels.delta_rule.step`, which reads and writes the
     state once (CUDA, where `delta_rule.fits` the state). A row `active`
-    `[B]` marks False keeps its state untouched and outputs zeros."""
+    `[B]` marks False keeps its state untouched and outputs zeros. On a mesh
+    the step runs per shard (`manual_map`), each shard's rows and heads with
+    their state, as `fla_rule` runs: the kernel has no partitioning rule, and
+    the state is most of a decode step's bytes."""
+    active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
+    rows, heads = grouped_heads(value.shape, key.shape[2])
+    P = jax.sharding.PartitionSpec
+    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
+    return manual_map(_decoded, (four, four, four, three, three, memory, P(rows)),
+                      (four, memory))(query, key, value, g, beta, state, active)
+
+
+def _decoded(query, key, value, g, beta, state, active):
+    """`decode_gated_delta_rule` on arrays a shard holds."""
     work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
     decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)

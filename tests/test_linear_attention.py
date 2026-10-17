@@ -741,6 +741,45 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held
             np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
+def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
+    """One decode token through `dew.nn.kernels.delta_rule` over rows split two
+    ways, or heads split two ways, idle rows among the drawing ones, runs per
+    shard (`sharded.assert_runs_per_shard`): its output and state within the
+    float64 gate of one device's, from the recurrence's in float64 (an idle
+    row's output zeros and its state as it was), and no operand or state moved
+    between devices. Off a GPU the kernel interprets."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    from dew.nn.linear import decode_gated_delta_rule
+
+    rng = np.random.default_rng(2)
+    rows, H, D = 4, 4, 32
+    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    active = jnp.asarray([True, False, True, False])
+    with jax.enable_x64(new_val=True):
+        operands = widened((query, key, value, g, beta, state))
+        out, final = recurrent_gated_delta_rule(*operands)
+        drawing = np.asarray(active)[:, None, None, None]
+        truth = (np.where(drawing, np.asarray(out), 0.0), np.where(drawing, np.asarray(final), operands[-1]))
+
+    def spec(rank: int, at: int):
+        return PartitionSpec(*(axis if dim == at else None for dim in range(rank)))
+
+    heads_at = {0: 0, 2: 1}[split]
+    specs = [spec(4, split)] * 3 + [spec(3, split)] * 2 + [spec(4, heads_at), spec(1, split)]
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    assert_runs_per_shard(decode_gated_delta_rule, (query, key, value, g, beta, state, active), specs, mesh,
+                          truth)
+
+
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_the_decode_kernel_leaves_an_idle_row_alone():
     """A serving step holds every slot, drawing or not. A row the step marks
