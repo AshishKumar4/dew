@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, Self
 
 import jax
 import jax.numpy as jnp
@@ -139,9 +139,6 @@ class Decide:
     logits are divided by `calibration`'s temperatures, and each answer reports
     `confidence`'s statistic of its distribution.
     """
-
-    settings: ClassVar[type[DecideSettings]] = DecideSettings
-    """What a run of this task records beside its backbone."""
 
     model: DecisionModel
     variables: Variables

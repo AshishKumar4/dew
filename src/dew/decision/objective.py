@@ -412,6 +412,7 @@ class DecisionObjective(Objective[Ratio]):
     """
 
     saved_task = Decide
+    settings = DecideSettings
     _held_parts = True
 
     counts_tokens = True

@@ -15,7 +15,7 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -45,7 +45,6 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, model_logits
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -152,6 +151,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """
 
     saved_task = BlockGeneration
+    settings = BlockSettings
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,

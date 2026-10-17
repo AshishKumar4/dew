@@ -17,7 +17,7 @@ uses; the preview hook limits itself to the display count.
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -70,7 +70,6 @@ from dew.objectives.base import (
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
-from dew.records import JSON
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import ImageSettings, TextToImage
 from dew.sampling.sample import sample
@@ -236,6 +235,7 @@ class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
     saved_task = TextToImage
+    settings = ImageSettings
     # A pipeline's own sampling policy, else DDIM, CFG(3.0) and `_DEFAULT_STEPS`.
     resolved = ("solver", "guidance", "steps")
 

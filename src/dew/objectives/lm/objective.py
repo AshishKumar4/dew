@@ -92,7 +92,6 @@ from dew.objectives.lm.chunked import (
     refuse_without_logits,
     support_log_probs,
 )
-from dew.records import JSON
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -671,6 +670,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     saved_task = TextGeneration
+    settings = TextSettings
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 

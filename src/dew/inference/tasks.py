@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -287,9 +287,8 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     objective = objectives[named(record['objective'], 'objective')]
-    if objective.saved_task is None:
-        raise ValueError(f"{objective.__name__} declares no saved task to load its run as")
-    stray = set(record) - {'objective', 'model', *settings_fields(objective.saved_task.settings)}
+    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+    stray = set(record) - {'objective', 'model', *declared}
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")
@@ -374,7 +373,7 @@ class BlockSettings:
         integer(self.pad_token_id, "pad_token_id")
 
 
-def _budget_checked(budget: object) -> None:
+def _budget_checked(budget: int) -> None:
     """Refuse a recorded token budget that is not a nonnegative integer."""
     if type(budget) is not int or budget < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
@@ -493,9 +492,6 @@ class TextGeneration:
     two requests of nearby lengths share one compiled executable, and neither
     pays for the model's whole context.
     """
-
-    settings: ClassVar[type[TextSettings]] = TextSettings
-    """What a run of this task records beside its model."""
 
     model: nn.Module
     variables: Variables
@@ -654,9 +650,6 @@ class BlockGeneration:
     is a `dew.nn.protocols.BlockDenoiser`, as DiffusionGemma is.
     """
 
-    settings: ClassVar[type[BlockSettings]] = BlockSettings
-    """What a run of this task records beside its model."""
-
     model: nn.Module
     variables: Variables
     process: BlockProcess
@@ -760,9 +753,6 @@ class MaskedGeneration:
     passes none, it uses the task's `steps`, its `max_new_tokens` response
     length and its `n` continuations per prompt.
     """
-
-    settings: ClassVar[type[MaskedSettings]] = MaskedSettings
-    """What a run of this task records beside its model."""
 
     model: nn.Module
     variables: Variables
