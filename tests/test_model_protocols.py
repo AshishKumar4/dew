@@ -105,10 +105,12 @@ DECODERS = [name for name in CHECKPOINTS if name not in OWN]
 
 
 def _layers(value, found: set[str], under: bool = False) -> set[str]:
-    """The mixer names a translated record declares, under `mixer` or `kinds`, and its layer types."""
+    """The mixer classes a translated record names, by the `class` of each
+    record under `mixer` or `kinds` (KDA beside MLA is not a delta net beside
+    attention), and its layer types."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if under and key == "name" and isinstance(item, str):
+            if under and key == "class" and isinstance(item, str):
                 found.add(item)
             _layers(item, found, under or key in ("mixer", "kinds"))
             if key == "layer_types" and isinstance(item, (list, tuple)):
