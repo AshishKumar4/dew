@@ -396,9 +396,10 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
 
 def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
-    is the batch's rows: an array, or a per-row tuple of captions or texts."""
-    if isinstance(leaf, tuple) and len(leaf) == keep.size:
-        return tuple(text for text, kept in zip(leaf, keep, strict=True) if kept)
+    is the batch's rows: an array, a per-row tuple of captions or texts, or a
+    per-row list of opaque records (`dew.data.dataset.take_batch`)."""
+    if isinstance(leaf, list | tuple) and len(leaf) == keep.size:
+        return type(leaf)(row for row, kept in zip(leaf, keep, strict=True) if kept)
     array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
     return array[keep] if array is not None and array.ndim and array.shape[0] == keep.size else leaf
 
@@ -410,9 +411,11 @@ def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
 
 
 def _real_batch(batch: Batch, keep: np.ndarray) -> Batch:
-    """`batch` cut to the real rows, without `VALID_ROWS`."""
+    """`batch` cut to the real rows, without `VALID_ROWS`: a column of opaque records, a list, is
+    cut as one column, as `dew.data.dataset.take_batch` selects its rows."""
     return jax.tree.map(lambda leaf: _cut(leaf, keep),
-                        {name: leaf for name, leaf in batch.items() if name != VALID_ROWS})
+                        {name: leaf for name, leaf in batch.items() if name != VALID_ROWS},
+                        is_leaf=lambda leaf: isinstance(leaf, list))
 
 
 def _dispatched(objective: Objective[Loss, Effects], variables: Variables, batch: Batch, context: Step,
@@ -486,7 +489,10 @@ def _shares_host(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Bat
     share's own rows, from its first reader, which no device carries, so they meet on the host
     (`from_every_process`). Every process takes part; the fields are whole on each."""
     partition = DataPartition.of(mesh)
-    told = base64.b64encode(pickle.dumps(host)).decode() if partition.reader == 0 else ""
+    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
+    # waiting for its fields.
+    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
+                  if partition.reader == 0 else "")
     shares = {index: pickle.loads(base64.b64decode(word))
               for index, word in from_every_process([partition.index, told]) if word}
     ordered = [shares[index] for index in range(len(shares))]

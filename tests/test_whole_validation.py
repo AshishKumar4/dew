@@ -7,6 +7,7 @@ The last batch is filled out to the batch's rows with repeats that
 
 from __future__ import annotations
 
+import dataclasses
 import tarfile
 
 import jax
@@ -285,10 +286,18 @@ def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
     assert_the_metric_over_every_record(perplexity(windows, count), count)
 
 
-def named_records(mesh=None) -> list[tuple[str, int]]:
+@dataclasses.dataclass(frozen=True)
+class Note:
+    """A record's opaque field, which no batch stacks: a batch carries a column of them as a list."""
+
+    index: int
+
+
+def named_records(mesh=None) -> list[tuple[str, int, int]]:
     """Each record a validation pass scored, as a metric read it: its name, a string no accelerator
-    holds, beside the label the objective produced from what the devices hold. The pass runs on
-    `mesh`, a pool's spanning its processes (`tests/test_multiprocess.py`), or this process's."""
+    holds, and its note, an opaque record, beside the label the objective produced from what the
+    devices hold. The pass runs on `mesh`, a pool's spanning its processes
+    (`tests/test_multiprocess.py`), or this process's."""
     from affine_run import FEATURES, Features
 
     from dew.artifacts import Representations
@@ -297,7 +306,8 @@ def named_records(mesh=None) -> list[tuple[str, int]]:
     from dew.data.sources import Memory
 
     records = Memory(tuple({"x": np.full(FEATURES, index, np.float32), "y": np.full(2, index, np.float32),
-                            "index": np.int32(index), "name": f"record {index}"} for index in range(RECORDS)))
+                            "index": np.int32(index), "name": f"record {index}", "note": Note(index)}
+                           for index in range(RECORDS)))
     data = compile(Pipeline(records).repeat().batch(ROWS), validation=Pipeline(records).batch(ROWS),
                    objective=Features().data(), read="memory",
                    loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
@@ -309,8 +319,8 @@ def named_records(mesh=None) -> list[tuple[str, int]]:
             self.seen = []
 
         def __call__(self, artifact, batch):
-            self.seen += [(str(name), int(index)) for name, index in zip(batch["name"], artifact.labels,
-                                                                         strict=True)]
+            self.seen += [(str(name), note.index, int(label)) for name, note, label in zip(
+                batch["name"], batch["note"], artifact.labels, strict=True)]
             return 0.0, 1
 
         def merge(self, accumulated, contribution):
@@ -328,5 +338,5 @@ def test_a_metric_reads_the_fields_no_device_holds():
     """A held record's name, a string no accelerator holds, reaches the
     metrics with the rest of its batch: the objective's programs read what a
     device holds, and a metric reads the whole batch, its last batch's
-    repeats left out."""
-    assert named_records() == [(f"record {index}", index) for index in range(RECORDS)]
+    repeats left out, from its arrays and its columns of opaque records alike."""
+    assert named_records() == [(f"record {index}", index, index) for index in range(RECORDS)]

@@ -414,17 +414,26 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
     session of its own, apart from that terminal, its input /dev/null as a
     local rank's is, and the shell waits on it, so the terminal's signals
     reach the shell: the interrupt the launcher writes to stop the pool
-    (`STOP_BYTE`) makes the shell send the command SIGTERM, the preemption
-    notice a training run checkpoints on, and the connection stays open, its
-    output flowing, until the command exits; the connection closing, which
-    hangs the terminal up, makes the shell send it SIGHUP. The shell exits
-    with the command's code."""
+    (`STOP_BYTE`) makes the shell send the command's session SIGTERM, the
+    preemption notice a training run checkpoints on, and the connection
+    stays open, its output flowing, until the command exits; the connection
+    closing, which hangs the terminal up, makes the shell send it SIGHUP. A
+    wait a signal cut short is waited again, so the shell exits with the
+    command's own code. What the command started and left running in its
+    session is stopped then as a local rank's process group is (`_stop`):
+    SIGTERM, then SIGKILL after `FAILURE_GRACE`, so nothing outlives the
+    connection on a host the launcher no longer reaches."""
     assignments = tuple(f"{name}={value}" for name, value in env.items())
     run = shlex.join(("env", *assignments, *command) if env else command)
     lines = [f"cd {shlex.quote(cwd)} || exit 1"] if cwd else []
-    return "; ".join([*lines, f"setsid {run} </dev/null & rank=$!",
-                      "trap 'kill -TERM -$rank' INT", "trap 'kill -HUP -$rank' HUP",
-                      "while :; do wait $rank; code=$?; kill -0 $rank 2>/dev/null || exit $code; done"])
+    return "; ".join([
+        *lines, f"setsid {run} </dev/null & rank=$!",
+        "trap 'cut=1; kill -TERM -$rank 2>/dev/null' INT", "trap 'cut=1; kill -HUP -$rank 2>/dev/null' HUP",
+        'while :; do cut=0; wait $rank; code=$?; [ "$cut" = 1 ] || break; done',
+        "kill -TERM -$rank 2>/dev/null", "waited=0",
+        f"while kill -0 -$rank 2>/dev/null && [ $waited -lt {FAILURE_GRACE:.0f} ]; "
+        "do sleep 1; waited=$((waited + 1)); done",
+        "kill -KILL -$rank 2>/dev/null", "exit $code"])
 
 
 def gpu_count(host: str, visible: str | None) -> int | None:

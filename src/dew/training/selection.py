@@ -49,11 +49,11 @@ class Best:
                              ('weights_only', weights_only), ('split', split), ('_source', source)):
             object.__setattr__(self, field, value)
 
-    def resolved(self, metrics: Sequence[Metric], shown: Mapping[str, Shown],
-                 splits: Sequence[str] = ("val",)) -> Best:
-        """This selection bound to the metric it names among `metrics`, with its direction from how
-        that metric is `shown` where it names none, and the split it ranks: `train` for a training
-        scalar, else the one of `splits` it names or the only one."""
+    def resolved(self, metrics: Sequence[Metric], splits: Sequence[str] = ("val",)) -> Best:
+        """This selection bound to the metric it names among `metrics`, with its direction, where it
+        names none, from how that metric itself declares it is shown, so each suite's instance of one
+        metric keeps its own, and the split it ranks: `train` for a training scalar, else the one of
+        `splits` it names or the only one."""
         selection = self
         metric = selection._source
         if metric is None:
@@ -73,7 +73,7 @@ class Best:
         if isinstance(metric, Metric):
             if not any(metric is declared for declared in metrics):
                 raise ValueError("best must be a metric object passed in metrics")
-            declared = shown.get(metric.name)
+            declared = _declared_shown(metric)
             better = None if declared is None else declared.better
             if selection.mode is None:
                 if better not in ('higher', 'lower'):
@@ -88,3 +88,9 @@ class Best:
         elif selection.split not in splits:
             raise ValueError(f"unknown validation split {selection.split!r}")
         return selection
+
+
+def _declared_shown(metric: Metric) -> Shown | None:
+    """How `metric` itself declares it is shown, which the Metric protocol leaves optional, so it is
+    read at this boundary."""
+    return getattr(metric, "shown", None)
