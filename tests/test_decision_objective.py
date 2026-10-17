@@ -523,6 +523,15 @@ def test_a_joint_run_cuts_its_state_to_the_state_budget_and_a_layout_refuses_a_b
 
     layout = _fresh_layout(causal=True, one_question=False, budgets={"max_len": 3072, "max_state_tokens": 16})
     assert layout == JointLayout(max_len=3072, max_state_tokens=16)
+    # A budget of no state tokens is a budget, which a run's unset options leave alone.
+    bare = _fresh_layout(causal=True, one_question=False,
+                         budgets={"max_len": 3072, "max_state_tokens": 0, "option_tokens": None})
+    assert bare == JointLayout(max_len=3072, max_state_tokens=0)
+    (stateless,) = bare.rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
+    assert stateless.state_kept == 0
+    for budgets in ({"max_state_tokens": -1}, {"max_len": 0}):
+        with pytest.raises(ValueError):
+            _fresh_layout(causal=True, one_question=False, budgets=budgets)
     (row,) = layout.rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
     (whole,) = JointLayout(max_len=3072).rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
     assert row.state_kept == 16 and len(whole.tokens) - len(row.tokens) == whole.state_kept - 16
