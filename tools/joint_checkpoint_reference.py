@@ -154,8 +154,11 @@ def on_fla() -> None:
 
     found = {name: importlib.metadata.version(name).split("+")[0] for name in FLA_PINS}
     assert found == FLA_PINS, f"on_fla runs in {FLA_PINS}, not {found}"
+    # HF falls back to its torch rule when fla does not import; import it here so the cause shows.
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
     rule = inspect.getclosurevars(modeling_qwen3_5.torch_chunk_gated_delta_rule).nonlocals["implementation"]
-    assert rule.__module__.startswith("fla."), f"HF's Qwen 3.5 runs {rule.__module__}, not fla's chunked rule"
+    assert rule is chunk_gated_delta_rule, f"HF's Qwen 3.5 runs {rule.__module__}, not fla's chunked rule"
     # Only fla's kernels part from the torch math the CPU fixture runs: no TF32 elsewhere.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
