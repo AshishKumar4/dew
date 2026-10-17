@@ -670,9 +670,12 @@ class CausalSelfAttention(nn.Module):
         causal, mask, documents = self.ctx.causal, None, None
         implementation = self.ctx.attention_impl
         # An uncached call's keys are its own tokens; a cached call's keys are
-        # placed by `_cached_places` where the layer reads their places.
+        # placed by `_cached_places` where the layer reads their places. A
+        # paged cache holds rows a server seats at canonical positions, where
+        # a key's slot is its place, so it keeps none.
         key_places = places
-        reads_places = self.ctx.attention_chunk is not None or self.alibi
+        keeps_places = ((self.ctx.attention_chunk is not None or self.alibi)
+                        and self.ctx.kv_cache.page_size is None)
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -698,8 +701,9 @@ class CausalSelfAttention(nn.Module):
             key = jnp.concatenate([cached_key, key], axis=-3)
             value = jnp.concatenate([cached_value, value], axis=-3)
             causal, window = False, None
-            key_places = (jnp.concatenate([self.get_variable("cache", "cached_places"), places], axis=-1)
-                          if reads_places else jnp.arange(alloc + S))
+            key_places = (jnp.concatenate([self.get_variable("cache", "cached_places"),
+                                           jnp.broadcast_to(places, (B, S))], axis=-1)
+                          if keeps_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # No cache of its own: the provider's stashed keys carry the full
             # history, so the mask reads them the way the provider's own
@@ -716,7 +720,7 @@ class CausalSelfAttention(nn.Module):
             query = append.query(query)
             cursor, mask = self._decode_masks(positions, key.shape[-3])
             causal = False
-            key_places = self._cached_places(places, positions) if reads_places else jnp.arange(key.shape[-3])
+            key_places = self._cached_places(places, positions) if keeps_places else jnp.arange(key.shape[-3])
             if kv_store is not None and self.ctx.kv_store_key is not None:
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places)
         elif segment_ids is not None:
@@ -786,7 +790,7 @@ class CausalSelfAttention(nn.Module):
         held = self.variable("cache", "cached_places", jnp.zeros, (slots.shape[0], self.ctx.max_seq_len),
                              jnp.int32)
         if allocated:
-            held.value = write_cache(held.value, places, slots)
+            held.value = write_cache(held.value, jnp.broadcast_to(places, slots.shape), slots)
         return held.value
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):

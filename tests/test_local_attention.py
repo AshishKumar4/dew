@@ -143,28 +143,31 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     assert banded * 4 < dense
 
 
+@pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
 @pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
-def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin):
+def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, shared):
     """The whole-sequence pass runs `local_attention`; the cached decode runs
     the chunk as a mask over cache slots. Both read the same keys: chunks
     are cut at the tokens' logical places, so a row whose places start at
     `origin` (a continuation, a canvas) cuts them as its whole pass does,
-    not at its cache slots."""
+    not at its cache slots, whether each row gives its places or the rows
+    share one vector of them."""
     model = CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
         kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(1), (2, 13), 0, 64)
-    positions = jnp.broadcast_to(jnp.arange(13) + origin, tokens.shape)
+    positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, tokens.shape)
     variables = model.init(jax.random.key(0), tokens)
     whole = model.apply(variables, tokens, positions=positions)
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
-    logits, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4], positions=positions[:, :4],
+    logits, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4], positions=positions[..., :4],
                                   decode=True, mutable=["cache"])
     steps = [logits[:, -1]]
     for index in range(4, 13):
         logits, mutated = model.apply({**variables, "cache": mutated["cache"]}, tokens[:, index:index + 1],
-                                      positions=positions[:, index:index + 1], decode=True, mutable=["cache"])
+                                      positions=positions[..., index:index + 1], decode=True,
+                                      mutable=["cache"])
         steps.append(logits[:, -1])
     np.testing.assert_allclose(np.stack(steps, 1), whole[:, 3:], atol=1e-5, rtol=0)
 
