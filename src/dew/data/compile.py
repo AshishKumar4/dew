@@ -463,12 +463,9 @@ def _staged(
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
     train, validation = branches[0], (None if validation is None else branches[1])
-    batching = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if batching is None:
+    if not any(isinstance(stage, BatchStage) for stage in train.stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    # The rows each batch holds as the run reads it: the last rebatch's, else the batch's own.
-    batch = next((stage.size for stage in reversed(train.stages) if isinstance(stage, Rebatch)),
-                 batching.size)
+    batch = _output_batch(train)
     original = train
     if read == "memory":
         train = _materialize(train, counts)
@@ -479,6 +476,12 @@ def _staged(
             validation = None
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
+
+
+def _output_batch(pipeline: Pipeline) -> int:
+    """The rows each batch of `pipeline` holds as its reader yields them, which its loader declares
+    and its share pads to: the last rebatch's, else its batch's own, which still groups its reads."""
+    return [stage.size for stage in pipeline.stages if isinstance(stage, (BatchStage, Rebatch))][-1]
 
 
 def _compiled(
@@ -540,7 +543,8 @@ def _compiled(
             _validation_reader,
             pipeline=validation,
             build=dataclasses.replace(
-                build, lowering=_analyzed(validation, read, validation=True), training=False
+                build, lowering=_analyzed(validation, read, validation=True), training=False,
+                batch=_output_batch(validation),
             ).tuned(validation),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
@@ -1028,7 +1032,7 @@ def validation(
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
     # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+    batch = _output_batch(pipeline)
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
     packed = _coordinated(pipeline)

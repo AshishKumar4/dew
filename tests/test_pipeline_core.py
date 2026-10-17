@@ -1236,3 +1236,19 @@ def test_a_rebatched_loader_declares_the_rows_its_batches_hold(read):
         assert [len(next(stream)["x"]) for _ in range(3)] == [data.batch] * 3 == [4] * 3
     finally:
         stream.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_validation_pass_holds_every_record_whatever_size_training_rebatches_to(read):
+    """A validation pass batches by its own size, so training rebatched to four rows leaves each
+    eight-row held-out batch whole, every held-out record scored once."""
+    rows = Memory([{"x": np.int32(index)} for index in range(32)])
+    held = Memory([{"x": np.int32(100 + index)} for index in range(16)])
+    data = compile(Pipeline(rows).repeat().batch(8).rebatch(4), validation=Pipeline(held).batch(8), read=read,
+                   loading=READ)
+    assert data.val is not None
+    scored = []
+    for batch in data.val(DataPartition()):
+        valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["x"]), bool)))
+        scored += [int(value) for value, kept in zip(np.asarray(batch["x"]), valid, strict=True) if kept]
+    assert sorted(scored) == list(range(100, 116))
