@@ -484,7 +484,9 @@ class VideoData(_Loadable):
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from pathlib import PurePosixPath
 
-        from dew.data.processors import AutoAudioProcessor
+        from transformers import AutoFeatureExtractor
+
+        from dew.data.processors import sampling_rate
         from dew.data.sources.av_utils import FPS
         from dew.data.sources.files import Files
 
@@ -501,7 +503,7 @@ class VideoData(_Loadable):
         prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         # The sound at the rate the audio model reads, `audio_padding` frames either side of the frames.
-        rate = AutoAudioProcessor(tensor_type="np", modelname=self.audio_model).sampling_rate
+        rate = sampling_rate(AutoFeatureExtractor.from_pretrained(self.audio_model))
         padding = self.audio_padding / FPS
 
         def clips(chain: Pipeline) -> Pipeline:

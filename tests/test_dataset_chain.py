@@ -269,7 +269,7 @@ def fetched_generation(source, directory):
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
     manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
-    stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest, source,
+    stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
         for index in range(len(stored)):
@@ -623,7 +623,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     source = from_hf(stream, name="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
     manifest = source.manifest()
-    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key, manifest))
+    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
     actual = []
     for index in range(shares):
         reader = iter(streamed(cached, partition=DataPartition(index, shares), loading=READ))
@@ -842,7 +842,9 @@ def test_a_random_step_that_may_drop_draws_as_one_that_cannot(read):
 
 
 class Coin(grain.RandomMapTransform):
-    """Keeps a record, with its draw, on heads."""
+    """Keeps a record, with its draw, on heads; it says it drops records."""
+
+    rejects = True
 
     def random_map(self, element, rng) -> dict | Rejected:
         return keep_heads(element, rng)

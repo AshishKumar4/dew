@@ -251,7 +251,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
-                              budget=SearchBudget(consecutive=5, seconds=None)))
+                              budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
     counts = reader.get_state()["parents"][0]["counts"]
@@ -647,7 +647,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
-                              budget=SearchBudget(consecutive=3, seconds=None)))
+                              budget=SearchBudget(consecutive=3)))
     try:
         if tiny_targets:
             next(reader)
@@ -1252,3 +1252,171 @@ def test_a_validation_pass_holds_every_record_whatever_size_training_rebatches_t
         valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["x"]), bool)))
         scored += [int(value) for value, kept in zip(np.asarray(batch["x"]), valid, strict=True) if kept]
     assert sorted(scored) == list(range(100, 116))
+
+
+def test_a_step_drops_records_only_when_it_says_so():
+    """A step keeps every record unless it declares `rejects`, whatever its annotations read: an
+    unannotated indexed step and an annotated one compile to one global order with an epoch
+    count, a step that declares `rejects` drops what it rejects, and one that rejects without
+    declaring it is refused, where an unannotated step was once taken to drop records."""
+
+    def unannotated(index, row):
+        return {**row, "at": np.int32(index)}
+
+    def annotated(index: int, row: dict) -> dict:
+        return {**row, "at": np.int32(index)}
+
+    @dataclasses.dataclass(frozen=True)
+    class EvenOnly:
+        rejects = True
+
+        def __call__(self, index: int, row: dict) -> dict | Rejected:
+            return row if index % 2 == 0 else Rejected("odd")
+
+    def undeclared(index, row):
+        return row if index % 2 == 0 else Rejected("odd")
+
+    rows = Pipeline(source(8))
+    for step in (unannotated, annotated):
+        data = compile(rows.map_with_index(step).batch(4), read="indexed", loading=READ)
+        assert data.records == 8
+    kept = compile(rows.map_with_index(EvenOnly()).repeat(1).batch(2), read="indexed", loading=READ)
+    stream = kept.train(DataPartition())
+    try:
+        assert sorted(int(value) for batch in stream for value in batch["id"]) == [0, 2, 4, 6]
+    finally:
+        stream.close()
+    refused = compile(rows.map_with_index(undeclared).repeat(1).batch(2), read="indexed", loading=READ)
+    stream = refused.train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            list(stream)
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
+    """A mixture whose members a run picks may come down to one, which reads as that member
+    alone, by records or by tokens, in every read."""
+    from dew.data.steps.text import CountTargets
+
+    rows = Memory([{"text": np.full(3, index, np.int32), "id": np.int32(index)} for index in range(6)])
+    member = Pipeline(rows, name="only").filter_map(CountTargets())
+    data = compile(mix([member.repeat(1)], by=by).batch(2), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert sorted(int(value) for batch in stream for value in batch["id"]) == list(range(6))
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
+    """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
+    and a run counted in steps reads it; a run counted in epochs is refused, since one pass
+    over the two records fills no batch. Repeated after the batch, a pass holds no batch to
+    replay, so the read is refused rather than replaying nothing forever, whatever limit
+    follows, in every read; eight records make a batch either way."""
+    for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
+                            (8, "after, then take")):
+        rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(count)]))
+        chain = rows.repeat().batch(8) if repeated == "before" else rows.batch(8).repeat()
+        data = compile(chain.take(1) if repeated.endswith("take") else chain, read=read, loading=READ)
+        if count < 8 and repeated.startswith("after"):
+            with pytest.raises(ValueError):
+                refused = data.train(DataPartition())
+                try:
+                    next(refused)
+                finally:
+                    refused.close()
+            continue
+        stream = data.train(DataPartition())
+        try:
+            assert sorted(int(value) for value in next(stream)["id"]) == sorted(
+                index % count for index in range(8))
+        finally:
+            stream.close()
+        if count < 8:
+            with pytest.raises(ValueError):
+                data.epoch_steps(1)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("batched", ["before", "after"])
+def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read, batched):
+    """A position saved just as a pass of an endless repeat ends restores to that end, and the
+    read goes on into the next pass as the uninterrupted one does, rather than taking the
+    restored end for a pass that read nothing; a repeat after the batch reads its passes as a
+    stream in every read."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(2)]))
+    data = compile(rows.repeat().batch(2) if batched == "before" else rows.batch(2).repeat(), read=read,
+                   loading=READ)
+
+    def ids(stream, count: int) -> list[int]:
+        return [int(value) for batch in itertools.islice(stream, count) for value in batch["id"]]
+
+    whole = data.train(DataPartition())
+    try:
+        expected = ids(whole, 3)
+    finally:
+        whole.close()
+    stopped = data.train(DataPartition())
+    try:
+        head = ids(stopped, 1)
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert head + ids(resumed, 2) == expected
+    finally:
+        resumed.close()
+
+
+def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
+    """A streamed repeat read endlessly guards its passes without changing what a random step
+    after it draws: the passes a finite repeat reads draw the same values."""
+    rows = Pipeline(source(2)).take(2)
+
+    def draws(chain) -> list[int]:
+        data = compile(chain.random_map(Draw()).batch(2), read="streamed", loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            return [int(value) for batch in itertools.islice(stream, 2) for value in batch["draw"]]
+        finally:
+            stream.close()
+
+    assert draws(rows.repeat()) == draws(rows.repeat(2))
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
+    """A repeat after the batch repeats the batches the first pass made, a random step's draws
+    and all, in every read, and a resume reads on as the uninterrupted run does."""
+    data = compile(Pipeline(source(2)).random_map(Draw()).batch(2).repeat(), read=read, loading=READ)
+
+    def batches(stream, count: int) -> list[tuple[list[int], list[int]]]:
+        return [(np.asarray(batch["id"]).tolist(), np.asarray(batch["draw"]).tolist())
+                for batch in itertools.islice(stream, count)]
+
+    whole = data.train(DataPartition())
+    try:
+        expected = batches(whole, 3)
+    finally:
+        whole.close()
+    assert expected[0] == expected[1] == expected[2]
+    stopped = data.train(DataPartition())
+    try:
+        head = batches(stopped, 1)
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert head + batches(resumed, 2) == expected
+    finally:
+        resumed.close()
