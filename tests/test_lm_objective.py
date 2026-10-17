@@ -637,7 +637,8 @@ def test_z_loss_gradient_carries_the_reference_factor():
     model = objective.model
     logits, pullback = jax.vjp(lambda p: model.apply({"params": p}, ids), params["params"])
     weights = np.ones(tokens[:, 1:].shape)
-    _, _, rounded = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient, dtype=np.float32)
+    _, _, rounded = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient,
+                                     dtype=np.float32)
     reference, = pullback(jnp.asarray(rounded))
     _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient)
     with jax.enable_x64(True):
