@@ -5,9 +5,12 @@ joins exactly as a multi-node run does (`prepare_process`). Each process
 schedules the rollouts of the task rows its share of the batch holds, from a
 source that answers every sample of a task with a completion the task fixes;
 with `--vary`, the answer also depends on the process, as independent draws
-from engines do. The pool fits one update on `--mesh`, and process 0 writes
-the rows each process handed the step and the parameters the pool ended with.
-The same script on one process is the reference.
+from engines do. With `--records`, the model is a mixture and every call
+records its routing and its sampler's support, and the second half of the
+tasks truncate, so the share that holds them packs no record at all. The
+pool fits one update on `--mesh`, and process 0 writes the rows each process
+handed the step and the parameters the pool ended with. The same script on
+one process is the reference.
 """
 
 import argparse
@@ -28,6 +31,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--mesh", required=True, help="MeshSpec fields as JSON")
     parser.add_argument("--vary", action="store_true", help="each process's draws depend on the process")
+    parser.add_argument("--records", action="store_true",
+                        help="calls record routing and supports, and the second half of the tasks truncate")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -41,14 +46,17 @@ def main() -> None:
 
     from dew.data.dataset import DataPartition, Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler
     from dew.objectives.rl.sessions import Call, Session, Status
     from dew.training import Layout, MeshSpec, Trainer
 
     process = jax.process_index()
+    mixture = Mixture(experts=4, top_k=2, expert_features=16) if args.records else None
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla")
+                              mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
+                              mixture=mixture)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 
     class Scripted:
@@ -56,12 +64,15 @@ def main() -> None:
             futures = []
             for sample in range(samples):
                 draw = int(task.id) * 10 + sample + (process if args.vary else 0)
-                call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), (3 + draw % 4, 4 + sample),
-                            (-0.5 - 0.01 * sample, -0.25), "stop", version)
+                sampled = (3 + draw % 4, 4 + sample)
+                recorded = {"routed_experts": np.asarray([[[draw % 4, (draw + 1) % 4]]] * 3, np.uint8),
+                            "support": tuple((token, 11) for token in sampled)} if args.records else {}
+                call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
+                            (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
+                status = (Status.TRUNCATED if args.records and int(task.id) > TASKS // 2
+                          else Status.COMPLETED)
                 future = Future()
-                future.set_result(
-                    Session(str(task.id), "", 0, 0, (call,), Status.COMPLETED, float(sample), {}, "")
-                )
+                future.set_result(Session(str(task.id), "", 0, 0, (call,), status, float(sample), {}, ""))
                 futures.append(future)
             return futures
 
@@ -99,7 +110,7 @@ def main() -> None:
     partition = DataPartition.of(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),
-                                 groups=2, max_lag=1, ahead=1)
+                                 groups=2, max_lag=1, ahead=1, support_capacity=16 if args.records else None)
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
