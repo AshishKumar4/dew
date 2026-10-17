@@ -199,7 +199,8 @@ class DecisionRunConfig(RunConfig):
             if jax.process_index() == 0:
                 calibrated.save(directory)
 
-        metrics = (Accuracy(), ECE(), AURC(), LogLoss())
+        # The task's own default metrics, asked for where its data holds held-out rows to score.
+        metrics = (Accuracy(), ECE(), AURC(), LogLoss()) if dataset.val is not None else ()
         fitted = calibrate if self.calibrate and dataset.val is not None else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=fitted))

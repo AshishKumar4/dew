@@ -150,7 +150,9 @@ class LMRunConfig(RunConfig):
             raise ValueError(f"{loaded.records} training windows do not fill one batch of "
                              f"{self.trainer.batch_size}, so an epoch is no steps at all: read more data "
                              "or lower --trainer.batch-size")
-        validation = () if self.trainer.eval_interval(loaded) is None else (Perplexity(),)
+        # The run's own default metric, asked for where its data holds a validation split to score.
+        scored = self.trainer.eval_interval(loaded) is not None and loaded.val is not None
+        validation = (Perplexity(),) if scored else ()
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
 
     def tokens(self) -> TextData:
