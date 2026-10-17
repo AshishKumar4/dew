@@ -393,11 +393,14 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     metric = Value('value', Shown(better='lower'))
     plain = trainer(tmp_path / 'plain')
     state = plain.fit(data(), steps=2, log_every=1)
+    plain.checkpoints.wait()
+    # The data position the run saved with its state, which a resume past step 0 needs.
+    _, position = plain.checkpoints.restore(step=2)
     path, local = str(tmp_path / 'run'), str(tmp_path / 'local')
     control = {'plateau:val/value': {'best': .2, 'bad': 1, 'step': 2,
                                     'rule': {'mode': 'min', 'evals': 3, 'min_delta': 0.}}}
     checkpoints = Checkpoints(path, local_directory=local, local_every=1)
-    checkpoints.save_local(2, state, None, control=control)
+    checkpoints.save_local(2, state, position, control=control)
     checkpoints.wait()
     resumed = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
                        checkpoints=Checkpoints(path, local_directory=local, local_every=1))
