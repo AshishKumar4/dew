@@ -25,7 +25,9 @@ limits on memory, CPU, process count and CPU time. Use it for hostile code.
 
 A program that fails returns an `Outcome`, and the reward decides what a
 timeout or a crash is worth. A runner raises only when it cannot start a
-program at all.
+program at all: an `OSError` when the process cannot start, and an
+`InfrastructureError` when a container runtime starts no container. A
+session source retries either as an infrastructure failure.
 
 `MathReward` is a verifiable reward that runs no program. It reads the
 completion's final answer and compares it with the reference as an exact
@@ -58,6 +60,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
+from dew.objectives.rl.sessions import InfrastructureError
 from dew.records import JSON
 
 
@@ -463,7 +466,7 @@ class ContainerRunner:
     and the process count at `pids`, and it runs as `user`. At the wall
     deadline the runner kills the client process, then force-removes the
     container by name. A runtime that exits without creating the container
-    (no daemon, no permission, no image) raises RuntimeError.
+    (no daemon, no permission, no image) raises `InfrastructureError`.
     """
 
     image: str
@@ -527,8 +530,8 @@ class ContainerRunner:
             if stopped is None and not (os.path.exists(cidfile) and Path(cidfile).read_text().strip()):
                 # The client ended without creating a container: the runtime
                 # failed, and the program never ran to be scored.
-                raise RuntimeError(f"{self.runtime} created no container (exit {outcome.exit_code}): "
-                                   f"{outcome.stderr.strip()}")
+                raise InfrastructureError(f"{self.runtime} created no container (exit {outcome.exit_code}): "
+                                          f"{outcome.stderr.strip()}")
             # `docker run` exits with 128 plus the signal that ended the
             # container's process. The CPU soft limit sits one second under
             # the hard one, so running out of CPU time is SIGXCPU; SIGKILL is

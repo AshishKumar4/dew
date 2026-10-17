@@ -17,13 +17,16 @@ a session that spans a weight push carries both versions.
 
 The statuses follow the scheduler's failure policy. An infrastructure
 failure is an INFRA_ERROR session, retried and never scored: a failed draw,
-an environment that reports ERROR, and an `OSError` that the environment,
-the verifier or the reward raises, such as a lost connection or a sandbox
-past its wall clock (`SubprocessEnvironment` raises TimeoutError). A
-context, token or turn limit truncates, and only COMPLETED and TRUNCATED
-sessions reach the verifier. Any other error is broken code or a broken
-contract, such as a non-finite reward or an environment that returns no
-`Observation`: it fails the rollout's future, and the scheduler raises it.
+an environment that reports ERROR, and an `InfrastructureError` or
+`OSError` that the environment, the verifier or the reward raises. Those
+are a lost connection, a sandbox past its wall clock or with a dead worker
+(`SubprocessEnvironment`), a container runtime that started no container
+(`ContainerRunner`), and any boundary failure a callback reports as an
+`InfrastructureError`. A context, token or turn limit truncates, and only
+COMPLETED and TRUNCATED sessions reach the verifier. Any other error is
+broken code or a broken contract, such as a non-finite reward or an
+environment that returns no `Observation`: it fails the rollout's future,
+and the scheduler raises it.
 
 `PromptSource` is the single-turn case: one call per sample, scored on
 decoded text by a reward on scorer threads as each draw finishes, so
@@ -58,7 +61,10 @@ from .episodes import (
     step_action,
 )
 from .rollout import Reward, prompt_rows
-from .sessions import Call, Session, Status, Task
+from .sessions import Call, InfrastructureError, Session, Status, Task
+
+_INFRASTRUCTURE = (InfrastructureError, OSError)
+"""What a callback raises when its external boundary, not its code, failed."""
 
 
 def _failure(error: BaseException) -> str:
@@ -202,7 +208,7 @@ class EnvironmentSource:
                 self._play(episode, environment, key, handle, draws)
             if episode.status not in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
                 episode.score(lambda finished: self.verifier(task, finished), version, binding)
-        except OSError as error:
+        except _INFRASTRUCTURE as error:
             # The environment's or the verifier's boundary failed: infrastructure, retried.
             episode.abort(EpisodeStatus.ERROR, _failure(error))
         session = session_of(episode.episode(version, binding), group="")
@@ -258,10 +264,11 @@ class PromptSource:
     `decode` turns the sampled ids into text, and `reward` scores that text,
     without the EOS, on `scorers` threads as soon as each draw finishes. A
     draw that ends on its token budget is TRUNCATED and still scored. A
-    failed draw, and an `OSError` the reward raises, such as a sandbox it
-    could not start, give an INFRA_ERROR session. A non-finite reward and
-    any other error of the decode or the reward resolve the rollout's future
-    with the exception, so no future is left pending.
+    failed draw, and an `InfrastructureError` or `OSError` the reward
+    raises, such as a container runtime that started no container, give an
+    INFRA_ERROR session. A non-finite reward and any other error of the
+    decode or the reward resolve the rollout's future with the exception, so
+    no future is left pending.
     """
 
     def __init__(
@@ -314,7 +321,7 @@ class PromptSource:
         text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
         try:
             score = self.reward(prompt.source, text, prompt.truth, prompt.info)
-        except OSError as error:
+        except _INFRASTRUCTURE as error:
             # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
             return Session(
                 task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"

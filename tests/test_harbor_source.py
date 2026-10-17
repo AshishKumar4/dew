@@ -2,7 +2,9 @@
 
 The gateway's traces are the JSON rllm-model-gateway serves for a vLLM or
 SGLang worker; Harbor is a stand-in executable that takes the same `trials
-start` arguments and writes a `TrialResult`-shaped `result.json`.
+start` arguments and writes a `TrialResult`-shaped `result.json`. A trial
+that hangs past `trial_timeout` is interrupted and retried by a real
+`RolloutScheduler` under a `Trainer`.
 """
 
 import json
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import httpx
 import jax
+import numpy as np
 import pytest
 
 from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
@@ -150,6 +153,16 @@ if "stubborn" in value("-p"):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 if "slow" in value("-p") or "stubborn" in value("-p"):
     time.sleep(60)
+if "once" in value("-p"):
+    # The first trial of the task directory hangs, with its pid in the marker; the others finish.
+    try:
+        marker = os.open(os.path.join(value("-p"), "hung"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        pass
+    else:
+        os.write(marker, str(os.getpid()).encode())
+        os.close(marker)
+        time.sleep(60)
 with open(os.path.join(trial, "result.json"), "w") as out:
     json.dump({"exception_info": None, "verifier_result": {"rewards": {"reward": 1}}}, out)
 '''
@@ -163,8 +176,8 @@ def harbor(tmp_path):
     return executable
 
 
-def fake_gateway(unhealthy_checks=0, unreachable_models=0):
-    """A gateway whose every session recorded one call sampling [10 + sample].
+def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7):
+    """A gateway whose every session recorded one call sampling [10 + sample], stamped `version`.
 
     Its one worker is dead for the first `unhealthy_checks` health reads, like rllm-model-gateway
     started beside an engine still loading: its health loop marks the worker dead, and until the
@@ -192,7 +205,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0):
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
         sample = int(session.split(":")[2])
-        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=7)])
+        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=version)])
 
     return Gateway("http://gateway", sandbox_url="http://172.17.0.1:9090",
                    client=httpx.Client(transport=httpx.MockTransport(network))), asked
@@ -285,6 +298,57 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
         source.cancel([future])
     finally:
         source.close()
+
+
+def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tmp_path, harbor):
+    """Harbor bounds a trial's phases, not the whole trial. One trial hangs: `trial_timeout`
+    interrupts it, its Harbor exits, it resolves INFRA_ERROR, and the scheduler's retry
+    completes its group, so the step admits every task's group."""
+    import optax
+
+    from dew.data.dataset import Loader
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.objectives.rl.scheduler import task_ids
+    from dew.training import Layout, Trainer
+
+    class Publisher:
+        version = 0
+
+        def load(self, variables, version):
+            self.version = version
+
+    hanging = tmp_path / "once"
+    hanging.mkdir()
+    gateway, _ = fake_gateway(version=None)
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
+                          grace=1.0, trial_timeout=3.0)
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=16, dtype="float32")
+    objective = GRPOObjective(model, seq_len=7)
+    tasks, records = jax.device_count(), []
+    scheduler = RolloutScheduler(
+        objective, source, Publisher(), width=8, rows=2 * tasks, groups=2, max_lag=0, ahead=0,
+        tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
+        log=records.append)
+    data = scheduler.tasks(Loader(train=lambda partition: iter(
+        lambda: {"task_id": np.arange(tasks, dtype=np.int32)}, None), val=None, records=None, batch=tasks))
+    try:
+        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        state = trainer.fit(data, steps=1, log_every=1)
+    finally:
+        scheduler.close()
+        source.close()
+    assert int(state.step) == 1
+    [record] = records
+    assert record.groups == tasks and record.abandoned == 0 and record.resubmitted == {"infra_error": 1}
+    # The hung trial's Harbor exited on the interrupt, long before its sleep ended, so of the
+    # 2 * tasks + 1 trials only the hung one wrote no result.
+    pid = int((hanging / "hung").read_text())
+    assert not Path(f"/proc/{pid}").exists()
+    assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 2 * tasks + 1
+    assert len(list((tmp_path / "trials").glob("*/result.json"))) == 2 * tasks
 
 
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):

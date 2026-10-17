@@ -19,6 +19,7 @@ import time
 import pytest
 from tool_support import load
 
+from dew.objectives.rl import InfrastructureError
 from dew.rl.sandbox import (
     ContainerRunner,
     MathReward,
@@ -191,7 +192,7 @@ def test_a_runtime_that_cannot_start_the_container_raises():
     # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
     with (
         SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet,
-        pytest.raises(RuntimeError),
+        pytest.raises(InfrastructureError),
     ):
         fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
 
