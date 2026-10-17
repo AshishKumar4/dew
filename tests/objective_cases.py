@@ -18,7 +18,7 @@ from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.data import HoldOut, ImageData, PreferenceData, TextData, loader
 from dew.data import TFDS, Loading
 from dew.data.dataset import DataPartition
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.decision.data import Decisions

@@ -245,8 +245,8 @@ class DiffusionObjective(Objective[Ratio]):
         """Each batch's captions tokenized for the conditions, on the host, as
         the step reads them, and the fields other conditions read (a clip's
         sound) encoded; without text conditions, captions are dropped."""
+        from dew.data.images import EncodeCaptions, EncodeFields
         from dew.data.pipeline import ObjectiveData
-        from dew.data.steps.image import EncodeCaptions, EncodeFields
 
         conditions = self.inputs.conditions.values()
         steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),

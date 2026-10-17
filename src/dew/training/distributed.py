@@ -438,19 +438,25 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
     """Refuse a training stream a run cannot resume or cannot shard.
 
     `resumed` is the step a resume restored from a checkpoint without a data
-    position, which a stream that keeps none cannot continue: it would read
-    its data again from the start. A `batch` the mesh cannot divide fails where it is placed or
+    position, which no stream can continue: with no position to restore, one
+    that keeps positions (`Checkpointable`) and one declared to replay alike
+    would read its data again from the start, so past step 0 it is refused.
+    A `batch` the mesh cannot divide fails where it is placed or
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole, never in a `window` of more than one microbatch.
     """
-    if resumed is not None and not isinstance(source, Checkpointable):
-        raise ValueError(
-            f"step {resumed}'s checkpoint holds no data position, as {stream_identity(source)} keeps "
-            f"none, so resuming would read its data again from the start; give the stream get_state "
-            f"and set_state, read it through dew.data, or declare that it reads the same batches each "
-            f"time it opens (dew.data.dataset.replayed, from_iter(replay=True))")
+    if resumed:
+        kept = isinstance(source, Checkpointable)
+        why = ("it was saved without one (Checkpoints.save's `saved`)" if kept
+               else f"{stream_identity(source)} keeps none")
+        remedy = ("save the stream's position with the state, as Trainer.fit does" if kept else
+                  "give the stream get_state and set_state, read it through dew.data, or declare that "
+                  "it reads the same batches each time it opens (dew.data.dataset.replayed, "
+                  "from_iter(replay=True))")
+        raise ValueError(f"step {resumed}'s checkpoint holds no data position, as {why}, so resuming "
+                         f"would read its data again from the start; {remedy}")
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, microbatches)

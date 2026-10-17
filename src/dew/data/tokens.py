@@ -1,4 +1,4 @@
-"""Indexed document chunks and first-fit plans."""
+"""Document chunk tables, packed windows and first-fit plans."""
 
 from __future__ import annotations
 
@@ -17,11 +17,15 @@ def chunk_counts(lengths, chunk_len: int):
 
 
 def chunk_lengths(lengths, chunk_len: int) -> np.ndarray:
-    """The token count of every chunk `DocumentChunks` cuts `lengths` into.
+    """The token count of each chunk documents of `lengths` are cut into:
+    consecutive pieces of at most `chunk_len` tokens.
 
-    A document of `chunk_len` tokens or fewer is one chunk of its own length;
-    a longer one is whole chunks and a remainder. A document of no tokens is
-    no chunks, as `chunk_counts` says.
+    A window holds nothing longer than itself, so a document that outgrows
+    it is cut first, and each chunk becomes its own segment of the window,
+    which keeps attention inside the chunk and RoPE running from the chunk's
+    own 0. A document of `chunk_len` tokens or fewer is one chunk of its own
+    length; a longer one is whole chunks and a remainder. A document of no
+    tokens is no chunks, as `chunk_counts` says.
     """
     lengths = np.asarray(lengths, np.int64)
     counts = chunk_counts(lengths, chunk_len)
@@ -43,8 +47,17 @@ def chunk_table(lengths, chunk_len: int) -> tuple[np.ndarray, np.ndarray]:
 
 def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     """`chunks`, each holding the same per-token fields, laid end to end in a
-    zero-padded window of `window` tokens, with the segment ids and positions
-    `PackedWindows` describes."""
+    zero-padded window of `window` tokens.
+
+    Named after the first field (the ids), `<field>_segment_ids` says which
+    chunk of the window each token came from, counted from 1, and 0 for the
+    padding at the end, and `<field>_positions` the token's place inside its
+    chunk. A block-diagonal mask and per-document RoPE read that pair.
+    grain's packer writes one pair per packed feature
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
+    chunks are cut the same way in every field here, so one pair describes
+    them all and nothing transfers a second copy to the device.
+    """
     fields = {key: np.zeros(window, value.dtype) for key, value in chunks[0].items()}
     segment_ids = np.zeros(window, np.int32)
     positions = np.zeros(window, np.int32)
@@ -129,87 +142,3 @@ class _WrappingDataset(pygrain.MapDataset[Batch]):
         if isinstance(index, slice):
             return self.slice(index)
         return self.record(index % len(self))
-
-
-class DocumentChunks(_WrappingDataset):
-    """Cuts documents into consecutive chunks of at most `chunk_len` tokens.
-
-    A window holds nothing longer than itself, so a document that outgrows
-    the window is cut first. Each chunk becomes its own segment in the packed
-    window, which keeps attention inside the chunk and RoPE running from the
-    chunk's own 0.
-
-    The chunk table is built once from the document lengths. A record then
-    costs one read of its document and a slice.
-    """
-
-    def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
-        super().__init__(parent)
-        self._chunk_len = chunk_len
-        self._document, self._offset = chunk_table(lengths, chunk_len)
-
-    def __len__(self) -> int:
-        return len(self._document)
-
-    def record(self, index: int) -> Batch:
-        document = self._parent[int(self._document[index])]
-        if document is None:
-            raise ValueError(f"document {index} of the packed corpus is missing")
-        start = int(self._offset[index])
-        # Every per-token field is cut the same way, so ids and roles stay
-        # aligned inside the chunk.
-        return {key: value[start:start + self._chunk_len] for key, value in document.items()}
-
-
-class PackedWindows(_WrappingDataset):
-    """Packs documents into windows of `window` tokens, by one plan over the
-    whole corpus.
-
-    Every window carries its per-token fields and, named after the first of
-    them (the ids), `<field>_segment_ids` (which chunk of the window each
-    token came from, counted from 1, and 0 for the padding at the end) and
-    `<field>_positions` (the token's place inside its chunk). A block-diagonal
-    mask and per-document RoPE read that pair. grain's packer writes one
-    pair per packed feature
-    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
-    chunks are cut the same way in every field here, so one pair describes
-    them all and nothing transfers a second copy to the device.
-
-    A window is read by index. `first_fit` plans the packing from the
-    document lengths alone, in file order, before any sharding. Window w
-    therefore holds the same chunks at every process count, and the training
-    stream shuffles, shards and counts windows as it does any other record.
-    `order` and `starts` hold that plan as `first_fit` returns it.
-
-    `documents` is any dataset of per-token fields whose lengths are
-    `lengths`. `described` names it the way a saved position needs
-    (`describe`), since which chunks share a window is part of the order the
-    position counts into.
-    """
-
-    def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
-                 bins: int, described: str, *, segments: int | None = None):
-        super().__init__(DocumentChunks(documents, lengths, window))
-        self._window, self._bins = window, bins
-        self._described = described
-        self.order, self.starts = first_fit(chunk_lengths(lengths, window), window, bins, segments)
-
-    def __repr__(self) -> str:
-        # A saved position names the order it counts into (`dew.position`),
-        # and which chunks share a window is part of that order.
-        return (f"PackedWindows({self._described}, window={self._window}, "
-                f"bins={self._bins}, windows={len(self)})")
-
-    def __len__(self) -> int:
-        return len(self.starts) - 1
-
-    def record(self, index: int) -> Batch:
-        chunks = []
-        for position in self.order[self.starts[index]:self.starts[index + 1]]:
-            chunk = self._parent[int(position)]
-            if chunk is None:
-                raise ValueError(f"chunk {int(position)} of the packed corpus is missing")
-            chunks.append(chunk)
-        return packed_window(chunks, self._window)
-
-

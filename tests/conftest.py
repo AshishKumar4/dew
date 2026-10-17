@@ -34,6 +34,22 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
 jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
+def pytest_collectstart(collector):
+    if _remote is not None and isinstance(collector, pytest.Module):
+        _remote.opened(collector.nodeid)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Each file's programs join its bundle of the shared cache, written back after its last test."""
+    file = item.nodeid.split("::")[0]
+    if _remote is not None:
+        _remote.opened(file)
+    yield
+    if _remote is not None and (nextitem is None or nextitem.nodeid.split("::")[0] != file):
+        _remote.closed(file)
+
+
 def pytest_sessionfinish(session, exitstatus):
     if _remote is not None:
         _remote.drain()
