@@ -39,6 +39,16 @@ _SPELLING = RopeSpelling(theta=10000.0, per_kind=True, local_theta=10000.0)
 
 _SUBLAYERS = ('sliding_attention', 'full_attention')
 
+_DEFAULTS = {'vocab_size': 131072, 'hidden_size': 2560, 'num_hidden_layers': 72, 'intermediate_size': 7168,
+             'num_attention_heads': 16, 'num_key_value_heads': 4, 'head_dim': 256,
+             'max_position_embeddings': 8192, 'tie_word_embeddings': False, 'hidden_act': 'silu',
+             'initializer_range': 0.02, 'sliding_window': 1024, 'ngpt_alpha_init': 0.05,
+             'attention_output_gate_logit_scale_init': None, 'mlp_bias': False, 'attention_bias': False,
+             'n_input_layers': 0, 'n_recurrent_layers': None, 'n_output_layers': 0, 'n_recurrent_loops': 1,
+             'recurrent_kv_cache_mode': 'per_loop'}
+"""DoryConfig's defaults (configs/dory.py:14-38), which a config's absent keys take: transformers
+writes a config's non-default keys alone."""
+
 
 def _pairs(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
     """The attention kind of each (attention, MLP) pair of layers, which the released layout is."""
@@ -71,38 +81,42 @@ def _rope(hf_config: Mapping[str, object], used: set[str]):
     return read_rope({**hf_config, 'rope_parameters': whole or None}, used, None, _SPELLING)
 
 
-def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+def _dory_config(stated: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Dory config into `CausalTransformer` fields: half its layers as blocks, the loop over
-    the recurrent ones and nGPT's gains (dory.py:53-280)."""
+    the recurrent ones and nGPT's gains (dory.py:53-280), refusing what DoryConfig refuses
+    (configs/dory.py:39-133)."""
+    hf_config = {**_DEFAULTS, **stated}
     kinds = _pairs(hf_config, used)
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    first = records.integer(hf_config.get('n_input_layers', 0), 'n_input_layers')
-    outputs = records.integer(hf_config.get('n_output_layers', 0), 'n_output_layers')
-    stated = hf_config.get('n_recurrent_layers')
-    recurrent = (layers - first - outputs if stated is None
-                 else records.integer(stated, 'n_recurrent_layers'))
+    first = records.integer(hf_config['n_input_layers'], 'n_input_layers')
+    outputs = records.integer(hf_config['n_output_layers'], 'n_output_layers')
+    given = hf_config['n_recurrent_layers']
+    recurrent = layers - first - outputs if given is None else records.integer(given, 'n_recurrent_layers')
     if min(first, recurrent, outputs) < 0 or first + recurrent + outputs != layers:
         refuse(f'n_input_layers {first}, n_recurrent_layers {recurrent}, n_output_layers {outputs}',
                f'they partition the {layers} layers')
     if first % 2 or recurrent % 2:
         refuse('a partition that splits an (attention, mlp) pair', 'a Dew block is the whole pair')
-    loops = records.integer(hf_config.get('n_recurrent_loops', 1), 'n_recurrent_loops')
-    mode = records.text(hf_config.get('recurrent_kv_cache_mode', 'per_loop'), 'recurrent_kv_cache_mode')
+    loops = records.integer(hf_config['n_recurrent_loops'], 'n_recurrent_loops')
+    mode = records.text(hf_config['recurrent_kv_cache_mode'], 'recurrent_kv_cache_mode')
     if mode not in ('per_loop', 'last_loop'):
         refuse(f'recurrent_kv_cache_mode {mode!r}', "Dory caches 'per_loop' or 'last_loop'")
     if loops < 1:
         refuse(f'n_recurrent_loops {loops}', 'a loop runs its block at least once')
-    std = records.number(hf_config.get('initializer_range', 0.02), 'initializer_range')
-    alpha = records.number(hf_config.get('ngpt_alpha_init', 0.05), 'ngpt_alpha_init')
-    stated_gate = hf_config.get('attention_output_gate_logit_scale_init')
+    std = records.number(hf_config['initializer_range'], 'initializer_range')
+    alpha = records.number(hf_config['ngpt_alpha_init'], 'ngpt_alpha_init')
+    stated_gate = hf_config['attention_output_gate_logit_scale_init']
     gate = (None if stated_gate is None
             else records.number(stated_gate, 'attention_output_gate_logit_scale_init'))
     used.update(('n_input_layers', 'n_recurrent_layers', 'n_output_layers', 'n_recurrent_loops',
                  'recurrent_kv_cache_mode', 'initializer_range', 'ngpt_alpha_init',
                  'attention_output_gate_logit_scale_init'))
-    if records.boolean(hf_config.get('attention_bias', False), 'attention_bias'):
-        refuse('attention_bias', 'Dory projects without biases')
-    used.add('attention_bias')
+    if hf_config['attention_bias'] or hf_config['mlp_bias']:
+        refuse('attention_bias or mlp_bias', 'Dory projects without biases')
+    if hf_config['hidden_act'] != 'silu' or hf_config['tie_word_embeddings']:
+        refuse(f"hidden_act {hf_config['hidden_act']!r} or tied embeddings",
+               'Dory requires SiLU and untied embeddings')
+    used.update(('attention_bias', 'mlp_bias'))
     pairs = {**hf_config, 'num_hidden_layers': layers // 2, 'layer_types': list(kinds)}
     config = base_config(pairs, used, layer_types=kinds, rope=_rope(hf_config, used),
                          reads=frozenset({'layer_types', 'sliding_window'}))
