@@ -188,7 +188,7 @@ def running(pid: int) -> bool:
 # ssh -tt as the launcher runs it, to a host that is this machine: the remote command runs under a
 # terminal of its own whose input is ssh's, and closing the connection, as ssh exiting does, hangs that
 # terminal up.
-SSH = """import os, pty, select, sys
+SSH = """import os, pty, select, signal, sys
 words, skipped = [], False
 for word in sys.argv[1:]:
     if skipped or word == "-o":
@@ -197,6 +197,9 @@ for word in sys.argv[1:]:
         words.append(word)
 pid, terminal = pty.fork()
 if pid == 0:
+    # sshd starts the remote shell with every signal at its default, whatever this process inherited.
+    for number in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(number, signal.SIG_DFL)
     os.execvp(SHELL[0], [*SHELL, "-c", " ".join(words[1:])])
 reading = True
 while True:
