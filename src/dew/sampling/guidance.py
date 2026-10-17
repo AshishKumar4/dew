@@ -378,4 +378,13 @@ class Guidance(Protocol):
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk: ...
 
 
-__all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Walk"]
+@runtime_checkable
+class Guided(Protocol):
+    """A guidance whose walk runs a model of its own beside the denoiser's (`Autoguidance.model`),
+    which a program that walks it compiles for too (`dew.nn.kernels.options.compiler_options`)."""
+
+    @property
+    def model(self) -> nn.Module: ...
+
+
+__all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Guided", "Walk"]
