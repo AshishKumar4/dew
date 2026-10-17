@@ -32,7 +32,7 @@ from dew.decision.layout import (
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Decide, Weights, laid_out
+from dew.decision.task import Decide, DecideSettings, Weights, laid_out
 from dew.inference.pipeline import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
@@ -57,7 +57,6 @@ from dew.objectives.base import (
     part,
 )
 from dew.records import integer, record
-from dew.registry import import_path
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -413,7 +412,6 @@ class DecisionObjective(Objective[Ratio]):
     """
 
     saved_task = Decide
-    inference_fields = frozenset({"head", "layout", "specials", "tokenizer", "processor"})
     _held_parts = True
 
     counts_tokens = True
@@ -644,32 +642,28 @@ class DecisionObjective(Objective[Ratio]):
             packed=(PackedRows(self.layout.max_len, compact),),
         )
 
-    def inference_record(self):
-        """Return what a saved run rebuilds its task from.
+    def task_settings(self) -> DecideSettings:
+        """What a saved run rebuilds its task from beside the backbone.
 
-        That is the backbone, head, layout, tokenizer, special tokens and the
-        image processor's source, independently of the text tokenizer. Interop
+        That is the head, layout, tokenizer, special tokens and the image
+        processor's source, independently of the text tokenizer. Interop
         reloads that source's processor files and derives its media geometry
         from the source config; the decision record owns neither format.
         """
-        from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
 
-        return {
-            "objective": import_path(type(self)),
-            "model": to_record(ModelConfig.from_model(self.model.backbone), ModelConfig),
-            "head": self.model.head.record(),
-            "layout": {
-                "name": type(self.layout).__name__,
-                "fields": to_record(self.layout, type(self.layout)),
-            },
-            "specials": to_record(self.specials, Specials),
-            "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
+        return DecideSettings(
+            self.model.head.record(),
+            {"name": type(self.layout).__name__, "fields": to_record(self.layout, type(self.layout))},
+            self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
-            "processor": (None if self.image_processor is None or self.image_processor.directory is None
-                          else self.image_processor.source),
-        }
+            None if self.image_processor is None or self.image_processor.directory is None
+            else self.image_processor.source)
+
+    def recorded_model(self) -> nn.Module:
+        """The backbone; the head is a task setting of its own."""
+        return self.model.backbone
 
     def pipeline(
         self,
