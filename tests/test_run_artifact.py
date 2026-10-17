@@ -102,8 +102,9 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
     record = checkpoints.artifact()['model']
     assert record['name'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
     assert record['wrappers'] == [{'class': 'dew.lora:AdapterRecord', 'fields': {
-        'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
-            'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
+        'targets': {f'params/layers_0/self_attn/{name}': {'rank': 2, 'alpha': 4.0}
+                    for name in ('q_proj', 'v_proj')},
+        'rslora': False, 'dropout': 0.0, 'layouts': {
             f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight',
                                                    'shape': [16, 16], 'transpose': [1, 0]}
             for name in ('q_proj', 'v_proj')}, 'bases': {}}}]
