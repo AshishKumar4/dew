@@ -37,7 +37,7 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, po
 
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.nn.inputs import pad_token_rows
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import token_log_probs
 from dew.sampling.text import Sampling
 

@@ -46,7 +46,7 @@ from dew.nn.inputs import (
     real_slots,
     valid_order,
 )
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
@@ -905,7 +905,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None, None),
                    out_shardings=(None, rows), compiler_options=dict(options))

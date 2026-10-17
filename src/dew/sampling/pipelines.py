@@ -24,7 +24,7 @@ from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Variables, thaw
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
@@ -755,7 +755,7 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
 @functools.cache
 def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The image a walk starts from over `rows`, compiled with the autoencoder's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`)."""
+    (`dew.nn.kernels.options.compiler_options`)."""
     def prepare(autoencoder, process, shape, params, samples, keys, encode_key, start):
         spatial = {}
         pixels = samples.get("image")
@@ -832,7 +832,7 @@ def _initial(rows: jax.sharding.NamedSharding | None):
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The walk over `rows`, compiled with its denoiser's and autoencoder's own XLA `options`
-    (`dew.nn.kernels.generation.compiler_options`), so a quantized model and another never share it."""
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     # Rebinding weights must not change the static compilation identity, nor a
     # solver's or guidance's numbers, nor the grid's values: the solver and the
     # guidance are pytrees whose structure is static and whose numbers (a

@@ -44,7 +44,7 @@ from dew.inference.banks import (
     one_layer,
 )
 from dew.nn.backbones.layer_plan import group_name
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer

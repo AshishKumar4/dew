@@ -202,7 +202,7 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.generation.compiler_options`)."""
+    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`)."""
     quantized = _qwix().quantize_model(model, provider, methods=entry_methods(model))
     type(quantized)._dew_quantization = spec
     return quantized

@@ -40,7 +40,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.nn.kernels.generation import compiler_options
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
