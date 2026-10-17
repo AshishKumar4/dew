@@ -27,7 +27,8 @@ code reads.
 
 With `--fla`, on a CUDA GPU with fla installed, it reads that head back and
 runs each request through the same release with HF's Qwen 3.5 Gated DeltaNet
-on fla's own chunked kernels, every other product IEEE fp32, and writes each
+on fla's own chunked rule at its own fp32 dot precision, every other product
+IEEE fp32, and writes each
 question's fp32 logits to logits_fla.npz under `<case>/<id>`: the reference
 Dew's model is held to where its delta rule runs on its port, fla's algorithm
 (tests/test_decision_joint_checkpoint.py). Its environment is pinned: torch
@@ -154,12 +155,20 @@ def on_fla() -> None:
 
     found = {name: importlib.metadata.version(name).split("+")[0] for name in FLA_PINS}
     assert found == FLA_PINS, f"on_fla runs in {FLA_PINS}, not {found}"
-    # HF falls back to its torch rule when fla does not import; import it here so the cause shows.
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-    rule = inspect.getclosurevars(modeling_qwen3_5.torch_chunk_gated_delta_rule).nonlocals["implementation"]
-    assert rule is chunk_gated_delta_rule, f"HF's Qwen 3.5 runs {rule.__module__}, not fla's chunked rule"
-    # Only fla's kernels part from the torch math the CPU fixture runs: no TF32 elsewhere.
+    # HF's Qwen 3.5 takes fla's rule only where its kernel lookup resolves it, which it did not in this
+    # environment; its Gated DeltaNet calls the rule by this module name, so it is fla's here, on the
+    # arguments fla's signature takes, at fla's own fp32 dot precision.
+    accepted, calls = inspect.signature(chunk_gated_delta_rule).parameters, []
+
+    def on_fla_rule(*args, **kwargs):
+        calls.append(None)
+        taken = {name: value for name, value in kwargs.items() if name in accepted}
+        return chunk_gated_delta_rule(*args, **taken)
+
+    modeling_qwen3_5.torch_chunk_gated_delta_rule = on_fla_rule
+    # Only fla's rule parts from the torch math the CPU fixture runs: no TF32 elsewhere.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = torch.device("cuda")
@@ -181,6 +190,7 @@ def on_fla() -> None:
             found = head(hidden, batch["input_ids"], batch["attention_mask"], batch["records"], table)[0]
         for question, fp32 in zip(encoded.questions, found, strict=True):
             logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
+    assert calls, "no layer ran fla's rule"
     np.savez(OUT / "logits_fla.npz", **logits)
 
 
