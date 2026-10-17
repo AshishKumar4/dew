@@ -301,10 +301,10 @@ class DewLM(TemplateLM):
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
 
-        A beam search ends at its EOS and budget; under stop strings beyond the
-        EOS's own text it raises ValueError, since `HFLM` ends every beam
-        together once its completion's text holds a stop, and no cut of
-        another search's answer reproduces that.
+        A beam search (`num_beams` above 1) raises ValueError. `HFLM` always
+        stops on its EOS's text as well as its stop strings, and its criterion
+        reads the leading candidate alone and ends every beam together, which
+        neither Dew's per-beam search nor a cut of its answer reproduces.
         A request's `max_length` is the total length `HFLM` hands `generate`,
         context included, in place of the budget. Its temperature is 0 where
         it names none, which decodes greedily unless the request asks to
@@ -312,10 +312,9 @@ class DewLM(TemplateLM):
         controls are the ones `HFLM` hands Transformers' `generate`, and they
         decode as a source's generation config does
         (`dew.interop.generation_config.source_decoding`), over the task's own
-        EOS and pad ids where the request names none: sampling filters and
-        penalties, logits processors, and beam search under `num_beams` with
-        its `length_penalty` and `early_stopping`. One Dew has no counterpart
-        for raises ValueError, as `generate` refuses a keyword it does not use.
+        EOS and pad ids where the request names none: sampling filters,
+        penalties and logits processors. One Dew has no counterpart for raises
+        ValueError, as `generate` refuses a keyword it does not use.
         """
         del disable_tqdm
         eos = None if self.task.sampling.eos_token_ids in (None, ()) else self.tok_decode([self.eot_token_id])
@@ -328,11 +327,11 @@ class DewLM(TemplateLM):
             controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
             budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
             stops = handle_stop_sequences(controls.pop("until", None), eos=eos)
-            if int(controls.get("num_beams") or 1) > 1 and any(stop and stop != eos for stop in stops):
+            if int(controls.get("num_beams") or 1) > 1:
                 raise ValueError(
-                    "a beam search under stop strings is refused: lm-eval's own model ends every beam "
-                    "together once its completion's text holds a stop, which a search that ranks "
-                    "each beam as it stopped, or a text cut afterwards, would answer differently")
+                    "a beam search is refused: lm-eval's own model stops on its EOS's text and stop "
+                    "strings by the leading candidate alone and ends every beam together, which "
+                    "Dew's per-beam search would answer differently")
             seed = int(controls.pop("seed", 0))
             total = controls.pop("max_length", None)
             # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
