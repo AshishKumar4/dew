@@ -80,9 +80,11 @@ async function stages(prepared) {
 	const fetched = [];
 	globalThis.fetch = async (url) => (fetched.push(String(url)), new Response('# trusted pinned installer'));
 	try {
-		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }), true);
-		// Holding a job, it takes no other, and says so: no error, as a preparer busy is no failure of the pin.
-		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'other' }), false);
+		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }, { answer: true }), true);
+		// Holding a job, it takes no other, and says so to a caller that asks: no error, as a preparer busy is no
+		// failure of the pin; a caller of an earlier build, which does not ask, hears it as it always has.
+		assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'other' }, { answer: true }), false);
+		await assert.rejects(prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'other' }), /already running/);
 		prepared.fetched = fetched;
 		await prepared.runner.alarm();
 		const built = { job: prepared.storage.get('job'), starts: prepared.starts.length,
@@ -174,7 +176,7 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 	prepared.storage.set('job', { record: { id: 'current', state: 'preparing' } });
 	prepared.state.alarm = Date.now() + 60_000;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'preparing']]);
-	assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }), false);
+	assert.equal(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' }, { answer: true }), false);
 	// The runtime gave up on the job's alarm: no alarm will run it again.
 	prepared.state.alarm = null;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'failed']]);
@@ -184,7 +186,7 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 test('a job an alarm runs, or will run, is running, so no other replaces it', async () => {
 	const refused = [];
 	const prepared = preparer({ during: async () => {
-		refused.push(!(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'next' })));
+		refused.push(!(await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'next' }, { answer: true })));
 	} });
 	await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
 	prepared.storage.set('job', { ...prepared.storage.get('job'), stage: 'smoke', began: Date.now() - 6 * 60_000,

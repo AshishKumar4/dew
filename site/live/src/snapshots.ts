@@ -14,8 +14,8 @@ interface SnapshotEnv {
 	SNAPSHOT_COMMIT: string;
 	// Each queues a preparation, which the preparer's alarms run and report to `prepared`.
 	PREPARER: DurableObjectNamespace<DurableObject & {
-		// False where the preparer holds another job; a preparer of an earlier build throws instead.
-		prepare(commit: string, reply: Reply): Promise<boolean | void>;
+		// Asked for an `answer`, false where the preparer holds another job; a preparer of an earlier build throws.
+		prepare(commit: string, reply: Reply, options?: { answer: boolean }): Promise<boolean | void>;
 		trial(commit: string, reply: Reply): Promise<void>;
 	}>;
 	POOL?: DurableObjectNamespace<DurableObject & { configure(generation: SnapshotGeneration): Promise<void> }>;
@@ -154,14 +154,15 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		});
 		if (!acquired) return false;
 		let taken: boolean | void;
+		const asked = Date.now();
 		try {
 			taken = await this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted')).prepare(commit,
-				{ registry: this.ctx.id.toString(), token });
+				{ registry: this.ctx.id.toString(), token }, { answer: true });
 		} catch (error) {
 			await this.failed(token, String(error));
 			return true;
 		}
-		if (taken === false) await this.waiting(token);
+		if (taken === false) await this.waiting(token, asked);
 		else await this.ctx.storage.delete('waiting');
 		return true;
 	}
@@ -171,11 +172,16 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	 * kept as it was, and the preparation waits for the preparer to say it is free (`freed`), or at the latest for as
 	 * long as any job of the preparer's may run.
 	 */
-	private async waiting(token: string): Promise<void> {
+	private async waiting(token: string, asked: number): Promise<void> {
 		await this.ctx.storage.transaction(async (storage) => {
 			const lease = await storage.get<{ token: string }>('rebuild');
 			if (lease?.token !== token) return;
 			await storage.delete('rebuild');
+			// Freed since it was asked, its word came before this: the preparation runs now.
+			if (((await storage.get<number>('freed')) ?? 0) >= asked) {
+				await storage.setAlarm(Date.now() + 1000);
+				return;
+			}
 			await storage.put('waiting', true);
 			await storage.setAlarm(Date.now() + REBUILD_MS);
 		});
@@ -184,6 +190,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	/** The trusted preparer is free: a preparation it turned away while it held another job runs now. */
 	async freed(): Promise<void> {
 		await this.ctx.storage.transaction(async (storage) => {
+			await storage.put('freed', Date.now());
 			if (!(await storage.get<boolean>('waiting'))) return;
 			await storage.delete('waiting');
 			const lease = await storage.get<{ until: number }>('rebuild');

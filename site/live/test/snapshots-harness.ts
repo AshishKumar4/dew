@@ -6,12 +6,23 @@ export class Registry extends SnapshotRegistry {
 }
 
 export class Preparer extends DurableObject<Env> {
-	/** Whether it took the preparation: not while `busy` holds it, as a preparer holding another job does. */
-	async prepare(commit: string, reply: Reply) {
-		if (await this.ctx.storage.get('busy')) return false;
+	/**
+	 * Whether it took the preparation: not while `busy` holds it, as a preparer holding another job does, which
+	 * it answers where asked and throws otherwise; with `freeAsAnswering`, it frees just before its answer arrives.
+	 */
+	async prepare(commit: string, reply: Reply, { answer = false } = {}) {
+		if (await this.ctx.storage.get('busy')) {
+			if (!answer) throw new Error('snapshot preparation is already running');
+			if (await this.ctx.storage.get('freeAsAnswering')) {
+				await this.ctx.storage.put('busy', false);
+				await this.env.REGISTRY.get(this.env.REGISTRY.idFromString(reply.registry)).freed();
+			}
+			return false;
+		}
 		await this.queue({ commit, trial: false, reply });
 		return true;
 	}
+	async freeAsAnswering() { await this.ctx.storage.put('freeAsAnswering', true); }
 	async hold(busy: boolean) { await this.ctx.storage.put('busy', busy); }
 	async trial(commit: string, reply: Reply) {
 		if (await this.ctx.storage.get('reject')) {
@@ -80,6 +91,14 @@ export default {
 			const freed = { status: await registry.status(), now: Date.now() };
 			await registry.runAlarm();
 			return Response.json({ waiting, freed, leased: (await registry.status()).rebuild, calls: await preparer.calls() });
+		}
+		if (scenario === 'freed-early') {
+			// The preparer frees just as it answers no: its word reaches the registry first, which runs it now.
+			await preparer.hold(true);
+			await preparer.freeAsAnswering();
+			await registry.ensure(A);
+			await registry.runAlarm();
+			return Response.json({ status: await registry.status(), now: Date.now() });
 		}
 		if (scenario === 'queued') {
 			const reply = await registry.ensure(A);
