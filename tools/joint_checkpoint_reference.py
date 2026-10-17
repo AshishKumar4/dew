@@ -27,13 +27,19 @@ code reads.
 
 With `--fla`, on a CUDA GPU with fla installed, it reads that head back and
 runs each request through the same release with HF's Qwen 3.5 Gated DeltaNet
-on fla's own chunked rule at its own fp32 dot precision, every other product
-IEEE fp32, and writes each
-question's fp32 logits to logits_fla.npz under `<case>/<id>`: the reference
-Dew's model is held to where its delta rule runs on its port, fla's algorithm
-(tests/test_decision_joint_checkpoint.py). Its environment is pinned: torch
-2.8.0 for CUDA 12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla`
-checks before it runs.
+on fla's own chunked rule, and writes each question's fp32 logits to
+logits_fla.npz under `<case>/<id>`, with `precision` its matmuls': the
+reference Dew's model is held to where its delta rule runs on its port, fla's
+algorithm (tests/test_decision_joint_checkpoint.py). Every product is IEEE
+fp32, as tests/reference_error.py's `ieee_fixture` requires: run it with
+TRITON_F32_DEFAULT=ieee for the dots that leave their precision unset, and it
+sets the one constant that fixes fla-core 0.5.2's intra-chunk solve at TF32 on
+a GPU that has it (fla/ops/gated_delta_rule/chunk_fwd.py:20-23) to 'ieee',
+the value fla takes on a GPU without TF32. Triton keys its disk cache on a
+kernel's source and not on the globals it reads, so these kernels compile into
+a cache directory of their own. Its environment is pinned: torch 2.8.0 for
+CUDA 12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla` checks
+before it runs.
 
 With `--images`, it reads that head back and runs the quickstart request
 with the backbone fixture's two images (images.npy) as the release's
@@ -48,6 +54,7 @@ included).
 import copy
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -155,11 +162,19 @@ def on_fla() -> None:
 
     found = {name: importlib.metadata.version(name).split("+")[0] for name in FLA_PINS}
     assert found == FLA_PINS, f"on_fla runs in {FLA_PINS}, not {found}"
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
+        raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
+    if os.environ.get("FLA_TRIL_PRECISION", "ieee") != "ieee":
+        raise SystemExit("leave FLA_TRIL_PRECISION at its 'ieee' default")
+    os.environ["TRITON_CACHE_DIR"] = str(Path.home() / ".cache" / "dew" / "triton-ieee")
+    from fla.ops.gated_delta_rule import chunk_fwd, chunk_gated_delta_rule
+    from triton.language import constexpr
+
+    chunk_fwd.SOLVE_TRIL_DOT_PRECISION = constexpr("ieee")
 
     # HF's Qwen 3.5 takes fla's rule only where its kernel lookup resolves it, which it did not in this
     # environment; its Gated DeltaNet calls the rule by this module name, so it is fla's here, on the
-    # arguments fla's signature takes, at fla's own fp32 dot precision.
+    # arguments fla's signature takes.
     accepted, calls = inspect.signature(chunk_gated_delta_rule).parameters, []
 
     def on_fla_rule(*args, **kwargs):
@@ -168,7 +183,6 @@ def on_fla() -> None:
         return chunk_gated_delta_rule(*args, **taken)
 
     modeling_qwen3_5.torch_chunk_gated_delta_rule = on_fla_rule
-    # Only fla's rule parts from the torch math the CPU fixture runs: no TF32 elsewhere.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = torch.device("cuda")
@@ -191,7 +205,22 @@ def on_fla() -> None:
         for question, fp32 in zip(encoded.questions, found, strict=True):
             logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
     assert calls, "no layer ran fla's rule"
-    np.savez(OUT / "logits_fla.npz", **logits)
+    np.savez(OUT / "logits_fla.npz", **logits, precision=fla_precision())
+
+
+def fla_precision() -> str:
+    """What logits_fla.npz records of its run's matmuls: 'ieee' where torch,
+    Triton's default and fla's two triangular solves all keep fp32, else those
+    that do not (tests/reference_error.py refuses all but 'ieee')."""
+    from fla.ops.gated_delta_rule import chunk_fwd
+
+    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+    modes = {"torch": "tf32" if reduced else "ieee",
+             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
+             "FLA_TRIL_PRECISION": os.environ.get("FLA_TRIL_PRECISION", "ieee"),
+             "the intra-chunk solve": str(getattr(chunk_fwd.SOLVE_TRIL_DOT_PRECISION, "value",
+                                                  chunk_fwd.SOLVE_TRIL_DOT_PRECISION))}
+    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
 
 
 def images() -> None:
