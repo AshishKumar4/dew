@@ -55,6 +55,17 @@ def token_id(value: object, *, where: str) -> int:
     return int(value)
 
 
+def token_ids(values: object, *, where: str) -> list[int]:
+    """`values` read as a nonempty row of token ids by `token_id`'s law: a list, a tuple or a
+    one-dimensional NumPy array, as a tokenizer, a dataset's column or a step of Dew's own
+    (`dew.data.text.Tokenize`) holds them."""
+    if isinstance(values, np.ndarray) and values.ndim == 1:
+        values = values.tolist()
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{where} holds a nonempty row of token ids, got {values!r}")
+    return [token_id(token, where=where) for token in values]
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
                    fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
@@ -507,17 +518,34 @@ def generation_signature(inputs: InputTree, controls: tuple) -> np.ndarray:
 VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
+COORDINATES_FIELD = "coordinates"
+"""The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
+validity field, `segment_ids` and `positions`."""
 
-def real_slots(fields: Mapping[str, jax.Array | np.ndarray], shape: tuple[int, ...], *, xp=jnp):
+
+def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
+    """The validity `[B, S]` and documents `[B, S]` of a row's token fields as the decoder reads them:
+    their `Coordinates`' where the fields carry them, else the validity field and `segment_ids`. Each
+    is None where nothing gives it (every slot real, one document a row). `xp` is the array module."""
+    laid = fields.get(COORDINATES_FIELD)
+    if isinstance(laid, Coordinates):
+        valid, segments = laid.valid, laid.segments
+    else:
+        valid, segments = fields.get(VALIDITY_FIELD), fields.get("segment_ids")
+    return (None if valid is None else xp.asarray(valid, bool),
+            None if segments is None else xp.asarray(segments))
+
+
+def real_slots(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], shape: tuple[int, ...], *, xp=jnp):
     """Which of a request's `shape` `[B, S]` slots hold a real token: those its
-    validity field marks, every one where it has none, less the padding a
-    packed row numbers 0 in `segment_ids` (`Coordinates.segments`). Samplers
-    select, place and continue a row by these, so a row padded either way
-    reads as the row alone; a caller's mask is narrowed, never replaced. `xp`
-    is the array module."""
-    valid = xp.asarray(fields[VALIDITY_FIELD], bool) if VALIDITY_FIELD in fields else xp.ones(shape, bool)
-    segments = fields.get("segment_ids")
-    return valid if segments is None else valid & (xp.asarray(segments) != 0)
+    validity marks, every one where it has none, less the padding a packed
+    row numbers 0 in its documents (`token_layout`). Samplers select, place
+    and continue a row by these, and losses score and count them, so a row
+    padded either way reads as the row alone; a caller's mask is narrowed,
+    never replaced. `xp` is the array module."""
+    valid, segments = token_layout(fields, xp=xp)
+    real = xp.ones(shape, bool) if valid is None else valid
+    return real if segments is None else real & (segments != 0)
 
 
 def valid_order(valid: jax.Array, *, xp=jnp) -> tuple[jax.Array, jax.Array]:

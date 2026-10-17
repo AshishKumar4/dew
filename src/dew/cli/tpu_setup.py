@@ -20,7 +20,6 @@ RUNS_DIR = f"$HOME/{RUNS}"
 MOUNT_PATH = "$HOME/gcs_mount"
 DISK_MOUNT = "/mnt/persist"
 
-JAX_SPEC = "jax[tpu]"
 PACKAGE = "dewml"
 
 _ENV_LINES = (
@@ -80,13 +79,10 @@ have=$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'
 [ "$have" = "$PYTHON_VERSION" ] || uv venv --python "$PYTHON_VERSION" "$VENV"
 PY="$VENV/bin/python"
 
+step "$PACKAGE_SPEC"
 if [ "$EDITABLE" = 1 ]; then
-  step "$PACKAGE_SPEC"
   uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"
 else
-  step "$JAX_SPEC"
-  uv pip install --quiet --python "$PY" "$JAX_SPEC"
-  step "$PACKAGE_SPEC"
   uv pip install --quiet --python "$PY" "$PACKAGE_SPEC"
 fi
 
@@ -156,7 +152,6 @@ def render(
         "# Rendered by dew tpu setup.",
         "set -euo pipefail",
         f"PYTHON_VERSION={shlex.quote(python_version)}",
-        f"JAX_SPEC={shlex.quote(JAX_SPEC)}",
         f"PACKAGE_SPEC={shlex.quote(package_spec)}",
         f"EDITABLE={int(editable)}",
         f"GCS_BUCKET={shlex.quote(gcs_bucket)}",
@@ -172,14 +167,15 @@ def render(
 
 
 def package_spec(source_dir: str, extras: str, version: str) -> tuple[str, bool]:
-    """What to install: a directory under the worker's home, with its tpu
-    extra, or a release."""
-    suffix = f"[{extras}]" if extras else ""
+    """What to install, in one resolution: a directory under the worker's home, or a release, each
+    with its tpu extra, which pins the JAX range and the libtpu release Dew is built against, and
+    `extras`."""
+    names = dict.fromkeys(["tpu", *filter(None, (name.strip() for name in extras.split(",")))])
+    extra = f"[{','.join(names)}]"
     if source_dir:
-        names = dict.fromkeys(["tpu", *filter(None, (name.strip() for name in extras.split(",")))])
-        return f"{source_dir}[{','.join(names)}]", True
+        return f"{source_dir}{extra}", True
     pin = f"=={version}" if version else ""
-    return f"{PACKAGE}{suffix}{pin}", False
+    return f"{PACKAGE}{extra}{pin}", False
 
 
 def wrap(command: str) -> str:

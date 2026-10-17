@@ -2,19 +2,22 @@
 
 import json
 import os
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from dew.cli import config as tpu_config, tpu as tpu_cli
+from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
+from dew.cli.launch import remote_script
 
 #: Stands in for gcloud and rsync. Records every argv, answers from a state file.
 FAKE = '''#!/usr/bin/env python3
 import json
 import os
 import sys
+import subprocess
 
 argv = sys.argv[1:]
 program = os.path.basename(sys.argv[0])
@@ -285,8 +288,9 @@ def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
     calls = only(fake.gcloud_calls(), "ssh")
     expected = []
     for slice_id, name in enumerate(("left", "right")):
-        command = ("exec env MEGASCALE_COORDINATOR_ADDRESS=10.0.0.1 MEGASCALE_PORT=8081 "
-                   f"MEGASCALE_NUM_SLICES=2 MEGASCALE_SLICE_ID={slice_id} python train.py")
+        env = {"MEGASCALE_COORDINATOR_ADDRESS": "10.0.0.1", "MEGASCALE_PORT": "8081",
+               "MEGASCALE_NUM_SLICES": "2", "MEGASCALE_SLICE_ID": str(slice_id)}
+        command = remote_script(("python", "train.py"), env, None)
         expected += [pool_ssh(0, name, command), pool_ssh(1, name, command)]
     assert sorted(calls) == sorted(expected)
 
@@ -295,6 +299,38 @@ def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
 
 
 # ------------------------------------------------------------------------- setup
+
+
+@pytest.mark.parametrize("source, version", [("", "1.2.3"), ("dew", "")], ids=["release", "editable"])
+def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, source, version):
+    """The setup script a worker runs installs Dew once, a release or the synced source, with the tpu
+    extra that pins the JAX range and the libtpu release Dew is built against beside the extras asked
+    for: no JAX resolved apart first, which would pick its own TPU runtime and leave it to a second
+    resolve. Run as a worker runs it, with its package manager and privileged commands stand-ins that
+    record being called."""
+    spec, editable = tpu_setup.package_spec(source, "wandb", version)
+    script = tpu_setup.render(python_version="3.12", package_spec=spec, editable=editable)
+    home, binaries = tmp_path / "home", tmp_path / "bin"
+    home.mkdir()
+    binaries.mkdir()
+    calls = tmp_path / "calls"
+    stub = f'#!/bin/sh\necho "$(basename "$0") $*" >> {calls}\n'
+    for name in ("sudo", "curl", "gcsfuse", "rsync", "lsb_release"):
+        (binaries / name).write_text(stub)
+    # uv makes the venv it is asked for, whose interpreter answers its version.
+    (binaries / "uv").write_text(stub + 'if [ "$1" = venv ]; then mkdir -p "$4/bin"; '
+                                        'printf \'#!/bin/sh\\necho 3.12\\n\' > "$4/bin/python"; '
+                                        'chmod +x "$4/bin/python"; fi\n')
+    for path in binaries.iterdir():
+        path.chmod(0o755)
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                          env={"HOME": str(home), "PATH": f"{binaries}:/usr/bin:/bin"})
+    assert done.returncode == 0, done.stderr
+    installs = [line.split()[1:] for line in calls.read_text().splitlines()
+                if line.startswith("uv pip install")]
+    target = f"{home}/dew[tpu,wandb]" if editable else "dewml[tpu,wandb]==1.2.3"
+    assert installs == [["pip", "install", "--quiet", "--python", f"{home}/dew-venv/bin/python",
+                         *(["-e"] if editable else []), target]]
 
 
 # ----------------------------------------------------------------------- dry run

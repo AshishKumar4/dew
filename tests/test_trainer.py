@@ -345,6 +345,23 @@ def test_a_final_checkpoint_resumes_only_a_stream_that_keeps_or_replays_its_posi
     assert same_variables(resumed, make_trainer().fit(declared, steps=6, log_every=1))
 
 
+def test_a_checkpoint_saved_without_a_position_resumes_no_stream_past_step_zero(tmp_path):
+    """A checkpoint saved by hand without the stream's position (Checkpoints.save's `saved`) past
+    step 0 resumes no stream, not one that keeps positions either: with none to restore it would
+    read its data again from the start, apart from the uninterrupted run, so the run is refused. At
+    step 0 nothing was read, and the run trains on."""
+    trainer = make_trainer(tmp_path)
+    state = trainer.fit(dataset(), steps=3, log_every=1, checkpoint_final=False)
+    trainer.checkpoints.save(3, state)
+    trainer.checkpoints.wait()
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=6, log_every=1)
+    fresh = make_trainer(tmp_path / "fresh")
+    fresh.checkpoints.save(0, fresh.initial_state())
+    fresh.checkpoints.wait()
+    assert int(make_trainer(tmp_path / "fresh").fit(dataset(), steps=2, log_every=1).step) == 2
+
+
 def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
     """The replay guard: a stream declared to replay that reads back another
     batch at its position, one over fresh entropy, is refused."""

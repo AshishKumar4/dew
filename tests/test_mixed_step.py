@@ -9,6 +9,7 @@ import pytest
 from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import Admitted
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
@@ -91,6 +92,40 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
             alone_row = np.asarray(admitted["cache"][layer]["self_attn"][name])[0, :4]
             np.testing.assert_allclose(written[3, :4], alone_row, atol=2e-6)
             np.testing.assert_array_equal(attention[name][2], cache[layer]["self_attn"][name][2])
+
+
+REFUSALS = {"plain": {}, "alibi": {"position_embedding": "alibi"}, "sinks": {"attention_sinks": True},
+            "shared keys": {"kv_shared_layers": (1,)}, "int8 cache": {"kv_cache": KVCache(quantized="int8")},
+            "window": {"layer_types": ("local", "global"),
+                       "kinds": {"local": LayerKind(window=4), "global": LayerKind()}}}
+
+
+@pytest.mark.parametrize("case", list(REFUSALS))
+def test_a_model_says_whether_its_layers_run_the_mixed_call_as_they_do(case):
+    """The model answers for every layer it builds, unbound and untraced
+    (`mixed_admission_refusal`): it names a reason exactly where a layer's
+    mixed call refuses to run, and None where the call runs. ALiBi, sinks,
+    shared keys, a quantized cache and a sliding window are refused; plain
+    attention runs."""
+    model = tiny(**REFUSALS[case])
+    refusal = model.mixed_admission_refusal()
+    params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    cache = prefilled(model, params)
+    tokens = jnp.zeros((1, ROWS + WIDTH), jnp.int32)
+    valid = jnp.zeros((1, ROWS + WIDTH), bool).at[0, :2].set(True)
+
+    def mixed():
+        return model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]), attention_mask=valid,
+                           decode=True, mutable=["cache"],
+                           admitted=Admitted(slots=jnp.asarray([ROWS]), cursors=jnp.asarray([0])),
+                           method=CausalTransformer.states_and_logits_at)
+
+    assert (refusal is None) == (case == "plain")
+    if refusal is None:
+        mixed()
+    else:
+        with pytest.raises(ValueError):
+            mixed()
 
 
 def test_a_mixed_call_carrying_a_pairwise_mask_is_refused_by_name():

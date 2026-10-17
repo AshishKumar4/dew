@@ -13,13 +13,12 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
@@ -441,7 +440,7 @@ class Generation:
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         values = _decode_outputs(payload)
-        if not isinstance(values, tuple) or fingerprint(values) != entry["payload_sha256"]:
+        if fingerprint(values) != entry["payload_sha256"]:
             raise ValueError(f"committed cache completion is corrupt for {row_key}")
         return values
 
@@ -455,10 +454,7 @@ class Generation:
         row_id = json.loads(entry["id"])
         if isinstance(row_id, list):
             row_id = row_id[0], row_id[1]
-        value = _accepted(self.outputs(row_id))[entry["output"]]
-        if value is None or isinstance(value, (Mapping, bytes)):
-            return value
-        raise TypeError("generation source records must be mappings or bytes")
+        return _accepted(self.outputs(row_id))[entry["output"]]
 
 
 @dataclass(frozen=True)
@@ -482,23 +478,7 @@ class _GenerationSource:
         return self.generation
 
     def manifest(self) -> ShardManifest:
-        count = len(self.generation)
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"{self.generation.url}:{start}",
-                    self.generation.url,
-                    start,
-                    min(start + 4096, count),
-                    min(4096, count - start),
-                )
-                for start in range(0, count, 4096)
-            ),
-            self._read_shard,
-        )
-
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.generation)[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, self.generation.url, self.generation.url, 4096)
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]

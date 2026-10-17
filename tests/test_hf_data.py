@@ -11,7 +11,7 @@ from PIL import Image
 from dew.config.data import Augment, ImageData, loader
 from dew.data import Files, Loading
 from dew.data.dataset import DataPartition
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.objectives.base import VALID_ROWS
 
 SCALE = 8
@@ -149,8 +149,8 @@ def test_a_native_dataset_names_its_classes_in_a_configured_caption(streamed):
     import datasets
 
     from dew.data import from_hf
+    from dew.data.images import Caption, ConfigureCaption
     from dew.data.pipeline import Configured
-    from dew.data.steps.image import Caption, ConfigureCaption
 
     native = datasets.Dataset.from_dict({"label": [1, 0]}, features=datasets.Features(
         {"label": datasets.ClassLabel(names=["cat", "dog"])}))

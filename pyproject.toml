@@ -228,7 +228,7 @@ serve = ["starlette>=0.40", "uvicorn>=0.30"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
-# dew.data.images.albumentations: an albumentations pipeline as a seeded random step.
+# dew.data.images.Albumentations: an albumentations pipeline as a seeded random step.
 augment = ["albumentations>=2"]
 # Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build

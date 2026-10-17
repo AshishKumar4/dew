@@ -25,7 +25,6 @@ from .common import (
     _side,
     _vision_section,
     head_width,
-    refuse_dropout,
     rope_base,
     trunk_geometry,
 )
@@ -259,7 +258,6 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"vision_feature_layer {vision.get('vision_feature_layer')!r} reads a "
             "middle layer this trunk never returns")
-    refuse_dropout(vision, "attention_dropout", "projector_dropout")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
     output_dim = records.integer(
