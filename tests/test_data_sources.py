@@ -532,13 +532,20 @@ def test_file_catalog_keeps_distinct_nested_names_including_underscore_directori
 
 
 def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
+    import csv
+
     text = "a" * 140_000 + "\n" + "b" * 140_000
     root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
     root.write(('id,text\n0,"' + text + '"\n').encode())
     files = Files(root.url)
-    assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
-    files.provision()
-    assert files.records("indexed")[0] == {"id": "0", "text": text}
+    # A field past Python's default limit reads under the limit its caller raises (`Files`).
+    previous = csv.field_size_limit(len(text) + 1)
+    try:
+        assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
+        files.provision()
+        assert files.records("indexed")[0] == {"id": "0", "text": text}
+    finally:
+        csv.field_size_limit(previous)
 
 
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
@@ -563,6 +570,132 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     indexed = Files(root.url, format="parquet").records("indexed")
     assert len(indexed) == 20
     assert sorted(indexed[index]["value"] for index in range(20)) == list(range(20))
+
+
+def test_a_predicate_held_in_memory_keeps_the_rows_it_selects(tmp_path):
+    """A memory read of a filtered parquet source holds the rows the predicate keeps, as a
+    streamed read does, from a row group it filters in part and one it filters whole."""
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"x": [0, 1, 2, 3]}), tmp_path / "rows.parquet", row_group_size=2)
+    for where, kept in ((ds.field("x") > 0, [1, 2, 3]), (ds.field("x") > 1, [2, 3])):
+        files = Files(str(tmp_path / "rows.parquet"), where=where)
+        streamed_rows = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        assert [row["x"] for row in files.records("memory")] == [row["x"] for row in streamed_rows] == kept
+
+
+@pytest.mark.parametrize("format", ["jsonl", "csv"])
+def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_path, format):
+    """`columns=` selects a mapping row's fields however a line source is read, as an Arrow
+    source's projection does, and a field the rows lack is refused by name."""
+    rows = [{"id": str(index), "unused": "x" * index} for index in range(4)]
+    path = tmp_path / f"rows.{format}"
+    path.write_text("id,unused\n" + "".join(f"{row['id']},{row['unused']}\n" for row in rows)
+                    if format == "csv" else "".join(json.dumps(row) + "\n" for row in rows))
+    Files(str(path)).provision()
+    projected = Files(str(path), columns=("id",))
+    expected = [{"id": row["id"]} for row in rows]
+    manifest = projected.manifest()
+    assert [row for shard in manifest.shards for row in manifest.reader(shard)] == expected
+    assert list(projected.records("memory")) == expected
+    indexed = projected.records("indexed")
+    assert [indexed[index] for index in range(len(indexed))] == expected
+    with pytest.raises(ValueError):
+        list(Files(str(path), columns=("missing",)).records("memory"))
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_path, read):
+    """CSV is parsed by Python's csv module under the process's own field size limit, which a
+    source never changes: a 200 KiB quoted field is refused under the default limit, and under a
+    limit its caller raised it reads through a loader of four reader threads at its provisioned
+    offsets and resumes where it stopped. A source once raised the limit for every parser in the
+    process each time it opened a file."""
+    import csv
+
+    from dew.data.compile import compile
+
+    texts = [f"row {index}" if index != 2 else "x" * (200 * 1024) + "\nand more" for index in range(6)]
+    expected = [(str(index), text) for index, text in enumerate(texts)]
+    path = tmp_path / "rows.csv"
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "text"])
+        writer.writerows([str(index), text] for index, text in enumerate(texts))
+
+    def rows(reader) -> list[tuple[str, str]]:
+        return [(str(batch["id"][0]), str(batch["text"][0])) for batch in reader]
+
+    previous = csv.field_size_limit(128 * 1024)
+    try:
+        refused = Files(str(path))
+        with pytest.raises(csv.Error):
+            list(refused.records("memory"))
+        csv.field_size_limit(1024 * 1024)
+        Files(str(path)).provision()
+        data = compile(Files(str(path)).repeat(1).batch(1), read=read,
+                       loading=Loading(workers=0, threads=4, read_buffer=4))
+        whole = data.train(DataPartition())
+        try:
+            assert rows(whole) == expected
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = rows(itertools.islice(stopped, 3))
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert head + rows(resumed) == expected
+        finally:
+            resumed.close()
+        assert csv.field_size_limit() == 1024 * 1024
+    finally:
+        csv.field_size_limit(previous)
+
+
+@pytest.mark.parametrize("trickled", ["headers", "body"])
+def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
+    """A server that sends its headers or its body a byte every tenth of a second holds a fetch
+    no longer than its timeout: the attempt is dropped as transient, where it once read on byte
+    by byte, each byte inside the socket's timeout."""
+    import http.server
+    import time
+
+    from dew.data.pipeline import Rejected
+    from dew.data.sources.urls import Fetch
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if trickled == "headers":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", "60")
+                self.end_headers()
+            for _ in range(60):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.1)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    try:
+        began = time.monotonic()
+        fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
+        waited = time.monotonic() - began
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert waited < 1.5
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():

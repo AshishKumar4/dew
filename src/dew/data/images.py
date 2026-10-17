@@ -87,7 +87,8 @@ def resize_image(image: np.ndarray, size: int | tuple[int, int]) -> np.ndarray:
 
 def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20) -> Fetch:
     """A record step (`filter_map`) that fetches the image at the record's
-    `url` field into `to` as bytes, in one attempt of at most `timeout`; a
+    `url` field into `to` as bytes, in one attempt of at most `timeout` once
+    its host is resolved (`Fetch`); a
     failed fetch is counted and dropped, a transient one fetched again on a
     later pass. An indexed read runs `Loading.threads` fetches at once in each
     worker. The bytes are volatile: a published cache after the fetch keeps
