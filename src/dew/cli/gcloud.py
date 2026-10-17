@@ -29,22 +29,9 @@ def emit(line: str) -> None:
         sys.stdout.flush()
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class Result:
-    """What a finished subprocess left behind."""
-
-    argv: tuple[str, ...]
-    code: int
-    out: str = ""
-    err: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.code == 0
-
-    @property
-    def text(self) -> str:
-        return (self.out + self.err).strip()
+def said(done: subprocess.CompletedProcess[str]) -> str:
+    """What a finished command printed, its output then its errors, where it was captured."""
+    return ((done.stdout or "") + (done.stderr or "")).strip()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -108,27 +95,39 @@ class Gcloud:
             line.append(f"--project={self.project}")
         return line
 
-    def run(self, argv: Sequence[str], *, capture: bool = True, check: bool = False) -> Result:
+    def run(self, argv: Sequence[str], *, capture: bool = True,
+            check: bool = False) -> subprocess.CompletedProcess[str]:
         """Run one command. A dry run prints it and reports success."""
         argv = list(argv)
         if self.dry_run:
             emit(shlex.join(argv))
-            return Result(tuple(argv), 0)
-        if capture:
-            done = subprocess.run(argv, capture_output=True, text=True)
-            outcome = Result(tuple(argv), done.returncode, done.stdout, done.stderr)
-        else:
-            outcome = Result(tuple(argv), subprocess.call(argv))
-        if check and not outcome.ok:
-            raise SystemExit(outcome.text or f"{argv[0]} failed with code {outcome.code}")
-        return outcome
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        done = subprocess.run(argv, capture_output=capture, text=True)
+        if check and done.returncode:
+            raise SystemExit(said(done) or f"{argv[0]} failed with code {done.returncode}")
+        return done
 
-    def json(self, *args: str, default: JSON = None) -> JSON:
-        """Run a gcloud command that speaks JSON and parse it."""
-        outcome = self.run(self.argv(*args, "--format=json"))
-        if not outcome.ok or not outcome.out.strip():
-            return default
-        return json.loads(outcome.out)
+    def json(self, *args: str) -> JSON:
+        """Run a gcloud command that speaks JSON and parse it: None in a dry run, which prints the
+        command instead. A failed command stops dew with gcloud's message, as an answer of nothing
+        would read as nothing there (an authentication failure as no TPUs)."""
+        outcome = self.run(self.argv(*args, "--format=json"), check=True)
+        return json.loads(outcome.stdout) if outcome.stdout.strip() else None
+
+    def nodes(self, zone: str) -> list[Node]:
+        """The TPUs `zone` lists: none in a dry run. A TPU absent from a listing gcloud gave is not
+        there, which a failed describe cannot say apart from gcloud failing."""
+        payload = self.json("compute", "tpus", "tpu-vm", "list", f"--zone={zone}")
+        if payload is None:
+            return []
+        if not isinstance(payload, list):
+            raise ValueError(f"gcloud listed {payload!r} in {zone}, which is not a list of TPU records")
+        nodes = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise ValueError(f"gcloud listed {entry!r} in {zone}, which is not a TPU record")
+            nodes.append(Node.parse(entry))
+        return nodes
 
     def config_value(self, name: str) -> str:
         """Read one value from the local gcloud config.
@@ -141,12 +140,12 @@ class Gcloud:
         value = done.stdout.strip()
         return "" if done.returncode or value == "(unset)" else value
 
-    def stream(self, argv: Sequence[str], prefix: str = "") -> Result:
+    def stream(self, argv: Sequence[str], prefix: str = "") -> subprocess.CompletedProcess[str]:
         """Run one command, tagging every output line with a prefix."""
         argv = list(argv)
         if self.dry_run:
             emit(shlex.join(argv))
-            return Result(tuple(argv), 0)
+            return subprocess.CompletedProcess(argv, 0, "", "")
         # Popen as a context manager closes the pipe it opened; left to the
         # collector, a fanout over a pod leaks one file per worker.
         with subprocess.Popen(
@@ -158,37 +157,37 @@ class Gcloud:
                 raise RuntimeError(f"{argv[0]} opened without the pipe it was asked for")
             for line in stdout:
                 emit(prefix + line.rstrip("\n"))
-            return Result(tuple(argv), process.wait())
+            return subprocess.CompletedProcess(argv, process.wait())
 
     def fanout(
         self,
         jobs: Sequence[tuple[str, Sequence[str]]],
         *,
         capture: bool = False,
-    ) -> list[Result]:
+    ) -> list[subprocess.CompletedProcess[str]]:
         """Run one command per worker at the same time, in job order."""
         if not jobs:
             return []
         if self.dry_run:
             return [self.run(argv) for _, argv in jobs]
 
-        def one(job: tuple[str, Sequence[str]]) -> Result:
+        def one(job: tuple[str, Sequence[str]]) -> subprocess.CompletedProcess[str]:
             prefix, argv = job
             if not capture:
                 return self.stream(argv, prefix)
             outcome = self.run(argv)
-            if not outcome.ok:
+            if outcome.returncode:
                 # Captured output goes nowhere, so a failure would be silent.
-                emit(prefix + (outcome.text or f"exit {outcome.code}"))
+                emit(prefix + (said(outcome) or f"exit {outcome.returncode}"))
             return outcome
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             return list(pool.map(one, jobs))
 
 
-def exit_code(outcomes: Iterable[Result]) -> int:
+def exit_code(outcomes: Iterable[subprocess.CompletedProcess[str]]) -> int:
     """The first failure, so a fan-out reports what went wrong."""
-    return next((outcome.code for outcome in outcomes if not outcome.ok), 0)
+    return next((outcome.returncode for outcome in outcomes if outcome.returncode), 0)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -227,12 +226,12 @@ class Tpu:
         return self.vm(*args)
 
     def describe(self) -> Node | None:
-        payload = self.gcloud.json(
-            "compute", "tpus", "tpu-vm", "describe", self.name, f"--zone={self.zone}")
-        return Node.parse(payload) if isinstance(payload, dict) and payload else None
+        """This TPU as its zone lists it, or None where the zone has none of its name: not created
+        yet, or deleted."""
+        return next((node for node in self.gcloud.nodes(self.zone) if node.name == self.name), None)
 
     def fanout(self, jobs: Sequence[tuple[int, str]], *, capture: bool = False,
-               ssh_flags: Sequence[str] = ()) -> list[Result]:
+               ssh_flags: Sequence[str] = ()) -> list[subprocess.CompletedProcess[str]]:
         """Run one remote command per worker, prefixing output with the worker."""
         prepared = [
             (f"[worker {index}] ", self.ssh_argv(str(index), command, ssh_flags))

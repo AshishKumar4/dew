@@ -288,6 +288,9 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
     if validation is None:
+        if metrics and dataset.val is None:
+            # Else the metrics would never be scored, and the run would not say so.
+            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
         # `val` is read only when a pass is scheduled; a dataset need not hold one.
         validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
     elif not validation:
@@ -524,6 +527,8 @@ class Trainer(Generic[Loss, Effects]):
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
+        # Whether `fit` reads a batch ramp, whose stages change the batch's shape.
+        self._ramped = False
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
 
@@ -960,10 +965,16 @@ class Trainer(Generic[Loss, Effects]):
         """The state with the accumulation a `window` of microbatches of
         `batch`'s shapes pools in, empty; unchanged under a window of one, a
         custom step or an accumulation already held."""
-        if window == 1 or self.step is not None or state.accumulation is not None:
+        if window == 1 or self.step is not None:
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
+        if self._ramped and not shared:
+            # A restored accumulation too: its replay slots hold the batches of the run that saved it.
+            raise ValueError("a loss of composite statistics replays its accumulation window's batches, "
+                             "whose shape a batch ramp changes at each stage; ramp the batch or accumulate")
+        if state.accumulation is not None:
+            return state
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -1406,8 +1417,6 @@ class Trainer(Generic[Loss, Effects]):
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
-        if metrics and eval_every is None and validation is None:
-            raise ValueError("metrics need eval_every to schedule their validation pass")
         self._preflight(loader, stop, suites, preview=preview,
                         loss=self.checkpoints is not None and not selection)
         preview = preview and self.tracker is not None
@@ -1653,10 +1662,10 @@ class Trainer(Generic[Loss, Effects]):
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
-            check_stream(run.source, mesh, self.microbatches, plan.dataset.batch,
-                         self.accumulation * (self._split or 1), rows=self.rollout is None,
+            check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            if isinstance(run.source, RampedStream):
+            self._ramped = isinstance(run.source, RampedStream)
+            if self._ramped:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
             self._rows = (plan.dataset.batch,)
@@ -1986,8 +1995,6 @@ class Trainer(Generic[Loss, Effects]):
         for name, suite in suites.items():
             if loss and not any(metric.name == 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
-            if suite.metrics and suite.every is None:
-                raise ValueError(f"{name}'s metrics need eval_every or EvalSuite.every to schedule its pass")
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 self._check_validation_is_read(name, suite, preview=preview)
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
