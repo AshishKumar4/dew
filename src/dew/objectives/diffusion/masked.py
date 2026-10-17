@@ -131,8 +131,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def task_settings(self) -> MaskedSettings:
         """The row length, response budget, process, solver, sampling steps, and tokenizer or
         source processor: the task's own."""
-        return MaskedSettings(self.seq_len, self.seq_len, self.process, self.solver, self.steps,
-                              recorded_tokenizer(self.processor), recorded_processor(self.processor))
+        return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
+                              solver=self.solver, sampling_steps=self.steps,
+                              tokenizer=recorded_tokenizer(self.processor),
+                              processor=recorded_processor(self.processor))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:

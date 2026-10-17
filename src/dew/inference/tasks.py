@@ -309,20 +309,21 @@ def saved_settings[SettingsT](record: Mapping[str, object], settings: type[Setti
                        dtypes=False)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TextSettings:
     """What a causal decoder's run records beside its model, and its task is built with
     (`TextGeneration.from_settings`).
 
     `seq_len` is the decoder's training row length, `max_new_tokens` its
-    previews' budget (0 for none) and `sampling` their policy, which a run
-    with a budget must record. `tokenizer` names the run tokenizer
+    previews' budget (0 or None for none) and `sampling` their policy, which a
+    run with a budget must record. `tokenizer` names the run tokenizer
     (`recorded_tokenizer`) and `processor` a checkpoint's own processor
-    source (`recorded_processor`); either may be None.
+    source (`recorded_processor`); either may be None. A record written
+    before a field was recorded reads as its default.
     """
 
-    seq_len: int
-    max_new_tokens: int = 0
+    seq_len: int | None = None
+    max_new_tokens: int | None = None
     sampling: Sampling | None = None
     tokenizer: str | None = None
     processor: str | None = None
@@ -333,15 +334,15 @@ class TextSettings:
             raise ValueError("run.json lacks the sampling policy for its text previews")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class MaskedSettings:
     """What a masked-diffusion run records beside its model, and its task is built with
     (`MaskedGeneration.from_settings`): the row length, the response budget, the tokenizer or
     source processor as `TextSettings` holds them, the masking process, the unmasking solver
     and its step count."""
 
-    seq_len: int
-    max_new_tokens: int
+    seq_len: int | None = None
+    max_new_tokens: int | None = None
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
@@ -355,14 +356,14 @@ class MaskedSettings:
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class BlockSettings:
     """What a block-diffusion run records beside its model, and its task is built with
     (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
     source processor as `TextSettings` holds them, the block process and the pad id."""
 
-    seq_len: int
-    max_new_tokens: int
+    seq_len: int | None = None
+    max_new_tokens: int | None = None
     process: BlockProcess
     pad_token_id: int
     tokenizer: str | None = None
@@ -373,9 +374,9 @@ class BlockSettings:
         integer(self.pad_token_id, "pad_token_id")
 
 
-def _budget_checked(budget: int) -> None:
-    """Refuse a recorded token budget that is not a nonnegative integer."""
-    if type(budget) is not int or budget < 0:
+def _budget_checked(budget: int | None) -> None:
+    """Refuse a recorded token budget that is not a nonnegative integer, or None for none."""
+    if budget is not None and (type(budget) is not int or budget < 0):
         raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
