@@ -25,6 +25,9 @@ included, so every path of the block reaches the output.
     python tools/flaxdiff_reference.py --flaxdiff-path /tmp/flaxdiff \\
         --out tests/fixtures/flaxdiff
 
+`--hilbert` writes the same SimpleUDiT scanning its patches along a Hilbert
+curve (`use_hilbert`); pass `--out tests/fixtures/flaxdiff/hilbert`.
+
 For hybrid_dit, use commit 94d2d21caeb79aba48a505fa79d9a1a974751234
 (run cmbd8bia, flaxdiff 0.2.10), JAX 0.5.3 and Flax 0.10.6, and pass
 `--architecture hybrid_dit --out tests/fixtures/flaxdiff/hybrid_dit`.
@@ -59,6 +62,7 @@ def arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--flaxdiff-path", required=True,
                         help="the directory holding flaxdiff/ at the architecture's reference commit")
     parser.add_argument("--architecture", choices=("simple_udit", "hybrid_dit"), default="simple_udit")
+    parser.add_argument("--hilbert", action="store_true", help="a simple_udit with use_hilbert")
     parser.add_argument("--out", default="tests/fixtures/flaxdiff")
     return parser.parse_args(argv)
 
@@ -74,7 +78,7 @@ def main(argv=None) -> None:
         commit = HYBRID_COMMIT
     else:
         from flaxdiff.models.simple_vit import SimpleUDiT as Model
-        model_config, commit = MODEL, COMMIT
+        model_config, commit = {**MODEL, "use_hilbert": args.hilbert}, COMMIT
 
     model = Model(**{key: value for key, value in model_config.items()
                      if key not in ("activation", "dtype", "precision")}, dtype=jnp.float32)
