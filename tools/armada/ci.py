@@ -688,9 +688,10 @@ fragmentation, which can leave a share its own size short of a block it needs.""
 def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     """The GPU share a test file's process is given, as `XLA_PYTHON_CLIENT_MEM_FRACTION` of it, and what
     the file holds with its children, by its last run's `recorded` peak (tools/armada/executed.py's
-    `gpu_peak`) and `GPU_HEADROOM`: a child that took the share's fraction holds one more share, and
-    one that named its own fraction the pool it held. A file no run measured, one that started a
-    process it did not follow, and one whose last run left no report take all of `budget`."""
+    `gpu_peak`, or a child's that took its fraction, the larger) and `GPU_HEADROOM`: a child that took
+    the share's fraction holds one more share, and one that named its own fraction the pool it held.
+    A file no run measured, one that started a process it did not follow, and one whose last run left
+    no report take all of `budget`."""
     if recorded is None or recorded["depends"] is None or recorded["peak"] is None:
         return budget, budget
     factor, slack = GPU_HEADROOM
@@ -718,8 +719,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
         return gpu_needs(json.loads(record) if record else None, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        shares, holds = (dict(zip(tests, column, strict=True))
-                         for column in zip(*pool.map(needs, tests), strict=True))
+        needed = dict(zip(tests, pool.map(needs, tests), strict=True))
+    shares = {name: share for name, (share, _) in needed.items()}
+    holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
     waiting = sorted(tests, key=lambda name: -holds[name])

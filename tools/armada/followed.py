@@ -7,9 +7,9 @@ parent's or one passed on with it. The `.pth` the parent installs in the environ
 runs `follow` as the child starts: it records the checkout's files the child executed and read
 (`read`, as the parent records its own), where it read the backend, the processes it started in turn,
 and the GPU pool it held, and writes them as it exits.
-A child that ends without its record (killed, or leaving through os._exit) leaves its start mark
-behind, and the parent then counts its file's starts as unfollowed (`gathered`), as it does a child
-whose record names another file or a count of records other than the starts it saw."""
+A child marks its start, and one that ends without its record (killed, or leaving through os._exit)
+has a mark and no record, and the parent then counts its file's starts as unfollowed (`gathered`), as
+it does a child whose record names another file or a count of records other than the starts it saw."""
 
 import atexit
 import dis
@@ -214,7 +214,7 @@ def follow() -> None:
     # A child given its parent's fraction holds one more of the parent's shares where it opens the GPU.
     inherited = os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")
     record = {"file": os.environ.get("DEW_EXECUTED_FILE", ""), "files": set(), "reads": set(), "expected": 0,
-              "unfollowed": False, "began": time.time(), "pool": None, "inherited": inherited}
+              "unfollowed": False, "began": time.time(), "pool": None, "peak": None, "inherited": inherited}
     mark.write_text(record["file"])
 
     def started(code, offset):
@@ -240,6 +240,7 @@ def follow() -> None:
             return
         stats = [device.memory_stats() or {} for device in devices]
         record["pool"] = sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats)
+        record["peak"] = max(stat.get("peak_bytes_in_use", 0) for stat in stats)
 
     def audited(event, args):
         if event in READS:
@@ -256,8 +257,10 @@ def follow() -> None:
     def written() -> None:
         ended = {**record, "files": sorted(record["files"]), "reads": sorted(record["reads"]),
                  "ended": time.time()}
-        (directory / f"{os.getpid()}.json").write_text(json.dumps(ended))
-        mark.unlink()
+        # Whole or not at all, beside the mark, which stays: the parent may read either as this child ends.
+        partial = directory / f".{os.getpid()}.json"
+        partial.write_text(json.dumps(ended))
+        partial.replace(directory / f"{os.getpid()}.json")
 
     opening(record["files"].add, root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, "dew-followed")
@@ -270,20 +273,25 @@ def follow() -> None:
 def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
     """What each test file's children recorded in `directory`, by the file that started them, given
     how many children each file's own process started (`expected`): their files and reads, whether
-    every start was followed, and the GPU pools they held at once, the parent's share counted apart
-    (`shares`, the children that took its fraction) from the bytes of those that named their own."""
+    every start was followed, the most GPU memory a child that took the parent's fraction held
+    (`peak`), and the GPU pools they held at once, the parent's share counted apart (`shares`, the
+    children that took its fraction) from the bytes of those that named their own. Records are read
+    before marks, so a child that ends between the two counts as one without its record."""
     records = [json.loads(path.read_text()) for path in directory.glob("*.json")]
-    lost = {path.read_text() for path in directory.glob("*.started")}
+    ended = {path.stem for path in directory.glob("*.json")}
+    lost = {path.read_text() for path in directory.glob("*.started") if path.stem not in ended}
     found: dict[str, dict] = {}
     for name in {*expected, *(record["file"] for record in records)}:
         own = [record for record in records if record["file"] == name]
         starts = expected.get(name, 0) + sum(record["expected"] for record in own)
         pooled = [record for record in own if record["pool"]]
+        inherited = [record for record in pooled if record["inherited"]]
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
             "followed": name not in lost and len(own) == starts and not any(r["unfollowed"] for r in own),
-            "shares": _most_at_once([r for r in pooled if r["inherited"]], lambda record: 1),
+            "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
+            "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
     return found
 
