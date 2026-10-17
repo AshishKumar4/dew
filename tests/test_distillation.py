@@ -79,40 +79,43 @@ def step_at(index=0, key=1, ema=None) -> Step:
     return Step(step=jnp.asarray(index), key=jax.random.key(key), ema=ema)
 
 
-def reference_float32(arrays: dict, kind: str):
-    """The reference's own float32 run on the fixture's float32 outputs, the
-    projections applied in float32: its loss, its terms, and its cotangents
-    on the student's logits and projected features."""
+def reference_run(arrays: dict, kind: str, outputs, dtype: str):
+    """The reference transcription run in torch at the `dtype` named, on the student's `outputs`,
+    its logits and projected features, beside the fixture's teacher: its loss, its terms, and its
+    cotangents on those outputs."""
     import torch
 
     from tools.distillation_reference import distillation_loss
 
     pairs = range(len(META["pairs"]))
     targets = arrays["tokens"][:, 1:]
-    logits = torch.tensor(arrays["student_logits"], requires_grad=True)
-    features = torch.tensor(np.stack([arrays[f"student_feature_{index}"] @ arrays[f"projection_{index}"]
-                                      for index in pairs]), requires_grad=True)
+    logits, features = (torch.tensor(np.asarray(value), requires_grad=True) for value in outputs)
     loss, terms = distillation_loss(
         logits, torch.tensor(arrays["teacher_logits"]), torch.tensor(targets, dtype=torch.int64),
         torch.tensor((targets != META["pad_id"]).astype(np.float32)), features,
         torch.tensor(np.stack([arrays[f"teacher_feature_{index}"] for index in pairs])),
-        META["alpha"], META["temperature"], META["beta"], kind, dtype=torch.float32)
+        META["alpha"], META["temperature"], META["beta"], kind, dtype=getattr(torch, dtype))
     d_logits, d_features = torch.autograd.grad(loss, (logits, features))
     reported = {name: value.item() for name, value in terms.items()}
-    return loss.item(), reported, d_logits.numpy(), d_features.numpy()
+    return loss.item(), reported, (d_logits.numpy(), d_features.numpy())
 
 
 def student_outputs(model, trainable, ids):
-    """The student's logits and its paired layers' outputs projected, as the reference reads them."""
-    from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+    """The student's logits and its paired layers' outputs projected, as the reference reads them
+    (`tools/distillation_reference.py:dew_outputs`)."""
+    from tools.distillation_reference import dew_outputs
 
     variables = {"params": {name: value for name, value in trainable.items() if name != PROJECTIONS}}
-    logits = model.apply(variables, ids)
-    _, state = model.apply(variables, ids, method=type(model).hidden_states,
-                           capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
+    logits, states = dew_outputs(model, variables, ids, [layer for _, layer in META["pairs"]])
     projections = trainable[PROJECTIONS]
-    return logits, jnp.stack([layer_output(state[INTERMEDIATES], layer) @ projections[f"projection_{index}"]
-                              for index, (_, layer) in enumerate(META["pairs"])])
+    return logits, jnp.stack([state @ projections[f"projection_{index}"]
+                              for index, state in enumerate(states)])
+
+
+def widened_outputs(model, trainable, ids):
+    """The student's outputs run in float64 and their pullback, under `jax.enable_x64`."""
+    return jax.vjp(lambda leaves: student_outputs(model.clone(dtype=jnp.float64), leaves, ids),
+                   widened(trainable))
 
 
 # --------------------------------------------------------------------------
@@ -122,51 +125,58 @@ def student_outputs(model, trainable, ids):
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
-    """Loss and every reported term as near the reference's float64 value as
-    the reference's own float32 run is (`assert_as_exact_as_the_reference`).
-    Padding sits in the batch, so the mask is part of what agrees."""
+    """Loss and every reported term as near float64 as the reference's own
+    float32 run is (`assert_as_exact_as_the_reference`): the truth runs the
+    reference in float64 on the student's float64 forward, the reference in
+    float32 on its float32 one. Padding sits in the batch, so the mask is
+    part of what agrees."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
+    ids = jnp.asarray(arrays["tokens"][:, :-1])
+    model = objective.student.model
 
     loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
 
-    reference_loss, reference_terms, _, _ = reference_float32(arrays, kind)
-    assert_as_exact_as_the_reference(np.atleast_1d(np.float64(loss)), np.atleast_1d(reference_loss),
-                                     np.atleast_1d(arrays[f"{kind}/loss"]), f"{kind} loss")
+    outputs = student_outputs(model, params["params"], ids)
+    rounded_loss, rounded_terms, _ = reference_run(arrays, kind, outputs, "float32")
+    with jax.enable_x64(new_val=True):
+        wide, _ = widened_outputs(model, params["params"], ids)
+        truth_loss, truth_terms, _ = reference_run(arrays, kind, wide, "float64")
+    assert_as_exact_as_the_reference(np.atleast_1d(np.float64(loss)), np.atleast_1d(rounded_loss),
+                                     np.atleast_1d(truth_loss), f"{kind} loss")
     for metric, name in (("ce", "hard_loss"), ("distill/soft_loss", "soft_loss"),
                          ("distill/kl", "kl_div_at_T"), ("distill/feature", "feature"),
                          ("distill/teacher_loss", "teacher_loss")):
         assert_as_exact_as_the_reference(np.atleast_1d(np.float64(aux.metrics[metric])),
-                                         np.atleast_1d(reference_terms[name]),
-                                         np.atleast_1d(arrays[f"{kind}/{name}"]), f"{kind} {name}")
+                                         np.atleast_1d(rounded_terms[name]),
+                                         np.atleast_1d(truth_terms[name]), f"{kind} {name}")
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_student_gradient_matches_the_reference_cotangents(kind):
     """The gradient with respect to every trainable leaf, the projections
     included, as near float64 as the reference's own float32 run is
-    (`assert_leaves_as_exact`): the float64 truth pulls the reference's
-    float64 cotangents back through the student run in float64, and the
-    reference pulls its float32 cotangents back through the student in
-    float32. The student's logits are as near its float64 forward as the
-    fixture's, which the reference read."""
+    (`assert_leaves_as_exact`): the truth pulls the reference's float64
+    cotangents at the student's float64 forward back through that forward,
+    and the reference pulls its float32 cotangents at the float32 forward
+    back through the student in float32. The student's logits are as near
+    its float64 forward as the fixture's, which the reference generator
+    wrote from the same forward."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     batch = fixture_batch(arrays)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
     model = objective.student.model
 
-    (logits, _), pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids),
-                                    params["params"])
-    _, _, d_logits, d_features = reference_float32(arrays, kind)
-    reference, = pullback((jnp.asarray(d_logits), jnp.asarray(d_features)))
+    outputs, pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids), params["params"])
+    _, _, cotangents = reference_run(arrays, kind, outputs, "float32")
+    reference, = pullback(tuple(jnp.asarray(value) for value in cotangents))
     with jax.enable_x64(new_val=True):
-        wide = model.clone(dtype=jnp.float64)
-        (wide_logits, _), widened_pullback = jax.vjp(lambda trainable: student_outputs(wide, trainable, ids),
-                                                     widened(params["params"]))
-        truth, = widened_pullback((arrays[f"{kind}/d_student_logits"], arrays[f"{kind}/d_student_features"]))
-        truth, wide_logits = jax.tree.map(np.asarray, (truth, wide_logits))
-    assert_as_exact_as_the_reference(np.asarray(logits), arrays["student_logits"], wide_logits, "logits")
+        wide, widened_pullback = widened_outputs(model, params["params"], ids)
+        _, _, wide_cotangents = reference_run(arrays, kind, wide, "float64")
+        truth, = widened_pullback(wide_cotangents)
+        truth, wide_logits = jax.tree.map(np.asarray, (truth, wide[0]))
+    assert_as_exact_as_the_reference(np.asarray(outputs[0]), arrays["student_logits"], wide_logits, "logits")
     actual = jax.grad(lambda trainable: objective.scalar_loss(
         {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
