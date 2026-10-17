@@ -145,7 +145,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.dataset import DataPartition
 from dew.data.sinks import export
 import tempfile
-from dew.data.steps.text import Tokenize
+from dew.data.text import Tokenize
 
 tokenizer = ByteTokenizer()
 documents = Memory([{"text": "one document " * 40}, {"text": "another document " * 40}])
@@ -180,7 +180,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.chunk(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.Chunks(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 

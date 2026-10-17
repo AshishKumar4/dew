@@ -1,5 +1,6 @@
 """fla_gdn's test support: each kernel's math in XLA, per chunk, with the kernel's casts, and its declared
-tiles as abstract calls for the compile test."""
+tiles as abstract calls for the compile test, with Kimi delta attention's and the short conv's kernels at
+their training shapes."""
 
 import dataclasses
 import functools
@@ -9,7 +10,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import fla_gdn, generation, tuning
+from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
 
 COMPILED_SHAPES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
@@ -294,3 +295,71 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     shape = (batch, length, key_heads, group, q.shape[-1])
     dq, dk = dq.reshape(shape).sum(3).astype(q_dtype), dk.reshape(shape).sum(3).astype(k_dtype)
     return dq, dk, dw.reshape(w.shape).astype(w.dtype), dg.reshape(batch, length, heads)
+
+
+KDA_TRAINING = (1, 4096, 32, 128)
+"""Batch, length, heads, head width: Kimi Linear's KDA layer (32 heads of 128) at a 4096-token row."""
+
+
+def kda_training_cases() -> Iterator[KernelCase]:
+    """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
+    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
+    batch, length, heads, width = KDA_TRAINING
+
+    def case(name, width, columns, heads):
+        def call():
+            keys = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
+            values = jax.ShapeDtypeStruct((batch, length, heads, columns), jnp.bfloat16)
+            decay = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.float32)
+            beta = jax.ShapeDtypeStruct((batch, length, heads), jnp.bfloat16)
+            state = jax.ShapeDtypeStruct((batch, heads, width, columns), jnp.float32)
+
+            def grads(q, k, v, g, beta, h0):
+                def loss(*args):
+                    out, final = fla_kda.chunk_kda(*args, None, width ** -0.5, 64, interpret=False)
+                    return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+                return jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, beta, h0)
+
+            return grads, (keys, keys, values, decay, beta, state)
+
+        return KernelCase(name, call)
+
+    yield case("kda", width, width, heads)
+    yield case("kda/keys of 256", fla_gdn.WIDEST_KEYS, width, 4)
+
+
+CONV_SHAPES = {
+    # Qwen3.5-0.8B: 16 key and 16 value heads of 128.
+    "0.8b": ((8, 3072), ((2048, 128), (2048, 128), (2048, None))),
+    # Qwen3.5-9B: 16 key heads, 32 value heads.
+    "9b": ((4, 3072), ((2048, 128), (2048, 128), (4096, None))),
+}
+
+
+def conv_training_cases() -> Iterator[KernelCase]:
+    """Both kernels, through the conv's VJP, at each training shape: a delta net's bf16 conv into bf16
+    pieces over right-padded rows and over packed ones, and Mamba's fp32 output with a bias and no norm
+    over whole rows and packed ones."""
+    def case(name, shape, parts, out, bias, valid, packed):
+        def call():
+            x = jax.ShapeDtypeStruct((*shape, sum(width for width, _ in parts)), jnp.bfloat16)
+            weights = jax.ShapeDtypeStruct((x.shape[-1], 4), jnp.float32)
+            shift = jax.ShapeDtypeStruct((x.shape[-1],), jnp.float32) if bias else None
+            kept = jax.ShapeDtypeStruct(shape, jnp.int8) if valid else None
+            segments = jax.ShapeDtypeStruct(shape, jnp.int32) if packed else None
+
+            def grads(x, weights, shift, kept, segments):
+                def loss(x, weights, shift):
+                    out_ = short_conv.conv(x, weights, shift, kept, segments, parts, activation=True,
+                                           eps=1e-6, dtype=jnp.dtype(out), interpret=False)
+                    return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
+                return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
+            return grads, (x, weights, shift, kept, segments)
+        return KernelCase(name, call)
+
+    for model, (shape, parts) in sorted(CONV_SHAPES.items()):
+        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, bias=False, valid=True, packed=False)
+        yield case(f"{model}/packed", shape, parts, jnp.bfloat16, bias=False, valid=False, packed=True)
+    for packed in (False, True):
+        yield case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True,
+                   valid=False, packed=packed)

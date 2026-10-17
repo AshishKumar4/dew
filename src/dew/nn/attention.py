@@ -43,10 +43,10 @@ from .kernels.generation import (
 )
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
+    asks_default_precision,
     at_default_precision,
     at_least_fp32,
     bf16_operand_precision,
-    precision_names,
     rounded_to,
 )
 from .rope import rotate
@@ -1421,7 +1421,7 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
     the inputs' own dtype, whatever the caller asked for. Each message names
     the implementation and the reference path, so a caller can pick one.
     """
-    if precision_names(precision) & {'HIGH', 'HIGHEST'}:
+    if not asks_default_precision(precision):
         raise ValueError(
             f"attention implementation '{implementation}' cannot honor "
             f"precision={precision}: fused attention accumulates the logits and "
@@ -1706,10 +1706,11 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
     The three are what `refuse_reference_only_arguments` raises for: a
-    matmul precision above DEFAULT, a softmax outside fp32, and a compute
-    dtype other than the inputs'. A fused kernel runs none of them.
+    matmul precision other than DEFAULT (a higher one, a dot algorithm or
+    a preset of one), a softmax outside fp32, and a compute dtype other
+    than the inputs'. A fused kernel runs none of them.
     """
-    return (bool(precision_names(precision) & {'HIGH', 'HIGHEST'})
+    return (not asks_default_precision(precision)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype))
 

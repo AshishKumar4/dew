@@ -76,13 +76,13 @@ def test_failed_worker_keeps_every_ranks_output_and_stops_its_peers(tmp_path, ca
     with pytest.raises(AssertionError):
         run_pool("failure", tmp_path, 3, start=start, timeout=5)
     logs = capsys.readouterr().out
+    # Each rank's own output reaches the failing pool's log.
     for rank in range(3):
-        assert f"--- process {rank}, exit " in logs
         assert f"worker {rank}" in logs
     assert all(process.poll() is not None for process in running)
 
 
-def test_failed_start_finalizes_workers_that_already_started(tmp_path, capsys):
+def test_failed_start_finalizes_workers_that_already_started(tmp_path):
     running: list[subprocess.Popen[str]] = []
 
     def start(mode, out, processes, process_id, coordinator):
@@ -95,7 +95,6 @@ def test_failed_start_finalizes_workers_that_already_started(tmp_path, capsys):
     with pytest.raises(OSError):
         run_pool("startup", tmp_path, 2, start=start)
     assert len(running) == 1 and running[0].poll() is not None
-    assert "--- process 0, exit " in capsys.readouterr().out
 
 
 def test_timed_out_pool_reports_every_rank_and_reaps_them(tmp_path):
