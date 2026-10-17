@@ -400,7 +400,7 @@ class Delete(Named):
                                node.queued_resource, f"--zone={tpu.zone}", "--force", "--quiet")
         else:
             argv = tpu.vm("delete", self.name, f"--zone={tpu.zone}", "--quiet")
-        code = gcloud.run(argv, capture=False).code
+        code = gcloud.run(argv, capture=False).returncode
         if not code and not gcloud.dry_run:
             config.forget_zone(self.name)
             ssh_config.forget(self.name)
@@ -414,7 +414,7 @@ class Start(Named):
 
     def run(self, rest: list[str]) -> int:
         _, gcloud, tpu = self.opened()
-        code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).code
+        code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).returncode
         if not code:
             _worker_table(_wait_ready(tpu))
         return code
@@ -427,7 +427,7 @@ class Stop(Named):
 
     def run(self, rest: list[str]) -> int:
         _, gcloud, tpu = self.opened()
-        return gcloud.run(tpu.vm("stop", self.name, f"--zone={tpu.zone}"), capture=False).code
+        return gcloud.run(tpu.vm("stop", self.name, f"--zone={tpu.zone}"), capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -493,7 +493,7 @@ class Ssh(Named):
         argv = tpu.ssh_argv(str(self.worker), ssh_flags=flags)
         if rest:
             argv += ["--", *rest]
-        return gcloud.run(argv, capture=False).code
+        return gcloud.run(argv, capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -536,8 +536,8 @@ class AttachDisk(Named):
         mode = "read-only" if self.read_only else "read-write"
         attached = gcloud.run(tpu.vm("attach-disk", self.name, f"--zone={tpu.zone}",
                                      f"--disk={source}", f"--mode={mode}"), capture=False)
-        if not attached.ok:
-            return attached.code
+        if attached.returncode:
+            return attached.returncode
         count, _ = _slice(tpu, cfg)
         mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script())}"
         return exit_code(tpu.fanout([(index, mount) for index in range(count)]))
@@ -606,7 +606,7 @@ class Copy(Named):
         _, gcloud, tpu = self.opened()
         argv = tpu.scp_argv([self.src], f"{tpu.host}:{self.dst}", worker=self.worker,
                             recurse=Path(self.src).is_dir())
-        return gcloud.run(argv, capture=False).code
+        return gcloud.run(argv, capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -678,13 +678,13 @@ class Setup(Named):
 
         copy = gcloud.run(tpu.scp_argv([str(path)], f"{tpu.host}:~/dew-setup.sh", worker="all"),
                           capture=False)
-        if not copy.ok:
-            return copy.code
+        if copy.returncode:
+            return copy.returncode
         if self.git_key is not None:
             copy = gcloud.run(tpu.scp_argv([str(self.git_key)], f"{tpu.host}:~/.ssh/id_ed25519",
                                            worker="all"), capture=False)
-            if not copy.ok:
-                return copy.code
+            if copy.returncode:
+                return copy.returncode
         code = exit_code(tpu.fanout([(index, "bash ~/dew-setup.sh") for index in range(count)]))
         if code:
             return code
@@ -699,7 +699,7 @@ def _verify_devices(tpu: Tpu, count: int, expected: int) -> int:
         return 0
     rows, failed = [], 0
     for index, outcome in enumerate(outcomes):
-        reported = outcome.out.split()
+        reported = outcome.stdout.split()
         devices = int(reported[0]) if reported else 0
         local = reported[1] if len(reported) > 1 else "-"
         good = devices == expected
@@ -756,7 +756,7 @@ class Status(Named):
             return 0
         rows = []
         for index, outcome in enumerate(outcomes):
-            fields = (outcome.out.strip().split("|") + ["-"] * 4)[:4]
+            fields = (outcome.stdout.strip().split("|") + ["-"] * 4)[:4]
             rows.append((str(index), fields[0] or "-", fields[1], fields[2], fields[3]))
         _table(("WORKER", "UPTIME", "DEW PROCS", "DEVICES BUSY", "DEVICES"), rows)
         return exit_code(outcomes)
