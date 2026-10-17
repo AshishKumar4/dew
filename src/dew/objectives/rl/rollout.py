@@ -16,7 +16,7 @@ from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 
-from ..lm import LMObjective
+from ..lm import TokenScorer
 from .sessions import (
     OLD_LOG_PROBS_KEY,
     Call,
@@ -66,7 +66,7 @@ class SampledRollout:
     `rollout/<name>`.
     """
 
-    objective: LMObjective
+    objective: TokenScorer
     reward: Reward
     decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids)
     groups: int = 4

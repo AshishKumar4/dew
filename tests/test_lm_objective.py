@@ -338,6 +338,10 @@ def test_a_preview_over_prompts_of_different_lengths_draws_what_each_draws_alone
     together = objective_for(prompts)
     params = together.init(jax.random.key(0))
     drawn = together.preview(params, token_batch(), step_at(key=5))
+    # One prompt as a flat array previews as one row, as a list does.
+    flat = objective_for(jnp.asarray(prompts[0])).preview(params, token_batch(), step_at(key=5))
+    np.testing.assert_array_equal(flat.tokens, objective_for(prompts[0]).preview(
+        params, token_batch(), step_at(key=5)).tokens)
     for index, prompt in enumerate(prompts):
         alone = objective_for(prompt).preview(params, token_batch(), step_at(key=5))
         np.testing.assert_array_equal(drawn.tokens[index, -len(prompt) - 4:], alone.tokens[0])

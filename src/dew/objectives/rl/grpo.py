@@ -1,7 +1,7 @@
 """Group-relative policy optimization over sampled rollouts.
 
-A `GRPOObjective` is an `LMObjective` whose loss is the section 6
-composition from `dew.rl`: a clipped policy surrogate plus `beta` times the
+A `GRPOObjective` scores tokens as `LMObjective` does (`TokenScorer`), and its
+loss is the section 6 composition from `dew.rl`: a clipped policy surrogate plus `beta` times the
 k3 KL against the frozen reference. It reads the one batch layout
 `sessions.pack` builds, which every rollout in Dew produces: rows of strictly
 merged chains with `text_segment_ids` and `text_positions`, every column
