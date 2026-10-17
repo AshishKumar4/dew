@@ -26,6 +26,7 @@ from typing import ClassVar, Protocol, TypeGuard
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from typing_extensions import get_protocol_members
 
 from dew import records
 from dew.data.text import HFTokenizer, Tokenizer
@@ -55,15 +56,10 @@ class TokenizerSpecials(Protocol):
     def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
 
 
-_SPECIAL_IDS = ("cls_token_id", "sep_token_id", "eos_token_id", "bos_token_id", "mask_token_id",
-                "pad_token_id")
-"""The special-token ids `TokenizerSpecials` declares."""
-
-
 def _holds_specials(tokenizer: object) -> TypeGuard[TokenizerSpecials]:
     """Whether `tokenizer` answers what `TokenizerSpecials` declares. Each member is read, not
     looked up statically, since a transformers tokenizer answers its ids through `__getattr__`."""
-    return all(hasattr(tokenizer, name) for name in (*_SPECIAL_IDS, "convert_ids_to_tokens"))
+    return all(hasattr(tokenizer, name) for name in get_protocol_members(TokenizerSpecials))
 
 
 class _Same:
