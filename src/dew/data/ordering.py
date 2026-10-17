@@ -60,7 +60,8 @@ class BlockShuffle(grain.MapDataset[Batch]):
         size = int(ends[block]) - start
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
         picked = grain.MapDataset.range(size).shuffle(seed)[position - start]
-        assert picked is not None  # a shuffled integer range holds every integer
+        if picked is None:
+            raise RuntimeError("Grain index shuffle filtered an integer range")
         offset = int(picked)
         for member in members:
             if offset < self._sizes[member]:

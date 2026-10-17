@@ -9,7 +9,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
-from typing import overload
+from typing import TypeGuard, overload
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -90,7 +90,7 @@ class _KeepAccepted:
         self.consecutive = 0
         self.warned = False
 
-    def __call__(self, element: Batch | Rejected) -> bool:
+    def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         reason = element.reason if isinstance(element, Rejected) else None
         if reason is None and self.tokens is not None and not isinstance(element, Rejected):
@@ -184,9 +184,10 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate = predicate
 
     def __next__(self) -> Batch:
-        value = next(self._read)
-        assert not isinstance(value, Rejected)  # the filter under it (`_KeepAccepted`) passes none
-        return value
+        while True:
+            value = next(self._read)
+            if self._predicate(value):
+                return value
 
     def get_state(self) -> Mapping[str, object]:
         return {
@@ -202,7 +203,8 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """Grain's filter, with a named search budget and checkpointed counts."""
+    """The records its parent accepts, as Grain's filter keeps them, with a named search budget and
+    checkpointed counts; its position is its parent's, as the filter's is."""
 
     def __init__(
         self,
@@ -217,7 +219,7 @@ class Accepted(pygrain.IterDataset[Batch]):
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         predicate = _KeepAccepted(CorpusCounts(self._name), self._budget, self._tokens)
-        return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
+        return _AcceptedIterator(iter(self._records), predicate)
 
 
 def token_weights(
