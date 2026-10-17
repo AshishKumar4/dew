@@ -115,7 +115,7 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     perturb(reference)
     ours = audio_config(config.to_dict())
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
-    tree = audio_weights(tensors, ours)
+    tree, _ = audio_weights(tensors, ours)
     linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
                                use_clipped_linears=ours.use_clipped_linears)
     feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,
