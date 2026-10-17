@@ -1319,11 +1319,12 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     over the two records fills no batch. Repeated after the batch, a pass holds no batch to
     replay, so that read is refused rather than replaying nothing forever; eight records make
     a batch either way."""
-    for count, repeated in ((2, "before"), (2, "after"), (8, "after")):
+    for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
+                            (8, "after, then take")):
         rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(count)]))
         chain = rows.repeat().batch(8) if repeated == "before" else rows.batch(8).repeat()
-        data = compile(chain, read=read, loading=READ)
-        if count < 8 and repeated == "after":
+        data = compile(chain.take(1) if repeated.endswith("take") else chain, read=read, loading=READ)
+        if count < 8 and repeated.startswith("after"):
             with pytest.raises(ValueError):
                 refused = data.train(DataPartition())
                 try:
@@ -1337,7 +1338,7 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
                 index % count for index in range(8))
         finally:
             stream.close()
-        if count < 8:
+        if count < 8 and repeated == "before":
             with pytest.raises(ValueError):
                 data.epoch_steps(1)
 
