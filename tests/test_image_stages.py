@@ -204,3 +204,42 @@ def test_a_side_and_its_square_resize_alike(size):
     row = {"image": np.array([[[64, 64, 64], [192, 192, 192]]], np.uint8)}
     np.testing.assert_array_equal(images.resize(size).map(row)["image"],
                                   images.resize((size, size)).map(row)["image"])
+
+
+def test_a_saved_position_is_refused_by_a_run_that_tokenizes_its_captions_otherwise():
+    """A diffusion run's captions are tokenized by its condition's encoder, so a position saved
+    under eight caption tokens is refused by a run that tokenizes to sixteen: the batches differ,
+    though every step's code is the same."""
+    from dew.diffusion.presets import Flow
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.sampling import Euler
+
+    def data(tokens: int):
+        condition = Condition(CharTable.from_pretrained(tokens=tokens), field="text")
+        objective = DiffusionObjective(
+            SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1), Flow(),
+            InputSpec(Field("image", (16, 16, 3)), conditions={"textcontext": condition}),
+            solver=Euler(), steps=2)
+        recipe = ImageData(source=pictures(8), image_size=16, caption="a photograph of a flower in a field",
+                           validation=None)
+        return loader(recipe, batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1),
+                      objective=objective.data())
+
+    saving = data(8).train(DataPartition())
+    try:
+        assert np.asarray(next(saving)["text"]["input_ids"]).shape == (4, 8)
+        state = saving.get_state()
+    finally:
+        saving.close()
+    for tokens, refused in ((8, False), (16, True)):
+        resumed = data(tokens).train(DataPartition())
+        try:
+            if refused:
+                with pytest.raises(ValueError):
+                    resumed.set_state(state)
+            else:
+                resumed.set_state(state)
+        finally:
+            resumed.close()
