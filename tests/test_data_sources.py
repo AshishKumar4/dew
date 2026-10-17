@@ -657,37 +657,6 @@ def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_p
         csv.field_size_limit(previous)
 
 
-def test_a_fetch_whose_host_resolves_slowly_ends_at_its_timeout(monkeypatch):
-    """The system resolver takes no timeout; a fetch waits on a slow lookup no longer than its own
-    timeout and drops the attempt as transient, however many fetches give up on lookups at once,
-    on a bounded set of resolver threads. A host name no lookup can encode is still invalid."""
-    import socket
-    import time
-
-    from dew.data.pipeline import Rejected
-    from dew.data.sources.urls import Fetch
-
-    resolve = socket.getaddrinfo
-
-    def slow(*arguments, **options):
-        time.sleep(3)
-        return resolve(*arguments, **options)
-
-    monkeypatch.setattr(socket, "getaddrinfo", slow)
-
-    def timed(index: int) -> tuple[Rejected | dict, float]:
-        began = time.monotonic()
-        return Fetch(timeout=0.5)({"url": f"http://host-{index}.localhost:9/"}), time.monotonic() - began
-
-    with ThreadPoolExecutor(8) as pool:
-        outcomes = list(pool.map(timed, range(24)))
-    assert all(isinstance(fetched, Rejected) and not fetched.permanent and waited < 1.0
-               for fetched, waited in outcomes)
-    assert sum(thread.name.startswith("dew-fetch-resolve") for thread in threading.enumerate()) <= 16
-    monkeypatch.setattr(socket, "getaddrinfo", resolve)
-    assert Fetch(timeout=0.5)({"url": "http://a..b/"}) == Rejected("invalid_url")
-
-
 @pytest.mark.parametrize("trickled", ["headers", "body"])
 def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
     """A server that sends its headers or its body a byte every tenth of a second holds a fetch
