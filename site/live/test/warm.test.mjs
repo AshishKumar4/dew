@@ -1,5 +1,6 @@
-// The Worker warms its own pool: a session request that finds no warm model starts the pinned
-// generation's preparation, as the operator's warm does, without anyone warming it after a deploy.
+// The Worker warms its own pool: a session request that finds the pool set to another commit than the deploy
+// pins, none or the last deploy's, starts the pinned generation's preparation, as the operator's warm does,
+// without anyone warming it after a deploy; the last generation serves meanwhile.
 //
 //   pnpm live:test
 
@@ -13,6 +14,7 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 const here = (file) => fileURLToPath(new URL(file, import.meta.url));
 const config = JSON.parse(readFileSync(here('../wrangler.jsonc'), 'utf8'));
 const PINNED = 'c'.repeat(40);
+const LAST = 'b'.repeat(40);
 const ORIGIN = 'https://dewml.dev';
 
 /** The Worker under miniflare, its preparer the harness's, with `bindings` beside the deploy's. */
@@ -33,16 +35,18 @@ async function started(bindings = {}) {
 	}));
 }
 
-/** Six visitors' session requests at once, from addresses `first` on, each answered 503 "warming". */
-async function warming(worker, first) {
+/** Six visitors' session requests at once, from addresses `first` on: their answers' statuses. */
+async function visit(worker, first) {
 	const answers = await Promise.all(Array.from({ length: 6 }, (_, visitor) => worker.dispatchFetch('https://live/v1/sessions', {
 		method: 'POST', body: JSON.stringify({ turnstile: 'token' }),
 		headers: { Origin: ORIGIN, 'CF-Connecting-IP': `203.0.113.${first + visitor}`, 'Content-Type': 'application/json' },
 	})));
-	for (const answer of answers) {
-		assert.equal(answer.status, 503);
-		assert.equal((await answer.json()).error, 'warming');
-	}
+	return Promise.all(answers.map(async (answer) => [answer.status, (await answer.json()).error ?? null]));
+}
+
+/** Six visitors' session requests at once, from addresses `first` on, each answered 503 "warming". */
+async function warming(worker, first) {
+	assert.deepEqual(await visit(worker, first), Array(6).fill([503, 'warming']));
 }
 
 /** The commits the preparer has been asked for, once it has been asked `count` times, and a moment more. */
@@ -79,6 +83,35 @@ test('a failed preparation is retried after its backoff whatever visitors ask, a
 			{ method: 'POST', headers: { Authorization: 'Bearer operator' } });
 		assert.equal(warmed.status, 200);
 		assert.deepEqual(await asked(worker, 2), [PINNED, PINNED]);
+	} finally {
+		await worker.dispose();
+	}
+});
+
+/** The last deploy's generation, serving, as the last deploy left the pool and the registry (warm-harness.ts). */
+async function left(worker, retrying) {
+	const generation = { snapshot: { id: 'last-snapshot' }, commit: LAST, created: Date.now() - 60_000,
+		prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
+	const answer = await worker.dispatchFetch('https://live/left', { method: 'POST', body: JSON.stringify({ generation, retrying }) });
+	assert.equal(answer.status, 204);
+}
+
+test('a deploy no one warmed moves the pool off the last generation, which serves until the pinned one is ready', async () => {
+	const worker = await started();
+	try {
+		await left(worker, false);
+		assert.deepEqual(await visit(worker, 0), Array(6).fill([201, null]));
+		assert.deepEqual(await asked(worker, 1), [PINNED]);
+	} finally {
+		await worker.dispose();
+	}
+});
+
+test('the registry prepares the deploy\'s pinned commit over the last deploy\'s request of its own', async () => {
+	const worker = await started();
+	try {
+		await left(worker, true);
+		assert.deepEqual(await asked(worker, 1), [PINNED]);
 	} finally {
 		await worker.dispose();
 	}

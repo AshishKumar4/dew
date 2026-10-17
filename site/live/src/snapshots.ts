@@ -126,7 +126,8 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			else await this.failed(lease.token, 'the preparation left no outcome within its lease');
 			return;
 		}
-		const commit = await this.ctx.storage.get<string>('requested') || this.env.SNAPSHOT_COMMIT || (await this.previous())?.commit;
+		// The deploy's pinned commit over a request of another (a Worker of the last deploy's, during the rollout).
+		const commit = this.env.SNAPSHOT_COMMIT || await this.ctx.storage.get<string>('requested') || (await this.previous())?.commit;
 		if (commit) await this.refresh(commit);
 		else {
 			console.error('snapshot renewal has no requested generation');
@@ -177,7 +178,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			await storage.delete('failure');
 			await storage.delete('retries');
 			await storage.delete('rebuild');
-			const requested = await storage.get<string>('requested');
+			const requested = this.env.SNAPSHOT_COMMIT || await storage.get<string>('requested');
 			if (requested && requested !== candidate.commit) await storage.setAlarm(Date.now() + 1000);
 			else {
 				await storage.delete('requested');
