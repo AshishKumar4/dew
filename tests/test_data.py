@@ -1388,11 +1388,17 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     stream.close()
 
 
-def test_training_records_too_few_for_one_batch_are_refused():
-    """An endless stream would fill a batch by repeating records inside it,
-    and an epoch would be zero steps long."""
+def test_an_epoch_of_records_too_few_for_one_batch_is_refused():
+    """Three records repeat to fill a batch of four, as a run counted in steps reads them, but an
+    epoch of them is zero steps long, so a run counted in epochs is refused."""
+    data = loader(RecordsData(source=_columns(3)), batch=4, read="memory")
+    stream = data.train(DataPartition())
+    try:
+        assert len(next(stream)["index"]) == 4
+    finally:
+        stream.close()
     with pytest.raises(ValueError):
-        loader(RecordsData(source=_columns(3)), batch=4, read="memory")
+        data.epoch_steps(1)
 
 
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):

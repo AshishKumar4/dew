@@ -170,6 +170,24 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("kind", [np.asarray, tuple])
+def test_prompt_and_preference_encodings_read_token_arrays_as_they_read_lists(read, kind):
+    """Token ids a step of Dew's own makes are int32 arrays (`text.tokenize`), and a dataset's
+    column may hold tuples; prompt and preference encodings read either as they read lists."""
+    lists = [{"prompt": [1, 2], "chosen": [1, 2, 3], "rejected": [1, 4], "chosen_mask": [0, 1, 1],
+              "rejected_mask": [0, 1]}]
+    native = [{name: kind(np.asarray(value, np.int32)) for name, value in row.items()} for row in lists]
+
+    def first(rows):
+        chain = Memory(rows).filter_map(prompts.encode("byte", max_prompt_len=4)).map(preferences.pair(4))
+        return next(iter(iterate(chain, read=read, loading=READ)))
+
+    encoded = [first(rows) for rows in (lists, native)]
+    for name in ("prompt", "prompt_length", "input_ids", "completion_mask"):
+        np.testing.assert_array_equal(encoded[1][name], encoded[0][name])
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 @pytest.mark.parametrize("row", [
     {"id": 7}, {"id": 7, "prompt": ""},
     {"id": 7, "chosen": [1, 2]},

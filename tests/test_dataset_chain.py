@@ -825,7 +825,9 @@ def test_a_random_step_that_may_drop_draws_as_one_that_cannot(read):
 
 
 class Coin(grain.RandomMapTransform):
-    """Keeps a record, with its draw, on heads."""
+    """Keeps a record, with its draw, on heads; it says it drops records."""
+
+    rejects = True
 
     def random_map(self, element, rng) -> dict | Rejected:
         return keep_heads(element, rng)
