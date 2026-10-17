@@ -25,6 +25,15 @@ A choice whose criteria are a list is given to the release's code as a
 mapping of each option to None, which is what the list means and what that
 code reads.
 
+With `--fla`, on a CUDA GPU with fla installed, it reads that head back and
+runs each request through the same release with HF's Qwen 3.5 Gated DeltaNet
+on fla's own chunked kernels, every other product IEEE fp32, and writes each
+question's fp32 logits to logits_fla.npz under `<case>/<id>`: the reference
+Dew's model is held to where its delta rule runs on its port, fla's algorithm
+(tests/test_decision_joint_checkpoint.py). Its environment is pinned: torch
+2.8.0 for CUDA 12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla`
+checks before it runs.
+
 With `--images`, it reads that head back and runs the quickstart request
 with the backbone fixture's two images (images.npy) as the release's
 `systemone` runs one, its processor laying the images out before the state, and writes
@@ -32,7 +41,7 @@ images.json (the row's token ids) and images.npz (each question's fp32
 logits under `<id>` and float64 ones under `<id>/f64`, the vision tower
 included).
 
-    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--images]
+    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --images]
 """
 
 import copy
@@ -131,6 +140,47 @@ def main() -> None:
     np.savez(OUT / "logits.npz", **logits)
 
 
+FLA_PINS = {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"}
+"""The packages `on_fla` runs in, as its fixture's provenance names them."""
+
+
+def on_fla() -> None:
+    import importlib.metadata
+    import inspect
+
+    from safetensors.torch import load_file
+    from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    found = {name: importlib.metadata.version(name).split("+")[0] for name in FLA_PINS}
+    assert found == FLA_PINS, f"on_fla runs in {FLA_PINS}, not {found}"
+    rule = inspect.getclosurevars(modeling_qwen3_5.torch_chunk_gated_delta_rule).nonlocals["implementation"]
+    assert rule.__module__.startswith("fla."), f"HF's Qwen 3.5 runs {rule.__module__}, not fla's chunked rule"
+    # Only fla's kernels part from the torch math the CPU fixture runs: no TF32 elsewhere.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    device = torch.device("cuda")
+    upstream, _ = upstream_module()
+    tokenizer = AutoTokenizer.from_pretrained(BACKBONE)
+    backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
+                                                               attn_implementation="eager").to(device).eval()
+    head = upstream.JointSchemaHead(**json.loads((OUT / "joint_head_config.json").read_text())).eval()
+    head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
+    head = head.to(device)
+    cases = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())
+    table, text, logits = backbone.get_output_embeddings().weight, backbone.model.language_model, {}
+    for case, request in cases.items():
+        encoded = upstream.encode_record(tokenizer, as_upstream(request))
+        batch = upstream.collate_records([encoded], tokenizer.pad_token_id, device)
+        with torch.no_grad():
+            hidden = text(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                          use_cache=False).last_hidden_state
+            found = head(hidden, batch["input_ids"], batch["attention_mask"], batch["records"], table)[0]
+        for question, fp32 in zip(encoded.questions, found, strict=True):
+            logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
+    np.savez(OUT / "logits_fla.npz", **logits)
+
+
 def images() -> None:
     from diffusers_wan_reference import float64
     from PIL import Image
@@ -165,4 +215,4 @@ def images() -> None:
 
 
 if __name__ == "__main__":
-    images() if "--images" in sys.argv[1:] else main()
+    {"--images": images, "--fla": on_fla}.get(next(iter(sys.argv[1:]), ""), main)()

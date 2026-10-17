@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, port_formula, recurrence, through
+from delta_rule_support import CHUNKED, math, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
@@ -189,30 +189,27 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
 
 @pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
-def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key):
+def test_the_port_takes_each_packed_tokens_gradients_as_its_document_alone_does(per_key):
     """The port's output at each packed token and its gradients of the token's query, key and decay
-    (`linear.fla_rule`, a row of
-    documents as one sequence, each document's first token forgetting the memory by `linear.FORGET`)
-    as near the float64 recurrence run document by document as the port's formula in the portable
-    math (`port_formula`) on the same row, its every range two plain fp32 base-2 prefixes apart as
-    the port's: no token's gradient carries another document's. Per token, these hold what the
-    per-head decay parameters only sum: their gradients, `A_log`'s and `dt_bias`'s over a layer's few
-    heads, are two draws of sums of every token's prefix rounding, which a model's packed tests do
-    not hold (test_decision_packing, test_mixers). Documents of 40, 60, 1, 49, 40, 10 and 56
-    tokens, one of a single token and resets two apart in a chunk."""
-    batch, length, heads, width = 1, 256, 2, 64
+    (`linear.fla_rule`, a row of documents as one sequence, each document's first token forgetting the
+    memory by `linear.FORGET`) as near the float64 recurrence run document by document as the port's
+    own with the token's document alone in place, the row's other tokens zero: no token's gradient
+    carries another document's. Per token, these hold what the per-head decay parameters only sum.
+    The port's algorithm is held against fla's own packed sequences (test_fla_gdn, test_fla_kda).
+    Documents of 40, 60, 1, 49, 40, 10 and 56 tokens, one of a single token and resets two apart in
+    a chunk."""
+    length, heads, width = 256, 2, 64
     begins = (0, 40, 100, 101, 150, 190, 200)
-    starts = np.zeros((batch, length), bool)
-    starts[0, list(begins[1:])] = True
+    document = np.searchsorted(begins, np.arange(length), side="right") - 1
     keys = jax.random.split(jax.random.key(29), 6)
-    q = 0.3 * jax.random.normal(keys[0], (batch, length, heads, width))
-    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
-    v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (batch, length, heads, *(width,) * per_key)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    q = 0.3 * jax.random.normal(keys[0], (1, length, heads, width))
+    k = l2norm(jax.random.normal(keys[1], (1, length, heads, width)))
+    v = jax.random.normal(keys[2], (1, length, heads, width))
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (1, length, heads, *(width,) * per_key)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
     do = jax.random.normal(keys[5], v.shape)
 
-    def taken(rule):
+    def taken(rule, v, beta, do):
         def run(q, k, g):
             def loss(q, k, g):
                 out = rule(q, k, v.astype(q.dtype), g, beta.astype(q.dtype))[0]
@@ -221,22 +218,34 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key
             return {"out": out, **dict(zip(("q", "k", "g"), grads, strict=True))}
         return run
 
-    def packed(rule):
-        return lambda *args: rule(*args, None, starts=jnp.asarray(starts))
+    def on_the_port(starts):
+        return lambda q, k, v, g, beta: linear.fla_rule(q, k, v, g, beta, starts=jnp.asarray(starts))
+
+    starts = np.isin(np.arange(length), begins[1:])[None]
+    got = jax.jit(taken(on_the_port(starts), v, beta, do))(q, k, g)
+    # Each document alone where the row packed it, a row of its own: every other token zero, so it
+    # carries nothing, and its first token the row's only start but the row's first.
+    mine = (document[None, :] == np.arange(len(begins))[:, None])
+
+    def alone_in_place(x):
+        return jnp.where(mine.reshape(*mine.shape, *(1,) * (x.ndim - 2)), x, 0)
+
+    rows = taken(on_the_port(starts & mine), alone_in_place(v), alone_in_place(beta), alone_in_place(do))
+    each = jax.jit(rows)(*(alone_in_place(x) for x in (q, k, g)))
+    reference = {name: value[document, np.arange(length)][None] for name, value in each.items()}
 
     def alone(q, k, v, g, beta):
         decay = g if per_key else g[..., None]
-        out, _ = recurrence(q, k, v, decay, beta, jnp.zeros((batch, heads, width, width), q.dtype),
+        out, _ = recurrence(q, k, v, decay, beta, jnp.zeros((1, heads, width, width), q.dtype),
                             cuts=(begins,))
         return out, None
 
-    got = jax.jit(taken(packed(linear.fla_rule)))(q, k, g)
-    formula = jax.jit(taken(packed(port_formula)))(q, k, g)
     with jax.enable_x64(new_val=True):
-        wide = widened((q, k, g))
-        want = widened(taken(alone)(*wide))
-        _, terms = float64_terms(taken(packed(port_formula)), *wide)
-    assert_leaves_as_exact(got, formula, want, reductions=CHUNKED, terms=terms)
+        wide = widened((q, k, g, v, beta, do))
+        want = widened(taken(alone, *wide[3:])(*wide[:3]))
+        _, terms = float64_terms(taken(lambda q, k, v, g, beta: math(q, k, v, g, beta, None, starts),
+                                       *wide[3:]), *wide[:3])
+    assert_leaves_as_exact(got, reference, want, reductions=CHUNKED, terms=terms)
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
