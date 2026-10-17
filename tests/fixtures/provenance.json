@@ -8,6 +8,11 @@
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "joint_checkpoint/tiny/logits_fla.npz": {
+   "tool": "tools/joint_checkpoint_reference.py",
+   "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}, {"repo": "fla-org/flash-linear-attention", "version": "0.5.2", "runs": "fla"}],
+   "note": "--fla on an A100: torch 2.8.0+cu128, triton 3.4.0, fla-core 0.5.2; TRITON_F32_DEFAULT=ieee and fla's intra-chunk solve held to IEEE fp32 (precision 'ieee')."
+  },
   "joint_checkpoint/tiny/states.npz": {
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]

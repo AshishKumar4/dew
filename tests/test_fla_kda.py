@@ -14,7 +14,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, NAMES, fla_decay_terms, fla_side, plain_prefix, recurrence, through
+from delta_rule_support import (
+    CHUNKED,
+    NAMES,
+    fla_decay_terms,
+    fla_side,
+    float64_truth,
+    math,
+    plain_prefix,
+    recurrence,
+    through,
+)
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
@@ -25,7 +35,7 @@ from reference_error import (
 from sharded import boundary_copies
 from tuned import each_config
 
-from dew.nn import kernels, linear
+from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import fla_gdn, fla_kda, tuning
 from dew.nn.linear import fla_rule, l2norm
@@ -55,15 +65,6 @@ def operands(batch, length, key_heads, value_heads, width, columns, dtype, *, se
     do = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     dht = 0.1 * jax.random.normal(keys[7], (batch, value_heads, width, columns))
     return q, k, v, g, beta, h0, do, dht
-
-
-def math(q, k, v, g, beta, h0, starts=None):
-    """The portable rule, value heads reading their key head, a row's packed documents starting at
-    `starts` (`[B, T]`), as the port runs them."""
-    group = v.shape[2] // q.shape[2]
-    q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    starts = None if starts is None else jnp.asarray(starts)
-    return linear.chunk_delta_rule(q, k, v, g, beta, h0, starts=starts)
 
 
 def fla_math(q, k, v, g, beta, h0):
@@ -136,63 +137,6 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
     text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile().as_text()
     assert "__gpu$xla.gpu.triton" in text
     assert boundary_copies(text) == []
-
-
-def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
-    so a head's backward fits, and each one's float64 terms, evaluated op by op on the host: what the
-    sums of Dew's portable math add on the whole row, its documents from their starts as the port runs
-    them (`float64_terms`, `HEADS` value heads at a time), and for the decay's gradient those of the
-    parts the port sums besides (`fla_decay_terms`). A key head's gradients and terms are summed over
-    the value heads it serves."""
-    q, k, v, g, beta, h0, do, dht = inputs
-    group = v.shape[2] // q.shape[2]
-    rows = None if cuts is None else (cuts,)
-    host = jax.devices("cpu")[0]
-    starts = None
-    if cuts is not None:
-        starts = np.zeros(q.shape[:2], bool)
-        starts[0, list(cuts[1:])] = True
-    with jax.enable_x64(new_val=True):
-        run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
-            functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
-        heads, decay = [], []
-        for head in range(v.shape[2]):
-            keyed = slice(head // group, head // group + 1)
-            valued = slice(head, head + 1)
-            sliced = widened((q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued],
-                              beta[:, :, valued], h0[:, valued], do[:, :, valued], dht[:, valued]))
-            heads.append([np.asarray(x) for x in run(*sliced)])
-            with jax.default_device(host):
-                decay.append(fla_decay_terms(*jax.device_put(sliced, host), starts=starts))
-        sizes = []
-        step, packed = max(1, HEADS // group), functools.partial(math, starts=starts)
-        with jax.default_device(host):
-            for first in range(0, q.shape[2], step):
-                keyed, valued = slice(first, first + step), slice(first * group, (first + step) * group)
-                block = jax.device_put(widened((
-                    q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
-                    h0[:, valued], do[:, :, valued], dht[:, valued])), host)
-                _, terms = float64_terms(through(packed, *block[6:]), *block[:6])
-                sizes.append([np.asarray(x) for x in terms])
-
-    def joined(leaves):
-        return [np.concatenate([each[i] for each in leaves], axis=axis)
-                for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
-
-    def grouped(x):
-        return x.reshape(*x.shape[:2], q.shape[2], group, -1).sum(axis=3)
-
-    found, terms = joined(heads), joined(sizes)
-    terms[5] = np.maximum(terms[5], np.concatenate(decay, axis=2))
-    for i in (2, 3):
-        found[i] = grouped(found[i])
-    return found, terms
-
-
-HEADS = 8
-"""The value heads `float64_truth` evaluates the portable math's terms over at once: fewer operations
-dispatched one by one, at a few GB of host memory a block for Kimi's decay per key dimension."""
 
 
 GPU_CASES = {
