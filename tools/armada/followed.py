@@ -4,8 +4,9 @@ file without a key, as code no event sees ran.
 
 A child is this checkout's Python started with an environment that names DEW_EXECUTED_CHILDREN, the
 parent's or one passed on with it. The `.pth` the parent installs in the environment (`installed`)
-runs `follow` as the child starts: it records the checkout's files the child executed, where it read
-the backend, the processes it started in turn, and the GPU pool it held, and writes them as it exits.
+runs `follow` as the child starts: it records the checkout's files the child executed and read
+(`read`, as the parent records its own), where it read the backend, the processes it started in turn,
+and the GPU pool it held, and writes them as it exits.
 A child that ends without its record (killed, or leaving through os._exit) leaves its start mark
 behind, and the parent then counts its file's starts as unfollowed (`gathered`), as it does a child
 whose record names another file or a count of records other than the starts it saw."""
@@ -17,8 +18,10 @@ import os
 import subprocess
 import sys
 import sysconfig
+import threading
 import time
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
@@ -29,6 +32,10 @@ checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
+READS = {"open", "os.listdir", "os.scandir"}
+"""Audit events of a read: a file opened, a directory listed."""
+IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
+"""The import system's frozen modules, which list the directories it imports from."""
 CHILDREN = "DEW_EXECUTED_CHILDREN"
 """Where a followed child writes its record and its start mark, and what makes it one."""
 FOLLOWER_TOOL = 4
@@ -44,6 +51,8 @@ would itself take a pool. This private function's name and its `platform` argume
 use of another library in tools/armada; the pool is then read through `jax.devices()`."""
 FRACTION = "XLA_PYTHON_CLIENT_MEM_FRACTION"
 decided: dict[types.CodeType, bool] = {}
+placing = threading.local()
+"""Whether the `os.open` this thread is making opens relative to a directory descriptor (`opening`)."""
 
 
 def checkout(name: str, root: str) -> bool:
@@ -64,6 +73,70 @@ def reads_backend(code: types.CodeType) -> bool:
                 and steps[index - 1].argval in ("sys", "platform")))
             for index, step in enumerate(steps))
     return decided[code]
+
+
+def read(event: str, args: tuple, caller: str, root: str) -> str | None:
+    """The checkout's file or directory, relative to `root`, that a read event of code in file `caller`
+    names, or None: a file opened only to read (`open`'s mode, or its flags for `os.open`), or a
+    directory listed but by a listing tool (`listing_tool`). An open relative to a directory
+    descriptor is `opening`'s to place."""
+    path = args[0]
+    if isinstance(path, int):
+        return None
+    if event == "open":
+        mode, flags = args[1], args[2]
+        written = any(letter in mode for letter in "wax+") if mode is not None else (
+            flags & os.O_ACCMODE != os.O_RDONLY)
+        if written or (mode is None and getattr(placing, "relative", False)):
+            return None
+    elif listing_tool(caller):
+        return None
+    return placed(os.path.abspath(os.fsdecode(path if path is not None else ".")), root)
+
+
+def placed(name: str, root: str) -> str | None:
+    """Absolute path `name` relative to the checkout at `root`, its own directory as `.`, or None
+    where it is not the checkout's or is never an input (a hidden directory, compiled bytecode, the
+    environment's packages)."""
+    if name == root.removesuffix(os.sep):
+        return "."
+    if not name.startswith(root):
+        return None
+    relative = name[len(root):]
+    if relative.split(os.sep)[0].startswith(".") or "__pycache__" in relative or "site-packages" in relative:
+        return None
+    return relative
+
+
+def opening(recorded: Callable[[str], None], root: str) -> None:
+    """`os.open` wrapped, whose audit event names a path relative to `dir_fd` without the descriptor:
+    such an open, once it has opened to read, is passed to `recorded` as what the descriptor it
+    opened names (`placed`)."""
+    plain = os.open
+
+    def opened(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None:
+            return plain(path, flags, mode)
+        placing.relative = True
+        try:
+            descriptor = plain(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            placing.relative = False
+        if flags & os.O_ACCMODE == os.O_RDONLY and (name := placed(
+                os.readlink(f"/proc/self/fd/{descriptor}"), root)) is not None:
+            recorded(name)
+        return descriptor
+
+    os.open = opened
+
+
+def listing_tool(name: str) -> bool:
+    """Whether code in file `name` lists directories for the import system, for its search of the
+    installed distributions (the locks' to key) or for pytest's collection, whose listings are no
+    test's input: what they find is recorded as it runs. The rest of the standard library's
+    frozen modules (`os.walk`'s) list for whoever calls them."""
+    return (name in IMPORTING or f"{os.sep}_pytest{os.sep}" in name
+            or f"{os.sep}importlib{os.sep}metadata{os.sep}" in name)
 
 
 def programs(event: str, args: tuple) -> list:
@@ -169,6 +242,11 @@ def follow() -> None:
         record["pool"] = sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats)
 
     def audited(event, args):
+        if event in READS:
+            name = read(event, args, sys._getframe(1).f_code.co_filename, root)
+            if name is not None:
+                record["files"].add(name)
+            return
         kind = start(event, args, str(directory))
         if kind == "followed":
             record["expected"] += 1
@@ -181,6 +259,7 @@ def follow() -> None:
         (directory / f"{os.getpid()}.json").write_text(json.dumps(ended))
         mark.unlink()
 
+    opening(record["files"].add, root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, "dew-followed")
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
     sys.monitoring.set_events(FOLLOWER_TOOL, sys.monitoring.events.PY_START)
