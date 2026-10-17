@@ -404,6 +404,13 @@ class HarborSource:
       environment provider, timeouts and agent kwargs.
     - `workers` is how many trials run at once. Harbor's own sandbox limits
       apply inside each trial.
+    - `trial_timeout`, when set, bounds each trial's Harbor process in
+      seconds from its start. Harbor bounds the environment build, the
+      agent's setup and run, and the verifier itself (`--agent-timeout`,
+      `--verifier-timeout`, `--timeout-multiplier` in `arguments`), but no
+      option of its own bounds the whole trial. A trial past this deadline
+      is interrupted as `cancel` interrupts it, and resolves `INFRA_ERROR`,
+      which the scheduler retries.
 
     The harness must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
     Harbor's mini-swe-agent does.
@@ -442,14 +449,15 @@ class HarborSource:
         arguments: Sequence[str] = (),
         workers: int = 8,
         grace: float = 60.0,
+        trial_timeout: float | None = None,
         ready_timeout: float = 900.0,
         ready_poll: float = 2.0,
     ):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
-        if not grace > 0:
-            raise ValueError("grace is a positive number of seconds")
-        self._grace = grace
+        if not grace > 0 or (trial_timeout is not None and not trial_timeout > 0):
+            raise ValueError("grace and trial_timeout are positive numbers of seconds")
+        self._grace, self._trial_timeout = grace, trial_timeout
         self._ready_timeout, self._ready_poll = ready_timeout, ready_poll
         self._ready = False
         # Serializes the readiness wait apart from `_lock`, so cancel and close never wait on the gateway.
@@ -517,9 +525,13 @@ class HarborSource:
                 if record is None or record.cancelled:
                     continue
                 record.cancelled = True
-                if record.process is not None and record.process.poll() is None:
-                    _signal(record.process, signal.SIGINT)
-                    record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
+                self._interrupt(record)
+
+    def _interrupt(self, record: _Trial) -> None:
+        """Send a live trial's Harbor SIGINT, once, and arm its escalation. The caller holds the lock."""
+        if record.timer is None and record.process is not None and record.process.poll() is None:
+            _signal(record.process, signal.SIGINT)
+            record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
         """Harbor ignored the last signal for a whole grace period: send the next, SIGTERM then SIGKILL."""
@@ -599,15 +611,22 @@ class HarborSource:
                 # Resolved outside the lock: the future's done-callback takes it.
                 future.set_result(ended(Status.CANCELLED))
                 return
-            log, _ = process.communicate()
+            try:
+                log, _ = process.communicate(timeout=self._trial_timeout)
+            except subprocess.TimeoutExpired:
+                # Past the whole-trial deadline: interrupted as a cancel is, then waited for again.
+                with self._lock:
+                    record.expired = True
+                    self._interrupt(record)
+                log, _ = process.communicate()
             with self._lock:
                 record.process = None
-                cancelled = record.cancelled
+                cancelled, expired = record.cancelled, record.expired
                 if record.timer is not None:
                     record.timer.cancel()
             try:
                 future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
-                                                cancelled, version))
+                                                cancelled, expired, version))
             finally:
                 # The session's traces leave the gateway on every exit path;
                 # the future already has its verdict.
@@ -620,7 +639,7 @@ class HarborSource:
                 future.set_exception(error)
 
     def _verdict(self, ended: Callable[..., Session], session: str, trial: Path, log: str, returncode: int,
-                 cancelled: bool, version: int) -> Session:
+                 cancelled: bool, expired: bool, version: int) -> Session:
         try:
             recorded = calls(self._gateway.traces(session), unstamped=version)
         except Exception as error:
@@ -629,6 +648,9 @@ class HarborSource:
         records = recorded.calls
         if cancelled:
             return ended(Status.CANCELLED, records, detail=str(trial))
+        if expired:
+            return ended(Status.INFRA_ERROR, records,
+                         detail=f"{trial}: interrupted past trial_timeout={self._trial_timeout:g} s")
         if not (trial / "result.json").is_file():
             return ended(
                 Status.INFRA_ERROR,
@@ -649,9 +671,11 @@ class HarborSource:
 
 @dataclass
 class _Trial:
-    """What `cancel` needs of one submitted sample: whether it was cancelled and its running Harbor."""
+    """What `cancel` and the deadline need of one submitted sample: whether it was cancelled or ran
+    past `trial_timeout`, its running Harbor, and the timer of its next escalation."""
 
     cancelled: bool = False
+    expired: bool = False
     process: subprocess.Popen[str] | None = None
     timer: threading.Timer | None = None
 

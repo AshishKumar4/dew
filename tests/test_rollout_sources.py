@@ -6,15 +6,18 @@ multi-turn session records one call per turn with each call's own version,
 and its calls merge into one packed chain; the failure policy separates
 infrastructure failures (an environment's ERROR or OS error, Dew's own
 sandbox past its wall clock or dead, a verifier's or reward's OS error, a
-failed draw) from truncations, which are still scored, and from contract
-errors (a non-finite reward, an environment or sandbox worker that breaks
-its protocol, a failing decode), which fail the rollout's future; a
+container runtime that starts no container, a draw from an unreachable
+engine, a verifier's HTTP transport error reported as an
+InfrastructureError) from truncations, which are still scored, and from
+contract errors (a non-finite reward, an environment or sandbox worker that
+breaks its protocol, a failing decode), which fail the rollout's future; a
 cancelled session stops mid-draw and releases its environment; a server
 that reports no raw likelihood records none, and its sessions still train;
 and the prompt source scores decoded text and components per draw.
 """
 
 import json
+import socket
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -24,13 +27,17 @@ import jax
 import numpy as np
 import pytest
 from episode_support import environment as sandbox
+from tool_support import load
 
-from dew.inference import Draw
+from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
 from dew.objectives.rl.sessions import Status, Task, pack
 from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
+from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
+
+CodeReward = load("train_rlvr", "examples").CodeReward
 
 EOS = 9
 SAMPLING = Sampling(temperature=1.0, eos_token_ids=EOS)
@@ -195,6 +202,68 @@ def test_a_sandbox_past_its_wall_clock_or_dead_is_an_infra_error(mode, detail):
     rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
     episodes.close()
     assert rollout.status == Status.INFRA_ERROR and detail in rollout.detail and not rollout.calls
+
+
+def test_a_container_runtime_that_starts_no_container_is_an_infra_error_in_both_sources():
+    """The example's code reward on `ContainerRunner`, with `false` standing in for a runtime
+    whose daemon is gone: the reward cannot run its program, which both sources retry."""
+    cases, program = '[{"stdin": "", "stdout": "5"}]', "```python\nprint(5)\n```"
+    with SandboxFleet(ContainerRunner("python:3.12-slim", runtime="false"), workers=1) as fleet:
+        reward = CodeReward(fleet)
+        task = Task("t", {"prompt": (1, 2), "source": "code", "truth": cases, "info": ""})
+        prompts = PromptSource(Server(), reward, decode=lambda ids: program, max_new_tokens=4)
+        rollout = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=30)
+        prompts.close()
+        episodes = source(Server(), factory([], []),
+                          verifier=lambda task, episode: reward("code", program, cases, ""))
+        session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
+        episodes.close()
+    for failed in (rollout, session):
+        assert failed.status == Status.INFRA_ERROR and "created no container" in failed.detail
+
+
+def unreachable():
+    """The URL of a local port nothing listens on."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{probe.getsockname()[1]}"
+
+
+def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
+    """Two HTTP paths to a port nothing listens on. Dew's vLLM rollout server fails the draw,
+    and both sources retry the session. A verifier that judges over httpx reports its transport
+    error, which is not an OSError, as an InfrastructureError, and is retried as well."""
+    import httpx
+
+    from dew.objectives.rl import InfrastructureError
+
+    url = unreachable()
+    engine = VLLMGenerateServer(url, Sampling(temperature=1.0, top_k=4, eos_token_ids=EOS),
+                                lambda variables, version: None, timeout=10.0)
+    try:
+        episodes = source(engine, factory([], []))
+        session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
+        episodes.close()
+        [task] = prompt_tasks(prompt_batch())
+        prompts = PromptSource(engine, lambda *_: 1.0, decode=str, max_new_tokens=4)
+        rollout = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=30)
+        prompts.close()
+    finally:
+        engine.close()
+    for failed in (session, rollout):
+        assert failed.status == Status.INFRA_ERROR and "ConnectError" in failed.detail
+
+    def judged(task, episode):
+        try:
+            return float(httpx.post(f"{url}/judge", json={"task": task.id}, timeout=10.0).json()["score"])
+        except httpx.TransportError as error:
+            raise InfrastructureError(f"the judge is unreachable: {error}") from error
+
+    episodes = source(Server(), factory([], []), verifier=judged)
+    session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
+    episodes.close()
+    assert session.status == Status.INFRA_ERROR and "the judge is unreachable" in session.detail
+    assert len(session.calls) == 3 and session.reward is None
 
 
 def test_a_contract_error_fails_the_rollouts_future_instead_of_being_retried():

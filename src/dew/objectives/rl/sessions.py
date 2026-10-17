@@ -126,6 +126,18 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
+class InfrastructureError(RuntimeError):
+    """A rollout's infrastructure failed: a sandbox, a container runtime, a connection or a service.
+
+    A session source turns it, like any `OSError`, into an `INFRA_ERROR`
+    session, which the scheduler retries; any other error is broken code
+    and fails the rollout. Dew's sandbox runners raise it when they cannot
+    run a program. An environment, verifier or reward raises it for a
+    failure of its own external boundary that is not an `OSError`, such as
+    an httpx transport error.
+    """
+
+
 def _finite(message: str, value: object) -> float:
     """Parse a boundary number: any finite real, numpy's included, as a float.
 
