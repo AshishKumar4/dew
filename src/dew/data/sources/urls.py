@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -94,26 +95,22 @@ class _Deadline:
                 _shut(handle)
 
 
+@functools.cache
+def _resolver() -> concurrent.futures.ThreadPoolExecutor:
+    """The threads every fetch resolves host names on, at most 16: the system resolver takes no
+    timeout, so a lookup a deadline gave up on keeps one of them until the resolver returns."""
+    return concurrent.futures.ThreadPoolExecutor(16, thread_name_prefix="dew-fetch-resolve")
+
+
 def _resolved(host: str, port: int, seconds: float) -> list[tuple]:
-    """`socket.getaddrinfo` for a stream to `host`, waited on at most `seconds`. The system resolver
-    takes no timeout, so it runs on a thread of its own, which a lookup the deadline gave up on
-    leaves to finish."""
-    answer: list[list[tuple] | OSError] = []
-
-    def resolve() -> None:
-        try:
-            answer.append(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
-        except OSError as error:
-            answer.append(error)
-
-    lookup = threading.Thread(target=resolve, name="dew-fetch-resolve", daemon=True)
-    lookup.start()
-    lookup.join(max(seconds, 0.0))
-    if not answer:
-        raise TimeoutError(f"resolving {host} outlasted the fetch's deadline")
-    if isinstance(answer[0], OSError):
-        raise answer[0]
-    return answer[0]
+    """`socket.getaddrinfo` for a stream to `host`, waited on at most `seconds`; a lookup still
+    queued behind busy resolver threads when its time is up is withdrawn."""
+    lookup = _resolver().submit(socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM)
+    try:
+        return lookup.result(timeout=max(seconds, 0.0))
+    except TimeoutError:
+        lookup.cancel()
+        raise
 
 
 def _shut(connection: socket.socket) -> None:
