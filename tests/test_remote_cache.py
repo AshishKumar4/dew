@@ -75,15 +75,18 @@ import sys
 import jax
 import remote_cache
 from dew.cache import enable_compilation_cache
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 enable_compilation_cache(sys.argv[1])
 remote = remote_cache.install(sys.argv[2], "token")
 assert remote is not None
+count_compilation_cache()
 remote.opened("tests/test_step.py")
 print(float(jax.jit(lambda x: (x * 3.0).sum())(jax.numpy.arange(4.0))))
 if sys.argv[3] == "more":
     jax.jit(lambda x: x - 1.0)(1.0)
 remote.drain()
-print(remote.fetched, remote.uploaded)
+counts = compilation_cache_counts()
+print(remote.fetched, remote.uploaded, int(counts.get("train/cache_misses", 0)))
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
@@ -94,15 +97,16 @@ print(remote.fetched, remote.uploaded)
         assert done.returncode == 0, done.stderr[-2000:]
         return done.stdout.split()
 
-    value, fetched, uploaded = run("first")
-    assert (value, fetched, uploaded) == ("18.0", "0", "1")
+    value, fetched, uploaded, compiled = run("first")
+    assert (value, fetched, uploaded) == ("18.0", "0", "1") and int(compiled) >= 1
     [key] = stored
     assert key.startswith(f"/jax{__import__('jax').__version__}/")
     assert key.endswith("/cpu/bundles/tests/test_step.py")
     programs = len(list(remote_cache.unpacked(stored[key])))
     assert programs >= 1
-    assert run("second") == ["18.0", str(programs), "0"]
-    assert run("third", "more") == ["18.0", str(programs), "1"]
+    # Read back, nothing compiles: JAX's persistent cache misses nothing.
+    assert run("second") == ["18.0", str(programs), "0", "0"]
+    assert run("third", "more") == ["18.0", str(programs), "1", "1"]
     assert len(list(remote_cache.unpacked(stored[key]))) > programs
 
 
@@ -232,3 +236,33 @@ def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_b
     server.shutdown()
     assert cache.base.get("jit_slow-1") == entry("slow") and not cache.available
     assert len(Counted.requests) == sent
+
+
+def test_a_bundle_holds_every_program_its_files_tests_used_however_they_ran(cache_worker):
+    """A file whose tests ran apart, another file's between them, writes back every program its tests
+    used, not the last run's alone; a split file's groups each keep a bundle of their own, which no
+    other group's replaces; and a bundle the Worker answers cut short or past its bound is a miss
+    that puts nothing in the local cache."""
+    url, stored, _ = cache_worker
+    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    for file, program in (("tests/a.py", "first"), ("tests/b.py", "other"), ("tests/a.py", "second")):
+        cache.opened(file)
+        cache.put(f"jit_{program}-1", entry(program))
+        cache.closed(file)
+    cache.drain()
+    [key] = [key for key in stored if key.endswith("/bundles/tests/a.py")]
+    assert dict(remote_cache.unpacked(stored[key])) == {"jit_first-1": entry("first"),
+                                                         "jit_second-1": entry("second")}
+    for group in ("1/2", "2/2"):
+        cache.opened(remote_cache.bundle("tests/split.py::test_x", group, None))
+        cache.put(f"jit_{group[0]}-1", entry(group))
+        cache.closed(remote_cache.bundle("tests/split.py::test_x", group, None))
+    cache.drain()
+    assert [len(remote_cache.unpacked(stored[f"/jax/cpu/bundles/tests/split.py/{group}-of-2"]))
+            for group in "12"] == [1, 1]
+    whole = remote_cache.packed([("jit_cut-1", entry("cut")), ("jit_cut-2", entry("cut"))])
+    for name, body in (("cut", whole[:-3]), ("header", whole + b"\0\0")):
+        stored[f"/jax/cpu/bundles/tests/{name}.py"] = body
+        fresh = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+        fresh.opened(f"tests/{name}.py")
+        assert fresh.base.entries == {} and fresh.fetched == 0 and fresh.failures == 1
