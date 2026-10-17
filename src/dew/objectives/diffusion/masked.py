@@ -51,9 +51,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, documents_of, text_preview
-from dew.records import JSON
 from dew.sampling.sample import sample
-from dew.sampling.solvers import Solver
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -69,6 +67,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """
 
     saved_task = MaskedGeneration
+    settings = MaskedSettings
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 

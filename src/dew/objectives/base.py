@@ -45,6 +45,7 @@ from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from flax import linen as nn
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
@@ -380,12 +381,7 @@ class SavedTask(Protocol):
 
     It is a class whose `from_run` builds the task from a run directory.
     Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`,
-    `MaskedGeneration`) are such classes, and a plugin can supply its own.
-    `settings` is the dataclass of what a saved run records beside its model
-    (`Objective.task_settings`), the one list of those fields: the objective
-    writes an instance, and `from_run` reads it back."""
-
-    settings: ClassVar[type]
+    `MaskedGeneration`) are such classes, and a plugin can supply its own."""
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -476,6 +472,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
+    settings: ClassVar[type[DataclassInstance] | None] = None
+    """The dataclass of what a saved run records beside its objective and model
+    (`task_settings`), the one list of those fields: the objective writes an
+    instance, its `saved_task` reads it back, and a record holding any other
+    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
     A subclass inherits its parent's. None means a saved run of this
@@ -1033,10 +1035,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self._model_tree(variables)
 
-    def task_settings(self) -> Any:
+    def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an
-        instance of `saved_task.settings`, or None when the objective declares
-        no inference contract.
+        instance of `settings`, or None when the objective declares no
+        inference contract.
 
         They are what the objective's task is built with and a loader cannot
         read off the model: a sampling policy, a token budget, a tokenizer, a

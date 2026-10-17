@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Generic
+from typing import TYPE_CHECKING, Generic
 
 import jax
 import jax.numpy as jnp
@@ -182,9 +182,6 @@ class TextToImage:
     pool of processes draws the same noise as one process does for the same
     prompts.
     """
-
-    settings: ClassVar[type[ImageSettings]] = ImageSettings
-    """What a run of this task records beside its model."""
 
     model: nn.Module
     process: Process
