@@ -181,11 +181,13 @@ def pytest_sessionfinish(session):
         found = followed.gathered(children, starts)
         shutil.rmtree(children)
         lost = {name for name, child in found.items() if not child["followed"]}
-        peak = gpu_peak() if len(own) == 1 and not spawned | lost else None
         recorded = {}
         for name, files in own.items():
-            child = found.get(name, {"files": set(), "reads": set(), "shares": 0, "pools": 0})
+            child = found.get(name, {"files": set(), "reads": set(), "peak": None, "shares": 0, "pools": 0})
             whole = name not in spawned | lost
+            # The share a process of this file takes: its own peak, or a child's that took its fraction.
+            peaks = [held for held in (gpu_peak(), child["peak"]) if held is not None]
+            peak = max(peaks) if len(own) == 1 and whole and peaks else None
             recorded[name] = {"depends": sorted(files | shared | child["files"]) if whole else None,
                               "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere
                                               | child["reads"]),

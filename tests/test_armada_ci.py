@@ -372,6 +372,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget) == (budget, budget)
     held = {"depends": [], "peak": 4 * gib, "shares": 2, "pools": gib}
     assert ci.gpu_needs(held, budget) == (6 * gib, 19 * gib), "6 GiB, twice more for its children, and 1 GiB"
+    assert ci.gpu_lane("3.12", [], out, cache=True, processes=4, deadline=600.0) == 0
+    assert json.loads(out.read_text()) == {"rows": []}, "an empty lane runs nothing"
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
@@ -379,20 +381,22 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
     """The children's records join the file that started them (`followed.gathered`): their files,
-    and the GPU they held, the children that took the parent's fraction as shares and the bytes of
-    those that named their own, counted only while they lived at once. A file is followed only
-    where every start it and its children saw left a record naming it and none started a process
-    it did not follow; one whose child left its start mark behind, killed before it wrote, is not."""
+    and the GPU they held, the most a child that took the parent's fraction used, those children as
+    shares and the bytes of those that named their own, counted only while they lived at once. A
+    file is followed only where every start it and its children saw left a record naming it and none
+    started a process it did not follow; one whose child marked its start and left no record, killed
+    before it wrote, is not."""
     followed = load("followed", "tools/armada")
     gib = 2 ** 30
 
-    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False):
+    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None):
+        (tmp_path / f"{index}.started").write_text(file)
         (tmp_path / f"{index}.json").write_text(json.dumps({
-            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected,
+            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected, "peak": peak,
             "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
 
-    child(1, "tests/a.py", 0, 10, pool=6 * gib)
-    child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1)
+    child(1, "tests/a.py", 0, 10, pool=6 * gib, peak=5 * gib)
+    child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1, peak=gib)
     child(3, "tests/a.py", 20, 30, pool=3 * gib, inherited=False)
     child(4, "tests/a.py", 25, 35, pool=2 * gib, inherited=False)
     child(5, "tests/a.py", 40, 41)
@@ -402,7 +406,7 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(9, "tests/d.py", 0, 1, unfollowed=True)
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "shares": 2, "pools": 5 * gib}
+                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
     assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
 
 
