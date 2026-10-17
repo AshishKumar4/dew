@@ -144,8 +144,8 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     with jax.enable_x64(new_val=True):
         wide, _ = widened_outputs(model, params["params"], ids)
         truth_loss, truth_terms, _ = reference_run(arrays, kind, wide, "float64")
-    named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss",
-             "distill/kl": "kl_div_at_T", "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
+    named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
+             "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
     reported = {**aux.metrics, "loss": loss}
     rounded_terms, truth_terms = {**rounded_terms, "loss": rounded_loss}, {**truth_terms, "loss": truth_loss}
 
