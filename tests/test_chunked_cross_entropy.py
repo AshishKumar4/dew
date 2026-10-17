@@ -31,7 +31,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
-from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns, vocabulary_chunks
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
@@ -419,14 +419,39 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
 
 # --- the chunk arithmetic itself -------------------------------------------
 
-@pytest.mark.parametrize("vocab, chunks, message", [
-    (100, 0, "at least one chunk"),
-    (4, 8, "empty tiles"),
-    (9, 4, "do not split"),
-])
-def test_impossible_chunk_counts_are_refused(vocab, chunks, message):
+@pytest.mark.parametrize("chunks", [0, -1])
+def test_nonpositive_chunk_counts_are_refused(chunks):
+    hidden, head, targets = inputs()
     with pytest.raises(ValueError):
-        vocabulary_chunks(vocab, chunks)
+        chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, chunks)
+
+
+@pytest.mark.parametrize("chunks", [4, 8])
+@pytest.mark.parametrize("tile", [None, (3, 2)])
+def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
+    """A five-column head's short tail and one-column tiles score every column and gradient."""
+    hidden, head, targets = inputs(vocab=5, features=8, tokens=(2, 4))
+    bias = jax.random.normal(jax.random.key(3), (5,)) / 7
+
+    def tiled(hidden, head, bias):
+        losses, predicted, log_z = chunked_cross_entropy(
+            hidden, OutputTable(head, vocab_major=False, bias=bias, softcap=3.),
+            targets, chunks, tile=tile)
+        return jnp.sum(losses + .01 * jnp.square(log_z)), (losses, predicted, log_z)
+
+    def whole(hidden, head, bias):
+        logits = OutputTable(head, vocab_major=False, bias=bias, softcap=3.).logits(hidden)
+        log_z = jax.nn.logsumexp(logits, axis=-1)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return jnp.sum(losses + .01 * jnp.square(log_z)), (losses, logits.argmax(-1), log_z)
+
+    with jax.default_matmul_precision("highest"):
+        got, gradients = jax.value_and_grad(tiled, argnums=(0, 1, 2), has_aux=True)(hidden, head, bias)
+        want, reference = jax.value_and_grad(whole, argnums=(0, 1, 2), has_aux=True)(hidden, head, bias)
+    np.testing.assert_array_equal(got[1][1], want[1][1])
+    for actual, expected in zip(jax.tree.leaves((got, gradients)),
+                                 jax.tree.leaves((want, reference)), strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_mismatched_shapes_are_refused():

@@ -127,6 +127,39 @@ def test_forward_mode_attention_leaves_a_jvp_capable_kernel_as_it_is():
     np.testing.assert_allclose(np.asarray(tangent), np.asarray(reference_tangent), rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("time_scale", [.001, 16.])
+def test_continuous_consistency_trains_a_teacher_with_its_own_time_scale(time_scale):
+    """The student differentiates the loaded Fourier table and takes a finite sCM update."""
+    from dew.diffusion.presets import Flow
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.base import TEACHER
+    from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionObjective
+    from dew.sampling import Euler
+    from dew.training import Trainer
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2,
+                       time_scale=time_scale, attention_impl="xla")
+    inputs = InputSpec(Field("image", (4, 4, 3)))
+    teacher = DiffusionObjective(model, Flow(), inputs, guidance=None, solver=Euler(), ema_decay=None)
+    weights = teacher.init(jax.random.key(1))
+    objective = ConsistencyDistillationObjective(
+        model, Flow(), inputs, guidance=None, ema_decay=None, dmd_weight=0., consistency_weight=1.,
+        variables={TEACHER: teacher.model_variables(weights)})
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(2))
+    initial = trainer.initial_state()
+    before = jax.tree.map(np.asarray, initial.variables)
+    batch = {"image": np.random.default_rng(3).integers(0, 256, (8, 4, 4, 3), dtype=np.uint8)}
+    trained, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted) and int(trained.updates) == 1
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(trained.variables))
+    assert any(not np.array_equal(start, end) for start, end in zip(
+        jax.tree.leaves(before["params"]), jax.tree.leaves(trained.variables["params"]), strict=True))
+    for start, end in zip(jax.tree.leaves(before[TEACHER]),
+                          jax.tree.leaves(trained.variables[TEACHER]), strict=True):
+        np.testing.assert_array_equal(start, end)
+
+
 def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_critic(tmp_path):
     """The teacher is a saved run; the student and fake score start from
     it. Past the warmup one step in two trains the student and the other
@@ -174,16 +207,11 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
             "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
             **fields}))
 
-    # The student starts from the teacher's time features, so a model whose
-    # features turn fast is refused, and a slower one is as smooth.
-    for time_scale, refused in ((16, True), (0.001, False)):
+    # The checkpoint's Fourier table is authoritative, whatever scale the model record names.
+    for time_scale in (16, 0.001):
         model = dataclasses.replace(teacher_run.model, fields={**teacher_run.model.fields,
                                                                 "time_scale": time_scale})
-        if refused:
-            with pytest.raises(ValueError):
-                dataclasses.replace(distilling(), model=model).build()
-        else:
-            dataclasses.replace(distilling(), model=model).build()
+        dataclasses.replace(distilling(), model=model).build()
 
     config = distilling(teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2, max_simulation_steps=2)
     task = config.build()
