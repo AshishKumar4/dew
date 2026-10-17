@@ -70,6 +70,20 @@ def test_a_dory_config_loads_as_its_looped_ngpt():
     assert model.per_layer_types == ('sliding_attention', 'full_attention') * 2
 
 
+@pytest.mark.parametrize('change', [{'tie_word_embeddings': True}, {'mlp_bias': True}, {'n_input_layers': 1},
+                                    {'recurrent_kv_cache_mode': 'each'}])
+def test_a_config_dory_refuses_is_refused(tmp_path, change):
+    """What DoryConfig refuses (configs/dory.py:39-133), and a partition that splits an attention
+    from its MLP, which Dew's blocks keep together, are refused."""
+    for source in TINY.iterdir():
+        (tmp_path / source.name).symlink_to(source)
+    (tmp_path / 'config.json').unlink()
+    stated = json.loads((TINY / 'config.json').read_text())
+    (tmp_path / 'config.json').write_text(json.dumps({**stated, **change}))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, dtype='float32', attention_impl='xla')
+
+
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     """A loaded Dory saves its config and tensors as the released checkpoint names them, and the
     saved checkpoint rebuilds the same model and tensors."""

@@ -1172,16 +1172,7 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        if self.ngpt is not None:
-            # nGPT's states are unit vectors; a loop's step norm is the unit norm itself.
-            self.norm = unit
-            self.logit_scale = self.param('logit_scale', nn.initializers.constant(1 / self.ngpt.logits),
-                                          (self.vocab_size,), jnp.float32)
-        else:
-            self.norm = decoder_norm(
-                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='norm')
+        self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -2205,6 +2196,19 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _final_norm(self):
+        """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
+        its states being unit vectors, with the logits' per-token gain beside it."""
+        if self.ngpt is not None:
+            self.norm = unit
+            self.logit_scale = self.param('logit_scale', nn.initializers.constant(1 / self.ngpt.logits),
+                                          (self.vocab_size,), jnp.float32)
+        else:
+            self.norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
