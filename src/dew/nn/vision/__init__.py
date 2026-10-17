@@ -42,6 +42,8 @@ the classes a caller constructs or subclasses, and keeps where each kind's
 tensors sit and which map reads them.
 """
 
+from __future__ import annotations
+
 import functools
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING

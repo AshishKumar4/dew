@@ -2,6 +2,8 @@
 (transformers 5.16.1 `models/gemma4/modeling_gemma4.py`).
 """
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
@@ -92,7 +94,7 @@ class Gemma4VisionTransformer(nn.Module):
     the checkpoint stores (`Gemma4ClippableLinear`).
     """
 
-    config: "Gemma4Vision"
+    config: Gemma4Vision
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
