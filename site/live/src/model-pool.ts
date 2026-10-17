@@ -57,15 +57,14 @@ export class ModelPool extends DurableObject<Env> {
 	}
 
 	/**
-	 * The image a new session runs on, where a ready host of the serving generation has room, and the commit the
-	 * pool is set to (its newest generation, which may still be starting while an older one serves).
+	 * The image a new session runs on, where a ready host of the serving generation has room. Workers of other builds
+	 * call it (the preview's, by script_name), so its reply keeps its shape: an RPC here is only ever extended.
 	 */
-	async image(): Promise<{ image: string | null; commit: string | null }> {
+	async image(): Promise<string | null> {
 		const pool = await this.state();
 		const load = (id: string) => Object.values(pool.sessions).filter((host) => host === id).length;
-		const room = pool.hosts.some((host) => host.ready && !host.retiring && host.generation.snapshot.id === pool.serving
-			&& load(host.id) < HOST_CAPACITY);
-		return { image: room ? pool.serving! : null, commit: pool.desired?.commit ?? null };
+		return pool.hosts.some((host) => host.ready && !host.retiring && host.generation.snapshot.id === pool.serving && load(host.id) < HOST_CAPACITY)
+			? pool.serving! : null;
 	}
 
 	async allocate(session: string, image: string): Promise<string> {
