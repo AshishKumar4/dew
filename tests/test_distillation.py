@@ -160,7 +160,7 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
                                     params["params"])
     _, _, d_logits, d_features = reference_float32(arrays, kind)
     reference, = pullback((jnp.asarray(d_logits), jnp.asarray(d_features)))
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = model.clone(dtype=jnp.float64)
         (wide_logits, _), widened_pullback = jax.vjp(lambda trainable: student_outputs(wide, trainable, ids),
                                                      widened(params["params"]))

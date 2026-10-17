@@ -641,7 +641,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
                                      dtype=np.float32)
     reference, = pullback(jnp.asarray(rounded))
     _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient)
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = model.clone(dtype=jnp.float64)
         _, widened_pullback = jax.vjp(lambda p: wide.apply({"params": p}, ids), widened(params["params"]))
         truth, = widened_pullback(cotangent)
