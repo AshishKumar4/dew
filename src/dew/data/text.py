@@ -1,4 +1,6 @@
-"""Tokenizers for language-model data: utf-8 bytes, or any HF tokenizer.
+"""Tokenizers for language-model data, utf-8 bytes or any HF tokenizer, and
+the text record steps: tokenizing, chunking, dropping, normalizing and
+filtering text.
 
 `import dew.data` stays cheap. Nothing here imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
@@ -13,15 +15,19 @@ import dataclasses
 import functools
 import hashlib
 import threading
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+import grain.python as grain
+import numpy as np
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.steps.text import Chunks, Dropped, MinChars, Normalized, Tokenize
+    from dew.data.dataset import Batch
 
 
 _load_lock = threading.Lock()
@@ -312,43 +318,115 @@ def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = 
     the tokenizer has one with None.
     `tokenizer` is "byte" (Dew's utf-8 vocabulary), a Hub repo or directory,
     or a transformers tokenizer object."""
-    from dew.data.steps.text import Tokenize
-
     return Tokenize(tokenizer_name(tokenizer), field, eos)
 
 
-def chunk(length: int, *, overlap: int = 0, fields: tuple[str, ...] = ("text",)) -> Chunks:
-    """An expansion (`flat_map`) that cuts a document's token `fields` into
-    pieces of at most `length`, overlapping by `overlap`, before `pack`, which
-    refuses a document longer than its window. For next-token training,
-    `overlap=1` keeps every target: pack to `length` with `seq_len=length`."""
-    from dew.data.steps.text import Chunks
+@dataclasses.dataclass(frozen=True)
+class Tokenize(grain.MapTransform):
+    """The text in `field` as token ids under "text", each document ended by
+    the tokenizer's EOS with `eos`, or where the tokenizer has one with None."""
 
-    return Chunks(length, fields, overlap)
+    tokenizer: str = "byte"
+    field: str = "text"
+    eos: bool | None = False
+
+    @functools.cached_property
+    def vocabulary(self) -> ByteTokenizer | HFTokenizer:
+        """The tokenizer `tokenizer` names, which resolves its name once
+        (`HFTokenizer.pinned`): the step's identity and its encoding both read
+        that one resolution, in this process and in any worker it is sent to."""
+        return tokenizer_for(self.tokenizer)
+
+    def dependencies(self) -> Mapping[str, object]:
+        return {"tokenizer": self.vocabulary.dependencies()}
+
+    def map(self, element: Batch) -> Batch:
+        value = element[self.field]
+        if not isinstance(value, str):
+            raise ValueError(f"Tokenize field {self.field!r} must contain text")
+        tokenizer = self.vocabulary
+        ids = tokenizer.encode(value)
+        if (self.eos or (self.eos is None and tokenizer.eos_id is not None)) and ids:
+            if tokenizer.eos_id is None:
+                raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
+            ids.append(tokenizer.eos_id)
+        kept = {key: value for key, value in element.items() if key != self.field}
+        return {**kept, "text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
 
-def drop(field: str = "caption", p: float = 0.1) -> Dropped:
-    """A random step that empties the text in `field` with probability `p`,
-    as classifier-free guidance trains its unconditioned branch."""
-    from dew.data.steps.text import Dropped
+@dataclasses.dataclass(frozen=True)
+class Chunks:
+    """A document's token `fields` cut into pieces of at most `length`, each
+    starting `length - overlap` after the last (`flat_map`), before `pack`,
+    which refuses a document longer than its window. With `overlap=1` every
+    token's next-token target stays in one piece: pack to `length` with
+    `seq_len=length`."""
 
-    return Dropped(field, p)
+    length: int
+    _: dataclasses.KW_ONLY
+    fields: tuple[str, ...] = ("text",)
+    overlap: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.overlap < self.length:
+            raise ValueError(f"chunks of {self.length} overlap by 0 to {self.length - 1}, not {self.overlap}")
+
+    def flat_map(self, element: Batch) -> Sequence[Batch]:
+        count = len(element[self.fields[0]])
+        stride = self.length - self.overlap
+        starts = range(0, max(count - self.overlap, 1), stride)
+        return tuple(
+            {
+                key: value[start : start + self.length] if key in self.fields else value
+                for key, value in element.items()
+            }
+            | {"_dew_length": min(self.length, count - start)}
+            for start in starts
+        )
 
 
-def normalize(form: Literal["NFC", "NFKC", "NFD", "NFKD"] = "NFKC", *, field: str = "text") -> Normalized:
-    """A step (`map`) that puts the text in `field` into Unicode normal form
-    `form`, so text written with composed, decomposed or compatibility
-    characters (a ligature, a full-width digit) reads and tokenizes alike."""
-    from dew.data.steps.text import Normalized
+@dataclasses.dataclass(frozen=True)
+class Dropped(grain.RandomMapTransform):
+    """The text in `field` emptied with probability `p`, as classifier-free
+    guidance trains its unconditioned branch."""
 
-    return Normalized(form, field)
+    field: str = "caption"
+    p: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.p <= 1:
+            raise ValueError(f"a drop probability is in [0, 1], not {self.p}")
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        return {**element, self.field: ""} if rng.random() < self.p else element
 
 
-def min_chars(count: int, field: str = "text") -> MinChars:
-    """A filter keeping texts of at least `count` characters."""
-    from dew.data.steps.text import MinChars
+@dataclasses.dataclass(frozen=True)
+class Normalized(grain.MapTransform):
+    """The text in `field` in Unicode normal form `form` (`unicodedata.normalize`), so text written
+    with composed, decomposed or compatibility characters (a ligature, a full-width digit) reads and
+    tokenizes alike; other fields pass through."""
 
-    return MinChars(count, field)
+    form: Literal["NFC", "NFKC", "NFD", "NFKD"] = "NFKC"
+    _: dataclasses.KW_ONLY
+    field: str = "text"
+
+    def map(self, element: Batch) -> Batch:
+        text = element[self.field]
+        text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+        return {**element, self.field: unicodedata.normalize(self.form, text)}
+
+
+@dataclasses.dataclass(frozen=True)
+class MinChars:
+    """Whether the text in `field` holds at least `count` characters."""
+
+    count: int
+    field: str = "text"
+    reason = "too_short"
+
+    def __call__(self, element: Batch) -> bool:
+        return len(str(element[self.field])) >= self.count
 
 
 def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:

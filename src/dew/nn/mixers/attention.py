@@ -91,6 +91,26 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     return jnp.where(jnp.asarray(positions) >= 0, index, 1)
 
 
+def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_images: bool) -> str | None:
+    """Why attention over `ctx` cannot run a serving step's mixed call
+    (`dew.nn.inputs.Admitted`), or None: it reads a full-precision cache,
+    dense or one page pool, whole and causal, and nothing a row carries
+    besides."""
+    layout = ctx.kv_cache
+    refusals = {
+        "a quantized or rotated cache": (layout.quantized is not None
+                                          or layout.key_rotation(ctx.head_dim) is not None),
+        "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
+        "a sliding window or chunk": ctx.sliding_window is not None or ctx.attention_chunk is not None,
+        "attention sinks": ctx.attention_sinks,
+        "ALiBi": alibi,
+        "keys shared from another layer": ctx.kv_shared,
+        "bidirectional attention or image groups": not ctx.causal or bidirectional_images,
+    }
+    named = [reason for reason, refused in refusals.items() if refused]
+    return None if not named else ", ".join(named)
+
+
 class _Masking(NamedTuple):
     """`CausalSelfAttention._masking`'s result: the kernel's operands and
     the visibility they are read under."""
@@ -806,32 +826,13 @@ class CausalSelfAttention(nn.Module):
                 'context')
         return attention
 
-    def mixed_refusal(self) -> str | None:
-        """Why this layer cannot run a serving step's mixed call
-        (`dew.nn.inputs.Admitted`), or None: it reads a full-precision cache,
-        dense or one page pool, whole and causal, and nothing a row carries
-        besides."""
-        layout = self.ctx.kv_cache
-        refusals = {
-            "a quantized or rotated cache": (layout.quantized is not None
-                                              or layout.key_rotation(self.ctx.head_dim) is not None),
-            "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
-            "a sliding window or chunk": (self.ctx.sliding_window is not None
-                                          or self.ctx.attention_chunk is not None),
-            "attention sinks": self.ctx.attention_sinks,
-            "ALiBi": self.alibi,
-            "keys shared from another layer": self.ctx.kv_shared,
-            "bidirectional attention or image groups": not self.ctx.causal or self.bidirectional_images,
-        }
-        named = [reason for reason, refused in refusals.items() if refused]
-        return None if not named else f"{self.name}: " + ", ".join(named)
-
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
         """Each token's slot in its row, `[1, tokens]`, -1 for padding: a
         decoding row's token at its cursor, a prompt's after its row's start."""
-        refusal = self.mixed_refusal()
+        refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi,
+                                          bidirectional_images=self.bidirectional_images)
         if refusal is not None:
-            raise ValueError(f"a mixed serving step needs plain attention; {refusal}")
+            raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
         index = self.get_variable("cache", "cache_index")
         rows, pieces = index.shape[0], admitted.slots.shape[0]
         valid = jnp.asarray(valid, bool)[0]
@@ -1029,6 +1030,9 @@ class AttentionMixer(MixerBase):
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
     mixed_step = True
+
+    def mixed_refusal(self, ctx: MixerContext) -> str | None:
+        return mixed_attention_refusal(ctx, alibi=self.alibi, bidirectional_images=self.bidirectional_images)
 
     def __post_init__(self):
         if self.alibi and not self.nope:

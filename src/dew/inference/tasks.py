@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -33,9 +33,10 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_c
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
 from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
-from dew.records import integer, json_value, record as named_fields, text as named
+from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
@@ -286,11 +287,94 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     objective = objectives[named(record['objective'], 'objective')]
-    stray = set(record) - {'objective', 'model', *objective.inference_fields}
+    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+    stray = set(record) - {'objective', 'model', *declared}
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")
     return SavedRun(record, step)
+
+
+def settings_fields(settings: type) -> frozenset[str]:
+    """The fields a saved run records beside its objective and model: those of its task's `settings`."""
+    return frozenset(field.name for field in dataclasses.fields(settings))
+
+
+def saved_settings[SettingsT](record: Mapping[str, object], settings: type[SettingsT]) -> SettingsT:
+    """The task `settings` a saved run's record holds, rebuilt through the record machinery
+    (`dew.registry.from_record`), each one it leaves out at its default."""
+    from dew.registry import from_record
+
+    return from_record(settings, {name: record[name] for name in settings_fields(settings) if name in record},
+                       dtypes=False)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TextSettings:
+    """What a causal decoder's run records beside its model, and its task is built with
+    (`TextGeneration.from_settings`).
+
+    `seq_len` is the decoder's training row length, `max_new_tokens` its
+    previews' budget (0 for none) and `sampling` their policy. `tokenizer`
+    names the run tokenizer (`recorded_tokenizer`) and `processor` a
+    checkpoint's own processor source (`recorded_processor`); either may be
+    None.
+    """
+
+    seq_len: int
+    max_new_tokens: int
+    sampling: Sampling
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaskedSettings:
+    """What a masked-diffusion run records beside its model, and its task is built with
+    (`MaskedGeneration.from_settings`): the row length, the response budget, the tokenizer or
+    source processor as `TextSettings` holds them, the masking process, the unmasking solver
+    and its step count."""
+
+    seq_len: int
+    max_new_tokens: int
+    process: DiscreteProcess
+    solver: Solver
+    sampling_steps: int
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+        integer(self.sampling_steps, "sampling_steps")
+        if not isinstance(self.solver, Unmask):
+            raise ValueError("a masked run's task unmasks with an Unmask solver")
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlockSettings:
+    """What a block-diffusion run records beside its model, and its task is built with
+    (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
+    source processor as `TextSettings` holds them, the block process and the pad id."""
+
+    seq_len: int
+    max_new_tokens: int
+    process: BlockProcess
+    pad_token_id: int
+    tokenizer: str | None
+    processor: str | None
+
+    def __post_init__(self) -> None:
+        _budget_checked(self.max_new_tokens)
+        integer(self.pad_token_id, "pad_token_id")
+
+
+def _budget_checked(budget: int) -> None:
+    """Refuse a recorded token budget that is not a nonnegative integer."""
+    if type(budget) is not int or budget < 0:
+        raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -324,47 +408,89 @@ def recorded_processor(processor: Processor | None) -> str | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def _saved_processor(record: Mapping[str, object], config: ModelConfig) -> Processor | None:
+def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
+                     config: ModelConfig) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
     from dew.interop.pretrained import load_processor
 
-    source = record.get('processor')
-    if source is not None:
-        return load_processor(named(source, "processor"), config.build())
-    tokenizer = record.get('tokenizer')
-    return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
+    if settings.processor is not None:
+        return load_processor(settings.processor, config.build())
+    return None if settings.tokenizer is None else RunProcessor(tokenizer_for(settings.tokenizer))
 
 
-def _saved_budget(record: Mapping[str, object]) -> int | None:
-    """Return how many tokens the run's own previews drew, where it drew any."""
-    budget = record.get("max_new_tokens")
-    if budget is None:
-        return None
-    if type(budget) is not int or budget < 0:
-        raise ValueError("max_new_tokens must be a nonnegative integer")
-    return budget
+class _NativeTextTask:
+    """The lifecycle Dew's three text tasks share, over their own `model`,
+    `variables` and `processor`: frozen weights, rebinding, loading a run or
+    its Hub copy, and the row decoder their generations carry. Each task
+    keeps its own controls, loading checks and device call."""
 
+    variables: Variables
+    processor: Processor | None
 
-def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, trust: Sequence[str]
-               ) -> tuple[Mapping[str, object], int, ModelConfig, Processor | None]:
-    """Read a run's record, the exact step it is, its model config at `dtype`, and its host processor."""
-    record, step = run_record(directory, step, trust)
-    config = saved_model(record, dtype)
-    return record, step, config, _saved_processor(record, config)
+    def __post_init__(self) -> None:
+        # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
+        # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
+        object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
+    def bind(self, variables: Variables) -> Self:
+        """Return the same task over other weights, such as a policy snapshot."""
+        return replace(self, variables=variables)
 
-def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
-                      variables: Variables) -> None:
-    """Freeze `variables` onto `task`, whose own `__post_init__` cannot assign.
+    if TYPE_CHECKING:
+        # Each task is a dataclass, which `bind` replaces a field of.
+        __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
 
-    A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
-    is read whole. A frozen dataclass refuses attribute assignment, so the
-    field is written through `object.__setattr__`.
-    """
-    object.__setattr__(task, "variables", freeze(dict(thaw(variables))))
+        # Each task loads its own kind of run; `from_pretrained` reads the Hub copy through it.
+        @classmethod
+        def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                     mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                     dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                     trust: Sequence[str] = ()) -> Self: ...
+
+    @classmethod
+    def _loaded[SettingsT: (TextSettings, MaskedSettings, BlockSettings)](
+            cls, directory: str, settings: type[SettingsT], checked: Callable[[nn.Module, SettingsT], None],
+            *, ema: bool | None, step: int | str | None, mesh: MeshSpec | Mesh | None,
+            layout: Layout | None, dtype: DTypeLike | None, param_dtype: DTypeLike | None,
+            trust: Sequence[str]) -> tuple[nn.Module, Variables, SettingsT, Processor | None]:
+        """A run's model at `dtype`, as `checked` accepts it before any weight loads, its weights
+        as its objective restores them, its task settings, and its host processor."""
+        from dew.registry import objectives
+
+        record, exact = run_record(directory, step, trust)
+        config = saved_model(record, dtype)
+        held = saved_settings(record, settings)
+        model = config.build()
+        checked(model, held)
+        variables = objectives[named(record["objective"], "objective")]._saved_variables(
+            directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        return model, variables, held, _saved_processor(held, config)
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> Self:
+        """Load a run directory published to the Hugging Face Hub.
+
+        You publish one by uploading the run directory itself with
+        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
+        other arguments work as in `from_run`.
+        """
+        from huggingface_hub import snapshot_download
+
+        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
+                            ema=ema, step=step, mesh=mesh, layout=layout,
+                            dtype=dtype, param_dtype=param_dtype, trust=trust)
+
+    def _decoded[GenerationT: (Generation, CanvasGeneration)](self, generated: GenerationT) -> GenerationT:
+        """`generated` carrying the processor's row decoder, or none without a processor."""
+        return replace(generated, decoder=None if self.processor is None
+                       else functools.partial(decoded_rows, self.processor))
 
 
 def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
@@ -381,20 +507,8 @@ def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
         return decoded_rows(processor, rows.tokens, rows.lengths, generation.prompt_width)
 
 
-def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Sampling:
-    """Return the policy the run drew its previews under, or the basic one."""
-    controls = record.get("sampling")
-    if controls is None:
-        if budget:
-            raise ValueError("run.json lacks the sampling policy for its text previews")
-        return Sampling()
-    if not isinstance(controls, dict):
-        raise ValueError("the run's sampling policy must be a Sampling record")
-    return Sampling(**controls)
-
-
 @dataclass(frozen=True)
-class TextGeneration:
+class TextGeneration(_NativeTextTask):
     """Generates next tokens from a decoder, its weights and its processor.
 
     A call runs the shared cached prefill and decode, and returns the
@@ -440,7 +554,7 @@ class TextGeneration:
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
+        super().__post_init__()
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -463,10 +577,6 @@ class TextGeneration:
         chain = (self.logits if sampling is None else None) if logits is None else logits
         criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
         return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
-
-    def bind(self, variables: Variables) -> TextGeneration:
-        """Return the same task over other weights, such as a policy snapshot."""
-        return replace(self, variables=variables)
 
     def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
         """Return the task with the weights matched by `spec` stored as int8 or fp8 through Qwix.
@@ -508,33 +618,20 @@ class TextGeneration:
         checkpoint stored. `trust` names the packages outside Dew the run's
         record may import, as `trust_remote_code` does in transformers.
         """
-        from dew.registry import objectives
-
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
-        budget = _saved_budget(record)
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        model = model_config.build()
-        return cls(model, variables, processor, sampling=_saved_sampling(record, budget),
-                   max_new_tokens=budget if budget else None)
+        model, variables, settings, processor = cls._loaded(
+            directory, TextSettings, lambda model, settings: None, ema=ema, step=step, mesh=mesh,
+            layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
+        return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                        dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextGeneration:
-        """Load a run directory published to the Hugging Face Hub.
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: TextSettings,
+                      processor: Processor | None) -> TextGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: the previews' policy and budget become its defaults. A live objective
+        (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        return cls(model, variables, processor, sampling=settings.sampling,
+                   max_new_tokens=settings.max_new_tokens or None)
 
-        You publish one by uploading the run directory itself with
-        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
-        other arguments work as in `from_run`.
-        """
-        from huggingface_hub import snapshot_download
-
-        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
-                            ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
@@ -553,9 +650,8 @@ class TextGeneration:
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
                                  trips=trips)
-            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
-            return replace(_requested(generated, budget, padding), decoder=decoder)
+            return self._decoded(_requested(generated, budget, padding))
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Return each row's valid continuation as text; raises ValueError without a processor."""
@@ -565,7 +661,7 @@ class TextGeneration:
 
 
 @dataclass(frozen=True)
-class BlockGeneration:
+class BlockGeneration(_NativeTextTask):
     """Generates block-diffusion canvases from a block denoiser and its weights.
 
     A call runs prefill, refinement and the commits of clean tokens as one
@@ -587,13 +683,6 @@ class BlockGeneration:
     max_length: int | None = None
     n: int = 1
 
-    def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
-
-    def bind(self, variables: Variables) -> BlockGeneration:
-        """Return the same task over other weights."""
-        return replace(self, variables=variables)
-
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
@@ -613,35 +702,20 @@ class BlockGeneration:
         the averaged weights, `mesh` and `layout` place them, and the two
         dtypes override computation and storage.
         """
-        from dew.diffusion.block import BlockProcess
-        from dew.registry import from_record, objectives
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
-        model = model_config.build()
-        refuse_non_denoiser(model)
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = from_record(BlockProcess, json_value(record['process'], 'process'), dtypes=False)
-        return cls(model, variables, process, processor,
-                   pad_token_id=integer(record['pad_token_id'], 'pad_token_id'),
-                   max_new_tokens=_saved_budget(record) or None)
+        model, variables, settings, processor = cls._loaded(
+            directory, BlockSettings, lambda model, settings: refuse_non_denoiser(model), ema=ema,
+            step=step, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
+        return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                        dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> BlockGeneration:
-        """Load a run directory published to the Hugging Face Hub.
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
+                      processor: Processor | None) -> BlockGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: their process, pad id and canvas budget. A live objective
+        (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
+                   max_new_tokens=settings.max_new_tokens or None)
 
-        You publish one by uploading the run directory itself with
-        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
-        other arguments work as in `from_run`.
-        """
-        from huggingface_hub import snapshot_download
-
-        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
-                            ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
@@ -655,8 +729,7 @@ class BlockGeneration:
                 self.model, self.variables, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
-            return replace(generated, decoder=decoder)
+            return self._decoded(generated)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid continuation as text; raises ValueError without a processor."""
@@ -664,7 +737,7 @@ class BlockGeneration:
 
 
 @dataclass(frozen=True)
-class MaskedGeneration:
+class MaskedGeneration(_NativeTextTask):
     """Samples a whole response with native MDLM, holding the prompt fixed.
 
     It does not reproduce the source-specific remasking recipes of LLaDA or
@@ -687,13 +760,6 @@ class MaskedGeneration:
     max_length: int | None = None
     n: int = 1
 
-    def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
-
-    def bind(self, variables: Variables) -> MaskedGeneration:
-        """Return the same native MDLM task over another weight snapshot."""
-        return replace(self, variables=variables)
-
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
@@ -712,48 +778,30 @@ class MaskedGeneration:
         The arguments work as in `TextGeneration.from_run`, and the run's
         preview budget becomes the response length a call omits.
         """
-        from dew.diffusion.discrete import DiscreteProcess
-        from dew.registry import from_record, objectives, solvers
+        def checked(model: nn.Module, settings: MaskedSettings) -> None:
+            refuse_causal(model)
+            mask_id = model.mask_token_id if isinstance(model, TokenModel) else None
+            if type(mask_id) is not int:
+                raise ValueError(f"a saved masked run requires a model that names its mask token "
+                                 f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
+            if settings.process.mask_id != mask_id:
+                raise ValueError("model and process mask token disagree")
 
-        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
-        budget = _saved_budget(record)
-        model = model_config.build()
-        refuse_causal(model)
-        mask_id = model.mask_token_id if isinstance(model, TokenModel) else None
-        if type(mask_id) is not int:
-            raise ValueError(f"a saved masked run requires a model that names its mask token "
-                             f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = from_record(DiscreteProcess, json_value(record['process'], 'process'), dtypes=False)
-        if process.mask_id != mask_id:
-            raise ValueError("model and process mask token disagree")
-        solver = named_fields(record['solver'], 'solver')
-        unmask = solvers.build(named(solver['class'], 'solver'), named_fields(solver['fields'], 'fields'))
-        if not isinstance(unmask, Unmask):
-            raise ValueError("a saved masked run requires an Unmask solver")
-        return cls(model, variables, process, processor, solver=unmask,
-                   steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
-                   max_new_tokens=budget or None)
+        model, variables, settings, processor = cls._loaded(
+            directory, MaskedSettings, checked, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype,
+            param_dtype=param_dtype, trust=trust)
+        return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                        dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> MaskedGeneration:
-        """Load a run directory published to the Hugging Face Hub.
+    def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
+                      processor: Processor | None) -> MaskedGeneration:
+        """The task `settings` describe over `model` and `variables`, reading text through
+        `processor`: their process, solver, step count and response budget. A live objective
+        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        assert isinstance(settings.solver, Unmask)
+        return cls(model, variables, settings.process, processor, solver=settings.solver,
+                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
 
-        You publish one by uploading the run directory itself with
-        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
-        other arguments work as in `from_run`.
-        """
-        from huggingface_hub import snapshot_download
-
-        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
-                            ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
@@ -767,8 +815,7 @@ class MaskedGeneration:
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
-            return replace(generated, decoder=decoder)
+            return self._decoded(generated)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid response as text; raises ValueError without a processor."""

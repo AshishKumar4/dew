@@ -159,7 +159,7 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
     originals = [{"id": index, "chosen": [1, 2, index + 3], "rejected": [1, index + 4],
                   "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1],
                   "catalog": {"tags": [str(index)]}} for index in range(3)]
-    rows = list(iterate(Memory(originals).map(preferences.pair(4)), read=read, loading=READ))
+    rows = list(iterate(Memory(originals).map(preferences.PreferencePair(4)), read=read, loading=READ))
     assert len(rows) == len(originals)
     for row, original in zip(rows, originals, strict=True):
         assert row["id"] == original["id"] and row["catalog"] == original["catalog"]
@@ -170,6 +170,25 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("kind", [np.asarray, tuple])
+def test_prompt_and_preference_encodings_read_token_arrays_as_they_read_lists(read, kind):
+    """Token ids a step of Dew's own makes are int32 arrays (`text.tokenize`), and a dataset's
+    column may hold tuples; prompt and preference encodings read either as they read lists."""
+    lists = [{"prompt": [1, 2], "chosen": [1, 2, 3], "rejected": [1, 4], "chosen_mask": [0, 1, 1],
+              "rejected_mask": [0, 1]}]
+    native = [{name: kind(np.asarray(value, np.int32)) for name, value in row.items()} for row in lists]
+
+    def first(rows):
+        chain = Memory(rows).filter_map(prompts.encode("byte", max_prompt_len=4))
+        chain = chain.map(preferences.PreferencePair(4))
+        return next(iter(iterate(chain, read=read, loading=READ)))
+
+    encoded = [first(rows) for rows in (lists, native)]
+    for name in ("prompt", "prompt_length", "input_ids", "completion_mask"):
+        np.testing.assert_array_equal(encoded[1][name], encoded[0][name])
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 @pytest.mark.parametrize("row", [
     {"id": 7}, {"id": 7, "prompt": ""},
     {"id": 7, "chosen": [1, 2]},
@@ -177,7 +196,7 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
 ])
 def test_encodings_still_validate_the_fields_they_read(read, row):
     stored = Memory([row])
-    chain = (stored.map(preferences.pair(4)) if "chosen" in row
+    chain = (stored.map(preferences.PreferencePair(4)) if "chosen" in row
              else stored.filter_map(prompts.encode("byte", max_prompt_len=4)))
     with pytest.raises(ValueError):
         list(iterate(chain, read=read, loading=READ))

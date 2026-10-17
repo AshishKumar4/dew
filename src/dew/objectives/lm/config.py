@@ -146,10 +146,6 @@ class LMRunConfig(RunConfig):
                              "packing or a filter over an indexed or streamed read cuts its order per share. "
                              "Read it whole first (--data-read memory), read a published packing generation "
                              "by index, or give the run length as --trainer.steps")
-        if loaded.steps_per_epoch == 0:
-            raise ValueError(f"{loaded.records} training windows do not fill one batch of "
-                             f"{self.trainer.batch_size}, so an epoch is no steps at all: read more data "
-                             "or lower --trainer.batch-size")
         # The run's own default metric, asked for where its data holds a validation split to score.
         scored = self.trainer.eval_interval(loaded) is not None and loaded.val is not None
         validation = (Perplexity(),) if scored else ()

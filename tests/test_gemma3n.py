@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_leaves_as_exact
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
 from dew.nn.mlp import GatedMLP
@@ -100,6 +101,54 @@ def test_the_sparse_mlp_matches_the_reference():
     dense = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu").apply(
         variables, hidden)
     assert float(np.max(np.abs(np.asarray(dense) - tensors["mlp_output"]))) > 1e-2
+
+
+def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
+    """A padded row of zeros has a constant gate row, whose deviation is
+    zero. The reference's deviation takes a zero gradient there (torch's std
+    backward masks it), and so must the port's: sqrt's infinite derivative
+    times the masked loss's zero cotangent made every weight's gradient NaN.
+    The output and the gradients of the input and the three kernels, the
+    padding masked out of the loss, are as exact as the reference's, both
+    measured from the reference in float64."""
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
+
+    tensors = fixture()
+    names = ("gate_proj", "up_proj", "down_proj")
+    hidden = np.array(tensors["activated"], np.float32)
+    hidden[:, 4:] = 0
+    real = np.arange(hidden.shape[1]) < 4
+    cotangent = np.random.default_rng(0).standard_normal(hidden.shape).astype(np.float32) * real[:, None]
+    config = Gemma3nTextConfig(
+        vocab_size=64, hidden_size=HIDDEN, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8, sliding_window=4,
+        hidden_size_per_layer_input=8, altup_num_inputs=COPIES, laurel_rank=8,
+        activation_sparsity_pattern=[0.95, 0.0], num_kv_shared_layers=0)
+
+    def reference(dtype):
+        mlp = Gemma3nTextMLP(config, layer_idx=0).to(dtype)
+        with torch.no_grad():
+            for name in names:
+                getattr(mlp, name).weight.copy_(torch.from_numpy(tensors[f"mlp.{name}.weight"]))
+        x = torch.tensor(hidden, dtype=dtype, requires_grad=True)
+        output = mlp(x)
+        (output * torch.tensor(cotangent, dtype=dtype)).sum().backward()
+        return {"output": output.detach().numpy(), "input": x.grad.numpy(),
+                **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
+
+    def loss(params, x):
+        output = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu",
+                          activation_sparsity=0.95).apply({"params": params}, x)
+        return jnp.sum(output * cotangent), output
+
+    params = {name: {"kernel": jnp.asarray(tensors[f"mlp.{name}.weight"].T)} for name in names}
+    (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
+        params, jnp.asarray(hidden))
+    dew = {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
+    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64),
+                           reductions=hidden.shape[0] * hidden.shape[1])
 
 
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])

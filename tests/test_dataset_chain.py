@@ -269,7 +269,7 @@ def fetched_generation(source, directory):
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
     manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
-    stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest, source,
+    stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
         for index in range(len(stored)):
@@ -623,7 +623,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     source = from_hf(stream, name="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
     manifest = source.manifest()
-    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key, manifest))
+    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
     actual = []
     for index in range(shares):
         reader = iter(streamed(cached, partition=DataPartition(index, shares), loading=READ))
@@ -644,19 +644,36 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
 
 @pytest.mark.parametrize("form", ["NFKC", "NFC"])
 def test_text_normalize_reads_composed_and_compatibility_characters_alike(form):
-    """text.normalize puts a record's text into one Unicode form, so a decomposed accent reads as
+    """text.Normalized puts a record's text into one Unicode form, so a decomposed accent reads as
     its composed letter and, under NFKC, a ligature and a full-width digit as their plain ones;
     the record's other fields pass through."""
     records = [{"text": "cafe\u0301 \ufb01ne \uff11", "id": 7}, {"text": b"plain", "id": 8}]
-    normalized = list(Memory(records).map(text.normalize(form)).iterate())
+    normalized = list(Memory(records).map(text.Normalized(form)).iterate())
     assert [row["text"] for row in normalized] == [
         "caf\u00e9 fine 1" if form == "NFKC" else "caf\u00e9 \ufb01ne \uff11", "plain"]
     assert [int(row["id"]) for row in normalized] == [7, 8]
 
 
 def test_chunks_cut_long_documents_keeping_every_target():
-    pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.chunk(4, overlap=1)).iterate())
+    pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.Chunks(4, overlap=1)).iterate())
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
+
+
+def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
+    """text.MinChars keeps the texts of at least its count of characters, and text.Dropped empties
+    a kept record's caption by the record's own draw: none at p=0, every one at p=1, and at any p
+    the same captions on every pass."""
+    records = [{"text": "x" * size, "caption": f"a photo {size}", "id": size} for size in range(12)]
+
+    def captions(p):
+        chain = Memory(records).filter(text.MinChars(5)).random_map(text.Dropped(p=p))
+        return {int(row["id"]): str(row["caption"]) for row in chain.iterate()}
+
+    assert captions(0.0) == {size: f"a photo {size}" for size in range(5, 12)}
+    assert captions(1.0) == dict.fromkeys(range(5, 12), "")
+    halved = captions(0.5)
+    assert halved == captions(0.5)
+    assert all(caption in ("", f"a photo {size}") for size, caption in halved.items())
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
@@ -825,7 +842,9 @@ def test_a_random_step_that_may_drop_draws_as_one_that_cannot(read):
 
 
 class Coin(grain.RandomMapTransform):
-    """Keeps a record, with its draw, on heads."""
+    """Keeps a record, with its draw, on heads; it says it drops records."""
+
+    rejects = True
 
     def random_map(self, element, rng) -> dict | Rejected:
         return keep_heads(element, rng)
@@ -850,7 +869,7 @@ def test_filter_map_refuses_a_step_that_draws():
     from dew.data import video
 
     with pytest.raises(TypeError):
-        Memory(rows("a", 2)).filter_map(video.pick_clip(1.0))
+        Memory(rows("a", 2)).filter_map(video.PickClip(1.0))
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

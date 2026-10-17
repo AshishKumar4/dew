@@ -40,7 +40,7 @@ from dew.data.generation import (
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Shard, ShardManifest, Source
+from dew.data.sources.base import Shard, Source
 from dew.data.sources.codec import encode, fingerprint
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
@@ -83,7 +83,9 @@ class Cache:
 
     CURRENT is read only by an explicit generation open. Each process keeps
     its own writes; it never discovers another filling writer's rows.
-    Volatile prefixes run on every read and produce no completions.
+    Volatile prefixes run on every read and produce no completions. A shard
+    upload to a remote store is tried `retry` more times; one to this host's
+    disk or memory fails at once.
     """
 
     url: str
@@ -148,20 +150,18 @@ class Cache:
         self,
         parent: grain.MapDataset,
         key: DependencyManifest,
-        source: Source,
         *,
         transform: Transform | None = None,
     ) -> _Mapped:
         self._root(key)
         if transform is not None and _volatile(transform):
             return _Mapped(parent.map_with_index(_Passthrough(transform)))
-        return _CachedMap(parent, self, key, source, transform)
+        return _CachedMap(parent, self, key, transform)
 
     def streamed(
         self,
         reader: Callable[[Shard], grain.IterDataset],
         key: DependencyManifest,
-        manifest: ShardManifest,
         *,
         transform: Transform | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
@@ -301,10 +301,7 @@ class _Writer:
             if self.cache.on_full == "stop":
                 self.admitting = False
                 break
-            for future in self.futures:
-                if future.done():
-                    future.result()
-            self.lock.wait()
+            self.lock.wait_for(lambda: self._room(len(payload)))
         if self.admitting:
             self.pending[row_key] = payload
             self.pending_bytes += len(payload)
@@ -326,8 +323,6 @@ class _Writer:
         used = self.pending_bytes
         for offset, (row_id, payload) in enumerate(self.pending.items()):
             outputs = _decode_outputs(payload)
-            if not isinstance(outputs, tuple):
-                raise ValueError(f"cache pending row {row_id} is not an input completion")
             writer.write(payload)
             accepted = _accepted(outputs)
             entries.append(
@@ -354,9 +349,9 @@ class _Writer:
         self.index.commit()
         self.pending.clear()
         self.pending_bytes = 0
-        future = self.pool.submit(self._upload, number, path, entries, actual)
-        future.add_done_callback(self._settled)
-        self.futures.append(future)
+        upload = self.pool.submit(self._upload, number, path, entries, actual)
+        upload.add_done_callback(self._ended)
+        self.futures.append(upload)
 
     def _reserve_shard(self, actual: int, provisional: int, path: Path) -> bool:
         if actual > self.cache.spool_limit:
@@ -377,22 +372,33 @@ class _Writer:
                 self.admitting = False
                 _log.warning("cache %s stopped admission at its spool budget", self.root.url)
                 return False
-            # A failed upload frees no spool: its error ends the wait.
-            for future in self.futures:
-                if future.done():
-                    future.result()
-            self.lock.wait()
+            self.lock.wait_for(lambda: self._room(actual - provisional))
         self.spool_bytes += actual - provisional
         return True
+
+    def _room(self, needed: int) -> bool:
+        """Whether the spool has room for `needed` more bytes. An upload that ended frees its bytes or
+        failed, which raises here; each wakes the waiting writer (`_ended`)."""
+        for future in self.futures:
+            if future.done():
+                future.result()
+        return self.spool_bytes + needed <= self.cache.spool_limit
+
+    def _ended(self, _: Future) -> None:
+        with self.lock:
+            self.lock.notify_all()
 
     def _upload(self, number: int, path: Path, entries: list[dict], used: int) -> dict:
         started = time.monotonic()
         payload = path.read_bytes()
         shard = f"shards/{self.writer}/{number:06d}.array_record"
         segment = f"segments/{self.writer}/{number:06d}.json"
+        # A remote store's write is retried, by the store (`Store.put_immutable`); a local disk's failure,
+        # or its retention refusing room (`LocalRetention`), is the cache's error at once.
+        retries = self.cache.retry if self.root.remote else 0
         if self.closed:
             raise RuntimeError("cache upload was cancelled")
-        self.root.child(shard).put_immutable(payload, retries=self.cache.retry)
+        self.root.child(shard).put_immutable(payload, retries=retries)
         encoded = _json(
             {
                 "schema": 1,
@@ -402,19 +408,13 @@ class _Writer:
         )
         if self.closed:
             raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
-        self.root.child(segment).put_immutable(encoded, retries=self.cache.retry)
+        self.root.child(segment).put_immutable(encoded, retries=retries)
         with self.lock:
             self.spool_bytes -= used
             self.uploaded_bytes += used
             self.upload_seconds += time.monotonic() - started
-            self.lock.notify_all()
         path.unlink(missing_ok=True)
         return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
-
-    def _settled(self, _: Future) -> None:
-        """An upload's end, done or failed, wakes whoever waits for the spool it held."""
-        with self.lock:
-            self.lock.notify_all()
 
     def metrics(self) -> CacheStats:
         with self.lock:
@@ -558,11 +558,10 @@ class _CachedMap(_Mapped):
         parent: grain.MapDataset,
         cache: Cache,
         key: DependencyManifest,
-        source: Source,
         transform: Transform | None,
     ):
         super().__init__(parent)
-        self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
+        self.cache, self.key, self.transform = cache, key, transform
         self.writer_lock = threading.RLock()
 
     @property

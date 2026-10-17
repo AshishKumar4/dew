@@ -95,8 +95,7 @@ class DataExport:
             raise ValueError(f"{self.recipe} has no validation source")
         metadata = None
         if self.tokenizer is not None:
-            from dew.data.steps.text import Tokenize
-            from dew.data.text import tokenizer_for
+            from dew.data.text import Tokenize, tokenizer_for
 
             vocabulary = tokenizer_for(self.tokenizer)
             pipeline = pipeline.map(Tokenize(self.tokenizer, eos=self.eos))

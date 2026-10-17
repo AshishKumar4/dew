@@ -1,5 +1,7 @@
-"""CPU first filters for the fla port's declared configs: each compiles for its GPU within the block's
-shared memory, and its dots refuse mixed dtypes. A GPU's own tests are the verdict."""
+"""CPU first filters for the kernels: each of the fla port's declared configs, and the delta rule's and
+the short conv's kernels at their training shapes, compiles for its GPU within the block's shared
+memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
+are the verdict, runs none of them: the file carries no `kernel` mark."""
 
 import fla_gdn_support as support
 import jax
@@ -7,11 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
+from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
-
-pytestmark = pytest.mark.kernel
 
 LAUNCHES = {launch for module in (fla_gdn, fla_kda) for launch in vars(module).values()
             if isinstance(launch, fla_gdn._Launch)}
@@ -116,4 +117,26 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
+    assert not failures(found), "\n".join(failures(found))
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
+def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+    """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
+    compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
+    compile bound and the block's shared memory."""
+    pytest.importorskip("triton")
+    found = compile_kernels(kda_training_cases(), target)
+    assert len(found) == 2
+    assert not failures(found), "\n".join(failures(found))
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
+def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+    """Each of the short conv's training cases lowered as on the GPU and compiled by pip's Triton for its
+    capability on this CPU (tests/kernel_compile.py), within the compile bound and the block's shared
+    memory."""
+    pytest.importorskip("triton")
+    found = compile_kernels(conv_training_cases(), target)
+    assert len(found) == 2 * len(CONV_SHAPES) + 2
     assert not failures(found), "\n".join(failures(found))

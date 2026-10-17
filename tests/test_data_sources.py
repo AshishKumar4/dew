@@ -814,7 +814,7 @@ def test_webdataset_groups_members_and_restores_inside_shard():
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
-    from dew.data.steps.text import Tokenize
+    from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
     original = b"first\r\nsecond\n\nlast without newline"
@@ -1631,7 +1631,7 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
 
     with pytest.raises(ValueError):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
-            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint())
         )
 
 
@@ -2162,3 +2162,119 @@ def test_provisioning_a_store_again_replaces_the_index_a_reader_has_mapped(tmp_p
     TokenFiles(str(tmp_path)).provision()
     assert os.stat(index).st_ino != original
     assert mapped.tolist() == np.load(index).tolist() == list(range(4, 257, 4))
+
+
+def _indexed_source(kind: str, root: Path):
+    """A source of `kind` that streams its indexed records, and the shards (id, location, start,
+    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into."""
+    from token_support import write_token_corpus
+
+    from dew.data.pipeline import Pack, Pipeline
+    from dew.data.sources import TFDS, TokenFiles
+
+    if kind == "memory":
+        return Memory([{"id": index} for index in range(7)], shard_rows=3), [
+            ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
+    if kind == "tfds":
+        tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+        path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
+        named = f"tfds:dew_images/None:None:all:{path}"
+        return TFDS("dew_images", path=path, split="all", shard_rows=8,
+                    decoders={"image": tfds.decode.SkipDecoding()}), [
+            (f"{named}:0", path, 0, 8, 8), (f"{named}:8", path, 8, 16, 8), (f"{named}:16", path, 16, 20, 4)]
+    if kind == "generation":
+        from dew.data.cache import Cache
+        from dew.data.compile import publish
+
+        generation = publish(Pipeline(Memory([{"id": index} for index in range(4100)])),
+                             Cache(str(root / "cache")), read="indexed",
+                             loading=Loading(workers=0, threads=1, read_buffer=0))
+        url = generation.url
+        return generation.source(), [(f"{url}:0", url, 0, 4096, 4096), (f"{url}:4096", url, 4096, 4100, 4)]
+    if kind == "planned":
+        from dew.data.packing import PackedSource
+
+        documents = [np.arange(3, dtype=np.int32) + index for index in range(1030)]
+        held = Memory({"text": documents, "length": [3] * 1030}, identity="documents")
+        return PackedSource.planned(held, Pack(4, bins=1)), [
+            ("memory:documents:0", "memory:documents", 0, 1024, 1024),
+            ("memory:documents:1024", "memory:documents", 1024, 1030, 6)]
+    write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
+    tokens = TokenFiles(str(root)).provision()
+    if kind == "tokens":
+        return tokens, [(f"{root}:train:0", str(root), 0, 1024, 1024),
+                        (f"{root}:train:1024", str(root), 1024, 1030, 6)]
+    from dew.data.steps.windows import WindowSource
+
+    windows = WindowSource(tokens, tokens.tokens, 4, 1)
+    named = f"{tokens.describe()} causal windows=4,stride=1"
+    return windows, [(f"{named}:0", named, 0, 1024, 1024), (f"{named}:1024", named, 1024, 2048, 1024),
+                     (f"{named}:2048", named, 2048, 2056, 8)]
+
+
+@pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
+def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
+    """A source read by index streams as consecutive shards of its records, each named by its
+    store and first row; a shard reads that slice of the indexed records, and the manifest
+    pickles, reader and all, for Grain's worker processes."""
+    source, expected = _indexed_source(kind, tmp_path)
+    manifest = source.manifest()
+    named = [(shard.id, shard.uri, shard.start, shard.stop, shard.rows) for shard in manifest.shards]
+    assert named == expected
+    reopened = pickle.loads(pickle.dumps(manifest))
+    records = source.records("indexed")
+    streamed_rows = [row for shard in reopened.shards for row in reopened.reader(shard)]
+    assert len(streamed_rows) == len(records)
+    for index, row in enumerate(streamed_rows):
+        assert row.keys() == records[index].keys()
+        for name, value in row.items():
+            np.testing.assert_array_equal(value, records[index][name])
+
+
+def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member():
+    """A Grain `MapDataset` and a Hugging Face `Dataset` read as one stream each, as they read by
+    index, so either mixes with a member that only streams (a Grain `IterDataset`), and the
+    mixture resumes where it stopped."""
+    import grain.python as grain
+    from datasets import Dataset as Arrow
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import mix
+    from dew.data.sources.grain import from_grain
+    from dew.data.sources.hf import from_hf
+
+    indexed = from_grain(grain.MapDataset.source([{"id": index} for index in range(6)]), "indexed")
+    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), name="table")
+    stream = grain.MapDataset.source([{"id": 20 + index} for index in range(6)]).to_iter_dataset()
+    streamed = from_grain(stream, "streamed")
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+
+    def ids(reader, count: int) -> list[int]:
+        return [int(value) for batch in itertools.islice(reader, count) for value in batch["id"]]
+
+    for native in (indexed, table):
+        alone = compile(native.repeat(1).batch(2), read="streamed", loading=loading).train(DataPartition())
+        try:
+            assert sorted(int(value) for batch in alone for value in batch["id"]) == sorted(
+                int(native.records("indexed")[index]["id"]) for index in range(6))
+        finally:
+            alone.close()
+        data = compile(mix([native.repeat(), streamed.repeat()]).batch(2), read="streamed", loading=loading)
+        whole = data.train(DataPartition())
+        try:
+            expected = ids(whole, 6)
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = ids(stopped, 3)
+            state = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert head + ids(resumed, 3) == expected
+        finally:
+            resumed.close()
+

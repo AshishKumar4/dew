@@ -15,7 +15,7 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Windows
-from dew.data.sources.base import Read, Shard, ShardManifest
+from dew.data.sources.base import Read, ShardManifest, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.records import integers, record
 
@@ -104,23 +104,7 @@ class WindowSource:
         return None
 
     def manifest(self) -> ShardManifest:
-        count = len(self.records("indexed"))
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"{self.describe()}:{start}",
-                    self.describe(),
-                    start,
-                    min(start + 1024, count),
-                    min(1024, count - start),
-                )
-                for start in range(0, count, 1024)
-            ),
-            self._reader,
-        )
-
-    def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, self.describe(), self.describe(), 1024)
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):

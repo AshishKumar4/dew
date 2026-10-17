@@ -65,10 +65,18 @@ EXPERT_DISPATCHES = ('global', 'exchange')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
 # whose sigmoid scores are all zero stays finite
-# (modeling_deepseek_v3.py:166, maxtext layers/moe.py:839). A softmax over the
-# experts sums to one, which cannot reach it, and in fp32 the term changes no
-# bit of a denominator above 1e-12.
+# (modeling_deepseek_v3.py:166, maxtext layers/moe.py:839). In fp32 the term
+# changes no bit of a denominator above 1e-12. A softmax's choices renormalize
+# as the softmax of their own logits instead (`renormalized_softmax`).
 WEIGHT_SUM_EPSILON = 1e-20
+
+
+def renormalized_softmax(logits: jax.Array, indices: jax.Array) -> jax.Array:
+    """The softmax's probabilities at `indices` renormalized to sum to one,
+    `[..., k]`: the softmax of the chosen logits alone. Renormalizing the full
+    softmax's probabilities instead underflows where a replayed choice
+    (`chosen_experts`) sits far below the router's own, to 0 / 0."""
+    return jax.nn.softmax(jnp.take_along_axis(logits, indices, axis=-1), axis=-1)
 
 
 def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],
@@ -280,10 +288,12 @@ class Router(nn.Module):
             self.sow('router', 'scores', scores)
             # The router z-loss squares each position's log partition.
             self.sow('router', 'log_z', jax.nn.logsumexp(logits, axis=-1))
-        weights = jnp.take_along_axis(scores, indices, axis=-1)
-        if self.normalize_weights:
-            weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
-                                 + WEIGHT_SUM_EPSILON)
+        if self.normalize_weights and self.score_function == 'softmax':
+            weights = renormalized_softmax(logits, indices)
+        else:
+            weights = jnp.take_along_axis(scores, indices, axis=-1)
+            if self.normalize_weights:
+                weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
     def _selected(self, scores, tokens, media):
