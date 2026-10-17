@@ -184,7 +184,7 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
 
     run = tmp_path / "run"
     run.mkdir()
-    make_block_run(run, moved=0.02, tokenizer=str(FIXTURE))
+    make_block_run(run, moved=0.02, tokenizer=str(FIXTURE), pad_token_id=5)
     exported = Pretrained.from_run(str(run), ema=False)
     exported.save(tmp_path / "export")
     assert (tmp_path / "export" / "tokenizer.json").read_bytes() == (FIXTURE / "tokenizer.json").read_bytes()
@@ -212,6 +212,17 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         return np.asarray(bundle.model.apply({**bundle.variables, "cache": cache}, reference["canvas"]))
 
     np.testing.assert_array_equal(logits(again), logits(exported))
+
+    # The run's task (its process, canvas budget and pad id) is the export's,
+    # in a generation config transformers' own class reads.
+    from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationConfig
+
+    from dew.inference.tasks import BlockGeneration
+
+    DiffusionGemmaGenerationConfig.from_pretrained(str(tmp_path / "export"))
+    task, saved = again.block_generation(), BlockGeneration.from_run(str(run), ema=False)
+    assert (task.process, task.max_new_tokens, task.pad_token_id) == (
+        saved.process, saved.max_new_tokens, saved.pad_token_id) and task.pad_token_id == 5
 
 
 def test_a_model_the_published_config_cannot_carry_is_refused_by_field():
