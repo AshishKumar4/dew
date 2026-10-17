@@ -228,6 +228,34 @@ def test_an_expert_schedule_that_routes_no_layer_loads_as_the_dense_model_the_re
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
 
 
+def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transformers_reads(tmp_path):
+    """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
+    the full layers beside plain sliding ones loads, writes back in that spelling, and
+    transformers' Olmo3 reads the export to the logits Dew computes."""
+    from shutil import copytree
+
+    import torch
+    from transformers import Olmo3ForCausalLM
+
+    source = tmp_path / "source"
+    copytree(FIXTURES / "olmo3-tiny", source)
+    config = fixture_config("olmo3-tiny")
+    config["rope_parameters"]["full_attention"] = {
+        "rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
+    (source / "config.json").write_text(json.dumps(config))
+    ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    expected = np.asarray(loaded.model.apply(loaded.variables, ids))
+    loaded.save(tmp_path / "export")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), expected)
+    reference = Olmo3ForCausalLM.from_pretrained(tmp_path / "export", torch_dtype=torch.float32).eval()
+    with torch.no_grad():
+        logits = reference(torch.tensor(ids, dtype=torch.long)).logits.numpy()
+    np.testing.assert_allclose(logits, expected, atol=1e-4, rtol=0)
+
+
 def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     """The rotary rule, on the release's own geometry and without its
     weights: `Olmo3RotaryEmbedding` calls `ROPE_INIT_FUNCTIONS['yarn']` for
