@@ -6,17 +6,21 @@ from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 from jax import lax
 
 from .common import (
     Multistep,
-    _check_distinct_levels,
     _check_endpoint_domain,
+    _check_gaps,
+    _grid_levels,
     _half_log_snr,
+    _history_gaps,
     _lambda_step,
     _multistep,
     _tapered_order,
+    _tapered_orders,
 )
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
@@ -106,8 +110,11 @@ class DPMSolverMultistep:
             _check_endpoint_domain(
                 process, times, source=True, target=not first_at_end,
                 reason="sde-dpmsolver requires finite alpha and a lowered order at sigma zero")
-        if self.order > 1:
-            _check_distinct_levels(process, times, reason="DPM-Solver's higher orders divide by")
+        orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, self.euler_at_final)
+        alpha, sigma, levels = _grid_levels(process, times)
+        # An order above one divides by its own step's h too, but at an endpoint (`_lambda_step`).
+        spans = [(i, i + 1) for i, k in enumerate(orders) if k > 1 and sigma[i + 1] > 0 and alpha[i] != 0]
+        _check_gaps(levels, _history_gaps(orders) + spans, reason="DPM-Solver's higher orders divide by")
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -148,7 +155,8 @@ class DPMSolverMultistep:
             d2 = (d1_0 - d1_1) / (r0 + r1)
             return base + c_heun * d1 + c_2 * d2
 
-        order = _tapered_order(self.order, history, self.lower_order_final, self.euler_at_final)
+        order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
+                               self.euler_at_final)
         stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
         return jnp.where(terminal, target_limit, stepped), history.advance()
 
@@ -225,9 +233,28 @@ class DPMSolverSinglestep:
                 and 3 in orders[:3]):
             _check_endpoint_domain(process, times, source=True,
                                    reason="third-order SDE Heun differences diverge at an alpha=0 anchor")
-        if any(order > 1 for order in orders):
-            _check_distinct_levels(process, times, reason="DPM-Solver's higher orders divide by")
+        alpha, _, levels = _grid_levels(process, times)
+        _check_gaps(levels, self._gaps(orders, alpha), reason="DPM-Solver's higher orders divide by")
         return Singlestep(_multistep(x, times, self.order), x, jnp.asarray(orders, jnp.int32))
+
+    def _gaps(self, orders: list[int], alpha: np.ndarray) -> list[tuple[int, int]]:
+        """The pairs of points whose gap each step's update divides by (`_check_gaps`).
+
+        An update of order k reads the k points from its group's anchor, k - 1
+        back. Its h runs from the anchor to its target, and its ratios from the
+        anchor to each later point, except from an anchor at alpha 0, whose
+        limit reads neither. A third-order Heun form also divides by the gap
+        between its two latest points, and so does its `dpmsolver++` limit from
+        an alpha=0 anchor. A terminal step is first order (`init`)."""
+        gaps = []
+        for i, k in enumerate(orders):
+            anchor = i - k + 1
+            finite = alpha[anchor] != 0
+            if k > 1 and finite:
+                gaps += [(anchor, i + 1), *((anchor, anchor + m) for m in range(1, k))]
+            if k == 3 and self.solver_type == "heun" and (finite or self.algorithm == "dpmsolver++"):
+                gaps.append((i - 1, i))
+        return gaps
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         alpha_s0, sigma_s0 = process.rates(t, like=x)
@@ -364,8 +391,9 @@ class DEIS:
             raise ValueError(f"DEIS has orders 1, 2 and 3, not {self.order}")
 
     def init(self, x, times, process, *, key):
-        if self.order > 1:
-            _check_distinct_levels(process, times, reason="DEIS's higher orders divide by")
+        orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, euler_at_final=False)
+        _check_gaps(_grid_levels(process, times)[2], _history_gaps(orders),
+                    reason="DEIS's higher orders divide by")
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -398,6 +426,7 @@ class DEIS:
                      - _deis_third(rho_s0, rho_s2, rho_s0, rho_s1))
             return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1 + coef3 * m2)
 
-        order = _tapered_order(self.order, history, self.lower_order_final, euler_at_final=False)
+        order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
+                               euler_at_final=False)
         stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
         return stepped, history.advance()
