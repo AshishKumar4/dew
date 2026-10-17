@@ -95,14 +95,14 @@ def compute_schedule(step: np.ndarray, max_steps: int, start_value: float,
 
 
 def z_loss_reference(logits: np.ndarray, targets: np.ndarray, weights: np.ndarray,
-                     coefficient: float) -> tuple[float, float, np.ndarray]:
+                     coefficient: float, dtype=np.float64) -> tuple[float, float, np.ndarray]:
     """`cross_entropy_with_logits` (max_utils.py:649-656) summed over the
     counted targets and divided by their count (train.py:227-234, :337-340),
     in float64: the loss, the z term alone, and the loss's gradient with
     respect to the logits (the custom vjp's `1 + 2 * z_loss * log_z` factor,
     max_utils.py:706)."""
-    logits = np.asarray(logits, np.float64)
-    weights = np.asarray(weights, np.float64)
+    logits = np.asarray(logits, dtype)
+    weights = np.asarray(weights, dtype)
     largest = logits.max(axis=-1, keepdims=True)
     log_z = np.squeeze(largest + np.log(np.exp(logits - largest).sum(axis=-1, keepdims=True)), -1)
     picked = np.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
@@ -119,9 +119,11 @@ def z_loss_reference(logits: np.ndarray, targets: np.ndarray, weights: np.ndarra
 
 def distillation_loss(student_logits, teacher_logits, targets, mask, student_features,
                       teacher_features, alpha: float, temperature: float, beta: float,
-                      feature_loss_type: str):
-    """`CombinedDistillationStrategy.compute_loss` (:462-566) in float64
-    torch over one batch: the total and its reported terms.
+                      feature_loss_type: str, dtype=None):
+    """`CombinedDistillationStrategy.compute_loss` (:462-566) in torch over
+    one batch, in `dtype` (float64 where None): the total and its reported
+    terms. The float32 run is the reference's own rounding, which a test
+    holds Dew's to.
 
     `student_features` and `teacher_features` are the `[L, B, T, D]` stacks
     the reference slices with `distill_layer_indices` (:552-557), here the
@@ -129,12 +131,13 @@ def distillation_loss(student_logits, teacher_logits, targets, mask, student_fea
     """
     import torch
 
-    s_logits = student_logits.to(torch.float64)
-    t_logits = teacher_logits.to(torch.float64)
-    mask = mask.to(torch.float64)
+    dtype = torch.float64 if dtype is None else dtype
+    s_logits = student_logits.to(dtype)
+    t_logits = teacher_logits.to(dtype)
+    mask = mask.to(dtype)
     valid_count = mask.sum()
     safe_count = torch.clamp(valid_count, min=1.0)
-    labels = torch.nn.functional.one_hot(targets, s_logits.shape[-1]).to(torch.float64) * mask[..., None]
+    labels = torch.nn.functional.one_hot(targets, s_logits.shape[-1]).to(dtype) * mask[..., None]
 
     log_s_T = torch.log_softmax(s_logits / temperature, dim=-1)
     t_p_T = torch.softmax(t_logits / temperature, dim=-1)
@@ -151,8 +154,8 @@ def distillation_loss(student_logits, teacher_logits, targets, mask, student_fea
 
     base_logit_loss = alpha * soft_loss_mean + (1.0 - alpha) * hard_loss_mean
 
-    s_features = student_features.to(torch.float64)
-    t_features = teacher_features.to(torch.float64)
+    s_features = student_features.to(dtype)
+    t_features = teacher_features.to(dtype)
     if feature_loss_type == "cosine":
         s_norm = torch.sqrt(torch.clamp(s_features.square().sum(-1, keepdim=True), min=1e-6))
         t_norm = torch.sqrt(torch.clamp(t_features.square().sum(-1, keepdim=True), min=1e-6))

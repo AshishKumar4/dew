@@ -24,6 +24,8 @@ import optax
 import pytest
 from flax.traverse_util import unflatten_dict
 
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+
 from dew.data.dataset import Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
@@ -78,11 +80,40 @@ def step_at(index=0, key=1, ema=None) -> Step:
     return Step(step=jnp.asarray(index), key=jax.random.key(key), ema=ema)
 
 
-def scaled_close(actual, expected, tolerance: float) -> None:
-    """The fp32 parity bound: the largest error, scaled by the largest reference value."""
-    actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
-    scale = max(float(np.abs(expected).max()), 1.0)
-    assert float(np.abs(actual - expected).max()) <= tolerance * scale
+def reference_float32(arrays: dict, kind: str):
+    """The reference's own float32 run on the fixture's float32 outputs, the
+    projections applied in float32: its loss, its terms, and its cotangents
+    on the student's logits and projected features."""
+    import torch
+
+    from tools.distillation_reference import distillation_loss
+
+    pairs = range(len(META["pairs"]))
+    targets = arrays["tokens"][:, 1:]
+    logits = torch.tensor(arrays["student_logits"], requires_grad=True)
+    features = torch.tensor(np.stack([arrays[f"student_feature_{index}"] @ arrays[f"projection_{index}"]
+                                      for index in pairs]), requires_grad=True)
+    loss, terms = distillation_loss(
+        logits, torch.tensor(arrays["teacher_logits"]), torch.tensor(targets, dtype=torch.int64),
+        torch.tensor((targets != META["pad_id"]).astype(np.float32)), features,
+        torch.tensor(np.stack([arrays[f"teacher_feature_{index}"] for index in pairs])),
+        META["alpha"], META["temperature"], META["beta"], kind, dtype=torch.float32)
+    d_logits, d_features = torch.autograd.grad(loss, (logits, features))
+    reported = {name: value.item() for name, value in terms.items()}
+    return loss.item(), reported, d_logits.numpy(), d_features.numpy()
+
+
+def student_outputs(model, trainable, ids):
+    """The student's logits and its paired layers' outputs projected, as the reference reads them."""
+    from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+
+    variables = {"params": {name: value for name, value in trainable.items() if name != PROJECTIONS}}
+    logits = model.apply(variables, ids)
+    _, state = model.apply(variables, ids, method=type(model).hidden_states,
+                           capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
+    projections = trainable[PROJECTIONS]
+    return logits, jnp.stack([layer_output(state[INTERMEDIATES], layer) @ projections[f"projection_{index}"]
+                              for index, (_, layer) in enumerate(META["pairs"])])
 
 
 # --------------------------------------------------------------------------
@@ -92,51 +123,56 @@ def scaled_close(actual, expected, tolerance: float) -> None:
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
-    """Loss and every reported term within 1e-4 of the float64 reference,
-    scaled; observed at most 1.2e-7 on CPU. Padding sits in the batch, so the
-    mask is part of what agrees."""
+    """Loss and every reported term as near the reference's float64 value as
+    the reference's own float32 run is (`assert_as_exact_as_the_reference`).
+    Padding sits in the batch, so the mask is part of what agrees."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
 
     loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
 
-    scaled_close(loss, arrays[f"{kind}/loss"], 1e-4)
+    reference_loss, reference_terms, _, _ = reference_float32(arrays, kind)
+    assert_as_exact_as_the_reference(np.atleast_1d(np.float64(loss)), np.atleast_1d(reference_loss),
+                                     np.atleast_1d(arrays[f"{kind}/loss"]), f"{kind} loss")
     for metric, name in (("ce", "hard_loss"), ("distill/soft_loss", "soft_loss"),
                          ("distill/kl", "kl_div_at_T"), ("distill/feature", "feature"),
                          ("distill/teacher_loss", "teacher_loss")):
-        scaled_close(aux.metrics[metric], arrays[f"{kind}/{name}"], 1e-4)
+        assert_as_exact_as_the_reference(np.atleast_1d(np.float64(aux.metrics[metric])),
+                                         np.atleast_1d(reference_terms[name]),
+                                         np.atleast_1d(arrays[f"{kind}/{name}"]), f"{kind} {name}")
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_student_gradient_matches_the_reference_cotangents(kind):
     """The gradient with respect to every trainable leaf, the projections
-    included, within 1e-4 scaled of the reference's logit and feature
-    cotangents pulled back through the student; observed at most 1.8e-7."""
+    included, as near float64 as the reference's own float32 run is
+    (`assert_leaves_as_exact`): the float64 truth pulls the reference's
+    float64 cotangents back through the student run in float64, and the
+    reference pulls its float32 cotangents back through the student in
+    float32."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     batch = fixture_batch(arrays)
+    ids = jnp.asarray(arrays["tokens"][:, :-1])
+    model = objective.student.model
 
-    def student_outputs(trainable):
-        _, _, prediction = objective.student.predict(
-            {"params": {name: value for name, value in trainable.items() if name != PROJECTIONS}},
-            batch, step_at(), train=True, layers=[s for _, s in META["pairs"]])
-        projected = jnp.stack([state.astype(jnp.float32) @ trainable[PROJECTIONS][f"projection_{index}"]
-                               for index, state in enumerate(prediction.hidden)])
-        return prediction.logits, projected
-
-    (logits, _), pullback = jax.vjp(student_outputs, params["params"])
-    scaled_close(logits, arrays["student_logits"], 1e-5)
-    expected, = pullback((jnp.asarray(arrays[f"{kind}/d_student_logits"], jnp.float32),
-                          jnp.asarray(arrays[f"{kind}/d_student_features"], jnp.float32)))
+    (logits, _), pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids),
+                                    params["params"])
+    np.testing.assert_array_equal(np.asarray(logits), arrays["student_logits"])
+    _, _, d_logits, d_features = reference_float32(arrays, kind)
+    reference, = pullback((jnp.asarray(d_logits), jnp.asarray(d_features)))
+    with jax.enable_x64(True):
+        wide = model.clone(dtype=jnp.float64)
+        _, widened_pullback = jax.vjp(lambda trainable: student_outputs(wide, trainable, ids),
+                                      widened(params["params"]))
+        truth, = widened_pullback((arrays[f"{kind}/d_student_logits"], arrays[f"{kind}/d_student_features"]))
+        truth = jax.tree.map(np.asarray, truth)
     actual = jax.grad(lambda trainable: objective.scalar_loss(
         {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
-    expected_leaves = dict(jax.tree_util.tree_leaves_with_path(expected))
-    actual_leaves = dict(jax.tree_util.tree_leaves_with_path(actual))
-    assert actual_leaves.keys() == expected_leaves.keys()
-    for path, leaf in expected_leaves.items():
-        assert float(jnp.abs(leaf).max()) > 0, path
-        scaled_close(actual_leaves[path], leaf, 1e-4)
+    assert jax.tree.structure(actual) == jax.tree.structure(truth)
+    assert all(float(np.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(truth))
+    assert_leaves_as_exact(actual, reference, truth)
 
 
 # --------------------------------------------------------------------------
