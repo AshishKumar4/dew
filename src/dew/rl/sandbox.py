@@ -60,8 +60,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
-from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 from dew.inference.rollouts import InfrastructureError
+from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 from dew.records import JSON
 
 
