@@ -454,6 +454,36 @@ def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("chunks", [4, 8])
+def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
+    """The objective's chunk count reaches the tiled head in both the loss and optimizer update."""
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=5, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8, head_bias=True, attention_impl="xla")
+    objective = LMObjective(model, seq_len=4, head_chunks=chunks, head_tile=(3, 2), ema_decay=None)
+    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0))
+    initial = trainer.initial_state()
+    ids = jnp.tile(jnp.arange(5, dtype=jnp.int32), (jax.device_count(), 1))
+    step = Step(jnp.array(0), jax.random.key(1), None)
+
+    def whole(params):
+        logits = model.apply({**initial.variables, "params": params}, ids[:, :-1])
+        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]))
+
+    want, gradient = jax.value_and_grad(whole)(initial.variables["params"])
+    actual = objective.scalar_loss(initial.variables, {"text": ids}, step)[0]
+    np.testing.assert_allclose(actual, want, rtol=1e-6)
+    expected = jax.tree.map(lambda p, g: p - .01 * g, initial.variables["params"], gradient)
+    trained, _, _, _, accepted, _ = trainer.compile(initial, {"text": ids})(initial, {"text": ids})
+    assert bool(accepted) and int(trained.updates) == 1
+    for actual, reference in zip(jax.tree.leaves(trained.variables["params"]),
+                                 jax.tree.leaves(expected), strict=True):
+        np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-7)
+
+
 def test_mismatched_shapes_are_refused():
     hidden, head, targets = inputs()
     with pytest.raises(ValueError):

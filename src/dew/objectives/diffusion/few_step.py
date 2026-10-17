@@ -115,8 +115,8 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 _EULER = Euler()
 
 SMOOTH_TIME_SCALE = 0.002
-"""The Fourier time scale a model trained through a derivative in time takes
-when its config names none, and the fastest an sCM teacher's may turn. On a
+"""The recommended Fourier time scale for losses with time derivatives,
+used when a run config names none. On a
 2-D two-class toy (RTX 4080), one-step class accuracy at simple_dit's
 default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
 against 98.6%."""

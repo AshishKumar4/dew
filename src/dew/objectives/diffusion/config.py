@@ -248,8 +248,6 @@ class DiffusionRunConfig(RunConfig):
                 raise ValueError(
                     f"{self.pretrained} decides the model, its text conditioning and its "
                     f"autoencoder; leave {', '.join(chosen)} unset")
-            if self.objective.fields.get("end_to_end") is not None:
-                raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
             object.__setattr__(self, "text", None)
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
