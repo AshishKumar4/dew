@@ -10,10 +10,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from fla_gdn_support import CONV_SHAPES
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
+from tuned import each_config
 
-from dew.nn.kernels import generation, short_conv
+from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
 
 pytestmark = pytest.mark.kernel
@@ -115,6 +117,58 @@ def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias,
             assert_follows_xla(grad, reference, value, f"d{name}")
 
 
+def configs(op) -> list:
+    """Every config of `op`'s space, as its key declares it for the CPU tests' delta conv
+    (`each_config` reads them from a lowering, which a CPU's interpreted kernels describe too)."""
+    x, weights, _, _ = operands(2, 37, DELTA)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    return each_config(op, lambda x, weights: run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16,
+                                                  grads), x, weights)
+
+
+def test_the_tuner_reads_the_convs_launches_and_stores_their_picks():
+    """A delta conv and its gradients, traced as the tuner reads a program: one forward launch and one
+    backward launch a piece, each a tuner op keyed by its pieces, and a pick for each stored and read
+    back as the tuner stores them, by the same launch and key."""
+    x, weights, _, _ = operands(2, 37, DELTA)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(jax.jit(lambda x, weights: run(
+            kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16, grads)), x, weights)
+    assert sorted(type(ba.op).__name__ for ba in found) == ["ConvBackward"] * len(DELTA) + ["ConvForward"]
+    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                                   metadata={})
+    keyed = [ba.op.keyed(ba) for ba in found]
+    stored = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
+        (ba, tuning.AutotuningData({ba.heuristics_config: timing})) for ba in keyed))
+    read = tokamax.AutotuningResult.loads(stored.dumps())
+    assert [(type(ba.op), ba.autotuning_cache_key) for ba, _ in read.data] == [
+        (type(ba.op), ba.autotuning_cache_key) for ba in keyed]
+
+
+@pytest.mark.parametrize("op", [short_conv.ConvForward, short_conv.ConvBackward])
+def test_every_config_of_the_kernels_computes_causal_conv1d(op):
+    """Each config of each launch's space (`tuning.pinned`) gives each piece and the gradients of the
+    projection and the taps as XLA computes them, over packed documents at a length that leaves runs and
+    a tile partly past the end: the configs order the tap gradients' sums, and every one is within the
+    gate the heuristic is."""
+    x, weights, _, _ = operands(2, 37, DELTA)
+    segments = documents(2, 37)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    want, want_grads = run(xla_conv1d, x, weights, None, None, DELTA, jnp.bfloat16, grads, segments=segments)
+    exact, exact_grads = truth(x, weights, None, None, DELTA, grads, segments=segments)
+    found = configs(op)
+    assert len(found) > 1
+    for config in found:
+        with tuning.pinned({op: config}):
+            got, got_grads = run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16, grads,
+                                 segments=segments)
+        for label, mine, theirs, value in zip(("q", "k", "v", "dx", "dtaps"), (*got, *got_grads[:2]),
+                                              (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
+                                              strict=True):
+            assert_follows_xla(mine, theirs, value, f"{config} {label}")
+
+
 def test_padding_tokens_are_zero_and_pass_no_gradient():
     """A right-padded row's padding slots come out zero and their cotangents reach nothing."""
     x, weights, _, kept = operands(2, 24, DELTA, valid=True)
@@ -170,20 +224,30 @@ def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason)
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
-    XLA's own conv (`assert_as_exact_as_the_reference`). Two rows: a row's tokens are the distances'
+    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's heuristic and, at the 0.8b's
+    width, at every config of its space (`tuning.pinned`). Two rows: a row's tokens are the distances'
     terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
     (_, length), parts = CONV_SHAPES[model]
     x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
     grads = cotangents(x, parts, dtype)
-    got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+
+    def kernels(x, weights):
+        return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
     exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
-    labels = ("q", "k", "v", "dx", "dtaps")
-    # The gradients of the projection and the taps; there is no bias.
-    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                          (*exact, *exact_grads[:2]), strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
+    # Every config of each launch's space at the 0.8b's width, the heuristics at the other's.
+    pins = [{}] + ([{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
+                    for config in each_config(op, kernels, x, weights)] if model == "0.8b" else [])
+    for pin in pins:
+        with tuning.pinned(pin):
+            got, got_grads = kernels(x, weights)
+        labels = ("q", "k", "v", "dx", "dtaps")
+        # The gradients of the projection and the taps; there is no bias.
+        for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
+                                              (*exact, *exact_grads[:2]), strict=True):
+            assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}")
 
 
 @pytest.mark.mesh(devices=2)
