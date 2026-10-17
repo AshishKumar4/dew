@@ -22,7 +22,6 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.diffusion.transforms import FlowMatchPredictionTransform
 
 from .guidance import Guidance, Walk
 from .sample import sample
@@ -128,17 +127,16 @@ class FlowSDE:
     """Samples a rectified-flow `Process` with Flow-GRPO's Euler-Maruyama solver.
 
     Process times may be resolution-shifted. The transition integrates in
-    the noise rate sigma that results, as the reference scheduler does. A
-    process without a rectified-flow schedule and velocity prediction raises
-    `ValueError`.
+    the noise rate sigma that results, as the reference scheduler does.
+    Predictions are converted to clean samples and noise by the denoiser.
+    A process without a rectified-flow schedule raises `ValueError`.
     """
 
     noise_level: float = struct.field(pytree_node=False, default=0.7)
 
     def validate(self, process: Process) -> None:
-        if not isinstance(process.sampler_schedule, RectifiedFlow) or not isinstance(
-                process.prediction, FlowMatchPredictionTransform):
-            raise ValueError("FlowSDE requires a rectified-flow schedule and velocity prediction")
+        if not isinstance(process.sampler_schedule, RectifiedFlow):
+            raise ValueError("FlowSDE requires a rectified-flow schedule")
 
     def init(self, x: jax.Array, times: jax.Array, process: Process, *,
              key: jax.Array) -> tuple[jax.Array, jax.Array]:
