@@ -50,7 +50,7 @@ from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageMod
 from flax.nnx import bridge
 from recording import RecordingTracker
 from steady_state import steady_state
-from test_precision_policy import PER_ARCH, TINY
+from tiny_models import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
 from dew.config.data import loader
@@ -298,7 +298,7 @@ DENOISER_CONFIGS: Mapping[str, tuple[Mapping, Callable[[], InputSpec], frozenset
     "wan_transformer": (PER_ARCH["wan_transformer"], described((FRAMES, 8, 8, 4), "conditioning", width=16),
                         PIXEL_DENOISER),
 }
-"""Every registered denoiser at a tiny config (tests/test_precision_policy.py's),
+"""Every registered denoiser at a tiny config (tests/tiny_models.py's),
 with the sample and the conditioning it reads."""
 
 JEPA_GRID = (PIXELS // 4, PIXELS // 4)
