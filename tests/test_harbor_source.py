@@ -9,6 +9,7 @@ process group, which ignores SIGINT and SIGTERM and holds its output open,
 is killed with the group, at the deadline and at exit.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -448,6 +449,48 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
     assert ended(json.loads(seen.read_text())["pid"])
     assert rollout.status is Status.INFRA_ERROR and time.monotonic() - began < 20
+
+
+def test_a_trial_without_a_descriptor_for_its_wake_pipe_fails_and_frees_its_worker(tmp_path, harbor):
+    """A trial that cannot make its wake pipe, every descriptor taken, fails its future with that
+    OSError, and the source's one worker goes on to run the next trial once descriptors are free.
+    In a process of its own, whose descriptor limit it lowers (`descriptorless_flow`)."""
+    (tmp_path / "task").mkdir()
+    here = Path(__file__).resolve().parent
+    script = (f"import test_harbor_source as tests; "
+              f"tests.descriptorless_flow({str(harbor)!r}, {str(tmp_path)!r})")
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+                         cwd=here, env={**os.environ,
+                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+    assert run.returncode == 0, run.stderr[-4000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "OSError", "COMPLETED"]
+
+
+def descriptorless_flow(harbor: str, root: str) -> None:
+    """Run a trial, take every descriptor and submit one, free them and submit another, on one
+    worker; print the first's and last's statuses and the middle one's error class."""
+    import resource
+
+    task = Task("hello", {HARBOR_KEY: str(Path(root) / "task")})
+    source = HarborSource(fake_gateway()[0], harbor=harbor, model="hosted_vllm/policy",
+                          trials=Path(root) / "trials", workers=1)
+    try:
+        (first,) = source.submit(task, 1, version=0, key=KEY)
+        before = first.result(timeout=120)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+        taken = []
+        with contextlib.suppress(OSError):
+            while True:
+                taken.append(os.open(os.devnull, os.O_RDONLY))
+        (starved,) = source.submit(task, 1, version=0, key=KEY)
+        error = starved.exception(timeout=120)
+        for descriptor in taken:
+            os.close(descriptor)
+        (after,) = source.submit(task, 1, version=0, key=KEY)
+        rollout = after.result(timeout=120)
+    finally:
+        source.close()
+    print(json.dumps([before.status.name, type(error).__name__, rollout.status.name]))
 
 
 def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
