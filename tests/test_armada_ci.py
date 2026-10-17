@@ -134,14 +134,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
-    Python child a file starts with its environment is followed: its own
-    reads and files join the file's record, which keeps its key. A file
-    that started any other process, a shell's, a child it killed, one given
-    an environment of its own, or any multiprocessing context's, has no key,
-    so it is in, and no task reuses its row, whatever names its program (a
-    descriptor, for `os.execve`); one that asked a native tool about the
-    host or compiled a kernel with ptxas (`followed.TOOLS`) keeps its key.
-    The command line
+    file that started a process a record does not follow
+    (test_a_python_child_joins_its_files_record), a shell's or any
+    multiprocessing context's, has no key, so it is in, and no task reuses
+    its row, whatever names its program (a descriptor, for `os.execve`); one
+    that asked a native tool about the host or compiled a kernel with ptxas
+    (`followed.TOOLS`) keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -170,21 +168,6 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "plain.py": "def helper(): return 1\n",
         "test_plain.py": "def test_plain():\n    from plain import helper\n    assert helper() == 1\n",
         "test_lost.py": "def test_lost(): pass\n",
-        "test_spawns.py": "import subprocess, sys\n"
-                          "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
-        "child.py": "import devices, plain\n"
-                    "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n",
-        "test_child.py": "import subprocess, sys\n"
-                         "def test_child(): subprocess.run([sys.executable, 'tests/child.py'], check=True)\n",
-        "test_killed.py": "import subprocess, sys\n"
-                          "def test_killed():\n"
-                          "    child = subprocess.Popen([sys.executable, '-c', 'input()'],\n"
-                          "                             stdin=subprocess.PIPE)\n"
-                          "    child.kill()\n    child.wait()\n",
-        "test_own_environment.py": "import os, subprocess, sys\n"
-                                   "def test_child():\n"
-                                   "    subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
-                                   "                   env={'PATH': os.environ['PATH']})\n",
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
@@ -224,8 +207,6 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
-    # The child's files are its file's: its key holds until one changes.
-    assert ci.reused("3.12", "tests/test_child.py", "", ci.shared("3.12")) is not None
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
     stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())[len(url):]] = None
@@ -244,17 +225,11 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
         "tests/test_spawn.py": ["changed"],
-        "tests/test_child.py": ["tests/devices.py:placed"],
-        "tests/test_killed.py": ["changed"],
-        "tests/test_own_environment.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
-    # test_child.py's child read plain.py, which changed.
-    kept = ("test_machine.py", "test_tool.py", "test_spawns.py")
-    again = ("test_child.py", "test_killed.py", "test_own_environment.py", "test_spawn.py",
-             "test_forkserver.py", "test_fork.py", "test_shell.py")
-    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None for name in (*kept, *again)] == [
-        *(True for _ in kept), *(False for _ in again)]
+    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
+            for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
+                         "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
@@ -267,6 +242,49 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
     assert ci.main() == 0
     assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):
+    """A Python child a test file starts with its environment records itself
+    (tools/armada/followed.py): its reads of the backend join the file's
+    evidence and the files it executed the file's key, which holds until one
+    changes. A child given an environment of its own, or killed before it
+    wrote its record, leaves its file without a key."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    started = "import os, subprocess, sys\ndef test_child():\n    "
+    files = {
+        "devices.py": "class Device:\n    platform = 'gpu'\ndef placed(device): return device.platform\n",
+        "plain.py": "def helper(): return 1\n",
+        "child.py": "import devices, plain\n"
+                    "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n",
+        "test_child.py": started + "subprocess.run([sys.executable, 'tests/child.py'], check=True)\n",
+        "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
+        "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
+                                    "    child.kill()\n    child.wait()\n",
+        "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
+                                             "                   env={'PATH': os.environ['PATH']})\n",
+    }
+    for name, source in files.items():
+        (tmp_path / "tests" / name).write_text(source)
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+
+    def reused() -> list[bool]:
+        common = ci.shared("3.12")
+        return [ci.reused("3.12", name, "", common) is not None for name in tests]
+
+    assert reused() == [True, True, False, False]
+    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
+    assert reused() == [False, True, False, False]
+    assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
+                                   "tests/test_killed.py": ["changed"],
+                                   "tests/test_own_environment.py": ["changed"]}
 
 
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
