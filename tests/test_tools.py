@@ -1063,7 +1063,7 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
     """SLOP018 reads a loop over a range as attempts at one piece of work only where its body reads
     the number it counts nowhere but in a handler: a scan by index, like one over the items,
     retries nothing, and so, by the rule's stated boundary, does a retry that reads its attempt
-    number outside the handler. A failure that
+    number outside the handler; a name the work only binds is no read of it. A failure that
     raises on its last attempt and goes round on the others retries; one that raises on every
     attempt does not. A failure that runs on into the loop's tail retries where some path of the
     tail goes round, and a `try` inside the loop's own `with`, branch or `match` case is read as
@@ -1157,8 +1157,15 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
         "        try:\n"
         "            return parse(row)\n"
         "        except ValueError:\n"
+        "            continue\n"
+        "def unpacked(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            parsed, _ = work()\n"
+        "            return parsed\n"
+        "        except ValueError:\n"
         "            continue\n")})
-    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 60, 67, 74)]
+    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 60, 67, 74, 91)]
 
 
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
