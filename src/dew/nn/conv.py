@@ -332,18 +332,18 @@ class Conv(nn.Conv):
             kernel *= self.mask
         bias = (self.param('bias', self.bias_init, (self.features,), self.param_dtype)
                 if self.use_bias else None)
-        inputs, kernel, bias = self.promote_dtype(inputs, kernel, bias, dtype=self.dtype)
-        if inputs is None or kernel is None:
+        promoted, kernel, bias = self.promote_dtype(inputs, kernel, bias, dtype=self.dtype)
+        if promoted is None or kernel is None:
             raise ValueError("a convolution's promotion must return its input and kernel")
         if self.conv_general_dilated_cls is not None:
             convolve = self.conv_general_dilated_cls()
         else:
             convolve = self.conv_general_dilated or jax.lax.conv_general_dilated
         # Channels last, as flax lays them out: [N, *spatial, C] and a [*spatial, I, O] kernel.
-        ndim = inputs.ndim
+        ndim = promoted.ndim
         lhs = (0, ndim - 1, *range(1, ndim - 1))
         dimensions = jax.lax.ConvDimensionNumbers(lhs, (ndim - 1, ndim - 2, *range(ndim - 2)), lhs)
-        y = convolve(inputs, kernel, strides, padding, lhs_dilation=input_dilation,
+        y = convolve(promoted, kernel, strides, padding, lhs_dilation=input_dilation,
                      rhs_dilation=kernel_dilation, dimension_numbers=dimensions,
                      feature_group_count=self.feature_group_count, precision=self.precision)
         if bias is not None:
