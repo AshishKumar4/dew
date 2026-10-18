@@ -1560,8 +1560,11 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         def decoded(query, key, value):
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
-            return _per_shard(lambda *arrays, lengths: decode_attention.attend(*arrays, lengths), query, key,
-                              value, lengths=(key_value_seq_lengths, ("activation_batch",)))
+            def attend(query, key, value, lengths):
+                return decode_attention.attend(query, key, value, lengths)
+
+            rows = (key_value_seq_lengths, ("activation_batch",))
+            return _per_shard(attend, query, key, value, lengths=rows)
 
         def folded(query, key, value):
             return folded_attention(query, key, value,
