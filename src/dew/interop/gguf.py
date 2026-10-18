@@ -54,14 +54,10 @@ it, would compute another model."""
 
 
 def _parse(reader: GGUFReader, key: str) -> records.JSON:
-    """One metadata value as transformers parses it: a one-element array is its element."""
-    from transformers.integrations.ggml import _gguf_parse_value
-
-    field = reader.fields[key]
-    values = [
-        records.json_value(_gguf_parse_value(field.parts[index], field.types), key) for index in field.data
-    ]
-    return values[0] if len(values) == 1 else values
+    """One metadata value as gguf decodes it (`ReaderField.contents`), and as
+    transformers reads it: a one-element array is its element."""
+    value = records.json_value(reader.fields[key].contents(), key)
+    return value[0] if isinstance(value, list) and len(value) == 1 else value
 
 
 def _config(reader: GGUFReader) -> tuple[str, Mapping[str, object]]:

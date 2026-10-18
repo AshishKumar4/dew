@@ -457,17 +457,13 @@ class Processor:
         """The per-patch position layout's feature blocks, in placeholder order:
         each image or video's patches, their positions and placeholder count,
         and the vision pooling kernel that sets how many slots one fills."""
-        vision = self.config.get("vision_config")
-        if not isinstance(vision, Mapping):
-            raise ValueError("patch position ids require a vision config")
-        kernel = vision.get("pooling_kernel_size")
-        if type(kernel) is not int or kernel < 1:
-            raise ValueError("pooling_kernel_size must be a positive integer")
-        table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
-        if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
-            raise ValueError("position_embedding_size and patch_size must be positive integers")
+        # The tower's geometry as its translation reads it, the reference's defaults included.
+        tower = records.record(records.record(self.record["tower"], "tower")["fields"], "tower fields")
+        kernel = records.integer(tower["pooling_kernel_size"], "pooling_kernel_size")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=table_size, patch_size=patch_size)
+                                 table_size=records.integer(tower["position_embedding_size"],
+                                                            "position_embedding_size"),
+                                 patch_size=records.integer(tower["patch_size"], "patch_size"))
         patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
@@ -525,6 +521,13 @@ class Processor:
         }
         return {"audio_indices": jnp.asarray(indices)}, conditioning
 
+    def _merge_size(self) -> int:
+        """The merger's spatial merge, as the projector's translation reads it, the reference's
+        default of 2 included."""
+        projector = records.record(records.record(self.record["projector"], "projector")["fields"],
+                                   "projector fields")
+        return records.integer(projector["merge_size"], "merge_size")
+
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
         """Return views of packed image/video patches in text order, one item per frame.
 
@@ -533,12 +536,7 @@ class Processor:
         timestamps between frames. Attention never crosses a frame, so these
         views share the existing visual tower and merger without new weights.
         """
-        vision = self.config.get("vision_config")
-        if not isinstance(vision, Mapping):
-            raise ValueError("packed visual inputs require a vision config")
-        merge = vision.get("spatial_merge_size")
-        if type(merge) is not int or merge < 1:
-            raise ValueError("spatial_merge_size must be a positive integer")
+        merge = self._merge_size()
         streams = {}
         for pixel_name, grid_name, token_name, split in (
                 ("pixel_values", "image_grid_thw", "image_token_id", False),
@@ -585,8 +583,7 @@ class Processor:
         temporal/height/width grid, and following text starts after its longest
         spatial side. Padding keeps coordinate zero, as in the reference.
         """
-        vision = records.record(self.config["vision_config"], "vision_config")
-        merge = records.integer(vision["spatial_merge_size"], "spatial_merge_size")
+        merge = self._merge_size()
         image_groups, grid_values = np.asarray(groups), np.asarray(grids)
         prepared = np.zeros((*tokens.shape, 3), np.int32)
         for row in range(tokens.shape[0]):

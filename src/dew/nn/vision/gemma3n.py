@@ -2,9 +2,12 @@
 with their checkpoint maps.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -12,13 +15,16 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import translate_parameters
+from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
 from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,12 +167,13 @@ def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
 
 def translate_gemma3n_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Mapping[str, object]:
+) -> tuple[Mapping[str, object], tuple[WeightLayout, ...]]:
+    """A Gemma 3n vision embedder's parameter tree, with the layouts that write it back."""
     paths = _PROJECTOR_PATHS["gemma3n"]
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
-    return translate_parameters(hf_tensors, paths.__getitem__, param_dtype)
+    return placed(hf_tensors, paths.__getitem__, param_dtype)
 
 
 def _gemma3n_vision_record(

@@ -2,8 +2,11 @@
 (transformers 5.16.1 `models/siglip/modeling_siglip.py`, `models/gemma3/modeling_gemma3.py`).
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +41,9 @@ from .common import (
     trunk_geometry,
 )
 
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
+
 
 class SiglipVisionTransformer(nn.Module):
     """The SigLIP vision trunk, param layout of `SiglipVisionConfig`.
@@ -48,7 +54,7 @@ class SiglipVisionTransformer(nn.Module):
     checkpoints carry is not built; the Gemma path reads the sequence alone.
     """
 
-    config: "SiglipVision"
+    config: SiglipVision
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -191,19 +197,25 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
 
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """A Gemma projector's two tensors into its parameter tree.
+) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """A Gemma projector's two tensors into its parameter tree, with the layouts that write them
+    back.
 
     The norm's weight becomes its scale; the projection matrix is a plain
     parameter the reference multiplies as is, so unlike a Linear kernel it
     keeps its layout.
     """
+    from dew.interop.streaming import WeightLayout
+
     known = set(_PROJECTOR_PATHS["gemma"])
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    return {module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
-            for name, (module, leaf) in _PROJECTOR_PATHS["gemma"].items()}
+    paths = _PROJECTOR_PATHS["gemma"]
+    return ({module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
+             for name, (module, leaf) in paths.items()},
+            tuple(WeightLayout(name, (path,), tuple(np.shape(hf_tensors[name])))
+                  for name, path in paths.items()))
 
 
 def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:

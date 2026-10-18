@@ -33,6 +33,7 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew import records
+from dew.nn.scan_orders import ScanOrder
 
 if TYPE_CHECKING:
     from dew.diffusion.process import Process
@@ -54,15 +55,15 @@ _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
                  "final_proj": ("output", "final_proj")}
 
 _READ = frozenset({"output_channels", "patch_size", "emb_features", "num_layers", "num_heads",
-                   "mlp_ratio", "norm_epsilon"})
+                   "mlp_ratio", "norm_epsilon", "use_hilbert"})
 _HYBRID_READ = frozenset({"ssm_state_dim", "ssm_attention_ratio", "use_2d_fusion", "use_zigzag"})
 # Model config keys FlaxDiff 0.2's DiTs computed nothing with on a CPU
 # or GPU: its blocks take `dropout_rate` and never apply it, and it reads
 # none of the others.
 _UNREAD = frozenset({"dropout_rate", "activation", "norm_groups", "use_flash_attention",
                      "dtype", "precision"})
-# Variants this port was never checked against FlaxDiff with.
-_REFUSED = ("use_hilbert", "learn_sigma")
+# FlaxDiff's learned-variance head doubles its output channels, which Dew's DiTs don't predict.
+_REFUSED = ("learn_sigma",)
 
 
 class SimpleUDiTFields(TypedDict):
@@ -77,6 +78,7 @@ class SimpleUDiTFields(TypedDict):
     norm_epsilon: float
     adaln_silu: bool
     text_pooling: Literal["real", "all"]
+    scan_order: ScanOrder
 
 
 class HybridDiTFields(SimpleUDiTFields):
@@ -85,7 +87,6 @@ class HybridDiTFields(SimpleUDiTFields):
     ssm_state_dim: int
     ssm_attention_ratio: str
     use_2d_fusion: bool
-    scan_order: Literal["raster", "zigzag"]
 
 
 def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: bool = False) -> dict:
@@ -144,6 +145,7 @@ def simple_udit_fields(model: Mapping[str, object]) -> SimpleUDiTFields:
     for name in _REFUSED:
         if records.boolean(model.get(name, False), name):
             raise ValueError(f"a FlaxDiff simple_udit with {name} has no Dew counterpart")
+    hilbert = records.boolean(model.get("use_hilbert", False), "use_hilbert")
     return SimpleUDiTFields(
         output_channels=records.integer(model["output_channels"], "output_channels"),
         patch_size=records.integer(model["patch_size"], "patch_size"),
@@ -152,7 +154,7 @@ def simple_udit_fields(model: Mapping[str, object]) -> SimpleUDiTFields:
         num_heads=records.integer(model["num_heads"], "num_heads"),
         mlp_ratio=records.integer(model.get("mlp_ratio", 4), "mlp_ratio"),
         norm_epsilon=records.number(model.get("norm_epsilon", 1e-5), "norm_epsilon"),
-        adaln_silu=False, text_pooling="all")
+        adaln_silu=False, text_pooling="all", scan_order="hilbert" if hilbert else "raster")
 
 
 def simple_udit_variables(weights: Mapping, model: Mapping[str, object], *,
@@ -163,15 +165,19 @@ def simple_udit_variables(weights: Mapping, model: Mapping[str, object], *,
 
 
 def hybrid_dit_fields(model: Mapping[str, object]) -> HybridDiTFields:
-    """The `hybrid_dit` fields that compute FlaxDiff 0.2's S5-attention DiT."""
+    """The `hybrid_dit` fields that compute FlaxDiff 0.2's S5-attention DiT.
+    Its `use_hilbert` and `use_zigzag` flags name its scan order, which
+    FlaxDiff refuses to set both of."""
     common = simple_udit_fields({name: value for name, value in model.items()
                                  if name not in _HYBRID_READ})
+    zigzag = records.boolean(model.get("use_zigzag", False), "use_zigzag")
+    if zigzag and common["scan_order"] == "hilbert":
+        raise ValueError("a FlaxDiff hybrid_dit scans in one order, and sets both use_hilbert and use_zigzag")
     return HybridDiTFields(
-        **common,
+        **{**common, "scan_order": "zigzag" if zigzag else common["scan_order"]},
         ssm_state_dim=records.integer(model.get("ssm_state_dim", 64), "ssm_state_dim"),
         ssm_attention_ratio=records.text(model.get("ssm_attention_ratio", "3:1"), "ssm_attention_ratio"),
-        use_2d_fusion=records.boolean(model.get("use_2d_fusion", False), "use_2d_fusion"),
-        scan_order="zigzag" if records.boolean(model.get("use_zigzag", False), "use_zigzag") else "raster")
+        use_2d_fusion=records.boolean(model.get("use_2d_fusion", False), "use_2d_fusion"))
 
 
 def hybrid_dit_variables(weights: Mapping, model: Mapping[str, object], *,
