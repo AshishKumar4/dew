@@ -11,6 +11,7 @@ sees.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -74,7 +75,7 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
 
 def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                    subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                   lazy: bool = False
+                   lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
                    ) -> tuple[Flux2Autoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published FLUX.2 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo. The batch norm's
@@ -102,5 +103,5 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         lambda bound: Flux2Autoencoder(model=model, params=bound, mean=tensors["bn.running_mean"],
                                        variance=tensors["bn.running_var"],
                                        epsilon=config.get("batch_norm_eps", 1e-4)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy,
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes,
         inputs=(frame,), tensors=tensors)

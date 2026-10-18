@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 from jax.typing import DTypeLike
 
@@ -243,9 +244,8 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     untransposed leaf is a `SourceLeaf`, read when it is placed; a reshaped
     attention kernel and a convolution are read whole either way.
     """
-    from dew.interop.streaming import SourceLeaf, WeightLayout
+    from dew.interop.streaming import SourceLeaf
     parameters: LazyTree = {}
-    layouts = []
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
         path = _unet_path(name, tensor.ndim)
@@ -255,35 +255,48 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
         kernel = path[-1] == "kernel"
         attention = "self_attention" in path or "cross_attention" in path
         if lazy and not (kernel and (stored.ndim == 4 or attention)):
-            layouts.append(WeightLayout("unet/" + name, (("params", *path),), stored.shape,
-                                        (1, 0) if kernel else None))
             if owners[path] == name:
                 # Equal source aliases add export names without another leaf.
                 insert(parameters, path, SourceLeaf((stored,), dtype, transposed=kernel), name)
             continue
         value = stored.astype(dtype, copy=False)
-        transpose = None
         if kernel:
             value = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T
-            transpose = (3, 2, 0, 1) if stored.ndim == 4 else (1, 0)
             if attention:
-                root = path[0]
-                stage = (
-                    model.stages[int(root.removeprefix("down_"))]
-                    if root.startswith("down_")
-                    else model.stages[::-1][int(root.removeprefix("up_"))]
-                    if root.startswith("up_")
-                    else model.stages[-1]
-                )
-                if path[-2] in ("to_q", "to_k", "to_v"):
-                    value = value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
-                    transpose = (1, 2, 0)
-                else:
-                    value = value.reshape(stage.heads, stage.features // stage.heads, stage.features)
-                    transpose = (2, 0, 1)
+                stage = _unet_stage(model, path)
+                value = (value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
+                         if path[-2] in ("to_q", "to_k", "to_v")
+                         else value.reshape(stage.heads, stage.features // stage.heads, stage.features))
         insert(parameters, path, value, name)
-        layouts.append(WeightLayout("unet/" + name, (("params", *path),), stored.shape, transpose))
-    return parameters, tuple(layouts)
+    return parameters, unet_layouts({name: tensor.shape for name, tensor in tensors.items()}, model)
+
+
+def _unet_stage(model: UNet2DCondition, path: tuple[str, ...]) -> UNetStage:
+    """The stage whose attention a UNet leaf at `path` sits in."""
+    root = path[0]
+    if root.startswith("down_"):
+        return model.stages[int(root.removeprefix("down_"))]
+    if root.startswith("up_"):
+        return model.stages[::-1][int(root.removeprefix("up_"))]
+    return model.stages[-1]
+
+
+def unet_layouts(shapes: Mapping[str, tuple[int, ...]], model: UNet2DCondition) -> tuple[WeightLayout, ...]:
+    """The layouts `translate_unet_weights` returns, from the stored tensors' shapes
+    alone: a convolution's kernel transposed back from `[h, w, in, out]`, a
+    linear's from `[in, out]`, and an attention kernel from its per-head axes."""
+    from dew.interop.streaming import WeightLayout
+
+    layouts = []
+    for name, shape in shapes.items():
+        path = _unet_path(name, len(shape))
+        transpose = None
+        if path[-1] == "kernel":
+            transpose = (3, 2, 0, 1) if len(shape) == 4 else (1, 0)
+            if "self_attention" in path or "cross_attention" in path:
+                transpose = (1, 2, 0) if path[-2] in ("to_q", "to_k", "to_v") else (2, 0, 1)
+        layouts.append(WeightLayout("unet/" + name, (("params", *path),), tuple(shape), transpose))
+    return tuple(layouts)
 
 
 
@@ -709,21 +722,26 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     optimizer and an EMA see only `params`, and export writes the stored
     array back unchanged.
     """
-    from dew.interop.streaming import WeightLayout
-
-    parameters, layouts = weights.record_layouts(
+    parameters, _ = weights.record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype, lazy=lazy)
-    buffers: ParamTree = {}
     position = tensors.get("pos_embed.pos_embed")
     if position is None:
         raise ValueError("An SD3 transformer stores its position embedding buffer")
     array = np.asarray(position, np.float32)
     if array.ndim != 3 or array.shape[0] != 1:
         raise ValueError(f"The position buffer must be [1, tokens, width], got {array.shape}")
-    buffers["pos_embed"] = np.ascontiguousarray(array)
-    layouts += (WeightLayout("transformer/pos_embed.pos_embed", (("buffers", "pos_embed"),),
-                             tuple(position.shape), None),)
-    return parameters, buffers, layouts
+    buffers: ParamTree = {"pos_embed": np.ascontiguousarray(array)}
+    return parameters, buffers, sd3_layouts({name: tensor.shape for name, tensor in tensors.items()})
+
+
+def sd3_layouts(shapes: Mapping[str, tuple[int, ...]]) -> tuple[WeightLayout, ...]:
+    """The layouts `translate_sd3_weights` returns, from the stored tensors' shapes
+    alone, the position buffer's among them."""
+    from dew.interop.streaming import WeightLayout
+
+    return (*weights.source_layouts("transformer", shapes, _sd3_path, ("params",)),
+            *(WeightLayout(f"transformer/{name}", (("buffers", "pos_embed"),), tuple(shape), None)
+              for name, shape in shapes.items() if name == "pos_embed.pos_embed"))
 
 
 def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -815,6 +833,13 @@ def read_transformer(tensors: Mapping[str, np.ndarray],
         param_dtype=param_dtype, lazy=lazy)
 
 
+def transformer_layouts(shapes: Mapping[str, tuple[int, ...]],
+                        path_of: Callable[[str, int], tuple[str, ...] | None]) -> tuple[WeightLayout, ...]:
+    """The layouts `read_transformer` returns, from the stored tensors' shapes alone."""
+    return weights.source_layouts("transformer", shapes, lambda name: path_of(name, len(shapes[name])),
+                                  ("params",))
+
+
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read one published component's weights: the shards its index names or
     its one weights file, never a precision variant beside them."""
@@ -885,6 +910,15 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     read the safetensors beside it, and their `from_flax` conversion, which reads the msgpack,
     takes a folder without them (modeling_utils.py:1109-1113, 0.34.0)."""
     from dew.interop.safetensors_io import save_sharded
+    written = {path for layout in source.weight_layouts for path in layout.paths}
+    leaves = [tuple(str(key.key) for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(values)]
+    unwritten = ["/".join(path) for path in leaves if path not in written]
+    if unwritten:
+        # A pipeline bound from saved variables takes its layouts from its source's
+        # weight headers (`StoredWeights`), so one whose source holds none has none.
+        raise ValueError(f"{len(unwritten)} weights of this pipeline have no source layout to be written "
+                         f"under, {unwritten[0]} first; a pipeline bound from saved variables writes its "
+                         f"weights by its source's weight files, which {source.source} does not hold")
     destination.mkdir(parents=True, exist_ok=True)
     config = dict(source.config)
     index = dict(config.pop("model_index"))

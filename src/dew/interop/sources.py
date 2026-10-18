@@ -12,18 +12,28 @@ naming what it ships instead (`missing_weights`).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 
+import jax
 import numpy as np
 
 from dew import records
 from dew.cache import hub_answer
 from dew.interop import pickles
-from dew.interop.safetensors_io import read_weights, weight_files
+from dew.interop.safetensors_io import (
+    LazyTensors,
+    header_specs,
+    read_file,
+    read_weights,
+    stored_spec,
+    weight_files,
+)
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -206,3 +216,50 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     if selected:
         snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
     return directory
+
+
+@dataclass(frozen=True)
+class StoredWeights:
+    """A source's weight files, read by their headers and fetched by name: what a
+    pipeline rebound from saved variables writes its export by, downloading no
+    weight it does not write. `directory` is the snapshot the metadata fetch
+    resolved (`snapshot(weights=False)`), named by its commit."""
+
+    name_or_dir: str
+    directory: Path
+
+    def files(self, folder: str) -> tuple[str, ...]:
+        """The repo-relative files that hold `folder`'s weights (`weight_files`)."""
+        local = os.path.isdir(self.name_or_dir)
+        listing = ({path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
+                    if path.is_file()} if local else repo_files(self.name_or_dir, self.directory))
+        return weight_files(listing, folder, lambda name: json.loads((self.directory / name).read_text()))
+
+    def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]]:
+        """Each of `folder`'s tensors, by its stored name: the file that holds it and
+        the array it reads as. A Hub source's headers are read over HTTP
+        (`HfApi.parse_safetensors_file_metadata`), its weights left on the Hub."""
+        held: dict[str, tuple[str, jax.ShapeDtypeStruct]] = {}
+        for file in self.files(folder):
+            if os.path.isdir(self.name_or_dir):
+                specs = header_specs(self.directory / file)
+            else:
+                from huggingface_hub import HfApi
+
+                header = HfApi().parse_safetensors_file_metadata(self.name_or_dir, file,
+                                                                 revision=self.directory.name)
+                specs = {name: stored_spec(name, tensor.shape, tensor.dtype, file)
+                         for name, tensor in header.tensors.items()}
+            held.update({name: (file, spec) for name, spec in specs.items()})
+        return held
+
+    def tensors(self, held: dict[str, tuple[str, jax.ShapeDtypeStruct]]) -> LazyTensors:
+        """The tensors `held` names (`specs`), each read from its file when it is read,
+        a Hub source's file downloaded then."""
+
+        @functools.cache
+        def read(file: str) -> dict[str, np.ndarray]:
+            return read_file(repo_file(self.name_or_dir, self.directory, file))[0]
+
+        return LazyTensors({name: spec for name, (_, spec) in held.items()},
+                           lambda name: read(held[name][0])[name])

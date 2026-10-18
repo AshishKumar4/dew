@@ -35,19 +35,25 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
     tensors: Mapping[str, np.ndarray] | None = None,
     validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
     state: Callable[[str], bool] | None = None,
+    shapes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> tuple[ComponentT, Variables, tuple[WeightLayout, ...], ConfigT]:
     """Translate absent parameters, validate the native geometry and bind a wrapper.
 
-    Supplied parameters remain authoritative and return no source layouts.
-    Explicit tensors let components read non-parameter state, such as FLUX.2's
-    latent statistics, even when their parameters were supplied. The tensors
-    `state` selects are state rather than weights, such as a safety head's
-    scoring vectors and thresholds, and keep FP32 whatever `param_dtype` says.
+    Supplied parameters remain authoritative, and their layouts come from the
+    stored tensors' `shapes` (`weights.source_layouts`), with no weight read; none
+    where those are not given. Explicit tensors let components read
+    non-parameter state, such as FLUX.2's latent statistics, even when their
+    parameters were supplied. The tensors `state` selects are state rather than
+    weights, such as a safety head's scoring vectors and thresholds, and keep
+    FP32 whatever `param_dtype` says.
     """
     from dew.interop.safetensors_io import read_weights
+    from dew.interop.weights import source_layouts
     from dew.nn.text_encoders import check_tree
 
     layouts: tuple[WeightLayout, ...] = ()
+    if params is not None and shapes is not None:
+        layouts = source_layouts(component, shapes, lambda name: path_of(name, len(shapes[name])), prefix)
     if params is None:
         stored = read_weights(directory) if tensors is None else tensors
         if validate is not None:
