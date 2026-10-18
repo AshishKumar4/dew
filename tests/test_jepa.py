@@ -471,6 +471,7 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
     assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)
     assert knn.finalize(knn(representations, None)) > 0.9
+    assert linear(representations, {})[0] > 0.9
     flipped = Representations(features=-x, labels=y)
     # The rates go in as operands and the accuracy comes back; nothing compiles.
     with steady_state(allow=("host_to_device", "device_to_host")):

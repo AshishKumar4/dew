@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
@@ -144,7 +145,7 @@ class LaurelBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype,
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype,
                                   precision=self.precision)
         maps = self.projections()
         low = dense(maps['linear_left'][1], name='linear_left')(x)
@@ -235,8 +236,8 @@ class AltUpLayer(nn.Module):
             'correct_output_scale', nn.initializers.zeros, (self.emb_features,), jnp.float32)
         self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
         self.prediction_coefs = coefficients(maps['prediction_coefs'][1], name='prediction_coefs')
-        self.modality_router = nn.Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
-                                        precision=self.precision, name='modality_router')
+        self.modality_router = Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
+                                     precision=self.precision, name='modality_router')
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 
     def modalities(self, x):

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, RunConfig
 from dew.decision.config import DecisionRunConfig
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
@@ -30,9 +30,8 @@ def written(config) -> dict:
 def test_a_run_config_reads_back_as_its_class_from_its_own_record(config):
     """`run.json` names the run's class, so a reader that knows only
     `RunConfig` rebuilds a run of any kind as the kind it is."""
-    # A JEPA run validates through probes it has no classes for by default.
     value = {"run": RunConfig(), "diffusion": DiffusionRunConfig(), "lm": LMRunConfig(),
-             "jepa": JepaRunConfig(trainer=TrainerConfig(eval_every=None)),
+             "jepa": JepaRunConfig(),
              "decision": DecisionRunConfig()}[config]
     assert RunConfig.read(json.loads(json.dumps(value.record()))) == value
 

@@ -40,6 +40,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
+from dew.nn.dense import Dense
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
 from .attention import FORWARD_MODE, gated_rms_normalized
@@ -680,7 +681,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
     k_cumdecay = inv @ (kb_c * entering)
 
-    state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
+    # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
+    # carry varies as the operands it takes in do.
+    state = jnp.zeros_like(value, work, shape=(B, H, Dk, Dv)) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
@@ -792,10 +795,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None):
     B, _, Hv, Dv = value.shape
     state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
              else state.astype(jnp.float32))
-    mesh = jax.sharding.get_abstract_mesh()
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return _blocked_rule(query, key, value, g, beta, state, starts)
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
@@ -926,7 +926,20 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
     through `dew.nn.kernels.delta_rule.step`, which reads and writes the
     state once (CUDA, where `delta_rule.fits` the state). A row `active`
-    `[B]` marks False keeps its state untouched and outputs zeros."""
+    `[B]` marks False keeps its state untouched and outputs zeros. On a mesh
+    the step runs per shard (`manual_map`), each shard's rows and heads with
+    their state, as `fla_rule` runs: the kernel has no partitioning rule, and
+    the state is most of a decode step's bytes."""
+    active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
+    rows, heads = grouped_heads(value.shape, key.shape[2])
+    P = jax.sharding.PartitionSpec
+    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
+    return manual_map(_decoded, (four, four, four, three, three, memory, P(rows)),
+                      (four, memory))(query, key, value, g, beta, state, active)
+
+
+def _decoded(query, key, value, g, beta, state, active):
+    """`decode_gated_delta_rule` on arrays a shard holds."""
     work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
     decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
@@ -1053,7 +1066,7 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,

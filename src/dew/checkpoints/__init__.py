@@ -1598,11 +1598,7 @@ class Checkpoints:
         `step` defaults to the latest. Each state field comes back as a
         shape/dtype tree, and an unset field as None.
         """
-        step = self.resolve(step)
-        if step is None:
-            step = self.latest
-            if step is None:
-                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        step = self.pinned(step)
         snapshot = self._step_metadata(step, local=step == self._local_latest())
         metadata = _item_metadata(snapshot)
         stored = {name: None if value is None else
@@ -1663,13 +1659,8 @@ class Checkpoints:
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
         """
-        step = self.resolve(step)
-        local = self._local_latest()
-        if step is None:
-            step = self.latest
-            if step is None:
-                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        from_local = step == local
+        step = self.pinned(step)
+        from_local = step == self._local_latest()
         checkpointer = self._open_local() if from_local else self._open()
         where = self.local_path if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:
