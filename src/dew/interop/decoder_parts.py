@@ -1576,6 +1576,11 @@ class DecoderFamily:
     DeepSeek V4's grouped output projection. A quantized format is undone
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
+    spelling: Callable[[str], str] = field(default=lambda name: name)
+    """The name the family reads a stored tensor under and its encoder writes it
+    under, where a checkpoint may store it as another: a bare GPT2Model leaves
+    out GPT-2's `transformer.`. `prepare` renames by it, and a quantized source
+    is written back under its own names (`Pretrained.export`)."""
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""

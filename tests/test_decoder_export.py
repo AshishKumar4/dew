@@ -89,7 +89,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import assert_restores
+from interop_support import assert_restores, assert_same_stored_tensors
 from model_support import flat_tree
 from reference_error import (
     FACTOR,
@@ -633,8 +633,11 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     encodes the weights it shipped quantized again: the export holds the
     source's own tensor names, each the dense export of the same weights
     with that one tensor in FP8, under the source's config, and Dew reads
-    back the weights its decoded export holds."""
+    back the weights its decoded export holds. A source placed on a mesh as
+    it streams, and one loaded as shapes alone for a resume to fill, write
+    the same export of the same weights."""
     from dew.interop.codecs import source_quantization
+    from dew.training import MeshSpec
 
     fixture, name, bare = PREPARED[case]
     tensors = {stored.removeprefix(bare): tensor
@@ -652,6 +655,12 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
         lambda leaf: leaf * 1.03 + 1e-3 if np.issubdtype(leaf.dtype, np.floating) else leaf, loaded.variables)
 
     loaded.save(tmp_path / "export", variables=updated)
+    for placement, options in (("placed", {"mesh": MeshSpec(fsdp=1)}), ("shapes", {"weights": False})):
+        again = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference", **options)
+        assert jax.tree.structure(again.variables) == jax.tree.structure(loaded.variables)
+        again.save(tmp_path / placement, variables=updated)
+        assert_same_stored_tensors(tool.source_tensors(tmp_path / placement),
+                                   tool.source_tensors(tmp_path / "export"))
     dense = {stored.removeprefix(bare): tensor for stored, tensor in
              dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
     expected = quantization.requantize(dense, (name,))

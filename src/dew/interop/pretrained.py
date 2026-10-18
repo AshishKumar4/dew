@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -1168,20 +1168,12 @@ def _source_weights(model: CausalTransformer, variables: Mapping[str, object],
     return decoders.export_decoder_weights(model, variables, config)
 
 
-def _source_spelling(family: decoder_parts.DecoderFamily, tensors: Mapping[str, np.ndarray],
-                     record: Mapping[str, object], written: Collection[str]) -> dict[str, str]:
-    """The source's own name for each tensor its family's encoder writes under another:
-    the name its `prepare` renamed to that one, as GPT-2's nests a bare GPT2Model's
-    `h.*` under `transformer.`. A quantized source's weights, scales and grid are
-    written back under the names it stored them by (`export`)."""
-    return {canonical: name for name in tensors if name not in written
-            for canonical in family.prepare({name: tensors[name]}, record) if canonical in written}
-
-
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
                             variables: Mapping[str, object], config: Mapping[str, object]
                             ) -> Mapping[str, np.ndarray]:
-    """`_source_weights` under the source's own names (`_source_spelling`)."""
+    """`_source_weights` under the source's own names: `spelling` maps each name the
+    family's encoder writes to the one the source stored it under
+    (`DecoderFamily.spelling`)."""
     written = _source_weights(model, variables, config)
     return {spelling.get(name, name): tensor for name, tensor in written.items()}
 
@@ -1227,8 +1219,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         if not quantized:
             export_adapter = _source_weights
         elif not layouts:
-            export_adapter = partial(_spelled_source_weights, _source_spelling(
-                entry, tensors, record, set(_source_weights(model, variables, config))))
+            export_adapter = partial(_spelled_source_weights, {
+                entry.spelling(name): name for name in tensors if entry.spelling(name) != name})
     return _Built(model, variables, record, built, layouts, retained, export_adapter)
 
 
