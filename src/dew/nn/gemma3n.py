@@ -19,6 +19,7 @@ import functools
 import math
 from statistics import NormalDist
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -158,9 +159,18 @@ class _Coefficients(nn.Module):
     training forward pass, as the reference clamps its AltUp coefficient
     weights (modeling_gemma3n.py, Gemma3nTextAltUp); the eval pass reads
     the kernel as stored. Same leaf as a Dense, so a checkpoint's Linear
-    lands on it unchanged."""
+    lands on it unchanged.
+
+    `stored` is the prediction map's clamp, which the reference applies to
+    the stored weight before its product: the forward reads the clamped
+    kernel and the gradient reaches every entry, as if to the clamped one.
+    The stored kernel is not projected back, so an entry a step pushes past
+    the clip keeps its excess until an update returns it; released weights
+    sit far inside the clip. The correction map clamps inside its product,
+    which zeroes a clamped entry's gradient."""
     features: int
     clip: float | None
+    stored: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -169,7 +179,8 @@ class _Coefficients(nn.Module):
         kernel = self.param('kernel', nn.initializers.lecun_normal(),
                             (x.shape[-1], self.features), jnp.float32)
         if train and self.clip is not None:
-            kernel = jnp.clip(kernel, -self.clip, self.clip)
+            clipped = jnp.clip(kernel, -self.clip, self.clip)
+            kernel = kernel + jax.lax.stop_gradient(clipped - kernel) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
         return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.precision)
 
@@ -193,7 +204,7 @@ class AltUpLayer(nn.Module):
     Each coefficient scales the block's innovation, which is the activated
     output minus the active prediction, and the scaled innovation is added to
     every prediction. `coef_clip` bounds both coefficient weights during
-    training, as the reference clamps them.
+    training, as the reference clamps them (`_Coefficients`).
     """
     # modeling_gemma3n.py, Gemma3nTextAltUp.
     spec: AltUp
@@ -234,7 +245,8 @@ class AltUpLayer(nn.Module):
         self.correct_output_scale = self.param(
             'correct_output_scale', nn.initializers.zeros, (self.emb_features,), jnp.float32)
         self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
-        self.prediction_coefs = coefficients(maps['prediction_coefs'][1], name='prediction_coefs')
+        self.prediction_coefs = coefficients(maps['prediction_coefs'][1], stored=True,
+                                             name='prediction_coefs')
         self.modality_router = nn.Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
                                         precision=self.precision, name='modality_router')
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
