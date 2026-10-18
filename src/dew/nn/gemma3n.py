@@ -19,7 +19,6 @@ import functools
 import math
 from statistics import NormalDist
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -27,6 +26,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
+from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
@@ -181,7 +181,7 @@ class _Coefficients(nn.Module):
                             (x.shape[-1], self.features), jnp.float32)
         if train and self.clip is not None:
             clipped = jnp.clip(kernel, -self.clip, self.clip)
-            kernel = kernel + jax.lax.stop_gradient(clipped - kernel) if self.stored else clipped
+            kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
         return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.precision)
 
