@@ -242,10 +242,14 @@ def plain_prefix(g, chunk: int = CHUNKED):
     return g + jax.lax.stop_gradient(recut - g)
 
 
-def port_formula(query, key, value, g, beta, state=None):
+def port_formula(query, key, value, g, beta, state=None, *, starts=None, max_segments=None):
     """`linear.fla_rule`'s formula in the portable math over unpacked rows: every range the
     difference of two plain fp32 prefixes per row-aligned chunk (`plain_prefix`), as the port takes
-    them. A second rounding sample of the port's own formula, where fla cannot run."""
+    them. A second rounding sample of the port's own formula, where fla cannot run. Packed rows,
+    each document a sequence of its own on the port, it refuses: their formula is each document's."""
+    del max_segments
+    if starts is not None:
+        raise ValueError("port_formula takes unpacked rows")
     group = value.shape[2] // key.shape[2]
     query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
     decay = plain_prefix(g).reshape(*value.shape[:3], -1)

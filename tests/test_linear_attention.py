@@ -234,6 +234,32 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
                                           err_msg=f"{name} of the document at {begin}")
 
 
+def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
+    """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
+    bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
+    port (`linear.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
+    A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
+    document on from its first."""
+    from dew.nn.inputs import coordinates
+
+    segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
+    tokens = coordinates(segments=segments, max_segments=2, right_padded=True)
+    keys = jax.random.split(jax.random.key(31), 5)
+    q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
+    beta = jnp.full((2, 128, 1), 0.5)
+    h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
+    packed = jax.jit(lambda *a: linear.fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
+    out, _ = packed(q, k, v, g, beta, h0)
+    rule = jax.jit(linear.fla_rule)
+    for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
+        for begin, end in itertools.pairwise(cuts):
+            alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
+                            h0[row:row + 1] if begin == 0 else None)
+            np.testing.assert_array_equal(np.asarray(out[row:row + 1, begin:end]), np.asarray(alone),
+                                          err_msg=f"row {row} from {begin}")
+
+
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
     """Masked positive log differences must never reach exp in the chunk rule.
 

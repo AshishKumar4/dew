@@ -44,6 +44,7 @@ from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
     chunk_gated_delta_rule,
+    document_bound,
     held_scan,
     port_refusal,
     recurrent_delta_rule,
@@ -197,7 +198,8 @@ class KimiDeltaAttention(nn.Module):
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        ported = S > 1 and port_refusal(*(split(part) for part in jnp.split(projected, 3, axis=-1))) is None
+        ported = S > 1 and port_refusal(*(split(part) for part in jnp.split(projected, 3, axis=-1)),
+                                        document_bound(tokens)) is None
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,

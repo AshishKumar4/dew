@@ -45,7 +45,7 @@ from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
+from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, cu_seqlens, valid_order
 from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
@@ -725,7 +725,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
                          "a whole number of value heads")
     rows, keys, values, gates = ((query, key, value, beta) if projected is None
                                  else (x.astype(projected) for x in (query, key, value, beta)))
-    if on_the_port(rows, keys, values):
+    documents = None if starts is None else query.shape[1] if max_segments is None else max_segments
+    if on_the_port(rows, keys, values, documents):
         return fla_rule(rows, keys, values, g, gates, state, starts=starts, max_segments=max_segments)
     group = value.shape[2] // key.shape[2]
     if group > 1:
@@ -734,7 +735,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
                             starts=starts)
 
 
-def port_refusal(query, key, value) -> str | None:
+def port_refusal(query, key, value, documents: int | None = None) -> str | None:
     """Why a rule over these operands runs the portable math rather than the
     port (`fla_rule`), or None where the port takes it: on every GPU whose
     target row names it (`measured_kernel`, the table qualification reads)
@@ -743,9 +744,14 @@ def port_refusal(query, key, value) -> str | None:
     gives no tangent; inside a caller's `shard_map` that checks varying axes
     over operands that vary, where a Pallas call, which states no varying
     type for its results, cannot run; float64 operands, whose rule is the
-    reference math itself; and keys wider than the port takes in their
-    dtype."""
+    reference math itself; keys wider than the port takes in their dtype;
+    and rows of packed documents, at most `documents` a row, whose sequences
+    with the row's padding outnumber the row's chunks: each sequence keeps a
+    chunk's memory more (`fla_rule`), so up to there the port keeps at most
+    twice the memory an unpacked row does, and past it the math resets its
+    recurrence at each start for none."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
+    chunks = -(-query.shape[1] // CHUNK_SIZE)
     return first_refusal(
         (measured_kernel('gated_delta_rule', 'xla') == 'fla',
          "the device's target row (generation.TARGETS) does not name the port"),
@@ -759,13 +765,22 @@ def port_refusal(query, key, value) -> str | None:
         (key.shape[-1] <= widest,
          f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
          f"{jnp.result_type(query, key, value).name}"),
+        (documents is None or documents + 1 <= chunks,
+         f"rows of up to {documents} packed documents and their padding, past the {chunks} chunks a "
+         "row's memory is kept for"),
     )
 
 
-def on_the_port(query, key, value) -> bool:
-    """Whether the rule runs on the port; a GPU whose row names it that runs
+def document_bound(tokens: Coordinates) -> int | None:
+    """The packed documents a row of `tokens` may hold, which the port sizes itself by
+    (`port_refusal`), None for rows of one document."""
+    return None if tokens.starts is None else tokens.max_segments
+
+
+def on_the_port(query, key, value, documents: int | None = None) -> bool:
+    """Whether the rule runs on the port (`port_refusal`); a GPU whose row names it that runs
     the rule elsewhere logs why the first time (`ran_kernel`)."""
-    refusal = port_refusal(query, key, value)
+    refusal = port_refusal(query, key, value, documents)
     if refusal is not None:
         ran_kernel('gated_delta_rule', 'xla', refusal)
     return refusal is None
@@ -779,9 +794,10 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and packed
     documents' first tokens `starts` `[B, S]`, at most `max_segments` a row
     (the row length where None). Each document runs as a sequence of its own
-    (fla's varlen `cu_seqlens`, `_document_spans`), its chunks from its first
-    token and its memory from zero, as it would alone; the row's first takes
-    `state`.
+    (fla's varlen `cu_seqlens`), its chunks from its first token and its
+    memory from zero, as it would alone; the row's first takes `state`. The
+    kernels' grids and the states they keep are sized by that bound, a chunk
+    more for each document and the row's padding (`port_refusal`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -806,17 +822,6 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     return manual_map(functools.partial(_blocked_rule, documents=documents),
                       (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
                       (four, memory))(query, key, value, g, beta, state, starts)
-
-
-def _document_spans(starts, documents: int) -> jax.Array:
-    """fla's `cu_seqlens` `[B * documents + 1]` over the `[B * S]` tokens of rows whose packed
-    documents begin at `starts` `[B, S]`: each row's first token and each document's, then empty
-    sequences at the end, so the count the kernels' grids are sized by is the static `documents` a
-    row may hold."""
-    B, S = starts.shape
-    begins = starts.at[:, 0].set(True).reshape(-1)
-    first = jnp.nonzero(begins, size=B * documents, fill_value=B * S)[0].astype(jnp.int32)
-    return jnp.concatenate([first, jnp.full((1,), B * S, jnp.int32)])
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -846,7 +851,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     dimension with them. None of them changes a real output or gradient:
     every padded product is an exact zero. The outputs are cut back. Where
     `documents` bounds a row's packed documents, each begun at `starts`, each
-    is a sequence of its own (`_document_spans`). The decay's shape picks
+    is a sequence of its own (fla's varlen `cu_seqlens`). The decay's shape picks
     the port: per head fla's gated delta rule, per key dimension its Kimi
     delta attention. It keeps its memory for the backward
     but where the block's remat rung recomputes it (`RECOMPUTED`)."""
@@ -874,7 +879,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    spans = None if documents is None else _document_spans(starts, documents)
+    # A row's padding after its documents runs as one more sequence of its own.
+    spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get())
@@ -1160,7 +1166,7 @@ class GatedDeltaNet(nn.Module):
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
         rows, keys, values = (self._split_heads(part, width) for part, width in
                               zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
-        ported = S > 1 and port_refusal(rows, keys, values) is None
+        ported = S > 1 and port_refusal(rows, keys, values, document_bound(tokens)) is None
 
         def scan(convolved, *, starts, valid, held):
             query, key, value = (self._split_heads(part, width)
