@@ -2,7 +2,9 @@
 
 import json
 
-from tools.mutation import TARGETS, plan, source_digest, summarize
+import pytest
+
+from tools.mutation import FILE_TESTS, TARGETS, Target, collected, plan, run, source_digest, summarize
 
 
 def test_nightly_plan_keeps_the_rotation_and_covers_every_shard():
@@ -39,3 +41,14 @@ def test_session_digest_changes_with_source_content_or_population(tmp_path):
     assert original != source_digest([first])
     second.write_text("RATE = 3\n")
     assert original != source_digest([first, second])
+
+
+def test_every_selection_collects_and_a_deleted_test_is_refused_before_the_baseline(tmp_path):
+    """Each target's tests and each file's collect under pytest, and a session whose selection
+    names a deleted file stops before anything runs, naming it."""
+    collected(tuple(sorted({test for selection in (*(target.tests for target in TARGETS.values()),
+                                                   *FILE_TESTS.values()) for test in selection})))
+    gone = Target("src/dew/diffusion/schedules", ("tests/test_schedulers.py", "tests/test_deleted.py"))
+    with pytest.raises(ValueError):
+        run(gone, tmp_path / "session", 0, 1, 60.0)
+    assert not (tmp_path / "session").exists()
