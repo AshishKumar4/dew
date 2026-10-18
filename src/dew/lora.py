@@ -95,6 +95,9 @@ FACTORS = ("lora_A", "lora_B")
 # identity.
 INIT_A = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
 INIT_B = nn.initializers.zeros
+FACTOR_DTYPE = jnp.float32
+"""What an adapter's factors are stored in, whatever its base's storage: attached, loaded or
+initialized by the model rebuilt from its record."""
 
 
 @dataclass(frozen=True)
@@ -195,8 +198,8 @@ class LoRA:
             factors = _factors(name, bound[name], variables, self.rank)
             shape_a, shape_b = factors.shapes(self.rank)
             targets[factors.module] = Target(self.rank, scaling)
-            _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
-                            INIT_B(factor_key, shape_b, jnp.float32))
+            _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, FACTOR_DTYPE),
+                            INIT_B(factor_key, shape_b, FACTOR_DTYPE))
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
         return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
@@ -504,8 +507,8 @@ class _Branch:
             a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
         else:
             kernel = module.get_variable("params", "kernel")
-            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
-            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
+            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), FACTOR_DTYPE)
+            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), FACTOR_DTYPE)
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
@@ -815,9 +818,9 @@ class _Factors:
 
 
 def _insert_factors(leaves: dict, module: Path, a, b) -> None:
-    """Write one target's two factor leaves into `leaves`, under `FACTORS`."""
+    """Write one target's two factor leaves into `leaves`, under `FACTORS`, stored as `FACTOR_DTYPE`."""
     for name, value in zip(FACTORS, (a, b), strict=True):
-        _insert(leaves, (*module, name), value)
+        _insert(leaves, (*module, name), jnp.asarray(value, FACTOR_DTYPE))
 
 
 def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -> _Factors:
