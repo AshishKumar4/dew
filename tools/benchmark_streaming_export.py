@@ -50,7 +50,7 @@ def main() -> None:
     seconds = time.perf_counter() - start
     done.set()
     sampler.join()
-    files = sorted(out.glob("model*.safetensors"))
+    files = sorted(out.rglob("*.safetensors"))
     print(json.dumps({"repo": repo, "max_shard_size": shard_size, "rss_before_gb": round(before, 2),
                       "rss_peak_during_save_gb": round(highest[0], 2),
                       "rise_gb": round(highest[0] - before, 2), "seconds": round(seconds, 1),
