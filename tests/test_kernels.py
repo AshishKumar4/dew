@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, distance
 from test_attention_splash import attention_terms
 
@@ -760,6 +761,30 @@ def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
     chosen, reference = (np.asarray(model(name).apply(params, tokens, attention_mask=valid))
                          for name in ('auto', 'reference'))
     np.testing.assert_array_equal(chosen[np.asarray(valid)], reference[np.asarray(valid)])
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
+@pytest.mark.parametrize("forced", [True, False])
+@pytest.mark.parametrize("dropout_rate", [0.0, 0.25])
+def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
+    """Without sinks the reference path (`reference_attention`) is flax's
+    `dot_product_attention` handed the key heads repeated over their group and
+    Dew's value product (`weighted_values`), bitwise: in each compute dtype,
+    the softmax forced to fp32 or not, an fp32 bias wider than half-precision
+    logits, a causal mask and a probability draw from the same key."""
+    keys = jax.random.split(jax.random.key(0), 5)
+    query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
+    key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
+    bias = jax.random.normal(keys[3], (2, 4, 6, 6), jnp.float32)
+    drop = {"dropout_rate": dropout_rate, "dropout_rng": keys[4], "deterministic": not dropout_rate}
+    ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True, bias=bias,
+                                        force_fp32_for_softmax=forced, **drop)
+    theirs = nn.dot_product_attention(
+        query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
+        mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
+        force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
+        attn_weights_value_einsum=weighted_values, **drop)
+    np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

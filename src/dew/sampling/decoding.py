@@ -638,9 +638,7 @@ def sequence_bias(entries: Sequence[tuple[Sequence[int], float]]) -> SequenceBia
     pairs = [(tuple(ids), float(value)) for ids, value in entries]
     for ids, _ in pairs:
         _ids("sequence_bias", ids)
-    if not pairs:
-        raise ValueError("sequence_bias needs at least one sequence")
-    width = max(len(ids) for ids, _ in pairs)
+    width = max((len(ids) for ids, _ in pairs), default=1)
     table = np.zeros((len(pairs), width), np.int32)
     for row, (ids, _) in enumerate(pairs):
         table[row, width - len(ids):] = ids
@@ -657,8 +655,6 @@ def bad_words(ids: Sequence[Sequence[int]], eos_token_ids: int | Sequence[int] |
     """
     stops = () if eos_token_ids is None else _ids("eos_token_ids", eos_token_ids)
     kept = [tuple(word) for word in ids if not (len(word) == 1 and word[0] in stops)]
-    if not kept:
-        raise ValueError("bad_words_ids holds no sequence outside the EOS ids")
     return sequence_bias([(word, -math.inf) for word in kept])
 
 

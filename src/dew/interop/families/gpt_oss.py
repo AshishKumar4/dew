@@ -47,10 +47,8 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         refuse('experts_per_token', 'it disagrees with num_experts_per_tok')
     if hf_config.get('output_router_logits', False):
         refuse('output_router_logits', 'the decoder returns token logits')
-    quantization = hf_config.get('quantization_config')
-    if quantization is not None and (not isinstance(quantization, Mapping)
-                                    or quantization.get('quant_method') != 'mxfp4'):
-        refuse('quantization_config', 'GPT OSS supports MXFP4 blocks and scales')
+    # quantization_config describes how the weights are stored, which the shared codec reads
+    # (`dew.interop.codecs.source_quantization`), the released MXFP4 experts among them.
     used.update(('num_local_experts', 'num_experts_per_tok', 'experts_per_token',
                  'swiglu_limit', 'initial_context_length', 'router_aux_loss_coef',
                  'output_router_logits', 'quantization_config'))

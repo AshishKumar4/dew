@@ -20,6 +20,17 @@ from .hf import class_names
 from .memory import _record
 
 
+def hold_progress_lock() -> None:
+    """Give `datasets`' progress-bar class a lock of its own, before a Hub read. `datasets` reads a split's
+    shards through tqdm's thread_map, which lends the class a lock for the map and deletes it after where
+    the class held none. Two splits read at once (compile's readers: a holdout's train and held) then
+    delete it under each other's bars: "type object 'tqdm' has no attribute '_lock'". Held, each map
+    restores it instead."""
+    from datasets.utils.tqdm import tqdm as bars
+
+    bars.get_lock()
+
+
 @dataclass(frozen=True)
 class Hub(Dataset):
     """A pinned split of a Hub dataset: `name` is its configuration, as
@@ -79,6 +90,7 @@ class Hub(Dataset):
         from datasets.naming import camelcase_to_snakecase
         from datasets.packaged_modules.cache.cache import Cache
 
+        hold_progress_lock()
         question = ("dataset builder", self.repo, self.commit, self.name or "", self.split)
         if self._pinned.recorded:
             # Never built online, so never prepared.
