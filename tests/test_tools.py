@@ -289,17 +289,19 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
 
-def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
+@pytest.mark.parametrize("states_dtype", ["float32", "bfloat16"])
+def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dtype):
     """stored and remat are the baseline head rearranged into vocabulary
     tiles, so on one small case all three agree on the loss, the top-1
-    accuracy and both gradients. The vocabulary of 12 does not split into
-    4 equal tiles, so the short last tile is on the path."""
+    accuracy and both gradients, in the states' own precision: bf16 states
+    take the bf16 head product in every variant. The vocabulary of 12 does
+    not split into 4 equal tiles, so the short last tile is on the path."""
     tool = load("benchmark_lm_head")
     key = jax.random.PRNGKey(0)
-    states = jax.random.normal(key, (2, 3, 8), jnp.float32)
+    states = jax.random.normal(key, (2, 3, 8), jnp.float32).astype(states_dtype)
     table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
-    variant = tool.parse_variant("stored4-fp32")
+    variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
     outputs = {}
     for name in ("baseline", "stored", "remat"):
@@ -309,11 +311,15 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]
+    # The loop adds each tile's state gradient in the states' dtype, one rounding a tile, where the
+    # baseline's one product rounds once: in bf16 up to a 2^-8 of the largest entry each.
+    states_bound = 1e-5 if states_dtype == "float32" else 4 * 2**-8 * np.abs(reference[2]).max()
     for name in ("stored", "remat"):
         loss, accuracy, d_states, d_table = outputs[name]
         assert loss == pytest.approx(reference[0], abs=1e-5), name
         assert accuracy == reference[1], name
-        np.testing.assert_allclose(d_states, reference[2], atol=1e-5, err_msg=name)
+        np.testing.assert_allclose(np.asarray(d_states, np.float32), np.asarray(reference[2], np.float32),
+                                   atol=states_bound, err_msg=name)
         np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
 
 
