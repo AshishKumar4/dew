@@ -159,14 +159,26 @@ class _HashSource:
         return None
 
     def manifest(self) -> ShardManifest:
+        """The source's shards, each read through the hash. Which of a shard's rows the hash keeps
+        is known only once they are read, so no shard states its rows."""
         manifest = self.source.manifest()
-        return dataclasses.replace(manifest, reader=functools.partial(self._reader, manifest))
+        subdivide = manifest.subdivide
+        return ShardManifest(_unsized(manifest.shards), functools.partial(self._reader, manifest),
+                             None if subdivide is None else functools.partial(_unsized_parts, subdivide))
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
         from dew.data.mixing import Accepted
 
         rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held, self.key))
         return Accepted(rows, self.describe())
+
+
+def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
+    return tuple(dataclasses.replace(shard, rows=None) for shard in shards)
+
+
+def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) -> tuple[Shard, ...]:
+    return _unsized(subdivide(count))
 
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
