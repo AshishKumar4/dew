@@ -94,6 +94,11 @@ class MixerContext:
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
     or 'default' (Qwen3.5); `dew.nn.rope.rotary_freqs` cites both."""
+    narrow_rotary_tables: bool = False
+    """Whether the rotary's cos and sin round to the activations' dtype before the rotation, which
+    stays fp32: vLLM's rotary casts its cos/sin cache to the query's dtype
+    (rotary_embedding/base.py, `_match_cos_sin_cache_dtype`) and its kernel rotates in fp32
+    (csrc/pos_encoding_kernels.cu, `apply_token_rotary_embedding`)."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -128,6 +133,7 @@ class MixerContext:
             "value_scale": self.value_scale is not None,
             "o_proj_bias": bool(self.o_proj_bias),
             "attention_dropout_rate": bool(self.attention_dropout_rate),
+            "narrow_rotary_tables": self.narrow_rotary_tables,
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
