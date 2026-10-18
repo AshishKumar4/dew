@@ -1886,7 +1886,7 @@ class CausalTransformer(nn.Module):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -2014,7 +2014,7 @@ class CausalTransformer(nn.Module):
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=True, rngs=rngs,
-            train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+            train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         output = output.streams if isinstance(output, Carried) else output
@@ -2079,6 +2079,14 @@ class CausalTransformer(nn.Module):
                 f"mixture, a layer_types pattern and a K/V sharing that do")
         return count
 
+    @property
+    def _provides(self) -> bool:
+        """Whether a layer leaves what a later one reads (`LayerSpec.provider`): keys and
+        values a sharing layer takes, or a CSA2 layer's publications, which its Reindex
+        and Reuse layers read whether or not any layer shares keys. The stack then
+        threads a kv_store through its layers."""
+        return any(spec.provider is not None for spec in self.specs)
+
     @nn.compact
     def _stacked(self, view: StackView, x, train: bool, decode: bool, per_layer_input,
                  attention_metadata=None):
@@ -2086,7 +2094,7 @@ class CausalTransformer(nn.Module):
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return run_pipeline(
