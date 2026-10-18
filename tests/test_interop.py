@@ -133,53 +133,61 @@ def raw_safetensors(path, entries):
     path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
 
 
-def _stored(text: bytes, payload: bytes) -> bytes:
-    return len(text).to_bytes(8, "little") + text + payload
+_A = '"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}'
+_B = '"b":{"dtype":"I32","shape":[2,2],"data_offsets":[16,32]}'
+_PAYLOAD = np.arange(4, dtype=np.float32).tobytes() + np.arange(4, dtype=np.int32).tobytes()
 
-
-def _moved(header: dict, name: str, **entry) -> bytes:
-    return json.dumps({**header, name: {**header[name], **entry}}).encode()
+def _table(*entries: str) -> str:
+    return "{" + ",".join(entries) + "}"
 
 
 CORRUPTIONS = {
-    "valid": lambda header, payload: _stored(json.dumps(header).encode(), payload),
-    "gap": lambda header, payload: _stored(_moved(header, "b", data_offsets=[24, 40]), payload + bytes(8)),
-    "overlap": lambda header, payload: _stored(_moved(header, "b", data_offsets=[8, 24]), payload[:24]),
-    "short": lambda header, payload: _stored(json.dumps(header).encode(), payload[:-1]),
-    "trailing": lambda header, payload: _stored(json.dumps(header).encode(), payload + bytes(4)),
-    "span": lambda header, payload: _stored(_moved(header, "a", shape=[2, 3]), payload),
-    "dtype": lambda header, payload: _stored(_moved(header, "a", dtype="Q9"), payload),
-    "repeated": lambda header, payload: _stored(
-        b'{"b":' + json.dumps({**header["b"], "dtype": "F32"}).encode() + b","
-        + json.dumps(header).encode()[1:], payload),
-    "length": lambda header, payload: (10 ** 9).to_bytes(8, "little") + json.dumps(header).encode() + payload,
+    "valid": (_table(_A, _B), _PAYLOAD),
+    "gap": (_table(_A, _B.replace("[16,32]", "[24,40]")), _PAYLOAD + bytes(8)),
+    "overlap": (_table(_A, _B.replace("[16,32]", "[8,24]")), _PAYLOAD[:24]),
+    "short": (_table(_A, _B), _PAYLOAD[:-1]),
+    "trailing": (_table(_A, _B), _PAYLOAD + bytes(4)),
+    "span": (_table(_A.replace("[2,2]", "[2,3]"), _B), _PAYLOAD),
+    "dtype": (_table(_A.replace("F32", "Q9"), _B), _PAYLOAD),
+    "repeated": (_table(_B.replace("I32", "F32"), _A, _B), _PAYLOAD),
+    "null-metadata": (_table('"__metadata__":null', _A, _B), _PAYLOAD),
+    "unknown-field": (_table(_A.replace("}", ',"extension":1}'), _B), _PAYLOAD),
+    "repeated-field": (_table(_A.replace('{"dtype":"F32"', '{"dtype":"F32","dtype":"F32"'), _B), _PAYLOAD),
+    "repeated-metadata": (_table('"__metadata__":{"x":"1"}', '"__metadata__":{"y":"2"}', _A, _B), _PAYLOAD),
+    "metadata": (_table('"__metadata__":{"x":"1","x":"2"}', _A, _B), _PAYLOAD),
+    "utf-16": (_table(_A, _B), _PAYLOAD),
+    "entry": (_table('"c":[1]', _A, _B), _PAYLOAD),
 }
-"""One change each to a valid two-tensor file: a hole between tensors, two
+"""Each one change to a valid two-tensor file: a hole between tensors, two
 tensors on the same bytes, a missing byte, bytes after the tensors, a shape
-its bytes do not hold, an unknown dtype tag, a key named twice with another
-dtype first, and a header longer than the file."""
+its bytes do not hold, an unknown dtype tag, a tensor named twice with another
+dtype first, null metadata, a field TensorInfo does not know, a TensorInfo
+field named twice, metadata named twice, a metadata key named twice, the
+header in UTF-16, and a tensor that is no object."""
 
 
-@pytest.mark.parametrize("corruption", list(CORRUPTIONS))
+@pytest.mark.parametrize("corruption", [*CORRUPTIONS, "length"])
 def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
     """Dew reads the header of the file it holds open itself, so it checks the
     container as safetensors 0.8.0's safe_open does: a file safe_open reads
-    reads to the same tensors, and each one safe_open refuses, Dew refuses."""
-    header = {"a": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
-              "b": {"dtype": "I32", "shape": [2, 2], "data_offsets": [16, 32]}}
-    payload = np.arange(4, dtype=np.float32).tobytes() + np.arange(4, dtype=np.int32).tobytes()
+    reads to the same tensors and metadata, and each one safe_open refuses,
+    Dew refuses. `length` states a header longer than the file."""
+    text, payload = CORRUPTIONS.get(corruption, CORRUPTIONS["valid"])
+    header = text.encode("utf-16" if corruption == "utf-16" else "utf-8")
+    stated = 10 ** 9 if corruption == "length" else len(header)
     path = tmp_path / "model.safetensors"
-    path.write_bytes(CORRUPTIONS[corruption](header, payload))
+    path.write_bytes(stated.to_bytes(8, "little") + header + payload)
     try:
         with safetensors.safe_open(str(path), "np") as reader:
             names = reader.keys()
             expected = {name: reader.get_tensor(name) for name in names}
+            stored = reader.metadata() or {}
     except safetensors.SafetensorError:
         with pytest.raises(ValueError):
             read_file(path)
         return
     tensors, metadata = read_file(path)
-    assert metadata == {} and list(tensors) == sorted(expected)
+    assert metadata == stored and list(tensors) == sorted(expected)
     for name, value in expected.items():
         assert tensors[name].dtype == value.dtype
         np.testing.assert_array_equal(tensors[name], value)

@@ -296,6 +296,11 @@ _MAX_HEADER = 100_000_000
 """The largest header safetensors reads (`MAX_HEADER_SIZE`, safetensors 0.8.0)."""
 
 
+class _Pairs(list[tuple[str, JSON]]):
+    """A JSON object's key-value pairs in order, kept so a header reader applies
+    the duplicate-key rule of the type it reads the object as."""
+
+
 type _Entries = dict[str, tuple[tuple[int, ...], np.dtype, int]]
 """Each tensor's shape, dtype and byte offset into a safetensors file's data."""
 
@@ -319,20 +324,29 @@ def _header(stream, filename: str) -> tuple[_Entries, dict[str, str], int]:
     if length is None or length > _MAX_HEADER or 8 + length > size:
         raise ValueError(f"{filename} is not a safetensors file: it holds no header of the length it states")
     try:
-        header = json.loads(stream.read(length))
+        header = json.loads(stream.read(length).decode("utf-8"), object_pairs_hook=_Pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"{filename} is not a safetensors file: its header is not JSON") from error
-    metadata = header.pop("__metadata__", {}) if isinstance(header, dict) else None
-    if not isinstance(header, dict) or not isinstance(metadata, dict) or not all(
-            isinstance(value, str) for value in metadata.values()):
-        raise ValueError(f"{filename} is not a safetensors file: its header is not a table of tensors "
-                         "beside string metadata")
+        raise ValueError(f"{filename} is not a safetensors file: its header is not UTF-8 JSON") from error
+    if not isinstance(header, _Pairs):
+        raise ValueError(f"{filename} is not a safetensors file: its header is not a table of tensors")
+    # serde's rules for the header's types: a struct (the header's `__metadata__`, a
+    # TensorInfo) refuses a field named twice and ignores one it does not know, and a
+    # map (the tensors, the metadata) keeps the last value of a repeated key.
+    stated = [value for key, value in header if key == "__metadata__"]
+    held = stated[0] if stated else None
+    metadata = dict(held) if isinstance(held, _Pairs) else {}
+    if (len(stated) > 1 or not (held is None or isinstance(held, _Pairs))
+            or not all(isinstance(value, str) for value in metadata.values())):
+        raise ValueError(f"{filename} is not a safetensors file: its __metadata__ is not one table "
+                         "of strings")
     entries: _Entries = {}
     spans = []
-    for name, entry in header.items():
-        if not isinstance(entry, dict) or set(entry) != {"dtype", "shape", "data_offsets"}:
-            raise ValueError(f"tensor {name!r} in {filename} is not a dtype, shape and data_offsets")
-        tag, shape, span = entry["dtype"], entry["shape"], entry["data_offsets"]
+    for name, entry in {key: value for key, value in header if key != "__metadata__"}.items():
+        fields = dict(entry) if isinstance(entry, _Pairs) else {}
+        if (not isinstance(entry, _Pairs) or len(fields) != len(entry)
+                or not {"dtype", "shape", "data_offsets"} <= fields.keys()):
+            raise ValueError(f"tensor {name!r} in {filename} is not one dtype, shape and data_offsets")
+        tag, shape, span = fields["dtype"], fields["shape"], fields["data_offsets"]
         if not (isinstance(shape, list) and all(type(axis) is int and axis >= 0 for axis in shape)
                 and isinstance(span, list) and len(span) == 2 and all(type(end) is int for end in span)
                 and 0 <= span[0] <= span[1]):
