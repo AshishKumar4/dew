@@ -8,7 +8,8 @@ one tensor at a time, and encodes dense weights back into those parts for
 
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
-  beside `<m>.weight_scale_inv`, one float32 scale per square block.
+  beside `<m>.weight_scale_inv`, one float32 scale per block of the
+  configured rows and columns, square or not.
 - MiMo-V2.6's storage of that config under `store_dtype: mxfp4`: FP8 blocks,
   the fused qkv in runs over the key heads, and routed experts as MXFP4,
   `<m>.weight` beside `<m>.weight_scale`.
@@ -26,9 +27,10 @@ one tensor at a time, and encodes dense weights back into those parts for
   and FP8 codes under the one weights scheme a config declares, and
   `nvfp4-pack-quantized`, E2M1 codes in groups of 16 whose dynamic local
   input scales the checkpoint Qwix provider computes.
-- ModelOpt (`quant_method: modelopt`): NVFP4 with its stored input
-  multipliers, and the MIXED_PRECISION table that gives each layer NVFP4,
-  W4A16_NVFP4 or FP8 (`MODELOPT_ALGOS`).
+- ModelOpt (`quant_method: modelopt`): one algorithm for every quantized
+  layer, or the MIXED_PRECISION table that gives each layer its own, each
+  NVFP4 with its stored input multipliers, W4A16_NVFP4 or FP8
+  (`MODELOPT_ALGOS`).
 
 MLX's affine groups, which declare no `quant_method`, are refused by their
 shape, and any other `quant_method` by its name.
@@ -470,13 +472,14 @@ always stores float8_e4m3fn, so Qwen3's FP8 repos that omit it are E4M3;
 DeepSeek writes 'e4m3' and MiniMax 'float8_e4m3fn'."""
 
 
-def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
-    """Return the block size and whether the scales are ue8m0, from `quantization`.
+def fp8_format(quantization: Mapping[str, object]) -> tuple[tuple[int, int], bool]:
+    """Return the block's rows and columns and whether the scales are ue8m0, from `quantization`.
 
-    The finegrained format or refused: E4M3 weights (`E4M3_NAMES`) in a
-    square block, the scales float32 (`scale_fmt` absent or 'float', V3)
-    or ue8m0 (V3.2). A per-tensor or rectangular scale, or a scale format
-    with no rounding rule here, is not this format.
+    The finegrained format or refused: E4M3 weights (`E4M3_NAMES`) in blocks
+    of any positive rows and columns, square as DeepSeek's or a row's
+    `[1, cols]`, the scales float32 (`scale_fmt` absent or 'float', V3) or
+    ue8m0 (V3.2). A per-tensor scale, or a scale format with no rounding rule
+    here, is not this format.
 
     This codec follows transformers 5.16.1's dequantize=True reader: its
     finegrained FP8 quantizer chooses that path on CPU without a GPU/XPU,
@@ -494,19 +497,26 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
                              for key in ('fmt', 'weight_block_size', 'scale_fmt'))
     if (fmt not in E4M3_NAMES or not isinstance(block, list) or len(block) != 2
             or any(type(side) is not int or side < 1 for side in block)
-            or block[0] != block[1] or scale_fmt not in (None, 'float', 'ue8m0')
-            or quantization.get('weight_per_tensor')):
+            or scale_fmt not in (None, 'float', 'ue8m0') or quantization.get('weight_per_tensor')):
         raise ValueError(
             f"quantization_config names fp8 with fmt {fmt!r}, weight_block_size "
             f"{block!r} and scale_fmt {scale_fmt!r}; this loader reads e4m3 weights "
-            f"in square blocks, not per tensor, with float32 or ue8m0 scales and nothing else")
-    return block[0], scale_fmt == 'ue8m0'
+            f"in blocks, not per tensor, with float32 or ue8m0 scales and nothing else")
+    return (block[0], block[1]), scale_fmt == 'ue8m0'
 
 
 Block = int | tuple[int, int]
 """The rows and columns one FP8 scale covers: DeepSeek's square `block`, or
 `(rows, cols)`, such as `(1, cols)` for one scale a row of a `cols`-wide
 matrix (a frozen FP8 matrix's rows, `dew.training.quantization`)."""
+
+
+def _square(block: tuple[int, int], release: str) -> int:
+    """The side of a square `block`, the only kind `release` storage holds: its
+    row-scaled tensors take a `(1, side)` block beside the square ones."""
+    if block[0] != block[1]:
+        raise ValueError(f"{release} FP8 storage scales square blocks; weight_block_size is {list(block)}")
+    return block[0]
 
 
 def _sides(block: Block) -> tuple[int, int]:
@@ -672,9 +682,9 @@ def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return names
 
 
-def fp8_blocks(block: int = BLOCK, *, ue8m0: bool = False) -> SourceQuantization:
-    """DeepSeek's FP8 blocks of `block` x `block` under `_scale_inv`
-    partners, encoded back with ue8m0 scales where the source's are."""
+def fp8_blocks(block: Block = BLOCK, *, ue8m0: bool = False) -> SourceQuantization:
+    """Finegrained FP8 in `block`s (`Block`) under `_scale_inv` partners,
+    encoded back with ue8m0 scales where the source's are."""
     return SourceQuantization(
         scaled_names, lambda name: (name + SCALE_SUFFIX,),
         lambda tensors, name: dequantize_fp8_blocks(tensors[name], tensors[name + SCALE_SUFFIX], block),
@@ -1484,10 +1494,6 @@ def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
     return tuple(stem + '.weight' for stem in stems)
 
 
-def _modelopt_parts(name: str) -> tuple[str, ...]:
-    return tuple(name.removesuffix('.weight') + suffix for suffix in MODELOPT_PARTS)
-
-
 def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: str = 'NVFP4',
                      layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> np.ndarray:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
@@ -1549,24 +1555,21 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
                    grid: Mapping[str, np.ndarray] | None) -> SourceQuantization:
     """ModelOpt's per-layer dispatch, held to the author's exporter and quantizers.
 
-    FP8 and NVFP4 own their stored input multipliers; W4A16_NVFP4 stores
-    only quantized weights even when generic config_groups advertise an
-    input quantizer. Per-expert activation quantizers remain refused.
-    The checkpoint Qwix provider reads each accepted Linear's input rule.
+    One algorithm for every quantized layer (`quant_algo` FP8, NVFP4 or
+    W4A16_NVFP4, as ModelOpt 0.47.0 writes a checkpoint of one scheme) or a
+    published table of them (`MIXED_PRECISION`, `quantized_layers`). FP8 and
+    NVFP4 own their stored input multipliers; W4A16_NVFP4 stores only
+    quantized weights even when generic config_groups advertise an input
+    quantizer. A layer is quantized where its scales are stored, so experts
+    left dense read as dense; an expert stack's input quantizers are refused
+    where the weights bind (`dew.interop.pretrained`). The checkpoint Qwix
+    provider reads each accepted Linear's input rule.
     """
     method = quantization.get('quant_algo')
-    if method not in ('NVFP4', 'MIXED_PRECISION'):
-        raise ValueError(f"quant_method 'modelopt' quant_algo {quantization.get('quant_algo')!r} needs "
-                         "other input activations; this loader reads dense NVFP4 W4A4")
+    if method not in (*MODELOPT_ALGOS, 'MIXED_PRECISION'):
+        raise ValueError(f"quant_method 'modelopt' quant_algo {method!r} has no input rule in this loader")
     if quantization.get('kv_cache_quant_algo') is not None or quantization.get('kv_cache_scheme') is not None:
         raise ValueError("ModelOpt KV cache quantization is not computed by this loader")
-    text = config.get('text_config')
-    architecture = text if isinstance(text, Mapping) else config
-    for key in ('num_experts', 'num_local_experts', 'n_routed_experts', 'num_routed_experts'):
-        experts = architecture.get(key)
-        if method == 'NVFP4' and isinstance(experts, int) and experts > 1:
-            raise ValueError("ModelOpt per-expert input activations need a provider "
-                             "this loader does not compute")
     layers: dict[str, str] = {}
     if method == 'MIXED_PRECISION':
         if not isinstance(quantization.get('quantized_layers'), Mapping):
@@ -1574,44 +1577,30 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
         declared = records.record(quantization['quantized_layers'], 'ModelOpt quantized_layers')
         if not declared:
             raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
-        for name, entry in declared.items():
-            entry = records.record(entry, f'ModelOpt quantized_layers.{name}')
-            algo = entry.get('quant_algo')
-            if algo not in MODELOPT_ALGOS:
-                raise ValueError(f"ModelOpt {name} quant_algo {algo!r} has no input rule in this loader")
-            if algo in ('NVFP4', 'W4A16_NVFP4') and entry.get('group_size', 16) != 16:
-                raise ValueError(f"ModelOpt {name} group_size must be 16")
-            if algo == 'NVFP4' and '.experts' in str(name):
-                raise ValueError(f"ModelOpt {name} per-expert input activations are not computed")
-            layers[str(name)] = str(algo)
-        # config_groups can advertise W4A4 for a W4A16_NVFP4 layer. The
-        # published per-layer table is the deployment dispatch contract.
-        return SourceQuantization(
-            partial(_modelopt_names, method=str(method), layers=layers),
-            lambda name: _modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)),
-            partial(_modelopt_decode, method=str(method), layers=layers),
-            partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
-            grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
-            input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
-            input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
-    groups = records.record(quantization.get('config_groups'), 'ModelOpt config_groups')
-    expected = {'num_bits': 4, 'type': 'float', 'group_size': 16, 'dynamic': False}
-    if not groups:
-        raise ValueError("ModelOpt config_groups must declare the NVFP4 W4A4 scheme")
-    for name, group in groups.items():
-        group = records.record(group, f'ModelOpt config_groups.{name}')
-        for side in ('weights', 'input_activations'):
-            args = records.record(group.get(side), f'ModelOpt {name}.{side}')
-            if (any(args.get(key) != value for key, value in expected.items())
-                    or args.get('symmetric', True) is not True):
-                raise ValueError(f"ModelOpt {name}.{side} must declare "
-                                 "static-global 4-bit float groups of 16")
-        if group.get('output_activations') is not None:
-            raise ValueError(f"ModelOpt {name}.output_activations is not computed by this input provider")
+        entries = {str(name): records.record(entry, f'ModelOpt quantized_layers.{name}')
+                   for name, entry in declared.items()}
+    else:
+        entries = {'': quantization}
+    for name, entry in entries.items():
+        algo = entry.get('quant_algo')
+        if algo not in MODELOPT_ALGOS:
+            raise ValueError(f"ModelOpt {name} quant_algo {algo!r} has no input rule in this loader")
+        if algo in ('NVFP4', 'W4A16_NVFP4') and entry.get('group_size', 16) != 16:
+            raise ValueError(f"ModelOpt {name or 'quant_algo'} group_size must be 16")
+        if algo == 'NVFP4' and '.experts' in name:
+            raise ValueError(f"ModelOpt {name} per-expert input activations are not computed")
+        if name:
+            layers[name] = str(algo)
+    # config_groups can advertise W4A4 for a W4A16_NVFP4 layer. The published
+    # algorithm, uniform or per layer, is the deployment dispatch contract.
     return SourceQuantization(
-        _modelopt_names, _modelopt_parts, _modelopt_decode, partial(_modelopt_encode, grid=grid),
-        grid=lambda name: (*_modelopt_parts(name), name), input_scale_dtype='float8_e4m3fn',
-        input_format='modelopt', input_suffix='.input_scale')
+        partial(_modelopt_names, method=str(method), layers=layers),
+        lambda name: _modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)),
+        partial(_modelopt_decode, method=str(method), layers=layers),
+        partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
+        grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
+        input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
+        input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
 
 
 # --------------------------------------------------------------------------
@@ -1667,6 +1656,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         # pairs (inference/model.py `Linear` under float4_e2m1fn_x2), 'fp8' or
         # null as FP8 blocks like every other Linear (the Base releases).
         block, ue8m0 = fp8_format(quantization)
+        side = _square(block, "DeepSeek-V4's")
         experts = quantization.get("expert_dtype", config.get("expert_dtype"))
         if not ue8m0:
             raise ValueError(
@@ -1675,16 +1665,17 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         if experts not in ("fp4", "fp8", None):
             raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
                              f"pairs or as fp8 blocks and nothing else")
-        return deepseek_v4(block, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
+        return deepseek_v4(side, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
     if method == "fp8" and quantization.get("store_dtype") is not None:
         block, ue8m0 = fp8_format(quantization)
+        side = _square(block, "MiMo-V2.6's")
         stored, group = quantization["store_dtype"], quantization.get("mxfp4_block_size", GROUP)
         if stored != "mxfp4" or group != GROUP or ue8m0:
             raise ValueError(f"quantization_config stores fp8 as {stored!r} in groups of {group!r}; this "
                              f"loader reads store_dtype 'mxfp4' in groups of {GROUP} beside float32 FP8 "
                              f"block scales")
         heads = config.get("num_key_value_heads")
-        return mxfp4_store(block, None if heads is None else records.integer(heads, "num_key_value_heads"))
+        return mxfp4_store(side, None if heads is None else records.integer(heads, "num_key_value_heads"))
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
         return fp8_blocks(block, ue8m0=ue8m0)

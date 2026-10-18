@@ -66,7 +66,6 @@ from dew.interop.processors import (
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
-from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -90,25 +89,25 @@ def _in_language_model(path: tuple[str, ...]) -> tuple[str, ...]:
     return (path[0], "language_model", *path[1:])
 
 
-def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading]):
-    """Return one `WeightLayout` per wrapper source tensor.
+def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading],
+                     media: tuple[WeightLayout, ...]):
+    """Return one `WeightLayout` per wrapper source tensor, and the tensors no layout reads.
 
     Each layout keeps the source's own tensor name and points at the leaf path
     the loader built, so an export writes the names the source shipped. The
     language model's tensors bind through the readings its load placed
     (`language`, by its local names), an alias of a local name through the
-    same one.
+    same one; the media components' through the layouts their readers placed
+    them by (`media`). A media tensor no component computes with (SigLIP's
+    pooling head, auxiliary tensors the reference ignores) keeps its source
+    bytes for export.
     """
     readings = {reading.name: reading for reading in language}
     # The decoder's own tree, each collection's `language_model` entry, which its readings index.
     language_tree = {collection: tree["language_model"] for collection, tree in variables.items()
                      if isinstance(tree, Mapping) and "language_model" in tree}
-    from dew.nn import vision
-    from dew.nn.vision.common import projector_weight_path
-
-    tower_kind = record["tower"]["class"]
-    audio_encoder = None if record["audio"] is None else towers.from_record(record["audio"])
-    bindings = []
+    bindings = list(media)
+    placed = {layout.name for layout in media}
     retained = {}
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
@@ -119,38 +118,7 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
                 retained[name] = tensor
             else:
                 bindings.append(layout)
-            continue
-        paths: tuple[tuple[str, ...], ...] = ()
-        transpose = None
-        if group == "projector":
-            path = projector_weight_path(record["projector"]["class"], local)
-            paths = (("params", "projector", *path),)
-            if path[-1] == "kernel" and local != "mm_input_projection_weight":
-                transpose = (1, 0)
-        elif group == "tower":
-            path = vision.TOWERS[tower_kind].path(local)
-            if path is not None:
-                paths = ((path[0], "tower", *path[1:]),)
-                if path[-1] == "kernel":
-                    transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
-        elif group == "audio_projector":
-            path = projector_weight_path(record["audio_projector"]["class"], local)
-            paths = (("params", "audio_projector", *path),)
-            if path[-1] == "kernel":
-                transpose = (1, 0)
-        else:
-            if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-                raise ValueError("source export requires a Gemma audio encoder")
-            path = audio_nn.audio_weight_path(local, audio_encoder)
-            paths = ((path[0], "audio_tower", *path[1:]),)
-            if path[-1] == "kernel":
-                # Kernels store [*window, in, out]; the source keeps [out, in, *window].
-                transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        if paths:
-            bindings.append(WeightLayout(name, paths, tensor.shape, transpose))
-        else:
-            # SigLIP's pooling head and reference-ignored auxiliary tensors
-            # have no forward consumer; export preserves their source bytes.
+        elif name not in placed:
             retained[name] = tensor
     return tuple(bindings), retained
 
@@ -638,7 +606,6 @@ class PretrainedDecoder(Pretrained):
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
         config = decoders.export_config(decoder)
-        decoders.refuse_lossy_export(decoder, config)
         built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(decoder, variables, None, config, None, built,
@@ -1073,13 +1040,6 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
         config = records.record(json.load(handle), "config.json")
-    # A GGUF file holds no kimi_k25 wrapper, so only a config.json can carry this.
-    text_config = config.get("text_config")
-    if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
-            and text_config.get("quantization_config") is not None):
-        raise ValueError(
-            "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
-            "provide dequantized text weights and remove that quantization descriptor")
     return config, None
 
 
@@ -1172,7 +1132,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    parts, language = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
     for fields in (text_fields, record['text']):
         decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
@@ -1181,7 +1141,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
-    layouts, retained = _wrapper_layouts(tensors, record, variables, language)
+    layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
 

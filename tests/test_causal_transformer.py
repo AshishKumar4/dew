@@ -1099,13 +1099,22 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
 @pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4},
                                    {"altup": {"num_inputs": 2}},
                                    {"hyper_connections": HyperConnections(hc_mult=2)}])
-def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
-    """LAuReL, AltUp, per-layer inputs and mHC's stream stack keep their own
-    inits and add their branches unscaled, so lm-engine's multipliers cannot be
-    asked of them."""
-    model = tiny(initializer_range=0.02, residual_multiplier=0.22, **extra)
-    with pytest.raises(ValueError):
-        model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
+    """`embedding_multiplier` scales the embeddings before the first layer and
+    `logits_scaling` divides the final states, outside every block. With
+    LAuReL, AltUp, per-layer inputs or mHC's stream stack, a model with both
+    runs as the model without them over its embedding table times the
+    multiplier, its logits divided by the scaling: bitwise, both being powers
+    of two, which round nothing."""
+    ids = tokens(jax.random.key(0), length=8)
+    plain = tiny(tie_embeddings=False, **extra)
+    variables = plain.init(jax.random.key(1), ids)
+    table = ("params", "embed_tokens", "embedding")
+    multiplied = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf * 2 if tuple(key.key for key in path) == table else leaf, variables)
+    scaled = tiny(tie_embeddings=False, embedding_multiplier=2.0, logits_scaling=4.0, **extra)
+    np.testing.assert_array_equal(np.asarray(scaled.apply(variables, ids)),
+                                  np.asarray(plain.apply(multiplied, ids)) / 4)
 
 
 def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):

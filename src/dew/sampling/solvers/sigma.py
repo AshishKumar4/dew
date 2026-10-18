@@ -9,7 +9,7 @@ from jax import lax
 
 from dew.diffusion.schedules import expand
 
-from .common import _push, _sigma_integrator
+from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
 
 def _euler_step(x, denoised, source, target):
@@ -235,6 +235,10 @@ class MultiStepDPM:
     FlaxDiff's `MultiStepDPM`, which despite the name is not DPM-Solver."""
 
     def init(self, x, times, process, *, key):
+        # The order grows by one a step, to three.
+        orders = [min(index, 2) + 1 for index in range(times.shape[0] - 1)]
+        _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
+                    reason="its finite differences divide by")
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
@@ -296,6 +300,9 @@ class LMS:
             raise ValueError(f"LMS's order is at least 1, not {self.order}")
 
     def init(self, x, times, process, *, key):
+        orders = [min(index, self.order - 1) + 1 for index in range(times.shape[0] - 1)]
+        _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
+                    reason="LMS's Lagrange basis divides by")
         sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
         return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 

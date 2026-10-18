@@ -185,49 +185,57 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
     })
 
 
+_LAYOUT_FIELDS = ('n_routed_experts', 'num_local_experts', 'num_experts_per_tok', 'routed_scaling_factor',
+                  'n_group', 'topk_group', 'n_shared_experts', 'moe_intermediate_size',
+                  'first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types', 'aux_loss_alpha', 'seq_aux')
+"""The fields every DeepSeek mixture reads (`deepseek_layout`)."""
+
+
+def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> tuple[int, ...]:
+    """The layers a DeepSeek MoE routes: those past the first `first_k_dense_replace`.
+
+    Transformers builds every layer past the dense ones as MoE whatever
+    `moe_layer_freq` says, so anything but that refuses, as does an
+    `mlp_layer_types` that disagrees with it.
+    """
+    used.update(('first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types'))
+    freq = hf_config.get('moe_layer_freq')
+    if freq is not None and freq != 1:
+        refuse(f"moe_layer_freq {freq!r}",
+                "transformers builds every layer past the dense ones as MoE, "
+                "whatever this field says")
+    first_k = records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
+    if not 0 <= first_k <= layers:
+        refuse(f"first_k_dense_replace {first_k!r}",
+                f"it names dense layers of a {layers}-layer model")
+    pattern = hf_config.get('mlp_layer_types')
+    if pattern is not None:
+        expected = ['dense'] * first_k + ['sparse'] * (layers - first_k)
+        if list(records.strings(pattern, 'mlp_layer_types')) != expected:
+            refuse(f"mlp_layer_types {list(records.strings(pattern, 'mlp_layer_types'))!r}",
+                    "it disagrees with first_k_dense_replace, which is what "
+                    "the reference builds")
+    return tuple(range(first_k, layers))
+
+
 def deepseek_layout(hf_config: Mapping[str, object], layers: int,
                      used: set, *, sparse_layers: tuple[int, ...] | None = None) -> MixtureFields:
     """Read the expert counts, widths and sparse layers every DeepSeek MoE shares.
 
-    The first `first_k_dense_replace` layers stay dense and the rest route.
-    Transformers builds every layer past the dense ones as MoE whatever
-    `moe_layer_freq` says, so anything but that refuses. `aux_loss_alpha`
+    The first `first_k_dense_replace` layers stay dense and the rest route
+    (`deepseek_routed`). `aux_loss_alpha`
     and `seq_aux` shape the training loss alone and no forward pass reads
     them; a run sets them on LMObjective, whose `aux_loss_alpha` and
     `seq_aux` compute V2's balance loss. A family with an explicit per-layer
     schedule supplies sparse_layers and reuses only the expert geometry.
     """
-    used.update(('n_routed_experts', 'num_local_experts',
-                 'num_experts_per_tok', 'routed_scaling_factor',
-                 'n_group', 'topk_group',
-                 'n_shared_experts', 'moe_intermediate_size',
-                 'first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types',
-                 'aux_loss_alpha', 'seq_aux'))
+    used.update(_LAYOUT_FIELDS)
     experts = hf_config.get('n_routed_experts',
                             hf_config.get('num_local_experts'))
     if experts is None:
         refuse("n_routed_experts",
                 "a DeepSeek MoE layer needs its expert count")
-    sparse = sparse_layers
-    if sparse is None:
-        freq = hf_config.get('moe_layer_freq')
-        if freq is not None and freq != 1:
-            refuse(f"moe_layer_freq {freq!r}",
-                    "transformers builds every layer past the dense ones as MoE, "
-                    "whatever this field says")
-        first_k = records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
-        if not 0 <= first_k <= layers:
-            refuse(f"first_k_dense_replace {first_k!r}",
-                    f"it names dense layers of a {layers}-layer model")
-        sparse = tuple(range(first_k, layers))
-        pattern = hf_config.get('mlp_layer_types')
-        if pattern is not None:
-            expected = (['dense'] * first_k
-                        + ['sparse'] * (layers - first_k))
-            if list(records.strings(pattern, 'mlp_layer_types')) != expected:
-                refuse(f"mlp_layer_types {list(records.strings(pattern, 'mlp_layer_types'))!r}",
-                        "it disagrees with first_k_dense_replace, which is what "
-                        "the reference builds")
+    sparse = deepseek_routed(hf_config, layers, used) if sparse_layers is None else sparse_layers
     shared = records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
     shared_features = 0
     if shared:
@@ -265,6 +273,11 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     layer_types = records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    # A schedule whose dense layers are all of them routes nothing, as the reference builds it, and the
+    # mixture's fields describe nothing it computes.
+    routed = deepseek_routed(hf_config, layers, used)
+    if not routed:
+        used.update((*_LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
     sparse_name = ('deepseek_sparse_attention'
                    if sparse else 'full_attention')
     if hf_config.get('layer_types') is None:
@@ -342,7 +355,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'index_head_dim': (None if index is None
                                else index['index_head_dim']),
         }},
-        mixture=mixture(hf_config, layers, used),
+        mixture=mixture(hf_config, layers, used) if routed else None,
     )
     return config
 
