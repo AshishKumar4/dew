@@ -277,7 +277,7 @@ class CLIPVisionTransformer(nn.Module):
     def __call__(self, pixel_values) -> CLIPTowerOutput:
         pixel_values = checked_image(pixel_values, self.num_channels, self.image_size)
         batch = pixel_values.shape[0]
-        # torch convolves channels first; nn.Conv takes them last.
+        # torch convolves channels first; Conv takes them last.
         patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
         patches = patches.reshape(batch, -1, self.hidden_size)
         class_token = jnp.broadcast_to(self.class_embedding.astype(patches.dtype),
