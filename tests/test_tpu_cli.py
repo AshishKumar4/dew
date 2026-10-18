@@ -209,6 +209,17 @@ def test_create_uses_the_configured_defaults(fake):
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-central2-b"}
 
 
+def test_a_dry_run_writes_nothing_it_would_keep(fake):
+    """A dry run prints the commands and changes no file: a create with a data disk leaves the
+    zone cache and writes no startup script, and a setup writes no setup script."""
+    fake.offer("slice", "us-central2-b")
+    (config_dir() / "zones.json").write_text(json.dumps({"slice": "europe-west4-a"}))
+    before = {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()}
+    assert run("create", "slice", "--dry-run", "--disk", "data") == 0
+    assert run("setup", "slice", "--dry-run", "--zone", "us-central2-b") == 0
+    assert {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()} == before
+
+
 def test_delete_removes_the_queued_resource_that_holds_the_node(fake):
     fake.offer("slice", "us-central2-b", dict(
         NODE, queuedResource="projects/p/locations/us-central2-b/queuedResources/qr-slice"))
