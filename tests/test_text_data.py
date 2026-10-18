@@ -539,8 +539,9 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
 
 
 def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
-    """Grain's packer refuses an over-long element, so the loader cuts first;
-    each piece is its own segment and its positions start again at 0."""
+    """Grain's packer refuses an over-long element, so the loader cuts first,
+    into pieces that share their boundary token so each keeps its next-token
+    target; each piece is its own segment and its positions start again at 0."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
     data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1,
@@ -548,8 +549,8 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
 
     rows = [batch["text"][0] for batch in data.val(DataPartition())]
     positions = [batch["text_coordinates"].positions[0] for batch in data.val(DataPartition())]
-    assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
-    np.testing.assert_array_equal(np.concatenate(rows)[:10],
+    assert len(rows) == 3  # pieces 3 ids apart, one per window
+    np.testing.assert_array_equal(np.concatenate([rows[0], *(row[1:] for row in rows[1:])])[:10],
                                   [*list(range(10, 19)), 0])
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
