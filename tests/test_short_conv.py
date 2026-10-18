@@ -13,7 +13,7 @@ import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
-from tuned import each_config
+from tuned import each_config, launches, timed
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
@@ -126,16 +126,21 @@ def configs(op) -> list:
                                                   grads), x, weights)
 
 
-def test_the_tuner_reads_the_convs_launches_and_stores_their_picks():
-    """A delta conv and its gradients, traced as the tuner reads a program: one forward launch and one
-    backward launch a piece, each a tuner op keyed by its pieces, and a pick for each stored and read
-    back as the tuner stores them, by the same launch and key."""
-    x, weights, _, _ = operands(2, 37, DELTA)
+def test_the_tuner_reads_times_and_stores_the_convs_launches():
+    """A right-padded delta conv and its gradients, traced as the tuner reads a program: one forward
+    launch and one backward launch a piece, each a tuner op keyed by its pieces; each timed on rows
+    whose every token is real (`KernelOp.operands`), so every token's output and the taps' gradients
+    are written, where the default operands' zero validity masks every token; and a pick for each
+    stored and read back as the tuner stores them, by the same launch and key."""
+    x, weights, _, kept = operands(2, 37, DELTA, valid=True)
     grads = cotangents(x, DELTA, jnp.bfloat16)
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(jax.jit(lambda x, weights: run(
-            kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16, grads)), x, weights)
+    found = launches(lambda x, weights: run(kernel_conv, x, weights, None, kept, DELTA, jnp.bfloat16, grads),
+                     x, weights)
     assert sorted(type(ba.op).__name__ for ba in found) == ["ConvBackward"] * len(DELTA) + ["ConvForward"]
+    for ba in found:
+        written = timed(ba) if type(ba.op) is short_conv.ConvForward else timed(ba)[1:2]
+        for array in written:
+            assert np.all(np.any(np.asarray(array, np.float32) != 0, axis=-1)), type(ba.op).__name__
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     keyed = [ba.op.keyed(ba) for ba in found]
