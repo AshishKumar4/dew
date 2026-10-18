@@ -476,9 +476,8 @@ class Csa2Indexer(FakeQuantizing):
 def _published(kv_store, name: str, layer: str):
     if kv_store is None or name not in kv_store:
         raise ValueError(
-            f"a CSA2 {layer} layer reads {name} from the latest layer that publishes it; "
-            "the model threads one kv_store down its stack when kv_shared_layers are set, "
-            "and a Full layer has to come first")
+            f"a CSA2 {layer} layer reads {name} from the latest layer that publishes it, "
+            "so a Full layer has to come first")
     return kv_store[name]
 
 
