@@ -1250,10 +1250,13 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
         if (isinstance(family, str) and family in decoders.families()
                 and not decoders.families()[family].preserve_source_layout
-                and source_quantization(config) is None):
+                and (source_quantization(config) is None or not layouts)):
             # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
             # through too. A quantized source keeps its packed format by going back
-            # over its source names (`weight_layouts`).
+            # over its source names (`weight_layouts`) where it binds them; a family
+            # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX,
+            # ModernBERT) binds none, and its encoder undoes that rewrite before the
+            # format encodes the weights again (`export`).
             export_adapter = _source_weights
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"

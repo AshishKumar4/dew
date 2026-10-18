@@ -615,6 +615,52 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
         without_provenance.save(tmp_path / "refused", variables=state.variables)
 
 
+PREPARED = {"gpt2-tiny": "transformer.h.0.attn.c_attn.weight",
+            "gptj-tiny": "transformer.h.0.attn.q_proj.weight",
+            "gpt-neox-tiny": "gpt_neox.layers.0.attention.query_key_value.weight",
+            "modernbert-tiny": "model.layers.0.attn.Wqkv.weight"}
+"""Families whose `prepare` rewrites a tensor before it binds, and the one
+each checkpoint ships in FP8 here: GPT-2's Conv1D qkv, GPT-J's query rows
+in rotary order, GPT-NeoX's and ModernBERT's fused qkv."""
+
+
+@pytest.mark.parametrize("fixture", list(PREPARED), ids=list(PREPARED))
+def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its_format(fixture, tmp_path):
+    """The family's encoder undoes its preparation (GPT-J's reverse rotary
+    order, GPT-2's transpose and fused qkv) and the format encodes the
+    weights it shipped quantized again: the export is the dense export of the
+    same weights with that one tensor in FP8, under the source's config, and
+    Dew reads back the weights its decoded export holds."""
+    from dew.interop.codecs import source_quantization
+
+    name = PREPARED[fixture]
+    tensors = tool.source_tensors(FIXTURES / fixture)
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    plain = dict(config)
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    quantization = source_quantization(config)
+    assert quantization is not None
+    save_hf_layout(quantization.requantize(tensors, (name,)), config, tmp_path / "fp8")
+    loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
+    assert loaded.quantized_tensors == (name,)
+    updated = jax.tree.map(
+        lambda leaf: leaf * 1.03 + 1e-3 if np.issubdtype(leaf.dtype, np.floating) else leaf, loaded.variables)
+
+    loaded.save(tmp_path / "export", variables=updated)
+    dense = dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated)
+    expected = quantization.requantize(dict(dense), (name,))
+    exported = tool.source_tensors(tmp_path / "export")
+    assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
+    assert set(exported) == set(expected)
+    for tensor, value in expected.items():
+        assert exported[tensor].dtype == value.dtype, tensor
+        np.testing.assert_array_equal(exported[tensor], value, err_msg=tensor)
+    save_hf_layout({**dense, name: quantization.decode(exported, name)}, plain, tmp_path / "decoded")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    decoded = Pretrained.load(tmp_path / "decoded", dtype="float32", attention_impl="reference")
+    assert_restores(decoded.model, decoded.variables, reloaded, np.load(FIXTURES / fixture / "input_ids.npy"))
+
+
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
     """A GPT OSS source shipped MXFP4 writes its trained experts back as
     blocks and scales the released reader decodes, and every float tensor
