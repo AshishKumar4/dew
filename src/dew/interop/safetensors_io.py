@@ -296,7 +296,7 @@ _MAX_HEADER = 100_000_000
 """The largest header safetensors reads (`MAX_HEADER_SIZE`, safetensors 0.8.0)."""
 
 
-class _Pairs(list[tuple[str, JSON]]):
+class _Pairs(list[tuple[str, object]]):
     """A JSON object's key-value pairs in order, kept so a header reader applies
     the duplicate-key rule of the type it reads the object as."""
 
@@ -333,12 +333,12 @@ def _header(stream, filename: str) -> tuple[_Entries, dict[str, str], int]:
     # TensorInfo) refuses a field named twice and ignores one it does not know, and a
     # map (the tensors, the metadata) keeps the last value of a repeated key.
     stated = [value for key, value in header if key == "__metadata__"]
-    held = stated[0] if stated else None
-    metadata = dict(held) if isinstance(held, _Pairs) else {}
-    if (len(stated) > 1 or not (held is None or isinstance(held, _Pairs))
-            or not all(isinstance(value, str) for value in metadata.values())):
+    held = stated[0] if stated else _Pairs()
+    if (len(stated) > 1 or not isinstance(held, _Pairs | None)
+            or not all(isinstance(value, str) for _, value in held or ())):
         raise ValueError(f"{filename} is not a safetensors file: its __metadata__ is not one table "
                          "of strings")
+    metadata = {key: value for key, value in held or () if isinstance(value, str)}
     entries: _Entries = {}
     spans = []
     for name, entry in {key: value for key, value in header if key != "__metadata__"}.items():
