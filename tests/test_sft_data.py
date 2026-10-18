@@ -126,14 +126,15 @@ def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, toke
 
 
 def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
-    """A conversation longer than the window is cut like a document, and the
-    chunks reassemble to the render, ids and roles together."""
+    """A conversation longer than the window is cut like a document, into
+    chunks that share their boundary token, and the chunks reassemble to the
+    render, ids and roles together."""
     window = 64
     conversation = SHORT * 5
     path = write_parquet(tmp_path, [conversation])
     ids, roles = render(tokenizer, conversation)
     assert len(ids) > window
-    chunks = -(-len(ids) // window)
+    chunks = -(-(len(ids) - 1) // (window - 1))
 
     data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1,
         validation=path, long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
@@ -142,10 +143,12 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     assert data.val is not None
     batches = list(data.val(DataPartition()))
     assert len(batches) == chunks
-    np.testing.assert_array_equal(
-        np.concatenate([batch["text"][0] for batch in batches])[:len(ids)], ids)
-    np.testing.assert_array_equal(
-        np.concatenate([batch[ROLES_KEY][0] for batch in batches])[:len(ids)], roles)
+    def joined(field):
+        pieces = [batch[field][0] for batch in batches]
+        return np.concatenate([pieces[0], *(piece[1:] for piece in pieces[1:])])[:len(ids)]
+
+    np.testing.assert_array_equal(joined("text"), ids)
+    np.testing.assert_array_equal(joined(ROLES_KEY), roles)
 
 
 @pytest.mark.slow
