@@ -143,6 +143,30 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
     assert head + joined == expected
 
 
+def test_a_random_step_draws_alike_in_every_read_of_one_order():
+    """A random step's draw is keyed by its record's place in the order and by the step's place in
+    what the run wrote, never by how the read lowers the steps before it: a memory read, which runs
+    the map before it over the whole source, an indexed read and a streamed read of one share draw
+    the same values, in a mixture as alone, and a second random step draws apart from the first."""
+    rows = Pipeline(source(8)).map(Tagged())
+    alone = rows.random_map(Draw()).repeat(1).batch(4)
+    mixed = mix([rows.random_map(Draw()).repeat(1)]).batch(4)
+
+    def draws(chain, read):
+        data = compile(chain, read=read, loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return [(int(index), int(draw)) for batch in itertools.islice(stream, 2)
+                    for index, draw in zip(batch["id"], batch["draw"], strict=True)]
+        finally:
+            stream.close()
+
+    for chain in (alone, mixed):
+        assert draws(chain, "memory") == draws(chain, "indexed") == draws(chain, "streamed")
+    again = draws(rows.random_map(Draw()).random_map(Draw()).repeat(1).batch(4), "indexed")
+    assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
     prefix = Pipeline(source(8))
