@@ -615,43 +615,49 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
         without_provenance.save(tmp_path / "refused", variables=state.variables)
 
 
-PREPARED = {"gpt2-tiny": "transformer.h.0.attn.c_attn.weight",
-            "gptj-tiny": "transformer.h.0.attn.q_proj.weight",
-            "gpt-neox-tiny": "gpt_neox.layers.0.attention.query_key_value.weight",
-            "modernbert-tiny": "model.layers.0.attn.Wqkv.weight"}
-"""Families whose `prepare` rewrites a tensor before it binds, and the one
-each checkpoint ships in FP8 here: GPT-2's Conv1D qkv, GPT-J's query rows
-in rotary order, GPT-NeoX's and ModernBERT's fused qkv."""
+PREPARED = {"gpt2": ("gpt2-tiny", "transformer.h.0.attn.c_attn.weight", ""),
+            "gpt2-bare": ("gpt2-tiny", "h.0.attn.c_attn.weight", "transformer."),
+            "gptj": ("gptj-tiny", "transformer.h.0.attn.q_proj.weight", ""),
+            "gpt-neox": ("gpt-neox-tiny", "gpt_neox.layers.0.attention.query_key_value.weight", ""),
+            "modernbert": ("modernbert-tiny", "model.layers.0.attn.Wqkv.weight", "")}
+"""Families whose `prepare` rewrites a tensor before it binds, the one each
+checkpoint ships in FP8 here, and the prefix its names leave out: GPT-2's
+Conv1D qkv, also as the bare GPT2Model stores it without `transformer.`,
+GPT-J's query rows in rotary order, GPT-NeoX's and ModernBERT's fused qkv."""
 
 
-@pytest.mark.parametrize("fixture", list(PREPARED), ids=list(PREPARED))
-def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its_format(fixture, tmp_path):
+@pytest.mark.parametrize("case", list(PREPARED), ids=list(PREPARED))
+def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its_format(case, tmp_path):
     """The family's encoder undoes its preparation (GPT-J's reverse rotary
-    order, GPT-2's transpose and fused qkv) and the format encodes the
-    weights it shipped quantized again: the export is the dense export of the
-    same weights with that one tensor in FP8, under the source's config, and
-    Dew reads back the weights its decoded export holds."""
+    order, GPT-2's transpose, fused qkv and nested names) and the format
+    encodes the weights it shipped quantized again: the export holds the
+    source's own tensor names, each the dense export of the same weights
+    with that one tensor in FP8, under the source's config, and Dew reads
+    back the weights its decoded export holds."""
     from dew.interop.codecs import source_quantization
 
-    name = PREPARED[fixture]
-    tensors = tool.source_tensors(FIXTURES / fixture)
+    fixture, name, bare = PREPARED[case]
+    tensors = {stored.removeprefix(bare): tensor
+               for stored, tensor in tool.source_tensors(FIXTURES / fixture).items()}
     config = json.loads((FIXTURES / fixture / "config.json").read_text())
     plain = dict(config)
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     quantization = source_quantization(config)
     assert quantization is not None
-    save_hf_layout(quantization.requantize(tensors, (name,)), config, tmp_path / "fp8")
+    source = quantization.requantize(tensors, (name,))
+    save_hf_layout(source, config, tmp_path / "fp8")
     loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
     assert loaded.quantized_tensors == (name,)
     updated = jax.tree.map(
         lambda leaf: leaf * 1.03 + 1e-3 if np.issubdtype(leaf.dtype, np.floating) else leaf, loaded.variables)
 
     loaded.save(tmp_path / "export", variables=updated)
-    dense = dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated)
-    expected = quantization.requantize(dict(dense), (name,))
+    dense = {stored.removeprefix(bare): tensor for stored, tensor in
+             dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
+    expected = quantization.requantize(dense, (name,))
     exported = tool.source_tensors(tmp_path / "export")
     assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
-    assert set(exported) == set(expected)
+    assert set(exported) == set(expected) == set(source)
     for tensor, value in expected.items():
         assert exported[tensor].dtype == value.dtype, tensor
         np.testing.assert_array_equal(exported[tensor], value, err_msg=tensor)
