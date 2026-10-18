@@ -18,7 +18,6 @@ from reference_error import float64_terms
 
 from dew.nn import linear
 from dew.nn.kernels import fla_gdn
-from dew.nn.linear import FORGET
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -132,14 +131,25 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     representation (`bwd_wy_dqkg`: `q dq_mem`, `-k dk_mem`, the chunk's last row's memory term,
     `k exp(g) dkgb beta`) and from the scores within the chunk (`bwd_intra`: `q dq2`, `k dk2`,
     `-k dkt`), each summed back over its chunk, and their sum: the gradient, the parts as its
-    float64 path adds them, for `float64_terms`. `starts` `[B, T]` marks packed documents as the
-    port runs them, the decay forgotten at each one's first token. A row's first token's and a
-    document's first token's gradients are the port's own (`fla_kda.first_decay_grad`, a gradient
-    stopped), not these."""
-    dtype = q.dtype
-    batch, length, heads, width = k.shape
+    float64 path adds them, for `float64_terms`. `starts` `[B, T]` (host) marks packed documents,
+    each a sequence of its own as the port runs them (fla's varlen): its chunks from its first token,
+    its memory from zero but the row's first, the row's final memory's cotangent its last's. A row's
+    first token's and a document's first token's gradients are the port's own
+    (`fla_kda.first_decay_grad`), not these."""
     if starts is not None:
-        g = g + jnp.where(jnp.asarray(starts)[..., None, None], FORGET, 0.0).astype(dtype)
+        rows = []
+        for row, begun in enumerate(np.asarray(starts, bool)):
+            cuts = [0, *(np.flatnonzero(begun[1:]) + 1), begun.size]
+            pieces = []
+            for index, (begin, end) in enumerate(itertools.pairwise(cuts)):
+                memory, cotangent = h0[row:row + 1], dht[row:row + 1]
+                pieces.append(fla_decay_parts(
+                    *(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
+                    memory if index == 0 else jnp.zeros_like(memory), do[row:row + 1, begin:end],
+                    cotangent if end == begun.size else jnp.zeros_like(cotangent), chunk=chunk))
+            rows.append(tuple(jnp.concatenate(parts, axis=1) for parts in zip(*pieces, strict=True)))
+        return tuple(jnp.concatenate(parts, axis=0) for parts in zip(*rows, strict=True))
+    batch, length, heads, width = k.shape
     pad = -length % chunk
     q, k, v, g, do = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (q, k, v, g, do))
     beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
@@ -232,22 +242,10 @@ def plain_prefix(g, chunk: int = CHUNKED):
     return g + jax.lax.stop_gradient(recut - g)
 
 
-DECAY_SUMS = ("['A_log']", "['dt_bias']", "['in_proj_a']")
-"""A delta rule layer's decay parameters and the projection to its decay: each gradient sums every
-token's decay gradient over a layer's few heads, and with it every token's prefix rounding on the
-port, two draws of which no ratio holds (on an A100 they sat 0.4 to 3 times the port's formula's);
-each token's is held by test_linear_attention's
-test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does."""
-
-
-def port_formula(query, key, value, g, beta, state=None, *, starts=None):
-    """`linear.fla_rule`'s formula in the portable math: each packed document's first token decays by
-    `linear.FORGET`, and every range is the difference of two plain fp32 prefixes per row-aligned
-    chunk (`plain_prefix`), as the port takes them. A second rounding sample of the port's own
-    formula, where fla, which restarts a varlen sequence's prefix, cannot run."""
-    if starts is not None:
-        forget = jnp.asarray(starts, bool).reshape(*starts.shape, *(1,) * (g.ndim - 2))
-        g = g + jnp.where(forget, linear.FORGET, 0.0)
+def port_formula(query, key, value, g, beta, state=None):
+    """`linear.fla_rule`'s formula in the portable math over unpacked rows: every range the
+    difference of two plain fp32 prefixes per row-aligned chunk (`plain_prefix`), as the port takes
+    them. A second rounding sample of the port's own formula, where fla cannot run."""
     group = value.shape[2] // key.shape[2]
     query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
     decay = plain_prefix(g).reshape(*value.shape[:3], -1)
