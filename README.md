@@ -435,7 +435,7 @@ tokenizer = HFTokenizer("gpt2")
 data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory", loading=Loading(workers=0), validation_records=(4) * (32))
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
                           num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
-objective = LMObjective(model, seq_len=256)
+objective = LMObjective(model, seq_len=256, ema_decay=0.999)
 lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
     data, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("Once upon a time")],
