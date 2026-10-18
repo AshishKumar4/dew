@@ -38,7 +38,7 @@ from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion, decode_routed_experts
+from .clients import OpenAICompletion, _engine_stops, decode_routed_experts
 from .serving import Server, settled
 
 if TYPE_CHECKING:
@@ -682,9 +682,8 @@ class VLLMGenerateServer(_RequestServer):
         sampling = self._sampling
         parameters: dict[str, JSON] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                        "top_k": sampling.top_k, "min_p": sampling.min_p,
-                                       "max_tokens": budget, "seed": seed, "logprobs": 0}
-        if sampling.eos_token_ids is not None:
-            parameters["stop_token_ids"] = list(sampling.stops)
+                                       "max_tokens": budget, "seed": seed, "logprobs": 0,
+                                       **_engine_stops(sampling, "vllm")}
         response = _post(self._root, "/inference/v1/generate",
                          {"token_ids": list(prompt), "sampling_params": parameters}, self._timeout)
         (choice,) = response.json()["choices"]
