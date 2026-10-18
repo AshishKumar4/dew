@@ -41,10 +41,15 @@ def block(name: str, addresses: Sequence[str], user: str) -> str:
 
 
 def _without(text: str, name: str) -> str:
+    """`text` without the TPU's block. A start marker without its end marker leaves the block's
+    extent unknown, so it is refused rather than taking every entry after it."""
     start, end = _markers(name)
     if start not in text:
         return text
     head, _, rest = text.partition(start)
+    if end not in rest:
+        raise ValueError(f"{path()} holds {start.strip()!r} without {end.strip()!r}; restore the end "
+                         "marker or remove the block by hand")
     _, _, tail = rest.partition(end)
     return head + tail
 

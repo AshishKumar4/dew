@@ -220,6 +220,24 @@ def test_a_dry_run_writes_nothing_it_would_keep(fake):
     assert {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()} == before
 
 
+def test_ssh_config_refuses_a_block_without_its_end_marker_and_keeps_the_file(fake):
+    """The TPU's ~/.ssh/config block lies between its two markers. A file holding the start marker
+    without the end one is refused, and every entry in it is kept as it was; with the end marker
+    back, the block is replaced and the entries after it are kept."""
+    fake.offer("slice", "us-central2-b")
+    config = Path(os.environ["HOME"]) / ".ssh" / "config"
+    config.parent.mkdir()
+    block = "# dew tpu slice\nHost slice\n    HostName 10.0.0.1\n"
+    other = "Host other\n    HostName 10.9.9.9\n"
+    config.write_text(block + other)
+    with pytest.raises(ValueError):
+        run("ssh-config", "slice")
+    assert config.read_text() == block + other
+    config.write_text(block + "# end dew tpu slice\n" + other)
+    assert run("ssh-config", "slice") == 0
+    assert other in config.read_text() and config.read_text().count("# dew tpu slice") == 1
+
+
 def test_delete_removes_the_queued_resource_that_holds_the_node(fake):
     fake.offer("slice", "us-central2-b", dict(
         NODE, queuedResource="projects/p/locations/us-central2-b/queuedResources/qr-slice"))
