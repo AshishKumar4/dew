@@ -27,7 +27,8 @@ writes tests/fixtures/hf/dory-1.0-4b/probe.npz from the released checkpoint
 (`source.json`'s revision): the logits of two prompts, a sentence and
 `WINDOW` ids past the 1024-token window, at float64, fp32 and bf16 on
 `PROBE_COLUMNS` columns, and each cache's float64 greedy continuation of the
-sentence. Its float64 weights take 32 GB of the device.
+sentence. The float64 runs take the host's CPU, whose 32 GB of float64
+weights an A100 of 40 GB does not hold; fp32 and bf16 run on `--device`.
 """
 
 from __future__ import annotations
@@ -79,19 +80,20 @@ def slerp_alpha(a, b, alpha, alpha_scale):
 
 
 def rotate(x, positions, theta, factor=1.0):
-    """vLLM's neox-style rotary: a rope `int(head_dim * factor)` wide over each head's leading
-    dims, its two halves turned together, the rest passed through (get_rope, rotary_embedding
-    __init__.py:66-76, and RotaryEmbedding's neox forward). The angles are fp32, as its
-    `_compute_cos_sin_cache` builds them (base.py:80-102 at 153a1716), float64 in a float64 run,
-    and their cos and sin take the activations' dtype, as its cache does."""
+    """vLLM's neox-style rotary on CUDA: a rope `int(head_dim * factor)` wide over each head's
+    leading dims, its two halves turned together, the rest passed through (get_rope,
+    rotary_embedding/__init__.py:66-76). The angles are fp32, as `_compute_cos_sin_cache` builds
+    them (base.py:94-103), float64 in a float64 run; the cos and sin round to the activations'
+    dtype, as `_match_cos_sin_cache_dtype` casts the cache (base.py:105-131); and the kernel turns
+    each pair in fp32 and rounds once (pos_encoding_kernels.cu:9-33, all at 55076950)."""
     width = int(x.shape[-1] * factor)
     exact = torch.float64 if x.dtype == torch.float64 else torch.float32
     inv = 1.0 / (theta ** (torch.arange(0, width, 2, dtype=exact, device=x.device) / width))
     angles = positions.to(exact)[:, None] * inv[None, :]
     half = width // 2
-    cos, sin = angles.cos().to(x.dtype)[:, None, :], angles.sin().to(x.dtype)[:, None, :]
-    x1, x2, rest = x[..., :half], x[..., half:width], x[..., width:]
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], dim=-1)
+    cos, sin = (wide(table.to(x.dtype))[:, None, :] for table in (angles.cos(), angles.sin()))
+    x1, x2, rest = wide(x[..., :half]), wide(x[..., half:width]), x[..., width:]
+    return torch.cat([(x1 * cos - x2 * sin).to(x.dtype), (x2 * cos + x1 * sin).to(x.dtype), rest], dim=-1)
 
 
 class DoryReference:
@@ -109,7 +111,7 @@ class DoryReference:
         self.dtype = dtype
         c = self.c
         self.std = c['initializer_range']
-        self.d, self.heads, self.kv = c['head_dim'], c['num_attention_heads'], c['num_key_value_heads']
+        self.d, self.heads_count, self.kv = c['head_dim'], c['num_attention_heads'], c['num_key_value_heads']
         g0 = c['attention_output_gate_logit_scale_init']
         g0 = c['hidden_size'] ** 0.5 if g0 is None else g0
         self.sqk_factor = self.d ** 0.5 / self.std
@@ -120,9 +122,9 @@ class DoryReference:
     def _w(self, name):
         return self.w[name]
 
-    def attention(self, j, h, positions, cache, loop):
-        """dory.py:134-161 over the step's tokens, `cache` the (keys, values, positions) earlier
-        tokens left this layer (None for none); returns the output and the step's own entries."""
+    def heads(self, j, h, positions):
+        """dory.py:135-149: attention layer `j`'s rotated, normed and scaled query heads, its
+        keys and values as its cache stores them, and its gate's logits."""
         p = f'backbone.layers.{j}.mixer.'
         q = h @ self._w(p + 'q_proj.weight').T
         k = h @ self._w(p + 'k_proj.weight').T
@@ -132,26 +134,42 @@ class DoryReference:
         rope = self.c['rope_parameters'][kind]
         theta, factor = rope['rope_theta'], rope.get('partial_rotary_factor', 1.0)
         t = h.shape[0]
-        q = rotate(q.view(t, self.heads, self.d), positions, theta, factor)
+        q = rotate(q.view(t, self.heads_count, self.d), positions, theta, factor)
         k = rotate(k.view(t, self.kv, self.d), positions, theta, factor)
-        sqk = (wide(self._w(p + 'sqk')) * self.sqk_factor).view(1, self.heads, self.d)
+        sqk = (wide(self._w(p + 'sqk')) * self.sqk_factor).view(1, self.heads_count, self.d)
         q = (sqk.square() * wide(justnorm(q))).to(q.dtype)
-        k = justnorm(k)
-        v = v.view(t, self.kv, self.d)
+        return q, justnorm(k), v.view(t, self.kv, self.d), gate
+
+    def attention(self, j, h, positions, cache, loop):
+        """dory.py:134-161 over the step's tokens, `cache` the (keys, values, positions) earlier
+        tokens left this layer (None for none); returns the output and the step's own entries.
+
+        The attention is vLLM's kernels' arithmetic (triton_unified_attention.py:543-599 and
+        triton_attention_helpers.py:462-484 at 55076950): fp32 scores of the stored queries and
+        keys, scaled in fp32, their exponentials from the row's maximum in fp32, those rounded to
+        the values' dtype for the fp32 product with the values, the sum divided by the fp32 sum of
+        the exponentials, and the result rounded to the values' dtype. The kernel walks the keys in
+        tiles and shifts each tile's exponentials by the maximum so far; this takes the whole row's
+        maximum, which moves where the exponentials round, not by how much."""
+        p = f'backbone.layers.{j}.mixer.'
+        q, k, v, gate = self.heads(j, h, positions)
+        t = h.shape[0]
         own = (k, v, positions)
         if cache is not None:
             k, v, key_positions = (torch.cat([held, new]) for held, new in zip(cache, own, strict=True))
         else:
             key_positions = positions
-        repeat = self.heads // self.kv
+        repeat = self.heads_count // self.kv
         keys, values = k.repeat_interleave(repeat, dim=1), v.repeat_interleave(repeat, dim=1)
-        logits = torch.einsum('qhd,khd->hqk', q, keys) / math.sqrt(self.d)
+        scores = (1.0 / math.sqrt(self.d)) * torch.einsum('qhd,khd->hqk', wide(q), wide(keys))
         distance = positions[:, None] - key_positions[None, :]
         visible = distance >= 0
-        if kind == 'sliding_attention':
+        if self.c['layer_types'][j] == 'sliding_attention':
             visible &= distance < self.c['sliding_window']
-        logits = logits.masked_fill(~visible[None], float('-inf'))
-        out = torch.einsum('hqk,khd->qhd', torch.softmax(wide(logits), dim=-1).to(values.dtype), values)
+        scores = scores.masked_fill(~visible[None], float('-inf'))
+        weights = torch.exp(scores - scores.amax(dim=-1, keepdim=True))
+        summed = torch.einsum('hqk,khd->qhd', wide(weights.to(values.dtype)), wide(values))
+        out = (summed / weights.sum(dim=-1).transpose(0, 1)[..., None]).to(values.dtype)
         sg = (wide(self._w(p + 's_gate')) * self.gate_factor).square()
         out = (wide(out.reshape(t, -1)) * torch.sigmoid(wide(gate) * sg)).to(out.dtype)
         out = justnorm(out)
@@ -181,12 +199,24 @@ class DoryReference:
             pending[key] = own
         return slerp_alpha(h, out, self._w(f'backbone.layers.{j}.attn_alpha'), self.alpha_scale)
 
+    def embedded(self, ids):
+        rows = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+        return self._w('backbone.embeddings.weight')[rows]
+
+    def first_keys(self, ids):
+        """The keys the first layer caches for each row of `ids` `[B, S]`: rotated and unit-normed,
+        in the run's dtype, as float64 arrays."""
+        with torch.no_grad():
+            places = torch.arange(ids.shape[1], device=self.device)
+            return np.stack([self.heads(0, self.embedded(row), places)[1].to(torch.float64).cpu().numpy()
+                             for row in ids])
+
     def hidden(self, ids, positions, caches=None, cut=None):
         """dory.py:254-280 over the step's tokens. `cut` is the pass whose incoming state carries
         no gradient (Dew's `Loop.backprop_steps`, Huginn's truncation): the input layers still
         train through what every pass from it reinjects."""
         c = self.c
-        h = self._w('backbone.embeddings.weight')[torch.as_tensor(ids, dtype=torch.long, device=self.device)]
+        h = self.embedded(ids)
         positions = positions.to(self.device)
         n_in, n_rec = c['n_input_layers'], c['n_recurrent_layers']
         for j in range(n_in):
@@ -352,6 +382,8 @@ def write_tiny() -> None:
 
     for loops in (1, 2, 4):
         both(f'logits_{loops}', lambda reference: reference.forward(ids), loops=loops)
+    both('keys', lambda reference: reference.first_keys(ids))
+    arrays['keys_bf16'] = DoryReference(CONFIG, tensors, torch.bfloat16).first_keys(ids)
     for mode in ('per_loop', 'last_loop'):
         tokens, steps = DoryReference(CONFIG, tensors, torch.float64, mode=mode).decode(ids[0, :6], 8)
         arrays[f'generated_{mode}'], arrays[f'step_logits_{mode}_f64'] = tokens, steps
@@ -409,8 +441,8 @@ WINDOW = 1100
 
 def write_released(device: str) -> None:
     """The released checkpoint's probe (module docstring), its bf16 tensors widened to each dtype:
-    float64, fp32 and bf16 logits, each position's float64 argmax and top-two margin, and each
-    cache's float64 greedy continuation of the sentence."""
+    float64 logits on the host's CPU, fp32 and bf16 ones on `device`, each position's float64 argmax
+    and top-two margin, and each cache's float64 greedy continuation of the sentence."""
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
     from tokenizers import Tokenizer
@@ -425,8 +457,9 @@ def write_released(device: str) -> None:
                'window': np.random.default_rng(7).integers(1000, config['vocab_size'], WINDOW)}
     kept = {'sentence': slice(None), 'window': slice(WINDOW - 64, None)}
     arrays: dict[str, np.ndarray] = dict(prompts)
-    for suffix, dtype in (('_f64', torch.float64), ('', torch.float32), ('_bf16', torch.bfloat16)):
-        reference = DoryReference(config, tensors, dtype, device=device)
+    runs = (('_f64', torch.float64, 'cpu'), ('', torch.float32, device), ('_bf16', torch.bfloat16, device))
+    for suffix, dtype, where in runs:
+        reference = DoryReference(config, tensors, dtype, device=where)
         for name, ids in prompts.items():
             logits = reference.forward(ids[None])[0][kept[name]]
             if dtype == torch.float64:
@@ -440,7 +473,7 @@ def write_released(device: str) -> None:
             arrays[f'{name}_logits{suffix}'] = logits[:, arrays['columns']]
         del reference
     for mode in ('per_loop', 'last_loop'):
-        reference = DoryReference(config, tensors, torch.float64, mode=mode, device=device)
+        reference = DoryReference(config, tensors, torch.float64, mode=mode, device='cpu')
         arrays[f'generated_{mode}'] = reference.decode(prompts['sentence'], 16)[0][len(prompts['sentence']):]
         del reference
     np.savez(RELEASED / 'probe.npz', **arrays)

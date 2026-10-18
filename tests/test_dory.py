@@ -13,7 +13,7 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -63,6 +63,22 @@ def changed(directory: Path, change: dict) -> Path:
     return directory
 
 
+LOGIT_TOLERANCE = 2e-5
+"""The largest absolute difference from the fp32 reference's logits a forward may show. The logits
+reach 20, where an fp32 unit is 1.9e-6; the observed differences are 5.7e-6 at one loop, 6.7e-6 at
+two, 7.6e-6 at four, and 5.7e-6 for the packed rows (xla and reference kernels), on CPU, fp32."""
+
+
+def assert_parity(logits, name: str, label: str) -> None:
+    """CONTRIBUTING's statement of logits parity against the reference's array `name`: the same
+    argmax, within `LOGIT_TOLERANCE` of the fp32 reference, and within tests/reference_error.py's
+    rule against float64."""
+    reference = REFERENCE[name]
+    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    assert float(np.max(np.abs(logits - reference))) < LOGIT_TOLERANCE, label
+    assert_as_exact_as_the_reference(logits, reference, REFERENCE[f'{name}_f64'], label)
+
+
 @pytest.mark.parametrize('loops', [1, 2, 4])
 def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count(loops):
     """The tiny Dory's logits with its recurrent block run once, twice (its own count) and four
@@ -72,13 +88,26 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
     loaded = load()
     model = loaded.model.with_passes(loops)
     ids = REFERENCE['input_ids']
-    expected, truth = REFERENCE[f'logits_{loops}'], REFERENCE[f'logits_{loops}_f64']
-    assert_as_exact_as_the_reference(np.asarray(model.apply(loaded.variables, ids)), expected, truth,
-                                     f'Dory logits at {loops} loops')
+    name = f'logits_{loops}'
+    assert_parity(np.asarray(model.apply(loaded.variables, ids)), name, f'Dory logits at {loops} loops')
     table = model.apply(loaded.variables, method='output_table')
     hidden = model.apply(loaded.variables, ids, method='hidden_states')
-    assert_as_exact_as_the_reference(np.asarray(table.logits(hidden)), expected, truth,
-                                     f"Dory's output table at {loops} loops")
+    assert_parity(np.asarray(table.logits(hidden)), name, f"Dory's output table at {loops} loops")
+
+
+def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
+    """In bf16 the first layer's keys, the projections of the same embeddings, rotate as vLLM's
+    CUDA rotary does (cos and sin rounded to bf16, the turn in fp32, one rounding) and unit-norm in
+    fp32, so the keys a prefill caches sit within a quarter of the reference's own bf16 error of
+    its keys (`assert_rounds_where_the_reference_does`); fp32 tables, which round only the turn,
+    sit a whole bf16 rounding apart."""
+    loaded = Pretrained.load(TINY, dtype='bfloat16', attention_impl='xla')
+    ids = REFERENCE['input_ids']
+    cache = loaded.model.apply(loaded.variables, ids.shape[0], method=CausalTransformer.init_cache,
+                               mutable=['cache'])[1]['cache']
+    _, written = loaded.model.apply({**loaded.variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
+    keys = np.asarray(written['cache']['layers_0']['self_attn']['cached_key'][:, :ids.shape[1]], np.float64)
+    assert_rounds_where_the_reference_does(keys, REFERENCE['keys_bf16'], REFERENCE['keys_f64'], 'bf16 keys')
 
 
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
@@ -120,8 +149,7 @@ def test_packed_documents_read_only_themselves_through_every_pass(attention_impl
     logits = loaded.model.apply(loaded.variables, REFERENCE['packed_ids'],
                                 positions=REFERENCE['packed_positions'],
                                 segment_ids=REFERENCE['packed_segments'])
-    assert_as_exact_as_the_reference(np.asarray(logits), REFERENCE['packed_logits'],
-                                     REFERENCE['packed_logits_f64'], 'Dory packed documents')
+    assert_parity(np.asarray(logits), 'packed_logits', 'Dory packed documents')
 
 
 def greedy(mode: str) -> TextGeneration:

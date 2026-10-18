@@ -42,7 +42,7 @@ from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotat
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, scaled
+from dew.nn.precision import at_least_fp32, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate, yarn_rope_freqs
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -417,13 +417,19 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array):
         """Build the rotary cos and sin this layer rotates its heads by, in
-        the arithmetic `rotate` rotates `heads` in.
+        the arithmetic `rotate` rotates `heads` in, rounded to `heads`'
+        dtype under `MixerContext.narrow_rotary_tables` (`rounded_to`, which
+        compilation keeps)."""
+        tables = self._rotary_tables(rotary_positions, at_least_fp32(heads.dtype))
+        if not self.ctx.narrow_rotary_tables:
+            return tables
+        return rounded_to(tables[0], heads.dtype), rounded_to(tables[1], heads.dtype)
 
-        Interleaved mRoPE, YaRN and the plain rope each build their own
-        angles; YaRN rotates whole heads at its own frequencies, so it
-        takes neither a partial rotary nor a Llama 3.1 ramp.
-        """
-        dtype = at_least_fp32(heads.dtype)
+    def _rotary_tables(self, rotary_positions, dtype):
+        """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
+        plain rope each build their own angles; YaRN rotates whole heads at
+        its own frequencies, so it takes neither a partial rotary nor a
+        Llama 3.1 ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "

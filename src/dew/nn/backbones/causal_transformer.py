@@ -225,6 +225,10 @@ class CausalTransformer(nn.Module):
     rope_scaling: RopeScaling | LongRopeScaling | None = None
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
+    narrow_rotary_tables: bool = False
+    """The rotary's cos and sin round to the activations' dtype before the fp32 rotation, as vLLM
+    casts its cos/sin cache to the query's dtype (`MixerContext.narrow_rotary_tables`); False keeps
+    them at the rotation's precision."""
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5

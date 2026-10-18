@@ -140,7 +140,7 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
         if factor != 1.0 and kind in kinds:
             kinds_of(config).setdefault(kind, native_fields(LayerKind)())['partial_rotary_factor'] = factor
     config.update(
-        partial_rotary_type='default',
+        partial_rotary_type='default', narrow_rotary_tables=True,
         qk_norm=False, pre_norms=False, output_gate=True,
         mixer={'class': 'attention', 'fields': {'gate_projection': 'own'}},
         ngpt={'std': std, 'alpha': alpha, 'gate_logit': gate},
