@@ -20,7 +20,7 @@ except where it packs several records into one row.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from dew.data import (
     audio as audio_steps,
@@ -29,6 +29,7 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
+from dew.data.pipeline import Pack
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -61,9 +62,8 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: i
     first-fit into rows of `seq_len + 1` tokens (the last a target), in
     batches of `batch` rows."""
 
-    return (dataset.map(text_steps.tokenize(tokenizer, field=field))
-            .flat_map(text_steps.Chunks(seq_len + 1, overlap=1))
-            .pack(seq_len + 1).batch(batch))
+    documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
+    return _next_token_windows(documents, Pack(seq_len + 1)).batch(batch)
 
 
 def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
@@ -72,8 +72,30 @@ def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: 
     cut to `seq_len + 1` tokens and packed first-fit into rows of that
     length, in batches of `batch` rows."""
 
-    return (dataset.map(chat.template(tokenizer)).map(chat.fit_length(seq_len + 1))
-            .pack(seq_len + 1, fields=("text", "text_roles")).batch(batch))
+    return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
+                                 long="truncate").batch(batch)
+
+
+_CHAT_FIELDS = ("text", chat.ROLES_KEY)
+"""The per-token fields a rendered conversation packs: its ids and each one's speaker."""
+
+
+def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
+    """Token documents cut into pieces of `pack`'s length overlapping by one token, so each token's
+    next-token target stays in one piece, then packed by `pack`. `lm`, a conversation cut into
+    pieces and the text and chat recipes (`dew.config.data`) prepare text through it."""
+    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1)).then(pack)
+
+
+def _conversation_windows(rendered: Dataset, pack: Pack, *,
+                          long: Literal["truncate", "drop", "chunk"]) -> Pipeline:
+    """Rendered conversations (`chat.template`) packed by `pack` with their speakers: one longer
+    than a window cut at its end, dropped and counted, or cut into pieces (`_next_token_windows`),
+    as `long` says. `sft` and the chat recipe (`dew.config.data.ChatData`) share it."""
+    if long == "chunk":
+        return _next_token_windows(rendered, pack)
+    fitted = chat.fit_length(pack.seq_len, long=long)
+    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted)).then(pack)
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,

@@ -11,38 +11,27 @@ import numpy as np
 from .dataset import Batch
 
 
-def chunk_counts(lengths, chunk_len: int):
-    """How many chunks of at most `chunk_len` tokens each entry of `lengths` is cut into."""
-    return -(-np.asarray(lengths, np.int64) // chunk_len)
+def chunk_table(lengths, chunk_len: int, overlap: int) -> tuple[np.ndarray, np.ndarray]:
+    """The document each chunk is cut from and where in it the chunk starts, both int64 and one
+    entry per chunk, for documents of `lengths` cut into pieces of at most `chunk_len` tokens, each
+    starting `chunk_len - overlap` after the last (`dew.data.text.Chunks`).
 
-
-def chunk_lengths(lengths, chunk_len: int) -> np.ndarray:
-    """The token count of each chunk documents of `lengths` are cut into:
-    consecutive pieces of at most `chunk_len` tokens.
-
-    A window holds nothing longer than itself, so a document that outgrows
-    it is cut first, and each chunk becomes its own segment of the window,
-    which keeps attention inside the chunk and RoPE running from the chunk's
-    own 0. A document of `chunk_len` tokens or fewer is one chunk of its own
-    length; a longer one is whole chunks and a remainder. A document of no
-    tokens is no chunks, as `chunk_counts` says.
-    """
+    A window holds nothing longer than itself, so a document that outgrows it is cut first, and
+    each chunk becomes its own segment of the window, which keeps attention inside the chunk and
+    RoPE running from the chunk's own 0. A document of `chunk_len` tokens or fewer is one chunk; a
+    document of no tokens is no chunks."""
     lengths = np.asarray(lengths, np.int64)
-    counts = chunk_counts(lengths, chunk_len)
-    sizes = np.full(int(counts.sum()), chunk_len, np.int64)
-    kept = counts > 0
-    last = np.cumsum(counts)[kept] - 1
-    sizes[last] = lengths[kept] - (counts[kept] - 1) * chunk_len
-    return sizes
-
-
-def chunk_table(lengths, chunk_len: int) -> tuple[np.ndarray, np.ndarray]:
-    """The document each chunk `chunk_lengths` sizes is cut from, and where
-    in that document the chunk starts, both int64 and one entry per chunk."""
-    counts = chunk_counts(lengths, chunk_len)
+    stride = chunk_len - overlap
+    counts = np.where(lengths > 0, -(-np.maximum(lengths - overlap, 1) // stride), 0)
     documents = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
     first = np.repeat(np.cumsum(counts) - counts, counts)
-    return documents, (np.arange(len(documents), dtype=np.int64) - first) * chunk_len
+    return documents, (np.arange(len(documents), dtype=np.int64) - first) * stride
+
+
+def chunk_lengths(lengths, chunk_len: int, overlap: int) -> np.ndarray:
+    """The token count of each chunk `chunk_table` cuts documents of `lengths` into."""
+    documents, starts = chunk_table(lengths, chunk_len, overlap)
+    return np.minimum(chunk_len, np.asarray(lengths, np.int64)[documents] - starts)
 
 
 def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
