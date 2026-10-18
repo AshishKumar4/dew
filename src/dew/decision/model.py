@@ -67,7 +67,8 @@ class DecisionModel:
                                           rngs=rngs))
 
     def table(self, variables: Variables) -> jax.Array:
-        """Return the backbone's output table as `[V, D]` rows, which a head may read (`AffineHead`)."""
+        """Return the backbone's output table as `[V, D]` rows (`OutputTable.rows`), which a head may
+        read (`AffineHead`)."""
         if not isinstance(self.backbone, AffineHead):
             raise TypeError(f"the head reads its backbone's output table (`AffineHead`), which a "
                             f"{type(self.backbone).__name__} does not give")
@@ -75,7 +76,7 @@ class DecisionModel:
         if not isinstance(table, OutputTable):
             raise ValueError("the head reads its backbone's output table, and no matrix alone gives "
                              "this backbone's logits")
-        return table.matrix if table.vocab_major else table.matrix.T
+        return table.rows()
 
     @staticmethod
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:

@@ -26,6 +26,7 @@ from flax.typing import Dtype
 
 from dew import records
 from dew.interop.components import bind_component, component_source
+from dew.nn.dense import Dense
 from dew.objectives.base import Variables
 
 from ..attention import rms_normalized
@@ -131,7 +132,7 @@ class _LinearAttention(nn.Module):
         batch, height, width, _ = x.shape
         heads = self.features // self.head_dim
         inner = heads * self.head_dim
-        qkv = jnp.concatenate([nn.Dense(inner, use_bias=False, dtype=self.dtype, name=name)(x)
+        qkv = jnp.concatenate([Dense(inner, use_bias=False, dtype=self.dtype, name=name)(x)
                                for name in ("to_q", "to_k", "to_v")], axis=-1)
         qkv = jnp.concatenate(
             [
@@ -161,7 +162,7 @@ class _LinearAttention(nn.Module):
             attended = jnp.einsum("bgde,bnge->bngd", scores, query)
             attended = (attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)).astype(x.dtype)
         attended = attended.reshape(batch, height, width, -1)
-        out = nn.Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out")(attended)
+        out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out")(attended)
         return _norm(self.norm, self.features, self.dtype, "norm_out")(out) + x
 
 

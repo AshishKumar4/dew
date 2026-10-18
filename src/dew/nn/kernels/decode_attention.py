@@ -15,7 +15,9 @@ dots, so a Mosaic GPU port takes it as is.
 The arithmetic is jax.nn's but for the order of its sums: fp32 logits of
 the operands, the scale after, an fp32 softmax, its probabilities in the
 value's dtype for the value product, which accumulates in fp32 and is
-normalized at the end rather than before the product.
+normalized at the end rather than before the product. Both products name
+the highest precision, so fp32 operands multiply in IEEE fp32 whatever the
+default precision, where Triton's default is one TF32 product.
 
 `attend_paged` is the same kernel over a paged cache: a program takes one
 row and one key head with the query heads that share it, and reads the row's
@@ -52,6 +54,10 @@ def fits(query: jax.Array, key: jax.Array) -> bool:
             and 16 <= width <= 256 and key.shape[1] % BLOCK == 0 and query.dtype == key.dtype)
 
 
+FULL = jax.lax.Precision.HIGHEST
+"""Each product's precision: IEEE fp32 for fp32 operands, and bf16's or fp16's own product for those."""
+
+
 def _attend(query: jax.Array, length: jax.Array, read, block: int, scale: float) -> jax.Array:
     """`query` `[QUERIES, D]` over the first `length` keys, `block` at a time,
     `read(step)` giving a step's keys and values `[block, D]`: an online
@@ -63,13 +69,13 @@ def _attend(query: jax.Array, length: jax.Array, read, block: int, scale: float)
     def body(step, carry):
         out, peak, total = carry
         key, value = read(step)
-        logits = plgpu.dot(query, key.T).astype(jnp.float32) * scale              # [QUERIES, block]
+        logits = plgpu.dot(query, key.T, precision=FULL).astype(jnp.float32) * scale  # [QUERIES, block]
         reads = step * block + jnp.arange(block) < length
         logits = jnp.where(reads[None, :], logits, -0.7 * float(jnp.finfo(jnp.float32).max))
         new_peak = jnp.maximum(peak, logits.max(axis=-1))
         correction = jnp.exp(peak - new_peak)
         weights = jnp.exp(logits - new_peak[:, None])
-        product = plgpu.dot(weights.astype(value.dtype), value).astype(jnp.float32)
+        product = plgpu.dot(weights.astype(value.dtype), value, precision=FULL).astype(jnp.float32)
         out = correction[:, None] * out + product
         return out, new_peak, correction * total + weights.sum(axis=-1)
 
@@ -103,7 +109,9 @@ def _paged_kernel(lengths_ref, table_ref, query_ref, key_ref, value_ref, out_ref
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the first `lengths` `[B]` of
-    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out."""
+    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out.
+    Its Pallas call has no derivative: `dew.nn.attention` differentiates it as
+    the folded attention it stands in for."""
     from jax.experimental.pallas import triton as plgpu
 
     batch, positions, heads, width = query.shape
@@ -117,6 +125,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
         out_specs=queried,
         out_shape=jax.ShapeDtypeStruct(padded.shape, query.dtype),
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+        name="decode_attention",
     )(jnp.asarray(lengths, jnp.int32)[:, None], padded, key, value)
     return out[:, :positions]
 
@@ -158,5 +167,6 @@ def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array,
         out_specs=queried,
         out_shape=jax.ShapeDtypeStruct(grouped.shape, query.dtype),
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+        name="paged_decode_attention",
     )(jnp.asarray(lengths, jnp.int32)[:, None], table, grouped, key_pages, value_pages)
     return out[:, :, :group].reshape(rows, heads, width)

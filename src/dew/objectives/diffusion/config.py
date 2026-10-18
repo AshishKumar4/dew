@@ -216,8 +216,10 @@ class DiffusionRunConfig(RunConfig):
     """
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
-    val_metrics: tuple[str, ...] = ("clip",)
-    """Metric aliases or import paths, scored on every validation pass.
+    val_metrics: tuple[str, ...] | None = None
+    """Metric aliases or import paths, scored on every validation pass. None is the run's default:
+    CLIP where an image run's data holds a validation split, and nothing otherwise. A name given
+    is asked for whatever the data holds, so data with no validation split refuses it.
 
     `__post_init__` refuses an alias that names no metric.
     """
@@ -225,7 +227,8 @@ class DiffusionRunConfig(RunConfig):
     def __post_init__(self) -> None:
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
-        object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+        if self.val_metrics is not None:
+            object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
@@ -248,8 +251,6 @@ class DiffusionRunConfig(RunConfig):
                 raise ValueError(
                     f"{self.pretrained} decides the model, its text conditioning and its "
                     f"autoencoder; leave {', '.join(chosen)} unset")
-            if self.objective.fields.get("end_to_end") is not None:
-                raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
             object.__setattr__(self, "text", None)
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
@@ -267,7 +268,7 @@ class DiffusionRunConfig(RunConfig):
             height, width = self.sample_field().shape[-3:-1]
             object.__setattr__(self, "preset", dataclasses.replace(
                 self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
-        unknown = [name for name in self.val_metrics if ":" not in name and name not in metrics]
+        unknown = [name for name in self.val_metrics or () if ":" not in name and name not in metrics]
         if unknown:
             raise ValueError(f"val_metrics names {unknown}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
@@ -356,7 +357,11 @@ class DiffusionRunConfig(RunConfig):
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
-            source = self._source(variables)
+            # A REPA-E run keeps its tuned autoencoder under `params`, where the pipeline's
+            # metadata binds it at the pipeline's own `autoencoder`; the trained tree is kept whole.
+            trained = variables
+            source = self._source(None if variables is None else
+                                  {**variables, "autoencoder": self._autoencoder_params(variables)})
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's
                 # weights, so the objective trains its factors alone.
@@ -367,7 +372,7 @@ class DiffusionRunConfig(RunConfig):
                 raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
                                  "on masks an image dataset does not carry")
             model, conditions, autoencoder = source.model, dict(source.inputs.conditions), source.autoencoder
-            variables, convention = source.variables, source.process
+            variables, convention = source.variables if trained is None else trained, source.process
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
@@ -387,7 +392,7 @@ class DiffusionRunConfig(RunConfig):
         run = self.pinned()
         objective = run.build()
         dataset = run.loader(objective.data())
-        metrics = run.build_eval_metrics()
+        metrics = run.build_eval_metrics(dataset.val is not None)
         rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
                                                     rollout=rollout))
@@ -481,8 +486,9 @@ class DiffusionRunConfig(RunConfig):
                 "name a preset of its kind, or none for the scheduler's own")
         return process
 
-    def build_eval_metrics(self) -> list:
-        """Build the validation metrics `val_metrics` names, each loading its own weights.
+    def build_eval_metrics(self, validates: bool = True) -> list:
+        """Build the validation metrics `val_metrics` names, each loading its own weights, or by
+        default CLIP for an image run whose data `validates`.
 
         A video run scores a `VideoGrid` against its `video` field, so `psnr` and
         `ssim` read that grid there, and an image-only metric raises a ValueError
@@ -491,8 +497,10 @@ class DiffusionRunConfig(RunConfig):
         from dew.artifacts import ImageGrid, VideoGrid
 
         video = len(self.sample_field().shape) == 4
+        names = self.val_metrics if self.val_metrics is not None else (
+            ("clip",) if validates and not video else ())
         built = []
-        for name in self.val_metrics:
+        for name in names:
             if video and name in ("fid", "clip", "clip_score"):
                 raise ValueError(
                     f"metric {name!r} reads an ImageGrid and this run samples video; "
