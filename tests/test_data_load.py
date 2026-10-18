@@ -112,6 +112,52 @@ def test_text_forms_pack_each_document_on_only_one_side_of_the_default_holdout(h
     assert all(batch["text"].shape[1] == options.get("seq_len", 256) + 1 for batch in batches(data))
 
 
+RACE = """
+import io, sys, threading
+from datasets.utils.tqdm import tqdm as bars
+from tqdm.contrib.concurrent import thread_map
+if sys.argv[1] == "held":
+    from dew.data.sources.hub import hold_progress_lock
+    hold_progress_lock()
+started, opened, failures = threading.Event(), threading.Event(), []
+def other():
+    started.wait()
+    bar = bars(total=1, file=io.StringIO())
+    opened.set()
+    mapped.join()
+    try:
+        bar.close()
+    except AttributeError as error:
+        failures.append(str(error))
+def shard(index):
+    started.set()
+    opened.wait()
+    return index
+mapped = threading.Thread(target=lambda: thread_map(shard, [0], tqdm_class=bars, file=io.StringIO()))
+closer = threading.Thread(target=other)
+closer.start(); mapped.start(); closer.join()
+print(failures)
+"""
+"""A `datasets` bar opened while another thread reads shards through tqdm's thread_map, as `datasets` reads
+a split's Arrow shards, and closed once the map has ended, in a fresh interpreter: before any read or after
+the lock a Hub read holds (`hold_progress_lock`)."""
+
+
+def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_read_holds_the_lock():
+    """`datasets`' thread_map deletes its bar class's lock under a bar of another thread's read that outlives
+    the map, as two splits read at once do; after a Hub read holds the class's lock, the map restores it
+    and the bar closes."""
+    import subprocess
+    import sys
+
+    def race(mode: str) -> str:
+        return subprocess.run([sys.executable, "-c", RACE, mode], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    assert race("bare") != "[]"
+    assert race("held") == "[]"
+
+
 def test_a_refused_read_and_disabled_provisioning_leave_the_hub_cache_unprepared(hub):
     builders, _ = hub
     for options in ({"read": "streamed"}, {"read": "memory", "provision": False}):

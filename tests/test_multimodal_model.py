@@ -23,7 +23,7 @@ from safetensors.numpy import load_file
 
 from dew.data.dataset import Loader
 from dew.interop.pretrained import Pretrained
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -429,6 +429,55 @@ def test_audio_only_processor_forward_and_greedy_continuation_match_reference(au
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
     generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
+
+
+def test_a_gemma4_audio_models_prediction_depths_read_its_audio_frames():
+    """A Gemma 4 audio model with a prediction depth initializes and trains with its audio, and the
+    depth reads the embeddings the main forward read, its audio frames in place: its states are
+    the language model's depth over the main forward's own prepared embeddings, bitwise."""
+    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
+    directory = FIXTURE.parent / "gemma-4-audio-tiny"
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    meta = json.loads((directory / "meta.json").read_text())
+    inputs = loaded.processor(meta["prompts"],
+                              audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    model = loaded.model.clone(language_model=loaded.model.language_model.clone(num_nextn_predict_layers=1))
+    variables = model.init(jax.random.key(0), inputs.tokens, **inputs.kwargs())
+    hidden, sown = model.apply(variables, inputs.tokens, **inputs.kwargs(), method="hidden_states",
+                               mutable=["embeddings"])
+    depths = model.apply(variables, hidden, inputs.tokens, **inputs.kwargs(), method="mtp_hidden_states")
+    language = {collection: tree["language_model"] for collection, tree in variables.items()
+                if "language_model" in tree}
+    fields = {name: value for name, value in inputs.kwargs().items()
+              if name not in ("conditioning", "image_indices", "audio_indices")}
+    prepared = sown["embeddings"]["language_model"]["prepared"]
+    over_prepared = model.language_model.apply(language, hidden, inputs.tokens, method="mtp_hidden_states",
+                                               input_embeddings=prepared, **fields)
+    for mine, theirs in zip(depths, over_prepared, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    objective = LMObjective(model, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0, mtp_weight=1.0)
+    statistics, _ = objective.loss(variables, {"text": inputs},
+                                   Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+    assert np.isfinite(float(objective.reduce_loss(statistics)[0]))
+
+
+def test_a_cached_continuation_reads_the_coordinates_its_prefill_was_placed_at():
+    """A cached prefill whose tokens' places come as coordinates alone leaves the decode cursor
+    where raw positions leave it: an implicit continuation step after it is the same, bitwise."""
+    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
+    model, variables = loaded.model, loaded.variables
+    tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))[:1, -6:]
+    positions = jnp.arange(6)[None] + 10
+    cache = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+
+    def continued(**placed):
+        _, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4], decode=True,
+                                 mutable=["cache"], **placed)
+        return model.apply({**variables, "cache": mutated["cache"]}, tokens[:, 4:5], decode=True,
+                           mutable=["cache"])[0]
+
+    np.testing.assert_array_equal(np.asarray(continued(coordinates=coordinates(positions=positions[:, :4]))),
+                                  np.asarray(continued(positions=positions[:, :4])))
 
 
 def test_source_processor_forward_and_cached_generation_match_reference(family_source):

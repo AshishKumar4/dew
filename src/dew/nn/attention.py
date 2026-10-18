@@ -27,7 +27,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.telemetry.devices import deterministic_ops_requested
 
-from .attention_sinks import attention_with_sinks
+from .attention_sinks import sink_softmax
 from .documents import CrossDocuments, document_ids, document_offsets, with_documents
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
@@ -1249,32 +1249,62 @@ def _blocked_values_backward(precision, saved, cotangent):
 _blocked_values.defvjp(_blocked_values_forward, _blocked_values_backward)
 
 
-def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
-                         force_fp32_for_softmax=True, mask=None, bias=None):
-    """Attend with Gemma 2's tanh softcap on the logits, in plain XLA ops.
+def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
+                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_rng=None):
+    """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
-    The reference scales the logits, squashes them into (-softcap, softcap)
-    as `softcap * tanh(logits / softcap)`, adds the mask and takes the
-    softmax in fp32 (modeling_gemma2.py:192-208). No fused kernel has that
-    tanh, so this is flax's reference attention with the cap between the
-    scaling and the mask. Heads arrive repeated and the mask structural, as
-    the reference path prepares them.
+    It is flax's reference attention, op for op: the query scaled by
+    1/sqrt(D) in its dtype, the logits, the additive `bias`, the structural
+    `mask`, the softmax (in at least fp32 under `force_fp32_for_softmax`), a
+    probability draw at `dropout_rate` from `dropout_rng`, each weight its own,
+    and the value product (`weighted_values`). Gemma 2's `softcap` squashes the
+    scaled logits into (-softcap, softcap) before the bias and mask
+    (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
+    per head in the softmax's denominator (`sink_softmax`). Keys and values
+    may carry fewer heads. Without sinks they repeat to the query's, as flax
+    repeats them, which keeps flax's rounding; a sink layer decodes over its
+    whole cache here, since no fused kernel takes sinks, so there the query
+    heads group over their key head and no key or value repeats.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
-    logits = jnp.einsum('...qhd,...khd->...hqk',
-                        query / jnp.sqrt(query.shape[-1]).astype(dtype), key,
-                        precision=precision)
-    logits = jnp.tanh(logits / softcap) * softcap
+    *rows, length, heads, width = query.shape
+    kv_heads, keys = key.shape[-2], key.shape[-3]
+    scaled_query = query / jnp.sqrt(width).astype(dtype)
+    if sinks is None:
+        key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
+        logits = jnp.einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
+    else:
+        grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
+        logits = jnp.einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
+            *rows, heads, length, keys)
+    if softcap is not None:
+        logits = jnp.tanh(logits / softcap) * softcap
     if bias is not None:
         logits = logits + bias
     if mask is not None:
         logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
-    if force_fp32_for_softmax and dtype != jnp.float32:
+    if sinks is not None:
+        if sinks.shape != (heads,):
+            raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+        wide = jnp.promote_types(logits.dtype, sinks.dtype)
+        weights = sink_softmax(logits, sinks, at_least_fp32(wide) if force_fp32_for_softmax else None)
+    elif force_fp32_for_softmax and dtype != jnp.float32:
         weights = jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
     else:
+        # A bias wider than the logits widens them; the softmax runs there and its weights round after.
         weights = jax.nn.softmax(logits).astype(dtype)
-    return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
+    if dropout_rate:
+        if dropout_rng is None:
+            raise ValueError("training attention dropout requires dropout_rng")
+        keep = 1.0 - dropout_rate
+        drawn = jax.random.bernoulli(dropout_rng, keep, weights.shape)
+        weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
+    if sinks is None:
+        return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
+    groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
+    return jnp.einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
+        *rows, length, heads, value.shape[-1])
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
@@ -1309,7 +1339,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     lengths for right padding.
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active
-    dropout runs Flax's reference attention, independently per row, head and
+    dropout runs `reference_attention`, independently per row, head and
     query, and refuses explicit fused kernels and sequence parallelism. The
     result carries the checkpoint name 'attention_output', so a remat policy
     can save it instead of replaying the kernel (`remat_block` in dit.py).
@@ -1372,23 +1402,15 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
         )
     if shards > 1:
         raise ValueError("attention probability dropout requires sequence_shards=1")
-    if sinks is not None or softcap is not None:
-        raise ValueError("attention probability dropout does not support sinks or softcap")
-    if dropout_rng is None:
-        raise ValueError("training attention dropout requires dropout_rng")
     mask = combined_attention_mask(
         query.shape[-3], key.shape[-3], causal, sliding_window,
         mask if segment_ids is None else with_documents(mask, segment_ids))
     if key_value_seq_lengths is not None:
         mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
-    return nn.dot_product_attention(
-        query, repeat_kv_heads(key, query.shape[-2]), repeat_kv_heads(value, query.shape[-2]),
-        bias=bias, mask=mask, dtype=dtype, dropout_rate=dropout_rate,
-        dropout_rng=dropout_rng, broadcast_dropout=False, deterministic=False,
-        force_fp32_for_softmax=(force_fp32_for_softmax
-                                and at_least_fp32(dtype or query.dtype) == jnp.float32),
-        qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
-        attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
+    return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
+                               dtype=dtype, precision=precision,
+                               force_fp32_for_softmax=force_fp32_for_softmax,
+                               dropout_rate=dropout_rate, dropout_rng=dropout_rng)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,
@@ -1601,10 +1623,6 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
-    if sinks is not None and softcap is not None:
-        raise ValueError(
-            "attention sinks and a logit softcap have no reference that "
-            "combines them, so no path takes both")
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
@@ -1653,7 +1671,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     `masked` is `mask` with the key `lengths` in it. Splash takes sinks, a
     softcap and packed segment ids itself, and flash takes the ids as its
     packed sequences given `max_segments`; elsewhere segment ids become the
-    document mask, and sinks and a softcap run their own XLA paths, since
+    document mask, and sinks and a softcap run `reference_attention`, since
     `jax.nn.dot_product_attention` has neither. The rest goes to
     `fused_attention` once the arguments it cannot honour have raised. Key
     lengths reach cudnn and xla as they are and every other path as the mask
@@ -1669,35 +1687,12 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         # take no mask, so a packed call runs on xla.
         if implementation in ('cudnn', 'triton', 'flash'):
             implementation = 'xla'
-    if sinks is not None and implementation in ('reference', 'xla'):
-        mask = combined_attention_mask(
-            query.shape[-3], key.shape[-3], causal, sliding_window, masked)
-        return attention_with_sinks(
-            query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
-            precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
-    if implementation == 'reference' or (softcap is not None and implementation == 'xla'):
-        heads = query.shape[-2]
-        key = repeat_kv_heads(key, heads)
-        value = repeat_kv_heads(value, heads)
-        mask = combined_attention_mask(
-            query.shape[-3], key.shape[-3], causal, sliding_window, masked)
-        if softcap is not None:
-            return softcapped_attention(
-                query, key, value, softcap, dtype=dtype, precision=precision,
-                force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
-        # flax pins a forced softmax to float32 itself; a wider compute
-        # dtype already runs it at least that wide.
-        return nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
-            dropout_rng=None, precision=None,
-            force_fp32_for_softmax=(force_fp32_for_softmax
-                                    and at_least_fp32(dtype or query.dtype) == jnp.float32),
-            deterministic=True,
-            # flax takes the precision through these two or through
-            # `precision`, never both, and its own value product would
-            # multiply the fp32 probabilities by the bf16 value.
-            qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
-            attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
+    if implementation == 'reference' or (implementation == 'xla'
+                                         and (sinks is not None or softcap is not None)):
+        mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
+        return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
+                                   dtype=dtype, precision=precision,
+                                   force_fp32_for_softmax=force_fp32_for_softmax)
 
     refuse_reference_only_arguments(
         implementation, query, dtype, precision, force_fp32_for_softmax)
@@ -1963,9 +1958,9 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     vmap. It applies no scale, so 1/sqrt(d) goes onto the query in the query's
     dtype, where flax's reference puts it, which makes the two agree exactly in
     fp32. Grouped key heads stay grouped (splash reads q_heads % kv_heads).
-    `softcap` is applied to the scaled logits before the mask, as in
-    `softcapped_attention`; `sinks` `[H]` seed each head's running maximum and
-    denominator, as in `attention_with_sinks`, with their gradient. The kernel
+    `softcap` is applied to the scaled logits before the mask and `sinks` `[H]`
+    seed each head's running maximum and denominator, with their gradient, as
+    in `reference_attention`. The kernel
     lets equal segment ids attend, so padding (id 0) reads other padding where
     `document_mask` reads nothing; no document's query reads padding either way.
     """
@@ -1984,6 +1979,7 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     attended = jax.vmap(example)(jnp.moveaxis(query, -2, -3) * scale,
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
+    # jax types every splash kernel's call as either variant, whatever save_residuals it was made with.
     if isinstance(attended, tuple):
         # Only a save_residuals=True kernel returns a pair, and this one is
         # built without it; the check narrows the kernel's union return type.
