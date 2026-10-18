@@ -905,10 +905,12 @@ def write_flax_component(directory: Path, component: str, tensors: Mapping[str, 
 def save_source(source, values, destination: Path, max_shard_size: int | str) -> None:
     """Write a native diffusion bundle back to its published directory layout, each component's
     weights one file or shards of at most `max_shard_size` and their index, under the stem its
-    library reads (`save_sharded`). A component its source declares in Flax also gets the msgpack
-    Diffusers' Flax classes read, whole, since they read no shards; Diffusers' PyTorch classes
-    read the safetensors beside it, and their `from_flax` conversion, which reads the msgpack,
-    takes a folder without them (modeling_utils.py:1109-1113, 0.34.0)."""
+    library reads (`save_sharded`), each tensor built as its shard is written. A component its
+    source declares in Flax also gets the msgpack Diffusers' Flax classes read, whole, since
+    they read no shards; Diffusers' PyTorch classes read the safetensors beside it, and their
+    `from_flax` conversion, which reads the msgpack, takes a folder without them
+    (modeling_utils.py:1109-1113, 0.34.0)."""
+    from dew.interop.decoder_parts import layout_tensors
     from dew.interop.safetensors_io import save_sharded
     written = {path for layout in source.weight_layouts for path in layout.paths}
     leaves = [tuple(str(key.key) for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(values)]
@@ -936,13 +938,19 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
             name, "config.json"
         )
         (folder / file).write_text(json.dumps(component_config, indent=2))
-    grouped: dict[str, dict[str, np.ndarray]] = {}
-    exported = {**source.retained_tensors,
-                **{layout.name: layout.export(values) for layout in source.weight_layouts}}
-    for source_name, tensor in exported.items():
+    layouts: dict[str, dict[str, WeightLayout]] = {}
+    for layout in source.weight_layouts:
+        component, _, name = layout.name.partition("/")
+        layouts.setdefault(component, {})[name] = layout
+    retained: dict[str, dict[str, np.ndarray]] = {}
+    for source_name, tensor in source.retained_tensors.items():
         component, _, name = source_name.partition("/")
-        grouped.setdefault(component, {})[name] = tensor
-    for component, tensors in grouped.items():
+        if name not in layouts.get(component, {}):
+            retained.setdefault(component, {})[name] = tensor
+    for component in dict.fromkeys((*layouts, *retained)):
+        # Each tensor is built as the shard that holds it is written, so the host
+        # holds one shard of the export (`save_sharded`).
+        tensors = layout_tensors(layouts.get(component, {}), values, retained=retained.get(component))
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         save_sharded(tensors, destination / component, max_shard_size, stem=weights)
         declared = index.get(component)
@@ -952,5 +960,6 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
             and isinstance(declared[1], str)
             and declared[1].startswith("Flax")
         ):
-            write_flax_component(destination, component, tensors)
+            # Diffusers' Flax classes read one whole msgpack, so it is built whole.
+            write_flax_component(destination, component, dict(tensors))
     source.inputs.conditions["conditioning"].encoder.save_assets(destination)
