@@ -17,9 +17,10 @@ are more than `norm.ppf(sparsity)` standard deviations above the mean.
 import dataclasses
 import functools
 import math
+from statistics import NormalDist
 
-import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -66,24 +67,36 @@ def gaussian_topk(x, sparsity: float):
 
     The cutoff is the row's mean plus `norm.ppf(sparsity)` times its
     population standard deviation, and a value above the cutoff is kept as
-    its distance above it. The quantile is computed in fp32, as the
-    reference's icdf of a float32 tensor is, or in the row's own dtype where
-    that is wider (`at_least_fp32`). `sparsity` must be within (0, 1).
+    its distance above it. The quantile is formed as the reference's icdf of
+    a float32 tensor forms it, erfinv(2 p - 1) sqrt(2), each step in fp32, or
+    in the row's own dtype where that is wider (`at_least_fp32`). `sparsity`
+    must be within (0, 1).
     """
-    # modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk. Computed as a Python
-    # float, the quantile took the default float width, which x64 widens, so a
-    # float32 model's cutoff moved with the process's x64 flag.
+    # modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk. The erfinv is taken on
+    # the host in float64 and rounded once: jax's fp32 erfinv lands two ulps from
+    # torch's at 0.95, a cutoff the reference never computes. Python's default
+    # float width is never used, since x64 would move a float32 model's cutoff.
     if not 0 < sparsity < 1:
         raise ValueError(
             f"activation sparsity is the fraction of gate activations dropped, "
             f"within (0, 1), got {sparsity}")
-    quantile = jax.scipy.special.erfinv(jnp.asarray(2.0 * sparsity - 1.0, at_least_fp32(x.dtype)))
-    multiplier = (math.sqrt(2.0) * quantile).astype(x.dtype)
+    wide = np.dtype(at_least_fp32(x.dtype)).type
+    argument = wide(2) * wide(sparsity) - wide(1)
+    quantile = wide(_erfinv(float(argument)))
+    multiplier = jnp.asarray(quantile * wide(math.sqrt(2)), x.dtype)
     mean = jnp.mean(x, axis=-1, keepdims=True)
     # A constant row (a padded row of zeros) has deviation zero, which takes a
     # zero gradient, as torch's std backward gives it.
     std = _root(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
     return nn.relu(x - (mean + std * multiplier))
+
+
+def _erfinv(value: float) -> float:
+    """erfinv in float64 over the closed [-1, 1], infinite at its ends as torch's is: a sparsity whose
+    fp32 argument rounds to an end takes an infinite cutoff, as the reference's gate does."""
+    if abs(value) == 1:
+        return math.copysign(math.inf, value)
+    return NormalDist().inv_cdf((1 + value) / 2) / math.sqrt(2)
 
 
 def _root(square):
