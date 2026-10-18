@@ -786,7 +786,8 @@ class TrainerConfig:
         it started from need not be read (`Pretrained.load`'s `weights`)."""
         if self.name is None:
             return False
-        return Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep).latest is not None
+        with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
+            return checkpoints.latest is not None
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run."""
@@ -1261,7 +1262,7 @@ class RunConfig:
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         steps = trainer.total_steps(dataset)
-        tracker = None
+        tracker = checkpoints = None
         try:
             wandb_tracker = None
             if trainer.wandb is not None and trainer.lower_for is None:
@@ -1317,6 +1318,8 @@ class RunConfig:
 
         finally:
             _closed(tracker, sys.exception())
+            if checkpoints is not None:
+                checkpoints.close()
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:

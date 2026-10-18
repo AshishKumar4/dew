@@ -223,6 +223,26 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
 
+def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
+    """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
+    managers and metadata stores leave no thread behind: two more trials run no more threads than
+    the first left, and a closed Checkpoints reopens to read what it wrote."""
+    import threading
+
+    def trial(index):
+        with Checkpoints(str(tmp_path / str(index))) as checkpoints:
+            Trainer(Regression(), optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+                dataset(), steps=2, checkpoint_every=1, log_every=1)
+        return checkpoints
+
+    trial(0)
+    settled = threading.active_count()
+    for index in (1, 2):
+        reopened = trial(index)
+        assert threading.active_count() == settled
+    assert reopened.latest == 2
+
+
 class Keyed(Regression):
     """Loss scaled by the step key, so the key stream is observable in the parameters.
 
