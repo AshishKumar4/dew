@@ -234,11 +234,14 @@ class MiMoAudioCodeEncoder(nn.Module):
                 rope_theta=cfg.rope_theta, dtype=self.dtype, precision=self.precision))
         mlp = functools.partial(GatedMLP, hidden_features=cfg.input_local_intermediate_size,
                                 out_features=cfg.input_local_dim, dtype=self.dtype, precision=self.precision)
+        # Qwen2RMSNorm casts the normalized activations back before its weight
+        # multiplies them (modeling_qwen2.py:247-252), at every block norm and the final one.
         for index in range(cfg.input_local_layers):
             x = DecoderBlock(attention, mlp, cfg.input_local_dim, BlockWiring(), norm_eps=cfg.rms_norm_eps,
-                             dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(x)
+                             scale_after_cast=True, dtype=self.dtype, precision=self.precision,
+                             name=f"layers_{index}")(x)
         if cfg.add_post_norm:
-            x = RMSNorm(epsilon=cfg.rms_norm_eps, dtype=self.dtype, name="norm")(x)
+            x = RMSNorm(epsilon=cfg.rms_norm_eps, scale_after_cast=True, dtype=self.dtype, name="norm")(x)
         x = x.reshape(batch, groups, cfg.group_size * cfg.input_local_dim)
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         if cfg.projection_layers == 1:
