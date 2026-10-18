@@ -73,6 +73,58 @@ def test_altup_predicts_and_corrects_like_the_reference():
     assert float(np.max(np.abs(scaled - tensors["scaled"]))) < 1e-5
 
 
+def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
+    """A training step with half of the prediction coefficients past
+    `coef_clip`. The reference clamps the stored prediction weight before its
+    product, so the forward reads the clamped values and the gradient reaches
+    every one of them, while the correction clamps inside its product, which
+    zeroes the clamped ones' gradient. The outputs and the gradients of all
+    five AltUp leaves are as exact as the reference's, both measured from the
+    reference in float64."""
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+
+    tensors = fixture()
+    clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
+    assert np.abs(tensors["altup.correction_coefs.weight"]).max() > clip
+    stream, activated = tensors["stream"], tensors["activated"]
+    draws = np.random.default_rng(0)
+    cotangents = [draws.standard_normal(shape).astype(np.float32)
+                  for shape in (stream.shape, stream.shape, activated.shape)]
+    config = Gemma3nTextConfig(hidden_size=HIDDEN, num_hidden_layers=1, altup_num_inputs=COPIES,
+                               altup_coef_clip=clip)
+    names = ("correction_coefs", "prediction_coefs", "modality_router")
+
+    def reference(dtype):
+        altup = Gemma3nTextAltUp(config).to(dtype).train()
+        with torch.no_grad():
+            for name in names:
+                getattr(altup, name).weight.copy_(torch.from_numpy(tensors[f"altup.{name}.weight"]))
+            altup.router_norm.weight.copy_(torch.from_numpy(tensors["altup.router_norm.weight"]))
+            altup.correct_output_scale.copy_(torch.from_numpy(tensors["altup.correct_output_scale"]))
+        predictions = altup.predict(torch.tensor(stream, dtype=dtype))
+        corrected = altup.correct(predictions, torch.tensor(activated, dtype=dtype))
+        outputs = (predictions, corrected, altup.scale_corrected_output(corrected[0]))
+        sum((output * torch.tensor(cotangent, dtype=dtype)).sum()
+            for output, cotangent in zip(outputs, cotangents, strict=True)).backward()
+        return {"outputs": [output.detach().numpy() for output in outputs], "params": {"altup": {
+            **{name: {"kernel": getattr(altup, name).weight.grad.numpy().T} for name in names},
+            "router_norm": {"scale": altup.router_norm.weight.grad.numpy()},
+            "correct_output_scale": altup.correct_output_scale.grad.numpy()}}}
+
+    def loss(params):
+        outputs = Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
+            {"params": params}, jnp.asarray(stream), jnp.asarray(activated), train=True)
+        terms = [jnp.sum(output * cotangent) for output, cotangent in zip(outputs, cotangents, strict=True)]
+        return sum(terms), outputs
+
+    (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(altup_variables(tensors)["params"])
+    dew = jax.tree.map(np.asarray, {"outputs": list(outputs), "params": gradient})
+    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64),
+                           reductions=stream.shape[1] * stream.shape[2])
+
+
 def test_the_laurel_block_matches_the_reference():
     """`x + post_laurel_norm(linear_right(linear_left(x)))`. Tolerance
     1e-5; observed 4.8e-07."""
