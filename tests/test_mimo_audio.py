@@ -13,6 +13,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -122,3 +123,52 @@ def test_a_bf16_checkpoint_binds_in_its_own_dtype_and_runs():
     mask = np.arange(refs["mels"].shape[1])[None, :] < refs["lengths"][:, None]
     encoding = tower.build().apply(variables, jnp.asarray(refs["mels"], jnp.bfloat16), mask)
     assert np.isfinite(np.asarray(encoding.features, np.float32)).all()
+
+
+def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
+    """The code encoder's transformer in bfloat16 against the class MiMo builds for it,
+    transformers' Qwen2Model (modeling_mimo_v2.py:944-957 at 6a7f202), on the same
+    bfloat16 weights and code embeddings: as exact as Qwen2Model's bfloat16 from its
+    float64 one (tests/reference_error.py's rule). Qwen2RMSNorm casts before its weight
+    multiplies, and every norm here does the same. Observed RMS distances: 1.25e-2 for
+    Dew, 1.15e-2 for the reference; scaling before the cast measured 0.98e-2."""
+    import torch
+    from transformers import Qwen2Config, Qwen2Model
+
+    config, variables, refs = load()
+    audio = json.loads((FIXTURE / "config.json").read_text())["audio_config"]
+    encoder = {name.removeprefix("encoder/").removeprefix("audio_encoder."): value
+               for name, value in refs.items() if name.startswith("encoder/")}
+    params = {"params": jax.tree.map(lambda leaf: np.asarray(leaf, ml_dtypes.bfloat16),
+                                     variables["params"]["encoder"])}
+    codes = refs["codes_0"]
+    _, state = MiMoAudioCodeEncoder(config, dtype=jnp.bfloat16).apply(
+        params, codes[None], np.asarray([len(codes)], np.int32), capture_intermediates=True,
+        mutable=["intermediates"])
+    ours = np.asarray(state["intermediates"]["norm"]["__call__"][0], np.float32)
+
+    def reference(dtype):
+        model = Qwen2Model(Qwen2Config(
+            hidden_size=audio["input_local_dim"], num_hidden_layers=audio["input_local_layers"],
+            num_attention_heads=audio["input_local_attn_heads"],
+            num_key_value_heads=audio["input_local_attn_heads"],
+            intermediate_size=audio["input_local_intermediate_size"], rope_theta=audio["rope_theta"])).eval()
+        model.load_state_dict({name.removeprefix("input_local_transformer."): torch.from_numpy(value)
+                               for name, value in encoder.items()
+                               if name.startswith("input_local_transformer.")}, strict=False)
+        model = model.to(dtype)
+        group, frames = audio["group_size"], len(codes)
+        groups = -(-frames // group)
+        held = torch.from_numpy(np.concatenate([codes, codes[-1:].repeat(groups * group - frames, 0)]))
+        tables = [torch.from_numpy(encoder[f"speech_embeddings.{channel}.weight"]).to(dtype)
+                  for channel in range(audio["audio_channels"])]
+        embedded = sum(torch.nn.functional.embedding(held[:, channel].long(), table)
+                       for channel, table in enumerate(tables))
+        with torch.no_grad():
+            return model(inputs_embeds=embedded.reshape(groups, group, -1), use_cache=False,
+                         is_causal=not audio["input_full_attention"]).last_hidden_state.float().numpy()
+
+    assert_as_exact_as_the_reference(ours.reshape(-1, ours.shape[-1]),
+                                     reference(torch.bfloat16).reshape(-1, ours.shape[-1]),
+                                     reference(torch.float64).reshape(-1, ours.shape[-1]),
+                                     "code encoder transformer in bfloat16")
