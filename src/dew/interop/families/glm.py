@@ -26,7 +26,6 @@ from dew.interop.decoder_parts import (
     base_config,
     check_decoder_tree,
     fixed_fields,
-    fixed_mixture,
     hf_tensor_name,
     kind_mixers,
     layer_depth_path,
@@ -216,14 +215,10 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     `sparse` for k-pool attention. The routed geometry is added from
     `model.mixture` when the model routes at all.
     """
-    fixed = {
-        'causal': True, 'pre_norms': True, 'sandwich_norms': False,
-        'scale_offset': False, 'scale_after_cast': True, 'embedding_scale': False,
-        'mlp': 'swiglu', 'dropout_rate': 0.0, 'layer_scalar': None,
-        'altup': None, 'laurel_rank': None, 'per_layer_input_dim': None,
-        'activation_sparsity_pattern': None, 'final_logit_softcap': None,
-    }
-    fixed_fields(model, fixed, 'GLM5 requires {0!r}')
+    # What the config carries is held to the round trip (`refuse_lossy_export`); how the model
+    # runs, which it does not carry, is held here.
+    fixed_fields(model, {'scale_after_cast': True, 'dropout_rate': 0.0, 'layer_scalar': None},
+                 'GLM5 requires {0!r}')
     hc = model.hyper_connections
     if hc is None or hc.head != 'mean':
         refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
@@ -275,12 +270,6 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         **dataclasses.asdict(sparse),
     }
     if mixture is not None:
-        represented = {'experts', 'top_k', 'layers', 'scaling', 'groups',
-                       'groups_per_token', 'expert_features', 'shared_features', 'norm_topk_prob',
-                       'implementation', 'dispatch'}
-        defaults = Mixture(experts=mixture.experts, score_function='sigmoid', bias=True)
-        fixed_mixture(mixture, defaults, represented,
-                       'GLM5 uses biased grouped sigmoid routing with top-two group scores')
         width = mixture.expert_features or model.hidden_features
         if mixture.shared_features < width or mixture.shared_features % width:
             refuse(

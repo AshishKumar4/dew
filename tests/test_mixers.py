@@ -25,6 +25,7 @@ from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn import linear
+from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
@@ -104,6 +105,23 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read():
     params = recurrent.init(jax.random.key(0), ids)
     with pytest.raises(ValueError):
         recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
+
+
+def test_alibi_biases_rotated_attention_by_its_keys_places():
+    """ALiBi and rotation are independent: a rotary layer with `alibi` attends
+    as the same rotary layer handed ALiBi's bias at its keys' places as its
+    position bias, bitwise, and not as the rotary layer alone does."""
+    x = jax.random.normal(jax.random.key(1), (2, 6, 32))
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=16)
+    with_alibi, rotary = (DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32,
+                                       wiring=BlockWiring())
+                          for kind in (AttentionMixer(alibi=True), AttentionMixer()))
+    params = rotary.init(jax.random.key(0), x)
+    bias = AttentionMetadata(position_bias=alibi_bias(jnp.arange(6), 4, dtype=x.dtype))
+    biased = with_alibi.apply(params, x)
+    np.testing.assert_array_equal(np.asarray(biased),
+                                  np.asarray(rotary.apply(params, x, attention_metadata=bias)))
+    assert not np.allclose(biased, rotary.apply(params, x))
 
 
 def hybrid(**overrides):

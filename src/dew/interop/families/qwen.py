@@ -144,15 +144,23 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         'sliding_attention' if windowed else 'full_attention',) * layers)
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
     used.update(('num_experts', 'num_local_experts'))
+    sparse = _sparse_step_layers(hf_config, layers, used)
+    if not sparse:
+        # mlp_only_layers and decoder_sparse_step leave every layer dense, as the reference builds it.
+        return _dense(config, used)
     experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
     if experts is None:
         refuse("num_experts", "a qwen3_moe layer needs its expert count")
-    sparse = _sparse_step_layers(hf_config, layers, used)
-    if not sparse:
-        refuse("mlp_only_layers with decoder_sparse_step",
-                "together they leave no routed layer, which is a dense qwen3 model")
     expert_count = records.integer(experts, 'num_experts/num_local_experts')
     config['mixture'] = _qwen_moe_mixture(hf_config, used, sparse, expert_count)
+    return config
+
+
+def _dense(config: DecoderFields, used: set[str]) -> DecoderFields:
+    """A Qwen MoE config whose schedule routes no layer: every layer keeps the dense MLP, and the
+    router's fields describe nothing the reference computes."""
+    used.update(('norm_topk_prob', 'moe_intermediate_size', 'num_experts_per_tok', 'output_router_logits',
+                 'router_aux_loss_coef', 'shared_expert_intermediate_size'))
     return config
 
 
@@ -191,11 +199,12 @@ def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
                  'shared_expert_intermediate_size'))
     experts = records.integer(hf_config.get('num_experts', 60), 'num_experts')
     sparse = _sparse_step_layers(hf_config, layers, used)
-    if experts > 0 and sparse:
-        mixture = _qwen_moe_mixture(hf_config, used, sparse, experts)
-        mixture.update(shared_features=record_int(hf_config, 'shared_expert_intermediate_size'),
-                       shared_gate=True)
-        config['mixture'] = mixture
+    if not (experts > 0 and sparse):
+        return _dense(config, used)
+    mixture = _qwen_moe_mixture(hf_config, used, sparse, experts)
+    mixture.update(shared_features=record_int(hf_config, 'shared_expert_intermediate_size'),
+                   shared_gate=True)
+    config['mixture'] = mixture
     return config
 
 

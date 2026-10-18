@@ -12,7 +12,8 @@ The solvers named after Diffusers 0.34.0 schedulers reproduce their
 arithmetic. Before the compiled scan, `init` checks each algorithm's endpoint
 domain on the concrete grid; finite endpoint limits are tested, and endpoints
 where the update is undefined raise an error instead of substituting another
-update.
+update. A multistep update, which divides by the gaps between its history's
+levels, refuses a grid with two equal levels before its last interval.
 """
 
 from .brownian import DPMSolverSDE

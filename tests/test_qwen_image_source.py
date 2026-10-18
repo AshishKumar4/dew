@@ -24,7 +24,7 @@ import pytest
 from interop_support import extract_fixture, fixture_arrays
 
 from dew.diffusion.process import DenoisingCondition
-from dew.interop.diffusion import component_tensors, qwen_image_fields, translate_qwen_image_weights
+from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +61,7 @@ def transformer_case(source, arrays, name: str):
     directory = source / name
     config = json.loads((directory / "transformer" / "config.json").read_text())
     model = QwenImageTransformer(**qwen_image_fields(config, attention_impl="xla"))
-    params, layouts = translate_qwen_image_weights(component_tensors(directory, "transformer"))
+    params, layouts = read_transformer(component_tensors(directory, "transformer"), qwen_image_path)
     return model, params, layouts
 
 
@@ -168,7 +168,7 @@ def test_every_declared_qwen_image_tensor_is_mapped(source):
     """Every stored tensor lands in the tree and writes back bit for bit; a
     name the class does not declare, a bias included, is refused."""
     tensors = component_tensors(source / "square", "transformer")
-    params, layouts = translate_qwen_image_weights(tensors)
+    params, layouts = read_transformer(tensors, qwen_image_path)
     assert {entry.name for entry in layouts} == {f"transformer/{name}" for name in tensors}
     for entry in layouts:
         np.testing.assert_array_equal(entry.export({"params": params}),
@@ -177,7 +177,7 @@ def test_every_declared_qwen_image_tensor_is_mapped(source):
     for foreign in ("img_in.bias", "transformer_blocks.0.attn.add_q_proj.weight",
                     "transformer_blocks.0.norm1.linear.weight", "pos_embed.freqs"):
         with pytest.raises(ValueError):
-            translate_qwen_image_weights({foreign: weight})
+            read_transformer({foreign: weight}, qwen_image_path)
 
 
 @pytest.fixture(scope="module")

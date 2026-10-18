@@ -10,6 +10,7 @@ import pytest
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import coordinates
 from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
@@ -106,17 +107,21 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     assert np.isfinite(loss(after)) and loss(after) < loss(before)
 
 
+@pytest.mark.parametrize('given', ['attention_mask', 'coordinates'])
 @pytest.mark.parametrize('scan_layers', [False, True])
-def test_learned_position_cache_advances_each_rows_unpadded_positions(scan_layers):
+def test_learned_position_cache_advances_each_rows_unpadded_positions(scan_layers, given):
+    """Learned positions read each row's unpadded places, whether the padding comes as a raw mask
+    or as the tokens' coordinates alone, prefill and cache alike."""
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
                               max_seq_len=8, position_embedding='learned', qk_norm=False,
                               attention_impl='reference', scan_layers=scan_layers)
     ids = jnp.asarray([[1, 2, 3, 4], [0, 0, 5, 6]], jnp.int32)
     valid = jnp.asarray([[True, True, True, True], [False, False, True, True]])
     variables = model.init(jax.random.key(0), ids)
-    _, cache = model.apply(variables, ids, decode=True, attention_mask=valid, mutable=['cache'])
-    _, cache = model.apply({**variables, **cache}, ids, decode=True,
-                           attention_mask=valid, mutable=['cache'])
+    padding = {'attention_mask': valid} if given == 'attention_mask' else {
+        'coordinates': coordinates(valid=valid)}
+    _, cache = model.apply(variables, ids, decode=True, mutable=['cache'], **padding)
+    _, cache = model.apply({**variables, **cache}, ids, decode=True, mutable=['cache'], **padding)
     token = jnp.asarray([[7], [8]], jnp.int32)
     cached, _ = model.apply({**variables, **cache}, token, decode=True, mutable=['cache'])
     for index, prompt in enumerate((ids[0], ids[1, 2:])):
