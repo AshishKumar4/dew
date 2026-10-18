@@ -36,11 +36,12 @@ class Delta(Files):
         return tuple(self.table.file_uris())
 
     def fingerprint(self) -> Mapping[str, object]:
+        """The table at its resolved version, whose log names immutable files, read with the
+        files' options."""
         return {
             "store": "delta",
             "uri": self.url,
             "version": self.table.version(),
             "files": self.table.file_uris(),
-            "columns": self.columns,
-            "filter": str(self.filter),
+            **self._read_options,
         }
