@@ -89,6 +89,36 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     )
 
 
+NATIVE = 2
+"""The engine model's own EOS, which no policy here names."""
+
+
+def vllm_stopping(request):
+    """vLLM's answer to `request` over the draw 3, NATIVE, 5, EOS, 6, ...: it ends on its model's EOS
+    unless the request ignores it, on a requested stop id either way, else at its budget."""
+    stops = set(request.get("stop_token_ids") or ()) | (set() if request.get("ignore_eos") else {NATIVE})
+    ids = []
+    for token in [3, NATIVE, 5, EOS, 6, 6, 6, 6][:request["max_tokens"]]:
+        ids.append(token)
+        if token in stops:
+            return choice("vllm", ids, [-.5] * len(ids), "stop")
+    return choice("vllm", ids, [-.5] * len(ids), "length")
+
+
+@pytest.mark.parametrize("eos", [EOS, None])
+def test_a_vllm_draw_ends_on_the_policys_stops_alone(eos):
+    """A policy's stops are the only ids that end a vLLM draw: its model's own EOS, which the policy
+    does not name, is drawn past, and a policy with no stop runs to its budget."""
+    completion, _ = engine("vllm", vllm_stopping)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=eos), pushed)
+    try:
+        draw = server.submit([1], 6, key=0).result(timeout=30)
+    finally:
+        server.close()
+    assert draw.tokens == ((3, NATIVE, 5, EOS) if eos is not None else (3, NATIVE, 5, EOS, 6, 6))
+    assert draw.terminated == (eos is not None)
+
+
 def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
     release = threading.Event()
     arrived = threading.Semaphore(0)

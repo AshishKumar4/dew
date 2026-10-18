@@ -445,6 +445,22 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     return _bound(parameters, fixed), count * n
 
 
+def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Mapping[str, JSON]:
+    """The request fields that end an engine's draw on `sampling.stops`.
+
+    vLLM ends a draw on its model's EOS and its generation config's EOS ids unless told to ignore
+    them, and on `stop_token_ids` either way (vllm/sampling_params.py:690-718 at v0.30.0), so it
+    is told to ignore them and given the stops: exact for every policy. SGLang's `ignore_eos`
+    turns off every token stop, `stop_token_ids` too, and otherwise it also ends on its model's
+    EOS ids (sglang/srt/managers/schedule_batch.py:1707-1729 at v0.5.20): a policy without stops
+    is exact there, and one with stops ends on its model's EOS as well, which a draw that checks
+    its finish refuses where the policy leaves that EOS out."""
+    stops: list[JSON] = list(sampling.stops)
+    if provider == "vllm":
+        return {"ignore_eos": True, **({"stop_token_ids": stops} if stops else {})}
+    return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
+
+
 @dataclass(frozen=True)
 class OpenAICompletion:
     """Calls one model through an OpenAI client, including one pointed at a vLLM or SGLang `base_url`.
@@ -497,8 +513,8 @@ class OpenAICompletion:
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
-        if sampling.eos_token_ids is not None:
-            controls["stop_token_ids"] = list(sampling.stops)
+        if self.provider != "openai":
+            controls.update(_engine_stops(sampling, self.provider))
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(
