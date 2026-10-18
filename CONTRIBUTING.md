@@ -77,7 +77,7 @@ These constructions are banned in prose, docstrings, comments and commit message
 - Test observable runtime behavior. Do not add assertions about prose, source spelling, documentation structure, or generated API-index snapshots.
 - A tutorial's diagrams, charts and animations are SVG from `dew.figures`, never mermaid or matplotlib. A concept figure is drawn in `docs/assets/figures.py` and embedded in Markdown, alone in its paragraph, by its raw GitHub URL on `main`, which Colab loads and the site inlines; a figure from the notebook's run is a cell's output.
 - The site at [dewml.dev](https://dewml.dev) is built from `docs/`, `tutorials/` and the docstrings in `src/dew`; [Installation](docs/installation.md#building-the-documentation) says how to build it. A new docs page goes into `site/src/manifest.mjs`, a new module that declares `__all__` into `GROUPS` in `site/scripts/gen_api.py`, and a notebook is committed executed top to bottom. The build fails on anything it cannot place.
-- A tutorial uses real models and data on the GPU it needs, and runs once, top to bottom, on that GPU (a Colab or Lambda session), with Dew installed from the commit that lands it. Commit the executed notebook with its outputs and `accelerator: "GPU"` in its metadata. It is not run again when the library changes.
+- A tutorial uses real models and data on the GPU it needs, and runs once, top to bottom, on that GPU (a Colab session), with Dew installed from the commit that lands it. Commit the executed notebook with its outputs and `accelerator: "GPU"` in its metadata. It is not run again when the library changes.
 
 ## Before a merge
 
