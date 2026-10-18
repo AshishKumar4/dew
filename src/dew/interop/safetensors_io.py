@@ -9,11 +9,13 @@ Only the container is handled here. No leaf is renamed, transposed or cast.
 The names on disk are the module names in the tree.
 """
 
+import contextlib
 import json
 import math
 import os
 import re
 import secrets
+import tempfile
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from pathlib import Path
 
@@ -71,16 +73,19 @@ is the producing codec's convention; safetensors fixes only the byte count.
 
 
 def _safetensors():
-    """Import and return safetensors' NumPy writer, lazily, with the install
-    message where the optional package is missing; `read_file` reads the
-    format itself (`_header`)."""
+    """Import safetensors and return its reader and NumPy writer modules.
+
+    The import is lazy and in one place, so the reader and the writer raise the
+    same install message when the optional package is missing.
+    """
     try:
+        import safetensors
         from safetensors import numpy as safetensors_numpy
     except ImportError as error:
         raise ImportError(
             "dew.interop needs safetensors: pip install dewml[interop]"
         ) from error
-    return safetensors_numpy
+    return safetensors, safetensors_numpy
 
 
 def _publish(
@@ -98,7 +103,7 @@ def _publish(
     TPU array can come back as, would be written transposed. A failed write
     or replacement leaves the old file intact and removes the temporary.
     """
-    backend = _safetensors()
+    _, backend = _safetensors()
     with replacing(path) as temporary:
         backend.save_file(
             {name: _host_array(array) for name, array in tensors().items()},
@@ -285,96 +290,61 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     only when written, never back to the file.
     """
     filename = os.fspath(path)
+    package, _ = _safetensors()
     with open(filename, "rb") as stream:
-        entries, metadata, start = _header(stream, filename)
+        prefix = stream.read(8)
+        length = int.from_bytes(prefix, "little")
+        with _stand_in(prefix + stream.read(min(length, _MAX_HEADER)), os.fstat(stream.fileno()).st_size
+                       ) as validated, package.safe_open(validated, "np") as reader:
+            metadata = reader.metadata() or {}
+            names = reader.offset_keys()
+            stored = [(name, reader.get_slice(name)) for name in names]
+            layout = [(name, tuple(view.get_shape()), view.get_dtype()) for name, view in stored]
         mapping = np.memmap(stream, mode="c" if copy_on_write else "r", dtype=np.uint8)
-    return ({name: np.ndarray(shape, dtype=dtype, buffer=mapping, offset=start + offset)
-             for name, (shape, dtype, offset) in sorted(entries.items())}, metadata)
-
-
-_MAX_HEADER = 100_000_000
-"""The largest header safetensors reads (`MAX_HEADER_SIZE`, safetensors 0.8.0)."""
-
-
-class _Pairs(list[tuple[str, object]]):
-    """A JSON object's key-value pairs in order, kept so a header reader applies
-    the duplicate-key rule of the type it reads the object as."""
-
-
-type _Entries = dict[str, tuple[tuple[int, ...], np.dtype, int]]
-"""Each tensor's shape, dtype and byte offset into a safetensors file's data."""
-
-
-def _header(stream, filename: str) -> tuple[_Entries, dict[str, str], int]:
-    """The open file's tensors (shape, dtype and offset into the data, F4 as its
-    `PACKED_F4` byte view), its metadata and where its data starts, checked as
-    safetensors checks a file (`Metadata::validate`, 0.8.0): each tensor's bytes
-    are its shape times its dtype, and the tensors tile the data in order with no
-    gap, no overlap and nothing after them.
-
-    This is safe_open's validation, done on the one open file: safe_open reads a
-    path, and a reader that reopens the path can meet another file, since
-    `_publish` replaces it. Its descriptor's /dev/fd name does not hold either:
-    a sandboxed /proc (armada's containers) cannot reopen a file replaced since,
-    and safetensors' reader of an open file is private (`_safe_open_handle`).
-    """
-    size = os.fstat(stream.fileno()).st_size
-    prefix = stream.read(8)
-    length = int.from_bytes(prefix, "little") if len(prefix) == 8 else None
-    if length is None or length > _MAX_HEADER or 8 + length > size:
-        raise ValueError(f"{filename} is not a safetensors file: it holds no header of the length it states")
-    try:
-        header = json.loads(stream.read(length).decode("utf-8"), object_pairs_hook=_Pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"{filename} is not a safetensors file: its header is not UTF-8 JSON") from error
-    if not isinstance(header, _Pairs):
-        raise ValueError(f"{filename} is not a safetensors file: its header is not a table of tensors")
-    # serde's rules for the header's types: a struct (the header's `__metadata__`, a
-    # TensorInfo) refuses a field named twice and ignores one it does not know, and a
-    # map (the tensors, the metadata) keeps the last value of a repeated key.
-    stated = [value for key, value in header if key == "__metadata__"]
-    held = stated[0] if stated else _Pairs()
-    if (len(stated) > 1 or not isinstance(held, _Pairs | None)
-            or not all(isinstance(value, str) for _, value in held or ())):
-        raise ValueError(f"{filename} is not a safetensors file: its __metadata__ is not one table "
-                         "of strings")
-    metadata = {key: value for key, value in held or () if isinstance(value, str)}
-    entries: _Entries = {}
-    spans = []
-    for name, entry in {key: value for key, value in header if key != "__metadata__"}.items():
-        fields = dict(entry) if isinstance(entry, _Pairs) else {}
-        if (not isinstance(entry, _Pairs) or len(fields) != len(entry)
-                or not {"dtype", "shape", "data_offsets"} <= fields.keys()):
-            raise ValueError(f"tensor {name!r} in {filename} is not one dtype, shape and data_offsets")
-        tag, shape, span = fields["dtype"], fields["shape"], fields["data_offsets"]
-        if not (isinstance(shape, list) and all(type(axis) is int and axis >= 0 for axis in shape)
-                and isinstance(span, list) and len(span) == 2 and all(type(end) is int for end in span)
-                and 0 <= span[0] <= span[1]):
-            raise ValueError(f"tensor {name!r} in {filename} has shape {shape!r} and data_offsets {span!r}")
+    tensors: dict[str, np.ndarray] = {}
+    # safe_open has checked that the tensors tile the data in offset order, so
+    # each one starts where the one before it ends.
+    offset = 8 + length
+    for name, shape, tag in layout:
         if tag == PACKED_F4:
             if not shape or shape[-1] % 2:
                 raise ValueError(
                     f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
                     "elements share a byte, so its last axis is even")
-            shape, dtype = [*shape[:-1], shape[-1] // 2], np.dtype(np.uint8)
-        elif isinstance(tag, str) and tag in _STORED_DTYPES:
-            dtype = _STORED_DTYPES[tag]
+            shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
         else:
-            raise ValueError(f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}")
-        if span[1] - span[0] != math.prod(shape) * dtype.itemsize:
-            raise ValueError(f"tensor {name!r} in {filename} spans {span[1] - span[0]} bytes, and its "
-                             f"shape and dtype hold {math.prod(shape) * dtype.itemsize}")
-        entries[name] = (tuple(shape), dtype, span[0])
-        spans.append((span[0], span[1], name))
-    end = 0
-    for begin, finish, name in sorted(spans):
-        if begin != end:
-            raise ValueError(f"tensor {name!r} in {filename} starts at data byte {begin}, where the "
-                             f"tensors before it end at {end}")
-        end = finish
-    if 8 + length + end != size:
-        raise ValueError(f"{filename} holds {size - 8 - length} data bytes, and its header indexes {end}")
-    return entries, metadata, 8 + length
+            try:
+                dtype = _STORED_DTYPES[tag]
+            except KeyError as error:
+                raise ValueError(
+                    f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
+                ) from error
+        tensors[name] = np.ndarray(shape, dtype=dtype, buffer=mapping, offset=offset)
+        offset += math.prod(shape) * dtype.itemsize
+    return dict(sorted(tensors.items())), metadata
+
+
+_MAX_HEADER = 100_000_000
+"""The largest header safetensors reads (`MAX_HEADER_SIZE`, safetensors 0.8.0): a
+read of a header stops there, so a corrupt length cannot read a whole file."""
+
+
+@contextlib.contextmanager
+def _stand_in(header: bytes, size: int) -> Iterator[str]:
+    """A file of `size` bytes that starts with `header` and holds nothing past it,
+    sparse, for safe_open to validate in place of the file `header` was read from.
+
+    safe_open reads a path, and a reader that reopens a path can meet another file,
+    since `_publish` replaces it; a descriptor's /dev/fd name is no path to the open
+    file in a sandboxed /proc (armada's containers), and safetensors' reader of an
+    open file is private. Its checks read the header and the length alone, never the
+    tensors' bytes, so the stand-in gets every one of them as the file would.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".safetensors") as stand_in:
+        stand_in.write(header)
+        stand_in.truncate(size)
+        stand_in.flush()
+        yield stand_in.name
 
 
 class LazyTensors(Mapping[str, np.ndarray]):
