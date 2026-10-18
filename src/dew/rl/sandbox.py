@@ -351,7 +351,8 @@ class _Streams:
 
 def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
                limit: int) -> tuple[_Streams, Verdict | None]:
-    """Feed stdin, read both output streams until they close, and wait for the exit.
+    """Feed stdin until it is all written or its reader is gone, read both output streams until
+    they close, and wait for the exit.
 
     Returns what was read, and TIMEOUT or OUTPUT_LIMIT when the process had
     to be stopped for it, else None. The caller kills and reaps.
@@ -367,7 +368,7 @@ def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
             process.stdin.close()
         ready.register(process.stdout, selectors.EVENT_READ, streams.stdout)
         ready.register(process.stderr, selectors.EVENT_READ, streams.stderr)
-        while any(key.data != "stdin" for key in ready.get_map().values()):
+        while ready.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return streams, Verdict.TIMEOUT
