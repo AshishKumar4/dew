@@ -1,6 +1,6 @@
 """What the names of a Python file stand for, for tools/lint_slop.py: the
-nodes of each lexical scope, a signature's parameters, and the imports each
-scope reads through its own bindings.
+nodes of each lexical scope, a signature's parameters, what binds each name
+in a scope, and the imports each scope reads through its own bindings.
 
 Scopes are read flow-insensitively: a name a scope both imports and assigns
 counts as assigned throughout it, as one the scope binds by a parameter and
@@ -10,9 +10,10 @@ then imports counts as imported.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
 def own(scope: ast.AST) -> Iterator[ast.AST]:
@@ -50,6 +51,37 @@ def bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[s
     return {alias.asname or alias.name: f"{base}.{alias.name}" for alias in node.names if alias.name != "*"}
 
 
+def targets(comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp) -> list[ast.Name]:
+    """The names a comprehension's `for` clauses bind, in the comprehension's own scope."""
+    return [name for generator in comprehension.generators for name in ast.walk(generator.target)
+            if isinstance(name, ast.Name)]
+
+
+def binders(nodes: Sequence[ast.AST], parameters: Sequence[ast.arg] = ()) -> dict[str, list[ast.AST]]:
+    """Each name one scope binds, with every node that binds it there, in order: its `parameters`,
+    then among its `nodes` (`own`) a stored name, a definition, an import, an exception's name and a
+    pattern's capture. A comprehension's targets bind in the comprehension (`targets`), not here."""
+    hidden = {id(name) for node in nodes if isinstance(node, COMPREHENSIONS) for name in targets(node)}
+    bound: dict[str, list[ast.AST]] = {}
+    for argument in parameters:
+        bound.setdefault(argument.arg, []).append(argument)
+    for node in nodes:
+        names: Iterable[str | None] = ()
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in hidden:
+            names = (node.id,)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.ExceptHandler
+                        | ast.MatchAs | ast.MatchStar):
+            names = (node.name,)
+        elif isinstance(node, ast.MatchMapping):
+            names = (node.rest,)
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            names = bound_by(node, ())
+        for name in names:
+            if name:
+                bound.setdefault(name, []).append(node)
+    return bound
+
+
 def imports(tree: ast.Module, parent: Sequence[str]) -> dict[str, str]:
     """What each name a module imports stands for, as a dotted path: every
     import in it, those inside functions and type-checking blocks included.
@@ -81,10 +113,9 @@ def comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str], body: Mappi
     node identity."""
     tables: dict[int, Mapping[str, str]] = {}
     for node in nodes:
-        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+        if isinstance(node, COMPREHENSIONS):
             around = tables.get(id(node), body)
-            names = {name.id for generator in node.generators for name in ast.walk(generator.target)
-                     if isinstance(name, ast.Name)}
+            names = {name.id for name in targets(node)}
             inside = {name: target for name, target in around.items() if name not in names}
             first = {id(child) for child in ast.walk(node.generators[0].iter)}
             for child in ast.walk(node):
@@ -94,30 +125,25 @@ def comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str], body: Mappi
 
 
 def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
-           parameters: frozenset[str] = frozenset(), class_body: bool = False
+           parameters: Sequence[ast.arg] = (), class_body: bool = False
            ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
     """Every node of a scope's `body` and of the scopes in it, with what each
     name imported there stands for (`visible` around it). A scope's own
-    import replaces its `parameters`; a name it otherwise binds (an
-    assignment, a definition) stands for no import. A comprehension's
+    import replaces its `parameters`; a name it otherwise binds (`binders`:
+    an assignment, a definition) stands for no import. A comprehension's
     targets are its own, and a class body's names reach no scope inside it."""
     nodes = [node for statement in body
              for node in (statement, *(() if isinstance(statement, SCOPES) else own(statement)))]
-    targets = {id(name) for node in nodes if isinstance(node, ast.comprehension)
-               for name in ast.walk(node.target)}
-    local = {node.id for node in nodes
-             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and id(node) not in targets}
-    local |= {node.name for node in nodes
-              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
-    # An exception's name and a pattern's capture bind without a stored Name.
-    local |= {node.name for node in nodes if isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar)
-              and node.name}
-    local |= {node.rest for node in nodes if isinstance(node, ast.MatchMapping) and node.rest}
     imported: dict[str, str] = {}
-    for node in nodes:
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            imported |= bound_by(node, parent)
-    around = {name: target for name, target in visible.items() if name not in parameters}
+    local: set[str] = set()
+    for name, by in binders(nodes, parameters).items():
+        importers = [node for node in by if isinstance(node, ast.Import | ast.ImportFrom)]
+        if any(not isinstance(node, ast.arg | ast.Import | ast.ImportFrom) for node in by):
+            local.add(name)
+        elif importers:
+            imported[name] = bound_by(importers[-1], parent)[name]
+    around = {name: target for name, target in visible.items()
+              if name not in {argument.arg for argument in parameters}}
     table = {name: target for name, target in {**around, **imported}.items() if name not in local}
     inside = comprehended(nodes, table, visible if class_body else table)
     for node in nodes:
@@ -126,8 +152,7 @@ def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence
         if isinstance(node, SCOPES):
             yield from scoped(outside(node), here, parent)
             inner = node.body if isinstance(node.body, list) else [node.body]
-            bound = frozenset() if isinstance(node, ast.ClassDef) else frozenset(
-                argument.arg for argument in arguments(node))
+            bound = () if isinstance(node, ast.ClassDef) else arguments(node)
             yield from scoped(inner, visible if class_body else here, parent, bound,
                               isinstance(node, ast.ClassDef))
 
