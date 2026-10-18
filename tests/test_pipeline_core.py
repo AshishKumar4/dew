@@ -71,6 +71,31 @@ def take(reader, count):
             for row in itertools.islice(reader, count)]
 
 
+@dataclasses.dataclass(frozen=True)
+class Logged(Memory):
+    """Records in memory that log each read a run takes of them."""
+
+    reads: list = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        self.reads.append(read)
+        return super().records(read)
+
+
+def test_a_memory_compile_reads_each_source_once():
+    """Compiling a memory read pins each source's facts and materializes its steps from one read of
+    its records, whatever else states its facts by index."""
+    reads = []
+    stored = Logged(source(8).values, reads=reads)
+    data = compile(Pipeline(stored).map(Tagged()).shuffle(0).repeat().batch(2), read="memory", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        assert sorted(value for batch in take(reader, 4) for value in batch["tag"]) == list(range(0, 80, 10))
+    finally:
+        reader.close()
+    assert reads.count("memory") == 1
+
+
 def test_memory_rejections_are_dense_before_global_order():
     stored = source()
     data = compile(Pipeline(stored).filter_map(Odd()).shuffle(3).repeat().batch(4),
