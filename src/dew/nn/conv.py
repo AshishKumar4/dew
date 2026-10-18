@@ -44,7 +44,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import biased
+from .precision import biased, wide_product
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -335,6 +335,7 @@ class Conv(nn.Conv):
         promoted, kernel, bias = self.promote_dtype(inputs, kernel, bias, dtype=self.dtype)
         if promoted is None or kernel is None:
             raise ValueError("a convolution's promotion must return its input and kernel")
+        own = self.conv_general_dilated_cls is not None or self.conv_general_dilated is not None
         if self.conv_general_dilated_cls is not None:
             convolve = self.conv_general_dilated_cls()
         else:
@@ -345,7 +346,9 @@ class Conv(nn.Conv):
         dimensions = jax.lax.ConvDimensionNumbers(lhs, (ndim - 1, ndim - 2, *range(ndim - 2)), lhs)
         y = convolve(promoted, kernel, strides, padding, lhs_dilation=input_dilation,
                      rhs_dilation=kernel_dilation, dimension_numbers=dimensions,
-                     feature_group_count=self.feature_group_count, precision=self.precision)
+                     feature_group_count=self.feature_group_count, precision=self.precision,
+                     **({} if own else wide_product(promoted.dtype, bias)))
         if bias is not None:
-            y = biased(y, bias)
+            # lax's product rounds once with the bias (`biased`); one of the layer's own keeps its dtype.
+            y = biased(y, bias, jnp.result_type(y, bias) if own else promoted.dtype)
         return y if batch_dims == 1 else jnp.reshape(y, (*batch_shape, *y.shape[1:]))

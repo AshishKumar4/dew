@@ -3,8 +3,9 @@
 `Dense` and `DenseGeneral` are flax 0.12's layers, fields, parameter names,
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did. Their call is their own: the same
-product, then the bias added by `biased`, which sums its gradient at fp32
-and rounds the sum once to the dtype flax's addition gives it. The bias is
+product, taken unrounded where a bias follows, then the bias added by
+`biased`, which rounds product and bias once to the dtype flax's addition
+gives them, as torch's addmm does, and sums its gradient at fp32. The bias is
 added inside the layer's own managed call, so a method interceptor (an
 adapter, an input quantization) and an intermediate capture see the
 rounded output as they saw flax's.
@@ -23,7 +24,7 @@ from flax import linen as nn
 from flax.core import meta
 from flax.typing import Array
 
-from .precision import biased
+from .precision import biased, wide_product
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
@@ -31,6 +32,20 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     if layer.dot_general_cls is not None:
         return layer.dot_general_cls()
     return layer.dot_general if layer.dot_general is not None else jax.lax.dot_general
+
+
+def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
+            shaped):
+    """The layer's product of `inputs` and `kernel` over `dimensions`, plus `bias` reshaped by `shaped`
+    to broadcast over it: lax's product taken unrounded and rounded once with the bias (`biased`), as
+    torch's addmm rounds them, and a product of the layer's own (a `dot_general` it was given) in the
+    dtype it chose, the bias added to it as flax adds it."""
+    own = layer.dot_general_cls is not None or layer.dot_general is not None
+    product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision,
+                              **({} if own else wide_product(inputs.dtype, bias)))
+    if bias is None:
+        return product
+    return biased(product, shaped(bias), jnp.result_type(product, bias) if own else inputs.dtype)
 
 
 def _reshaped(init, flat_shape):
@@ -69,9 +84,7 @@ class Dense(nn.Dense):
         bias = (self.param('bias', self.bias_init, (self.features,), self.param_dtype)
                 if self.use_bias else None)
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
-        product = _product(self)(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
-                                 precision=self.precision)
-        return product if bias is None else biased(product, bias)
+        return _biased(self, inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), bias, lambda bias: bias)
 
 
 class DenseGeneral(nn.DenseGeneral):
@@ -97,11 +110,8 @@ class DenseGeneral(nn.DenseGeneral):
             batch_shape + features, self.param_dtype) if self.use_bias else None
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         contracted = tuple(range(batched, batched + len(axis)))
-        product = _product(self)(inputs, kernel, ((axis, contracted), (batch_dims, tuple(range(batched)))),
-                                 precision=self.precision)
-        if bias is None:
-            return product
         # The product is [batch dims, kept dims, features]; the bias broadcasts over the kept dims.
         kept = tuple(inputs.shape[dim] if dim in batch_dims else 1
                      for dim in range(inputs.ndim) if dim not in axis)
-        return biased(product, jnp.reshape(bias, kept + features))
+        return _biased(self, inputs, kernel, ((axis, contracted), (batch_dims, tuple(range(batched)))), bias,
+                       lambda bias: jnp.reshape(bias, kept + features))
