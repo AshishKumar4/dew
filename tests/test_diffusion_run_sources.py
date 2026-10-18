@@ -64,7 +64,11 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     """The run trains the pipeline's own transformer under its own text
     conditioning, and a saved tree rebuilds over the directory's metadata
     alone: the rebuilt objective scores the trained weights exactly, from a
-    copy of the pipeline with every weight file deleted."""
+    copy of the pipeline with every weight file deleted. Rebound over the
+    published pipeline, the tree exports through the layouts its source's
+    headers give, which are the loaded source's own, and reloads leaf for
+    leaf; the copy without weight files has none to export through, and its
+    save writes nothing."""
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
@@ -88,6 +92,38 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     shutil.copytree(directory, metadata, ignore=shutil.ignore_patterns("*.safetensors"))
     rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=state.variables)
     assert value(rebuilt, state.variables, batch) == trained
+
+    # The saved tree rebound over the published pipeline writes its trained
+    # weights back by the layouts the source's headers give, and the tensors
+    # no leaf holds (Qwen-Image's vision tower) as the source stores them.
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.interop.safetensors_io import read_weights
+
+    def rebound(source: Path):
+        return load_diffusion_source(str(source), dtype="float32", attention_impl="xla", size=(size, size),
+                                     variables=state.variables)
+
+    with pytest.raises(ValueError):
+        rebound(metadata).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla",
+                                      size=(size, size))
+    pipeline = rebound(directory)
+    assert sorted(pipeline.weight_layouts, key=lambda layout: layout.name) == sorted(
+        published.weight_layouts, key=lambda layout: layout.name)
+    pipeline.save(tmp_path / "export")
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                                  size=(size, size))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(pipeline.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(pipeline.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert set(pipeline.retained_tensors) == set(published.retained_tensors)
+    for name in published.retained_tensors:
+        component, _, stored = name.partition("/")
+        written, source = (read_weights(root / component)[stored]
+                           for root in (tmp_path / "export", directory))
+        assert written.dtype == source.dtype and written.tobytes() == source.tobytes(), name
 
 
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
