@@ -53,6 +53,10 @@ scope (tools/lint_scopes.py).
 SLOP018 reads one module: a function deals with what leaves the process where
 it names such a module (`EXTERNAL`) or calls a function of the module, or a
 method reached from `self`, that does; work handed to a future is another's.
+It reads a loop over a range whose body reads the number it counts anywhere
+but where a failure is handled as a scan by index, not as attempts, so a retry
+that reads its attempt number outside its handler (returns or logs it) is not
+reported.
 SLOP016 follows the device's generation through the names one file binds, in
 statement order: both arms of a branch in turn and a loop's body once, so a
 name an arm rebinds counts as rebound after it.
@@ -1414,9 +1418,8 @@ def _ending(statement: ast.stmt) -> frozenset[str]:
             return _finally(pending, statement.finalbody)
         case ast.Match():
             done = frozenset[str]().union(*(_outcomes(case.body) for case in statement.cases))
-            irrefutable = any(case.guard is None and isinstance(case.pattern, ast.MatchAs)
-                              and case.pattern.pattern is None for case in statement.cases)
-            return done if irrefutable else done | {"next"}
+            caught = any(case.guard is None and _irrefutable(case.pattern) for case in statement.cases)
+            return done if caught else done | {"next"}
         case ast.For() | ast.AsyncFor() | ast.While():
             body = _outcomes(statement.body)
             forever = (isinstance(statement, ast.While) and isinstance(statement.test, ast.Constant)
@@ -1426,36 +1429,65 @@ def _ending(statement: ast.stmt) -> frozenset[str]:
     return frozenset({"next"})
 
 
-def _fed(work: Sequence[ast.stmt], counted: Set[str]) -> bool:
-    """Whether a number in `counted` feeds `work`'s inputs: an argument of a call it makes, or the
-    index of what it reads. Work that only reports the number repeats one piece."""
-    def counts(node: ast.AST) -> bool:
-        return any(isinstance(name, ast.Name) and name.id in counted for name in ast.walk(node))
+def _irrefutable(pattern: ast.pattern) -> bool:
+    """Whether `pattern` matches every subject: a wildcard or a capture, also under `as` or as one
+    alternative of an `|`."""
+    match pattern:
+        case ast.MatchAs(pattern=None):
+            return True
+        case ast.MatchAs(pattern=inner) if inner is not None:
+            return _irrefutable(inner)
+        case ast.MatchOr(patterns=alternatives):
+            return any(map(_irrefutable, alternatives))
+    return False
 
-    return any((isinstance(node, ast.Call) and any(map(counts, [*node.args, *node.keywords])))
-               or (isinstance(node, ast.Subscript) and counts(node.slice)) for node in _executed(work))
+
+def _attempts(statements: Sequence[ast.stmt], after: Sequence[Sequence[ast.stmt]]
+              ) -> Iterator[tuple[ast.Try | ast.TryStar, list[Sequence[ast.stmt]]]]:
+    """Each `try` that `statements` run at their loop's own level, with the statements that run after
+    it, in turn, on the way to the loop's next round (`after` the ones after `statements`): through
+    a `with`, a branch or a `match` case, not into a nested loop or a definition, whose exits are
+    their own."""
+    for index, statement in enumerate(statements):
+        rest = [statements[index + 1:], *after]
+        if isinstance(statement, ast.Try | ast.TryStar):
+            yield statement, rest
+        elif isinstance(statement, ast.With | ast.AsyncWith):
+            yield from _attempts(statement.body, rest)
+        elif isinstance(statement, ast.If):
+            yield from _attempts(statement.body, rest)
+            yield from _attempts(statement.orelse, rest)
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                yield from _attempts(case.body, rest)
 
 
 def _retrying(loop: ast.For | ast.While) -> bool:
-    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose number
-    feeds none of the work's inputs (attempts, where it does a scan by index, `_fed`), whose `try`
-    leaves the loop on some path where the work succeeds and goes round again on some path where it
-    fails, each path followed through the `try`'s `finally` and the rest of the loop's body
-    (`_outcomes`)."""
-    counted: set[str] = set()
+    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose body
+    reads the number it counts only where a failure is handled (attempts, counted to stop; read
+    anywhere else, it can choose the work, a scan by index), with a `try` at its own level
+    (`_attempts`) that leaves the loop on some path where the work succeeds and goes round again on
+    some path where it fails, each path followed through the `try`'s `finally` and every statement
+    after it in the loop's body (`_outcomes`)."""
+    attempts = list(_attempts(loop.body, []))
     if isinstance(loop, ast.For):
-        if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range"):
-            return False
         counted = {name.id for name in ast.walk(loop.target) if isinstance(name, ast.Name)}
-    body = list(loop.body)
-    for index, attempt in enumerate(body):
-        if not isinstance(attempt, ast.Try | ast.TryStar) or _fed([*attempt.body, *attempt.orelse], counted):
-            continue
-        tail = body[index + 1:]
-        succeeded = _then(_outcomes(attempt.body), attempt.orelse)
-        succeeds = {"break", "return"} & _then(_finally(succeeded, attempt.finalbody), tail)
-        again = any({"next", "continue"} & _then(_finally(_outcomes(handler.body), attempt.finalbody), tail)
-                    for handler in attempt.handlers)
+        handling = {id(node) for attempt, _ in attempts for handler in attempt.handlers
+                    for node in _executed(handler.body)}
+        if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range") or any(
+                isinstance(node, ast.Name) and node.id in counted and id(node) not in handling
+                for node in _executed(loop.body)):
+            return False
+    for attempt, rest in attempts:
+        def onward(ends: frozenset[str], attempt: ast.Try | ast.TryStar = attempt,
+                   rest: list[Sequence[ast.stmt]] = rest) -> frozenset[str]:
+            ends = _finally(ends, attempt.finalbody)
+            for statements in rest:
+                ends = _then(ends, statements)
+            return ends
+
+        succeeds = {"break", "return"} & onward(_then(_outcomes(attempt.body), attempt.orelse))
+        again = any({"next", "continue"} & onward(_outcomes(handler.body)) for handler in attempt.handlers)
         if succeeds and again:
             return True
     return False
