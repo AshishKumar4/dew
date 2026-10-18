@@ -287,6 +287,20 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
 
 
+def test_a_request_keyed_by_another_prng_implementation_is_refused_before_it_queues():
+    """A server makes each admission's keys with the default PRNG implementation, so a key of
+    another one (rbg) is refused at submission, before anything queues, and a request beside it
+    draws the sampled tokens and likelihoods the one-row task draws."""
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_token_ids=None))
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with pytest.raises(ValueError):
+        server.submit(prompt, 5, key=jax.random.key(7, impl="rbg"))
+    ticket = server.submit(prompt, 5, key=3)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=3))
+
+
 @pytest.mark.parametrize("seed", [7, 2**31, -1, 2**40 + 3])
 def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     """Submitting with an integer seed moves nothing to the device, not even

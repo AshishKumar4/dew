@@ -208,10 +208,18 @@ _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
 
 def _seed(key: int | jax.Array | None) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
-    `_row_keys` to make into a key, or a key's data."""
+    `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
+    reads every row's key with the default PRNG implementation, so a key of
+    another is refused here, before the request queues."""
     if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
         return int(key)
-    return jax.random.key_data(request_key(key))
+    typed = request_key(key)
+    implementation = str(jax.random.key_impl(typed))
+    if implementation != jax.config.jax_default_prng_impl:
+        raise ValueError(f"a served request's key is {implementation}, and the server batches keys of the "
+                         f"default implementation, {jax.config.jax_default_prng_impl}; pass an integer seed "
+                         "or a key of that implementation")
+    return jax.random.key_data(typed)
 
 
 @jax.jit
