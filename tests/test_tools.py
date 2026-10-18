@@ -1059,14 +1059,54 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
 
 
+def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
+    """SLOP018 reads a loop over a range as attempts at one piece of work only where the work reads
+    no number the loop counts: a scan by index, like one over the items, retries nothing. A failure
+    that raises on its last attempt and goes round on the others retries; one that raises on every
+    attempt does not."""
+    found = _linted(tmp_path, {"src/sparx/retries.py": (
+        "def retry(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def last_raises(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            if attempt == 2:\n"
+        "                raise\n"
+        "def raised(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            raise\n"
+        "def direct(rows, parse):\n"
+        "    for row in rows:\n"
+        "        try:\n"
+        "            return parse(row)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def indexed(rows, parse):\n"
+        "    for index in range(len(rows)):\n"
+        "        try:\n"
+        "            return parse(rows[index])\n"
+        "        except ValueError:\n"
+        "            continue\n")})
+    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8)]
+
+
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
     """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
     that binds `f` in its method resolution order, from a method or a closure in one; a name to its
     binding, which a comprehension's own variable does not make outside it but does inside, and a
     pattern's capture, an exception's name or a class body's assignment does, and a receiver a
     comprehension rebinds is another object's. A generator's element runs only as it is consumed,
-    and a list's again and again, as a loop's body does. A sleep beside a call that reaches a
-    subprocess, a list built of them included, is at its boundary."""
+    at once where a loop iterates it, and a list's again and again, as a loop's body does. A sleep
+    beside a call that reaches a subprocess, a list built of them included, is at its boundary."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import subprocess\n"
         "import time\n"
@@ -1133,7 +1173,10 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "        [self.work() for self in peers]\n"
         "        time.sleep(1)\n"
         "def polled(done):\n"
-        "    return [done.wait(0.1) for _ in range(3)]\n")})
+        "    return [done.wait(0.1) for _ in range(3)]\n"
+        "def consumed(commands):\n"
+        "    for finished in (subprocess.run(command) for command in commands):\n"
+        "        time.sleep(1)\n")})
     assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
 
 
@@ -1142,7 +1185,7 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     raises, by any name it is imported as, that carries on instead of raising, in the package's
     source. One that raises, naming what to install, requires the feature and is not reported, as
     is one whose class body raises where it is defined; a raise in a function the handler only
-    defines is no raise of its own."""
+    defines is no raise of its own, and one that raises on some paths carries on along the rest."""
     found = _linted(tmp_path, {"src/sparx/features.py": (
         "from builtins import ImportError as Missing\n"
         "def optional():\n"
@@ -1176,8 +1219,16 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    except ImportError:\n"
         "        class Missing:\n"
         "            raise RuntimeError('install sparx[yaml]')\n"
+        "    return yaml\n"
+        "def unrelated():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        if error.name != 'yaml':\n"
+        "            raise\n"
+        "        yaml = None\n"
         "    return yaml\n")})
-    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22)]
+    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
