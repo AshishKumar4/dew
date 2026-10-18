@@ -21,7 +21,7 @@ from .attention import (
     tensor_shards,
 )
 from .documents import with_documents
-from .inputs import coordinates, valid_order
+from .inputs import Coordinates, coordinates, valid_order
 from .sharding import (
     HEADS,
     KV_HEADS,
@@ -69,9 +69,8 @@ def token_places(length: int, segment_ids=None, valid=None) -> jax.Array:
         places = coordinates(segments=segment_ids, valid=valid).positions
         assert places is not None  # derived from the segments
         return places
-    if valid is not None:
-        return jnp.maximum(jnp.cumsum(jnp.asarray(valid, bool), axis=1, dtype=jnp.int32) - 1, 0)
-    return jnp.arange(length)
+    ranks = Coordinates(valid=valid).places()
+    return jnp.arange(length) if ranks is None else ranks
 
 
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
@@ -176,6 +175,10 @@ def _local_attention(query, key, value, *, window, chunk, positions, segment_ids
     # Padding among a row's tokens left in place: the dense call counts them by rank.
     holes = valid is not None and not right_padded
     if length <= 2 * span or not halo or holes:
+        # A mask pairs every query with every key, which an Explicit axis splitting both sides of
+        # it would place twice, so the `[B, S]` fields it is built from are each device's whole.
+        segment_ids, valid = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
+                              for x in (segment_ids, valid))
         ranks = token_places(length, valid=valid) if holes else None
         places = (jnp.arange(length) if ranks is None else ranks) if positions is None else positions
         mask = (None if chunk is None or (positions is None and ranks is None and length <= chunk)

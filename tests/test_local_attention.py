@@ -107,12 +107,13 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
 @pytest.mark.parametrize("explicit", [False, True], ids=["auto", "explicit"])
 @pytest.mark.parametrize("span", [{"window": 2}, {"chunk": 4}])
 def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_axis(span, explicit):
-    """A sequence axis that splits a row with padding among its tokens in two,
-    Auto or Explicit, its rows placed split: each real query reads the keys
-    its tokens' ranks say, as near the float64 truth as the same call on one
-    device, which compacts the row. Compacting sorts the sequence axis, which
-    JAX refuses on an Explicit axis that splits it, so the split call counts
-    by rank in place."""
+    """A sequence axis that splits a packed row with padding among its tokens
+    in two, Auto or Explicit, its rows placed split: each real query reads
+    the keys of its document its tokens' ranks say, as near the float64 truth
+    as the same call on one device, which compacts the row. Compacting sorts
+    the sequence axis, which JAX refuses on an Explicit axis that splits it,
+    so the split call counts by rank in place, its mask built from fields
+    each device holds whole."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.training import MeshSpec
@@ -120,23 +121,27 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
     length = 16
     query, key, value = inputs(length, batch=1)
     valid = jnp.asarray([[True, False, False, True, True, False, True, True] * 2])
+    segments = jnp.asarray(packed(length, (11, length))[None])
     rank = np.cumsum(np.asarray(valid), axis=1) - 1
+    # Each token's index among its document's tokens: the second starts at slot 11, rank 6.
+    place = np.where(np.arange(length) < 11, rank, rank - 6)
     keep = rank[:, None, :] <= rank[:, :, None]
+    keep &= np.asarray(segments)[:, :, None] == np.asarray(segments)[:, None, :]
     if "window" in span:
         keep &= rank[:, :, None] - rank[:, None, :] < span["window"]
     else:
-        keep &= rank[:, :, None] // span["chunk"] == rank[:, None, :] // span["chunk"]
+        keep &= place[:, :, None] // span["chunk"] == place[:, None, :] // span["chunk"]
     keep &= np.asarray(valid)[:, None, :]
     truth = dense_reference(query, key, value, keep)
 
-    def attend(q, k, v, valid):
-        return local_attention(q, k, v, **span, valid=valid, implementation="xla")
+    def attend(q, k, v, valid, segments):
+        return local_attention(q, k, v, **span, segment_ids=segments, valid=valid, implementation="xla")
 
-    alone = attend(query, key, value, valid)
+    alone = attend(query, key, value, valid, segments)
     mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])
     with jax.set_mesh(mesh):
         placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
-                  for x in (query, key, value, valid)]
+                  for x in (query, key, value, valid, segments)]
         split = jax.jit(attend)(*placed)
     real = np.asarray(valid)[0]
     assert_as_exact_as_the_reference(np.asarray(split)[:, real], np.asarray(alone)[:, real], truth[:, real],
