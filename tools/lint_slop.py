@@ -1372,16 +1372,28 @@ def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
 def _outcomes(statements: Sequence[ast.stmt]) -> frozenset[str]:
     """How running `statements` can end, by Python's control flow: "next", off their end, or by a
     "return", a "raise", or a "break" or "continue" of the loop they sit in. A branch, a `with`, a
-    `try` and a `match` end as any of their paths can, a nested loop keeps its own `break` and
-    `continue`, and a class's body runs where it is defined; a function's body runs only where it is
-    called. An exception a call raises is not read."""
-    ends: set[str] = set()
+    `try` and a `match` end as any of their paths can, a `finally` that completes resumes the exit
+    it interrupted, a nested loop keeps its own `break` and `continue`, and a class's body runs where
+    it is defined; a function's body runs only where it is called. An exception a call raises is
+    not read."""
+    ends = frozenset({"next"})
     for statement in statements:
-        ending = _ending(statement)
-        ends |= ending - {"next"}
-        if "next" not in ending:
-            return frozenset(ends)
-    return frozenset({*ends, "next"})
+        if "next" not in ends:
+            break
+        ends = ends - {"next"} | _ending(statement)
+    return ends
+
+
+def _then(ends: frozenset[str], statements: Sequence[ast.stmt]) -> frozenset[str]:
+    """`ends` with the path that runs off their end ("next") going on into `statements`."""
+    return ends - {"next"} | (_outcomes(statements) if "next" in ends else frozenset())
+
+
+def _finally(pending: frozenset[str], final: Sequence[ast.stmt]) -> frozenset[str]:
+    """How a `try` ends whose paths end as `pending` before its `final` body runs: a `final` body
+    that completes resumes each of them, and one that leaves replaces them."""
+    ends = _outcomes(final)
+    return ends - {"next"} | (pending if "next" in ends else frozenset())
 
 
 _JUMPS = {ast.Return: "return", ast.Raise: "raise", ast.Break: "break", ast.Continue: "continue"}
@@ -1397,12 +1409,9 @@ def _ending(statement: ast.stmt) -> frozenset[str]:
         case ast.With() | ast.AsyncWith() | ast.ClassDef():
             return _outcomes(statement.body)
         case ast.Try() | ast.TryStar():
-            done = _outcomes(statement.body)
-            if "next" in done:
-                done = done - {"next"} | _outcomes(statement.orelse)
-            done = done.union(*(_outcomes(handler.body) for handler in statement.handlers))
-            final = _outcomes(statement.finalbody)
-            return final if "next" not in final else done | final
+            pending = _then(_outcomes(statement.body), statement.orelse).union(
+                *(_outcomes(handler.body) for handler in statement.handlers))
+            return _finally(pending, statement.finalbody)
         case ast.Match():
             done = frozenset[str]().union(*(_outcomes(case.body) for case in statement.cases))
             irrefutable = any(case.guard is None and isinstance(case.pattern, ast.MatchAs)
@@ -1417,12 +1426,22 @@ def _ending(statement: ast.stmt) -> frozenset[str]:
     return frozenset({"next"})
 
 
+def _fed(work: Sequence[ast.stmt], counted: Set[str]) -> bool:
+    """Whether a number in `counted` feeds `work`'s inputs: an argument of a call it makes, or the
+    index of what it reads. Work that only reports the number repeats one piece."""
+    def counts(node: ast.AST) -> bool:
+        return any(isinstance(name, ast.Name) and name.id in counted for name in ast.walk(node))
+
+    return any((isinstance(node, ast.Call) and any(map(counts, [*node.args, *node.keywords])))
+               or (isinstance(node, ast.Subscript) and counts(node.slice)) for node in _executed(work))
+
+
 def _retrying(loop: ast.For | ast.While) -> bool:
-    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose work reads
-    no number it counts (attempts, where reading it is a scan by index), whose `try` leaves the loop
-    where the work succeeds (inside it, or by an exit after it) and goes round again on some path
-    where it fails: a handler that continues the loop, or that runs off its end where nothing after
-    the `try` leaves (`_outcomes`)."""
+    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose number
+    feeds none of the work's inputs (attempts, where it does a scan by index, `_fed`), whose `try`
+    leaves the loop on some path where the work succeeds and goes round again on some path where it
+    fails, each path followed through the `try`'s `finally` and the rest of the loop's body
+    (`_outcomes`)."""
     counted: set[str] = set()
     if isinstance(loop, ast.For):
         if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range"):
@@ -1430,15 +1449,13 @@ def _retrying(loop: ast.For | ast.While) -> bool:
         counted = {name.id for name in ast.walk(loop.target) if isinstance(name, ast.Name)}
     body = list(loop.body)
     for index, attempt in enumerate(body):
-        if not isinstance(attempt, ast.Try | ast.TryStar):
+        if not isinstance(attempt, ast.Try | ast.TryStar) or _fed([*attempt.body, *attempt.orelse], counted):
             continue
-        work = [*attempt.body, *attempt.orelse]
-        if any(isinstance(node, ast.Name) and node.id in counted for node in _executed(work)):
-            continue
-        after = bool({"break", "return"} & _outcomes(body[index + 1:]))
-        succeeds = after or bool({"break", "return"} & _outcomes(work))
-        again = any("continue" in ends or ("next" in ends and not after)
-                    for ends in (_outcomes(handler.body) for handler in attempt.handlers))
+        tail = body[index + 1:]
+        succeeded = _then(_outcomes(attempt.body), attempt.orelse)
+        succeeds = {"break", "return"} & _then(_finally(succeeded, attempt.finalbody), tail)
+        again = any({"next", "continue"} & _then(_finally(_outcomes(handler.body), attempt.finalbody), tail)
+                    for handler in attempt.handlers)
         if succeeds and again:
             return True
     return False
