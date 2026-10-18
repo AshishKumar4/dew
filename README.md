@@ -588,7 +588,7 @@ from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = loader(TextData(source="data/tinystories", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
+masked_data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(
