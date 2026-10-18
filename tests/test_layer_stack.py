@@ -139,7 +139,15 @@ def deepseek_shaped(dtype=jnp.float32, **overrides):
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
 # one-ULP weight perturbations without any sparse-ReLU branch changing.
-SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped}
+def deepseek_widths(dtype=jnp.float32, **overrides):
+    """The DeepSeek-shaped stack with a dense width per layer beside the routed
+    experts' own width, and no prediction depth, which would need one width."""
+    return deepseek_shaped(dtype, **{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
+                                     **overrides})
+
+
+SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
+          "deepseek_widths": deepseek_widths}
 
 FLOOR_FACTOR = 4.0
 """How far a scanned stack may sit from the plain loop, in multiples of the

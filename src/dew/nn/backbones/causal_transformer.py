@@ -924,7 +924,7 @@ class CausalTransformer(nn.Module):
             routed = None
         else:
             routed = mixture.build(
-                out_features=self.emb_features, hidden_features=self.hidden_features, activation=self.mlp,
+                out_features=self.emb_features, hidden_features=expert_features, activation=self.mlp,
                 dense=gated_mlp, swiglu_limit=self.swiglu_limit,
                 init_std=init_std, output_init_std=output_init_std,
                 norm=functools.partial(
