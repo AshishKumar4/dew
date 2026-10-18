@@ -38,7 +38,7 @@ from delta_rule_support import CHUNKED, port_formula, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
-from tuned import each_config
+from tuned import each_config, launches, timed
 
 from dew.nn import linear
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
@@ -712,7 +712,8 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held
     the float64 gate of the fp32 recurrence's, at Qwen3.5-0.8B's widths (16
     heads, 128 wide) on a GPU and interpreted at a small width. A state held
     in bf16 is read and stepped in fp32 and written back rounded once,
-    stochastically: within one bf16 step of the fp32 one."""
+    stochastically: within one bf16 step of the fp32 one. The tuner times the
+    launch on every row active, where the default operands' zeros idle them."""
     from dew.nn.kernels import delta_rule
     from dew.nn.linear import decode_gated_delta_rule
 
@@ -729,6 +730,9 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held
         truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
     found = each_config(delta_rule.DeltaStep, decode_gated_delta_rule, query, key, value, g, beta, state)
     assert len(found) > 1
+    # Timed on every row active (`KernelOp.operands`): each row-head's output is written.
+    [step] = launches(decode_gated_delta_rule, query, key, value, g, beta, state)
+    assert np.all(np.any(np.asarray(timed(step)[1]) != 0, axis=-1))
     for config in found:
         with tuning.pinned({delta_rule.DeltaStep: config}):
             got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)

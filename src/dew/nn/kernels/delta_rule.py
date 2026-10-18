@@ -152,3 +152,8 @@ class DeltaStep(tuning.KernelOp):
 
     def _get_autotuning_configs(self, ba) -> set[Columns]:
         return {config for config in SPACE if ba.arguments['state'].shape[-1] % config.block == 0}
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats and every row active, so a timed launch steps each row-head's state."""
+        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
