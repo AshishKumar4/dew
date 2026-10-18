@@ -16,7 +16,7 @@ import tyro
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Rejected, Stage
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted
 from dew.data.sources.codec import content_fingerprint
 from dew.records import integer
 
@@ -72,8 +72,7 @@ class _SliceRecords:
         return SourceSlice(records, self.start, stop)
 
     def metadata(self) -> Mapping[str, object]:
-        stated = self.source.metadata()
-        return {**stated, **({"held_out": self.start} if self.start else {})}
+        return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -154,7 +153,7 @@ class _HashSource:
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
+        return _uncounted(self.source.metadata())
 
     def lengths(self) -> np.ndarray | None:
         return None

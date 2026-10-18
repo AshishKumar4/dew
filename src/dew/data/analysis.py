@@ -486,10 +486,7 @@ def _analyzed(
         eager += 1
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
-        per_share = per_share or any(
-            isinstance(child.source, (Mixture, Phases)) or "valid_targets" not in child.source.metadata()
-            for child in nested
-        )
+        per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in children)
     children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
@@ -546,6 +543,16 @@ def _analyzed(
     if per_share and lowering.split and not validation and not configured:
         raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     return lowering
+
+
+def _states_its_targets(pipeline: Pipeline) -> bool:
+    """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
+    valid targets count, so a weight from them holds its share of the targets (`token_weights`):
+    a source that states them, read every row alike, which no slice, limit or token split takes a
+    part of. Any other corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
+    source = pipeline.source
+    return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
+            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in pipeline.stages))
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
