@@ -209,7 +209,7 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
     as fla takes it, not the release's: on an A100 the port's logits sat 3.46
     times the release's distance from float64, the portable math's 1.57. There
     the reference is Dew's own model with the port's formula in the portable
-    math (`port_formula`), as a packed window's is (test_decision_packing)."""
+    math (`port_formula`)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())

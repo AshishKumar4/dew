@@ -487,7 +487,7 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
                             "is fla's own distance (test_fla_kda's packed case)"))])
 def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
-    """Packed documents (`starts`, each first token forgetting the memory, `linear.FORGET`), with a
+    """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
     and gradients within fp32 rounding of the token recurrence run document by document in float64.
