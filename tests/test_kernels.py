@@ -832,7 +832,9 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     length, block by block, and is within tests/reference_error.py's rule of
     jax.nn's xla attention against float64: rows reading 1 key (an idle
     slot), a block's worth, one past it, and the whole capacity, at
-    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256)."""
+    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256). At the
+    default precision its fp32 products are fp32 ones, held to jax.nn's at
+    fp32 precision; Triton's default is one TF32 product."""
     from dew.nn.kernels import decode_attention
 
     rng = np.random.default_rng(0)
@@ -844,8 +846,9 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
     assert decode_attention.fits(query, key)
     out = jax.jit(decode_attention.attend)(query, key, value, lengths)
-    plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                         implementation='xla')
+    with jax.default_matmul_precision("float32"):
+        plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                             implementation='xla')
     assert out.shape == plain.shape and out.dtype == plain.dtype
     q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
     read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
@@ -856,57 +859,71 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
                                      "decode kernel")
 
 
-@pytest.mark.gpu(reason="the kernel runs on CUDA")
-def test_fp32_attention_the_decode_kernel_takes_keeps_fp32_products_at_the_default_precision():
-    """At the default matmul precision, fp32 attention with key lengths on 'xla', which the decode
-    kernel takes, returns a value carrying 2**-12 exactly, as XLA's own dots do: one visible key of
-    value 1 + 2**-12 under zero queries and keys. A TF32 product rounds it to 1."""
-    from dew.nn.kernels import decode_attention
+def decode_step(lengths):
+    """fp32 attention of a decode step's grouped query (`CausalSelfAttention._decode_attention`) over
+    key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
+    folded attention it stands in for over the prefix those lengths mean."""
+    def attended(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                            key_value_seq_lengths=lengths)
 
-    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
-    key = jnp.zeros((1, 32, 1, 16), jnp.float32)
-    value = jnp.full((1, 32, 1, 16), 1 + 2.0**-12, jnp.float32)
-    assert decode_attention.fits(query, key)
-    lengths = jnp.asarray([1], jnp.int32)
-    with jax.default_matmul_precision("default"):
-        out = jax.jit(lambda q, k, v: scaled_dot_product_attention(
-            q, k, v, implementation='xla', key_value_seq_lengths=lengths))(query, key, value)
-    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, 16), 1 + 2.0**-12, np.float32))
+    def folded(query, key, value):
+        return folded_attention(query, key, value, with_key_lengths(None, lengths, key.shape[-3]))
+
+    return attended, folded
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_both_modes(generation):
+    """Lowered for the GPU on this CPU, a decode step's attention runs the decode kernel for its value
+    under reverse and forward mode alike, its Pallas call having no derivative of its own."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    attended, _ = decode_step(jnp.asarray([1, 20], jnp.int32))
+    query = jax.ShapeDtypeStruct((2, 4, 2, 64), jnp.float32)
+    key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.float32)
+
+    def loss(*arrays):
+        return jnp.square(attended(*arrays)).sum()
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
+    for differentiated in (jax.value_and_grad(loss, argnums=(0, 1, 2)),
+                           lambda *arrays: jax.jvp(loss, arrays, arrays)):
+        with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+            lowered = jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        assert triton_kernels(lowered) == {"decode_attention": 1}
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
-    """`scaled_dot_product_attention` with key lengths on 'xla', which the decode kernel takes,
-    differentiates as the folded attention it stands in for: query, key and value gradients within
+    """A decode step's attention, its value the kernel's, differentiates as the folded attention it
+    stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
     tests/reference_error.py's rule of the folded attention's against float64."""
-    from dew.nn.attention import folded_attention, with_key_lengths
     from dew.nn.kernels import decode_attention
 
     rng = np.random.default_rng(1)
-    lengths = jnp.asarray([1, 20, 64], jnp.int32)
-    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
-                         for shape in ((3, 2, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
+    attended, folded = decode_step(jnp.asarray([1, 20, 64], jnp.int32))
+    query, key, value, *tangents = (jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
+        (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
     assert decode_attention.fits(query, key)
     cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.float32)
 
-    def gradients(attend, *arrays):
+    def derivatives(attend, *arrays):
         def pulled(*a):
             return jnp.sum(attend(*a) * cotangent.astype(a[0].dtype))
 
-        return jax.grad(pulled, argnums=(0, 1, 2))(*arrays)
+        out, tangent = jax.jvp(attend, arrays, tuple(t.astype(arrays[0].dtype) for t in tangents))
+        return (out, *jax.grad(pulled, argnums=(0, 1, 2))(*arrays), tangent)
 
-    found = jax.jit(lambda *a: gradients(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, implementation='xla', key_value_seq_lengths=lengths), *a))(query, key, value)
-
-    def folded(q, k, v):
-        return folded_attention(q, k, v, with_key_lengths(None, lengths, k.shape[-3]))
-
-    reference = jax.jit(lambda *a: gradients(folded, *a))(query, key, value)
+    found = jax.jit(lambda *a: derivatives(attended, *a))(query, key, value)
+    reference = jax.jit(lambda *a: derivatives(folded, *a))(query, key, value)
     with jax.enable_x64(new_val=True):
-        truth = gradients(folded, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
-    for name, got, want, exact in zip("qkv", found, reference, truth, strict=True):
+        truth = derivatives(folded, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    names = ("value", "dq", "dk", "dv", "tangent")
+    for name, got, want, exact in zip(names, found, reference, truth, strict=True):
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact),
-                                         f"the decode kernel's {name} gradient")
+                                         f"the decode kernel's {name}")
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")

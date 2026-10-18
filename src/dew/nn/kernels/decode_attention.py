@@ -15,9 +15,9 @@ dots, so a Mosaic GPU port takes it as is.
 The arithmetic is jax.nn's but for the order of its sums: fp32 logits of
 the operands, the scale after, an fp32 softmax, its probabilities in the
 value's dtype for the value product, which accumulates in fp32 and is
-normalized at the end rather than before the product. Both products of fp32
-operands are fp32 products: Triton's default for them is one TF32 product,
-which XLA's dots at the default precision are not.
+normalized at the end rather than before the product. Both products name
+the highest precision, so fp32 operands multiply in IEEE fp32 whatever the
+default precision, where Triton's default is one TF32 product.
 
 `attend_paged` is the same kernel over a paged cache: a program takes one
 row and one key head with the query heads that share it, and reads the row's
@@ -107,35 +107,11 @@ def _paged_kernel(lengths_ref, table_ref, query_ref, key_ref, value_ref, out_ref
     out_ref[...] = out.astype(out_ref.dtype)
 
 
-@jax.custom_vjp
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the first `lengths` `[B]` of
-    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out,
-    differentiated as the folded attention it stands in for is
-    (`dew.nn.attention.folded_attention`): its Pallas call has no transpose."""
-    return _attended(query, key, value, lengths)
-
-
-def _attend_fwd(query, key, value, lengths):
-    return attend(query, key, value, lengths), (query, key, value, lengths)
-
-
-def _attend_bwd(saved, cotangent):
-    # Imported here: dew.nn.attention imports this module.
-    from dew.nn.attention import folded_attention, with_key_lengths
-
-    query, key, value, lengths = saved
-    def folded(q, k, v):
-        return folded_attention(q, k, v, with_key_lengths(None, lengths, k.shape[-3]))
-
-    _, backward = jax.vjp(folded, query, key, value)
-    return (*backward(cotangent), None)
-
-
-attend.defvjp(_attend_fwd, _attend_bwd)
-
-
-def _attended(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
+    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out.
+    Its Pallas call has no derivative: `dew.nn.attention` differentiates it as
+    the folded attention it stands in for."""
     from jax.experimental.pallas import triton as plgpu
 
     batch, positions, heads, width = query.shape
@@ -149,6 +125,7 @@ def _attended(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.A
         out_specs=queried,
         out_shape=jax.ShapeDtypeStruct(padded.shape, query.dtype),
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+        name="decode_attention",
     )(jnp.asarray(lengths, jnp.int32)[:, None], padded, key, value)
     return out[:, :positions]
 
@@ -190,5 +167,6 @@ def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array,
         out_specs=queried,
         out_shape=jax.ShapeDtypeStruct(grouped.shape, query.dtype),
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+        name="paged_decode_attention",
     )(jnp.asarray(lengths, jnp.int32)[:, None], table, grouped, key_pages, value_pages)
     return out[:, :, :group].reshape(rows, heads, width)
