@@ -157,21 +157,25 @@ CORRUPTIONS = {
     "metadata": (_table('"__metadata__":{"x":"1","x":"2"}', _A, _B), _PAYLOAD),
     "utf-16": (_table(_A, _B), _PAYLOAD),
     "entry": (_table('"c":[1]', _A, _B), _PAYLOAD),
+    "object-shape": (_table(_A.replace("[2,2]", "{}"), _B), _PAYLOAD),
+    "sequence": (_table('"a":["F32",[2,2],[0,16]]', _B), _PAYLOAD),
+    "surrogate": (_table('"__metadata__":{"x":"\\ud800"}', _A, _B), _PAYLOAD),
 }
 """Each one change to a valid two-tensor file: a hole between tensors, two
 tensors on the same bytes, a missing byte, bytes after the tensors, a shape
 its bytes do not hold, an unknown dtype tag, a tensor named twice with another
 dtype first, null metadata, a field TensorInfo does not know, a TensorInfo
 field named twice, metadata named twice, a metadata key named twice, the
-header in UTF-16, and a tensor that is no object."""
+header in UTF-16, a tensor that is no object, a shape that is an object, a
+tensor stated as a sequence, and metadata holding an unpaired surrogate."""
 
 
 @pytest.mark.parametrize("corruption", [*CORRUPTIONS, "length"])
 def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
-    """Dew reads the header of the file it holds open itself, so it checks the
-    container as safetensors 0.8.0's safe_open does: a file safe_open reads
-    reads to the same tensors and metadata, and each one safe_open refuses,
-    Dew refuses. `length` states a header longer than the file."""
+    """Dew validates the header of the file it holds open through safe_open, on
+    a stand-in of that header: a file safe_open reads reads to the same tensors
+    and metadata, and each one safe_open refuses, Dew refuses with safe_open's
+    error. `length` states a header longer than the file."""
     text, payload = CORRUPTIONS.get(corruption, CORRUPTIONS["valid"])
     header = text.encode("utf-16" if corruption == "utf-16" else "utf-8")
     stated = 10 ** 9 if corruption == "length" else len(header)
@@ -183,7 +187,7 @@ def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
             expected = {name: reader.get_tensor(name) for name in names}
             stored = reader.metadata() or {}
     except safetensors.SafetensorError:
-        with pytest.raises(ValueError):
+        with pytest.raises(safetensors.SafetensorError):
             read_file(path)
         return
     tensors, metadata = read_file(path)
