@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
 from dew.nn.mlp import GatedMLP
@@ -149,6 +149,52 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
     dew = {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
     assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64),
                            reductions=hidden.shape[0] * hidden.shape[1])
+
+
+@pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
+def test_gaussian_topk_is_as_exact_as_the_references(sparsity):
+    """Gemma 3n's sparse gate over 256 rows of 2048 normal activations: Dew's
+    fp32 is within tests/reference_error.py's rule of the reference's fp32
+    (Gemma3nTextMLP._gaussian_topk), both from the reference in float64, which
+    keeps the reference's fp32 cutoff multiplier. Dew's multiplier from jax's
+    fp32 erfinv, two ulps off at 0.95, was 3.77 and 6.33 times the reference's
+    distance at 0.95 and 0.9, and 1.10 and 1.15 once formed as the reference's."""
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
+
+    rows = np.random.default_rng(0).standard_normal((256, 2048)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
+                               activation_sparsity_pattern=[sparsity])
+    mlp = Gemma3nTextMLP(config, layer_idx=0)
+
+    def reference(dtype):
+        return mlp._gaussian_topk(torch.tensor(rows, dtype=dtype)).numpy()
+
+    dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows))
+    assert_as_exact_as_the_reference(np.asarray(dew), reference(torch.float32), reference(torch.float64),
+                                     f"the gate at sparsity {sparsity}")
+
+
+@pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])
+def test_gaussian_topk_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
+    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the
+    reference's infinite cutoff multiplier (torch's icdf there): every value
+    kept as infinity below, and none kept above, bit for bit as the
+    reference's gate in fp32 and bf16, which both take the fp32 argument. A
+    float64 model forms its own float64 argument, which these do not end."""
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
+
+    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
+                               activation_sparsity_pattern=[sparsity])
+    mlp = Gemma3nTextMLP(config, layer_idx=0)
+    for torch_dtype, dtype in ((torch.float32, jnp.float32), (torch.bfloat16, jnp.bfloat16)):
+        dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows, dtype))
+        theirs = mlp._gaussian_topk(torch.tensor(rows).to(torch_dtype)).float().numpy()
+        np.testing.assert_array_equal(np.asarray(dew, np.float32), theirs)
 
 
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])
