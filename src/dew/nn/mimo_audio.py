@@ -21,6 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import translate_parameters
+from dew.nn.dense import Dense
 from dew.registry import Record
 
 from .activations import gelu_exact
@@ -238,7 +239,7 @@ class MiMoAudioCodeEncoder(nn.Module):
         if cfg.add_post_norm:
             x = RMSNorm(epsilon=cfg.rms_norm_eps, dtype=self.dtype, name="norm")(x)
         x = x.reshape(batch, groups, cfg.group_size * cfg.input_local_dim)
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         if cfg.projection_layers == 1:
             return dense(cfg.out_hidden_size, name="projection")(x)
         hidden = dense(4 * cfg.group_size * cfg.input_local_dim, name="projection_fc1")(x)
