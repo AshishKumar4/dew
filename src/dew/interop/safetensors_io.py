@@ -292,7 +292,8 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     package, _ = _safetensors()
     # One open file answers for the header, its validation and the bytes: `_publish`
     # replaces the pathname, so a reopened path can be another file. safe_open takes
-    # only a path, so it validates the open file through its descriptor's name.
+    # only a path, so it validates the open file through its descriptor's name, which
+    # every platform Dew installs on has (grain, a dependency, ships no Windows wheels).
     with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
         length = int.from_bytes(stream.read(8), "little")
         header = json.loads(stream.read(length))
