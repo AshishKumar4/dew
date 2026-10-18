@@ -970,14 +970,11 @@ def patches(module: Module) -> Iterator[Finding]:
 
 
 def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
-    """The statements an import executes: every block but function bodies and the
-    script guard's body (its `else` still runs), class bodies included."""
+    """The statements an import executes: every block but the script guard's body
+    (its `else` still runs). A definition among them runs what `_executed` says:
+    its decorators and defaults, and a class's bases, keywords and body."""
     for node in body:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        if isinstance(node, ast.ClassDef):
-            yield from _module_level(node.body)
-        elif isinstance(node, ast.If):
+        if isinstance(node, ast.If):
             if not _script_guard(node):
                 yield node.test
                 yield from _module_level(node.body)
@@ -993,18 +990,17 @@ def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
 
 def imports(module: Module) -> Iterator[Finding]:
     """SLOP013: importing the module changes process-wide state."""
-    for statement in _module_level(module.tree.body):
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Assign):
-                written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
-                              for target in node.targets)
-            elif isinstance(node, ast.Call):
-                written = _named(node.func).endswith(GLOBAL_WRITES)
-            else:
-                continue
-            if written:
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
-                              "changes process-wide state at import; do it where the caller asks for it")
+    for node in _executed(_module_level(module.tree.body)):
+        if isinstance(node, ast.Assign):
+            written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
+                          for target in node.targets)
+        elif isinstance(node, ast.Call):
+            written = _named(node.func).endswith(GLOBAL_WRITES)
+        else:
+            continue
+        if written:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
+                          "changes process-wide state at import; do it where the caller asks for it")
 
 
 def _mixing(module: Module) -> frozenset[str]:
