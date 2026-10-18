@@ -74,9 +74,10 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
 @pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
 def test_packed_documents_restart_their_windows_and_chunks(span):
     """Chunks count from each document's first token, as `chunked_overlay`
-    reads packed positions; windows count rows inside the document. Padding
-    keys (segment 0 and invalid) are never read by a real query, one of a
-    document and valid; a padding query's output is no token's."""
+    reads packed positions; windows count the tokens inside the document, an
+    invalid slot among them none, as the cache counts them. Padding keys
+    (segment 0 and invalid) are never read by a real query, one of a document
+    and valid; a padding query's output is no token's."""
     length = 29
     query, key, value = inputs(length)
     segments, positions = packed(length, (7, 18, 26))
@@ -86,11 +87,13 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
     keep = (
         (rows[None, :] <= rows[:, None]) & (segments[:, None] == segments[None, :]) & (segments[:, None] != 0)
     )
+    # Each slot's index among its row's real tokens.
+    rank = np.cumsum(valid, axis=1) - 1
     if "window" in span:
-        keep &= rows[:, None] - rows[None, :] < span["window"]
+        keep = keep[None] & (rank[:, :, None] - rank[:, None, :] < span["window"])
     else:
-        keep &= positions[:, None] // span["chunk"] == positions[None, :] // span["chunk"]
-    keep = keep[None] & valid[:, None, :]
+        keep = keep[None] & (positions[:, None] // span["chunk"] == positions[None, :] // span["chunk"])[None]
+    keep = keep & valid[:, None, :]
     expected = dense_reference(query, key, value, keep)
     actual = local_attention(
         query, key, value, **span, segment_ids=jnp.broadcast_to(segments, (2, length)),
