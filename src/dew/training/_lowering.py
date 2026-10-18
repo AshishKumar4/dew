@@ -25,31 +25,52 @@ host, so attention traces its XLA path.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 
 import jax
 from jax.extend.mlir import ir
 
 TRITON = "__gpu$xla.gpu.triton"
-"""The custom call Pallas lowers a Triton kernel to, its name in the call's backend config."""
+"""The custom call Pallas lowers a Triton kernel to."""
 
 
-def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
-    """The Pallas-Triton kernels a lowered program calls, by name, with the call sites of each: each
-    Triton custom call's `name`, read from the attributes Pallas set (`mhlo.backend_config`)."""
-    calls: Counter[str] = Counter()
+@dataclass(frozen=True)
+class TritonCall:
+    """One Pallas-Triton call of a lowered program, as Pallas configured it (`mhlo.backend_config`)."""
+
+    name: str
+    ir: bytes
+    """The kernel's Triton IR, serialized as Pallas wrote it."""
+    warps: int
+    stages: int
+
+
+def triton_calls(lowered: jax.stages.Lowered) -> list[TritonCall]:
+    """Every Pallas-Triton custom call a lowered program makes, in program order."""
+    calls: list[TritonCall] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
         attributes = operation.attributes
         if (operation.name == "stablehlo.custom_call"
                 and ir.StringAttr(attributes["call_target_name"]).value == TRITON):
-            calls[ir.StringAttr(ir.DictAttr(attributes["mhlo.backend_config"])["name"]).value] += 1
+            config = ir.DictAttr(attributes["mhlo.backend_config"])
+            calls.append(TritonCall(ir.StringAttr(config["name"]).value,
+                                    ir.StringAttr(config["ir"]).value_bytes,
+                                    ir.IntegerAttr(config["num_warps"]).value,
+                                    ir.IntegerAttr(config["num_stages"]).value))
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
     with module.context:
-        module.operation.walk(visit)
-    return dict(sorted(calls.items()))
+        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return calls
+
+
+def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
+    """The Pallas-Triton kernels a lowered program calls (`triton_calls`), by name, with the call
+    sites of each."""
+    return dict(sorted(Counter(call.name for call in triton_calls(lowered)).items()))
 
 
 class Lowered(SystemExit):
