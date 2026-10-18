@@ -200,3 +200,44 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
     truth = np.einsum('bngs,bsnd->bngd', probs / probs.sum(-1, keepdims=True), v).reshape(rows, heads, width)
     assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
                                      "paged decode kernel")
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
+def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+    """The dense kernel under a decode step's attention and its gradient, in bf16 and fp32 at
+    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256, a 384-slot cache), and the paged
+    kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys, lowered for
+    each GPU on this CPU and compiled by Triton within its block's shared memory. A first filter: the
+    A100 runs them; the H100 and the RTX PRO 6000 have this check alone."""
+    pytest.importorskip("triton")
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    from dew.nn.kernels import decode_attention
+
+    def dense(dtype):
+        lengths = jax.ShapeDtypeStruct((8,), jnp.int32)
+        query = jax.ShapeDtypeStruct((8, 4, 2, 256), dtype)
+        cache = jax.ShapeDtypeStruct((8, 384, 2, 256), dtype)
+
+        def step(query, key, value, lengths):
+            def loss(query, key, value):
+                return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                                    key_value_seq_lengths=lengths).astype(jnp.float32).sum()
+            return jax.value_and_grad(loss, argnums=(0, 1, 2))(query, key, value)
+        return step, (query, cache, cache, lengths)
+
+    def paged(page_size):
+        pages = jax.ShapeDtypeStruct((8, 8 * 24 + 3, page_size, 128), jnp.bfloat16)
+        return decode_attention.attend_paged, (jax.ShapeDtypeStruct((8, 16, 128), jnp.bfloat16), pages, pages,
+                                               jax.ShapeDtypeStruct((8, 24), jnp.int32),
+                                               jax.ShapeDtypeStruct((8,), jnp.int32))
+
+    cases = [KernelCase(f"dense/{jnp.dtype(dtype).name}", lambda dtype=dtype: dense(dtype))
+             for dtype in (jnp.bfloat16, jnp.float32)]
+    cases += [KernelCase(f"paged/{size}", lambda size=size: paged(size)) for size in (16, 32)]
+    found = compile_kernels(cases, target)
+    assert len(found) == len(cases)
+    assert not failures(found), "\n".join(failures(found))
+    # Each case lowered to a kernel Triton compiled, which takes shared memory.
+    assert all(record["shared"] > 0 for record in found), found
