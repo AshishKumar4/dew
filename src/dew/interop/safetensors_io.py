@@ -290,11 +290,13 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     filename = os.fspath(path)
     tensors: dict[str, np.ndarray] = {}
     package, _ = _safetensors()
-    with package.safe_open(filename, "np") as reader:
-        with open(filename, "rb") as stream:
-            length = int.from_bytes(stream.read(8), "little")
-            header = json.loads(stream.read(length))
-        mapping = np.memmap(filename, mode="c" if copy_on_write else "r", dtype=np.uint8)
+    # One open file answers for the header, its validation and the bytes: `_publish`
+    # replaces the pathname, so a reopened path can be another file. safe_open takes
+    # only a path, so it validates the open file through its descriptor's name.
+    with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
+        length = int.from_bytes(stream.read(8), "little")
+        header = json.loads(stream.read(length))
+        mapping = np.memmap(stream, mode="c" if copy_on_write else "r", dtype=np.uint8)
         metadata = reader.metadata() or {}
         names = reader.keys()
         for name in names:
