@@ -133,6 +133,58 @@ def raw_safetensors(path, entries):
     path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
 
 
+def _stored(text: bytes, payload: bytes) -> bytes:
+    return len(text).to_bytes(8, "little") + text + payload
+
+
+def _moved(header: dict, name: str, **entry) -> bytes:
+    return json.dumps({**header, name: {**header[name], **entry}}).encode()
+
+
+CORRUPTIONS = {
+    "valid": lambda header, payload: _stored(json.dumps(header).encode(), payload),
+    "gap": lambda header, payload: _stored(_moved(header, "b", data_offsets=[24, 40]), payload + bytes(8)),
+    "overlap": lambda header, payload: _stored(_moved(header, "b", data_offsets=[8, 24]), payload[:24]),
+    "short": lambda header, payload: _stored(json.dumps(header).encode(), payload[:-1]),
+    "trailing": lambda header, payload: _stored(json.dumps(header).encode(), payload + bytes(4)),
+    "span": lambda header, payload: _stored(_moved(header, "a", shape=[2, 3]), payload),
+    "dtype": lambda header, payload: _stored(_moved(header, "a", dtype="Q9"), payload),
+    "repeated": lambda header, payload: _stored(
+        b'{"b":' + json.dumps({**header["b"], "dtype": "F32"}).encode() + b","
+        + json.dumps(header).encode()[1:], payload),
+    "length": lambda header, payload: (10 ** 9).to_bytes(8, "little") + json.dumps(header).encode() + payload,
+}
+"""One change each to a valid two-tensor file: a hole between tensors, two
+tensors on the same bytes, a missing byte, bytes after the tensors, a shape
+its bytes do not hold, an unknown dtype tag, a key named twice with another
+dtype first, and a header longer than the file."""
+
+
+@pytest.mark.parametrize("corruption", list(CORRUPTIONS))
+def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
+    """Dew reads the header of the file it holds open itself, so it checks the
+    container as safetensors 0.8.0's safe_open does: a file safe_open reads
+    reads to the same tensors, and each one safe_open refuses, Dew refuses."""
+    header = {"a": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
+              "b": {"dtype": "I32", "shape": [2, 2], "data_offsets": [16, 32]}}
+    payload = np.arange(4, dtype=np.float32).tobytes() + np.arange(4, dtype=np.int32).tobytes()
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(CORRUPTIONS[corruption](header, payload))
+    try:
+        with safetensors.safe_open(str(path), "np") as reader:
+            names = reader.keys()
+            expected = {name: reader.get_tensor(name) for name in names}
+    except safetensors.SafetensorError:
+        with pytest.raises(ValueError):
+            read_file(path)
+        return
+    tensors, metadata = read_file(path)
+    assert metadata == {} and list(tensors) == sorted(expected)
+    for name, value in expected.items():
+        assert tensors[name].dtype == value.dtype
+        np.testing.assert_array_equal(tensors[name], value)
+
+
 def test_block_scale_exponents_and_packed_fp4_are_mapped_as_stored(tmp_path):
     """DeepSeek-V4's shards carry F8_E8M0 scales and F4 experts (the header of
     DeepSeek-V4-Flash shard 5). An E8M0 byte is the exponent 2**(b - 127); an
