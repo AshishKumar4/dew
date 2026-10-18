@@ -548,11 +548,12 @@ def _analyzed(
 def _states_its_targets(pipeline: Pipeline) -> bool:
     """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
     valid targets count, so a weight from them holds its share of the targets (`token_weights`):
-    a source that states them, read every row alike, which no slice, limit or token split takes a
-    part of. Any other corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
-    source = pipeline.source
+    a source that states them, whose epoch reads every row alike: no slice, limit or token split
+    before its repeat takes a part of them. Any other corpus's targets are counted as its rows
+    arrive (`TokenDeficit`)."""
+    source, epoch = pipeline.source, pipeline.stages[: _until(pipeline.stages, (Repeat,))]
     return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
-            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in pipeline.stages))
+            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in epoch))
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
