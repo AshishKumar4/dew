@@ -62,10 +62,12 @@ The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JA
 
 The driver and the GPU decide the build, newest first:
 
+<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->
 | Build | NVIDIA driver | GPU (SM) |
 |---|---|---|
 | `cuda13` | 580 or later | 7.5 or later |
 | `cuda12` | 525 or later | 5.2 or later |
+<!-- END CUDA builds -->
 
 `nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). Neither build runs on an older driver or GPU. The [dewml.dev install script](https://dewml.dev/install.sh) applies the same rule.
 
