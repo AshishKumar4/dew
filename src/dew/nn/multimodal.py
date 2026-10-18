@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates, next_position
+from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -41,11 +41,12 @@ class HardVocabularyEmbedder(Protocol):
 @struct.dataclass
 class Fusion:
     """Decoder token identities, their scaled, conditioned embeddings, and
-    which positions media fill."""
+    which positions media fill; both None where the decoder looks its tokens
+    up itself."""
 
     tokens: jax.Array
-    embeddings: jax.Array
-    media: jax.Array
+    embeddings: jax.Array | None
+    media: jax.Array | None
 
 
 class VisionConditioner(nn.Module):
@@ -278,14 +279,26 @@ class MultimodalTransformer(nn.Module):
     def num_nextn_predict_layers(self) -> int:
         return self.language_model.num_nextn_predict_layers
 
-    def _conditioned_embeddings(self, tokens, image_indices, conditioning, train=False,
-                                audio_indices=None) -> Fusion:
-        """Decoder token identities and their embeddings with media slots filled.
+    def _fused(self, tokens, image_indices=None, audio_indices=None, conditioning=None,
+               train: bool = False) -> Fusion:
+        """Decoder token identities and their embeddings with media slots filled,
+        which the main forward and every prediction depth read alike.
 
-        Marked slots read the towers; the rest read the embedding table. Gemma
-        3n keeps placeholder ids for its per-layer inputs and embeds its hard
-        media vocabulary ranges, so it runs this path with no payloads too.
+        Gemma 4's placeholder ids read as padding. Marked slots read the
+        towers; the rest read the embedding table. Gemma 3n keeps placeholder
+        ids for its per-layer inputs and embeds its hard media vocabulary
+        ranges, so it runs this path with no payloads too; any other call
+        without payloads leaves the decoder its own lookup.
         """
+        if self.family == "gemma4":
+            placeholder = tokens == self.image_token_id
+            for token_id in self.extra_placeholder_ids:
+                placeholder = placeholder | (tokens == token_id)
+            tokens = jnp.where(placeholder, self.pad_token_id, tokens)
+        if conditioning is None and (image_indices is not None or audio_indices is not None):
+            raise ValueError("media indices require conditioning payloads")
+        if conditioning is None and self.family != "gemma3n":
+            return Fusion(tokens, None, None)
         if conditioning is not None and image_indices is None and audio_indices is None:
             raise ValueError("conditioned inputs require image_indices or audio_indices")
         media = jnp.zeros(tokens.shape, bool)
@@ -323,38 +336,32 @@ class MultimodalTransformer(nn.Module):
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
                           segment_ids=None, image_indices=None, conditioning=None,
-                          attention_mask=None, image_groups=None, rotary_positions=None):
-        """Run the multi-token prediction layers over the same media embeddings as the main decoder."""
-        embeddings = None
-        if conditioning is not None:
-            fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
-            tokens, embeddings = fused.tokens, fused.embeddings
-        elif image_indices is not None:
-            raise ValueError("image_indices require conditioning payloads")
+                          attention_mask=None, image_groups=None, rotary_positions=None,
+                          audio_indices=None, coordinates: Coordinates | None = None):
+        """Run the multi-token prediction layers over the same media embeddings and
+        token fields as the main decoder (`hidden_states`)."""
+        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
         return self.language_model.mtp_hidden_states(
-            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=embeddings, attention_mask=attention_mask,
-            image_groups=image_groups, rotary_positions=rotary_positions)
+            hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
+            input_embeddings=fused.embeddings, attention_mask=attention_mask,
+            image_groups=image_groups, rotary_positions=rotary_positions, coordinates=coordinates)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
         return [self.language_model.logits_from_hidden(state)
                 for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
 
-    def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
+    def mtp_step(self, hidden, tokens, *, image_indices=None, audio_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
         """Run one candidate prediction step with the decoder's separate MTP cache.
 
         It returns the step's logits and hidden state. Pass either prepared
         `input_embeddings` or media `conditioning`, not both."""
-        if conditioning is not None:
-            if input_embeddings is not None:
-                raise ValueError("MTP receives either prepared embeddings or media conditioning")
-            fused = self._conditioned_embeddings(tokens, image_indices, conditioning)
-            tokens, input_embeddings = fused.tokens, fused.embeddings
-        elif image_indices is not None:
-            raise ValueError("image_indices require conditioning payloads")
-        return self.language_model.mtp_step(hidden, tokens, input_embeddings=input_embeddings, **kwargs)
+        if conditioning is not None and input_embeddings is not None:
+            raise ValueError("MTP receives either prepared embeddings or media conditioning")
+        fused = self._fused(tokens, image_indices, audio_indices, conditioning)
+        prepared = fused.embeddings if input_embeddings is None else input_embeddings
+        return self.language_model.mtp_step(hidden, fused.tokens, input_embeddings=prepared, **kwargs)
 
     def token_embeddings(self, tokens):
         """Return the decoder's own embeddings of `tokens`; a sampled token is always text, never media."""
@@ -383,17 +390,22 @@ class MultimodalTransformer(nn.Module):
         `right_padded` and `coordinates` are the language model's
         (`CausalTransformer.hidden_and_mtp_inputs`).
         """
-        if self.family == "gemma4":
-            placeholder = tokens == self.image_token_id
-            for token_id in self.extra_placeholder_ids:
-                placeholder = placeholder | (tokens == token_id)
-            tokens = jnp.where(placeholder, self.pad_token_id, tokens)
+        # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
+        # them in, so the cursor counts the places the layers do.
+        if coordinates is None and (segment_ids is not None or attention_mask is not None
+                                    or positions is not None or right_padded):
+            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
+                                            positions=positions, right_padded=right_padded)
         if decode:
             allocated = self.has_variable("cache", "next_position")
             cursor = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
-            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+            valid = (jnp.ones(tokens.shape, bool) if coordinates is None or coordinates.valid is None
+                     else coordinates.valid)
+            positions = None if coordinates is None else coordinates.positions
             if rotary_positions is None and positions is None:
                 positions = cursor.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                coordinates = (build_coordinates(tokens.shape, positions=positions) if coordinates is None
+                               else dataclasses.replace(coordinates, positions=positions))
             # The response's rule (`next_position`): past the last real token's position, or past
             # the largest coordinate of a multi-axis one.
             fields = {name: value for name, value in (("rotary_positions", rotary_positions),
@@ -406,22 +418,11 @@ class MultimodalTransformer(nn.Module):
             self.conditioner.initialize_parameters()
             if self.audio is not None:
                 self.audio_conditioner.initialize_parameters()
-        if conditioning is None and (image_indices is not None or audio_indices is not None):
-            raise ValueError("media indices require conditioning payloads")
-        if conditioning is None and self.family != "gemma3n":
-            return self.language_model.hidden_states(
-                tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
-                routed_experts=routed_experts, routed=routed, right_padded=right_padded,
-                coordinates=coordinates)
-        fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
-                                             train=train, audio_indices=audio_indices)
+        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
         return self.language_model.hidden_states(
-            fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, attention_mask=attention_mask,
+            fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, right_padded=right_padded,
-            coordinates=coordinates)
+            routed_experts=routed_experts, routed=routed, coordinates=coordinates)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
@@ -439,7 +440,8 @@ class MultimodalTransformer(nn.Module):
             self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, image_indices=image_indices,
                                    conditioning=conditioning, attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions)
+                                   image_groups=image_groups, rotary_positions=rotary_positions,
+                                   audio_indices=audio_indices, coordinates=coordinates)
         return self.language_model.logits_from_hidden(hidden)
 
     def logits(self, tokens, *, train: bool = False, **fields):

@@ -70,3 +70,107 @@ def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tm
     with pytest.raises(ValueError):
         Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16',
                         attention_impl='reference')
+
+
+@pytest.mark.parametrize('uniform', ['FP8', 'W4A16_NVFP4'])
+def test_a_checkpoint_of_one_modelopt_algorithm_loads_as_that_algorithms_layers_in_a_mixed_one(
+        tmp_path, uniform):
+    """ModelOpt writes a checkpoint of one scheme as a uniform quant_algo with no layer table. Its
+    quantized layers decode as the same layers of a mixed table do, the rest read dense, and with
+    FP8 layers its activations quantize as the mixed table's do."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    stored = read_weights(FIXTURE)
+    config = json.loads((FIXTURE / 'config.json').read_text())
+    codec = codecs.source_quantization(config)
+    assert codec is not None
+    tensors = dict(stored)
+    for layer, entry in config['quantization_config']['quantized_layers'].items():
+        if entry['quant_algo'] != uniform:
+            tensors[layer + '.weight'] = codec.decode(stored, layer + '.weight')
+            for part in ('.weight_scale', '.weight_scale_2', '.input_scale'):
+                tensors.pop(layer + part, None)
+    quantization = {'quant_algo': uniform, 'kv_cache_quant_algo': None,
+                    **({'group_size': 16} if uniform == 'W4A16_NVFP4' else {})}
+    producer = config['quantization_config']['producer']
+    save_hf_layout(tensors, {**config, 'quantization_config': {**quantization, 'producer': producer,
+                                                                 'quant_method': 'modelopt'}}, tmp_path)
+    (tmp_path / 'hf_quant_config.json').write_text(json.dumps({'producer': producer,
+                                                               'quantization': quantization}))
+    load = {'dtype': 'float32', 'param_dtype': 'bfloat16', 'attention_impl': 'reference'}
+    single, mixed = Pretrained.load(tmp_path, **load), Pretrained.load(FIXTURE, **load)
+    params = (jax.tree.leaves(single.variables['params']), jax.tree.leaves(mixed.variables['params']))
+    for ours, theirs in zip(*params, strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    if uniform == 'FP8':
+        ids = np.arange(8, dtype=np.int32).reshape(1, 8)
+        np.testing.assert_array_equal(np.asarray(single.model.apply(single.variables, ids)),
+                                      np.asarray(mixed.model.apply(mixed.variables, ids)))
+
+
+def nvfp4(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
+    """`weight` as ModelOpt's NVFP4 exporter stores it: E2M1 codes under one E4M3 scale per 16
+    inputs and one float32 global scale, beside the static input multiplier it calibrated."""
+    import ml_dtypes
+
+    stem = name.removesuffix('.weight')
+    overall = np.float32(np.abs(weight).max() / (6 * 448))
+    blocks = np.abs(weight).reshape(weight.shape[0], -1, 16).max(-1) / (6 * overall)
+    grid = {stem + '.weight_scale': blocks.astype(ml_dtypes.float8_e4m3fn),
+            stem + '.weight_scale_2': np.asarray(overall, np.float32),
+            stem + '.input_scale': np.asarray(0.05, np.float32),
+            name: np.zeros((weight.shape[0], weight.shape[1] // 2), np.uint8)}
+    quantization = {'quant_method': 'modelopt', 'quant_algo': 'NVFP4', 'group_size': 16}
+    codec = codecs.source_quantization({'quantization_config': quantization}, grid=grid)
+    assert codec is not None
+    return codec.encode(name, weight)
+
+
+@pytest.mark.parametrize('quantized', ['attention', 'experts'])
+def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_path, quantized):
+    """ModelOpt may quantize a model's attention and leave its experts dense: written as one
+    algorithm, it loads and computes, input quantizers and all, what the same layers listed
+    in a MIXED_PRECISION table compute. Quantized experts are refused either way, since an
+    expert stack's input quantizers are computed by no provider here."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    source = FIXTURE.parents[2] / 'hf' / 'qwen3-moe-tiny'
+    stored, config = read_weights(source), json.loads((source / 'config.json').read_text())
+    marker = '.self_attn.' if quantized == 'attention' else '.mlp.experts.0.'
+    tensors, layers = dict(stored), {}
+    for name, weight in stored.items():
+        if marker in name and name.endswith('_proj.weight'):
+            tensors.update(nvfp4(name, np.asarray(weight, np.float32)))
+            layers[name.removesuffix('.weight')] = {'quant_algo': 'NVFP4', 'group_size': 16}
+    layers_weights = {stem + '.weight' for stem in layers}
+    producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
+
+    def written(directory, quantization):
+        quantization = {**quantization, 'kv_cache_quant_algo': None}
+        save_hf_layout(tensors, {**config, 'quantization_config': {
+            **quantization, 'producer': producer, 'quant_method': 'modelopt'}}, directory)
+        (directory / 'hf_quant_config.json').write_text(json.dumps({'producer': producer,
+                                                                   'quantization': quantization}))
+        return directory
+
+    uniform = written(tmp_path / 'uniform', {'quant_algo': 'NVFP4', 'group_size': 16})
+    mixed = written(tmp_path / 'mixed', {'quant_algo': 'MIXED_PRECISION', 'quantized_layers': layers})
+    load = {'dtype': 'float32', 'attention_impl': 'reference'}
+    if quantized == 'experts':
+        for directory in (uniform, mixed):
+            with pytest.raises(ValueError):
+                Pretrained.load(directory, **load)
+        return
+    ids = np.load(source / 'input_ids.npy')
+    single, table = Pretrained.load(uniform, **load), Pretrained.load(mixed, **load)
+    logits = np.asarray(single.model.apply(single.variables, ids))
+    np.testing.assert_array_equal(logits, np.asarray(table.model.apply(table.variables, ids)))
+    # The same decoded weights with no input quantizers: what the two compute beyond them is
+    # the attention inputs' NVFP4 rounding.
+    codec = codecs.source_quantization(json.loads((uniform / 'config.json').read_text()))
+    assert codec is not None
+    decoded = {name: (codec.decode(tensors, name) if name in layers_weights else value)
+               for name, value in stored.items()}
+    save_hf_layout(decoded, config, tmp_path / 'decoded')
+    weights_only = Pretrained.load(tmp_path / 'decoded', **load)
+    assert np.abs(logits - np.asarray(weights_only.model.apply(weights_only.variables, ids))).max() > 0
