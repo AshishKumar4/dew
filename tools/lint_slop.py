@@ -1475,7 +1475,8 @@ def _retrying(loop: ast.For | ast.While) -> bool:
         handling = {id(node) for attempt, _ in attempts for handler in attempt.handlers
                     for node in _executed(handler.body)}
         if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range") or any(
-                isinstance(node, ast.Name) and node.id in counted and id(node) not in handling
+                isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in counted
+                and id(node) not in handling
                 for node in _executed(loop.body)):
             return False
     for attempt, rest in attempts:
