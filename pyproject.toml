@@ -30,6 +30,8 @@ dependencies = [
     # take the build through constraints.txt. A bump runs the GPU checks
     # docs/installation.md lists under "Bumping JAX" first: CI is CPU-only.
     "jax>=0.11.2,<0.11.3",
+    # dew.training.runtime reads whether jax is that build, a post-release.
+    "packaging",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
