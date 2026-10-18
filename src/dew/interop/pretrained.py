@@ -1115,8 +1115,9 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
 
 class _Built(NamedTuple):
     """A decoder source built and bound: the model, its variables, the
-    record it was translated to, what it was built from, and the source
-    tensors' bindings and the ones none binds."""
+    record it was translated to, what it was built from, the source
+    tensors' bindings and the ones none binds, and the encoder `export`
+    writes through where the bindings do not (`Pretrained.export_adapter`)."""
 
     model: nn.Module
     variables: Variables
@@ -1124,6 +1125,7 @@ class _Built(NamedTuple):
     built: Mapping[str, object]
     layouts: tuple[WeightLayout, ...]
     retained: dict[str, np.ndarray]
+    export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = None
 
 
 def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path, *,
@@ -1166,15 +1168,14 @@ def _source_weights(model: CausalTransformer, variables: Mapping[str, object],
     return decoders.export_decoder_weights(model, variables, config)
 
 
-def _source_spelling(family: str, tensors: Mapping[str, np.ndarray], record: Mapping[str, object],
-                     written: Collection[str]) -> dict[str, str]:
+def _source_spelling(family: decoder_parts.DecoderFamily, tensors: Mapping[str, np.ndarray],
+                     record: Mapping[str, object], written: Collection[str]) -> dict[str, str]:
     """The source's own name for each tensor its family's encoder writes under another:
     the name its `prepare` renamed to that one, as GPT-2's nests a bare GPT2Model's
     `h.*` under `transformer.`. A quantized source's weights, scales and grid are
     written back under the names it stored them by (`export`)."""
-    prepare = decoders.families()[family].prepare
     return {canonical: name for name in tensors if name not in written
-            for canonical in prepare({name: tensors[name]}, record) if canonical in written}
+            for canonical in family.prepare({name: tensors[name]}, record) if canonical in written}
 
 
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
@@ -1187,8 +1188,9 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
                     verified: verify.VerifiedMapping | None, *, dtype: str, attention_impl: str,
-                    max_seq_len: int | None, param_dtype: str, lazy: bool) -> _Built:
-    """A decoder of a registered family, or of one it was verified as (tier 2)."""
+                    max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool) -> _Built:
+    """A decoder of a registered family, or of one it was verified as (tier 2).
+    `quantized` says the source ships weights in a quantization format."""
     if verified is None:
         record = decoders.translate_config(config)
         # translate_config refused every model_type but a registered family's name.
@@ -1214,7 +1216,20 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
         layouts, retained = decoder_layouts(readings, record, family, variables)
-    return _Built(model, variables, record, built, layouts, retained)
+    export_adapter = None
+    if verified is None and not entry.preserve_source_layout:
+        # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
+        # through too. A quantized source keeps its packed format by going back
+        # over its source names (`weight_layouts`) where it binds them; a family
+        # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX,
+        # ModernBERT) binds none, and its encoder undoes that rewrite, under the
+        # source's own names, before the format encodes the weights again (`export`).
+        if not quantized:
+            export_adapter = _source_weights
+        elif not layouts:
+            export_adapter = partial(_spelled_source_weights, _source_spelling(
+                entry, tensors, record, set(_source_weights(model, variables, config))))
+    return _Built(model, variables, record, built, layouts, retained, export_adapter)
 
 
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
@@ -1248,7 +1263,6 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     media = _media_wrapper(config)
     tensors, quantized_tensors, scale_dtype, grid = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype, media=media)
-    export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 
@@ -1260,26 +1274,14 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
     elif media:
-        model, variables, record, built, layouts, retained = _wrapper_source(
+        model, variables, record, built, layouts, retained, export_adapter = _wrapper_source(
             config, tensors, directory, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len,
             param_dtype=param_dtype, lazy=streaming)
     else:
-        model, variables, record, built, layouts, retained = _decoder_source(
+        model, variables, record, built, layouts, retained, export_adapter = _decoder_source(
             config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
-            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
-        if (isinstance(family, str) and family in decoders.families()
-                and not decoders.families()[family].preserve_source_layout):
-            # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
-            # through too. A quantized source keeps its packed format by going back
-            # over its source names (`weight_layouts`) where it binds them; a family
-            # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX,
-            # ModernBERT) binds none, and its encoder undoes that rewrite, under the
-            # source's own names, before the format encodes the weights again (`export`).
-            if source_quantization(config) is None:
-                export_adapter = _source_weights
-            elif not layouts:
-                export_adapter = partial(_spelled_source_weights, _source_spelling(
-                    family, tensors, record, set(_source_weights(model, variables, config))))
+            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
+            quantized=source_quantization(config) is not None)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
