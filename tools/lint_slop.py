@@ -454,9 +454,8 @@ def names(module: Module) -> Iterator[Finding]:
     terms of the equations being implemented: 50 of them, against none that
     meant "the second version of". `_v2` still reports.
     """
-    comprehended = {id(target) for node in ast.walk(module.tree)
-                    if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp)
-                    for generator in node.generators for target in ast.walk(generator.target)}
+    comprehended = {id(target) for node in ast.walk(module.tree) if isinstance(node, scopes.COMPREHENSIONS)
+                    for target in scopes.targets(node)}
     # An annotated name in a class body is a field: a config key, a CLI flag
     # and a pytree entry a checkpoint is written with. Renaming one is a
     # migration with a converter, which is not something a linter asks for.
@@ -1175,9 +1174,6 @@ def _spelled_pattern(pattern: ast.pattern) -> bool:
     return isinstance(pattern, ast.MatchValue) and _spelled(pattern.value)
 
 
-COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
 def _eager(node: ast.AST) -> Iterator[ast.AST]:
     """`node` and every node under it that runs where it stands: not a lambda's body."""
     yield node
@@ -1229,11 +1225,10 @@ def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
         if found is not None:
             _scope_choices(node.body, hardware, closure, found)
         return hardware.without([node.name])
-    if isinstance(node, COMPREHENSIONS):
+    if isinstance(node, scopes.COMPREHENSIONS):
         first = node.generators[0]
         hardware = read(first.iter, hardware)
-        names = [name.id for generator in node.generators for name in ast.walk(generator.target)
-                 if isinstance(name, ast.Name)]
+        names = [name.id for name in scopes.targets(node)]
         inner, inherited = hardware.without(names), closure.without(names)
         for generator in node.generators:
             for child in (*([] if generator is first else [generator.iter]), *generator.ifs):
@@ -1352,7 +1347,7 @@ def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast
         elif isinstance(node, ast.ClassDef):
             yield from _executed_in(_evaluated(node), scope)
             yield from _executed_in(node.body, node)
-        elif isinstance(node, COMPREHENSIONS):
+        elif isinstance(node, scopes.COMPREHENSIONS):
             # Its first iterable is evaluated where it stands; the rest runs in its own scope, where its
             # targets bind: at once for a list, a set or a dict, and only as it is consumed for a generator.
             yield from _executed_in([node.generators[0].iter], scope)
@@ -1422,8 +1417,7 @@ class _Calls:
     any method `f` of the module's classes. Calls through other modules, callables passed in and
     attributes set at run time are not followed."""
 
-    def __init__(self, tree: ast.Module, parent: Sequence[str]):
-        self.parent = parent
+    def __init__(self, tree: ast.Module):
         self.enclosing: dict[int, ast.AST | None] = {}
         self.bindings: dict[int, dict[str, ast.AST | None]] = {}
         self.named: dict[str, list[ast.AST]] = {}
@@ -1431,55 +1425,32 @@ class _Calls:
 
     def _index(self, scope: ast.AST, enclosing: ast.AST | None) -> None:
         self.enclosing[id(scope)] = enclosing
-        names: dict[str, ast.AST | None] = {}
-
-        def bind(name: str | None, definition: ast.AST | None) -> None:
-            # A name bound twice in one scope, once otherwise, is no one definition's.
-            if name is not None:
-                names[name] = definition if names.get(name, definition) is definition else None
-
-        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            for argument in scopes.arguments(scope):
-                bind(argument.arg, None)
         own = list(scopes.own(scope))
-        # A comprehension's targets bind in its own implicit scope, not this one.
-        comprehended = {id(name) for node in own if isinstance(node, ast.comprehension)
-                        for name in ast.walk(node.target)}
+        parameters = (scopes.arguments(scope)
+                      if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) else [])
+        # A name one definition alone binds is that definition; bound otherwise, or twice, no one's.
+        definitions = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        self.bindings[id(scope)] = {name: by[0] if len(by) == 1 and isinstance(by[0], definitions) else None
+                                    for name, by in scopes.binders(own, parameters).items()}
         for node in own:
-            if isinstance(node, COMPREHENSIONS):
+            if isinstance(node, scopes.COMPREHENSIONS):
                 self._comprehension(node, scope)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                if id(node) not in comprehended:
-                    bind(node.id, None)
-            elif isinstance(node, ast.MatchAs | ast.MatchStar):
-                bind(node.name, None)
-            elif isinstance(node, ast.MatchMapping):
-                bind(node.rest, None)
-            elif isinstance(node, ast.ExceptHandler):
-                bind(node.name, None)
-            elif isinstance(node, ast.Import | ast.ImportFrom):
-                for name in scopes.bound_by(node, self.parent):
-                    bind(name, None)
-            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                bind(node.name, node)
-                if isinstance(scope, ast.ClassDef) and not isinstance(node, ast.ClassDef):
-                    self.named.setdefault(node.name, []).append(node)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and isinstance(scope, ast.ClassDef):
+                self.named.setdefault(node.name, []).append(node)
             if isinstance(node, scopes.SCOPES):
                 self._index(node, scope)
-        self.bindings[id(scope)] = names
 
     def _comprehension(self, node: ast.AST, enclosing: ast.AST) -> None:
         """Index a comprehension, which `_index` meets in the scope that holds it, as a scope of its own: its
         targets bind there, and a comprehension it holds encloses in it."""
         if id(node) in self.bindings:
             return
-        assert isinstance(node, COMPREHENSIONS)
+        assert isinstance(node, scopes.COMPREHENSIONS)
         self.enclosing[id(node)] = enclosing
-        self.bindings[id(node)] = {name.id: None for generator in node.generators
-                                   for name in ast.walk(generator.target) if isinstance(name, ast.Name)}
+        self.bindings[id(node)] = {name.id: None for name in scopes.targets(node)}
         for part in _comprehended(node):
             for inner in ast.walk(part):
-                if isinstance(inner, COMPREHENSIONS):
+                if isinstance(inner, scopes.COMPREHENSIONS):
                     self._comprehension(inner, node)
 
     def _lookup(self, scope: ast.AST | None, name: str) -> ast.AST | None:
@@ -1575,7 +1546,7 @@ def waits(module: Module) -> Iterator[Finding]:
     process: one inside a function that deals with no subprocess, network, remote service or other
     process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
     work is ordered or woken, not waited on; a timed wait made once is a deadline."""
-    calls = _Calls(module.tree, _parent(module))
+    calls = _Calls(module.tree)
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
     for function in ast.walk(module.tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
