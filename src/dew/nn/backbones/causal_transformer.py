@@ -759,6 +759,24 @@ class CausalTransformer(nn.Module):
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
 
+    def refuse_unbuildable_ngpt(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms
+        live in the attention and the dense gated feed-forward (an MLP mixer's too), so routed or
+        parallel experts, another mixer, prediction depths and the DSpark drafter, which would
+        compute without them, are refused."""
+        if self.ngpt is None:
+            return
+        if self.mixture is not None or self.num_nextn_predict_layers or self.dspark is not None:
+            raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
+                             "parallel experts (mixture), prediction depths and the DSpark drafter take "
+                             "none of it")
+        for layer_type, kind in sorted(kinds.items()):
+            mixer = kind.mixer or self.mixer
+            dense = isinstance(mixer, MLPMixer) and mixer.mixture is None
+            if mixer is not None and not (isinstance(mixer, AttentionMixer) or dense):
+                raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
+                                 f"feed-forward's; {layer_type!r} runs {mixer!r}")
+
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
 
@@ -768,6 +786,7 @@ class CausalTransformer(nn.Module):
         self.refuse_unbuildable_mup(kinds)
         self.refuse_unbuildable_dropout(kinds)
         self.refuse_unbuildable_classic_fields()
+        self.refuse_unbuildable_ngpt(kinds)
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
