@@ -28,8 +28,11 @@ from dew.interop.safetensors_io import read_file
 from dew.interop.sources import load_shards
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.mlp import MLPMixer
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -414,6 +417,24 @@ def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
                                   loaded.model.apply(loaded.variables, REFERENCE['input_ids']))
     with pytest.raises(ValueError):
         PretrainedDecoder.from_model(loaded.model.clone(loop=None), loaded.variables)
+
+
+def test_an_mlp_mixer_takes_ngpts_gains_and_what_ngpt_does_not_reach_is_refused():
+    """nGPT's arithmetic lives in the attention and the dense gated feed-forward. An MLP in the
+    mixer's slot takes the feed-forward's gains; routed experts, a gated delta net, a prediction
+    depth and an MLP mixer's own experts, which would compute without them, are refused."""
+    model = load().model
+    ids = jnp.asarray(REFERENCE['input_ids'])
+    mixed = model.clone(mixer=MLPMixer(intermediate_size=48, activation='swiglu'))
+    tree = mixed.init(jax.random.key(0), ids)['params']
+    assert set(tree['layers_0']['self_attn']) >= {'suv_gate', 'suv_up'}
+    delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
+                               linear_value_head_dim=8)
+    routed = MLPMixer(intermediate_size=48, activation='swiglu', mixture=Mixture(experts=4))
+    for refused in ({'mixture': Mixture(experts=4)}, {'num_nextn_predict_layers': 1}, {'mixer': delta},
+                    {'mixer': routed}):
+        with pytest.raises(ValueError):
+            model.clone(**refused).init(jax.random.key(0), ids)
 
 
 def test_the_releases_tokenizer_loads_with_the_checkpoint():
