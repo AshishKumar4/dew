@@ -40,7 +40,7 @@ from dew.data.pipeline import (
     Windows,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source
+from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountTargets, ValidTargets
 from dew.records import JSON, integer, json_value, record
@@ -85,7 +85,11 @@ class _Memory:
         return self.held
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.original.metadata(), **self.facts, "rows": len(self.held), "accepted": len(self.held)}
+        """Its source's facts, the counts only where it ran no stage over the source's rows, then
+        the counts it measured."""
+        stated = self.original.metadata()
+        return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
+                "accepted": len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured

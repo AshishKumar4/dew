@@ -54,6 +54,14 @@ class Targets:
         return int(row["targets"])
 
 
+@dataclasses.dataclass(frozen=True)
+class Counted:
+    """A token row as its corpus and the targets it holds, which batch whatever the row's length."""
+
+    def __call__(self, row):
+        return {"source": row["source"], "targets": np.int32(len(row["text"]) - 1)}
+
+
 def source(count=24):
     return Memory(tuple({"id": np.int32(index)} for index in range(count)))
 
@@ -314,6 +322,35 @@ def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     assert take(resumed, 20) == rest
     reader.close()
     resumed.close()
+
+
+@pytest.mark.parametrize("sliced", [False, True])
+def test_a_token_mixture_weighs_the_rows_each_corpus_delivers(sliced):
+    """Mixed by tokens, two corpora deliver equal valid targets. A corpus whose order reads every
+    row its source's counts describe keeps one global order, weighed by those counts; one whose
+    order takes a slice of its rows delivers targets those counts do not describe, so its mixture
+    counts targets as they arrive."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(name, lengths):
+        rows = Memory([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+        return Pipeline(rows, name=name).filter_map(CountTargets())
+
+    long = corpus("long", (2, 10, 10, 10))
+    long = long.slice(slice(1)) if sliced else long
+    mixed = mix([long.repeat(), corpus("short", (2, 2)).repeat()], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 8):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+    assert data.plan is not None and data.plan.lowering == ("per-share" if sliced else "global")
 
 
 def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation():

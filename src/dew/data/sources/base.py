@@ -56,6 +56,17 @@ def preparing(source: Source, size: int | None, into: str) -> None:
     logging.getLogger("dew.data").warning("preparing %s (%s) into %s", source.describe(), stated, into)
 
 
+_COUNTS = ("rows", "accepted", "accepted_rows", "windows", "valid_targets", "zero_target_windows")
+"""The `metadata` facts that count a source's rows and their target tokens."""
+
+
+def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    """`metadata` without its counts (`_COUNTS`): the facts a source that reads part of another's
+    rows, or rows made from them, keeps of the other's. Its own counts, where it knows them, it
+    states itself; a weight or a check that reads another's would describe rows it never reads."""
+    return {name: value for name, value in metadata.items() if name not in _COUNTS}
+
+
 @dataclasses.dataclass(frozen=True)
 class ShardManifest:
     """A streamed source's shards, in canonical order, and the reader that
