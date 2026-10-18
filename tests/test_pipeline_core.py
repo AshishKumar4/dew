@@ -98,6 +98,51 @@ def test_global_position_resumes_across_share_counts_with_rng():
     assert joined == expected
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+@pytest.mark.parametrize("after", ["take", "window shuffle", "random map", "finite repeat"])
+def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
+    """A global position counts the records of the batches the run read, in the order its batches
+    come in after every stage written after the batch. A run resumed after two batches reads on as
+    the uninterrupted run does through a limit, a window shuffle, a random step or a finite repeat
+    after the batch, and a stage that keeps whole rows reads on alike from two shares."""
+    rows = Pipeline(source(16))
+    chain = {"take": rows.batch(2).take(5),
+             "window shuffle": rows.repeat(1).batch(2).shuffle(7, window=3),
+             "random map": rows.repeat().batch(2).random_map(Draw()),
+             "finite repeat": rows.take(6).batch(2).repeat(2)}[after]
+    data = compile(chain, read=read, loading=READ, seed=3)
+    whole = data.train(DataPartition())
+    try:
+        expected = take(whole, 8)
+    finally:
+        whole.close()
+    stopped = data.train(DataPartition())
+    try:
+        head = take(stopped, 2)
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + take(resumed, 6) == expected
+    finally:
+        resumed.close()
+    if after == "random map":
+        return
+    shares = []
+    for index in range(2):
+        reader = data.train(DataPartition(index, 2))
+        try:
+            reader.set_state(saved)
+            shares.append(take(reader, 6))
+        finally:
+            reader.close()
+    joined = [{"id": [value for pair in zip(left["id"], right["id"], strict=True) for value in pair]}
+              for left, right in zip(*shares, strict=True)]
+    assert head + joined == expected
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
     prefix = Pipeline(source(8))
