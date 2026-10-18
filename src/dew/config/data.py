@@ -38,11 +38,11 @@ from dew.data.pipeline import (
 if TYPE_CHECKING:
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-from dew.data import audio, images, video
+from dew.data import images
 from dew.data.chat import RenderChat
 from dew.data.images import ConfigureCaption, EncodeCaptions
 from dew.data.preferences import PreferencePair
-from dew.data.presets import _CHAT_FIELDS, _conversation_windows, _next_token_windows
+from dew.data.presets import _CHAT_FIELDS, _clips, _conversation_windows, _decoded_images, _next_token_windows
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, ResponseCanvases
 from dew.data.steps.generic import Formatting
@@ -444,8 +444,8 @@ class ImageData(_Loadable):
         configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
-            return (chain.map(images.DecodeImage(self.field, at_least=staging, rejects=False))
-                    .map(images.Resize(staging)).map(configured))
+            decoded = _decoded_images(chain, staging, field=self.field, at_least=staging, rejects=False)
+            return decoded.map(configured)
 
         train = prepared(train, size)
         if augment is not None and augment.backend == "host":
@@ -510,10 +510,8 @@ class VideoData(_Loadable):
         def clips(chain: Pipeline) -> Pipeline:
             # A listed clip too short or that does not decode is an error, as it always was here, so the
             # run knows its count.
-            pick = video.PickClip(self.frames / FPS, margin=padding, rejects=False)
-            frames = video.DecodeVideo(self.frames, fps=FPS, size=self.frame_size, rejects=False)
-            sound = audio.DecodeAudio(rate, context=padding, rejects=False)
-            return chain.random_map(pick).map(frames, sound).remove_columns("mp4", "clip")
+            return _clips(chain, self.frames / FPS, frames=self.frames, fps=FPS, size=self.frame_size,
+                          margin=padding, sample_rate=rate, context=padding, missing="reject", rejects=False)
 
         return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
 

@@ -46,7 +46,7 @@ def images(dataset: Dataset, size: int, *, batch: int, augment: bool | RandomSte
     the uninterrupted one would. A user random step instead runs on the
     host right after resizing."""
 
-    resized = dataset.filter_map(image_steps.DecodeImage("image")).map(image_steps.Resize(size))
+    resized = _decoded_images(dataset, size)
     if augment is False:
         return resized.batch(batch)
     if augment is True:
@@ -108,8 +108,34 @@ def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
     than the window, or that does not decode, is counted and dropped; the
     media and its window are read here and leave the record."""
 
-    picked = (dataset.random_filter_map(video_steps.PickClip(seconds))
-              .filter_map(video_steps.DecodeVideo(frames, fps=fps, size=size)))
+    return _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
+                  missing="silence").batch(batch)
+
+
+def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,
+                    rejects: bool = True) -> Pipeline:
+    """The images in `field` decoded, reduced no further than `at_least` pixels where given, and
+    resized to `size` squares. With `rejects` an image that does not decode is dropped and counted,
+    else it stops the run. `images` and the image recipe (`dew.config.data.ImageData`) share it."""
+    decode = image_steps.DecodeImage(field, at_least=at_least, rejects=rejects)
+    return (rows.filter_map(decode) if rejects else rows.map(decode)).map(image_steps.Resize(size))
+
+
+def _clips(media: Dataset, seconds: float, *, frames: int, fps: float, size: int, margin: float = 0.0,
+           sample_rate: int | None = None, context: float = 0.0, missing: Literal["reject", "silence"],
+           rejects: bool = True) -> Pipeline:
+    """Windows of `seconds` drawn `margin` clear of the media's ends in `mp4`, each record's own on
+    every read and resume, as `frames` frames at `fps` in `size` squares, and with `sample_rate`
+    the window's sound `context` seconds wider (`missing` says what media without sound gives).
+    The media and its window leave the record. With `rejects` media too short or that does not
+    decode is dropped and counted, else it stops the run. `clips` and the video recipe
+    (`dew.config.data.VideoData`) share it."""
+    pick = video_steps.PickClip(seconds, margin=margin, rejects=rejects)
+    decoders: list[video_steps.DecodeVideo | audio_steps.DecodeAudio] = [
+        video_steps.DecodeVideo(frames, fps=fps, size=size, rejects=rejects)]
     if sample_rate is not None:
-        picked = picked.filter_map(audio_steps.DecodeAudio(sample_rate, missing="silence"))
-    return picked.remove_columns("mp4", "clip").batch(batch)
+        decoders.append(audio_steps.DecodeAudio(sample_rate, context=context, missing=missing,
+                                                rejects=rejects))
+    picked = media.random_filter_map(pick) if rejects else media.random_map(pick)
+    decoded = picked.filter_map(*decoders) if rejects else picked.map(*decoders)
+    return decoded.remove_columns("mp4", "clip")
