@@ -1849,6 +1849,46 @@ def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
     assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
 
 
+def test_a_delta_run_resumes_with_its_version_pinned_and_refuses_another_predicate(tmp_path):
+    """A table's identity is its resolved version, files and read options: a run started on the
+    table's head resumes exactly with that version pinned, and a run reading it through another
+    predicate is refused."""
+    import pyarrow.dataset as ds
+    from deltalake import write_deltalake
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    write_deltalake(root, pa.table({"value": list(range(8))}))
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+
+    def opened(table):
+        data = compile(Pipeline(table).repeat().batch(2), read="streamed", loading=loading)
+        return data.train(DataPartition())
+
+    head = opened(Delta(root))
+    try:
+        first = [np.asarray(next(head)["value"]).tolist()]
+        saved = head.get_state()
+        expected = [np.asarray(next(head)["value"]).tolist() for _ in range(2)]
+    finally:
+        head.close()
+    pinned = opened(Delta(root, version=Delta(root).table.version()))
+    try:
+        pinned.set_state(saved)
+        assert first + [np.asarray(next(pinned)["value"]).tolist() for _ in range(2)] == first + expected
+    finally:
+        pinned.close()
+    filtered = opened(Delta(root, where=ds.field("value") >= 0))
+    try:
+        with pytest.raises(ValueError):
+            filtered.set_state(saved)
+    finally:
+        filtered.close()
+
+
 def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
     import datetime
     from decimal import Decimal
