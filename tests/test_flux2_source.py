@@ -26,7 +26,7 @@ import tool_support
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
-from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
+from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path, read_transformer
 from dew.nn.autoencoders.flux2 import load_flux2_vae
 from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.scan_orders import pixel_shuffle
@@ -56,7 +56,7 @@ def arrays(source):
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = Flux2Transformer(**flux2_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = translate_flux2_weights(component_tensors(source / name, "transformer"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux2_path)
     return model, params, layouts
 
 

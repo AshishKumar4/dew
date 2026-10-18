@@ -35,7 +35,7 @@ def _audio(kind):
     path = FIXTURES / kind
     record = json.loads((path / "config.json").read_text())
     config = audio_config(record)
-    variables = audio_weights(load_file(str(path / "encoder.safetensors")), config)
+    variables, _ = audio_weights(load_file(str(path / "encoder.safetensors")), config)
     model = config.build().clone(precision=jax.lax.Precision.HIGHEST)
     tensors = load_file(str(path / "projector.safetensors"))
     if kind == "gemma3n":
@@ -43,12 +43,12 @@ def _audio(kind):
                                            vocab_offset=record["vocab_offset"], norm_eps=config.rms_norm_eps,
                                            precision=jax.lax.Precision.HIGHEST)
         method = projector.soft_embeddings
-        projector_variables = {"params": translate_gemma3n_projector_weights(tensors)}
+        projector_variables = {"params": translate_gemma3n_projector_weights(tensors)[0]}
     else:
         projector = Gemma4ProjectorModule(text_width=32, norm_eps=config.rms_norm_eps,
                                           precision=jax.lax.Precision.HIGHEST)
         method = projector.__call__
-        projector_variables = {"params": translate_gemma4_projector_weights(tensors)}
+        projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
     return path, config, variables, model, projector, method, projector_variables
 
 
@@ -115,7 +115,7 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     perturb(reference)
     ours = audio_config(config.to_dict())
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
-    tree = audio_weights(tensors, ours)
+    tree, _ = audio_weights(tensors, ours)
     linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
                                use_clipped_linears=ours.use_clipped_linears)
     feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,

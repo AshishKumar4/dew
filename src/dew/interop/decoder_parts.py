@@ -149,111 +149,58 @@ SERIALIZED_ENCODER_FIELDS = ('add_cross_attention', 'cross_attention_hidden_size
                               'tie_encoder_decoder', 'pruned_heads')
 
 
-def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
-    return True
-
-
-def _repeats(name: str, section: str | None = None) -> Callable[[str, Mapping[str, object]], bool]:
-    """A legacy field is inert only when it repeats the reference's field."""
-    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
-        record = hf_config if section is None else hf_config.get(section)
-        return isinstance(record, Mapping) and record.get(name) == hf_config[key]
-    return repeats
-
-
 # Fields released configs carry that the pinned reference (transformers
 # 5.16.1) neither declares on the family's config class nor reads in its
-# modeling, so the reference computes the same model whatever they hold.
-# Each predicate accepts the values that agree with what the reference
-# computes; any other value describes a different model and is refused by
-# name. The None entry holds the fields no family's reference reads. A field
-# in neither place is still refused as unknown.
-# tests/test_pretrained_sources.py checks every entry against the installed
-# reference config classes.
-_INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, object]], bool]]] = {
+# modeling, so the reference computes the same model whatever they hold, and
+# so does Dew. The None entry holds the fields no family's reference reads. A
+# field in neither place is still refused as unknown.
+_INERT_FIELDS: Mapping[str | None, frozenset[str]] = {
     # Tooling records no reference reads: transformers.js's loading hints
     # (SmolLM2-*-Instruct), Unsloth's patch markers (unsloth/* re-uploads) and
     # the source repo names exporters write.
-    None: {'transformers.js_config': _any_value, 'unsloth_fixed': _any_value, 'unsloth_version': _any_value,
-           'name_or_path': _any_value, 'model_name': _any_value},
+    None: frozenset({'transformers.js_config', 'unsloth_fixed', 'unsloth_version', 'name_or_path',
+                     'model_name'}),
     # nanotron's training flags, which SmolLM2 retains.
-    'llama': {'is_llama_config': _any_value, 'rope_interleaved': _any_value},
-    # Qwen2.5's text configs state the multimodal rotary off; on, it is a
-    # Qwen2-VL rotary the qwen2 reference never applies.
-    'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    'llama': frozenset({'is_llama_config', 'rope_interleaved'}),
+    # Qwen2.5's text configs state the multimodal rotary, which the qwen2
+    # reference never applies.
+    'qwen2': frozenset({'use_mrope'}),
     # Released Nemotron-H configs retain these older names. The native
-    # reference reads layer_norm_epsilon, has no rotary positions, and
-    # derives dt directly from the Mamba projection.
-    'nemotron_h': {
-        'mamba_num_groups': _repeats('n_groups'),
-        'mamba_state_dim': _repeats('ssm_state_size'),
-        'num_query_groups': _repeats('num_key_value_heads'),
-        'rms_norm_eps': _repeats('layer_norm_epsilon'),
-        'norm_eps': _repeats('layer_norm_epsilon'),
-        **dict.fromkeys(('time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
-    },
+    # reference reads n_groups, ssm_state_size, num_key_value_heads and
+    # layer_norm_epsilon, has no rotary positions, and derives dt directly
+    # from the Mamba projection.
+    'nemotron_h': frozenset({'mamba_num_groups', 'mamba_state_dim', 'num_query_groups', 'rms_norm_eps',
+                             'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor'}),
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
-    # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
-    # mamba_ssm's default; Mamba-Codestral's true is a stale default no
-    # implementation of that checkpoint reads), derives the inner width as
-    # expand * hidden_size (:374), and the time-step init fields only seed
-    # dt_bias at initialization.
-    'mamba2': {
-        'rms_norm': lambda key, hf_config: hf_config[key] is True,
-        'norm_before_gate': _any_value,
-        'intermediate_size': lambda key, hf_config: hf_config[key] == (
-            records.integer(hf_config.get('expand', 2), 'expand')
-            * records.integer(hf_config.get('hidden_size', 4096), 'hidden_size')),
-        'time_step_init_scheme': _any_value,
-        'time_step_scale': _any_value,
-    },
+    # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False),
+    # derives the inner width as expand * hidden_size (:374), and the
+    # time-step init fields only seed dt_bias at initialization.
+    'mamba2': frozenset({'rms_norm', 'norm_before_gate', 'intermediate_size', 'time_step_init_scheme',
+                         'time_step_scale'}),
     # The state-spaces/mamba-*-hf conversions keep mamba_ssm's MambaConfig
-    # beside the reference's: the same width, depth and inner width under
-    # their old names, the RMSNorm MambaBlock always applies, no layer
-    # arguments, a fused kernel's choice, and the multiple vocab_size was
-    # already padded to.
-    'mamba': {
-        'd_model': _repeats('hidden_size'),
-        'n_layer': _repeats('num_hidden_layers'),
-        'd_inner': lambda key, hf_config: hf_config[key] == (
-            records.integer(hf_config.get('expand', 2), 'expand')
-            * records.integer(hf_config.get('hidden_size', 768), 'hidden_size')),
-        'rms_norm': lambda key, hf_config: hf_config[key] is True,
-        'ssm_cfg': lambda key, hf_config: hf_config[key] == {},
-        'fused_add_norm': _any_value,
-        'pad_vocab_size_multiple': _any_value,
-    },
+    # beside the reference's: width, depth and inner width under their old
+    # names, the RMSNorm MambaBlock always applies, layer arguments, a fused
+    # kernel's choice, and the multiple vocab_size was already padded to.
+    'mamba': frozenset({'d_model', 'n_layer', 'd_inner', 'rms_norm', 'ssm_cfg', 'fused_add_norm',
+                        'pad_vocab_size_multiple'}),
     # Ornith's Qwen3.5 wrappers repeat the text width at the top level.
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
     # modeling_qwen3_5_moe.py:1868).
-    'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
-    'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
+    'qwen3_5': frozenset({'hidden_size'}),
+    'qwen3_5_moe': frozenset({'hidden_size'}),
 }
 
 
 def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
-    """The config's fields that neither the translation read nor any rule
-    accepts as describing no computation."""
-    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS
-            - _inert(hf_config.get('model_type'), hf_config)
+    """The config's fields that neither the translation read nor the reference
+    leaves inert (`_INERT_FIELDS`)."""
+    model_type = hf_config.get('model_type')
+    inert = _INERT_FIELDS[None] | _INERT_FIELDS.get(model_type if isinstance(model_type, str) else None,
+                                                    frozenset())
+    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
-
-
-def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
-    """Return the `_INERT_FIELDS` a config carries, refusing a value that is not inert."""
-    rules = {
-        **_INERT_FIELDS[None],
-        **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {}),
-    }
-    present = set(rules) & set(hf_config)
-    for key in sorted(present):
-        if not rules[key](key, hf_config):
-            refuse(f"{key}={hf_config[key]!r}",
-                    f"the {model_type} reference does not read {key} and computes the model "
-                    "another value states")
-    return present
 
 
 def refuse(field: str, detail: str) -> NoReturn:
@@ -309,18 +256,6 @@ def fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message:
     for name, expected in fixed.items():
         if getattr(model, name) != expected:
             refuse(name, message.format(expected))
-
-
-def fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[str],
-                   detail: str) -> None:
-    """Refuse a mixture field outside `represented` that leaves its family's default.
-
-    `represented` names the fields the export writes back; nothing carries the
-    rest to a file, so they have to hold what `defaults` holds.
-    """
-    for entry in dataclasses.fields(mixture):
-        if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
-            refuse(f'mixture.{entry.name}', detail)
 
 
 type Llama3Ramp = NativeFields[RopeScaling]

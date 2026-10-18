@@ -117,9 +117,15 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 }
 
 export class SnapshotPreparer extends DurableObject<Env> {
-	async prepare(commit: string, reply: Reply): Promise<void> {
+	/**
+	 * Queue `commit`'s preparation. Where this preparer holds another job it throws, as it always has, unless the
+	 * caller asks for an `answer`: then it returns whether it took the job, false where it holds another.
+	 */
+	async prepare(commit: string, reply: Reply, { answer = false } = {}): Promise<boolean> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
-		return this.queue(commit, false, reply);
+		if (answer && await this.running()) return false;
+		await this.queue(commit, false, reply);
+		return true;
 	}
 
 	/** Any pushed commit, prepared and smoked as a deploy would be; the registry never promotes it. */
@@ -129,6 +135,18 @@ export class SnapshotPreparer extends DurableObject<Env> {
 
 	async status(): Promise<{ phase: string; at: number } | null> {
 		return (await this.ctx.storage.get<{ phase: string; at: number }>('phase')) ?? null;
+	}
+
+	/** What an operator reads of the job this preparer holds: its stage, its clock and how it ended, no secret. */
+	async held(): Promise<{ commit: string; stage: string; began: number | null; restores: number; alarm: number | null;
+		snapshot: string | null; outcome: string | null; registry: string; token: string } | null> {
+		const job = await this.ctx.storage.get<Job>('job');
+		if (!job) return null;
+		const outcome = job.outcome ? (job.outcome.generation ? `ready ${job.outcome.generation.snapshot.id}`
+			: `failed: ${job.outcome.failure?.slice(-500)}`) : null;
+		return { commit: job.commit, stage: job.stage, began: job.began ?? null, restores: job.restores ?? 1,
+			alarm: await this.ctx.storage.getAlarm(), snapshot: job.built?.snapshot.id ?? job.record?.id ?? null, outcome,
+			registry: job.reply.registry, token: job.reply.token };
 	}
 
 	// Whether an alarm runs now: one the runtime resets is gone, and with it this.
@@ -243,6 +261,7 @@ export class SnapshotPreparer extends DurableObject<Env> {
 			console.error('preparation report names no registry here; the job is let go', job.reply.registry, error);
 			await this.ctx.storage.delete('job');
 			await this.ctx.storage.deleteAlarm();
+			await this.free(job);
 			return;
 		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
@@ -257,5 +276,19 @@ export class SnapshotPreparer extends DurableObject<Env> {
 		}
 		await this.ctx.storage.delete('job');
 		await this.ctx.storage.deleteAlarm();
+		await this.free(job);
+	}
+
+	/**
+	 * Tell the registry the trusted preparer is free, should a preparation wait for it (`SnapshotRegistry.freed`).
+	 * A registry of an earlier build has no `freed`; its own alarm asks again, so that error is only logged.
+	 */
+	private async free(job: Job): Promise<void> {
+		if (job.trial) return;
+		try {
+			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromName('global')).freed();
+		} catch (error) {
+			console.error('the registry was not told the preparer is free', error);
+		}
 	}
 }

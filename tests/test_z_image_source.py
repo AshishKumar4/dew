@@ -25,7 +25,7 @@ import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
-from dew.interop.diffusion import component_tensors, translate_z_image_weights, z_image_fields
+from dew.interop.diffusion import component_tensors, read_transformer, z_image_fields, z_image_path
 from dew.nn.backbones.z_image import ZImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +59,7 @@ def nhwc(latents):
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = ZImageTransformer(**z_image_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = translate_z_image_weights(component_tensors(source / name, "transformer"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), z_image_path)
     return model, params, layouts
 
 
