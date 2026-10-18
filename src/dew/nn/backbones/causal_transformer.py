@@ -75,7 +75,8 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
-from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
+from ..ngpt import NGPT, gain, unit
+from ..precision import at_least_fp32, capped_logits, head_dot_general, head_product, scaled, scaled_logits
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
@@ -102,7 +103,16 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
+from .decoder_stack import (
+    WRITTEN,
+    DecoderBank,
+    Loop,
+    PassView,
+    SharedPassView,
+    StackView,
+    run_pipeline,
+    run_stack,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -284,6 +294,12 @@ class CausalTransformer(nn.Module):
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
+    ngpt: NGPT | None = None
+    """The normalized transformer (`dew.nn.ngpt.NGPT`), NVIDIA's Dory: every hidden state on the
+    unit sphere, each block stepping its residual along it (`BlockWiring.ngpt`), the attention and
+    feed-forward unit-norming their products and scaling them by learned gains, no norm with a
+    weight anywhere, a unit norm between a loop's passes, no norm before the head, and the logits
+    times a learned per-token gain (`logit_scale`). None for none."""
     head_transform: Literal['gelu', 'gelu_exact'] | None = None
     """The activation of a BERT-style prediction head between the final norm
     and the vocabulary projection: a bias-free dense layer, this activation and
@@ -873,7 +889,7 @@ class CausalTransformer(nn.Module):
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit,
+                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
@@ -1128,7 +1144,7 @@ class CausalTransformer(nn.Module):
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                             shared_parallel_norm=self.shared_parallel_norm)
+                             shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1164,10 +1180,7 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = decoder_norm(
-            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)(name='norm')
+        self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1466,8 +1479,13 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
-        return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
+        return capped_logits(scaled_logits(logits, self._token_gains(),
+                                           self.head_bias_value if self.head_bias else None),
                              self.final_logit_softcap)
+
+    def _token_gains(self) -> jax.Array | None:
+        """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
+        return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
@@ -1750,7 +1768,7 @@ class CausalTransformer(nn.Module):
             attention_metadata=attention_metadata,
         )
         streams, x = self._collapse(residual)
-        hidden = constrain(self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
@@ -1823,17 +1841,26 @@ class CausalTransformer(nn.Module):
         run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = run_block(self, x, **dynamic)
+        injected = x
+        shared = SharedPassView() if loop.shared_cache else None
+        first_pass = run_block if shared is None else nn.map_variables(
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            mutable=True)
+        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
             x = normed if loop.step_norm else x
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
-            view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
+            if loop.reinject:
+                x = self.norm(x + injected)
+            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
             run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
             x = run(self, x, **dynamic)
+        if loop.reinject:
+            x = self.norm(x)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
@@ -2155,8 +2182,8 @@ class CausalTransformer(nn.Module):
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input.
+        the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
+        its product follows and a checkpoint's quantizer of its input.
         None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
         parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
         adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
@@ -2168,7 +2195,7 @@ class CausalTransformer(nn.Module):
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
-                           input_quantizer=quantizer)
+                           input_quantizer=quantizer, scale=self._token_gains())
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
@@ -2183,6 +2210,19 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _final_norm(self):
+        """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
+        its states being unit vectors, with the logits' per-token gain beside it."""
+        if self.ngpt is not None:
+            self.norm = unit
+            self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
+                                          (self.vocab_size,), jnp.float32)
+        else:
+            self.norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:

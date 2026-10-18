@@ -17,10 +17,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
 
+from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
@@ -107,10 +109,23 @@ class Loop:
     pass: with both enabled, the pass recomputes twice, once to recover the
     layers' inputs and again inside the layers' backward passes.
 
+    With `reinject`, every pass reads the block's input added to the last
+    pass's state under the step norm, the first pass's state that input
+    itself, and the state a pass leaves is its output under the step norm,
+    which the layers after the block read: Dory's looped nGPT
+    (vllm-project/vllm#60149, dory.py:254-280). It needs `step_norm`. Under
+    `backprop_steps` the cut stops the state alone, so the layers before the
+    block still train through the input every pass after the cut reads, as
+    Huginn's prelude does (arXiv 2502.05171, section 3.3).
+
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
-    stack that is `layers_{t L + i}`, as Ouro's cache indexes them.
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. With
+    `shared_cache` every pass reads and writes its layers' one entry, each
+    pass overwriting the step's keys and values the pass before wrote, so
+    a step's earlier tokens read the last pass's (Dory's last-loop cache):
+    a pass's cursor starts where the first pass's started (`SharedPassView`).
     """
     steps: int
     step_norm: bool = True
@@ -118,10 +133,15 @@ class Loop:
     exit_gate: bool = False
     layers: tuple[int, int] | None = None
     remat: bool = False
+    reinject: bool = False
+    shared_cache: bool = False
 
     def __post_init__(self):
         if self.steps < 1:
             raise ValueError(f"a loop runs its stack at least once, got steps={self.steps}")
+        if self.reinject and (not self.step_norm or self.exit_gate):
+            raise ValueError("a reinjecting loop norms each pass's state (step_norm) and exits at "
+                             "the last pass")
         if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
             raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
                              f"got {self.backprop_steps}")
@@ -132,6 +152,51 @@ class Loop:
                 raise ValueError(f"a loop's block is layers [first, end), first < end, not {self.layers}")
             if self.exit_gate:
                 raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
+
+
+type Cursors = Mapping[tuple[str, ...], object]
+"""A cache tree's cursors (`dew.nn.kv_cache.CURSOR`), by their paths."""
+
+
+@dataclasses.dataclass
+class SharedPassView:
+    """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
+    pass reads and writes. The first pass's cursors are recorded as it finds them (`first`) and as
+    it leaves them (`first_out`). A later pass sees every entry as the pass before left it but the
+    cursors, which start where the first pass's started, so it writes the step's keys and values
+    over the last pass's (`inside`), and it leaves the cursors as the first pass left them
+    (`outside`): a pass that allocates the cache advances none (`cache_positions`), and the later
+    ones, finding it allocated, must not either."""
+    before: Cursors = dataclasses.field(default_factory=dict)
+    after: Cursors = dataclasses.field(default_factory=dict)
+
+    def first(self, variables: Mapping[str, Mapping]) -> dict:
+        self.before = _cursors(variables)
+        return dict(variables)
+
+    def first_out(self, variables: Mapping[str, Mapping]) -> dict:
+        self.after = _cursors(variables)
+        return dict(variables)
+
+    def inside(self, variables: Mapping[str, Mapping]) -> dict:
+        return _with_cursors(variables, {**self.after, **self.before})
+
+    def outside(self, variables: Mapping[str, Mapping]) -> dict:
+        return _with_cursors(variables, self.after)
+
+
+def _cursors(variables: Mapping[str, Mapping]) -> Cursors:
+    flat = flatten_dict(variables.get('cache', {}))
+    return {path: leaf for path, leaf in flat.items() if path[-1] == CURSOR}
+
+
+def _with_cursors(variables: Mapping[str, Mapping], cursors: Cursors) -> dict:
+    """`variables` with each cache cursor `cursors` names replaced."""
+    cache = variables.get('cache')
+    if cache is None:
+        return dict(variables)
+    placed = {path: cursors.get(path, leaf) for path, leaf in flatten_dict(cache).items()}
+    return {**variables, 'cache': unflatten_dict(placed)}
 
 
 @dataclasses.dataclass
