@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +21,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
 from dew.registry import from_record
 
@@ -30,6 +31,9 @@ from .conv import Conv
 from .sharding import logical_axes
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 
 @struct.dataclass
@@ -617,8 +621,9 @@ def audio_weights(
     config: Gemma3nAudio | Gemma4Audio,
     *,
     param_dtype: str = "float32",
-) -> ParamTree:
-    """Translate reference weights into params and frozen clipping constants.
+) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Translate reference weights into params and frozen clipping constants, with the layouts
+    that write each tensor back from them (`placed`).
 
     Prefix stripping belongs to the shared wrapper loader. Parameters use the
     requested storage precision; clipping state stays FP32. Integer tensors
@@ -637,8 +642,8 @@ def audio_weights(
         seen.add(path)
         return path
 
-    placed = translate_parameters(tensors, path_of, param_dtype)
+    tree, layouts = placed(tensors, path_of, param_dtype)
     missing = expected.keys() - seen
     if missing:
         raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")
-    return placed
+    return tree, layouts
