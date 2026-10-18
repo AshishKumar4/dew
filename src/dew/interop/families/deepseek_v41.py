@@ -24,7 +24,6 @@ from dew.interop.decoder_parts import (
     Ropes,
     WrapperFields,
     base_config,
-    context_fields,
     dew_path,
     kind_mixers,
     record_float,
@@ -218,8 +217,7 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
         swiglu_limit=record_float(text, 'swiglu_limit', 0.0) or None,
         hyper_connections=native_fields(HyperConnections)(
             hc_mult=record_int(text, 'hc_mult', 4), hc_eps=record_float(text, 'hc_eps', 1e-6),
-            hc_sinkhorn_iters=record_int(text, 'hc_sinkhorn_iters', 20), head='carried', single_pass=True),
-        **context_fields(text))
+            hc_sinkhorn_iters=record_int(text, 'hc_sinkhorn_iters', 20), head='carried', single_pass=True))
     engram = _v41_engram(text, seen)
     if engram is not None:
         config['engram'] = engram

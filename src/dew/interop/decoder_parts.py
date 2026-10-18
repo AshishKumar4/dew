@@ -657,13 +657,13 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
-def context_fields(hf_config: Mapping[str, object]) -> DecoderFields:
-    """The stated context (`max_position_embeddings`) as `CausalTransformer.context_length`, and the
-    decode cache's capacity under it, capped at `DEFAULT_MAX_SEQ_LEN`."""
+def context_lengths(hf_config: Mapping[str, object]) -> tuple[int, int | None]:
+    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
+    `DEFAULT_MAX_SEQ_LEN`, and the stated context (`max_position_embeddings`, its `context_length`),
+    None where the config states none."""
     stated = hf_config.get('max_position_embeddings')
     context = None if stated is None else records.integer(stated, 'max_position_embeddings')
-    return native_fields(CausalTransformer)(
-        max_seq_len=min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context_length=context)
+    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
 
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
@@ -721,6 +721,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                       if 'sliding_attention' in layer_types else None)
 
     kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
+    capacity, context = context_lengths(hf_config)
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=records.integer(hf_config['vocab_size'], 'vocab_size'),
         emb_features=hidden,
@@ -730,7 +731,8 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         head_dim=head_dim,
         mlp=mapped,
         mlp_features=_mlp_features(hf_config),
-        **context_fields(hf_config),
+        max_seq_len=capacity,
+        context_length=context,
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
