@@ -211,6 +211,10 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
+    context_length: int | None = None
+    """The context a checkpoint states (max_position_embeddings), which an export writes back;
+    None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
+    capacity, which a loader caps below a long context (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
     position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.

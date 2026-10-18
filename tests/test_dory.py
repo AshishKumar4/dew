@@ -320,12 +320,11 @@ def test_a_dory_config_loads_as_its_looped_ngpt():
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',
-               'num_key_value_heads', 'head_dim', 'tie_word_embeddings', 'hidden_act', 'initializer_range',
-               'sliding_window', 'ngpt_alpha_init', 'attention_output_gate_logit_scale_init', 'mlp_bias',
-               'attention_bias', 'n_input_layers', 'n_recurrent_layers', 'n_output_layers',
-               'n_recurrent_loops', 'layer_types', 'rope_parameters')
-"""Every field DoryConfig declares (configs/dory.py:14-38) but the context length, which Dew reads
-as its cache's capacity, capped (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
+               'num_key_value_heads', 'head_dim', 'max_position_embeddings', 'tie_word_embeddings',
+               'hidden_act', 'initializer_range', 'sliding_window', 'ngpt_alpha_init',
+               'attention_output_gate_logit_scale_init', 'mlp_bias', 'attention_bias', 'n_input_layers',
+               'n_recurrent_layers', 'n_output_layers', 'n_recurrent_loops', 'layer_types', 'rope_parameters')
+"""Every field DoryConfig declares (configs/dory.py:14-38)."""
 
 
 def test_the_released_config_round_trips_through_dews_fields():
