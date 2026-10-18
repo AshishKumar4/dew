@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
+from absl import flags
 
 from dew.data.analysis import (
     _LOCAL,
@@ -702,6 +703,9 @@ class _Build:
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
         elif isinstance(stage, Workers):
+            # Grain reads absl flags as it starts workers, which a program without absl.app never parsed.
+            if not flags.FLAGS.is_parsed():
+                flags.FLAGS.mark_as_parsed()
             # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
             options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
             rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
