@@ -1,16 +1,72 @@
-"""LoRA's rsLoRA scaling and its branch dropout in training against PEFT
-0.20.0's own forward and backward (`tools/lora_peft_reference.py`), and a
-target that contracts and produces several axes against a float64 oracle
-of its forward and its factors' gradient."""
+"""LoRA's rsLoRA scaling in training against PEFT 0.20.0's own forward and
+backward (`tools/lora_peft_reference.py`), and a target that contracts and
+produces several axes against a float64 oracle of its forward and its
+factors' gradient."""
 
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from safetensors.numpy import load_file
 
-from dew.lora import Adapter, Target
+from dew import lora
+from dew.interop.pretrained import Pretrained
+from dew.lora import Adapter, LoRA, Target
+from dew.objectives.base import Step, merge
+from dew.objectives.lm import LMObjective
+
+ROOT = Path(__file__).resolve().parents[1]
+LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
+FIXTURES = ROOT / "tests" / "fixtures" / "lora_peft"
+
+
+def flat(arrays) -> np.ndarray:
+    return np.concatenate([np.ravel(np.asarray(array, np.float64)) for array in arrays])
+
+
+def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
+    """PEFT's rsLoRA adapter on the tiny Llama, read by `LoRA.load` and trained
+    through the LM objective: each target scales by its own alpha over the
+    square root of its own rank (layer 1's v_proj at rank 2, down_proj at
+    alpha 3). The adapted logits, the mean next-token cross entropy and its
+    gradient in all twelve factors, exported in PEFT's layout, are held to
+    PEFT's float64 run by the float64 rule."""
+    with np.load(FIXTURES / "rslora" / "reference.npz") as data:
+        reference = {key: data[key] for key in data}
+    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    adapter = LoRA.load(decoder.model, decoder.variables, FIXTURES / "rslora" / "adapter",
+                        layouts=decoder.layouts)
+    variables = adapter.variables
+    assert (adapter.rslora, adapter.dropout) == (True, 0.0)
+    tokens = jnp.asarray(reference["input_ids"])
+    logits = adapter.model.apply(variables, tokens)
+    assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
+                                     "the adapted logits")
+    assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
+
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=variables, ema_decay=None)
+    params = objective.init(jax.random.key(0))
+
+    def loss(moving):
+        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens},
+                                  Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+        return objective.reduce_loss(stats)[0]
+
+    value, gradient = jax.value_and_grad(loss)(params["params"])
+    np.testing.assert_allclose(float(value), float(reference["loss_f64"]), rtol=1e-6)
+    adapter.save(merge(variables, {"params": gradient}), tmp_path)
+    exported = {key.removeprefix(lora.PEFT_PREFIX): value
+                for key, value in load_file(tmp_path / lora.PEFT_WEIGHTS).items()}
+    names = sorted(key.removeprefix("grad/") for key in reference
+                   if key.startswith("grad/") and not key.endswith("_f64"))
+    assert sorted(exported) == names and len(names) == 12
+    assert_as_exact_as_the_reference(flat(exported[name] for name in names),
+                                     flat(reference[f"grad/{name}"] for name in names),
+                                     flat(reference[f"grad/{name}_f64"] for name in names),
+                                     "the factors' gradient")
 
 
 class Host(nn.Module):
