@@ -197,7 +197,8 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
-    source = TFDS("oxford_flowers102", path=config.flowers, split="all").records("indexed")
+    source = TFDS("oxford_flowers102", path=config.flowers, split="all",
+                  decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
     if not encoded:
         raise ValueError("the Flowers corpus contains no images")
