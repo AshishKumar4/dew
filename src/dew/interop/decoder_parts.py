@@ -657,6 +657,15 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
+def context_fields(hf_config: Mapping[str, object]) -> DecoderFields:
+    """The stated context (`max_position_embeddings`) as `CausalTransformer.context_length`, and the
+    decode cache's capacity under it, capped at `DEFAULT_MAX_SEQ_LEN`."""
+    stated = hf_config.get('max_position_embeddings')
+    context = None if stated is None else records.integer(stated, 'max_position_embeddings')
+    return native_fields(CausalTransformer)(
+        max_seq_len=min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context_length=context)
+
+
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  layer_types: tuple[str, ...] | None = None,
                  rope: Ropes | None = None,
@@ -721,9 +730,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         head_dim=head_dim,
         mlp=mapped,
         mlp_features=_mlp_features(hf_config),
-        max_seq_len=min(records.integer(hf_config.get('max_position_embeddings',
-                                             DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-                           DEFAULT_MAX_SEQ_LEN),
+        **context_fields(hf_config),
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
