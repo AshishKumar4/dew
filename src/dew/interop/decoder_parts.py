@@ -939,6 +939,17 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
 }
 _TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
+
+
+def dense_modules(layers: int) -> tuple[str, ...]:
+    """The modules of the HF dense decoder schema this codec maps, by name: the
+    trunk's (`_TRUNK`), the head, and in each of `layers` layers the attention and
+    MLP projections, the head norms and the block's norms. A dense HF decoder's
+    state dict holds these modules' tensors."""
+    block = (*(f'{module}.{part}' for module, parts in _PROJECTIONS.items() for part in parts),
+             *(f'self_attn.{norm}' for norm in _HEAD_NORMS), *_PRE_NORMS)
+    return (*dict.fromkeys(name.rsplit('.', 1)[0] for name in _TRUNK), 'lm_head',
+            *(f'model.layers.{layer}.{name}' for layer in range(layers) for name in block))
 # Gemma 4's per-layer residual. Gate and projection are kernels, the post
 # norm is a scale. The values norm carries no weight, so it maps nothing.
 _PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
