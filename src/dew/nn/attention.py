@@ -1217,16 +1217,17 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
+    plain = functools.partial(jnp.einsum, equation, precision=precision)
     if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
-        return jnp.einsum(equation, weights, value, precision=precision)
-    return _blocked_values(weights, value, precision)
+        return plain(weights, value)
+    # Both modes differentiate the plain product: neither sums over the keys, and the blocked
+    # form's own cost the backward an eighth more on two threads.
+    return forward_differentiable(functools.partial(_blocked_values, precision=precision), plain,
+                                  weights, value)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _blocked_values(weights, value, precision) -> jax.Array:
-    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys. Its
-    gradients are the plain product's: neither sums over the keys, and the
-    blocked form's own cost the backward an eighth more on two threads."""
+    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys."""
     keys = value.shape[-3]
     blocks = -(-keys // VALUE_BLOCK)
     pad = blocks * VALUE_BLOCK - keys
@@ -1236,18 +1237,6 @@ def _blocked_values(weights, value, precision) -> jax.Array:
     value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
     return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
 
-
-def _blocked_values_forward(weights, value, precision):
-    return _blocked_values(weights, value, precision), (weights, value)
-
-
-def _blocked_values_backward(precision, saved, cotangent):
-    weights, value = saved
-    return (jnp.einsum('...qhd,...khd->...hqk', cotangent, value, precision=precision),
-            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent, precision=precision))
-
-
-_blocked_values.defvjp(_blocked_values_forward, _blocked_values_backward)
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
