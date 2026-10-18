@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
-import json
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -136,28 +135,28 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     return held
 
 
+_DISPATCH_FIELDS = ("model_type", "model_name", "tokenizer_class")
+"""The model config's fields AutoTokenizer dispatches on, beside its `_name_or_path`
+(tokenization_auto.py:779-809 and 931, transformers 5.16.1)."""
+
+
 def _untyped_config(name: str, revision: str | None, local_files_only: bool) -> PreTrainedConfig | None:
     """AutoTokenizer's model config where transformers registers no class for the model's type;
     None where it does or the repo has no config, for AutoTokenizer to build its own.
 
-    AutoTokenizer reads a model config for its type, name and tokenizer class alone
-    (tokenization_auto.py:770-830, 5.16.1). An unregistered type reaches it as an untyped
-    PreTrainedConfig of every field the file holds, which transformers validates against its own
-    vocabulary: Dory's 'mlp' layer types fail `validate_layer_type`, though no tokenizer reads
-    them. This config holds the fields AutoTokenizer reads, and its type is untyped as before."""
+    An unregistered type reaches AutoTokenizer as an untyped PreTrainedConfig of every field the
+    file holds, which transformers validates against its own vocabulary: Dory's 'mlp' layer types
+    fail `validate_layer_type`, though no tokenizer reads them. This config holds the fields
+    AutoTokenizer dispatches on, read as `PreTrainedConfig.get_config_dict` resolves the file, so
+    an unregistered type transformers still dispatches (InternLM2's) dispatches as before."""
     from transformers import PreTrainedConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    from transformers.utils.hub import cached_file
 
-    path = cached_file(name, "config.json", revision=revision, local_files_only=local_files_only,
-                       _raise_exceptions_for_missing_entries=False)
-    if path is None:
+    stated, _ = PreTrainedConfig.get_config_dict(name, revision=revision, local_files_only=local_files_only)
+    if not stated or stated.get("model_type") in CONFIG_MAPPING:
         return None
-    stated = json.loads(Path(path).read_text())
-    if stated.get("model_type") in CONFIG_MAPPING:
-        return None
-    return PreTrainedConfig.from_dict({"_name_or_path": name,
-                                       "tokenizer_class": stated.get("tokenizer_class")})
+    return PreTrainedConfig.from_dict(
+        {"_name_or_path": name, **{field: stated[field] for field in _DISPATCH_FIELDS if field in stated}})
 
 
 @runtime_checkable
