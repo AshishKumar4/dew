@@ -1,23 +1,21 @@
 """Text-to-image DiT from scratch on Oxford Flowers, across a TPU slice.
 
-Prepare the records once, at the resolution the run trains at, so a training
-read is a memcpy rather than a JPEG decode:
+Prepare the TFDS ArrayRecords once:
 
     python -c "import tensorflow_datasets as tfds; tfds.builder('oxford_flowers102', \\
         data_dir='~/.cache/dew/datasets').download_and_prepare(\\
         file_format='array_record')"
-    python tools/prepare_images.py --dataset tfds_images \\
-        --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
-        --split all --image-size 256 --out prepared/flowers-256
 
 Then launch the same file on every worker of the slice:
 
-    python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
+    python examples/train_flowers_tpu.py \\
+        --data ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --steps 200000
 
-`--data` reads whichever of the two layouts it is given: the TFDS version
-directory loads as `tfds_images`, the `prepare_images.py` output as
-`array_record_images`. The smoke run writes a handful of synthetic records in
-that second layout and trains on them on one CPU device:
+`--data` reads whichever of two layouts it is given: the TFDS version
+directory, its captions made from the class names, or a directory of
+captioned ArrayRecords Dew published (its `manifest.json`). The smoke run
+writes a handful of synthetic records in that second layout and trains on
+them on one CPU device:
 
     JAX_PLATFORMS=cpu python examples/train_flowers_tpu.py --smoke --out /tmp/flowers-smoke
 """
@@ -64,7 +62,7 @@ SMOKE_INCEPTION = (Path(__file__).resolve().parents[1]
 @dataclass
 class Config:
     data: Path | None = None
-    """The prepared records: a TFDS version directory or a prepare_images.py output."""
+    """The records: a TFDS version directory, or a directory of captioned ArrayRecords Dew published."""
     out: Path = Path("runs/flowers-tpu")
     image_size: int = 256
     batch_size: int = 256
@@ -84,7 +82,7 @@ class Config:
 
 
 def synthetic_records(directory: Path, count: int, size: int) -> None:
-    """`count` captioned noise images in the layout prepare_images.py writes.
+    """`count` captioned noise images as captioned ArrayRecords.
 
     The pixels are tests/test_data.py's own fixture, one image per index from
     that index's seed, so the smoke run reads the records the data tests read.
