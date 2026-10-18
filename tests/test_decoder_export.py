@@ -81,6 +81,7 @@ not established by the tiny untied-cutoff fixtures.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -248,6 +249,28 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
             assert_computes_the_oracle(tool.reference_logits(trip.case, export, trip.ids, wide=True),
                                        trip.truth, f"{label} in order 1", roundings=roundings)
     assert_as_exact_over_orders(mine, theirs, label)
+
+
+def test_a_bfloat16_source_exports_its_trained_float32_masters(tmp_path):
+    """A bfloat16 checkpoint loads into float32 masters, and one training
+    step leaves them between bfloat16 values. The export writes each weight
+    at its leaf's float32 width, so the reload holds the trained masters bit
+    for bit; only the int64 token-to-expert tables keep their stored width."""
+    fixture = FIXTURES / "deepseek-v4-tiny"
+    directory = tmp_path / "bfloat16"
+    save_hf_layout({name: tensor.astype(ml_dtypes.bfloat16) if tensor.dtype == np.float32 else tensor
+                    for name, tensor in tool.source_tensors(fixture).items()},
+                   json.loads((fixture / "config.json").read_text()), directory)
+    (directory / "input_ids.npy").write_bytes((fixture / "input_ids.npy").read_bytes())
+    source, ids, trained, reloaded = tool.trained_export(
+        directory, tmp_path / "export", functools.partial(tool.train, CASES["deepseek_v4"]))
+
+    assert source.weight_layouts, "deepseek_v4 writes its export through the source layout"
+    stored = tool.source_tensors(directory)
+    for name, tensor in tool.source_tensors(tmp_path / "export").items():
+        assert tensor.dtype == (np.float32 if stored[name].dtype == ml_dtypes.bfloat16
+                                else stored[name].dtype), name
+    assert_restores(source.model, trained, reloaded, ids)
 
 
 def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path):
