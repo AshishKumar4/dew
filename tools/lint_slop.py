@@ -911,9 +911,60 @@ def _spelled_in_captured(node: ast.AST, names: Set[str]) -> bool:
             and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
 
 
+def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[frozenset[str], frozenset[str]]:
+    """The names a test binds to an error it caught: an `except` clause's, and a `pytest.raises`
+    block's target, whose `.value` the error is."""
+    nodes = list(scopes.own(function))
+    caught = {node.name for node in nodes if isinstance(node, ast.ExceptHandler) and node.name}
+    raised = {item.optional_vars.id for node in nodes if isinstance(node, ast.With | ast.AsyncWith)
+              for item in node.items if isinstance(item.optional_vars, ast.Name)
+              and isinstance(item.context_expr, ast.Call)
+              and _named(item.context_expr.func) == "pytest.raises"}
+    return frozenset(caught), frozenset(raised)
+
+
+def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
+    """Does `node` look for a sentence the source spells in a process's `stdout` or `stderr`, by
+    `in`, `startswith`, `endswith` or `count`, or match a caught error's text (`str` or `repr` of
+    it) so or by `==`? A process's whole output compared, or parsed first, is the value it reports."""
+    def output(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Attribute) and expr.attr in ("stdout", "stderr")
+
+    def error(expr: ast.expr) -> bool:
+        if not (isinstance(expr, ast.Call) and _named(expr.func) in ("str", "repr") and len(expr.args) == 1):
+            return False
+        held = expr.args[0]
+        return (isinstance(held, ast.Name) and held.id in caught) or (
+            isinstance(held, ast.Attribute) and held.attr == "value" and isinstance(held.value, ast.Name)
+            and held.value.id in raised)
+
+    def spelled(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Constant) and isinstance(expr.value, str)
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        left, right = node.left, node.comparators[0]
+        if isinstance(node.ops[0], ast.In | ast.NotIn):
+            return spelled(left) and (output(right) or error(right))
+        return isinstance(node.ops[0], ast.Eq | ast.NotEq) and (
+            (spelled(left) and error(right)) or (spelled(right) and error(left)))
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("startswith", "endswith", "count")
+            and (output(node.func.value) or error(node.func.value))
+            and bool(node.args) and spelled(node.args[0]))
+
+
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
-    warning's text matched, a sentence looked for in captured output, or source text read."""
+    warning's text matched, a sentence looked for in captured output, in a caught error's text or
+    in a process's output, or source text read."""
+    for function in ast.walk(module.tree):
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            caught, raised = _errors(function)
+            for node in scopes.own(function):
+                if _worded(node, caught, raised):
+                    yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                                  "looks for a sentence in an error's or a process's text; assert its "
+                                  "type, its exit status or the value it reports")
     held = _held(module.tree)
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
