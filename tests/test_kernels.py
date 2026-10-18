@@ -609,6 +609,30 @@ def test_a_query_reading_another_sequences_documents_reads_its_own_documents_key
                                        rtol=1e-12, atol=1e-14)
 
 
+def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_exact_as_xla():
+    """Packed queries over a context packed by its own documents (`key_segment_ids`) on 'tpu', which
+    interprets off a TPU: the output and the three gradients within tests/reference_error.py's rule of
+    xla's against float64, a document of the queries' the context lacks among them."""
+    queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
+    keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
+    arrays = [jax.random.normal(jax.random.key(seed), (1, 128, 2, 128), jnp.float32) for seed in range(3)]
+    cotangent = jax.random.normal(jax.random.key(3), (1, 128, 2, 128), jnp.float32)
+
+    def derivatives(implementation, *arrays):
+        def attend(q, k, v):
+            return scaled_dot_product_attention(q, k, v, implementation=implementation, segment_ids=queries,
+                                                key_segment_ids=keys, max_segments=3)
+
+        out, pull = jax.vjp(attend, *arrays)
+        return (out, *pull(cotangent.astype(out.dtype)))
+
+    found, reference = (derivatives(name, *arrays) for name in ("tpu", "xla"))
+    with jax.enable_x64(new_val=True):
+        truth = derivatives("reference", *(jnp.asarray(x, jnp.float64) for x in arrays))
+    for name, got, want, exact in zip(("out", "dq", "dk", "dv"), found, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
+
+
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
     """The output and the three input gradients of one call that ends each
     row's keys at `lengths`, either as lengths or as the mask they mean."""

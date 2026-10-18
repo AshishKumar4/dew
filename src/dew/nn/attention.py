@@ -859,7 +859,9 @@ def _per_shard(local, query, key, value, **extras):
     def shard(query, key, value, *arrays):
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
-    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
+    specs = (queries, keys, keys, *(jax.tree.map(lambda leaf, axes=axes: logical_spec(axes, leaf.shape), x)
+                                    for x, axes in given.values()))
     return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
 
 
