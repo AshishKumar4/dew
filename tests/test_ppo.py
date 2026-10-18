@@ -276,15 +276,22 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
 
 @pytest.mark.parametrize("coefficient", [0., .5])
 @pytest.mark.parametrize("split", [1, 2])
-def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficient, split):
-    trainer, rollout = build_ppo(sequence_mask=(.8, 1.2), split=split)
+@pytest.mark.parametrize("rejection", ["sequence", "band"])
+def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficient, split, rejection):
+    """Every actor token is rejected, by a sequence mask against the old log probs or, with none,
+    by the behavior importance band against the live ones; the critic still trains on all of its
+    own, unless its coefficient is zero."""
+    options = {"sequence_mask": (.8, 1.2)} if rejection == "sequence" else {"behavior_importance": (.5, 2.)}
+    trainer, rollout = build_ppo(split=split, **options)
     objective = rollout.objective
     objective.value_coefficient = coefficient
     state = trainer.initial_state()
     batch = rollout(state, {"task_id": np.arange(31, 35, dtype=np.int32)}, jax.random.key(23))
     old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
-    batch = {**batch, OLD_LOG_PROBS_KEY: old,
-             BEHAVIOR_LOG_PROBS_KEY: old - 2 * jnp.asarray(batch["response_mask"])}
+    batch = {name: value for name, value in batch.items() if name != OLD_LOG_PROBS_KEY}
+    if rejection == "sequence":
+        batch[OLD_LOG_PROBS_KEY] = old
+    batch[BEHAVIOR_LOG_PROBS_KEY] = old - 2 * jnp.asarray(batch["response_mask"])
     before = jax.tree.map(np.asarray, state.variables["params"])
     state, _, _, _, accepted, _ = trainer.compile(state, batch)(state, batch)
     assert bool(accepted)
