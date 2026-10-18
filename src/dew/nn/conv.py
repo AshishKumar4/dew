@@ -44,6 +44,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
+from .precision import biased
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -237,11 +238,19 @@ def _conv_general_dilated(
 
 
 class Conv(nn.Conv):
-    """Flax's convolution with safe placement and backend-specific depthwise work.
+    """Flax's convolution with safe placement, backend-specific depthwise work
+    and its bias gradient summed at fp32.
 
     The kernel is placed where Flax reads its promoted operands, through
     `promote_dtype`. Parameters and names remain Flax's, so checkpoints do
     not change. Other grouped and ordinary convolutions remain lax calls.
+
+    The call is flax 0.12's, its padding, batch flattening, mask and
+    promotion alike, with the bias added by `biased`: flax adds it in its
+    storage dtype after the product, so JAX sums a bfloat16 bias's gradient
+    over every output position in bfloat16 (jax-ml/jax#30310), where torch's
+    convolution sums it in float32 (`dew.nn.dense` says the same of a dense
+    layer's).
     """
 
     promote_dtype: PromoteDtypeFn = _promoted_whole
@@ -274,12 +283,69 @@ class Conv(nn.Conv):
         taps = self.kernel_size if isinstance(self.kernel_size, int) else math.prod(self.kernel_size)
         return conv_flops(lengths, input_channels, self.features, taps, groups=self.feature_group_count)
 
+    @nn.compact
     def __call__(self, inputs: jax.Array) -> jax.Array:
-        spatial = 1 if isinstance(self.kernel_size, int) else len(self.kernel_size)
+        kernel_size = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
+        spatial = len(kernel_size)
         inputs = _unreplicated(inputs, spatial)
         if spatial == 2 and self.strides is not None:
             strided = (self.strides > 1 if isinstance(self.strides, int)
                        else any(stride > 1 for stride in self.strides))
             if strided:
                 inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
-        return _unreplicated(super().__call__(inputs), spatial)
+        return _unreplicated(self._convolved(inputs, kernel_size), spatial)
+
+    @nn.nowrap
+    def _convolved(self, inputs: jax.Array, kernel_size: tuple[int, ...]) -> jax.Array:
+        """Flax's shared-weight convolution of `inputs`, its bias added by `biased`."""
+        def each(value: int | Sequence[int] | None) -> tuple[int, ...]:
+            value = 1 if value is None else value
+            return (value,) * len(kernel_size) if isinstance(value, int) else tuple(value)
+
+        # Every batch dimension in one, as flax convolves them.
+        batch_dims = inputs.ndim - len(kernel_size) - 1
+        batch_shape = inputs.shape[:batch_dims]
+        if batch_dims != 1:
+            inputs = jnp.reshape(inputs, (-1, *inputs.shape[batch_dims:]))
+        strides, input_dilation, kernel_dilation = (
+            each(self.strides), each(self.input_dilation), each(self.kernel_dilation))
+        padding = canonicalize_padding(self.padding, len(kernel_size))
+        if padding in ('CIRCULAR', 'REFLECT'):
+            dilated = [(size - 1) * rate + 1 for size, rate in zip(kernel_size, kernel_dilation, strict=True)]
+            pads = [(0, 0), *(((size - 1) // 2, size // 2) for size in dilated), (0, 0)]
+            inputs = jnp.pad(inputs, pads, mode='wrap' if padding == 'CIRCULAR' else 'reflect')
+            padding = 'VALID'
+        elif padding == 'CAUSAL':
+            if len(kernel_size) != 1:
+                raise ValueError('Causal padding is only implemented for 1D convolutions.')
+            inputs = jnp.pad(inputs, [(0, 0), (kernel_dilation[0] * (kernel_size[0] - 1), 0), (0, 0)])
+            padding = 'VALID'
+        width = inputs.shape[-1]
+        if width % self.feature_group_count:
+            raise ValueError(f"{width} input features do not split into {self.feature_group_count} groups")
+        kernel_shape = (*kernel_size, width // self.feature_group_count, self.features)
+        if self.mask is not None and self.mask.shape != kernel_shape:
+            raise ValueError('Mask needs to have the same shape as weights. '
+                             f'Shapes are: {self.mask.shape}, {kernel_shape}')
+        kernel = self.param('kernel', self.kernel_init, kernel_shape, self.param_dtype)
+        if self.mask is not None:
+            kernel *= self.mask
+        bias = (self.param('bias', self.bias_init, (self.features,), self.param_dtype)
+                if self.use_bias else None)
+        inputs, kernel, bias = self.promote_dtype(inputs, kernel, bias, dtype=self.dtype)
+        if inputs is None or kernel is None:
+            raise ValueError("a convolution's promotion must return its input and kernel")
+        if self.conv_general_dilated_cls is not None:
+            convolve = self.conv_general_dilated_cls()
+        else:
+            convolve = self.conv_general_dilated or jax.lax.conv_general_dilated
+        # Channels last, as flax lays them out: [N, *spatial, C] and a [*spatial, I, O] kernel.
+        ndim = inputs.ndim
+        lhs = (0, ndim - 1, *range(1, ndim - 1))
+        dimensions = jax.lax.ConvDimensionNumbers(lhs, (ndim - 1, ndim - 2, *range(ndim - 2)), lhs)
+        y = convolve(inputs, kernel, strides, padding, lhs_dilation=input_dilation,
+                     rhs_dilation=kernel_dilation, dimension_numbers=dimensions,
+                     feature_group_count=self.feature_group_count, precision=self.precision)
+        if bias is not None:
+            y = biased(y, bias)
+        return y if batch_dims == 1 else jnp.reshape(y, (*batch_shape, *y.shape[1:]))
