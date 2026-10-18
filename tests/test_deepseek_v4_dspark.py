@@ -82,3 +82,27 @@ def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
     for path, bias in flatten_dict(source.variables["moe"]).items():
         unchanged = np.array_equal(np.asarray(moved[path]), np.asarray(bias))
         assert unchanged == (path[0] not in ran), path
+
+
+def test_a_stack_in_host_memory_records_the_drafters_context_as_a_resident_one_does(source):
+    """The layers left in host memory run one at a time in a scope of their own
+    (`decoder_stack.run_stack`), and still write every collection the caller opens:
+    the DSpark target layers' `prediction_inputs` and the router's statistics come
+    back as the resident stack's, so the drafter reads the same context."""
+    model = source.model.clone(scan_layers=False)
+    ids = jnp.asarray(REFERENCE["input_ids"])[:, :6]
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+
+    def hosted(path, leaf):
+        names = [getattr(key, "key", str(key)) for key in path]
+        return jax.device_put(leaf, host) if names[0] == "params" and names[1].startswith("layers_") else leaf
+
+    held = {}
+    for name, variables in (("resident", source.variables),
+                            ("host", jax.tree_util.tree_map_with_path(hosted, source.variables))):
+        logits, state = model.apply(variables, ids, mutable=["prediction_inputs", "router"])
+        context = model.apply(variables, state["prediction_inputs"], method="draft_context")
+        held[name] = (logits, state, context)
+    for ours, theirs in zip(jax.tree.leaves(held["host"]), jax.tree.leaves(held["resident"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert jax.tree.structure(held["host"]) == jax.tree.structure(held["resident"])

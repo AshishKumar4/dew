@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core.scope import subtract_filters
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -312,11 +313,12 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
 
-        These are its parameters and whatever else it was given, all of
-        which a bank holds per layer.
+        These are its parameters, which a forward never writes, and whatever
+        else it was given and the caller left immutable, all of which a bank
+        holds per layer.
         """
         return [name for name in run.variables
-                if name != 'streaming' and (not run.is_mutable_collection(name) or name not in WRITTEN)]
+                if name != 'streaming' and (name == 'params' or not run.is_mutable_collection(name))]
 
     def first_of(index: int, dependency):
         """Fetch run `index`'s first layer's read-only variables.
@@ -336,7 +338,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
-        mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
+        # A run applied in a scope of its own writes the collections its caller
+        # opened (DSpark's `prediction_inputs` among them), which the loop carries back out.
+        if run.scope is None:
+            raise ValueError("a fetched run is applied inside its bound stack")
+        mutable = subtract_filters(run.scope.mutable, ('params', 'streaming'))
 
         def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
@@ -345,7 +351,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                 per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
             return hidden, dict(changed)
 
-        cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
+        cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         if count == 1:
             following = first_of(index + 1, x)
             x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
