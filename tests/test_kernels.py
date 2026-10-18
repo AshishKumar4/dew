@@ -465,6 +465,36 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
+@on_gpu
+def test_a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
+    """A bidirectional window over more keys than queries (256 queries over 512 keys, 32 each side)
+    keeps the keys `structural_mask` centres on each query's row, Dew's contract, whichever kernel
+    'auto' picks on this GPU: its output and gradients within tests/reference_error.py's rule of the
+    xla kernel's, both from float64. FlashAttention aligns a window to the last key, the keys 256
+    further on, so 'auto' leaves it such a call and an explicit 'flash' refuses it, while it takes
+    the same window square."""
+    flash_here()
+    rng = np.random.default_rng(61)
+    query = jnp.asarray(rng.normal(size=(1, 256, 8, 64)), jnp.bfloat16)
+    key, value = (jnp.asarray(rng.normal(size=(1, 512, 8, 64)), jnp.bfloat16) for _ in range(2))
+    cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.bfloat16)
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, sliding_window=33))
+
+    found = output_and_gradients(kernel('auto'), cotangent, query, key, value)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
+    with jax.enable_x64(new_val=True):
+        truth = output_and_gradients(kernel('reference'), jnp.asarray(cotangent, jnp.float64),
+                                     *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), found, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(got[0], theirs[0], want[0], name)
+    with pytest.raises(ValueError):
+        kernel('flash')(query, key, value)
+    kernel('flash')(query, key[:, :256], value[:, :256]).block_until_ready()
+
+
 def documents(lengths) -> np.ndarray:
     """Packed rows' segment ids, each row's documents of `lengths[:-1]` tokens numbered from 1 and its
     padding of `lengths[-1]` after them."""

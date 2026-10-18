@@ -1086,7 +1086,8 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     sliding window, sinks or packed documents where the call has them, the
     packing declaring at most `FLASH_PACKED_SEGMENTS` documents a row, the query is bf16 or
     fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
-    than sm80, whose backward takes no wider), a causal call is square, the
+    than sm80, whose backward takes no wider), a causal or windowed call is square
+    (FlashAttention aligns both to the last key, `structural_mask` to the row), the
     call has no mask, bias or softcap, no deterministic ops are asked for,
     which its backward's atomic sum of the query gradient would not keep, and
     the installed dew_flash_attn holds code for this GPU."""
@@ -1111,7 +1112,8 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
          "its empty sequences cost less than the document mask"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
-        (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
+        (not (causal or sliding_window is not None) or query.shape[-3] == key.shape[-3],
+         "a causal or windowed call has another number of keys than of queries"),
         (mask is None, "the call has a mask"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
@@ -1545,9 +1547,10 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "attention_impl 'cudnn' or 'xla' for this call.")
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if causal and query.shape[-3] != key.shape[-3]:
-            raise ValueError("flash attention aligns its causal mask to the last key, so a causal call "
-                             f"needs as many queries as keys, not {query.shape[-3]} and {key.shape[-3]}")
+        if (causal or sliding_window is not None) and query.shape[-3] != key.shape[-3]:
+            raise ValueError("flash attention aligns its causal mask and its window to the last key, so a "
+                             "causal or windowed call needs as many queries as keys, not "
+                             f"{query.shape[-3]} and {key.shape[-3]}")
         if deterministic_ops_requested():
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
