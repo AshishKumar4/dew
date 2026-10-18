@@ -959,6 +959,47 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
 
 
+def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_not(tmp_path):
+    """SLOP011: a sentence the test spells, looked for in a raised error's text (`str` or `repr` of
+    an `except` name or of `pytest.raises`'s value) or in a process's `stdout` or `stderr`, by
+    `in`, `==`, `startswith`, `endswith` or `count`, proves wording. A refusal's type, a process's
+    exit code, a value the process prints and the test parses, and an error's own attribute hold
+    behaviour, as does a process's whole output compared with the value it computes, and are not
+    reported."""
+    found = _linted(tmp_path, {"tests/test_refusal.py": (
+        "import json\n"
+        "import subprocess\n"
+        "import pytest\n"
+        "def test_caught():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert 'invalid literal' in str(error)\n"
+        "def test_raised():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert str(raised.value).startswith('invalid')\n"
+        "    assert repr(raised.value) == 'ValueError()'\n"
+        "def test_process():\n"
+        "    done = subprocess.run(['false'], capture_output=True, text=True)\n"
+        "    assert 'refused' in done.stderr\n"
+        "    assert done.stdout.count('saved')\n"
+        "def test_behaviour():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert raised.type is ValueError\n"
+        "    done = subprocess.run(['true'], capture_output=True, text=True)\n"
+        "    assert done.returncode == 0\n"
+        "    assert json.loads(done.stdout) == {'refused': True}\n"
+        "    assert done.stdout.split()[-1] == 'Scalar'\n"
+        "    assert done.stdout == '42\\n'\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert error.args\n")})
+    assert found == [("tests/test_refusal.py", line, "SLOP011") for line in (8, 12, 13, 16, 17)]
+
+
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
     """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
     one piece of work are reported where the function deals with no subprocess, network, service or

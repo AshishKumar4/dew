@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -629,7 +630,8 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     began = time.monotonic()
     trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
                              env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    assert "KeyboardInterrupt" in trainer.stderr
+    # An uncaught KeyboardInterrupt ends CPython by SIGINT, so any other failure shows as itself.
+    assert trainer.returncode == -signal.SIGINT, trainer.stderr[-2000:]
     # The running trial was killed (its 60 s sleep never finished) and the queued one never launched.
     assert time.monotonic() - began < 30
     (seen,) = (tmp_path / "trials").glob("*/seen.json")

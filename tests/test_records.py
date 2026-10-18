@@ -62,11 +62,3 @@ def test_json_value_carries_scalars_lists_and_sections_and_names_an_unknown_type
     with pytest.raises(ValueError):
         records.json_value(object(), 'generation_config')
 
-
-@pytest.mark.parametrize('reader', [records.integer, records.number, records.boolean,
-                                    records.text, records.record, records.strings,
-                                    records.integers, records.json_value])
-def test_every_reader_names_the_key_and_shows_the_value_it_refused(reader):
-    with pytest.raises(ValueError) as raised:
-        reader(bytearray(b'\x00'), 'quantization_config')
-    assert str(raised.value).startswith("quantization_config=bytearray(b'\\x00'): ")
