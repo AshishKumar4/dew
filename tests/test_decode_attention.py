@@ -166,6 +166,54 @@ def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attentio
                                          f"the decode kernel's {name}")
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axes, rows, heads", [({"data": 2}, 2, 4), ({"tensor": 2}, 4, 2)],
+                         ids=["rows", "heads"])
+def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes, rows, heads):
+    """A decoder's single-token step over four rows of four heads, lowered for an A100 on a mesh that
+    splits its rows or its heads in two, launches the decode kernel on each shard's own rows and
+    heads (`manual_map`), the shapes its call names: a Pallas call has no partitioning rule, and
+    launched on the whole batch it had XLA gather every row's cache to every device each token."""
+    import math
+    import re
+
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+
+    devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                            devices=jax.devices()[:math.prod(axes.values())])
+    mesh = gpu_mesh(devices, "sm80")
+    model = CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=4, num_kv_heads=4,
+                              head_dim=64, mlp_features=64, max_seq_len=64, dtype="bfloat16",
+                              attention_impl="xla")
+    tokens = jax.ShapeDtypeStruct((4, 1), jnp.int32)
+    with assumed("sm80"):
+        params = jax.eval_shape(model.init, jax.random.key(0), tokens)
+        cache = jax.eval_shape(lambda params: model.apply(params, 4, method=CausalTransformer.init_cache,
+                                                          mutable=["cache"])[1]["cache"], params)
+
+    def placed(tree, *spec):
+        sharding = NamedSharding(mesh, PartitionSpec(*spec))
+        return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
+
+    def step(params, cache, tokens):
+        return model.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
+
+    with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(step).trace(placed(params), placed(cache), placed(tokens, "data" if "data" in axes
+                                                                            else None))
+        text = lowered.lower(lowering_platforms=("cuda",)).as_text(debug_info=False)
+    # Each launch's operand types: the row lengths, the padded queries, the cache's keys and values.
+    called = r'custom_call @__gpu\$xla\.gpu\.triton\(.*?name = "decode_attention".*?: \((.*?)\) ->'
+    launches = re.findall(called, text)
+    assert launches
+    for types in launches:
+        lengths, query = types.split(", ")[:2]
+        assert lengths == f"tensor<{rows}x1xi32>" and query.startswith(f"tensor<{rows}x16x{heads}x"), types
+
+
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("page_size", [16, 32])
 def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
