@@ -176,6 +176,27 @@ def test_gaussian_topk_is_as_exact_as_the_references(sparsity):
                                      f"the gate at sparsity {sparsity}")
 
 
+@pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])
+def test_gaussian_topk_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
+    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the
+    reference's infinite cutoff multiplier (torch's icdf there): every value
+    kept as infinity below, and none kept above, bit for bit as the
+    reference's gate in fp32 and bf16, which both take the fp32 argument. A
+    float64 model forms its own float64 argument, which these do not end."""
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
+
+    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
+                               activation_sparsity_pattern=[sparsity])
+    mlp = Gemma3nTextMLP(config, layer_idx=0)
+    for torch_dtype, dtype in ((torch.float32, jnp.float32), (torch.bfloat16, jnp.bfloat16)):
+        dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows, dtype))
+        theirs = mlp._gaussian_topk(torch.tensor(rows).to(torch_dtype)).float().numpy()
+        np.testing.assert_array_equal(np.asarray(dew, np.float32), theirs)
+
+
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])
 def test_gaussian_topk_has_the_population_cutoff_jacobian(sparsity):
     # Both active and inactive coordinates, separated from the cutoff.
