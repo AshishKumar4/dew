@@ -44,6 +44,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
@@ -720,9 +721,13 @@ class T5EncoderTransformer(nn.Module):
             raise ValueError(
                 f"feed_forward_proj {self.feed_forward_proj!r} is not a T5 "
                 "feed-forward this tower implements; 'relu' and 'gated-gelu' are")
-        self.embed_tokens = nn.Embed(self.vocab_size, self.d_model, name="embed_tokens")
+        # Both tables are read in the compute dtype, as the reference reads its own
+        # tables in the dtype the model runs in, so the residual stream starts there.
+        self.embed_tokens = TokenEmbedding(self.vocab_size, self.d_model, dtype=self.dtype,
+                                           name="embed_tokens")
         self.relative_attention_bias = [
-            nn.Embed(self.num_buckets, self.num_heads, name=f"relative_attention_bias_{index}")
+            TokenEmbedding(self.num_buckets, self.num_heads, dtype=self.dtype,
+                           name=f"relative_attention_bias_{index}")
             for index in range(self.num_layers if self.per_layer_bias else 1)]
         self.layers = [
             self._layer(name=f"layers_{index}")
