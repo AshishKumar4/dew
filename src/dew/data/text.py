@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import json
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -25,7 +26,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
-    from transformers import PreTrainedTokenizerBase
+    from transformers import PreTrainedConfig, PreTrainedTokenizerBase
 
     from dew.data.dataset import Batch
 
@@ -122,14 +123,41 @@ def load_tokenizer(name: str, *, revision: str | None = None,
 
             stated = get_tokenizer_config(name, revision=revision, local_files_only=local_files_only)
             renamed = RENAMED_TOKENIZERS.get(str(stated.get("tokenizer_class")))
-            reader = AutoTokenizer if renamed is None else getattr(transformers, renamed)
-            loaded = reader.from_pretrained(name, revision=revision, local_files_only=local_files_only)
+            loaded = (AutoTokenizer.from_pretrained(
+                name, revision=revision, local_files_only=local_files_only,
+                config=_untyped_config(name, revision, local_files_only)) if renamed is None
+                else getattr(transformers, renamed).from_pretrained(name, revision=revision,
+                                                                    local_files_only=local_files_only))
             # from_pretrained's annotation names classes transformers binds
             # to None without their backend, so its result is untyped until here.
             if not isinstance(loaded, PreTrainedTokenizerBase):
                 raise TypeError(f"{name!r} loads as {type(loaded).__name__}, not a transformers tokenizer")
             held = _loaded[key] = loaded
     return held
+
+
+def _untyped_config(name: str, revision: str | None, local_files_only: bool) -> PreTrainedConfig | None:
+    """AutoTokenizer's model config where transformers registers no class for the model's type;
+    None where it does or the repo has no config, for AutoTokenizer to build its own.
+
+    AutoTokenizer reads a model config for its type, name and tokenizer class alone
+    (tokenization_auto.py:770-830, 5.16.1). An unregistered type reaches it as an untyped
+    PreTrainedConfig of every field the file holds, which transformers validates against its own
+    vocabulary: Dory's 'mlp' layer types fail `validate_layer_type`, though no tokenizer reads
+    them. This config holds the fields AutoTokenizer reads, and its type is untyped as before."""
+    from transformers import PreTrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from transformers.utils.hub import cached_file
+
+    path = cached_file(name, "config.json", revision=revision, local_files_only=local_files_only,
+                       _raise_exceptions_for_missing_entries=False)
+    if path is None:
+        return None
+    stated = json.loads(Path(path).read_text())
+    if stated.get("model_type") in CONFIG_MAPPING:
+        return None
+    return PreTrainedConfig.from_dict({"_name_or_path": name,
+                                       "tokenizer_class": stated.get("tokenizer_class")})
 
 
 @runtime_checkable
