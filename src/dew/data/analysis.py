@@ -122,10 +122,12 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, chunks_for, plan_name
 
-    def cut(stages: Sequence[Stage]) -> int:
-        """1 where a chunk step cuts documents as the pack after it plans them (`chunks_for`), else 0."""
-        return int(len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack)
-                   and chunks_for(stages[0].step, stages[1]))
+    def cutting(stages: Sequence[Stage]) -> int | None:
+        """The overlap of a chunk step that cuts documents as the pack after it plans them
+        (`chunks_for`), or None where none comes first."""
+        if len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack):
+            return chunks_for(stages[0].step, stages[1])
+        return None
 
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
@@ -135,13 +137,17 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             generation = stage.cache.source()
             source, stages = rebased(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            at = cut(stages)
+            overlap = cutting(stages)
+            at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
-            if source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans:
-                source = PackedSource.published(source, stage.cache, packing, chunked=bool(at))
+            # A published plan cuts a document as a window-long chunk step without overlap does.
+            if (source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans
+                    and overlap in (None, 0)):
+                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
             break
-    at = cut(stages)
+    overlap = cutting(stages)
+    at = int(overlap is not None)
     pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
@@ -151,7 +157,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.supports("indexed")
         and source.lengths() is not None
     ):
-        source, stages = PackedSource.planned(source, pack, chunked=bool(at)), stages[at + 1 :]
+        source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 

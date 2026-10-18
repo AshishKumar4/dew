@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import grain.python as grain
 import numpy as np
 
+from dew.data.tokens import chunk_table
+
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
@@ -373,15 +375,14 @@ class Chunks:
 
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         count = len(element[self.fields[0]])
-        stride = self.length - self.overlap
-        starts = range(0, max(count - self.overlap, 1), stride)
+        _, starts = chunk_table([count], self.length, self.overlap)
         return tuple(
             {
                 key: value[start : start + self.length] if key in self.fields else value
                 for key, value in element.items()
             }
             | {"_dew_length": min(self.length, count - start)}
-            for start in starts
+            for start in starts.tolist()
         )
 
 
