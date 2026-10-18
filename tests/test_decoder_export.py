@@ -797,24 +797,32 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
 
 
+@pytest.mark.parametrize("fixture", ["deepseek-v3-tiny", "kimi-k25-tiny"])
 @pytest.mark.parametrize(
     "same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"]
 )
-def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_values):
+def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixture, same_values):
+    """An FP8 tied head and its float32 embedding are one tensor only if
+    they hold equal values before narrowing to bfloat16 storage, under the
+    names the source's own family gives them. Kimi K2.5 computes what
+    DeepSeek V3 does and names its head and embedding under
+    `language_model.`."""
     from dew.interop.codecs import E4M3
+    from dew.interop.hf_decoders import families
 
-    fixture = FIXTURES / "deepseek-v3-tiny"
-    tensors = tool.source_tensors(fixture)
-    config = json.loads((fixture / "config.json").read_text())
-    config["tie_word_embeddings"] = True
+    tensors = tool.source_tensors(FIXTURES / fixture)
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    head, embedding = families()[config["model_type"]].tied_head_names
+    for tied in (config, config.get("text_config", {})):
+        tied["tie_word_embeddings"] = True
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                      "weight_block_size": [128, 128]}
-    shape = tensors["model.embed_tokens.weight"].shape
+    shape = tensors[embedding].shape
     decoded = np.float32(1. + 1. / 1024)
     unquantized = decoded if same_values else np.float32(1. + 2. / 1024)
-    tensors["model.embed_tokens.weight"] = np.full(shape, unquantized, np.float32)
-    tensors["lm_head.weight"] = np.ones(shape, dtype=E4M3)
-    tensors["lm_head.weight_scale_inv"] = np.full(
+    tensors[embedding] = np.full(shape, unquantized, np.float32)
+    tensors[head] = np.ones(shape, dtype=E4M3)
+    tensors[f"{head}_scale_inv"] = np.full(
         ((shape[0] + 127) // 128, (shape[1] + 127) // 128), decoded, np.float32)
     for name in tensors:
         if name.startswith("model.layers.") and name.endswith(".embed_tokens.weight"):
