@@ -75,10 +75,10 @@ def test_altup_predicts_and_corrects_like_the_reference():
 
 def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     """A training step with half of the prediction coefficients past
-    `coef_clip`. The reference clamps the stored prediction weight before its
-    product, so the forward reads the clamped values and the gradient reaches
-    every one of them, while the correction clamps inside its product, which
-    zeroes the clamped ones' gradient. The outputs and the gradients of all
+    `coef_clip`, two of them at 1e10. The reference clamps the stored
+    prediction weight before its product, so the forward reads the clamped
+    values and the gradient reaches every one of them, while the correction
+    clamps inside its product, which zeroes the clamped ones' gradient. The outputs and the gradients of all
     five AltUp leaves are as exact as the reference's, both measured from the
     reference in float64."""
     import torch
@@ -88,6 +88,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     tensors = fixture()
     clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
     assert np.abs(tensors["altup.correction_coefs.weight"]).max() > clip
+    tensors["altup.prediction_coefs.weight"][[0, 1], [0, 1]] = 1e10, -1e10
     stream, activated = tensors["stream"], tensors["activated"]
     draws = np.random.default_rng(0)
     cotangents = [draws.standard_normal(shape).astype(np.float32)
