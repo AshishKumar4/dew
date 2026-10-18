@@ -104,7 +104,7 @@ class MLPMixer(MixerBase):
 
         dense = functools.partial(
             GatedMLP, out_features=ctx.emb_features,
-            activation=self.activation, use_bias=self.use_bias, init_std=ctx.init_std,
+            activation=self.activation, use_bias=self.use_bias, ngpt=ctx.ngpt, init_std=ctx.init_std,
             output_init_std=ctx.output_init_std, dtype=ctx.dtype, precision=ctx.precision)
         if self.mixture is None:
             return functools.partial(dense, hidden_features=self.intermediate_size)

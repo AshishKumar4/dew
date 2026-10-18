@@ -134,6 +134,7 @@ class MixerContext:
             "o_proj_bias": bool(self.o_proj_bias),
             "attention_dropout_rate": bool(self.attention_dropout_rate),
             "narrow_rotary_tables": self.narrow_rotary_tables,
+            "ngpt": self.ngpt is not None,
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
