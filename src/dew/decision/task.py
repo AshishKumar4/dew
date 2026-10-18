@@ -52,7 +52,7 @@ from dew.decision.questions import (
     ScoreAnswer,
 )
 from dew.files import write_atomically
-from dew.inference.tasks import SHAPE_BUCKETS
+from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
@@ -355,7 +355,7 @@ class Decide:
         while start < len(order):
             stop = start + 1
             while (stop < len(order) and stop - start < self.budget.rows
-                   and (_bucket(len(rows[order[stop]].tokens)) * _bucket(stop - start + 1, smallest=1)
+                   and (shape_bucket(len(rows[order[stop]].tokens), 64) * shape_bucket(stop - start + 1, 1)
                         <= self.budget.tokens)):
                 stop += 1
             chosen = order[start:stop]
@@ -370,15 +370,15 @@ class Decide:
         weights' mesh (`RowPlan`)."""
         questions = max(len(row.questions) for row in rows)
         options = max(len(laid.options) for row in rows for laid in row.questions)
-        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=_bucket(questions, smallest=1),
-                                        options=_bucket(options, smallest=1))
-        length = _bucket(inputs.tokens.shape[1])
+        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=shape_bucket(questions, 1),
+                                        options=shape_bucket(options, 1))
+        length = shape_bucket(inputs.tokens.shape[1], 64)
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
-        count = _bucket(len(rows), smallest=1)
+        count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         plan = RowPlan.over(mesh_of(self.variables), count)
         return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
@@ -629,10 +629,6 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           max_segments=max_segments)
-
-
-def _bucket(value: int, smallest: int = 64) -> int:
-    return next((size for size in SHAPE_BUCKETS if size >= value and size >= smallest), value)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:
