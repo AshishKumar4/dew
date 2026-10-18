@@ -31,20 +31,28 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
-def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
-    """`product` plus `bias` broadcast over its leading axes, in the dtype the two sum to, the sum
-    taken at fp32 (`at_least_fp32`) and rounded once.
+def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
+    """`product` plus `bias` broadcast over its leading axes, the sum taken at fp32
+    (`at_least_fp32`) and rounded once to `dtype`, the dtype flax's layer gives its output. The
+    caller takes the product at that width (`wide_product`), unrounded, so product and bias round
+    together once, as torch's addmm rounds them: rounding the product first, then the sum, put a
+    Llama 3 query projection's bf16 output 1.42 times as far from float64 as torch's.
 
     JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
-    at fp32, the gradient sums at fp32 and rounds once into the bias. The sum of two values rounded
-    once is the one the narrower addition computes, so the forward is unchanged.
+    at fp32, the gradient sums at fp32 and rounds once into the bias.
     """
-    dtype = jnp.result_type(product, bias)
     wide = at_least_fp32(dtype)
     return (product.astype(wide) + bias.astype(wide)).astype(dtype)
+
+
+def wide_product(dtype, bias) -> dict:
+    """The product's `preferred_element_type`, as keyword arguments, for a layer computing in `dtype`
+    whose `bias` follows (`biased`): `at_least_fp32(dtype)` where there is one, so the product is not
+    rounded before the bias is added, and nothing where there is none, the product then the output."""
+    return {} if bias is None else {"preferred_element_type": at_least_fp32(dtype)}
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:

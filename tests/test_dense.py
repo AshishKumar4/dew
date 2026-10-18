@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
@@ -126,24 +126,54 @@ class _Host(nn.Module):
         return self.proj(x)
 
 
-def test_an_adapter_adds_its_branch_to_the_output_flaxs_layer_gives():
-    """A LoRA branch on a biased bfloat16 projection adds its delta to the layer's rounded
-    output, as on flax's own layer and as PEFT adds it to torch's."""
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
+def test_a_biased_bf16_projection_rounds_where_torchs_addmm_does(general):
+    """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, rounds its product
+    and bias once together, as torch's addmm does: within a quarter of torch's own rounding of
+    torch's bfloat16 nn.Linear over the same bfloat16 weights and inputs, both from float64. The
+    product rounded first and the sum again put a Llama 3 query 1.42 times as far from float64."""
+    import torch
+
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((512, 64)).astype(np.float32)
+    kernel = (rng.standard_normal((64, 32)) * 0.1).astype(np.float32)
+    bias = rng.standard_normal(32).astype(np.float32)
+    layer = (DenseGeneral(32, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16) if general
+             else Dense(32, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16))
+    params = {"params": {"kernel": jnp.asarray(kernel, jnp.bfloat16),
+                         "bias": jnp.asarray(bias, jnp.bfloat16)}}
+    dew = np.asarray(layer.apply(params, jnp.asarray(x, jnp.bfloat16)), np.float64)
+
+    def linear(dtype):
+        weight, shift, inputs = (torch.tensor(a).to(torch.bfloat16).to(dtype) for a in (kernel.T, bias, x))
+        return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+
+    assert_rounds_where_the_reference_does(dew, linear(torch.bfloat16), linear(torch.float64), "projection")
+
+
+def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
+    """A LoRA branch on a biased bfloat16 projection adds its delta to the layer's rounded output,
+    as PEFT adds it to torch's: the adapted layer is the plain layer's output plus the branch alone
+    (the same adapter over a zero kernel and bias), rounded once."""
     from dew.lora import Adapter, Target
 
     x = jnp.asarray(np.random.default_rng(2).standard_normal((4, 6)), jnp.bfloat16)
-    outputs = []
-    for dense in (Dense, nn.Dense):
-        model = _Host(dense(8, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
-                            bias_init=nn.initializers.normal(1.0)))
-        variables = model.init(jax.random.key(0), x)
-        factors = {"lora_A": jnp.asarray(np.random.default_rng(3).standard_normal((6, 2)), jnp.bfloat16),
-                   "lora_B": jnp.asarray(np.random.default_rng(4).standard_normal((2, 8)), jnp.bfloat16)}
-        adapted_tree = {"params": {"proj": {**variables["params"]["proj"], **factors}}}
-        adapter = Adapter.bound(model, adapted_tree, {("params", "proj"): Target(2, 4.0)}, rslora=False,
-                                dropout=0.0, layouts={})
-        outputs.append(np.asarray(adapter.model.apply(adapted_tree, x), np.float32))
-    np.testing.assert_array_equal(*outputs)
+    model = _Host(Dense(8, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
+                        bias_init=nn.initializers.normal(1.0)))
+    variables = model.init(jax.random.key(0), x)
+    factors = {"lora_A": jnp.asarray(np.random.default_rng(3).standard_normal((6, 2)), jnp.bfloat16),
+               "lora_B": jnp.asarray(np.random.default_rng(4).standard_normal((2, 8)), jnp.bfloat16)}
+
+    def adapted(params):
+        tree = {"params": {"proj": {**params, **factors}}}
+        adapter = Adapter.bound(model, tree, {("params", "proj"): Target(2, 4.0)}, rslora=False, dropout=0.0,
+                                layouts={})
+        return adapter.model.apply(tree, x)
+
+    plain = model.apply(variables, x)
+    branch = adapted(jax.tree.map(jnp.zeros_like, variables["params"]["proj"]))
+    np.testing.assert_array_equal(np.asarray(adapted(variables["params"]["proj"]), np.float32),
+                                  np.asarray(plain + branch, np.float32))
 
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
