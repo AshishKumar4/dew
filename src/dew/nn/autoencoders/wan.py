@@ -481,7 +481,7 @@ class WanAutoencoder(AutoEncoder):
 
 def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                  subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                 lazy: bool = False
+                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
                  ) -> tuple[WanAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Wan 2.1 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo, such as
@@ -504,4 +504,5 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
         directory, "vae", config, model, wan_vae_path,
         lambda bound: WanAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                      latents_std=config["latents_std"]),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(video,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(video,),
+        shapes=shapes)

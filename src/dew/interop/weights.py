@@ -167,10 +167,31 @@ def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param
         if path is None:
             continue
         stored = np.asarray(tensor)
-        order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
-        transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
+        order, transpose = _orders(path, stored.ndim)
         dtype = checkpoint_dtype(stored.dtype, param_dtype, path=path)
         yield name, path, read(stored, dtype, order), transpose
+
+
+def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    """The axis order a stored tensor of `rank` reads into its leaf at `path` by, and
+    the order that writes the leaf back: a kernel's `[out, in, ...]` read as
+    `[..., in, out]`; None for any other leaf."""
+    if path[-1] != "kernel":
+        return None, None
+    order = (*range(2, rank), 1, 0)
+    return order, tuple(int(axis) for axis in np.argsort(order))
+
+
+def source_layouts(component: str, shapes: Mapping[str, tuple[int, ...]], path_of: TensorPath,
+                   prefix: tuple[str, ...]) -> tuple[WeightLayout, ...]:
+    """`record_layouts`' layouts, from the stored tensors' shapes alone: each
+    tensor's leaf under `prefix` and the transpose that writes it back, for a tree
+    bound from saved variables rather than read (`components.bind_component`)."""
+    from dew.interop.streaming import WeightLayout
+
+    return tuple(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tuple(shape),
+                              _orders(path, len(shape))[1])
+                 for name, shape in shapes.items() if (path := path_of(name)) is not None)
 
 
 def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
@@ -215,10 +236,9 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     each placement reads and casts only its shard. Scoring state can request
     FP32 separately from parameters.
     """
-    from dew.interop.streaming import SourceLeaf, WeightLayout, materialize
+    from dew.interop.streaming import SourceLeaf, materialize
 
     parameters: LazyTree = {}
-    layouts = []
     owners: dict[tuple[str, ...], str] = {}
 
     def locate(name: str) -> tuple[str, ...] | None:
@@ -231,9 +251,9 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
         return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
                 else SourceLeaf((stored,), dtype, transposed=order is not None))
 
-    for name, path, leaf, transpose in _leaves(tensors, locate, param_dtype, mapped):
-        layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),),
-                                    tensors[name].shape, transpose))
+    for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, mapped):
         if owners[path] == name:
             insert(parameters, path, leaf, name)
-    return (parameters if lazy else materialize(parameters)), tuple(layouts)
+    layouts = source_layouts(component, {name: tensor.shape for name, tensor in tensors.items()}, path_of,
+                             prefix)
+    return (parameters if lazy else materialize(parameters)), layouts

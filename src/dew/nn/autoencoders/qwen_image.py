@@ -368,7 +368,7 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
 
 def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                         subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                        lazy: bool = False
+                        lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
                         ) -> tuple[QwenImageAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Qwen-Image 2.1 VAE, its parameters and their source
     layouts from `subfolder` of a pipeline directory or Hub repo; only that
@@ -388,4 +388,5 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
         directory, "vae", config, model, qwen_image_vae_path,
         lambda bound: QwenImageAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                            latents_std=config["latents_std"]),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
+        shapes=shapes)

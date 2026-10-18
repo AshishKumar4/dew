@@ -459,6 +459,7 @@ def load_rae(
     param_dtype: str = "float32",
     params: Variables | None = None,
     lazy: bool = False,
+    shapes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
@@ -480,7 +481,8 @@ def load_rae(
         lambda bound: RAEAutoencoder(model=model, params=bound, latents_mean=config.get("latents_mean"),
                                      latents_std=config.get("latents_std"),
                                      scaling_factor=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
+        shapes=shapes)
 
 
 def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
