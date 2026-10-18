@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import jax
 from jax.experimental import multihost_utils
+from packaging.version import Version
 
 from dew.cache import enable_compilation_cache
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
@@ -225,25 +226,20 @@ def _joined() -> None:
     multihost_utils.sync_global_devices("dew process pool joined")
 
 
-POOL_KEYS_ALIKE = "0.11.2.post3"
-"""The jax that keys a computation spanning processes alike on every one of them
-(jax-ml/jax#40940): constraints.txt's post-release of 0.11.2, its version saying so."""
-
-
 def _pool_keys_alike() -> bool:
     """Whether this jax keys a computation that spans processes alike on
-    every one of them (jax-ml/jax#40940), by the version that does.
+    every one of them (jax-ml/jax#40940).
 
     jax 0.11.2 keys an executable by the compiling process's own topology
     fingerprint, which on a GPU describes the device down to its NVLink
     links. In a pool across GPUs linked differently the processes keyed a
     step apart, and on the next run some loaded it while the others compiled
-    it and waited for ever for their shares of its sharded autotuning. The
-    jax constraints.txt names (`POOL_KEYS_ALIKE`) hashes every process's
-    fingerprint; the 0.11.2 release, which the published dewml installs, does
-    not, nor any other until one with the fix is named here.
+    it and waited for ever for their shares of its sharded autotuning. No
+    jax release has the fix. The build constraints.txt names carries it, and
+    its branch versions each build as a post-release of 0.11.2, which jax has
+    never published, so the version says which jax this is.
     """
-    return jax.__version__ == POOL_KEYS_ALIKE
+    return Version(jax.__version__).is_postrelease
 
 
 class Preempted(SystemExit):
