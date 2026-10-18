@@ -79,13 +79,18 @@ def sites(adapter) -> tuple[str, ...]:
     return adapter.model._dew_wrapped._dew_wrapper().frozen_fp8
 
 
-def adapters(model=None):
-    """One adapter over a bf16 base and one over the same base in FP8."""
+def adapters(model=None, generation=None):
+    """One adapter over a bf16 base and one over the same base in FP8, its record measured on
+    `generation` (this process's own by default)."""
     model = decoder() if model is None else model
     variables = model.init(jax.random.key(0), ids())
     spec = LoRA(rank=4, modules=("q_proj", "v_proj"))
     return (spec.apply(model, variables, key=1),
-            spec.apply(model, variables, key=1, fp8_base=record(variables)))
+            spec.apply(model, variables, key=1, fp8_base=record(variables, generation)))
+
+
+ELSEWHERE = "sm90" if device_generation() == "sm80" else "sm80"
+"""A generation other than this process's: an A100's record runs on an H100, anything else's on an A100."""
 
 
 def calls(model, variables, inputs):
@@ -160,11 +165,14 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     assert_products_exact(x, leaves, cotangent, output, pullback(cotangent)[0])
 
 
-def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
+@pytest.mark.parametrize("measured_on", [None, ELSEWHERE], ids=["here", "elsewhere"])
+def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch(measured_on):
     """A fresh adapter's branch adds zero (B starts at 0), so each named
     site's output is the frozen product of its own input, the adapted ones
-    included, and every other Dense computes as the bf16 base's does."""
-    plain, fp8 = adapters()
+    included, and every other Dense computes as the bf16 base's does. Where
+    the record's sites were measured is provenance: one measured on another
+    generation computes the same products here."""
+    plain, fp8 = adapters(generation=measured_on)
     seen, base = calls(fp8.model, fp8.variables, ids()), calls(plain.model, plain.variables, ids())
     named = set(sites(fp8))
     assert named and named <= set(seen)
@@ -283,16 +291,6 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
     leaves = [flatten_dict(adapter.variables[QUANTIZATION], sep="/")[f"{site}/{leaf}"] for leaf in FROZEN_FP8]
     expected = frozen_fp8_product(rounded.reshape(-1, x.shape[-1]), *leaves).astype(output.dtype)
     np.testing.assert_array_equal(np.asarray(output), np.asarray(expected.reshape(output.shape)))
-
-
-def test_a_record_runs_on_another_generation_than_it_was_measured_on():
-    """Where a record's sites were measured is provenance, not a bar: it computes here and on any
-    other generation alike, an A100's record on an H100 and anything else's on an A100."""
-    _, fp8 = adapters()
-    here = jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    with assumed("sm90" if device_generation() == "sm80" else "sm80"):
-        there = jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    assert there == here
 
 
 FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
