@@ -106,6 +106,35 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
     np.testing.assert_array_equal(actual[1], uniform[1])
 
 
+def test_phi3_packed_documents_each_take_their_own_longrope_table():
+    """A packed row selects LongRoPE's short or long factors per document, by
+    the document's own length, as each document alone does: a 3-token
+    document beside a 9-token one past the 8-token original context reads
+    the short table, the long one the long table, and the padding after a
+    document selects nothing. Each document's logits are its logits alone."""
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    ids = np.load(DIRECTORY / 'input_ids.npy')[0].astype(np.int32)
+    documents = ((ids[:3], ids[3:12]), (ids[3:9],))
+    rows, segments, positions = [], [], []
+    for row in documents:
+        width = sum(len(document) for document in row)
+        rows.append(np.concatenate([*row, np.zeros(12 - width, np.int32)]))
+        segments.append(np.concatenate([np.full(len(document), index + 1)
+                                        for index, document in enumerate(row)]
+                                       + [np.zeros(12 - width, np.int64)]))
+        positions.append(np.concatenate([np.arange(len(document)) for document in row]
+                                        + [np.zeros(12 - width, np.int64)]))
+    packed = np.asarray(loaded.model.apply(loaded.variables, np.stack(rows), positions=np.stack(positions),
+                                           segment_ids=np.stack(segments)))
+    for index, row in enumerate(documents):
+        start = 0
+        for document in row:
+            alone = np.asarray(loaded.model.apply(loaded.variables, document[None]))[0]
+            gap = float(np.max(np.abs(packed[index, start:start + len(document)] - alone)))
+            assert gap < 1e-5 * float(np.max(np.abs(alone))), (index, len(document), gap)
+            start += len(document)
+
+
 def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     from dew.inference import TextGeneration
     from dew.inference.serving import Server
