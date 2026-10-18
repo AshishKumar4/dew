@@ -851,7 +851,9 @@ class _Build:
         elif self.training and not self.lowering.endless and drop:
             rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
         whole = rows
-        rows = rows[partition.index :: partition.count]
+        # A count of records that ends inside a batch, as a batch ramp saves, resumes past the rest
+        # of that batch's records; the batches after them are cut where the count's batch ends.
+        rows = rows[offset % batch_stage.size + partition.index :: partition.count]
         empty = not self.training and not len(rows) and bool(len(whole))
         if empty:
             rows = whole[:1]
