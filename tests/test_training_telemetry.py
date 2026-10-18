@@ -124,6 +124,25 @@ def test_each_checkpoint_follows_the_log_of_its_step(tmp_path):
         step: losses[step] for step in (2, 4, 6, 8)}
 
 
+def test_a_run_ending_between_logs_reports_its_last_interval():
+    """A run whose last step falls between logging steps logs that step as a logging step: three
+    steps at log_every=100 report step 3, and five at log_every=2 report steps 2, 4 and 5, each
+    with the loss, objective metrics and committed gradient norm the run sends at its logs."""
+    values = [1., 3., 2., 6., 1.]
+    every = RecordingTracker()
+    Trainer(Squared(), optax.sgd(.1), key=0, tracker=every).fit(targets(values), steps=5, log_every=1)
+    losses = {step: scalars['train/loss'] for step, scalars in every.scalars if 'train/loss' in scalars}
+    for steps, cadence, logged in ((3, 100, [3]), (5, 2, [2, 4, 5])):
+        sink = RecordingTracker()
+        trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
+        trainer.fit(targets(values), steps=steps, log_every=cadence)
+        rows = {step: scalars for step, scalars in sink.scalars if 'train/loss' in scalars}
+        assert sorted(rows) == logged
+        assert {step: row['train/loss'] for step, row in rows.items()} == pytest.approx(
+            {step: losses[step] for step in logged})
+        assert all({'train/probe', 'train/grad_norm'} <= row.keys() for row in rows.values())
+
+
 @pytest.mark.parametrize('cadence,expected', [
     (1, {2: 4., 4: 7.2, 6: 1.76}), (3, {3: 4., 6: 4.48}), (6, {6: 4.32}),
 ])
