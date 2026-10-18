@@ -1347,6 +1347,12 @@ def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast
         elif isinstance(node, ast.ClassDef):
             yield from _executed_in(_evaluated(node), scope)
             yield from _executed_in(node.body, node)
+        elif isinstance(node, ast.For) and isinstance(node.iter, ast.GeneratorExp):
+            # The loop consumes the generator it iterates as it goes round: the generator's body runs here.
+            yield node.iter, scope
+            yield from _executed_in([node.iter.generators[0].iter], scope)
+            yield from _executed_in(_comprehended(node.iter), node.iter)
+            yield from _executed_in([node.target, *node.body, *node.orelse], scope)
         elif isinstance(node, scopes.COMPREHENSIONS):
             # Its first iterable is evaluated where it stands; the rest runs in its own scope, where its
             # targets bind: at once for a list, a set or a dict, and only as it is consumed for a generator.
@@ -1363,46 +1369,76 @@ def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
         yield node
 
 
-def _loop_level(statements: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
-    """The statements of a loop's body that belong to that loop: through a branch, a `with`, a
-    `try` or a `match`, but not into a nested loop or a definition, whose exits are their own."""
+def _outcomes(statements: Sequence[ast.stmt]) -> frozenset[str]:
+    """How running `statements` can end, by Python's control flow: "next", off their end, or by a
+    "return", a "raise", or a "break" or "continue" of the loop they sit in. A branch, a `with`, a
+    `try` and a `match` end as any of their paths can, a nested loop keeps its own `break` and
+    `continue`, and a class's body runs where it is defined; a function's body runs only where it is
+    called. An exception a call raises is not read."""
+    ends: set[str] = set()
     for statement in statements:
-        yield statement
-        if isinstance(statement, ast.If | ast.With | ast.AsyncWith):
-            yield from _loop_level([*statement.body, *getattr(statement, "orelse", [])])
-        elif isinstance(statement, ast.Try | ast.TryStar):
-            yield from _loop_level([*statement.body, *statement.orelse, *statement.finalbody,
-                                    *(line for handler in statement.handlers for line in handler.body)])
-        elif isinstance(statement, ast.Match):
-            yield from _loop_level([line for case in statement.cases for line in case.body])
+        ending = _ending(statement)
+        ends |= ending - {"next"}
+        if "next" not in ending:
+            return frozenset(ends)
+    return frozenset({*ends, "next"})
 
 
-def _exits(statements: Sequence[ast.stmt], kinds: tuple[type, ...]) -> bool:
-    """Whether `statements` leave the loop they sit in by one of `kinds` (a `return` or `raise`
-    anywhere they run; a `break` only where it belongs to that loop)."""
-    loop_own = {id(node) for node in _loop_level(statements)}
-    return any(isinstance(node, kinds) and (not isinstance(node, ast.Break) or id(node) in loop_own)
-               for node in _executed(statements))
+_JUMPS = {ast.Return: "return", ast.Raise: "raise", ast.Break: "break", ast.Continue: "continue"}
+
+
+def _ending(statement: ast.stmt) -> frozenset[str]:
+    """How running one statement can end (`_outcomes`)."""
+    if type(statement) in _JUMPS:
+        return frozenset({_JUMPS[type(statement)]})
+    match statement:
+        case ast.If():
+            return _outcomes(statement.body) | _outcomes(statement.orelse)
+        case ast.With() | ast.AsyncWith() | ast.ClassDef():
+            return _outcomes(statement.body)
+        case ast.Try() | ast.TryStar():
+            done = _outcomes(statement.body)
+            if "next" in done:
+                done = done - {"next"} | _outcomes(statement.orelse)
+            done = done.union(*(_outcomes(handler.body) for handler in statement.handlers))
+            final = _outcomes(statement.finalbody)
+            return final if "next" not in final else done | final
+        case ast.Match():
+            done = frozenset[str]().union(*(_outcomes(case.body) for case in statement.cases))
+            irrefutable = any(case.guard is None and isinstance(case.pattern, ast.MatchAs)
+                              and case.pattern.pattern is None for case in statement.cases)
+            return done if irrefutable else done | {"next"}
+        case ast.For() | ast.AsyncFor() | ast.While():
+            body = _outcomes(statement.body)
+            forever = (isinstance(statement, ast.While) and isinstance(statement.test, ast.Constant)
+                       and bool(statement.test.value))
+            ran_out = frozenset[str]() if forever else _outcomes(statement.orelse)
+            return body - {"next", "break", "continue"} | ran_out | ({"next"} if "break" in body else set())
+    return frozenset({"next"})
 
 
 def _retrying(loop: ast.For | ast.While) -> bool:
-    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` (attempts, not
-    items), whose `try` leaves the loop where the work succeeds (inside it, or by an exit after it)
-    and goes round again where it fails: a handler that continues the loop, or that leaves by no
-    exit where nothing after the `try` leaves either."""
-    ranged = isinstance(loop, ast.For) and isinstance(loop.iter, ast.Call) and (
-        _named(loop.iter.func) == "range")
-    if isinstance(loop, ast.For) and not ranged:
-        return False
+    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose work reads
+    no number it counts (attempts, where reading it is a scan by index), whose `try` leaves the loop
+    where the work succeeds (inside it, or by an exit after it) and goes round again on some path
+    where it fails: a handler that continues the loop, or that runs off its end where nothing after
+    the `try` leaves (`_outcomes`)."""
+    counted: set[str] = set()
+    if isinstance(loop, ast.For):
+        if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range"):
+            return False
+        counted = {name.id for name in ast.walk(loop.target) if isinstance(name, ast.Name)}
     body = list(loop.body)
     for index, attempt in enumerate(body):
         if not isinstance(attempt, ast.Try | ast.TryStar):
             continue
-        after = _exits(body[index + 1:], (ast.Break, ast.Return))
-        succeeds = _exits([*attempt.body, *attempt.orelse], (ast.Break, ast.Return)) or after
-        again = any(any(isinstance(line, ast.Continue) for line in _loop_level(handler.body))
-                    or not (after or _exits(handler.body, (ast.Raise, ast.Break, ast.Return)))
-                    for handler in attempt.handlers)
+        work = [*attempt.body, *attempt.orelse]
+        if any(isinstance(node, ast.Name) and node.id in counted for node in _executed(work)):
+            continue
+        after = bool({"break", "return"} & _outcomes(body[index + 1:]))
+        succeeds = after or bool({"break", "return"} & _outcomes(work))
+        again = any("continue" in ends or ("next" in ends and not after)
+                    for ends in (_outcomes(handler.body) for handler in attempt.handlers))
         if succeeds and again:
             return True
     return False
@@ -1552,12 +1588,14 @@ def waits(module: Module) -> Iterator[Finding]:
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         external = None
-        # What a loop runs each time round: its body, and a `while`'s test, asked before each.
-        # What runs again and again: a loop's body and a `while`'s test, and an eager comprehension's body.
+        # What runs again and again: a loop's body, a `while`'s test and a generator a `for` consumes,
+        # and an eager comprehension's body.
         repeated: list[ast.AST] = []
         for node in _executed(function.body):
             if isinstance(node, ast.For | ast.While):
-                repeated += [*node.body, *([node.test] if isinstance(node, ast.While) else [])]
+                repeated += [*node.body, *([node.test] if isinstance(node, ast.While) else []),
+                             *(_comprehended(node.iter) if isinstance(node, ast.For)
+                               and isinstance(node.iter, ast.GeneratorExp) else [])]
             elif isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp):
                 repeated += _comprehended(node)
         looped = {id(inner) for inner in _executed(repeated)}
@@ -1583,15 +1621,15 @@ DETECTED = {"ImportError", "ModuleNotFoundError", "AttributeError"}
 
 def detections(module: Module) -> Iterator[Finding]:
     """SLOP019: a feature detected by the exception its absence raises: a handler of ImportError,
-    ModuleNotFoundError or AttributeError, by any name it is imported as, that carries on instead of
-    raising (a raise in a function it only defines does not count)."""
+    ModuleNotFoundError or AttributeError, by any name it is imported as, that carries on along any
+    path instead of raising (`_outcomes`: a raise in a function it only defines does not count)."""
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
             continue
         caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
         kinds = [scopes.resolved(kind, table) or _named(kind) for kind in caught]
         detected = any(kind.removeprefix("builtins.") in DETECTED for kind in kinds)
-        if detected and not any(isinstance(child, ast.Raise) for child in _executed(node.body)):
+        if detected and _outcomes(node.body) != {"raise"}:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP019",
                           f"detects a feature by `except {'/'.join(kinds)}`; require it, or ask for it by "
                           "the version that has it")
