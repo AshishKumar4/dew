@@ -1,7 +1,7 @@
-"""LoRA's rsLoRA scaling in training against PEFT 0.20.0's own forward and
-backward (`tools/lora_peft_reference.py`), and a target that contracts and
-produces several axes against a float64 oracle of its forward and its
-factors' gradient."""
+"""LoRA's rsLoRA scaling and its branch dropout in training against PEFT
+0.20.0's own forward and backward (`tools/lora_peft_reference.py`), and a
+target that contracts and produces several axes against a float64 oracle
+of its forward and its factors' gradient."""
 
 from pathlib import Path
 
@@ -27,37 +27,33 @@ def flat(arrays) -> np.ndarray:
     return np.concatenate([np.ravel(np.asarray(array, np.float64)) for array in arrays])
 
 
-def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
-    """PEFT's rsLoRA adapter on the tiny Llama, read by `LoRA.load` and trained
-    through the LM objective: each target scales by its own alpha over the
-    square root of its own rank (layer 1's v_proj at rank 2, down_proj at
-    alpha 3). The adapted logits, the mean next-token cross entropy and its
-    gradient in all twelve factors, exported in PEFT's layout, are held to
-    PEFT's float64 run by the float64 rule."""
-    with np.load(FIXTURES / "rslora" / "reference.npz") as data:
+STEP = Step(step=jnp.int32(0), key=jax.random.key(1), ema=None)
+"""The training step whose loss the fixtures' gradients are, and whose draw `dew_masks` reads."""
+
+
+def adapted(case: str):
+    """The case's PEFT adapter on the tiny Llama, read by `LoRA.load`, and its reference arrays."""
+    with np.load(FIXTURES / case / "reference.npz") as data:
         reference = {key: data[key] for key in data}
     decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    adapter = LoRA.load(decoder.model, decoder.variables, FIXTURES / "rslora" / "adapter",
-                        layouts=decoder.layouts)
-    variables = adapter.variables
-    assert (adapter.rslora, adapter.dropout) == (True, 0.0)
-    tokens = jnp.asarray(reference["input_ids"])
-    logits = adapter.model.apply(variables, tokens)
-    assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
-                                     "the adapted logits")
-    assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
+    return LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter",
+                     layouts=decoder.layouts), reference
 
-    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=variables, ema_decay=None)
+
+def assert_trains_as_peft(adapter, reference, tmp_path):
+    """One training step's mean next-token cross entropy, and its gradient in all twelve factors
+    exported in PEFT's layout (`Adapter.save`), held to PEFT's float64 run by the float64 rule."""
+    tokens = jnp.asarray(reference["input_ids"])
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
     params = objective.init(jax.random.key(0))
 
     def loss(moving):
-        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens},
-                                  Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens}, STEP)
         return objective.reduce_loss(stats)[0]
 
     value, gradient = jax.value_and_grad(loss)(params["params"])
     np.testing.assert_allclose(float(value), float(reference["loss_f64"]), rtol=1e-6)
-    adapter.save(merge(variables, {"params": gradient}), tmp_path)
+    adapter.save(merge(adapter.variables, {"params": gradient}), tmp_path)
     exported = {key.removeprefix(lora.PEFT_PREFIX): value
                 for key, value in load_file(tmp_path / lora.PEFT_WEIGHTS).items()}
     names = sorted(key.removeprefix("grad/") for key in reference
@@ -67,6 +63,36 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
                                      flat(reference[f"grad/{name}"] for name in names),
                                      flat(reference[f"grad/{name}_f64"] for name in names),
                                      "the factors' gradient")
+
+
+def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
+    """rsLoRA: each target scales by its own alpha over the square root of its
+    own rank (layer 1's v_proj at rank 2, down_proj at alpha 3). The adapted
+    logits, and one training step, are PEFT's (`assert_trains_as_peft`)."""
+    adapter, reference = adapted("rslora")
+    assert (adapter.rslora, adapter.dropout) == (True, 0.0)
+    logits = adapter.model.apply(adapter.variables, jnp.asarray(reference["input_ids"]))
+    assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
+                                     "the adapted logits")
+    assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
+    assert_trains_as_peft(adapter, reference, tmp_path)
+
+
+def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_it_draws(tmp_path):
+    """Dropout at 0.25: a training step drops each target's branch input,
+    `B A dropout(x)`, and not the base path. The masks this step draws are the
+    ones PEFT's run was given (`dew_masks`, masks.npz), so the step's loss and
+    gradients are PEFT's on the same draw (`assert_trains_as_peft`)."""
+    from tools.lora_peft_reference import MASKS, dew_masks
+
+    adapter, reference = adapted("dropout")
+    assert (adapter.rslora, adapter.dropout) == (False, 0.25)
+    drawn = dew_masks(adapter, reference["input_ids"])
+    with np.load(FIXTURES / "dropout" / MASKS) as given:
+        assert sorted(drawn) == sorted(given.files) and len(drawn) == 6
+        for name, mask in drawn.items():
+            np.testing.assert_array_equal(mask, given[name], err_msg=name)
+    assert_trains_as_peft(adapter, reference, tmp_path)
 
 
 class Host(nn.Module):
