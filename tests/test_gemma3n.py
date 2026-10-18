@@ -78,9 +78,9 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     `coef_clip`, two of them at 1e10. The reference clamps the stored
     prediction weight before its product, so the forward reads the clamped
     values and the gradient reaches every one of them, while the correction
-    clamps inside its product, which zeroes the clamped ones' gradient. The outputs and the gradients of all
-    five AltUp leaves are as exact as the reference's, both measured from the
-    reference in float64."""
+    clamps inside its product, which zeroes the clamped ones' gradient. The
+    outputs and the gradients of all five AltUp leaves are as exact as the
+    reference's, both measured from the reference in float64."""
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
