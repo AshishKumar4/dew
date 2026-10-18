@@ -328,6 +328,10 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
         Family("causal_transformer+mimo_v2_flash", "causal_transformer", DECODER_LM, 64,
                released("mimo-v2-flash-tiny")),
         Family("causal_transformer+ouro", "causal_transformer", DECODER_LM, 64, released("ouro-tiny")),
+        # NVIDIA's Dory: nGPT blocks, a looped block that reinjects its input, and the
+        # release's tokenizer at 56 ids.
+        Family("causal_transformer+dory", "causal_transformer", DECODER_LM | {TEXT}, 64,
+               released("dory-tiny")),
         # Kimi K2.5's language model; Dew reads no Kimi vision tower.
         Family("causal_transformer+kimi_k25", "causal_transformer", DECODER_LM, 256,
                released("kimi-k25-tiny")),

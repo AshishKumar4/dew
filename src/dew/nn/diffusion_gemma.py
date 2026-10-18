@@ -25,6 +25,7 @@ from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.dense import Dense
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
@@ -51,7 +52,7 @@ class SelfConditioning(nn.Module):
         self.post_norm = RMSNorm(
             epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
             name="post_norm")
-        dense = functools.partial(nn.Dense, use_bias=False,
+        dense = functools.partial(Dense, use_bias=False,
                                   dtype=self.dtype, precision=self.precision)
         self.gate_proj = dense(self.intermediate_size, name="gate_proj")
         self.up_proj = dense(self.intermediate_size, name="up_proj")

@@ -1018,6 +1018,32 @@ def test_a_release_whose_remote_tokenizer_renames_qwen2s_loads_as_qwen2s_without
     assert loaded.decode(loaded.encode(text)) == plain.decode(plain.encode(text))
 
 
+def test_a_tokenizer_whose_model_type_transformers_dispatches_without_remote_code_loads_without_it(tmp_path):
+    """InternLM2's release names a remote tokenizer class beside a model type transformers does not
+    register; transformers lists that type among those whose hub class it overrides
+    (MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS) and reads tokenizer.json without the code. The
+    type, read from config.json, reaches that dispatch through `load_tokenizer` as it does
+    through AutoTokenizer, and the tokenizer encodes as its tokenizer.json does."""
+    from tokenizers import Tokenizer
+    from transformers import AutoTokenizer
+
+    from dew.data.text import load_tokenizer
+
+    source = Path(__file__).parent / "fixtures" / "hf" / "dory-tiny"
+    released = tmp_path / "internlm2"
+    released.mkdir()
+    shutil.copy(source / "tokenizer.json", released / "tokenizer.json")
+    remote = {"AutoTokenizer": ["tokenization_internlm2.InternLM2Tokenizer", None]}
+    (released / "tokenizer_config.json").write_text(json.dumps(
+        {"tokenizer_class": "InternLM2Tokenizer", "auto_map": remote}))
+    (released / "config.json").write_text(json.dumps(
+        {"model_type": "internlm2", "architectures": ["InternLM2ForCausalLM"]}))
+    text = "charged twice, site 500!"
+    expected = Tokenizer.from_file(str(released / "tokenizer.json")).encode(text).ids
+    assert AutoTokenizer.from_pretrained(str(released), local_files_only=True).encode(text) == expected
+    assert load_tokenizer(str(released), local_files_only=True).encode(text) == expected
+
+
 def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):
     """Each host of a pool reads its own copy of a token corpus, mounted where it was put: the
     copies' readers agree on what they read, and a copy that holds other tokens does not."""

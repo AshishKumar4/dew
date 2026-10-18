@@ -10,9 +10,9 @@
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
-# Dew's own FlashAttention wheels resolve as they stood when 0.3.3 was published, past the pins the
+# Dew's own FlashAttention wheels resolve as they stood when 0.3.4 was published, past the pins the
 # locks hold (-P); nothing else moves.
-FLASH=2026-10-16T06:32:42Z
+FLASH=2026-10-17T18:46:06Z
 lock() {
   name=$1
   shift

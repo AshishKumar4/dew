@@ -17,6 +17,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
+from dew.nn.dense import Dense
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
@@ -61,7 +62,7 @@ class Gemma3nProjectorModule(nn.Module):
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, dtype=self.dtype)
         self.hard_embedding_norm = norm(name="hard_embedding_norm")
         self.soft_embedding_norm = norm(name="soft_embedding_norm")
-        self.embedding_projection = nn.Dense(self.text_width, use_bias=False,
+        self.embedding_projection = Dense(self.text_width, use_bias=False,
                                               dtype=self.dtype, precision=self.precision,
                                               name="embedding_projection")
         self.embedding_post_projection_norm = norm(with_scale=False,

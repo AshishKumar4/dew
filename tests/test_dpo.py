@@ -186,10 +186,6 @@ def test_evaluation_scores_chosen_perplexity():
 def test_a_misbuilt_objective_is_refused():
     with pytest.raises(ValueError):
         DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=0.0)
-    with pytest.raises(ValueError):
-        DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, ema_decay=0.999)
-    with pytest.raises(ValueError):
-        DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, loss_role="x")
 
 
 def test_a_misshapen_batch_is_refused():

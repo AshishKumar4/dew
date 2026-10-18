@@ -18,6 +18,7 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
+from dew.nn.dense import Dense
 from dew.nn.text_encoders import (
     TOWER_ACTIVATIONS,
     _encoder_layer_path,
@@ -136,7 +137,7 @@ class GemmaProjectorModule(nn.Module):
         self.mm_soft_emb_norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=True, dtype=self.dtype,
             name="mm_soft_emb_norm")
-        self.mm_input_projection = nn.Dense(
+        self.mm_input_projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="mm_input_projection")
 

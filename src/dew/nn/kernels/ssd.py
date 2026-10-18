@@ -13,7 +13,9 @@ sums and Gram matrix and its `[P, N]` state through HBM; the kernel keeps
 them in one program and writes only `y`, the final state and, for a
 gradient, each chunk's entering state. Mosaic's grid is ordered and a
 revisited window survives a step, so `grid=(batch, heads, chunks)` runs the
-chunk innermost with the state in the shared output window.
+chunk innermost with the state in the shared output window. It takes the
+operands as the XLA scan does, `[B, T, H, ...]` (`ssd_chunk_scan`); the
+heads go ahead of the time inside it, the one layout Mosaic blocks.
 
 The backward is the hand-written reverse recurrence, `dS_n = exp(acs_C-1)
 dS_n+1 + dy^T (C exp(acs))`, since autodiff would keep every chunk's
@@ -218,15 +220,15 @@ def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref,
 def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
            reverse: bool = False):
     """The block specs of the arrays a chunk reads or writes, in the kernel's
-    own layout: `[B, H, NC, C, P]` for `x` and `y`, `[B, H, NC, C, N]` for `b`
-    and `c`, `[B, H, NC, 1, C]` for `a`, `[B, H, NC, P, N]` for the state each
-    chunk entered, and `[B, H, P, N]` for the state crossing the sequence.
-    Returned in that order.
+    own layout: `[B, H, T, P]` for `x` and `y`, `[B, H, T, N]` for `b` and
+    `c`, each chunk `chunk_size` steps of the time, `[B, H, NC, 1, C]` for
+    `a`, `[B, H, NC, P, N]` for the state each chunk entered, and
+    `[B, H, P, N]` for the state crossing the sequence. Returned in that order.
 
     Mosaic blocks the last two dimensions or nothing, which is what puts the
-    heads ahead of the chunks here rather than in the layout `chunk_ssd`
-    builds. A program holds one chunk and the grid counts them, backwards
-    when `reverse`.
+    heads ahead of the time here (`_heads_first`), and `a`'s chunk in a
+    dimension of its own. A program holds one chunk and the grid counts them,
+    backwards when `reverse`.
     """
     def position(grid: tuple[int, ...]) -> tuple[int, int, int]:
         return grid[0], grid[1], chunks - 1 - grid[2] if reverse else grid[2]
@@ -236,6 +238,10 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
         # int traces as int64, and Mosaic cannot return one from an index map.
         return tuple(jnp.asarray(value, jnp.int32) for value in values)
 
+    def over_time(*grid):
+        batch, head, chunk = position(grid)
+        return indices(batch, head, chunk, 0)
+
     def over_chunk(*grid):
         batch, head, chunk = position(grid)
         return indices(batch, head, chunk, 0, 0)
@@ -244,30 +250,32 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
         batch, head, _ = position(grid)
         return indices(batch, head, 0, 0)
 
-    return (pl.BlockSpec((None, None, None, chunk_size, head_dim), over_chunk),
-            pl.BlockSpec((None, None, None, chunk_size, state_size), over_chunk),
-            pl.BlockSpec((None, None, None, chunk_size, state_size), over_chunk),
+    return (pl.BlockSpec((None, None, chunk_size, head_dim), over_time),
+            pl.BlockSpec((None, None, chunk_size, state_size), over_time),
+            pl.BlockSpec((None, None, chunk_size, state_size), over_time),
             pl.BlockSpec((None, None, None, None, chunk_size), over_chunk),
             pl.BlockSpec((None, None, None, head_dim, state_size), over_chunk),
             pl.BlockSpec((None, None, head_dim, state_size), over_carry))
 
 
-def _heads_first(blocked):
-    """`[NC, B, C, H, W] -> [B, H, NC, C, W]`, the layout Mosaic can block."""
-    return jnp.transpose(blocked, (1, 3, 0, 2, 4))
+def _heads_first(t):
+    """`[B, T, H, ...] <-> [B, H, T, ...]`, the layout Mosaic can block."""
+    return jnp.swapaxes(t, 1, 2)
 
 
-def _chunks_first(blocked):
-    """`[B, H, NC, C, W] -> [NC, B, C, H, W]`, back to what `chunk_ssd` holds."""
-    return jnp.transpose(blocked, (2, 0, 3, 1, 4))
+def _decay_blocks(a, chunk_size: int):
+    """`a` `[B, T, H]` as `[B, H, NC, 1, C]`, a chunk in each of its last two dimensions."""
+    batch, total, heads = a.shape
+    return _heads_first(a).reshape(batch, heads, total // chunk_size, 1, chunk_size)
 
 
 def _interpreting(platform: str) -> bool:
-    """Whether pallas has to run its own interpreter instead of a kernel: it
-    compiles for a device, so a process holding none of that platform can only
-    interpret. That is how CPU reads the kernel's numbers, and it is what lets
-    a test name a backend it has no device for."""
-    return all(device.platform != platform for device in jax.devices())
+    """Whether pallas runs its own interpreter instead of a Mosaic kernel:
+    wherever the call's code is chosen for another platform than the kernel's
+    (`generation.backend`). That is how CPU reads the kernel's numbers, while a
+    step traced for an assumed TPU (`generation.assumed`) lowers the kernel
+    itself on any host."""
+    return generation.backend() != platform
 
 
 def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
@@ -278,16 +286,15 @@ def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_s
                           interpret=_interpreting(platform))
 
 
-def _forward(x_c, b_c, c_c, a_c, state, platform: str, *, keep_entered: bool):
-    """The forward kernel. Operands arrive in `chunk_ssd`'s layout and the
-    output leaves in it; `keep_entered` also returns the state every chunk
+def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered: bool):
+    """The forward kernel. Operands arrive as `ssd_chunk_scan` takes them and
+    the output leaves so; `keep_entered` also returns the state every chunk
     entered with, which is the residual the backward pass reads."""
-    chunks, batch, chunk_size, heads, head_dim = x_c.shape
-    state_size = b_c.shape[-1]
+    batch, total, heads, head_dim = x.shape
+    chunks, state_size = total // chunk_size, b.shape[-1]
     x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(
         chunks, chunk_size, head_dim, state_size)
-    laid_out = (batch, heads, chunks, chunk_size, head_dim)
-    out_shape = [jax.ShapeDtypeStruct(laid_out, jnp.float32),
+    out_shape = [jax.ShapeDtypeStruct((batch, heads, total, head_dim), jnp.float32),
                  jax.ShapeDtypeStruct(state.shape, jnp.float32)]
     out_specs = [x_spec, carry_spec]
     if keep_entered:
@@ -296,59 +303,57 @@ def _forward(x_c, b_c, c_c, a_c, state, platform: str, *, keep_entered: bool):
         out_specs.append(entered_spec)
     run = _call(_tpu_forward, platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_specs, out_shape)
-    y, final, *entered = run(_heads_first(x_c), _heads_first(b_c), _heads_first(c_c),
-                             jnp.transpose(a_c, (1, 2, 0, 3))[:, :, :, None, :], state)
-    return (_chunks_first(y), final, *entered)
+    y, final, *entered = run(_heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size),
+                             state)
+    return (_heads_first(y), final, *entered)
 
 
-def _backward(x_c, b_c, c_c, a_c, entered, dy, dfinal, platform: str):
+def _backward(x, b, c, a, entered, dy, dfinal, chunk_size: int, platform: str):
     """The backward kernel, one reverse pass over the same blocks."""
-    chunks, batch, chunk_size, heads, head_dim = x_c.shape
-    state_size = b_c.shape[-1]
+    batch, total, heads, head_dim = x.shape
+    chunks, state_size = total // chunk_size, b.shape[-1]
     x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(
         chunks, chunk_size, head_dim, state_size, reverse=True)
     widths = (head_dim, state_size, state_size)
-    out_shape = [jax.ShapeDtypeStruct((batch, heads, chunks, chunk_size, width), jnp.float32)
-                 for width in widths]
+    out_shape = [jax.ShapeDtypeStruct((batch, heads, total, width), jnp.float32) for width in widths]
     out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, 1, chunk_size), jnp.float32))
     out_shape.append(jax.ShapeDtypeStruct(dfinal.shape, jnp.float32))
     run = _call(_tpu_backward, platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, entered_spec, x_spec, carry_spec),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_shape)
-    dx, db, dc, da, dstate = run(
-        _heads_first(x_c), _heads_first(b_c), _heads_first(c_c),
-        jnp.transpose(a_c, (1, 2, 0, 3))[:, :, :, None, :], entered, _heads_first(dy), dfinal)
-    return (_chunks_first(dx), _chunks_first(db), _chunks_first(dc),
-            jnp.transpose(da[:, :, :, 0, :], (2, 0, 1, 3)), dstate)
+    dx, db, dc, da, dstate = run(_heads_first(x), _heads_first(b), _heads_first(c),
+                                 _decay_blocks(a, chunk_size), entered, _heads_first(dy), dfinal)
+    return (_heads_first(dx), _heads_first(db), _heads_first(dc),
+            _heads_first(da.reshape(batch, heads, total)), dstate)
 
 
-def _ssd_scan(x_c, b_c, c_c, a_c, state, platform: str) -> tuple[jax.Array, jax.Array]:
+def _ssd_scan(x, b, c, a, state, chunk_size: int, platform: str) -> tuple[jax.Array, jax.Array]:
     """Run the chunked SSD scan on the Pallas kernel for `platform`.
 
-    Operands arrive in `chunk_ssd`'s layout, all fp32: `x_c`
-    `[NC, B, C, H, P]` already scaled by `dt`, `b_c` and `c_c`
-    `[NC, B, C, H, N]` with the groups expanded, `a_c` `[NC, B, H, C]` the
-    per-step `A dt`, `state` `[B, H, P, N]` entering the sequence. Returns
-    the output in `x_c`'s layout and the final state, the same pair
+    Operands arrive as `xla_chunk_scan` takes them, all fp32: `x`
+    `[B, T, H, P]` already scaled by `dt`, `b` and `c` `[B, T, H, N]` with the
+    groups expanded, `a` `[B, T, H]` the per-step `A dt`, the length whole
+    chunks of `chunk_size`, `state` `[B, H, P, N]` entering the sequence.
+    Returns the output `[B, T, H, P]` and the final state, the same pair
     `xla_chunk_scan` returns.
     """
-    y, final = _forward(x_c, b_c, c_c, a_c, state, platform, keep_entered=False)
+    y, final = _forward(x, b, c, a, state, chunk_size, platform, keep_entered=False)
     return y, final
 
 
-def _ssd_fwd(x_c, b_c, c_c, a_c, state, platform: str):
-    y, final, entered = _forward(x_c, b_c, c_c, a_c, state, platform, keep_entered=True)
-    return (y, final), (x_c, b_c, c_c, a_c, entered)
+def _ssd_fwd(x, b, c, a, state, chunk_size: int, platform: str):
+    y, final, entered = _forward(x, b, c, a, state, chunk_size, platform, keep_entered=True)
+    return (y, final), (x, b, c, a, entered)
 
 
-def _ssd_bwd(platform: str, residual, cotangent):
-    x_c, b_c, c_c, a_c, entered = residual
+def _ssd_bwd(chunk_size: int, platform: str, residual, cotangent):
+    x, b, c, a, entered = residual
     dy, dfinal = cotangent
-    return _backward(x_c, b_c, c_c, a_c, entered, dy, dfinal, platform)
+    return _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform)
 
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
 # decorator loses that binding, so it is built by hand, as chunked_cross_entropy's
 # `_bounded_head` is.
-ssd_chunk_scan = jax.custom_vjp(_ssd_scan, nondiff_argnums=(5,))
+ssd_chunk_scan = jax.custom_vjp(_ssd_scan, nondiff_argnums=(5, 6))
 ssd_chunk_scan.defvjp(_ssd_fwd, _ssd_bwd)

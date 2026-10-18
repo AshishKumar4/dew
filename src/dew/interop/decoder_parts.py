@@ -657,6 +657,15 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
+def context_lengths(hf_config: Mapping[str, object]) -> tuple[int, int | None]:
+    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
+    `DEFAULT_MAX_SEQ_LEN`, and the stated context (`max_position_embeddings`, its `context_length`),
+    None where the config states none."""
+    stated = hf_config.get('max_position_embeddings')
+    context = None if stated is None else records.integer(stated, 'max_position_embeddings')
+    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
+
+
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  layer_types: tuple[str, ...] | None = None,
                  rope: Ropes | None = None,
@@ -712,6 +721,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                       if 'sliding_attention' in layer_types else None)
 
     kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
+    capacity, context = context_lengths(hf_config)
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=records.integer(hf_config['vocab_size'], 'vocab_size'),
         emb_features=hidden,
@@ -721,9 +731,8 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         head_dim=head_dim,
         mlp=mapped,
         mlp_features=_mlp_features(hf_config),
-        max_seq_len=min(records.integer(hf_config.get('max_position_embeddings',
-                                             DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-                           DEFAULT_MAX_SEQ_LEN),
+        max_seq_len=capacity,
+        context_length=context,
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
@@ -1091,7 +1100,7 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
     if module in _PROJECTIONS and len(parts) == 6:
         sublayer = parts[4]
         if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
-            # torch Linear holds [out, in]; nn.Dense keeps [in, out]
+            # torch Linear holds [out, in]; Dense keeps [in, out]
             return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
         if module == 'self_attn' and sublayer in _HEAD_NORMS and leaf == 'weight':
             return (module, sublayer, 'scale')
