@@ -2,9 +2,12 @@
 (transformers 5.16.1 `models/gemma4/modeling_gemma4.py`).
 """
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -13,7 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import translate_parameters
+from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.inputs import AttentionMetadata, coordinates
@@ -35,6 +38,9 @@ from .common import (
     rope_base,
     trunk_geometry,
 )
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 
 def clipped_linear(module: nn.Module, linear: Callable[[jax.Array], jax.Array], inputs: jax.Array,
@@ -87,7 +93,7 @@ class Gemma4VisionTransformer(nn.Module):
     the checkpoint stores (`Gemma4ClippableLinear`).
     """
 
-    config: "Gemma4Vision"
+    config: Gemma4Vision
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -304,15 +310,15 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
 
 def translate_gemma4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """A Gemma 4 embedder's map into its parameter tree.
+) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """A Gemma 4 embedder's map into its parameter tree, with the layouts that write it back.
 
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
     if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return translate_parameters(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
+    return placed(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:

@@ -1,6 +1,7 @@
 """Checkpoint precision, native tensor layouts and reversible source names."""
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
@@ -178,10 +179,30 @@ def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
 
     Repeated paths compare at their storage precision.
     """
+    return placed(tensors, path_of, param_dtype)[0]
+
+
+def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str = "float32"
+           ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """`translate_parameters`' tree, with the layout that writes each tensor it placed back
+    under its own name from its path in that tree; a tensor `path_of` leaves out has none."""
+    from dew.interop.streaming import WeightLayout
+
     parameters: ParamTree = {}
-    for name, path, leaf, _ in _leaves(tensors, path_of, param_dtype, _copy):
+    layouts = []
+    for name, path, leaf, transpose in _leaves(tensors, path_of, param_dtype, _copy):
         insert(parameters, path, leaf, name)
-    return parameters
+        layouts.append(WeightLayout(name, (path,), tuple(np.shape(tensors[name])), transpose))
+    return parameters, tuple(layouts)
+
+
+def nested(layouts: tuple[WeightLayout, ...], depth: int, *keys: str) -> tuple[WeightLayout, ...]:
+    """`layouts` read from a tree that holds theirs under `keys`, after the first `depth` keys
+    of each path: a component's `params` in its variables, or a component inside its model's
+    collections."""
+    return tuple(dataclasses.replace(layout, paths=tuple((*path[:depth], *keys, *path[depth:])
+                                                          for path in layout.paths))
+                 for layout in layouts)
 
 
 def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,

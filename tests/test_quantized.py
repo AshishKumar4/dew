@@ -177,18 +177,19 @@ def expanded(scale_inv, shape, block):
     return grid[:shape[0], :shape[1]]
 
 
-def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
+@pytest.mark.parametrize("block", [(16, 16), (1, 16), (8, 16)], ids=["square", "row", "rectangle"])
+def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
     """The tiny DeepSeek fixture re-shipped the way the real one is: the
-    config names the block, two projections are fp8 with `weight_scale_inv`
-    partners (one of them with a partial block), everything else is as it
-    was. `Pretrained.load` lands the dequantized weight, transposed
-    as every kernel is, and the untouched tensors bit for bit."""
+    config names the block, square as DeepSeek's or any rectangle
+    transformers' FineGrainedFP8Config allows, two projections are fp8 with
+    `weight_scale_inv` partners (one of them with a partial block),
+    everything else is as it was. `Pretrained.load` lands the dequantized
+    weight, transposed as every kernel is, and the untouched tensors bit for bit."""
     from dew.interop.safetensors_io import read_file
     directory = tmp_path / "fp8"
     shutil.copytree(FIXTURE, directory)
-    block = 16
     config = json.loads((directory / "config.json").read_text())
-    config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": [block, block]}
+    config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": list(block)}
     (directory / "config.json").write_text(json.dumps(config))
     tensors, _ = read_file(directory / "model.safetensors")
     quantized = ("model.layers.0.mlp.up_proj.weight",        # [48, 32]: 3 x 2 blocks

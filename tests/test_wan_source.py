@@ -37,7 +37,7 @@ from interop_support import assert_layout_tensors, extract_fixture, fixture_arra
 from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
-from dew.interop.diffusion import component_tensors, translate_wan_weights, wan_fields
+from dew.interop.diffusion import component_tensors, read_transformer, wan_fields, wan_path
 from dew.nn.backbones.wan import WanTransformer
 from dew.objectives.diffusion import DiffusionObjective
 
@@ -64,7 +64,7 @@ def channels_last(value):
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = WanTransformer(**wan_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = translate_wan_weights(component_tensors(source / name, "transformer"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), wan_path)
     return model, params, layouts
 
 
@@ -126,7 +126,7 @@ def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(source, arrays, name
     in bfloat16 land ten to twenty times further."""
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = WanTransformer(**wan_fields(config, dtype="bfloat16", attention_impl="xla"))
-    params, _ = translate_wan_weights(component_tensors(source / name, "transformer"))
+    params, _ = read_transformer(component_tensors(source / name, "transformer"), wan_path)
     latents = jnp.asarray(channels_last(arrays[f"{name}.latents"]), jnp.bfloat16)
     context = DenoisingCondition(jnp.asarray(arrays[f"{name}.context"], jnp.bfloat16))
     flow = model.apply({"params": params}, latents, jnp.asarray(arrays[f"{name}.times"]), context)
