@@ -48,7 +48,7 @@ from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import biased_logits, capped_logits, head_product
+from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -108,17 +108,18 @@ __all__ = [
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
-    otherwise, an optional fp32 `[vocab]` `bias` added after the product,
-    the `softcap` applied last, and the `precision` the product runs at.
-    `compute`, the model's compute dtype, decides the product's operands
+    otherwise, an optional fp32 `[vocab]` `scale` multiplying the product
+    (nGPT's per-token logit gain) and `bias` added after it, the `softcap`
+    applied last, and the `precision` the product runs at. `compute`, the
+    model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
     quantization does.
 
     Contracting the model's final states with it (`logits`) reproduces the
-    model's own logits, bias, softcap and any adapter on the head included.
-    Where no matrix does, `output_table` returns None, and the logits come
-    from `logits_from_hidden` or `logits` instead.
+    model's own logits, scale, bias, softcap and any adapter on the head
+    included. Where no matrix does, `output_table` returns None, and the
+    logits come from `logits_from_hidden` or `logits` instead.
     """
 
     matrix: jax.Array
@@ -128,6 +129,7 @@ class OutputTable:
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
+    scale: jax.Array | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
         """`hidden` as the product reads it: through the input quantizer's QDQ."""
@@ -135,12 +137,20 @@ class OutputTable:
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
         """`hidden`'s `[..., vocab]` logits, at least fp32: the states through
-        the input quantizer, the product (`head_product`), the bias, the
-        softcap, then `temperature`, which a sampler applies to the head's
-        logits."""
+        the input quantizer, the product (`head_product`), the scale and the
+        bias (`scaled_logits`), the softcap, then `temperature`, which a
+        sampler applies to the head's logits."""
         logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
-        return capped_logits(biased_logits(logits, self.bias), self.softcap, temperature)
+        return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
+
+    def rows(self) -> jax.Array:
+        """Each vocabulary token's `[vocab, features]` row: the matrix's, times
+        the token's scale, whose dot product with a state is the token's logit
+        before its bias and softcap, in the wider of the two dtypes. A reader
+        of tokens' vectors (a decision head's lexical prior) takes these."""
+        rows = self.matrix if self.vocab_major else self.matrix.T
+        return rows if self.scale is None else rows * self.scale[:, None]
 
 
 @runtime_checkable
