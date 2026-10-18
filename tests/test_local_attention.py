@@ -195,6 +195,37 @@ def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens(
                                      "holey row")
 
 
+@pytest.mark.parametrize("window", [2, 8], ids=["banded", "dense"])
+def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
+    """A window spans tokens, as the cache counts them: a row whose six tokens
+    sit among padding attends as the six tokens alone do, as near the float64
+    truth of the row alone as the row alone's float32 run, through the band
+    (a window of 2 over 16 slots) and the dense call (a window of 8), and its
+    cached prefill computes what its whole pass does. A window counted in
+    slots let the last token of slots 0, 3 and 6 see itself alone."""
+    model = CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=24, layer_types=("sliding_attention", "full_attention"),
+        kinds={"sliding_attention": {"window": window}}, attention_impl="xla")
+    real = jax.random.randint(jax.random.key(1), (1, 6), 0, 64)
+    slots = jnp.asarray([0, 3, 6, 7, 11, 15])
+    tokens = jnp.zeros((1, 16), jnp.int32).at[:, slots].set(real)
+    valid = jnp.zeros((1, 16), bool).at[:, slots].set(True)
+    variables = model.init(jax.random.key(0), tokens)
+    holey = model.apply(variables, tokens, attention_mask=valid)
+    alone = model.apply(variables, real)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = model.clone(dtype=jnp.float64).apply(wide, real)
+    assert_as_exact_as_the_reference(np.asarray(holey[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "holey row")
+    cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
+    prefilled, _ = model.apply({**variables, "cache": cache}, tokens, attention_mask=valid, decode=True,
+                               mutable=["cache"])
+    assert_as_exact_as_the_reference(np.asarray(prefilled[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "cached prefill")
+
+
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):

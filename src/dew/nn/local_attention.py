@@ -66,9 +66,10 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     Chunks that start at row multiples fold into the batch. Everything else
     runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
-    pads to whole spans, so at most two spans take the dense call. A chunk
-    over a row with padding among its tokens runs on the real tokens alone
-    (`_compacted`), so its keys stay within the band.
+    pads to whole spans, so at most two spans take the dense call. A row with
+    padding among its tokens runs on its real tokens alone (`_compacted`): a
+    window and a chunk count tokens, as the cache and `Coordinates.places`
+    do, and a chunk's keys stay within the band.
     """
     if (window is None) == (chunk is None):
         raise ValueError("local attention takes exactly one of window and chunk")
@@ -81,9 +82,10 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
-    if chunk is not None and valid is not None and not right_padded:
+    if valid is not None and not right_padded:
         return _compacted(
-            functools.partial(local_attention, chunk=chunk, max_segments=max_segments, right_padded=True,
+            functools.partial(local_attention, window=window, chunk=chunk, max_segments=max_segments,
+                              right_padded=True,
                               dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
                               implementation=implementation, sinks=sinks, softcap=softcap),
             query, key, value, positions, segment_ids, valid)
@@ -155,11 +157,12 @@ def _compacted(attend, query, key, value, positions, segment_ids, valid):
     """`attend` over each row's real tokens moved to its front in order, their
     places and documents with them, and its outputs moved back to their slots.
 
-    A chunk spans `chunk` places, and padding among a row's tokens spreads
-    them over more slots than the band before a query holds: real slots 0, 3,
-    6 and 9 at places 0 to 3 are one chunk of 4 the band of slot 9 reads only
-    from slot 4 on. Compacted, a chunk's real tokens sit within `chunk`
-    consecutive slots. The places stay those given, the row index where none
+    A window spans `window` tokens and a chunk `chunk` places, and padding
+    among a row's tokens spreads them over more slots: real slots 0, 3, 6 and
+    9 at places 0 to 3 are one chunk of 4 the band of slot 9 reads only from
+    slot 4 on, and a window of 2 at slot 9 reads slot 6 though no slot
+    between holds a token. Compacted, a window's or a chunk's real tokens sit
+    within that many consecutive slots. The places stay those given, the row index where none
     are; the padding's outputs come back unspecified."""
     batch, length = valid.shape
     real = jnp.asarray(valid, bool)
