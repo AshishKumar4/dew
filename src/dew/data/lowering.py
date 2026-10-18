@@ -37,7 +37,6 @@ from dew.data.analysis import (
     _Lowering,
     _name,
     _until,
-    _written,
 )
 from dew.data.dataset import (
     SHARED_BYTES,
@@ -534,11 +533,13 @@ class _Build:
 
     def stage_seed(self, pipeline: Pipeline, at: int) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
-        place in its mixtures and the stage's place among the stages its corpus wrote, those a memory
-        read ran included. Grain's default seed counts the datasets between a step and the nearest
-        seeded one instead, which a memory read and the wrappers a read adds change."""
-        written = len(_written(pipeline.source, ())) + at
-        return int(np.random.SeedSequence((self.seed, *self.corpus, written)).generate_state(1, np.uint32)[0])
+        place in its mixtures and how many random stages its corpus wrote before this one. No stage
+        a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
+        the steps a memory read runs over the whole source), so this count is the same in every
+        read. Grain's default seed counts the datasets between a step and the nearest seeded one
+        instead, which those reads and the wrappers a read adds change."""
+        drawn = sum(isinstance(stage, RandomMap) for stage in pipeline.stages[:at])
+        return int(np.random.SeedSequence((self.seed, *self.corpus, drawn)).generate_state(1, np.uint32)[0])
 
     def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
         source = pipeline.source

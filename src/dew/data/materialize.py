@@ -305,9 +305,6 @@ def _memory_mixture(
         raise ValueError(
             f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets"
         )
-    if len(kept) == 1:
-        child = kept[0][0]
-        return dataclasses.replace(child, stages=(*child.stages, *pipeline.stages))
     children, weights = zip(*kept, strict=True)
     return dataclasses.replace(
         pipeline, source=dataclasses.replace(mixture, pipelines=tuple(children), weights=tuple(weights))
