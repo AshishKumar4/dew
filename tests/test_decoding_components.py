@@ -13,6 +13,7 @@ v0.30.0), run as published by tools/vllm_penalty_reference.py.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -237,6 +238,11 @@ def test_bad_words_ban_sequences_and_keep_the_eos_reachable():
            NoBadWordsLogitsProcessor(words, eos_token_id=torch.tensor([4])), prompts, drawn)
 
 
+def test_empty_sequence_bias_leaves_every_logit_unchanged():
+    state, logits = rows(PROMPTS, DRAWN), logits_of(len(PROMPTS))
+    np.testing.assert_array_equal(applied(decoding.sequence_bias([]), state, logits), logits)
+
+
 @pytest.mark.parametrize("length", [4, 8])
 def test_min_length_counts_the_whole_unpadded_sequence(length):
     agrees(decoding.MinLength(length, jnp.asarray([2, 6], jnp.int32)),
@@ -378,7 +384,27 @@ def stop_string_tokenizer(tmp_path):
     return AutoTokenizer.from_pretrained(tmp_path / "stops", local_files_only=True)
 
 
-def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path):
+class PublicVocabulary:
+    """A tokenizer exposing only the public vocabulary operations the stop compiler reads."""
+
+    def __init__(self, source):
+        self.source = source
+
+    def get_vocab(self):
+        return self.source.get_vocab()
+
+    def convert_tokens_to_string(self, tokens):
+        return self.source.convert_tokens_to_string(tokens)
+
+    def convert_ids_to_tokens(self, index):
+        return self.source.convert_ids_to_tokens(index)
+
+    def __call__(self, text, *, add_special_tokens):
+        return self.source(text, add_special_tokens=add_special_tokens)
+
+
+@pytest.mark.parametrize("surface", ["tokenizer", "wrapped", "public"])
+def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path, surface):
     """Both sides read the same vocabulary. Overhangs on either end, strings
     spelled across several tokens and several stop strings at once all have to
     agree, and a string finished before the last token must not stop the row.
@@ -388,7 +414,13 @@ def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path):
     tokenizer = stop_string_tokenizer(tmp_path)
     size = len(tokenizer)
     strings = ["stop", "operation"]
-    native = decoding.stop_strings(tokenizer, strings, size)
+    source = tokenizer
+    if surface == "wrapped":
+        source = SimpleNamespace(reference=SimpleNamespace(tokenizer=SimpleNamespace(
+            reference=SimpleNamespace(tokenizer=tokenizer))))
+    elif surface == "public":
+        source = PublicVocabulary(tokenizer)
+    native = decoding.stop_strings(source, strings, size)
     oracle = StopStringCriteria(tokenizer, strings)
     checked = jax.jit(decoding.criterion((native,)))
 
@@ -410,6 +442,14 @@ def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path):
         got = bool(checked(state, jnp.asarray([row[-1]], jnp.int32))[0])
         want = bool(oracle(torch.tensor([row], dtype=torch.long), None)[0])
         assert got == want, (tokenizer.convert_ids_to_tokens(row), got, want)
+
+
+def test_stop_strings_refuse_a_cycle_of_tokenizer_wrappers():
+    first = SimpleNamespace()
+    second = SimpleNamespace(tokenizer=first)
+    first.reference = second
+    with pytest.raises(TypeError):
+        decoding.stop_strings(first, "stop")
 
 
 def test_stop_strings_refuse_a_vocabulary_that_cannot_spell_them(tmp_path):

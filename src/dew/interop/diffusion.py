@@ -6,7 +6,7 @@ scheduler implementation is imported by this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -483,7 +483,7 @@ _FLUX2_EMBEDDERS = {
 }
 
 
-def _flux2_path(name: str) -> tuple[str, ...]:
+def flux2_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `Flux2Transformer` path for a published FLUX.2 tensor name."""
     parts = name.split(".")
     leaf, stem = parts[-1], ".".join(parts[:-1])
@@ -506,15 +506,6 @@ def _flux2_path(name: str) -> tuple[str, ...]:
             if rest[1] in ("norm_q", "norm_k") and leaf == "weight":
                 return (*block, rest[1], "scale")
     raise ValueError(f"unknown tensor name {name!r}")
-
-
-def translate_flux2_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
-                            lazy: bool = False
-                            ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map FLUX.2 tensors into a parameter tree and the layouts that invert
-    it; its rotary tables are computed from ids, so it stores no buffer."""
-    return weights.record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype,
-                          lazy=lazy)
 
 
 def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -570,7 +561,7 @@ _Z_IMAGE_BLOCK = {
 }
 
 
-def _z_image_path(name: str, ndim: int) -> tuple[str, ...]:
+def z_image_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `ZImageTransformer` path for a published Z-Image tensor
     name; a one-axis weight is a norm's scale."""
     if name in ("x_pad_token", "cap_pad_token"):
@@ -579,7 +570,7 @@ def _z_image_path(name: str, ndim: int) -> tuple[str, ...]:
         return ("cap_norm", "scale")
     stem, _, leaf = name.rpartition(".")
     if leaf == "weight":
-        leaf = "kernel" if ndim == 2 else "scale"
+        leaf = "kernel" if rank == 2 else "scale"
     elif leaf != "bias":
         raise ValueError(f"unknown tensor name {name!r}")
     if stem in _Z_IMAGE_MODULES:
@@ -593,16 +584,6 @@ def _z_image_path(name: str, ndim: int) -> tuple[str, ...]:
     ):
         return (f"{stack}_{index}", *_Z_IMAGE_BLOCK[inner], leaf)
     raise ValueError(f"unknown tensor name {name!r}")
-
-
-def translate_z_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
-                              lazy: bool = False
-                              ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map Z-Image tensors into a parameter tree and the layouts that invert
-    it; its rotary table is computed, so it stores no buffer."""
-    return weights.record_layouts(
-        "transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
-        ("params",), param_dtype=param_dtype, lazy=lazy)
 
 
 def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -653,7 +634,7 @@ _WAN_MODULES = {
 }
 
 
-def _wan_path(name: str) -> tuple[str, ...]:
+def wan_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `WanTransformer` path for a published Wan tensor name."""
     parts = name.split(".")
     if name == "scale_shift_table":
@@ -674,14 +655,6 @@ def _wan_path(name: str) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def translate_wan_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
-                          lazy: bool = False
-                          ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map Wan transformer tensors into a parameter tree and the layouts that
-    invert it; its rotary table is computed, so it stores no buffer."""
-    return weights.record_layouts("transformer", tensors, _wan_path, ("params",),
-                                  param_dtype=param_dtype, lazy=lazy)
-
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
     "context_embedder": ("context_embedder",),
@@ -696,7 +669,7 @@ _FLUX_EMBEDDERS = {
 }
 
 
-def _flux_path(name: str) -> tuple[str, ...]:
+def flux_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `FluxTransformer` path for a published Flux tensor name.
 
     A single-stream block's fused output projection is `proj_out` in the
@@ -724,18 +697,6 @@ def _flux_path(name: str) -> tuple[str, ...]:
         if len(rest) > 1 and rest[0] == "attn":
             return _dit_attention(block, "attn", rest[1:], leaf, name, joint=False)
     raise ValueError(f"unknown tensor name {name!r}")
-
-
-def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
-                           lazy: bool = False
-                           ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map Flux tensors into a parameter tree and the layouts that invert it.
-
-    Rotary tables are computed from input ids, so Flux stores no positional
-    buffer and there is nothing to place outside `params`.
-    """
-    return weights.record_layouts("transformer", tensors, _flux_path, ("params",),
-                                  param_dtype=param_dtype, lazy=lazy)
 
 
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
@@ -814,7 +775,7 @@ _QWEN_IMAGE_EMBEDDERS = {
 _QWEN_IMAGE_MLP = {"gate_layer": "gate_proj", "proj": "up_proj", "out": "down_proj"}
 
 
-def _qwen_image_path(name: str) -> tuple[str, ...]:
+def qwen_image_path(name: str, rank: int) -> tuple[str, ...]:
     """Return the `QwenImageTransformer` path for a published Qwen-Image 2.1 tensor name.
 
     The class holds no bias anywhere, so a bias is an unknown name. The text
@@ -841,14 +802,17 @@ def _qwen_image_path(name: str) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def translate_qwen_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
-                                 lazy: bool = False
-                                 ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map Qwen-Image 2.1 transformer tensors into a parameter tree and the
-    layouts that invert it. Its rotary table is computed from positions, so
-    it stores no buffer."""
-    return weights.record_layouts("transformer", tensors, _qwen_image_path, ("params",),
-                          param_dtype=param_dtype, lazy=lazy)
+def read_transformer(tensors: Mapping[str, np.ndarray],
+                     path_of: Callable[[str, int], tuple[str, ...] | None], *,
+                     param_dtype: str = "float32", lazy: bool = False
+                     ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
+    """Map a transformer denoiser's tensors into its parameter tree and the layouts that invert
+    it, each placed where its family's `path_of(name, rank)` says (`flux_path`, `flux2_path`,
+    `qwen_image_path`, `wan_path`, `z_image_path`). Their rotary tables are computed, so none
+    stores a buffer outside `params`."""
+    return weights.record_layouts(
+        "transformer", tensors, lambda name: path_of(name, np.ndim(tensors[name])), ("params",),
+        param_dtype=param_dtype, lazy=lazy)
 
 
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:

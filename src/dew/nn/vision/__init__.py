@@ -42,13 +42,16 @@ the classes a caller constructs or subclasses, and keeps where each kind's
 tensors sit and which map reads them.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew.interop.weights import translate_parameters
+from dew.interop.weights import placed
 from dew.objectives.base import Variables
 
 from .common import (
@@ -108,6 +111,9 @@ from .vit import (
     translate_vit_weights,
 )
 
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
+
 
 @dataclasses.dataclass(frozen=True)
 class TowerLayout:
@@ -121,9 +127,12 @@ class TowerLayout:
     path: Callable[[str], tuple[str, ...] | None]
     patch_dense: bool = False
 
-    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
-        """The tower's variables from its tensors, in the requested storage."""
-        translate = translate_vit_weights if self.patch_dense else translate_parameters
+    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                  ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        """The tower's variables from its tensors, in the requested storage, and the layouts that
+        write each tensor it placed back from them (`placed`); a tensor the tower does not compute
+        with, as SigLIP's pooling head, has none."""
+        translate = translate_vit_weights if self.patch_dense else placed
         return translate(hf_tensors, self.path, param_dtype)
 
 
@@ -153,24 +162,28 @@ PROJECTOR_PREFIX: dict[str, str | tuple[str, ...]] = {
 """Where each projector kind's tensors sit: one prefix, or several whose tensors each keep the name
 past their own."""
 # Three projectors check their tensors; every other map reads one tensor to one leaf.
-_PROJECTOR_WEIGHTS: dict[str, Callable[..., Variables]] = {
+_PROJECTOR_WEIGHTS: dict[str, Callable[..., tuple[Variables, tuple[WeightLayout, ...]]]] = {
     "gemma": translate_gemma_projector_weights,
     "gemma4": translate_gemma4_projector_weights,
     "gemma3n": translate_gemma3n_projector_weights,
 }
 
 
-def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
-    """One vision tower's variables, in the requested storage (`TOWERS`)."""
+def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                    ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """One vision tower's variables, in the requested storage (`TOWERS`), and the layouts that
+    write its tensors back from them."""
     if kind not in TOWERS:
         raise ValueError(f"tower kind {kind!r} has no weight map here")
     return TOWERS[kind].variables(hf_tensors, param_dtype)
 
 
-def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
-    """One projector kind's tensors, in the requested storage."""
+def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                        ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """One projector kind's parameters, in the requested storage, and the layouts that write
+    its tensors back from them."""
     if kind in _PROJECTOR_WEIGHTS:
         return _PROJECTOR_WEIGHTS[kind](hf_tensors, param_dtype=param_dtype)
     if kind not in PROJECTOR_PREFIX:
         raise ValueError(f"projector kind {kind!r} has no weight map here")
-    return translate_parameters(hf_tensors, functools.partial(projector_weight_path, kind), param_dtype)
+    return placed(hf_tensors, functools.partial(projector_weight_path, kind), param_dtype)
