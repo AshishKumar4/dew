@@ -1060,10 +1060,11 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
-    """SLOP018 reads a loop over a range as attempts at one piece of work only where the work reads
-    no number the loop counts: a scan by index, like one over the items, retries nothing. A failure
-    that raises on its last attempt and goes round on the others retries; one that raises on every
-    attempt does not."""
+    """SLOP018 reads a loop over a range as attempts at one piece of work only where the work's
+    inputs take a number the loop counts: a scan by index, like one over the items, retries nothing,
+    and work that merely reports its attempt is still one piece. A failure that raises on its last
+    attempt and goes round on the others retries; one that raises on every attempt does not. A
+    failure that runs on into the loop's tail retries where some path of the tail goes round."""
     found = _linted(tmp_path, {"src/sparx/retries.py": (
         "def retry(work):\n"
         "    for _ in range(3):\n"
@@ -1095,8 +1096,35 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
         "        try:\n"
         "            return parse(rows[index])\n"
         "        except ValueError:\n"
+        "            continue\n"
+        "def tail_returns(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            parsed = work()\n"
+        "        except ValueError:\n"
+        "            parsed = None\n"
+        "        if parsed is not None:\n"
+        "            return parsed\n"
+        "def tail_once(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            parsed = work()\n"
+        "        except ValueError:\n"
+        "            parsed = None\n"
+        "        return parsed\n"
+        "def mentioned(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work(), attempt\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def fed(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work(attempt)\n"
+        "        except ValueError:\n"
         "            continue\n")})
-    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8)]
+    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 48)]
 
 
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
@@ -1185,7 +1213,8 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     raises, by any name it is imported as, that carries on instead of raising, in the package's
     source. One that raises, naming what to install, requires the feature and is not reported, as
     is one whose class body raises where it is defined; a raise in a function the handler only
-    defines is no raise of its own, and one that raises on some paths carries on along the rest."""
+    defines is no raise of its own, and one that raises on some paths carries on along the rest. A
+    `finally` that completes resumes the raise it interrupted."""
     found = _linted(tmp_path, {"src/sparx/features.py": (
         "from builtins import ImportError as Missing\n"
         "def optional():\n"
@@ -1227,8 +1256,26 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "        if error.name != 'yaml':\n"
         "            raise\n"
         "        yaml = None\n"
+        "    return yaml\n"
+        "def released(lock):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        try:\n"
+        "            raise RuntimeError('install sparx[yaml]') from error\n"
+        "        finally:\n"
+        "            lock.release()\n"
+        "    return yaml\n"
+        "def released_fallback(lock):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        try:\n"
+        "            yaml = None\n"
+        "        finally:\n"
+        "            lock.release()\n"
         "    return yaml\n")})
-    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37)]
+    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37, 54)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
