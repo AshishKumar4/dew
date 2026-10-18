@@ -42,13 +42,12 @@ def inputs(length, heads=4, kv_heads=2, width=16, batch=2, seed=0):
 
 
 def packed(length, cuts):
-    """Segment ids and in-document positions for documents ending at `cuts`, padding after."""
-    segments, positions, start = np.zeros(length, np.int32), np.zeros(length, np.int32), 0
+    """Segment ids for documents ending at `cuts`, padding after."""
+    segments, start = np.zeros(length, np.int32), 0
     for index, stop in enumerate(cuts, start=1):
         segments[start:stop] = index
-        positions[start:stop] = np.arange(stop - start)
         start = stop
-    return segments, positions
+    return segments
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
@@ -73,34 +72,75 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
 
 @pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
 def test_packed_documents_restart_their_windows_and_chunks(span):
-    """Chunks count from each document's first token, as `chunked_overlay`
-    reads packed positions; windows count the tokens inside the document, an
-    invalid slot among them none, as the cache counts them. Padding keys
+    """Chunks count each document's tokens from its first, as it would alone;
+    windows count the tokens inside the document; an invalid slot among them
+    counts in neither, as the cache counts them. Padding keys
     (segment 0 and invalid) are never read by a real query, one of a document
     and valid; a padding query's output is no token's."""
     length = 29
     query, key, value = inputs(length)
-    segments, positions = packed(length, (7, 18, 26))
+    segments = packed(length, (7, 18, 26))
     valid = np.ones((2, length), bool)
     valid[1, 3] = False
     rows = np.arange(length)
     keep = (
         (rows[None, :] <= rows[:, None]) & (segments[:, None] == segments[None, :]) & (segments[:, None] != 0)
     )
-    # Each slot's index among its row's real tokens.
+    # Each slot's index among its row's real tokens, and among its document's.
     rank = np.cumsum(valid, axis=1) - 1
+    starts = np.concatenate([[True], segments[1:] != segments[:-1]])
+    places = rank - np.maximum.accumulate(np.where(starts[None], rank + 1 - valid, 0), axis=1)
     if "window" in span:
         keep = keep[None] & (rank[:, :, None] - rank[:, None, :] < span["window"])
     else:
-        keep = keep[None] & (positions[:, None] // span["chunk"] == positions[None, :] // span["chunk"])[None]
+        keep = keep[None] & (places[:, :, None] // span["chunk"] == places[:, None, :] // span["chunk"])
     keep = keep & valid[:, None, :]
     expected = dense_reference(query, key, value, keep)
     actual = local_attention(
         query, key, value, **span, segment_ids=jnp.broadcast_to(segments, (2, length)),
-        positions=None if "window" in span else jnp.asarray(positions), valid=jnp.asarray(valid),
-        implementation="xla")
+        valid=jnp.asarray(valid), implementation="xla")
     real = (segments != 0) & valid & keep.any(-1)
     np.testing.assert_allclose(np.asarray(actual)[real], expected[real], atol=2e-6, rtol=0)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("explicit", [False, True], ids=["auto", "explicit"])
+@pytest.mark.parametrize("span", [{"window": 2}, {"chunk": 4}])
+def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_axis(span, explicit):
+    """A sequence axis that splits a row with padding among its tokens in two,
+    Auto or Explicit, its rows placed split: each real query reads the keys
+    its tokens' ranks say, as near the float64 truth as the same call on one
+    device, which compacts the row. Compacting sorts the sequence axis, which
+    JAX refuses on an Explicit axis that splits it, so the split call counts
+    by rank in place."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length = 16
+    query, key, value = inputs(length, batch=1)
+    valid = jnp.asarray([[True, False, False, True, True, False, True, True] * 2])
+    rank = np.cumsum(np.asarray(valid), axis=1) - 1
+    keep = rank[:, None, :] <= rank[:, :, None]
+    if "window" in span:
+        keep &= rank[:, :, None] - rank[:, None, :] < span["window"]
+    else:
+        keep &= rank[:, :, None] // span["chunk"] == rank[:, None, :] // span["chunk"]
+    keep &= np.asarray(valid)[:, None, :]
+    truth = dense_reference(query, key, value, keep)
+
+    def attend(q, k, v, valid):
+        return local_attention(q, k, v, **span, valid=valid, implementation="xla")
+
+    alone = attend(query, key, value, valid)
+    mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value, valid)]
+        split = jax.jit(attend)(*placed)
+    real = np.asarray(valid)[0]
+    assert_as_exact_as_the_reference(np.asarray(split)[:, real], np.asarray(alone)[:, real], truth[:, real],
+                                     f"{span} split")
 
 
 @pytest.mark.parametrize("span", [{"window": 6}, {"chunk": 8}])
@@ -146,22 +186,31 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     assert banded * 4 < dense
 
 
-@pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
-@pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
-def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, shared):
-    """The whole-sequence pass runs `local_attention`; the cached decode runs
-    the chunk as a mask over cache slots. Both read the same keys: chunks
-    are cut at the tokens' logical places, so a row whose places start at
-    `origin` (a continuation, a canvas) cuts them as its whole pass does,
-    not at its cache slots, whether each row gives its places or the rows
-    share one vector of them."""
+@pytest.mark.parametrize("given", ["offset-shared", "offset-per-row", "repeated"])
+def test_a_chunked_kind_cuts_its_chunks_at_token_indices_whatever_positions_it_is_given(given):
+    """Chunks count tokens, as transformers' `chunked_overlay` counts its token
+    arange; the positions a caller gives move the rotation alone. Given
+    positions offset by 2, which the rows share or each row gives, or one
+    position for every token (as an image's tokens share one), the whole pass,
+    its diagnostic path (an open `qk` collection builds the dense mask) and
+    the cached decode attend alike, within tests/reference_error.py's rule of
+    the diagnostic path in float64; offset positions, whose differences are
+    all the rotation reads, attend as the tokens' own indices do. The band
+    read chunks off the given positions within its two blocks, and the mask
+    off all of them."""
     model = CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
         kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(1), (2, 13), 0, 64)
-    positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, tokens.shape)
+    positions = {"offset-shared": jnp.arange(13) + 2,
+                 "offset-per-row": jnp.broadcast_to(jnp.arange(13) + 2, tokens.shape),
+                 "repeated": jnp.zeros(tokens.shape, jnp.int32)}[given]
     variables = model.init(jax.random.key(0), tokens)
+
+    def diagnostic(model, variables, positions):
+        return model.apply(variables, tokens, positions=positions, mutable=["qk"])[0]
+
     whole = model.apply(variables, tokens, positions=positions)
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     logits, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4], positions=positions[..., :4],
@@ -172,7 +221,17 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
                                       positions=positions[..., index:index + 1], decode=True,
                                       mutable=["cache"])
         steps.append(logits[:, -1])
-    np.testing.assert_allclose(np.stack(steps, 1), whole[:, 3:], atol=1e-5, rtol=0)
+    reference = diagnostic(model, variables, positions)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = np.asarray(diagnostic(model.clone(dtype=jnp.float64), wide, positions), np.float64)
+        own = np.asarray(diagnostic(model.clone(dtype=jnp.float64), wide, None), np.float64)
+    assert_as_exact_as_the_reference(np.asarray(whole), np.asarray(reference), truth, "whole pass")
+    assert_as_exact_as_the_reference(np.asarray(jnp.stack(steps, 1)), np.asarray(reference)[:, 3:],
+                                     truth[:, 3:], "decode")
+    if given != "repeated":
+        assert_as_exact_as_the_reference(np.asarray(whole), np.asarray(model.apply(variables, tokens)), own,
+                                         "offset positions")
 
 
 def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens():
@@ -203,8 +262,9 @@ def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
     """A window spans tokens, as the cache counts them: a row whose six tokens
     sit among padding attends as the six tokens alone do, as near the float64
     truth of the row alone as the row alone's float32 run, through the band
-    (a window of 2 over 16 slots) and the dense call (a window of 8), and its
-    cached prefill computes what its whole pass does. A window counted in
+    (a window of 2 over 16 slots) and the dense call (a window of 8), as does
+    its diagnostic path (an open `qk` collection builds the dense mask), and
+    its cached prefill computes what its whole pass does. A window counted in
     slots let the last token of slots 0, 3 and 6 see itself alone."""
     model = CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
@@ -222,6 +282,9 @@ def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
         truth = model.clone(dtype=jnp.float64).apply(wide, real)
     assert_as_exact_as_the_reference(np.asarray(holey[:, slots]), np.asarray(alone),
                                      np.asarray(truth, np.float64), "holey row")
+    diagnostic = model.apply(variables, tokens, attention_mask=valid, mutable=["qk"])[0]
+    assert_as_exact_as_the_reference(np.asarray(diagnostic[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "diagnostic path")
     cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     prefilled, _ = model.apply({**variables, "cache": cache}, tokens, attention_mask=valid, decode=True,
                                mutable=["cache"])

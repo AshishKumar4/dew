@@ -40,7 +40,7 @@ from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
-from dew.nn.local_attention import local_attention
+from dew.nn.local_attention import local_attention, token_places
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
 from dew.nn.precision import at_least_fp32, rounded_to, scaled
@@ -129,8 +129,8 @@ class _Masking(NamedTuple):
     implementation: str
     cursor: jax.Array | None
     key_places: jax.Array
-    """Each key's logical place, which a chunk and ALiBi read: a cached key's where the layer keeps
-    them (`CausalSelfAttention._cached_places`), else its slot."""
+    """Each key's logical place, which ALiBi reads: a cached key's where the layer keeps them
+    (`CausalSelfAttention._cached_places`), else its slot."""
 
 
 @logical_axes({
@@ -477,7 +477,12 @@ class CausalSelfAttention(nn.Module):
                           & (groups[:, :, None] >= 0))
             keep = keep | same_image[:, None]
         if self.ctx.sliding_window is not None and (self.ctx.causal or self.ctx.bidirectional_window):
-            distance = query_slots[:, None, :, None] - jnp.arange(key_length)[None, None, None, :]
+            # A window counts tokens (`token_places`): a cache's slots are its tokens, and an uncached
+            # call's tokens are ranked past the padding among them.
+            ranked = None if decode or valid is None else token_places(length, valid=valid)
+            places = query_slots if ranked is None else ranked
+            key_places = jnp.arange(key_length)[None, :] if ranked is None else ranked
+            distance = places[:, None, :, None] - key_places[:, None, None, :]
             # A causal window bounds only the keys behind the query, so an
             # image's later tokens stay visible to its earlier ones; a
             # two-sided one bounds both (`window_sides`).
@@ -606,7 +611,6 @@ class CausalSelfAttention(nn.Module):
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,
-                positions=None if logical_positions is None else positions,
                 segment_ids=segment_ids,
                 max_segments=None if segment_ids is None else tokens.max_segments,
                 valid=tokens.valid, right_padded=tokens.right_padded,
@@ -728,8 +732,7 @@ class CausalSelfAttention(nn.Module):
         # paged cache holds rows a server seats at canonical positions, where
         # a key's slot is its place, so it keeps none.
         key_places = places
-        keeps_places = ((self.ctx.attention_chunk is not None or self.alibi)
-                        and self.ctx.kv_cache.page_size is None)
+        keeps_places = self.alibi and self.ctx.kv_cache.page_size is None
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -802,10 +805,8 @@ class CausalSelfAttention(nn.Module):
             causal, window, documents = False, None, None
             implementation = masked
         if self.ctx.attention_chunk is not None:
-            # The decode and diagnostic paths: the chunk joins the mask the
-            # branch above built, each query and key in the chunk of its
-            # logical place, never its cache slot.
-            chunked = chunk_mask(places, key_places, self.ctx.attention_chunk)
+            # The decode and diagnostic paths: the chunk joins the mask the branch above built.
+            chunked = self._chunked(positions, segment_ids, attention_metadata, S, key.shape[-3], decode)
             if documents is not None:
                 mask, documents = with_documents(mask, documents), None
             base = combined_attention_mask(S, key.shape[-3], causal, window, mask)
@@ -834,9 +835,21 @@ class CausalSelfAttention(nn.Module):
                 mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
         return mask, key_positions
 
+    def _chunked(self, positions, segment_ids, metadata: AttentionMetadata | None, length: int,
+                 key_length: int, decode: bool) -> jax.Array:
+        """Each query's and key's chunk `[.., 1, T, S]`, cut at their token indices
+        (`token_places`), a cached call's at its cache slots, never at the positions a caller
+        gives, which rotation alone reads."""
+        chunk = self.ctx.attention_chunk
+        assert chunk is not None
+        if decode:
+            return chunk_mask(positions, jnp.arange(key_length), chunk)
+        tokens = token_places(length, segment_ids, None if metadata is None else metadata.valid)
+        return chunk_mask(tokens, tokens, chunk)
+
     def _cached_places(self, places, slots) -> jax.Array:
-        """Each cache slot's logical place `[rows, capacity]`, where a chunk
-        and ALiBi read its key: the place the call that wrote the slot gave
+        """Each cache slot's logical place `[rows, capacity]`, where ALiBi
+        reads its key: the place the call that wrote the slot gave
         its token (`Coordinates.positions`). A slot is that place only by
         default, so the cache keeps it beside the key, and this call's
         `places` go in at their `slots` as its keys do."""
