@@ -133,6 +133,70 @@ def raw_safetensors(path, entries):
     path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
 
 
+_A = '"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}'
+_B = '"b":{"dtype":"I32","shape":[2,2],"data_offsets":[16,32]}'
+_PAYLOAD = np.arange(4, dtype=np.float32).tobytes() + np.arange(4, dtype=np.int32).tobytes()
+
+def _table(*entries: str) -> str:
+    return "{" + ",".join(entries) + "}"
+
+
+CORRUPTIONS = {
+    "valid": (_table(_A, _B), _PAYLOAD),
+    "gap": (_table(_A, _B.replace("[16,32]", "[24,40]")), _PAYLOAD + bytes(8)),
+    "overlap": (_table(_A, _B.replace("[16,32]", "[8,24]")), _PAYLOAD[:24]),
+    "short": (_table(_A, _B), _PAYLOAD[:-1]),
+    "trailing": (_table(_A, _B), _PAYLOAD + bytes(4)),
+    "span": (_table(_A.replace("[2,2]", "[2,3]"), _B), _PAYLOAD),
+    "dtype": (_table(_A.replace("F32", "Q9"), _B), _PAYLOAD),
+    "repeated": (_table(_B.replace("I32", "F32"), _A, _B), _PAYLOAD),
+    "null-metadata": (_table('"__metadata__":null', _A, _B), _PAYLOAD),
+    "unknown-field": (_table(_A.replace("}", ',"extension":1}'), _B), _PAYLOAD),
+    "repeated-field": (_table(_A.replace('{"dtype":"F32"', '{"dtype":"F32","dtype":"F32"'), _B), _PAYLOAD),
+    "repeated-metadata": (_table('"__metadata__":{"x":"1"}', '"__metadata__":{"y":"2"}', _A, _B), _PAYLOAD),
+    "metadata": (_table('"__metadata__":{"x":"1","x":"2"}', _A, _B), _PAYLOAD),
+    "utf-16": (_table(_A, _B), _PAYLOAD),
+    "entry": (_table('"c":[1]', _A, _B), _PAYLOAD),
+    "object-shape": (_table(_A.replace("[2,2]", "{}"), _B), _PAYLOAD),
+    "sequence": (_table('"a":["F32",[2,2],[0,16]]', _B), _PAYLOAD),
+    "surrogate": (_table('"__metadata__":{"x":"\\ud800"}', _A, _B), _PAYLOAD),
+}
+"""Each one change to a valid two-tensor file: a hole between tensors, two
+tensors on the same bytes, a missing byte, bytes after the tensors, a shape
+its bytes do not hold, an unknown dtype tag, a tensor named twice with another
+dtype first, null metadata, a field TensorInfo does not know, a TensorInfo
+field named twice, metadata named twice, a metadata key named twice, the
+header in UTF-16, a tensor that is no object, a shape that is an object, a
+tensor stated as a sequence, and metadata holding an unpaired surrogate."""
+
+
+@pytest.mark.parametrize("corruption", [*CORRUPTIONS, "length"])
+def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
+    """Dew validates the header of the file it holds open through safe_open, on
+    a stand-in of that header: a file safe_open reads reads to the same tensors
+    and metadata, and each one safe_open refuses, Dew refuses with safe_open's
+    error. `length` states a header longer than the file."""
+    text, payload = CORRUPTIONS.get(corruption, CORRUPTIONS["valid"])
+    header = text.encode("utf-16" if corruption == "utf-16" else "utf-8")
+    stated = 10 ** 9 if corruption == "length" else len(header)
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(stated.to_bytes(8, "little") + header + payload)
+    try:
+        with safetensors.safe_open(str(path), "np") as reader:
+            names = reader.keys()
+            expected = {name: reader.get_tensor(name) for name in names}
+            stored = reader.metadata() or {}
+    except safetensors.SafetensorError:
+        with pytest.raises(safetensors.SafetensorError):
+            read_file(path)
+        return
+    tensors, metadata = read_file(path)
+    assert metadata == stored and list(tensors) == sorted(expected)
+    for name, value in expected.items():
+        assert tensors[name].dtype == value.dtype
+        np.testing.assert_array_equal(tensors[name], value)
+
+
 def test_block_scale_exponents_and_packed_fp4_are_mapped_as_stored(tmp_path):
     """DeepSeek-V4's shards carry F8_E8M0 scales and F4 experts (the header of
     DeepSeek-V4-Flash shard 5). An E8M0 byte is the exponent 2**(b - 127); an
