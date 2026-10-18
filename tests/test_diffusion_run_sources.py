@@ -28,10 +28,11 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
-from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import to_record
-from dew.sampling import Euler
+from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -87,6 +88,42 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     shutil.copytree(directory, metadata, ignore=shutil.ignore_patterns("*.safetensors"))
     rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=state.variables)
     assert value(rebuilt, state.variables, batch) == trained
+
+
+def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
+    """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
+    and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""
+    with tarfile.open(FIXTURES / "rae.tar.xz") as archive:
+        archive.extractall(tmp_path / "representation", filter="data")
+    alignment = Alignment("proj_out", source=str(tmp_path / "representation" / "dinov2_plain"),
+                          resolution=56, width=8)
+    config = DiffusionRunConfig(
+        pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(), val_metrics=(),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+        objective=ObjectiveConfig("diffusion", {
+            "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None,
+            "alignment": alignment, "end_to_end": EndToEnd(perceptual_weight=0., discriminator_weight=0.)}))
+    objective = config.build()
+    batch = batch_for(objective, 16)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(3))
+    initial = trainer.initial_state()
+    before = jax.tree.map(np.asarray, initial.variables)
+    trained, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted) and int(trained.updates) == 1
+    for name in (AUTOENCODER, "proj_out"):
+        assert any(not np.array_equal(start, end) for start, end in zip(
+            jax.tree.leaves(before["params"][name]),
+            jax.tree.leaves(trained.variables["params"][name]), strict=True))
+    assert not np.array_equal(before[LATENT_STATS]["mean"], trained.variables[LATENT_STATS]["mean"])
+    task = TextToImage.from_objective(objective, trained.variables)
+    for actual, expected in zip(jax.tree.leaves(task.variables["autoencoder"][TUNED_WEIGHTS]),
+                                 jax.tree.leaves(trained.variables["params"][AUTOENCODER]), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+    metadata = tmp_path / "metadata"
+    shutil.copytree(pipelines / "sd3" / "pipeline", metadata, ignore=shutil.ignore_patterns("*.safetensors"))
+    rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=trained.variables)
+    assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
 
 
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])

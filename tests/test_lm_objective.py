@@ -322,6 +322,33 @@ def test_preview_generates_reproducible_text_from_ema():
     assert averaged.tokens.shape == (1, 7)
 
 
+def test_a_preview_over_prompts_of_different_lengths_draws_what_each_draws_alone():
+    """Two prompts of three and five ids preview together, left-padded as one
+    request: each row holds the ids its prompt draws alone, and each text is
+    that prompt and its draw, with no padding."""
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                              num_heads=2, mlp_features=32, max_seq_len=32,
+                              dtype="float32", attention_impl="xla")
+    prompts = [[1, 2, 3], [4, 5, 6, 7, 1]]
+
+    def objective_for(prompt):
+        return LMObjective(model, seq_len=SEQ, samples=Samples(
+            prompt=prompt, max_new_tokens=4, sampling=Sampling(temperature=0.0), decode=lambda ids: str(ids)))
+
+    together = objective_for(prompts)
+    params = together.init(jax.random.key(0))
+    drawn = together.preview(params, token_batch(), step_at(key=5))
+    # One prompt as a flat array previews as one row, as a list does.
+    flat = objective_for(jnp.asarray(prompts[0])).preview(params, token_batch(), step_at(key=5))
+    np.testing.assert_array_equal(flat.tokens, objective_for(prompts[0]).preview(
+        params, token_batch(), step_at(key=5)).tokens)
+    for index, prompt in enumerate(prompts):
+        alone = objective_for(prompt).preview(params, token_batch(), step_at(key=5))
+        np.testing.assert_array_equal(drawn.tokens[index, -len(prompt) - 4:], alone.tokens[0])
+        assert drawn.texts[index] == alone.texts[0] == str(alone.tokens[0].tolist())
+    assert drawn.prompt == str(prompts[0])
+
+
 # --- perplexity ------------------------------------------------------------
 
 def test_perplexity_weighs_every_batch_by_its_counted_targets():
