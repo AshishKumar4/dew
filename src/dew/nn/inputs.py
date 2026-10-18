@@ -87,8 +87,8 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays
     ):
         raise ValueError("each prompt must contain a nonempty integer token row")
-    if any(np.any((row < 0) | (row > limits.max)) for row in arrays):
-        raise ValueError("token IDs must be nonnegative int32 values")
+    for row in arrays:
+        _check_token_ids(row)
     width = max(row.size for row in arrays)
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
@@ -117,13 +117,18 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     return tokens, padded
 
 
+def _check_token_ids(array: np.ndarray) -> None:
+    """Refuse an integer array holding an id outside `token_id`'s law: 0 through int32's largest."""
+    if np.any((array < 0) | (array > np.iinfo(np.int32).max)):
+        raise ValueError("token IDs must be nonnegative int32 values")
+
+
 def host_token_rows(array: np.ndarray) -> np.ndarray:
-    """Integer `[B, S]` token ids normalized on the host without a device round-trip."""
+    """Integer `[B, S]` token ids normalized on the host without a device round-trip,
+    read by `token_id`'s law whatever container holds them."""
     if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
         raise ValueError("tokens must be an integer [B, S] array")
-    bounds = np.iinfo(np.int32)
-    if np.any(array < bounds.min) or np.any(array > bounds.max):
-        raise ValueError("token IDs must be representable as int32")
+    _check_token_ids(array)
     return array.astype(np.int32, copy=False)
 
 
@@ -182,10 +187,12 @@ class ModelInputs:
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
             )
         for name, value in self.token_fields.items():
-            if value.ndim < 2 or value.shape[:2] != self.tokens.shape:
-                raise ValueError(
-                    f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}"
-                )
+            # A field may be a tree of arrays, as `coordinates` is; each of its arrays is token-aligned.
+            for leaf in jax.tree.leaves(value):
+                if leaf.ndim < 2 or leaf.shape[:2] != self.tokens.shape:
+                    raise ValueError(
+                        f"token field {name!r} must start with {self.tokens.shape}, got {leaf.shape}"
+                    )
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -194,7 +201,8 @@ class ModelInputs:
         """Select the same rows from tokens, sequence fields and media."""
         return replace(self,
             tokens=self.tokens[indices],
-            token_fields={name: value[indices] for name, value in self.token_fields.items()},
+            token_fields={name: jax.tree.map(lambda leaf: leaf[indices], value)
+                          for name, value in self.token_fields.items()},
             conditioning={name: value[indices] for name, value in self.conditioning.items()})
 
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
@@ -222,7 +230,8 @@ class ModelInputs:
             return jnp.take_along_axis(value, indices, axis=1)
 
         return replace(self, tokens=shift(self.tokens),
-                            token_fields={name: shift(value) for name, value in self.token_fields.items()})
+                            token_fields={name: jax.tree.map(shift, value)
+                                          for name, value in self.token_fields.items()})
 
     def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
         """Return the keyword arguments for a native model call, without the tokens.
