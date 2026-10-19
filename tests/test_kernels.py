@@ -721,6 +721,37 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
+def test_cpu_fp32_attention_over_keys_summed_in_blocks_takes_forward_mode():
+    """fp32 reference attention over 300 keys, whose values XLA:CPU sums in blocks (`weighted_values`),
+    as a consistency model's JVP runs it under `forward_mode_attention` (sCM, rCM): its value, tangent and
+    three gradients are within tests/reference_error.py's rule of jax.nn.dot_product_attention's against
+    float64. The blocked product's custom_vjp refused forward mode."""
+    from dew.nn.attention import forward_mode_attention
+
+    arrays = [jax.random.normal(jax.random.key(seed), (1, 300, 2, 16), jnp.float32) for seed in range(7)]
+    primals, tangents, cotangent = arrays[:3], arrays[3:6], arrays[6]
+
+    def reference(q, k, v):
+        return scaled_dot_product_attention(q, k, v, implementation="reference", causal=True)
+
+    def plain(q, k, v):
+        return jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation="xla")
+
+    def derivatives(attend, *primals):
+        with forward_mode_attention():
+            out, tangent = jax.jvp(attend, primals, tuple(t.astype(primals[0].dtype) for t in tangents))
+        _, pull = jax.vjp(attend, *primals)
+        return (out, tangent, *pull(cotangent.astype(out.dtype)))
+
+    found, theirs = derivatives(reference, *primals), derivatives(plain, *primals)
+    with jax.enable_x64(new_val=True):
+        truth = derivatives(reference, *(jnp.asarray(x, jnp.float64) for x in primals))
+    names = ("out", "tangent", "dq", "dk", "dv")
+    for name, got, want, exact in zip(names, found, theirs, truth, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
+
+
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
 def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
     """A layer whose rows are padded on the left builds its mask and runs the
     kernel a materialized mask takes (`kernel_for_materialized_mask`). Over
