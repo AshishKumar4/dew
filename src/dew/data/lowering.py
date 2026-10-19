@@ -652,7 +652,7 @@ class _Build:
                    for index, child in enumerate(source.pipelines)]
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
-            checked = primed_maps(mapped, [_name(child) for child in source.pipelines])
+            checked = primed_maps(mapped)
             return pygrain.MapDataset.mix(checked, _weights(source))
         streams = [
             Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
@@ -666,7 +666,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 budget=self.budget,
             )
-        return PrimedMix(streams, source.weights, [_name(child) for child in source.pipelines])
+        return PrimedMix(streams, source.weights)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
