@@ -10,9 +10,9 @@ give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
 (src/dew/training/trainer.py) and in its compiled step
-(src/dew/training/transaction.py). The RLVR figures score their answers
-with the counting task of tutorials/10-rl-with-verifiable-rewards.ipynb, and
-take their advantages and clipped objective from dew.rl.
+(src/dew/training/transaction.py). The RLVR figures score replies to the
+GSM8K question of tutorials/10-rl-with-verifiable-rewards.ipynb, and take
+their advantages and clipped objective from dew.rl.
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
         python docs/assets/figures.py [NAME_PREFIX ...]
