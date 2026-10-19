@@ -8,7 +8,7 @@ run into one group.
 """
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 
 from dew.registry import read_arguments
 
@@ -45,8 +45,9 @@ class LayerKind:
     local_attention // 2). A causal layer ignores it."""
     chunk: int | None = None
     """The chunk size of chunked local attention. A layer of this kind reads
-    only the keys at or before each query whose position has the same
-    `position // chunk` as the query. This is MaxText's
+    only the keys at or before each query whose place has the same
+    `place // chunk` as the query's, places counted over each document's
+    tokens (`dew.nn.inputs.counted_places`). This is MaxText's
     `chunk_attn_window_size` and Llama 4's `attention_chunk_size`. None
     attends to all keys. A kind sets a window or a chunk, not both."""
     num_kv_heads: int | None = None
@@ -159,14 +160,16 @@ class LayerSpec:
     """Whether the block norms its attention input; ModernBERT's first block does not."""
 
 
-def scan_groups(specs: Sequence[LayerSpec],
+def scan_groups(specs: Sequence[Hashable],
                 bank_layers: int | None = None) -> tuple[tuple[int, int], ...]:
     """The stack as runs of layers, `(first, count)` each, in order.
 
     Consecutive layers with equal specs form one run, which a scan runs as
     iterations of one body; a layer with no equal neighbour is a run of one,
     which stays unrolled. The grouping is read off the specs, never written
-    by hand, so a model's pattern decides what scans.
+    by hand, so a model's pattern decides what scans. A spec is a layer's
+    `LayerSpec`, or that with what else one body has to share, as the
+    structure of the layer's variables (`CausalTransformer.scan_keys`).
 
     `bank_layers` caps how many layers one run holds, which is how many a
     parameter bank stacks: a longer run splits into consecutive runs of at

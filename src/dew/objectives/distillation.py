@@ -266,6 +266,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         return self.student.apply_effects(self.student_variables(variables), effects)
 
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The student's projection of its own parameters; the feature projections as they are."""
+        own = self.student_variables({"params": params})["params"]
+        return {**params, **self.student.projected(own, updated=updated)}
+
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         return self.student.evaluate(self.student_variables(params), batch, self._student_step(step))
 

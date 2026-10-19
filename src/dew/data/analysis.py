@@ -22,6 +22,7 @@ support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +59,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
+from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import record
 
@@ -84,12 +86,35 @@ class _RestrictedReads(Protocol):
     refusal: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _Members:
+    """A concatenation's stores that cannot take a read, each prepared by its own preparer
+    (`_provisioner`), so the concatenation takes it once they have."""
+
+    concatenation: Concatenate
+    preparers: tuple[_Provisionable, ...]
+
+    def can_provision(self, read: Read) -> bool:
+        return True
+
+    def provision(self) -> Source:
+        for preparer in self.preparers:
+            preparer.provision()
+        return self.concatenation
+
+
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through any split or slice wrapping it."""
+    """The source that can prepare `read`, through any split or slice wrapping it; for a
+    concatenation, each of its stores that cannot take `read` yet, all of which must prepare it."""
     while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
         if isinstance(source, _RestrictedReads) and read not in source.reads:
             return None
         source = source.source
+    if isinstance(source, Concatenate):
+        preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
+        if not preparers or any(preparer is None for preparer in preparers):
+            return None
+        return _Members(source, tuple(preparer for preparer in preparers if preparer is not None))
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
@@ -122,10 +147,12 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, chunks_for, plan_name
 
-    def cut(stages: Sequence[Stage]) -> int:
-        """1 where a chunk step cuts documents as the pack after it plans them (`chunks_for`), else 0."""
-        return int(len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack)
-                   and chunks_for(stages[0].step, stages[1]))
+    def cutting(stages: Sequence[Stage]) -> int | None:
+        """The overlap of a chunk step that cuts documents as the pack after it plans them
+        (`chunks_for`), or None where none comes first."""
+        if len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack):
+            return chunks_for(stages[0].step, stages[1])
+        return None
 
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
@@ -135,13 +162,17 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             generation = stage.cache.source()
             source, stages = rebased(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            at = cut(stages)
+            overlap = cutting(stages)
+            at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
-            if source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans:
-                source = PackedSource.published(source, stage.cache, packing, chunked=bool(at))
+            # A published plan cuts a document as a window-long chunk step without overlap does.
+            if (source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans
+                    and overlap in (None, 0)):
+                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
             break
-    at = cut(stages)
+    overlap = cutting(stages)
+    at = int(overlap is not None)
     pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
@@ -151,7 +182,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.supports("indexed")
         and source.lengths() is not None
     ):
-        source, stages = PackedSource.planned(source, pack, chunked=bool(at)), stages[at + 1 :]
+        source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
@@ -259,6 +290,18 @@ def _name(pipeline: Pipeline) -> str:
     if pipeline.name is not None:
         return pipeline.name
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
+
+
+def _members(pipelines: Sequence[Pipeline]) -> list[str]:
+    """The names a mixture's members go by, for their draws and in its plan: the one each was given
+    (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
+    `place:1`, ...), which no mount, read or preparation of its source changes; the two kinds never
+    meet, whatever a name holds. A member keeps its draws and its place across a member joining or
+    leaving by its name; one without keeps them while no other unnamed member joins or leaves ahead
+    of it."""
+    unnamed = itertools.count()
+    return [f"name:{pipeline.name}" if pipeline.name is not None else f"place:{next(unnamed)}"
+            for pipeline in pipelines]
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
@@ -486,10 +529,7 @@ def _analyzed(
         eager += 1
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
-        per_share = per_share or any(
-            isinstance(child.source, (Mixture, Phases)) or "valid_targets" not in child.source.metadata()
-            for child in nested
-        )
+        per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in children)
     children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
@@ -509,6 +549,7 @@ def _analyzed(
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
+            "members": _members(source.pipelines),
             "until_steps": list(source.until_steps),
         }
     else:
@@ -517,6 +558,7 @@ def _analyzed(
             **(
                 {
                     "corpora": [child.order for child in children],
+                    "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
                 }
@@ -546,6 +588,25 @@ def _analyzed(
     if per_share and lowering.split and not validation and not configured:
         raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     return lowering
+
+
+def _states_its_targets(pipeline: Pipeline) -> bool:
+    """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
+    valid targets count, so a weight from them holds its share of the targets (`token_weights`):
+    a source that states them, whose stages only order, repeat and place those rows
+    (`_KEEPS_TARGETS`), and after its repeat may take a window of the repeated rows, as a phase
+    does. A step still to run over them, a random crop or a filter, before its repeat or after
+    it, or a slice, limit or token split that takes a part of one epoch, delivers other rows than
+    the stated ones, so that corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
+    source, at = pipeline.source, _until(pipeline.stages, (Repeat,))
+    return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
+            and all(isinstance(stage, _KEEPS_TARGETS) for stage in pipeline.stages[:at])
+            and all(isinstance(stage, (*_KEEPS_TARGETS, Slice, Limit)) for stage in pipeline.stages[at:]))
+
+
+_KEEPS_TARGETS = (Shuffle, Repeat, Prefetch, Workers, Interleave, Artifact)
+"""The stages that order, repeat or place a corpus's rows, each row and its targets as they
+arrive; a mixture's members are not batched, so these are all a member's stages may be."""
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:

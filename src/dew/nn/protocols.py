@@ -48,7 +48,7 @@ from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import biased_logits, capped_logits, head_product
+from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -59,8 +59,8 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
+    from dew.quantization import InputQuantizer
     from dew.records import JSON
-    from dew.training.quantization import InputQuantizer
 
 __all__ = [
     "AffineHead",
@@ -94,6 +94,7 @@ __all__ = [
     "HiddenStates",
     "IntervalModel",
     "LayerScalars",
+    "LayerStates",
     "Layered",
     "Logits",
     "LogitsFromHidden",
@@ -102,6 +103,7 @@ __all__ = [
     "OutputTable",
     "Predicting",
     "ProjectionGroup",
+    "ProjectsParameters",
     "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
@@ -118,17 +120,18 @@ __all__ = [
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
-    otherwise, an optional fp32 `[vocab]` `bias` added after the product,
-    the `softcap` applied last, and the `precision` the product runs at.
-    `compute`, the model's compute dtype, decides the product's operands
+    otherwise, an optional fp32 `[vocab]` `scale` multiplying the product
+    (nGPT's per-token logit gain) and `bias` added after it, the `softcap`
+    applied last, and the `precision` the product runs at. `compute`, the
+    model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
     quantization does.
 
     Contracting the model's final states with it (`logits`) reproduces the
-    model's own logits, bias, softcap and any adapter on the head included.
-    Where no matrix does, `output_table` returns None, and the logits come
-    from `logits_from_hidden` or `logits` instead.
+    model's own logits, scale, bias, softcap and any adapter on the head
+    included. Where no matrix does, `output_table` returns None, and the
+    logits come from `logits_from_hidden` or `logits` instead.
     """
 
     matrix: jax.Array
@@ -138,6 +141,7 @@ class OutputTable:
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
+    scale: jax.Array | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
         """`hidden` as the product reads it: through the input quantizer's QDQ."""
@@ -145,12 +149,20 @@ class OutputTable:
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
         """`hidden`'s `[..., vocab]` logits, at least fp32: the states through
-        the input quantizer, the product (`head_product`), the bias, the
-        softcap, then `temperature`, which a sampler applies to the head's
-        logits."""
+        the input quantizer, the product (`head_product`), the scale and the
+        bias (`scaled_logits`), the softcap, then `temperature`, which a
+        sampler applies to the head's logits."""
         logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
-        return capped_logits(biased_logits(logits, self.bias), self.softcap, temperature)
+        return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
+
+    def rows(self) -> jax.Array:
+        """Each vocabulary token's `[vocab, features]` row: the matrix's, times
+        the token's scale, whose dot product with a state is the token's logit
+        before its bias and softcap, in the wider of the two dtypes. A reader
+        of tokens' vectors (a decision head's lexical prior) takes these."""
+        rows = self.matrix if self.vocab_major else self.matrix.T
+        return rows if self.scale is None else rows * self.scale[:, None]
 
 
 @runtime_checkable
@@ -383,9 +395,20 @@ class AffineHead(Protocol):
 
 
 @runtime_checkable
+class VocabularyRows(Protocol):
+    """A model whose head scores its final states against one row per vocabulary token: each
+    token's `[vocab, features]` row as `OutputTable.rows` gives it, read from the bound variables,
+    where no matrix alone is the head too (an `AffineHead` returning None): past a nonlinear head
+    transform the matrix's rows, with an adapter on the head its rows as the adapter updates them.
+    A reader of tokens' vectors, a decision head's lexical prior, takes these."""
+
+    def vocabulary_rows(self) -> jax.Array: ...
+
+
+@runtime_checkable
 class QuantizesInputs(Protocol):
     """A model computing under a checkpoint's input quantization
-    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    (`dew.quantization.InputQuantization`): the quantizer a bound
     module's input takes, which a head read as a table (`OutputTable`) applies
     as the module's own call does."""
 
@@ -431,6 +454,27 @@ class RematChoosing(Protocol):
     """
 
     def with_remat(self, policy: RematPolicy | None) -> Self: ...
+
+
+@runtime_checkable
+class ProjectsParameters(Protocol):
+    """A model whose training keeps a constraint on the parameters it stores.
+
+    `projected` returns the stored parameters a training step reads and
+    updates. The trainer calls it at each optimizer commit: first with
+    `updated=False` on the parameters the step's update applies to, which
+    the optimizer sees (Gemma 3n's AltUp clamps its prediction coefficients
+    there, as the reference clamps the stored weight in place before its
+    forward); then with `updated=True` on the updated parameters, which the
+    step stores (a normalized transformer puts its matrices back on the unit
+    sphere there). The tree a run starts from is projected once with
+    `updated=True`, drawn or held, so a projection leaves a tree that already
+    satisfies the constraint as it is. `params` is the trainable tree,
+    which may hold a part of the model's parameters (an adapter's frozen
+    base is absent): a model projects the leaves present and keeps the rest.
+    """
+
+    def projected(self, params: VariableDict, *, updated: bool) -> VariableDict: ...
 
 
 @runtime_checkable
@@ -529,7 +573,10 @@ class Serving(Protocol):
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
     run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
-    prefill calls would, or None."""
+    prefill calls would, or None. `split_prefill_refusal` says why it
+    prefills each prompt whole, a prompt taken in pieces or after a prefix
+    another request cached computing something its whole prefill does not,
+    and what serves those modes instead, or None."""
 
     def inference_projection_groups(self, variables: Mapping[str, Mapping]
                                     ) -> tuple[ProjectionGroup, ...]: ...
@@ -538,6 +585,8 @@ class Serving(Protocol):
     def cache_rebuild_position(self) -> int | None: ...
 
     def mixed_admission_refusal(self) -> str | None: ...
+
+    def split_prefill_refusal(self) -> str | None: ...
 
 
 @runtime_checkable
@@ -634,6 +683,22 @@ class DecoderTraining(Predicting, Protocol):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+
+
+@runtime_checkable
+class LayerStates(Protocol):
+    """A model whose forward keeps its layers' residual states, each layer's output before the
+    final norm, for a reader of a middle layer's features: applied with
+    `capture_intermediates=model.capture_layers` and `model.layer_collections` mutable, the
+    collections it returns hold them, and `model.layer_state(collections, index)` reads layer
+    `index`'s (0-based; -1 is the last). A layer a loop runs more than once is read at its last
+    pass, the state the layers after it read."""
+
+    layer_collections: tuple[str, ...]
+
+    def capture_layers(self, module: nn.Module, method: str) -> bool: ...
+
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array: ...
 
 
 @runtime_checkable

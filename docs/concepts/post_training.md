@@ -99,6 +99,8 @@ Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
 10.5% of the wall time in steps, final loss 0.008948
 ```
 
+`DPOObjective` and `GRPOObjective` score tokens through `TokenScorer`, the scoring machinery `LMObjective` also builds on. Besides their own loss arguments they take its options: `head_chunks`, `head_tile`, `samples`, `variables`, `qk_stats` and `processor`. The language-model loss's own options (`ema_decay`, `pad_id`, `token_accuracy`, `loss_role`, `mtp_weight`, `z_loss`, the MoE balance and router terms, `indexer`) are `LMObjective`'s alone.
+
 `Preferences.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
@@ -508,29 +510,115 @@ With Qwen3 (`Qwen/Qwen3-0.6B`), only a reasoning turn followed by a tool-role ob
 
 The prepared batch keeps `old_log_probs`, `behavior_log_probs` and `response_mask`, and adds `old_values`, `advantages` and `returns`, each shaped like the packed `input_ids`. Both losses reduce over the same action-token mass, so PPO keeps token-mean aggregation and refuses sequence masks. `value_coefficient` scales the half-squared critic loss, and `value_clip` clips predictions around the recorded values. Policy clipping, KL strength and the optional behavior-importance cap are the same controls as in GRPO. You can also keep these targets in a dataset and run several PPO updates on them without sampling again.
 
-The next example samples square-tool calls, runs the in-memory square environment and learns from the final-answer reward. Its policy, environment and critic backbone come from Dew's test suite, so it needs a Dew repository checkout. The policy is a small bigram model and the critic backbone is a set of trainable token features, so it needs no pretrained language model, checkpoint or network service.
+The next example samples square-tool calls, runs an in-memory square environment and learns from the final-answer reward. The policy is a small bigram model over ten tokens: from the start token it calls square(3) or square(4), and from the tool's result it answers right or wrong. The critic backbone is a set of trainable token features. So it needs no pretrained language model, checkpoint or network service.
 
 ```python
 import itertools
-import sys
-from pathlib import Path
+import json
+from contextlib import contextmanager
 
-import dew
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import linen as nn
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
+from dew.nn.protocols import OutputTable
+from dew.objectives.rl import (EpisodeRollout, EpisodeStatus, Observation, PPOObjective,
+                               PPORollout, ValueHead)
+from dew.sampling import Sampling
 
-sys.path.insert(0, str(Path(dew.__file__).parents[2] / "tests"))
-from test_ppo import TokenFeatures
-from test_tool_episodes import SAMPLING, Harness, ToolPolicy, verify
+PAD, START, CALL_THREE, EOS, NINE, ANSWER_NINE, WRONG, CALL_FOUR, SIXTEEN, ANSWER_SIXTEEN = range(10)
+VOCAB = 12
+SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD)
+
+
+def transitions():
+    """The starting bigram logits: a call from the start token, an answer from a result."""
+    logits = np.full((VOCAB, VOCAB), -1000., np.float32)
+    logits[:, EOS] = 1000.
+    logits[START, :] = -1000.
+    logits[START, [CALL_THREE, CALL_FOUR]] = .2, 0.
+    for result, answer in ((NINE, ANSWER_NINE), (SIXTEEN, ANSWER_SIXTEEN)):
+        logits[result, :] = -1000.
+        logits[result, [answer, WRONG]] = .25, 0.
+    return logits
+
+
+class ToolPolicy(nn.Module):
+    """A trainable bigram table, decoded by Dew's shared sampler."""
+
+    vocab_size: int = VOCAB
+    max_seq_len: int = 11
+
+    def setup(self):
+        self.table = self.param("table", lambda key: jnp.asarray(transitions()))
+
+    def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
+        return jax.nn.one_hot(tokens, self.vocab_size)
+
+    def output_table(self):
+        return OutputTable(self.table, vocab_major=False)
+
+    @nn.compact
+    def init_cache(self, batch_size):
+        self.variable("cache", "seen", lambda: jnp.zeros(batch_size, jnp.int32))
+
+    def __call__(self, tokens, train=False, decode=False, attention_mask=None, positions=None,
+                 segment_ids=None):
+        if decode:
+            seen = self.get_variable("cache", "seen")
+            valid = jnp.ones_like(tokens, bool) if attention_mask is None else attention_mask
+            self.put_variable("cache", "seen", seen + valid.sum(-1))
+        return self.hidden_states(tokens) @ self.table
+
+
+class TokenFeatures(nn.Module):
+    """The critic's backbone: one trainable scale per token."""
+
+    @nn.compact
+    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
+        return jax.nn.one_hot(tokens, VOCAB) * self.param("scale", nn.initializers.ones, (VOCAB,))
+
+
+class SquareSession:
+    """Runs the tool the policy calls, then reports its final answer."""
+
+    def __init__(self):
+        self.expected = None
+
+    def reset(self):
+        return Observation((START,))
+
+    def step(self, action):
+        command = action.tokens[0]
+        if self.expected is None:
+            value = {CALL_THREE: 3, CALL_FOUR: 4}[command]
+            self.expected = value * value
+            result = {9: NINE, 16: SIXTEEN}[self.expected]
+            return Observation((*action.context, *action.tokens, result))
+        answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command]
+        result = json.dumps({"answer": answer, "expected": self.expected})
+        return Observation((), EpisodeStatus.COMPLETED, result)
+
+
+@contextmanager
+def harness(identity):
+    yield SquareSession()
+
+
+def verify(episode):
+    if episode.status == EpisodeStatus.TRUNCATED:
+        return -1.
+    result = json.loads(episode.detail)
+    return float(result["answer"] == result["expected"])
+
 
 key = jax.random.key(19)
 objective = PPOObjective(ToolPolicy(), seq_len=10,
                          critic=ValueHead(TokenFeatures()), beta=.03)
-episodes = EpisodeRollout(objective.policy(objective.init(key)), Harness(), verify,
+episodes = EpisodeRollout(objective.policy(objective.init(key)), harness, verify,
                           max_prompt_tokens=8, max_new_tokens=3, max_turns=3,
                           groups=4, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,

@@ -16,6 +16,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import counted_places
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.local_attention import local_attention
 
@@ -42,13 +43,12 @@ def inputs(length, heads=4, kv_heads=2, width=16, batch=2, seed=0):
 
 
 def packed(length, cuts):
-    """Segment ids and in-document positions for documents ending at `cuts`, padding after."""
-    segments, positions, start = np.zeros(length, np.int32), np.zeros(length, np.int32), 0
+    """Segment ids for documents ending at `cuts`, padding after."""
+    segments, start = np.zeros(length, np.int32), 0
     for index, stop in enumerate(cuts, start=1):
         segments[start:stop] = index
-        positions[start:stop] = np.arange(stop - start)
         start = stop
-    return segments, positions
+    return segments
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
@@ -73,31 +73,58 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
 
 @pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
 def test_packed_documents_restart_their_windows_and_chunks(span):
-    """Chunks count from each document's first token, as `chunked_overlay`
-    reads packed positions; windows count rows inside the document. Padding
-    keys (segment 0 and invalid) are never read by a real query, one of a
-    document and valid; a padding query's output is no token's."""
+    """Chunks count each document's tokens from its first, as it would alone;
+    windows count the tokens inside the document; an invalid slot among them
+    counts in neither, as the cache counts them. Padding keys (segment 0 and
+    invalid) are never read by a real query, one of a document and valid; a
+    padding query's output is no token's."""
     length = 29
     query, key, value = inputs(length)
-    segments, positions = packed(length, (7, 18, 26))
+    segments = packed(length, (7, 18, 26))
     valid = np.ones((2, length), bool)
     valid[1, 3] = False
     rows = np.arange(length)
     keep = (
         (rows[None, :] <= rows[:, None]) & (segments[:, None] == segments[None, :]) & (segments[:, None] != 0)
     )
+    # Each slot's index among its row's real tokens, and among its document's.
+    rank = np.cumsum(valid, axis=1) - 1
+    starts = np.concatenate([[True], segments[1:] != segments[:-1]])
+    places = rank - np.maximum.accumulate(np.where(starts[None], rank + 1 - valid, 0), axis=1)
     if "window" in span:
-        keep &= rows[:, None] - rows[None, :] < span["window"]
+        keep = keep[None] & (rank[:, :, None] - rank[:, None, :] < span["window"])
     else:
-        keep &= positions[:, None] // span["chunk"] == positions[None, :] // span["chunk"]
-    keep = keep[None] & valid[:, None, :]
+        keep = keep[None] & (places[:, :, None] // span["chunk"] == places[:, None, :] // span["chunk"])
+    keep = keep & valid[:, None, :]
     expected = dense_reference(query, key, value, keep)
+    segment_ids = jnp.broadcast_to(segments, (2, length))
     actual = local_attention(
-        query, key, value, **span, segment_ids=jnp.broadcast_to(segments, (2, length)),
-        positions=None if "window" in span else jnp.asarray(positions), valid=jnp.asarray(valid),
-        implementation="xla")
+        query, key, value, **span, places=counted_places(segment_ids, jnp.asarray(valid)),
+        segment_ids=segment_ids, valid=jnp.asarray(valid), implementation="xla")
     real = (segments != 0) & valid & keep.any(-1)
     np.testing.assert_allclose(np.asarray(actual)[real], expected[real], atol=2e-6, rtol=0)
+
+
+@pytest.mark.parametrize("given", ["origin", "repeated"])
+@pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
+def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length):
+    """A chunk is cut at each token's place counted from the place its
+    document's first token is given (`counted_places`): places given from 2
+    put the first boundary after two tokens, as a continuation's whole pass
+    cuts it; places that do not count the tokens (every one 0, as tokens
+    sharing a place give) still chunk the tokens by their count. The band (12
+    tokens, chunks of 4) and the dense call (8) read the same keys, where the
+    band once read the given places within its two blocks and missed a
+    chunk's earlier keys."""
+    query, key, value = inputs(length)
+    positions = jnp.arange(length) + 2 if given == "origin" else jnp.zeros((length,), jnp.int32)
+    rows = np.arange(length)
+    places = rows + 2 if given == "origin" else rows
+    keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // 4 == places[None, :] // 4)
+    expected = dense_reference(query, key, value, np.broadcast_to(keep, (2, length, length)))
+    actual = local_attention(query, key, value, chunk=4, places=counted_places(positions=positions),
+                             implementation="xla")
+    np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=0)
 
 
 @pytest.mark.parametrize("span", [{"window": 6}, {"chunk": 8}])
@@ -140,6 +167,65 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     banded = temporaries(lambda q, k, v: local_attention(
         q, k, v, window=window, implementation="xla"))
     assert dense >= heads * length * length * 4
+    assert banded * 4 < dense
+
+
+@pytest.mark.mesh(devices=2)
+def test_chunks_from_a_shared_vector_of_places_split_over_an_explicit_sequence_axis():
+    """Places given as one `[S]` vector the rows share, from 2, split over an Explicit sequence axis
+    with the tokens: the chunks are cut from the given origin, as on one device, the vector counted as
+    a row (`counted_places`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length = 16
+    query, key, value = inputs(length, batch=1)
+    positions = jnp.arange(length) + 2
+    rows = np.arange(length)
+    keep = (rows[None, :] <= rows[:, None]) & ((rows[:, None] + 2) // 4 == (rows[None, :] + 2) // 4)
+    truth = dense_reference(query, key, value, keep[None])
+
+    def attend(q, k, v, positions):
+        return local_attention(q, k, v, chunk=4, places=counted_places(positions=positions),
+                               implementation="xla")
+
+    alone = attend(query, key, value, positions)
+    mesh = MeshSpec(sequence=2, explicit=("sequence",)).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value)]
+        shared = jax.device_put(positions, NamedSharding(mesh, PartitionSpec("sequence")))
+        split = jax.jit(attend)(*placed, shared)
+    assert_as_exact_as_the_reference(np.asarray(split), np.asarray(alone), truth, "shared places split")
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis():
+    """Split over a sequence axis, a row with padding among its tokens still runs its window
+    banded, on its real tokens compacted: its temporaries a fraction of the dense windowed call's
+    `[H, S, S]` logits at 4096 tokens and a window of 128, both measured from the compiled
+    executables on the same mesh."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length, window, heads = 4096, 128, 4
+    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
+    valid = jnp.asarray(np.arange(length) % 7 != 3)[None]
+    mesh = MeshSpec(sequence=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value, valid)]
+
+        def temporaries(fn):
+            compiled = jax.jit(fn).lower(*placed).compile()
+            return compiled.memory_analysis().temp_size_in_bytes
+
+        dense = temporaries(lambda q, k, v, valid: scaled_dot_product_attention(
+            q, k, v, causal=True, sliding_window=window, mask=valid[:, None, None, :], implementation="xla"))
+        banded = temporaries(lambda q, k, v, valid: local_attention(
+            q, k, v, window=window, valid=valid, implementation="xla"))
     assert banded * 4 < dense
 
 
@@ -195,6 +281,129 @@ def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens(
                                      "holey row")
 
 
+def test_a_chunked_kind_attends_alike_on_every_path_whatever_places_it_is_given():
+    """Given places that do not count the tokens (every token's 0, as tokens
+    sharing one place give), the whole pass (the band over 13 tokens in
+    chunks of 5) and its diagnostic path (an open `qk` collection builds the
+    dense mask) chunk the tokens alike, by their count, as near the
+    diagnostic path's float64 truth as the diagnostic path itself."""
+    model = CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
+        kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla")
+    tokens = jax.random.randint(jax.random.key(1), (2, 13), 0, 64)
+    positions = jnp.zeros(tokens.shape, jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+
+    def diagnostic(model, variables):
+        return model.apply(variables, tokens, positions=positions, mutable=["qk"])[0]
+
+    whole = model.apply(variables, tokens, positions=positions)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = np.asarray(diagnostic(model.clone(dtype=jnp.float64), wide), np.float64)
+    assert_as_exact_as_the_reference(np.asarray(whole), np.asarray(diagnostic(model, variables)), truth,
+                                     "whole pass")
+
+
+@pytest.mark.parametrize("window", [2, 8], ids=["banded", "dense"])
+def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
+    """A window spans tokens, as the cache counts them: a row whose six tokens
+    sit among padding attends as the six tokens alone do, as near the float64
+    truth of the row alone as the row alone's float32 run, through the band
+    (a window of 2 over 16 slots) and the dense call (a window of 8), as does
+    its diagnostic path (an open `qk` collection builds the dense mask), and
+    its cached prefill computes what its whole pass does. A window counted in
+    slots let the last token of slots 0, 3 and 6 see itself alone."""
+    model = CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=24, layer_types=("sliding_attention", "full_attention"),
+        kinds={"sliding_attention": {"window": window}}, attention_impl="xla")
+    real = jax.random.randint(jax.random.key(1), (1, 6), 0, 64)
+    slots = jnp.asarray([0, 3, 6, 7, 11, 15])
+    tokens = jnp.zeros((1, 16), jnp.int32).at[:, slots].set(real)
+    valid = jnp.zeros((1, 16), bool).at[:, slots].set(True)
+    variables = model.init(jax.random.key(0), tokens)
+    holey = model.apply(variables, tokens, attention_mask=valid)
+    alone = model.apply(variables, real)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = model.clone(dtype=jnp.float64).apply(wide, real)
+    assert_as_exact_as_the_reference(np.asarray(holey[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "holey row")
+    diagnostic = model.apply(variables, tokens, attention_mask=valid, mutable=["qk"])[0]
+    assert_as_exact_as_the_reference(np.asarray(diagnostic[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "diagnostic path")
+    cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
+    prefilled, _ = model.apply({**variables, "cache": cache}, tokens, attention_mask=valid, decode=True,
+                               mutable=["cache"])
+    assert_as_exact_as_the_reference(np.asarray(prefilled[:, slots]), np.asarray(alone),
+                                     np.asarray(truth, np.float64), "cached prefill")
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("explicit", [False, True], ids=["auto", "explicit"])
+@pytest.mark.parametrize("span", [{"window": 2}, {"chunk": 4}])
+def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_axis(span, explicit):
+    """A sequence axis that splits a packed row with padding among its tokens
+    in two, Auto or Explicit, its rows placed split: each real query reads
+    the keys of its document its tokens' counts say, as near the float64
+    truth as the same call on one device, which compacts the row. Compacting
+    sorts the sequence axis, which JAX refuses on an Explicit axis that
+    splits it, so the split call counts in place, its mask built from fields
+    each device holds whole."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length = 16
+    query, key, value = inputs(length, batch=1)
+    valid = jnp.asarray([[True, False, False, True, True, False, True, True] * 2])
+    segments = jnp.asarray(packed(length, (11, length))[None])
+    rank = np.cumsum(np.asarray(valid), axis=1) - 1
+    # Each token's index among its document's tokens: the second starts at slot 11, rank 6.
+    place = np.where(np.arange(length) < 11, rank, rank - 6)
+    keep = rank[:, None, :] <= rank[:, :, None]
+    keep &= np.asarray(segments)[:, :, None] == np.asarray(segments)[:, None, :]
+    if "window" in span:
+        keep &= rank[:, :, None] - rank[:, None, :] < span["window"]
+    else:
+        keep &= place[:, :, None] // span["chunk"] == place[:, None, :] // span["chunk"]
+    keep &= np.asarray(valid)[:, None, :]
+    truth = dense_reference(query, key, value, keep)
+
+    def attend(q, k, v, valid, segments):
+        return local_attention(q, k, v, **span, places=counted_places(segments, valid), segment_ids=segments,
+                               valid=valid, implementation="xla")
+
+    alone = attend(query, key, value, valid, segments)
+    mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value, valid, segments)]
+        split = jax.jit(attend)(*placed)
+    real = np.asarray(valid)[0]
+    assert_as_exact_as_the_reference(np.asarray(split)[:, real], np.asarray(alone)[:, real], truth[:, real],
+                                     f"{span} split")
+
+
+def custom_call_targets(lowered) -> list[str]:
+    """The target of every custom call in a lowered program's StableHLO module, in program order."""
+    from jax.extend.mlir import ir
+
+    targets: list[str] = []
+
+    def visit(operation):
+        if operation.name == "stablehlo.custom_call":
+            targets.append(ir.StringAttr(operation.attributes["call_target_name"]).value)
+        return ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir(dialect="stablehlo")
+    with module.context:
+        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return targets
+
+
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
@@ -221,7 +430,8 @@ def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_determini
             return jnp.sum(out.astype(jnp.float32) * cotangent * real[None, :, None, None]), out
         return jax.jit(jax.value_and_grad(run, argnums=(0, 1, 2), has_aux=True))
 
-    assert "__cudnn$fmha" in loss("auto").lower(query, key, value).compile().as_text()
+    targets = custom_call_targets(loss("auto").lower(query, key, value))
+    assert any(target.startswith("__cudnn$fmha") for target in targets), targets
 
     def oracle(query, key, value):
         q, k, v = (x.astype(jnp.float64) for x in (query, key, value))

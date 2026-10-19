@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from typing import Literal
 
 import grain.python as grain
@@ -60,13 +61,74 @@ class ValidTargets:
 
 @dataclasses.dataclass(frozen=True)
 class CountTargets(grain.MapTransform):
+    """Each record's targets the loss scores, counted once and carried on the record with the rule
+    that counted them (`recounted`), so a token mixture weighs it without counting it again."""
+
     role: int | None = None
     pad_id: int | None = None
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
         count = ValidTargets(role=self.role, pad_id=self.pad_id, measured=False)(element)
-        return Rejected("zero_targets") if count == 0 else {**element, "_dew_valid_targets": count}
+        if count == 0:
+            return Rejected("zero_targets")
+        rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
+                if value is not None}
+        kept = {name: value for name, value in element.items() if name not in (*_RULE, _BOUND)}
+        return {**kept, "_dew_valid_targets": count, **rule}
+
+
+_RULE = ("_dew_target_role", "_dew_target_pad")
+"""The fields a counted record carries its count's rule in, each where the rule sets it."""
+
+
+_COUNTED = ("text", "text_segment_ids", "text_roles")
+"""The fields a record's targets are counted from (`ValidTargets`), as they are first named."""
+
+_BOUND = "_dew_target_fields"
+"""Where a counted record names the fields its targets were counted from, as projections since
+renamed them (`rebound`), one entry each of `_COUNTED`; an empty name is one a projection removed."""
+
+
+def _bound(row: Batch) -> tuple[str, ...]:
+    return tuple(row.get(_BOUND, _COUNTED))
+
+
+def rebound(element: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
+    """Where a projection of a counted `element` (`Fields`) leaves the fields its count was counted
+    from: renamed where it renames one, empty where it drops one, which no step can count from
+    again; nothing for a record no count rides on."""
+    if "_dew_valid_targets" not in element:
+        return {}
+    names = tuple(renamed.get(name, name) if name in kept else "" if name in element else name
+                  for name in _bound(element))
+    return {_BOUND: names}
+
+
+def targets_changed(given: Batch, output: Batch) -> bool:
+    """Whether a step that made `output` of `given` changed a field its targets are counted from:
+    each read where the record names it before the step and where `output` names it after
+    (`rebound`), so a projection that moves a field, or names another field as it was, changes
+    nothing; a field the step removed pins the count, which nothing it still holds could give
+    again."""
+    pairs = [(before, after) for before, after in zip(_bound(given), _bound(output), strict=True)
+             if before in given]
+    return ("" not in _bound(output) and all(after in output for _, after in pairs)
+            and any(output[after] is not given[before] for before, after in pairs))
+
+
+def recounted(given: Batch, output: Batch) -> Batch:
+    """`output` with the targets counted on `given` (`CountTargets`): kept while the step left every
+    field they were counted from as it was, as a map of a record's other fields or a projection
+    does, and counted again by the rule that counted them where it changed one in place, as a crop
+    does, from the fields as they are named now."""
+    if "_dew_valid_targets" not in output or not targets_changed(given, output):
+        return output
+    view = {counted: output[name] for counted, name in zip(_COUNTED, _bound(output), strict=True)
+            if name in output}
+    rule = ValidTargets(role=output.get("_dew_target_role"), pad_id=output.get("_dew_target_pad"),
+                        measured=False)
+    return {**output, "_dew_valid_targets": rule(view)}
 
 
 @dataclasses.dataclass(frozen=True)
