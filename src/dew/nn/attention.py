@@ -379,12 +379,15 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     """
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
                                     axes=axes, activated=activation is not None)
+    def portable(x, branch, scale):
+        stream = x if branch is None else x + branch
+        return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                           fp32_statistics, activation)
+
     if chosen == 'pallas':
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           axes=axes)
-    stream = x if branch is None else x + branch
-    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                       fp32_statistics, activation)
+                                           portable, axes=axes)
+    return portable(x, branch, scale)
 
 
 def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
@@ -396,13 +399,16 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
     inputs' logical axes, place the kernel's rows on a mesh.
     """
+    def portable(x, gate, scale):
+        wide = at_least_fp32(x.dtype)
+        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
+        gate = gate.astype(wide)
+        return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':
-        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, axes=axes)
-    wide = at_least_fp32(x.dtype)
-    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
-    gate = gate.astype(wide)
-    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, portable, axes=axes)
+    return portable(x, gate, scale)
 
 
 def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
@@ -470,11 +476,11 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
     if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
-        # Its forward mode is the portable norm's, so a jvp of a jit that staged it keeps working.
-        fused = functools.partial(norm_swiglu.rms_norm, scale=None, epsilon=eps, dtype=x.dtype,
-                                  offset=False, after_cast=False, inverse_rounded=True)
-        portable = functools.partial(unweighted_rmsnorm, eps=eps, implementation='xla')
-        return generation.linear_tangent(fused, portable)(x)
+        def portable(x, scale):
+            return unweighted_rmsnorm(x, eps, implementation='xla')
+
+        return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
+                                    inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
