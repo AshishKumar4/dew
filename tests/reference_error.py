@@ -730,12 +730,13 @@ def element_factor(elements: int, spread: float | np.ndarray = np.pi / 2) -> flo
     return np.maximum(FACTOR, np.exp(stats.norm.isf(FALSE_FAILURE / max(elements, 1)) * deviation))
 
 
-def error_spread(absolutes, squares) -> np.ndarray:
+def error_spread(absolutes, squares, orders: int = 2 * ORDERS) -> np.ndarray:
     """Each row's E[e^2] / E[|e|]^2 over its elements' errors: `absolutes` and `squares` `[rows,
-    elements]` each element's absolute and squared errors summed over ORDERS orders, both sides'
-    elements stacked. Each element's own over its orders, pooled over the row's (its own ORDERS draws
-    too few to tell), never below a Gaussian's pi / 2 where no element moves."""
-    first, second = np.asarray(absolutes, np.float64) / ORDERS, np.asarray(squares, np.float64) / ORDERS
+    elements]` each element's absolute and squared errors summed over `orders` orders, both sides'
+    together. Each element's own over its orders, averaged over the row's (its own draws too few to
+    tell; pooled over the row's raw errors, elements of unlike scales would read as heavy tails), a
+    Gaussian's pi / 2 where no element moves."""
+    first, second = np.asarray(absolutes, np.float64) / orders, np.asarray(squares, np.float64) / orders
     moving = first > 0
     spread = np.where(moving, second / np.where(moving, np.square(first), 1), 0.0)
     counted = np.count_nonzero(moving, axis=1)
@@ -766,8 +767,7 @@ def assert_elements_as_exact_over_orders(dew_absolutes, reference_absolutes, lab
     dew_absolutes, reference_absolutes, dew_squares, reference_squares = (
         side.reshape(rows, -1) for side in sides)
     mine, theirs = dew_absolutes / ORDERS, reference_absolutes / ORDERS
-    spread = error_spread(np.concatenate([dew_absolutes, reference_absolutes], axis=1),
-                          np.concatenate([dew_squares, reference_squares], axis=1))
+    spread = error_spread(dew_absolutes + reference_absolutes, dew_squares + reference_squares)
     factor = element_factor(mine.size, spread)[:, None]
     failing = mine > factor * theirs
     if np.any(failing):

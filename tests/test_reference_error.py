@@ -221,8 +221,7 @@ def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more(tail
         sums[0][3, away], sums[1][3, away] = 0, 0
     with pytest.raises(AssertionError):
         held(misplaced, moved, "misplaced")
-    spreads = error_spread(np.concatenate([dew[0], reference[0]], axis=1),
-                           np.concatenate([dew[1], reference[1]], axis=1))
+    spreads = error_spread(dew[0] + reference[0], dew[1] + reference[1])
     factor = float(element_factor(dew[0].size, spreads[5]))
     wrong = tuple(side.copy() for side in dew)
     wrong[0][5, 17], wrong[1][5, 17] = (2 * factor * reference[0][5, 17],
@@ -244,21 +243,21 @@ def test_the_element_factor_widens_with_the_errors_tails_and_the_element_count()
     assert float(error_spread(np.zeros((1, 4)), np.zeros((1, 4)))[0]) == pytest.approx(np.pi / 2)
 
 
-def test_elements_held_over_orders_keep_their_false_failures_on_heavy_tails():
-    """Two runs as exact as each other, their errors Student-t with 3 degrees of freedom over ORDERS
-    orders (heavier-tailed than any rounding the suite saw, kurtosis past 7), held at a per-element
-    rate of 1e-3: under 2e-3 of 200000 elements fail, where the RMS ratio's F(ORDERS, ORDERS) bound
-    failed 1.4e-2 of them."""
+@pytest.mark.parametrize("degrees, allowed", [(5, 2e-3), (3, 3e-3)])
+def test_elements_held_over_orders_keep_their_false_failures_on_heavy_tails(degrees, allowed):
+    """Two runs as exact as each other, their errors Student-t over ORDERS orders (5 degrees, kurtosis
+    9, past Dory's median rows; 3, of unbounded kurtosis), held at a per-element rate of 1e-3 with
+    the spread the rule measures: of 200000 elements under 2e-3 fail at 5 degrees and under 3e-3 at
+    3, where the RMS ratio's F(ORDERS, ORDERS) bound failed 4.5e-3 and 1.4e-2."""
     from scipy import stats
 
     rng = np.random.default_rng(9)
     n = 200_000
     (mine, mine_squares), (theirs, theirs_squares) = (
-        _summed_over_orders(rng.standard_t(3, size=(ORDERS, n))) for _ in range(2))
-    spread = float(error_spread(np.concatenate([mine, theirs])[None],
-                                np.concatenate([mine_squares, theirs_squares])[None])[0])
+        _summed_over_orders(rng.standard_t(degrees, size=(ORDERS, n))) for _ in range(2))
+    spread = float(error_spread((mine + theirs)[None], (mine_squares + theirs_squares)[None])[0])
     factor = np.exp(stats.norm.isf(1e-3) * np.sqrt(2 * (spread - 1) / ORDERS))
-    assert np.mean(mine > factor * theirs) < 2e-3
+    assert np.mean(mine > factor * theirs) < allowed
 
 
 def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(tmp_path):
