@@ -241,11 +241,87 @@ def test_a_head_that_grows_its_compile_by_more_than_a_quarter_regresses(gate):
     assert gate.verdict(step_row, [10.0, 10.0, 10.01], [10.5, 10.5, 10.51])[0] == "regressed"
 
 
-def test_every_row_compiles_from_scratch(gate, monkeypatch):
-    """No round reads another's compile from JAX's persistent cache, so a compile row times a compile."""
-    commands = []
-    monkeypatch.setattr(gate.subprocess, "run",
-                        lambda command, **kwargs: commands.append(kwargs["env"]) or
-                        subprocess.CompletedProcess(command, 0, "", ""))
-    gate._run(ROOT, Path(sys.executable), "benchmark_step.py", [], ROOT / "tools", 60)
-    assert commands[0]["JAX_ENABLE_COMPILATION_CACHE"] == "false"
+CACHED = """
+import jax, jax.numpy as jnp
+counts = {"/jax/compilation_cache/cache_hits": 0, "/jax/compilation_cache/cache_misses": 0}
+def counted(event, **_):
+    if event in counts:
+        counts[event] += 1
+jax.monitoring.register_event_listener(counted)
+jax.jit(lambda x: jnp.sin(x) * 2 + 1)(jnp.arange(8.0)).block_until_ready()
+print(counts["/jax/compilation_cache/cache_hits"], counts["/jax/compilation_cache/cache_misses"])
+"""
+"""A child that compiles one small program and prints JAX's own count of cache hits and misses."""
+
+
+def test_a_tree_compiles_once_into_its_own_cache_and_later_rounds_load_from_it(gate, tmp_path, monkeypatch):
+    """Two real children of one tree with its cache: the first compiles and writes the program, though it
+    compiles in well under JAX's default one-second threshold, the second loads it; a child of the other
+    tree, with its own cache, compiles again; a child run outside a gate run keeps the caller's settings,
+    here JAX's cache turned off."""
+    for name in ("JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                 "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("JAX_ENABLE_COMPILATION_CACHE", "false")
+
+    def child(cache):
+        done = gate._run(ROOT, Path(sys.executable), "", ["-c", CACHED], ROOT / "tools", 600, cache)
+        assert done.returncode == 0, done.stderr
+        return tuple(int(word) for word in done.stdout.split()[-2:])
+
+    caches = tmp_path / "caches"
+    hits, compiled = child(caches / "base")
+    assert hits == 0 and compiled > 0 and any((caches / "base").iterdir())
+    assert child(caches / "base") == (compiled, 0)
+    assert child(caches / "head") == (0, compiled)
+    assert child(None) == (0, 0)
+
+
+def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_first_round(
+        gate, tmp_path, monkeypatch):
+    """A run gives each tree a cache of its own beside its results (made where absent), removes them at
+    its end, records each tree's compile rows in the first round alone and the step rows in every round,
+    and keeps the first round's seconds and the later rounds' apart."""
+    from types import SimpleNamespace
+
+    standing_in(gate, monkeypatch, passed=True)
+    measured_row = gate.subprocess.run
+    caches = []
+
+    def child(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
+        if command[0] == "uv":
+            (Path(command[-1]) / "bin").mkdir(parents=True)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[0] == "sh":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "JAX_COMPILATION_CACHE_DIR" in kwargs.get("env", {}):
+            caches.append((Path(kwargs["cwd"]).name, kwargs["env"]["JAX_COMPILATION_CACHE_DIR"]))
+            Path(kwargs["env"]["JAX_COMPILATION_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        return measured_row(command, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    trees = {name: tmp_path / name for name in ("main", "head")}
+    for tree in trees.values():
+        (tree / "locks").mkdir(parents=True)
+        for lock in (ROOT / "locks").glob("*.txt"):
+            (tree / "locks" / lock.name).write_text("numpy\n")
+        (tree / "tools").mkdir()
+        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+        (tree / ".python-version").write_text("3.12\n")
+    out = tmp_path / "not" / "yet" / "gate.json"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+                           only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(out), environments=str(tmp_path / "environments"))
+    assert gate.run(args) == 0
+    by_tree = {tree: {cache for name, cache in caches if name == tree} for tree in trees}
+    assert all(len(found) == 1 for found in by_tree.values()) and by_tree["main"] != by_tree["head"]
+    assert {Path(cache).name for found in by_tree.values() for cache in found} == {"base", "head"}
+    assert not any(Path(cache).exists() for found in by_tree.values() for cache in found)
+    results = json.loads(out.read_text())
+    for tree in trees:
+        compiles = ["compile lm-dense 4x1024" in sample for sample in results["samples"][tree]]
+        assert compiles == [True, False, False], (tree, compiles)
+    assert set(results["seconds"]) == {"first round", "later rounds"}
+    assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
