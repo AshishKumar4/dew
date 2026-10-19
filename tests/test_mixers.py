@@ -23,6 +23,7 @@ from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
+from dew.nn import linear
 from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
