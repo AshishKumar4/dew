@@ -85,6 +85,9 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
     resumed = objective()
     climb_to(resumed, rungs[2])
     assert rung_record(resumed, xla_defaults=False) == rungs[2]
+    # A head put back whole, as a new shape starts from the run's own rung, tiles fused again.
+    resumed.restore_head(None, fused=False)
+    assert resumed.tile_head() is not None and rung_record(resumed, xla_defaults=False)["head_fused"]
 
 
 def test_a_microbatch_is_every_splitth_row():

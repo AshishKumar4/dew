@@ -56,6 +56,7 @@ from dew.nn.inputs import (
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
+    AffineHead,
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
@@ -619,7 +620,12 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     head_fused: bool = True
     """Whether a tiled head scored for its weighted sums takes their gradient in its forward
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
-    fused chunk does not fit (`LMObjective.unfuse_head`)."""
+    fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
+
+    _head_matrix: bool = True
+    """Whether the head is one matrix (`chunked.head_table`), as the last trace of a fused loss found
+    it: past a nonlinear head transform, or with an adapter's factors beside its kernel, no matrix
+    is, and no head is fused."""
 
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -860,8 +866,10 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        head = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
-                and reads_states(self.model) else None)
+        head = None
+        if z_loss is not None and self.head_tile is not None and reads_states(self.model):
+            head = head_table(self.model, params)
+            self._head_matrix = head is not None
         table = head if self.head_fused else None
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
@@ -940,6 +948,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if self.head_tile is not None:
             return None
         self.head_tile = chunked_tile() if tile is None else tile
+        self.head_fused = True
         return f"the head tiled {self.head_tile}"
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
@@ -1309,8 +1318,10 @@ class LMObjective(TokenScorer):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The decoder, its head fused where its training loss takes the head's gradient in the
-        forward: a tiled head the model holds as a table (`token_scores`' `z_loss`)."""
-        fused = self.head_fused and self.head_tile is not None and reads_states(self.model)
+        forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
+        indexer's warm-up, which scores no head."""
+        fused = (self.head_fused and self.head_tile is not None and reads_states(self.model)
+                 and isinstance(self.model, AffineHead) and self._head_matrix and not self._warmup)
         return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
 
     def unfuse_head(self) -> str | None:

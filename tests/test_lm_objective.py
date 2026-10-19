@@ -738,6 +738,19 @@ def head_scored(vocab: int, **options):
     return model, jax.random.randint(jax.random.key(1), (2, 9), 0, vocab)
 
 
+def test_a_head_that_is_no_matrix_is_never_fused():
+    """A head past a nonlinear transform is no one matrix (`chunked.head_table`), so a training step
+    tiles it unfused, its program says so once traced, and the fit ladder has no rung to unfuse."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    params = objective.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+    assert not objective.program_key()[0].head_fused
+    assert objective.unfuse_head() is None
+
+
 def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
     """A teacher's or a student's prediction (`LMObjective.predict`) holds the
     whole logits, and scores its losses from them: its forward contracts the
