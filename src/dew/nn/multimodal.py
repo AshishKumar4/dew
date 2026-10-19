@@ -532,6 +532,9 @@ class MultimodalTransformer(nn.Module):
     def mixed_admission_refusal(self) -> str | None:
         return "media fuse into a prefill's embeddings, which a mixed call does not carry"
 
+    def split_prefill_refusal(self) -> str | None:
+        return self.language_model.split_prefill_refusal()
+
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None:
         return self.language_model.mtp_hyper_connections

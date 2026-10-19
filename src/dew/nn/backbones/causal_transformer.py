@@ -2382,6 +2382,22 @@ class CausalTransformer(nn.Module):
                 return f"layer {index}: {refusal}"
         return None
 
+    @nn.nowrap
+    def split_prefill_refusal(self) -> str | None:
+        """A cache rebuilt per request from its whole prompt, or a loop's shared cache, whose earlier
+        tokens hold the last pass's keys: a prompt's later piece would read those where its whole
+        prefill reads each pass's own."""
+        position = self.cache_rebuild_position
+        if position is not None:
+            return (f'LongRoPE crossing position {position} rebuilds a request\'s cache from its whole '
+                    'prompt; serve it with whole-prompt dense admission')
+        if self.loop is not None and self.loop.shared_cache:
+            return ("a loop's shared cache holds only the last pass's keys of the tokens before a "
+                    "call, where the whole prompt's prefill reads each pass's own; keep a cache a "
+                    "pass (Loop.shared_cache=False, Dory's recurrent_kv_cache_mode 'per_loop') for "
+                    "chunked prefill or prefix reuse")
+        return None
+
     @property
     def layer_mixer(self) -> MixerBase:
         """The mixer a layer whose kind names none builds: the model's own, else
