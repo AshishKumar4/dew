@@ -1,8 +1,12 @@
 """The performance gate's verdict (tools/perf_gate.py), on samples written here."""
 
+import base64
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -105,6 +109,7 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
         assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
 
 
+
 def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path, monkeypatch):
     """A head that changes a locked wheel (a kernel's new version) is measured with it: each tree's
     rows run in the Python of the environment its own lock installs, by its own installer, and two
@@ -116,10 +121,12 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
     built, rows = [], []
 
     def child(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
         if command[0] == "uv":
             (Path(command[-1]) / "bin").mkdir(parents=True)
         elif command[0] == "sh":
-            built.append((Path(kwargs["cwd"]), Path(kwargs["env"]["VIRTUAL_ENV"])))
+            built.append((Path(kwargs["cwd"]), Path(command[command.index("--python") + 1])))
         else:
             rows.append((Path(kwargs["cwd"]), Path(command[0])))
             return measured_row(command, **kwargs)
@@ -128,14 +135,15 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
     monkeypatch.setattr(gate.subprocess, "run", child)
     locks = [path.name for path in (ROOT / "locks").glob("*.txt")]
     trees = {name: tmp_path / name for name in ("main", "head")}
-    for tree, wheel in zip(trees.values(), ("0.3.3", "0.3.4"), strict=True):
+    for tree, wheel_version in zip(trees.values(), ("0.3.3", "0.3.4"), strict=True):
         (tree / "locks").mkdir(parents=True)
         for lock in locks:
-            (tree / "locks" / lock).write_text(f"dew-flash-attn-cu13=={wheel}\n")
+            (tree / "locks" / lock).write_text(f"dew-flash-attn-cu13=={wheel_version}\n")
         (tree / "tools").mkdir()
-        installer = (ROOT / "tools" / "install_environment.sh").read_bytes()
-        (tree / "tools" / "install_environment.sh").write_bytes(installer)
+        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
         (tree / ".python-version").write_text("3.12\n")
+        (tree / "src" / "dew" / "telemetry").mkdir(parents=True)
+        shutil.copy(ROOT / "src" / "dew" / "telemetry" / "devices.py", tree / "src" / "dew" / "telemetry")
 
     def gated(environments):
         built.clear()
@@ -147,12 +155,76 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
         assert gate.run(args) == 0
         return dict(built)
 
-    environments = gated(tmp_path / "apart")
-    assert environments.keys() == set(trees.values()) and len(set(environments.values())) == 2
+    pythons = gated(tmp_path / "apart")
+    assert pythons.keys() == set(trees.values()) and len(set(pythons.values())) == 2
     assert {tree for tree, _ in rows} == set(trees.values())
-    assert all(python == environments[tree] / "bin" / "python" for tree, python in rows)
+    assert all(python == pythons[tree] for tree, python in rows)
 
     for lock in locks:
-        (trees["head"] / "locks" / lock).write_bytes((trees["main"] / "locks" / lock).read_bytes())
+        shutil.copy(trees["main"] / "locks" / lock, trees["head"] / "locks" / lock)
     (shared,) = gated(tmp_path / "shared").values()
-    assert len(built) == 1 and {python for _, python in rows} == {shared / "bin" / "python"}
+    assert len(built) == 1 and {python for _, python in rows} == {shared}
+
+
+PROJECT = """[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probe-tree"
+version = "0"
+"""
+
+
+def wheel(directory: Path, version: str) -> Path:
+    """A wheel of the package `probe_wheel` at `version`: its module, metadata and record, zipped."""
+    info = f"probe_wheel-{version}.dist-info"
+    files = {"probe_wheel/__init__.py": f"__version__ = {version!r}\n",
+             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: probe-wheel\nVersion: {version}\n",
+             f"{info}/WHEEL": ("Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
+                               "Tag: py3-none-any\n")}
+
+    def digest(text: str) -> str:
+        return base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
+    record = "".join(f"{name},sha256={digest(text)},{len(text.encode())}\n" for name, text in files.items())
+    path = directory / f"probe_wheel-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, text in {**files, f"{info}/RECORD": f"{record}{info}/RECORD,,\n"}.items():
+            archive.writestr(name, text)
+    return path
+
+
+def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(gate, tmp_path):
+    """Built for real by each tree's own installer: a tree's process imports the wheel version its
+    lock names and Dew from its own src, also where two trees whose locks agree share one
+    environment, which is built once and then reused."""
+    trees = {}
+    for name, version in (("main", "1.0"), ("head", "2.0")):
+        tree = trees[name] = tmp_path / name
+        (tree / "locks").mkdir(parents=True)
+        (tree / "locks" / "cpu.txt").write_text(f"probe-wheel @ {wheel(tmp_path, version).as_uri()}\n")
+        (tree / "tools").mkdir()
+        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+        (tree / ".python-version").write_text("3.12\n")
+        (tree / "src" / "dew").mkdir(parents=True)
+        (tree / "src" / "dew" / "__init__.py").write_text("")
+        (tree / "pyproject.toml").write_text(PROJECT)
+
+    def imported(tree: Path, python: Path) -> tuple[str, Path]:
+        done = gate._run(tree, python, "", ["-c", "import dew, probe_wheel; print(probe_wheel.__version__, "
+                                                  "dew.__file__)"], ROOT / "tools", 600)
+        assert done.returncode == 0, done.stderr
+        version, source = done.stdout.split()
+        return version, Path(source)
+
+    cache = tmp_path / "environments"
+    pythons = {name: gate.environment(tree, "cpu", cache) for name, tree in trees.items()}
+    assert pythons["main"] != pythons["head"]
+    for (name, tree), version in zip(trees.items(), ("1.0", "2.0"), strict=True):
+        assert imported(tree, pythons[name]) == (version, tree / "src" / "dew" / "__init__.py")
+
+    shutil.copy(trees["main"] / "locks" / "cpu.txt", trees["head"] / "locks" / "cpu.txt")
+    finished = (pythons["main"].parent.parent / "complete").stat().st_mtime_ns
+    shared = gate.environment(trees["head"], "cpu", cache)
+    assert shared == pythons["main"] and (shared.parent.parent / "complete").stat().st_mtime_ns == finished
+    assert imported(trees["head"], shared) == ("1.0", trees["head"] / "src" / "dew" / "__init__.py")
