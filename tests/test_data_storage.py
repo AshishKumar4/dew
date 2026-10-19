@@ -39,8 +39,8 @@ def store(request, tmp_path):
 
 def test_a_versioned_s3_read_is_the_filesystems_own_request():
     """An S3 store's versioned read sends what its filesystem's options add to every request: an
-    object written under a customer-provided key (SSE-C) reads back with that key, and an object
-    that is absent raises FileNotFoundError."""
+    object written under a customer-provided key (SSE-C) is read with that key, and an object that
+    is absent raises FileNotFoundError."""
     import base64
     import hashlib
     import os
@@ -60,7 +60,12 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
         fs = fsspec.filesystem("s3", **options)
         fs.mkdir(bucket)
         fs.pipe(f"{bucket}/value", b"payload")
+        # The read's own parameters, as botocore builds the request from them.
+        sent = []
+        fs.s3.meta.events.register("before-parameter-build.s3.GetObject",
+                                   lambda params, **kwargs: sent.append(dict(params)))
         assert Store(f"s3://{bucket}/value", options).get_versioned().data == b"payload"
+        assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
         with pytest.raises(FileNotFoundError):
             Store(f"s3://{bucket}/absent", options).get_versioned()
     finally:
