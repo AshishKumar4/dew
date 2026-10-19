@@ -1,25 +1,21 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
-from pathlib import Path
-
+import jax
 import numpy as np
 import pytest
 from reference_error import (
     FACTOR,
     ORDERS,
-    ORDERS_DIR,
-    ORDERS_REQUESTED,
+    ROW_FACTOR,
+    STAGES,
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
-    assert_elements_as_exact_over_orders,
+    assert_elements_as_exact,
     assert_leaves_as_exact,
-    assert_leaves_as_exact_in_two_stages,
+    assert_leaves_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
     distance,
-    element_factor,
-    error_spread,
-    reduce,
 )
 
 
@@ -130,43 +126,47 @@ def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
     return draw
 
 
-def test_a_draw_within_the_factor_passes_and_an_unstable_one_is_held_over_orders(monkeypatch):
-    """The two-stage rule: an equally exact port passes on order 0 alone; one whose order 0 meets a
-    reference rounding by luck a tenth as far goes on to ORDERS draws and passes there; one rounding
-    three times as far fails over the orders as it does on one draw."""
-    monkeypatch.delenv(ORDERS_REQUESTED, raising=False)
+def counted(draw, calls: list):
+    """`draw`, each order it is asked for appended to `calls`."""
+    def run(order):
+        calls.append(order)
+        return draw(order)
+    return run
+
+
+def test_a_comparison_is_held_over_a_whole_batch_of_orders_and_one_rounding_more_fails():
+    """The K-order gate (`assert_leaves_as_exact_over_orders`) takes ORDERS orders before it passes
+    anything, as one draw within its factors is no evidence that every element is: an equally
+    exact port passes on them, as does one whose order 0 meets a reference rounding by luck a tenth
+    as far; one rounding three times as far fails."""
     calls = []
-
-    def counted(draw):
-        def run(order):
-            calls.append(order)
-            return draw(order)
-        return run
-
-    assert_leaves_as_exact_in_two_stages(counted(drawn(1.0)), "equal", rows=False)
-    assert calls == [0]
-    calls.clear()
-    assert_leaves_as_exact_in_two_stages(counted(drawn(1.0, unstable=True)), "lucky", rows=False)
+    assert_leaves_as_exact_over_orders(counted(drawn(1.0), calls), "equal", rows=False)
     assert calls == list(range(ORDERS))
+    assert_leaves_as_exact_over_orders(drawn(1.0, unstable=True), "lucky", rows=False)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact_in_two_stages(drawn(3.0, unstable=True), "rounds more", rows=False)
+        assert_leaves_as_exact_over_orders(drawn(3.0), "rounds more", rows=False)
 
 
-def test_orders_recorded_apart_reduce_to_the_rule_run_in_one_process(monkeypatch, tmp_path):
-    """CI's two passes (`record_orders`, `reduce`): order 0 recorded alone names the case for its other
-    orders where it is over its factor; all ORDERS recorded by items run apart hold it as one process
-    would, and a missing order fails it."""
-    monkeypatch.setenv(ORDERS_DIR, str(tmp_path))
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_x.py::test_case (call)")
-    monkeypatch.setenv(ORDERS_REQUESTED, "0")
-    assert_leaves_as_exact_in_two_stages(drawn(1.0, unstable=True), "lucky", rows=False)
-    assert reduce(tmp_path, stage1=True) == ["tests/test_x.py::test_case"]
-    for group in range(1, ORDERS, 13):
-        monkeypatch.setenv(ORDERS_REQUESTED, ",".join(map(str, range(group, min(group + 13, ORDERS)))))
-        assert_leaves_as_exact_in_two_stages(drawn(1.0, unstable=True), "lucky", rows=False)
-    assert reduce(tmp_path, stage1=False) == []
-    next(tmp_path.glob("*/7.json")).unlink()
-    assert reduce(tmp_path, stage1=False)
+def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_element():
+    """A port 100 times the reference's rounding on 4 of a row's 4096 elements (0.1%) moves that
+    row's RMS by sqrt(10.999), 3.3 times, inside ROW_FACTOR, and its leaf's by less, inside FACTOR;
+    the elements are held one by one and fail at every stage."""
+    unit = float(np.finfo(np.float32).eps)
+
+    def draw(order):
+        rng = np.random.default_rng(order)
+        truth = rng.normal(size=(8, 4096))
+        reference = truth + unit * rng.normal(size=truth.shape)
+        error = unit * rng.normal(size=truth.shape)
+        error[2, :4] *= 100
+        return {"leaf": truth + error}, {"leaf": reference}, {"leaf": truth}, None
+
+    (dew,), (reference,), (truth,), _ = (jax.tree.leaves(tree) for tree in draw(0))
+    assert distance(dew[2], truth[2]) < ROW_FACTOR * distance(reference[2], truth[2])
+    calls = []
+    with pytest.raises(AssertionError):
+        assert_leaves_as_exact_over_orders(counted(draw, calls), "localized")
+    assert calls == list(range(STAGES * ORDERS))
 
 
 def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
@@ -183,92 +183,64 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
         assert_rows_as_exact_over_orders(dew, reference, "one row")
 
 
-def _summed_over_orders(errors):
-    """Each element's absolute and squared errors summed over its orders, `errors` `[ORDERS, ...]`."""
-    return np.sum(np.abs(errors), axis=0), np.sum(np.square(errors), axis=0)
+def staged(dew, reference):
+    """A `batch` for `assert_elements_as_exact` from `[stages, ...]` sums, each stage asked for appended
+    to the returned list."""
+    asked = []
+
+    def batch(stage):
+        asked.append(stage)
+        return dew[stage], reference[stage]
+    return batch, asked
+
+
+def test_an_element_flagged_by_chance_clears_at_a_confirmation_and_one_rounding_more_does_not():
+    """Each element's mean absolute error over ORDERS orders against FACTOR times the reference's
+    there (`assert_elements_as_exact`): an element three times the reference's at stage 0 alone is
+    re-measured over fresh orders and clears; one three times it at every stage fails, after
+    STAGES; elements both compute exactly pass; one Dew rounds where the reference is exact in
+    every order fails; a non-finite one fails at the stage it is measured, before any other."""
+    rng = np.random.default_rng(6)
+    dew, reference = (np.sum(np.abs(rng.standard_normal((STAGES, ORDERS, 64, 256))), axis=1)
+                      for _ in range(2))
+    batch, asked = staged(dew, reference)
+    assert_elements_as_exact(batch, "alike")
+    assert asked == [0]
+    once = dew.copy()
+    once[0, 3, 5] = 3 * reference[0, 3, 5]
+    batch, asked = staged(once, reference)
+    assert_elements_as_exact(batch, "once")
+    assert asked == [0, 1]
+    always = dew.copy()
+    always[:, 3, 5] = 3 * reference[:, 3, 5]
+    batch, asked = staged(always, reference)
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact(batch, "always")
+    assert asked == list(range(STAGES))
+    exact, both = reference.copy(), dew.copy()
+    exact[:, :, :8], both[:, :, :8] = 0, 0
+    assert_elements_as_exact(staged(both, exact)[0], "both exact")
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact(staged(dew, exact)[0], "exact only in the reference")
+    broken = dew.copy()
+    broken[0, 0, 0] = np.nan
+    batch, asked = staged(broken, reference)
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact(batch, "nan")
+    assert asked == [0]
 
 
 @pytest.mark.parametrize("tails", ["gaussian", "laplace", "student-t5"])
-def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more(tails):
-    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`), each held to the
-    reference's own mean absolute error at it, for errors of a Gaussian's tails and heavier ones, as
-    a bf16 rounding's flips give: 64 rows of 4096 elements rounding alike pass, as do elements both
-    compute exactly; an element Dew rounds where the reference is exact in every order fails, as do
-    one whose error the reference has elsewhere in its row, one rounding twice its row's derived
-    factor as far, and a non-finite one."""
-    rng = np.random.default_rng(6)
-    shape = (64, 4096)
-    draw = {"gaussian": lambda: rng.standard_normal((ORDERS, *shape)),
-            "laplace": lambda: rng.laplace(size=(ORDERS, *shape)),
-            "student-t5": lambda: rng.standard_t(5, size=(ORDERS, *shape))}[tails]
-    spread = 3e-6
-    dew, reference = (_summed_over_orders(spread * draw()) for _ in range(2))
-
-    def held(dew, reference, label):
-        assert_elements_as_exact_over_orders(dew[0], reference[0], label, dew_squares=dew[1],
-                                             reference_squares=reference[1])
-
-    held(dew, reference, "alike")
-    both, exact = (tuple(side.copy() for side in sums) for sums in (dew, reference))
-    for side in (*both, *exact):
-        side[:, :8] = 0
-    held(both, exact, "both exact")
-    with pytest.raises(AssertionError):
-        held(dew, exact, "exact only in the reference")
-    moved, misplaced = (tuple(side.copy() for side in sums) for sums in (reference, dew))
-    for sums, (at, away) in ((moved, (0, 1)), (misplaced, (1, 0))):
-        sums[0][3, at], sums[1][3, at] = ORDERS * 30 * spread, ORDERS * (30 * spread) ** 2
-        sums[0][3, away], sums[1][3, away] = 0, 0
-    with pytest.raises(AssertionError):
-        held(misplaced, moved, "misplaced")
-    spreads = error_spread(dew[0] + reference[0], dew[1] + reference[1])
-    factor = float(element_factor(dew[0].size, spreads[5]))
-    wrong = tuple(side.copy() for side in dew)
-    wrong[0][5, 17], wrong[1][5, 17] = (2 * factor * reference[0][5, 17],
-                                        (2 * factor) ** 2 * reference[1][5, 17])
-    with pytest.raises(AssertionError):
-        held(wrong, reference, "one element")
-    broken = tuple(side.copy() for side in dew)
-    broken[0][0, 0] = np.nan
-    with pytest.raises(AssertionError):
-        held(broken, reference, "nan")
-
-
-def test_the_element_factor_widens_with_the_errors_tails_and_the_element_count():
-    """The derived factor (`element_factor`): 3.06 at 43.5M elements of a Gaussian's spread, wider
-    for a Laplace's (spread 2), and at least FACTOR; the spread is each row's pooled over its
-    elements (`error_spread`), a Gaussian's where none moves."""
-    assert round(float(element_factor(332 * 131072)), 2) == 3.06
-    assert float(element_factor(332 * 131072, 2.0)) > float(element_factor(332 * 131072)) >= FACTOR
-    assert float(error_spread(np.zeros((1, 4)), np.zeros((1, 4)))[0]) == pytest.approx(np.pi / 2)
-
-
-@pytest.mark.parametrize("degrees, allowed", [(5, 2e-3), (3, 3e-3)])
-def test_elements_held_over_orders_keep_their_false_failures_on_heavy_tails(degrees, allowed):
-    """Two runs as exact as each other, their errors Student-t over ORDERS orders (5 degrees, kurtosis
-    9, past Dory's median rows; 3, of unbounded kurtosis), held at a per-element rate of 1e-3 with
-    the spread the rule measures: of 200000 elements under 2e-3 fail at 5 degrees and under 3e-3 at
-    3, where the RMS ratio's F(ORDERS, ORDERS) bound failed 4.5e-3 and 1.4e-2."""
-    from scipy import stats
-
+def test_two_ports_equally_exact_pass_element_by_element_on_tails_heavier_than_a_gaussians(tails):
+    """Two runs as exact as each other over 200000 elements, their errors Gaussian, Laplace or
+    Student t of 5 degrees (kurtosis 9, past Dory's median rows): stage 0 flags some by chance, a
+    few hundred on the heaviest, and the confirmations clear them. A check of the mechanism, not the
+    rule's calibration, which real order traces at the real element count set (STAGES)."""
     rng = np.random.default_rng(9)
-    n = 200_000
-    (mine, mine_squares), (theirs, theirs_squares) = (
-        _summed_over_orders(rng.standard_t(degrees, size=(ORDERS, n))) for _ in range(2))
-    spread = float(error_spread((mine + theirs)[None], (mine_squares + theirs_squares)[None])[0])
-    factor = np.exp(stats.norm.isf(1e-3) * np.sqrt(2 * (spread - 1) / ORDERS))
-    assert np.mean(mine > factor * theirs) < allowed
-
-
-def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(tmp_path):
-    """`python tests/reference_error.py reduce DIR` reads a directory of recorded orders and exits
-    zero where it holds none to fail."""
-    import subprocess
-    import sys
-
-    found = subprocess.run([sys.executable, str(Path(__file__).parent / "reference_error.py"), "reduce",
-                            str(tmp_path)], capture_output=True, text=True, check=False, timeout=120)
-    assert found.returncode == 0, found.stderr
+    draw = {"gaussian": rng.standard_normal, "laplace": lambda size: rng.laplace(size=size),
+            "student-t5": lambda size: rng.standard_t(5, size=size)}[tails]
+    sums = [[np.sum(np.abs(draw((ORDERS, 200_000))), axis=0) for _ in range(STAGES)] for _ in range(2)]
+    assert_elements_as_exact(lambda stage: (sums[0][stage], sums[1][stage]), tails)
 
 
 def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
@@ -288,5 +260,7 @@ def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
     assert_computes_the_oracle(twin, truth, "a cancelled row", roundings=64)
     wrong = twin.copy()
     wrong[2, 5] = truth[2, 5] + 1e-11
-    with pytest.raises(AssertionError, match="entries"):
+    # The global RMS bound alone passes it.
+    assert distance(wrong, truth) <= FACTOR * 64 * eps * float(np.sqrt(np.mean(np.square(truth))))
+    with pytest.raises(AssertionError):
         assert_computes_the_oracle(wrong, truth, "one entry", roundings=64)

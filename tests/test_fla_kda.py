@@ -98,7 +98,7 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
         group = value_heads // key_heads
         q, k = (jnp.repeat(x, group, axis=2) for x in operands64[:2])
         terms = (*terms[:5], np.maximum(terms[5], fla_decay_terms(q, k, *operands64[2:])), *terms[6:])
-    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED, terms=terms)
+    assert_leaves_as_exact(got, want, widened(truth), terms=terms)
 
 
 @pytest.mark.gpu(reason="the layer runs the port where the GPU's own target row names it")

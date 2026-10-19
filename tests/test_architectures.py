@@ -602,8 +602,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         for layout in layouts:
             for name in ("variables", "opt_state", "ema"):
                 assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), reductions=reductions,
-                                       terms=getattr(terms, name), rows=rows)
+                                       getattr(exact, name), terms=getattr(terms, name), rows=rows)
         return layouts
 
     as_near(1, rows=True)
