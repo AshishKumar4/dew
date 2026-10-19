@@ -29,8 +29,8 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
     PretrainedDecoder.from_model(model, variables).save(tmp_path / "decoder")
     out = tmp_path / "drift.json"
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "decode_drift.py"),
-                           "--model", str(tmp_path / "decoder"), "--steps", str(STEPS), "--prompt", str(PROMPT),
-                           "--vocab-limit", "200", "--out", str(out)],
+                           "--model", str(tmp_path / "decoder"), "--steps", str(STEPS),
+                           "--prompt", str(PROMPT), "--vocab-limit", "200", "--out", str(out)],
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
                                "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}, cwd=ROOT)
     record = json.loads(out.read_text())
