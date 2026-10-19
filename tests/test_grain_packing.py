@@ -16,6 +16,7 @@ from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.plan import fingerprint
 from dew.data.text import Chunks
+from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -110,9 +111,11 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
 
 
 def pairs(batch, field="text"):
-    """The next-token pairs of `field` inside one segment of each window of a packed batch."""
+    """The next-token pairs of `field` inside one segment of each real window of a packed batch,
+    its repeats that fill the last batch (`VALID_ROWS`) left out."""
     tokens, segments = np.asarray(batch[field]), np.asarray(batch["text_coordinates"].segments)
-    return [(int(row[at]), int(row[at + 1])) for row, segment in zip(tokens, segments, strict=True)
+    return [(int(row[at]), int(row[at + 1]))
+            for row, segment, kept in zip(tokens, segments, np.asarray(batch[VALID_ROWS]), strict=True) if kept
             for at in range(row.size - 1) if segment[at] and segment[at] == segment[at + 1]]
 
 
