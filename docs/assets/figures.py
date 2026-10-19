@@ -630,7 +630,7 @@ def rlvr_kl_figure():
 def sft_mask_figure():
     """One conversation through a chat template: the messages, the tokens the template writes with each
     one's role, and the loss mask, 1 on the assistant's reply and its closing marker."""
-    width, height = 440, 300
+    width, height = 440, 336
     svg = Figure(width, height, seconds=11, label="A conversation through the chat template. The user's "
                  "question and the assistant's reply become one row of tokens with their roles, and the loss "
                  "mask is 1 only on the reply and its end-of-turn marker.")
@@ -645,7 +645,7 @@ def sft_mask_figure():
             ("<|im_start|>", "none"), ("assistant", "none"), ("Light", "accent_fill"),
             ("scatters", "accent_fill"), (".", "accent_fill"), ("<|im_end|>", "accent_fill")]
     x, y, line = 20, 112, 0
-    svg.text(20, 100, "tokens the template writes", size=13, color="muted")
+    svg.text(20, 100, "tokens the template writes, and the loss mask m under each", size=13, color="muted")
     placed = []
     for k, (token, fill) in enumerate(rows):
         w = 12 + 7.2 * len(token)
@@ -659,13 +659,12 @@ def sft_mask_figure():
         svg.appear(box, 0.6 + 0.12 * k)
         placed.append((x, top, w, fill == "accent_fill"))
         x += w + 4
-    svg.appear(svg.text(20, 268, "loss mask m", size=13, color="muted"), 3.4)
     for k, (bx, top, w, scored) in enumerate(placed):
         mark = svg.text(bx + w / 2, top + 44, "1" if scored else "0", size=13, mono=True, anchor="middle",
                         weight=600 if scored else 400, color="accent" if scored else "muted")
         svg.appear(mark, 3.8 + 0.1 * k)
-    svg.appear(svg.text(width - 20, 268, "only the reply is trained", size=13, color="accent", anchor="end"),
-               5.6)
+    svg.appear(svg.text(width - 20, height - 14, "only the reply is trained", size=13, color="accent",
+                        anchor="end"), 5.6)
     svg.save(HERE / "sft-mask.svg")
 
 
