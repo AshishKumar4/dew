@@ -1,8 +1,9 @@
 """Loader batches and RNG against frozen references, with real workers.
 
-Images pin the public-stage recipe. Packed batches pin host Coordinates,
-with the token, segment and position values from 66beb5305 unchanged.
-The other loaders pin 66beb5305.
+Images pin the public-stage recipe. Packed batches pin host Coordinates;
+packed text pins documents cut into pieces that share their boundary token,
+where 66beb5305 lost each piece's first next-token target. The other
+loaders pin 66beb5305.
 """
 
 import gzip

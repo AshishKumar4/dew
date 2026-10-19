@@ -16,7 +16,7 @@ import tyro
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Rejected, Stage
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted
 from dew.data.sources.codec import content_fingerprint
 from dew.records import integer
 
@@ -72,8 +72,7 @@ class _SliceRecords:
         return SourceSlice(records, self.start, stop)
 
     def metadata(self) -> Mapping[str, object]:
-        stated = self.source.metadata()
-        return {**stated, **({"held_out": self.start} if self.start else {})}
+        return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -154,20 +153,32 @@ class _HashSource:
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
+        return _uncounted(self.source.metadata())
 
     def lengths(self) -> np.ndarray | None:
         return None
 
     def manifest(self) -> ShardManifest:
+        """The source's shards, each read through the hash. Which of a shard's rows the hash keeps
+        is known only once they are read, so no shard states its rows."""
         manifest = self.source.manifest()
-        return dataclasses.replace(manifest, reader=functools.partial(self._reader, manifest))
+        subdivide = manifest.subdivide
+        return ShardManifest(_unsized(manifest.shards), functools.partial(self._reader, manifest),
+                             None if subdivide is None else functools.partial(_unsized_parts, subdivide))
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
         from dew.data.mixing import Accepted
 
         rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held, self.key))
         return Accepted(rows, self.describe())
+
+
+def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
+    return tuple(dataclasses.replace(shard, rows=None) for shard in shards)
+
+
+def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) -> tuple[Shard, ...]:
+    return _unsized(subdivide(count))
 
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
@@ -312,7 +323,7 @@ class _RandomSource:
         return grain.MapDataset.source(self._indices(len(rows))).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
+        return _uncounted(self.source.metadata())
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
