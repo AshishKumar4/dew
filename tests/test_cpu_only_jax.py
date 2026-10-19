@@ -84,8 +84,11 @@ def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_pa
     env["CUDA_VISIBLE_DEVICES"] = "999"
     if platforms is not None:
         env["JAX_PLATFORMS"] = platforms
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # This checkout's Dew, ahead of any the environment installs.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.path.join(root, "src"), os.environ.get("PYTHONPATH"))))
     done = subprocess.run([sys.executable, "-c", READIED, entry], capture_output=True, text=True, env=env,
-                          timeout=300, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                          timeout=300, cwd=root)
     assert done.returncode == (0 if platforms == "cpu" else REFUSED), done.stderr[-2000:]
 
 
@@ -145,7 +148,10 @@ def test_an_application_that_routes_dews_records_receives_them_through_its_handl
     """An application that gives Dew's logger a handler of its own before a run's setup keeps it:
     two fits and setups attach none of Dew's, and Dew's records reach the application's root
     handler."""
+    tests = os.path.dirname(os.path.abspath(__file__))
+    # This checkout's Dew, ahead of any the environment installs, and its test helpers.
+    path = os.pathsep.join(filter(None, (os.path.join(os.path.dirname(tests), "src"), tests,
+                                         os.environ.get("PYTHONPATH"))))
     done = subprocess.run([sys.executable, "-c", ROUTED], capture_output=True, text=True, timeout=300,
-                          cwd=os.path.dirname(os.path.abspath(__file__)),
-                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+                          cwd=tests, env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
     assert done.returncode == 0, done.stderr[-2000:]
