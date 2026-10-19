@@ -9,13 +9,11 @@ Only the container is handled here. No leaf is renamed, transposed or cast.
 The names on disk are the module names in the tree.
 """
 
-import contextlib
 import json
 import math
 import os
 import re
 import secrets
-import tempfile
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from pathlib import Path
 
@@ -291,15 +289,15 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     """
     filename = os.fspath(path)
     package, _ = _safetensors()
-    with open(filename, "rb") as stream:
-        prefix = stream.read(8)
-        length = int.from_bytes(prefix, "little")
-        with _stand_in(prefix + stream.read(min(length, _MAX_HEADER)), os.fstat(stream.fileno()).st_size
-                       ) as validated, package.safe_open(validated, "np") as reader:
-            metadata = reader.metadata() or {}
-            names = reader.offset_keys()
-            stored = [(name, reader.get_slice(name)) for name in names]
-            layout = [(name, tuple(view.get_shape()), view.get_dtype()) for name, view in stored]
+    # One open file answers for the header, its validation and the bytes: `_publish`
+    # replaces the pathname, so a reopened path can be another file. safe_open takes
+    # only a path, so it validates the open file through its descriptor's name, which
+    # every platform Dew installs on has (grain, a dependency, ships no Windows wheels).
+    with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
+        length = int.from_bytes(stream.read(8), "little")
+        metadata = reader.metadata() or {}
+        stored = [(name, reader.get_slice(name)) for name in reader.offset_keys()]
+        layout = [(name, tuple(view.get_shape()), view.get_dtype()) for name, view in stored]
         mapping = np.memmap(stream, mode="c" if copy_on_write else "r", dtype=np.uint8)
     tensors: dict[str, np.ndarray] = {}
     # safe_open has checked that the tensors tile the data in offset order, so
@@ -323,28 +321,6 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
         offset += math.prod(shape) * dtype.itemsize
     return dict(sorted(tensors.items())), metadata
 
-
-_MAX_HEADER = 100_000_000
-"""The largest header safetensors reads (`MAX_HEADER_SIZE`, safetensors 0.8.0): a
-read of a header stops there, so a corrupt length cannot read a whole file."""
-
-
-@contextlib.contextmanager
-def _stand_in(header: bytes, size: int) -> Iterator[str]:
-    """A file of `size` bytes that starts with `header` and holds nothing past it,
-    sparse, for safe_open to validate in place of the file `header` was read from.
-
-    safe_open reads a path, and a reader that reopens a path can meet another file,
-    since `_publish` replaces it; a descriptor's /dev/fd name is no path to the open
-    file in a sandboxed /proc (armada's containers), and safetensors' reader of an
-    open file is private. Its checks read the header and the length alone, never the
-    tensors' bytes, so the stand-in gets every one of them as the file would.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".safetensors") as stand_in:
-        stand_in.write(header)
-        stand_in.truncate(size)
-        stand_in.flush()
-        yield stand_in.name
 
 
 class LazyTensors(Mapping[str, np.ndarray]):
