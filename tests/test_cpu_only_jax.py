@@ -36,6 +36,7 @@ REFUSED = 3
 READIED = f"""
 import logging
 import sys
+import traceback
 
 import dew
 assert not logging.getLogger("dew").handlers, "import dew configured Dew's logger"
@@ -59,6 +60,9 @@ def run():
 try:
     run()
 except RuntimeError as refused:
+    # Dew's refusal, and no other failure of the run's setup.
+    if traceback.extract_tb(refused.__traceback__)[-1].name != "refuse_cpu_only_jax":
+        raise
     print(refused, file=sys.stderr)
     sys.exit({REFUSED})
 finally:
@@ -69,13 +73,16 @@ finally:
 @pytest.mark.parametrize("platforms", [None, "cpu"])
 @pytest.mark.parametrize("entry", ["prepare", "fit"])
 def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_path, platforms, entry):
-    """A stand-in nvidia-smi reports driver 580 and two GPUs beside a JAX that opens on the CPU:
+    """A stand-in nvidia-smi reports driver 580 and two GPUs beside a JAX that opens on the CPU, no
+    GPU being visible to it:
     `import dew` leaves the process alone, its logger and its hardware, and a run's setup,
     `prepare_process` or a `Trainer.fit` no `prepare_process` came before, stops with what
     `cpu_only_refusal` says of this environment's JAX, the plain refusal where it finds an install
     that should run. Either way the run gives Dew's logger its handler. JAX_PLATFORMS=cpu runs."""
     env = {key: value for key, value in os.environ.items() if key != "JAX_PLATFORMS"}
     env["PATH"] = stand_in(tmp_path, "580.82.07, 8.9\\n580.82.07, 8.6\\n")
+    # No GPU this process can open, on a host with GPUs too: JAX opens on the CPU.
+    env["CUDA_VISIBLE_DEVICES"] = ""
     if platforms is not None:
         env["JAX_PLATFORMS"] = platforms
     done = subprocess.run([sys.executable, "-c", READIED, entry], capture_output=True, text=True, env=env,
@@ -100,3 +107,31 @@ def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(driver, cuda, new
         assert (cpu_only_refusal({}, gpus, installed, cuda) is None) == runs
     if cuda is not None:
         assert newest_build(gpus, cuda) == newest
+
+
+ROUTED = """
+import logging
+
+received = []
+
+
+class Received(logging.Handler):
+    def emit(self, record):
+        received.append(record.getMessage())
+
+
+logging.getLogger().addHandler(Received())
+from dew.training.runtime import ready_process
+
+ready_process()
+logging.getLogger("dew.training").warning("through the application's handler")
+assert not logging.getLogger("dew").handlers and received == ["through the application's handler"], received
+"""
+
+
+def test_an_application_that_configured_its_logging_receives_dews_records_through_it():
+    """Where the application's root logger has a handler, a run's setup attaches none of Dew's own,
+    so Dew's records reach the application's handler, as any library's do."""
+    done = subprocess.run([sys.executable, "-c", ROUTED], capture_output=True, text=True, timeout=300,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stderr[-2000:]
