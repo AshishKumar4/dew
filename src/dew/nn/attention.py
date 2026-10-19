@@ -49,7 +49,7 @@ from .documents import (
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
-from .kernels.generation import bf16_dot_runs, device_generation, gpu_placed
+from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import KernelRefused, forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
@@ -1619,8 +1619,9 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     masked = 'xla' if implementation in ('auto', 'cudnn') else implementation
     if masked != 'xla':
         return masked
-    case = attention_case(query, key, dtype=dtype, precision=precision,
-                          force_fp32_for_softmax=force_fp32_for_softmax, mask=True, named='xla')
+    case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
+                                              force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
+                               mask=True, folds=False)
     return 'reference' if ATTENTION.kernel('xla').failed(case) else 'xla'
 
 
