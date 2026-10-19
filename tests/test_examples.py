@@ -239,14 +239,14 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
 def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     """The diffusion run's whole arc: synthetic ArrayRecords in, a run
     directory with its record and checkpoint, a samples grid out of
-    `dew.pipeline`, and the CLIPScore and FID of that grid, both scored
+    `dew.pipeline`, and the held-out split's CLIPScore and FID, both scored
     against a committed fixture rather than a download."""
     smoke("train_flowers_tpu", tmp_path)
 
     grid = np.asarray(__import__("PIL.Image").Image.open(tmp_path / "samples.png"))
     assert grid.shape == (16, 4 * 16, 3) and grid.dtype == np.uint8
     scored = json.loads((tmp_path / "eval.json").read_text())
-    assert "clip_score" in scored and scored["fid"] >= 0
+    assert "val/clip_score" in scored and scored["val/fid"] >= 0
     assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
 
 
