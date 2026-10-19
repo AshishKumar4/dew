@@ -2,8 +2,8 @@
 
 The encoder is the run's model. The predictor takes the encoder's width and
 heads, and its own depth and width from `predictor`: a predictor as wide as
-the encoder makes the objective too easy. The probes score the frozen
-encoder at every validation.
+the encoder makes the objective too easy. Optional probes score the frozen
+encoder beside the validation loss.
 """
 
 from __future__ import annotations
@@ -39,15 +39,9 @@ class JepaRunConfig(RunConfig):
     target_scale: tuple[float, float] = (0.15, 0.2)
     target_aspect: tuple[float, float] = (0.75, 1.5)
     probe_classes: int | None = None
-    """Number of classes for the frozen-encoder probes, which are what a
-    validation pass scores; a run without them schedules no pass."""
+    """Number of classes for optional frozen-encoder probes; without them,
+    validation scores the loss alone."""
     knn_k: int = 20
-
-    def __post_init__(self) -> None:
-        if self.probe_classes is None and self.trainer.eval_every is not None:
-            raise ValueError(
-                "a JEPA validation pass scores the frozen-encoder probes; set probe_classes, "
-                "or --trainer.eval-every None for a run without them")
 
     def sample(self) -> Field:
         """The batch field the encoder reads, at the resolution the data comes in."""
