@@ -13,12 +13,20 @@ import dataclasses
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
+from flax import linen as nn
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_rounds_where_the_reference_does,
+    float64_forward,
+    ieee_fixture,
+)
 
+from dew.nn.attention import RMSNorm
 from dew.nn.mimo_audio import (
     AudioTokenizerEncoder,
     MiMoAudioCodeEncoder,
@@ -122,3 +130,83 @@ def test_a_bf16_checkpoint_binds_in_its_own_dtype_and_runs():
     mask = np.arange(refs["mels"].shape[1])[None, :] < refs["lengths"][:, None]
     encoding = tower.build().apply(variables, jnp.asarray(refs["mels"], jnp.bfloat16), mask)
     assert np.isfinite(np.asarray(encoding.features, np.float32)).all()
+
+
+def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
+    """The code encoder's transformer in bfloat16 against the class MiMo builds for it,
+    transformers' Qwen2Model (modeling_mimo_v2.py:944-957 at 6a7f202), on the same
+    bfloat16 weights and code embeddings: as exact as Qwen2Model's bfloat16 from its
+    float64 one (tests/reference_error.py's rule). Every norm the encoder runs, given the
+    input it received, rounds where Qwen2RMSNorm does (modeling_qwen2.py:247-252): the
+    normalized activations cast to bfloat16 before the weight multiplies them. Scaling
+    before the cast is the more accurate order, so only the per-norm check tells them apart."""
+    import contextlib
+
+    import torch
+    from transformers import Qwen2Config, Qwen2Model
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+    from tools.diffusers_wan_reference import float64
+
+    config, variables, refs = load()
+    audio = json.loads((FIXTURE / "config.json").read_text())["audio_config"]
+    encoder = {name.removeprefix("encoder/").removeprefix("audio_encoder."): value
+               for name, value in refs.items() if name.startswith("encoder/")}
+    params = {"params": jax.tree.map(lambda leaf: np.asarray(leaf, ml_dtypes.bfloat16),
+                                     variables["params"]["encoder"])}
+    codes = refs["codes_0"]
+    norms = []
+
+    def record(call, args, kwargs, context):
+        out = call(*args, **kwargs)
+        if isinstance(context.module, RMSNorm) and context.method_name == "seam":
+            module = context.module
+            norms.append((module.path, out, module.variables["params"]["scale"], module.epsilon))
+        return out
+
+    with nn.intercept_methods(record):
+        _, state = MiMoAudioCodeEncoder(config, dtype=jnp.bfloat16).apply(
+            params, codes[None], np.asarray([len(codes)], np.int32), capture_intermediates=True,
+            mutable=["intermediates"])
+    ours = np.asarray(state["intermediates"]["norm"]["__call__"][0], np.float32)
+    assert len(norms) == 2 * audio["input_local_layers"] + audio["add_post_norm"]
+    for path, (stream, normed), scale, epsilon in norms:
+        norm = Qwen2RMSNorm(stream.shape[-1], eps=epsilon).to(torch.bfloat16)
+        with torch.no_grad():
+            norm.weight.copy_(torch.from_numpy(np.asarray(scale, np.float32)))
+            theirs = norm(torch.from_numpy(np.asarray(stream, np.float32)).to(torch.bfloat16))
+        wide = np.asarray(stream, np.float64)
+        truth = (np.asarray(scale, np.float64) * wide
+                 / np.sqrt(np.mean(wide * wide, axis=-1, keepdims=True) + epsilon))
+        assert_rounds_where_the_reference_does(
+            np.asarray(normed, np.float64), theirs.double().numpy(), truth, "/".join(path))
+
+    def reference(dtype):
+        # The float64 truth is built and run under `float64`, so the norms' and the
+        # rotary's float32 pins compute in float64 too.
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            model = Qwen2Model(Qwen2Config(
+                hidden_size=audio["input_local_dim"], num_hidden_layers=audio["input_local_layers"],
+                num_attention_heads=audio["input_local_attn_heads"],
+                num_key_value_heads=audio["input_local_attn_heads"],
+                intermediate_size=audio["input_local_intermediate_size"],
+                rope_theta=audio["rope_theta"])).eval()
+            model.load_state_dict({name.removeprefix("input_local_transformer."): torch.from_numpy(value)
+                                   for name, value in encoder.items()
+                                   if name.startswith("input_local_transformer.")}, strict=False)
+            model = model.to(dtype)
+            group, frames = audio["group_size"], len(codes)
+            groups = -(-frames // group)
+            held = torch.from_numpy(np.concatenate([codes, codes[-1:].repeat(groups * group - frames, 0)]))
+            tables = [torch.from_numpy(encoder[f"speech_embeddings.{channel}.weight"]).to(dtype)
+                      for channel in range(audio["audio_channels"])]
+            embedded = sum(torch.nn.functional.embedding(held[:, channel].long(), table)
+                           for channel, table in enumerate(tables))
+            with torch.no_grad():
+                return model(inputs_embeds=embedded.reshape(groups, group, -1), use_cache=False,
+                             is_causal=not audio["input_full_attention"]).last_hidden_state.double().numpy()
+
+    assert_as_exact_as_the_reference(ours.reshape(-1, ours.shape[-1]),
+                                     reference(torch.bfloat16).reshape(-1, ours.shape[-1]),
+                                     reference(torch.float64).reshape(-1, ours.shape[-1]),
+                                     "code encoder transformer in bfloat16")
