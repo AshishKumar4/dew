@@ -529,7 +529,10 @@ class Serving(Protocol):
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
     run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
-    prefill calls would, or None."""
+    prefill calls would, or None. `split_prefill_refusal` says why it
+    prefills each prompt whole, a prompt taken in pieces or after a prefix
+    another request cached computing something its whole prefill does not,
+    and what serves those modes instead, or None."""
 
     def inference_projection_groups(self, variables: Mapping[str, Mapping]
                                     ) -> tuple[ProjectionGroup, ...]: ...
@@ -538,6 +541,8 @@ class Serving(Protocol):
     def cache_rebuild_position(self) -> int | None: ...
 
     def mixed_admission_refusal(self) -> str | None: ...
+
+    def split_prefill_refusal(self) -> str | None: ...
 
 
 @runtime_checkable

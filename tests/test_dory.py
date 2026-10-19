@@ -181,21 +181,37 @@ def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
 
 
 @pytest.mark.parametrize(('mode', 'options'), [
-    ('per_loop', {}), ('per_loop', {'kv_cache': KVCache(page_size=4, pages=40), 'chunk': 2}),
+    ('per_loop', {}),
+    ('per_loop', {'kv_cache': KVCache(page_size=4, pages=40), 'chunk': 2, 'prefix_cache': True}),
     ('last_loop', {}), ('last_loop', {'kv_cache': KVCache(page_size=4, pages=40)})],
-    ids=['per_loop-dense', 'per_loop-paged-chunked', 'last_loop-dense', 'last_loop-paged'])
+    ids=['per_loop-dense', 'per_loop-paged-chunked-prefix', 'last_loop-dense', 'last_loop-paged'])
 def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options):
     """Served side by side, over a dense cache or a pool of pages, each prompt continues as the
-    reference continues it alone. A per-pass cache also takes its prompt in pieces of two; a
-    shared one is prefilled whole, as the reference's is, since each piece's passes would read
-    the last pass's keys of the pieces before it."""
+    reference continues it alone, and so does the longer prompt asked again once a slot frees. A
+    per-pass cache also takes its prompts in pieces of two, the second ask reusing the first's
+    pages; a shared one prefills each prompt whole, as the reference's is."""
     task = greedy(mode)
     server = Server.from_task(task, slots=2, capacity=32, **options)
-    tickets = [server.submit(prompt, 6, key=index) for index, prompt in enumerate(ragged_prompts())]
+    prompts = [*ragged_prompts(), ragged_prompts()[1]]
+    tickets = [server.submit(prompt, 6, key=index) for index, prompt in enumerate(prompts)]
     server.run()
-    for ticket, expected in zip(tickets, REFERENCE[f'ragged_{mode}'], strict=True):
+    expected = [*REFERENCE[f'ragged_{mode}'], REFERENCE[f'ragged_{mode}'][1]]
+    for ticket, continuation in zip(tickets, expected, strict=True):
         served = ticket.result().host()
-        np.testing.assert_array_equal(served.tokens[0, served.prompt_width:], expected)
+        np.testing.assert_array_equal(served.tokens[0, served.prompt_width:], continuation)
+    assert (server.prefix_hits > 0) == bool(options.get('prefix_cache'))
+
+
+@pytest.mark.parametrize('options', [
+    {'chunk': 2}, {'kv_cache': KVCache(page_size=4, pages=40), 'prefix_cache': True}],
+    ids=['chunked', 'prefix'])
+def test_a_shared_loop_cache_takes_each_prompt_whole(options):
+    """A last-loop cache holds the last pass's keys of every token before a call, so a prompt's
+    second piece, or a prompt after a reused prefix, would read those where the whole prompt's
+    passes read their own: a server refuses chunked prefill and prefix reuse over it, naming the
+    per-pass cache that serves both."""
+    with pytest.raises(ValueError, match='per_loop'):
+        Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
