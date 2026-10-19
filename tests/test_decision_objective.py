@@ -266,15 +266,18 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
-@pytest.mark.parametrize("head", ["transformed", "adapted"])
+@pytest.mark.parametrize("head", ["transformed", "adapted", "fp8", "fp8-adapted"])
 def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_path):
     """A joint head's lexical prior gathers its backbone's vocabulary rows where no one matrix gives
     the logits, so no output table exists: past a nonlinear prediction head (dense, GELU and norm
-    before the tied matrix) the embedding's rows, and with an adapter on the head the rows of the
-    head its factors update, as `merge` folds them in. A step through the head moves the head and
-    the backbone's part the rows come from."""
+    before the tied matrix) the embedding's rows; with an adapter on the head the rows of the head
+    its factors update; and with the head's kernel frozen in FP8 under an adapter, its codes
+    decoded, updated where the adapter targets it: each as `merge` folds them into one matrix. A
+    step through the head moves the head and the backbone's part the rows come from."""
     from dew.decision import JointLayout, JointSchemaHead
     from dew.lora import unadapted
+    from dew.nn.kernels.generation import device_generation
+    from dew.training.quantization import InputQuantization
 
     model = tiny_backbone().clone(head_transform="gelu" if head == "transformed" else None,
                                   tie_embeddings=head == "transformed", max_seq_len=1536)
@@ -284,14 +287,17 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
         expected = variables["params"]["embed_tokens"]["embedding"]
         moving = ("params", "backbone", "embed_tokens")
     else:
-        adapter = LoRA(rank=4, modules=("lm_head", "q_proj")).apply(model, variables, key=1)
+        modules = ("q_proj",) if head == "fp8" else ("lm_head", "q_proj")
+        fp8 = (InputQuantization(frozen_fp8=("lm_head",), measured_on=device_generation())
+               if head.startswith("fp8") else None)
+        adapter = LoRA(rank=4, modules=modules).apply(model, variables, key=1, fp8_base=fp8)
         # B starts at zero; drawn, the rows show its update.
         held = jax.tree_util.tree_map_with_path(
             lambda path, leaf: jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype) / 8
             if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
         given, backbone = replace(adapter, variables=held), adapter.model
         expected = unadapted(backbone).apply(given.merge(held), method="output_table").rows()
-        moving = ("params", "backbone", "lm_head")
+        moving = ("params", "backbone")
     assert backbone.apply(held, method="output_table") is None
     np.testing.assert_array_equal(backbone.apply(held, method="vocabulary_rows"), expected)
 

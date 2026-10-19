@@ -166,6 +166,10 @@ class MixerBase:
     decoder skips a remat rung that keeps nothing more of its layers' names
     than the next (`CausalTransformer.recompute_more`)."""
 
+    keeps_cache = True
+    """Whether the mixer this kind builds keeps a decode cache, which a loop's
+    shared cache has every pass rewrite (`CausalTransformer.split_prefill_refusal`)."""
+
     mixed_step = False
     """Whether the mixer this kind builds runs a server's mixed call
     (`dew.nn.inputs.Admitted`) as the separate decode and prefill calls

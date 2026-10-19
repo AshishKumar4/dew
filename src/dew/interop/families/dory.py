@@ -77,12 +77,14 @@ def _rope(hf_config: Mapping[str, object], kinds: tuple[str, ...], used: set[str
     """The per-kind rope and each kind's `partial_rotary_factor`, which vLLM's `get_rope` reads as
     a rope `int(head_dim * factor)` wide over the head's leading dims (rotary_embedding/__init__.py
     at 55076950, lines 66-76), Dew's 'default' partial rotary. Each record is plain rotary, as
-    DoryConfig requires (configs/dory.py:114-137), and a stated set names every attention kind."""
+    DoryConfig requires (configs/dory.py:114-137), and a stated set names every attention kind and
+    no other."""
     stated = hf_config.get('rope_parameters')
     parameters = records.record(stated or {}, 'rope_parameters')
-    missing = sorted(set(kinds) - set(parameters))
-    if stated is not None and missing:
-        refuse(f'rope_parameters without {missing}', 'Dory reads one rope record per attention kind')
+    missing, unknown = sorted(set(kinds) - set(parameters)), sorted(set(parameters) - set(_SUBLAYERS))
+    if stated is not None and (missing or unknown):
+        refuse(f'rope_parameters without {missing} or with {unknown}',
+               'Dory reads one rope record per attention kind, sliding or full')
     plain, factors = {}, {}
     for kind, entry in parameters.items():
         entry = dict(records.record(entry, f'rope_parameters.{kind}'))

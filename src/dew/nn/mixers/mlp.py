@@ -69,7 +69,8 @@ class MLPMixer(MixerBase):
 
     residuals = ('gate_proj', 'up_proj', 'down_proj')
 
-    # Tokenwise, with no cache for a mixed call to misread.
+    # Tokenwise, with no cache for a mixed call to misread or a loop's pass to rewrite.
+    keeps_cache = False
     mixed_step = True
 
     intermediate_size: int
