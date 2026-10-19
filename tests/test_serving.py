@@ -235,7 +235,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     pytest.importorskip("qwix")
     bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
