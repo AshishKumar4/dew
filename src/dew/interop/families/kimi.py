@@ -82,11 +82,11 @@ from dew.interop.decoder_parts import (
     refuse_encoder_fields,
     renamed_path,
 )
+from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.moe import Situ
 
 # KimiLinearConfig's __init__ arguments (configuration_kimi.py:11-52 of
 # Kimi-Linear-48B-A3B-Instruct at e1df551).

@@ -6,9 +6,11 @@ importing the FLOP accounting.
 """
 
 import dataclasses
+import functools
 import importlib.metadata
 import os
 import sys
+import uuid
 from collections.abc import Callable
 
 import jax
@@ -122,6 +124,10 @@ def enable_compilation_cache(path: str):
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
+    # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
+    # in the cache directory would name one directory for every jaxlib and write picks from a
+    # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
+    jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
     # Defaults skip small/fast compilations; a training step is neither, and
     # caching everything keeps startup predictable.
     jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
@@ -169,6 +175,11 @@ KERNEL_SEEN = jax.make_user_context(default_value=None)
 trace cached before traces, and records, again. The program is the same, and so
 is its key in the persistent cache, which reads no user context."""
 
+KERNEL_ROUTES = jax.make_user_context(())
+"""The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
+into: JAX keys its trace caches on their identities, as on `KERNEL_SEEN`'s, so a trace cached before
+traces, and reports its routes, again."""
+
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
@@ -200,15 +211,49 @@ def measures_picks() -> bool:
 
 
 def persist_compilations() -> None:
-    """Point XLA at the on-disk executable cache, unless a directory is set.
+    """Point XLA at the on-disk executable cache, unless a directory is set or JAX's cache is
+    turned off.
 
-    A loaded task compiles for seconds the first time its shapes are seen
-    (a minute for a text-to-image sample on an A100), and a serving process
-    restarts. Training turns the same cache on in `prepare_process`; a task
-    turns it on where it is loaded, `dew.pipeline` or a saved run's record
-    (`dew.inference.tasks.run_record`). Reading the setting is what makes it
-    idempotent and what leaves a trainer's own directory, or a caller's, alone.
+    A run compiles its step for seconds to minutes, a loaded task the first time its shapes are
+    seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
+    without it. A process Dew readies for training turns it on (`dew.training.runtime.
+    ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
+    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
+    process pool whose processes key a step apart turns it off the same way. JAX writes entries
+    from process 0 alone, so a pool takes the directory only where every process reads it as one
+    (`_shared_by_pool`): caches apart would find a step on one process and compile it on another,
+    which waits for ever for its peers. Reading the settings is what makes it idempotent and what
+    leaves a trainer's own directory, or a caller's, alone.
+
+    JAX settles whether a process uses the cache at its first compile: one that compiled with the
+    cache turned off keeps it off, and one that compiled before any directory was set takes this
+    one. XLA reads the autotuner's flags (`enable_compilation_cache`) as the backend opens, so a
+    process whose backend is open keeps its executables here and measures its picks again.
     """
-    if jax.config.jax_compilation_cache_dir:
+    if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    enable_compilation_cache(default_compilation_cache_dir())
+    from dew.coordination import pool_size
+
+    directory = default_compilation_cache_dir()
+    if pool_size() > 1 and not _shared_by_pool(directory):
+        return
+    enable_compilation_cache(directory)
+
+
+@functools.cache
+def _shared_by_pool(directory: str) -> bool:
+    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
+    is one each of them finds, over the coordination service (`from_every_process`)."""
+    from dew.coordination import broadcast_from_process_zero, from_every_process
+
+    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
+    if jax.process_index() == 0:
+        os.makedirs(directory, exist_ok=True)
+        with open(mark, "w"):
+            pass
+    from_every_process(None)  # every process looks once the mark is written
+    found = from_every_process(os.path.exists(mark))
+    if jax.process_index() == 0:
+        os.remove(mark)
+    return all(found)
