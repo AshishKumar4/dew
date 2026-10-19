@@ -237,12 +237,13 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
 
 
 def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, timeout: float,
-         cache: Path) -> subprocess.CompletedProcess:
+         cache: Path | None = None) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
-    # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
-    # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
-    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}", "JAX_ENABLE_COMPILATION_CACHE": "true",
-           "JAX_COMPILATION_CACHE_DIR": str(cache)}
+    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}"}
+    if cache is not None:
+        # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
+        # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
+        env.update(JAX_ENABLE_COMPILATION_CACHE="true", JAX_COMPILATION_CACHE_DIR=str(cache))
     command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
@@ -283,8 +284,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                     sample.update({name: reason for name, reason in unsupported.items()
                                    if reason is not None})
                     continue
-                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600,
-                            cache or Path(tempfile.gettempdir()) / "perf-gate-cache")
+                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600, cache)
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
