@@ -92,7 +92,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     probe = torch.randn((batch, config["in_channels"], 1, height, width), generator=generator)
 
     def walk(model, dtype) -> dict[str, np.ndarray]:
-        inputs = [tensor.to(dtype).requires_grad_() for tensor in (latents, *captions)]
+        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (latents, *captions)]
         named = list(model.named_parameters())
         output = torch.stack(model(list(inputs[0].unbind(0)), times.to(dtype), inputs[1:],
                                    return_dict=False)[0])
