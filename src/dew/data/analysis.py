@@ -22,6 +22,7 @@ support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -291,6 +292,18 @@ def _name(pipeline: Pipeline) -> str:
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
 
 
+def _members(pipelines: Sequence[Pipeline]) -> list[str]:
+    """The names a mixture's members go by, for their draws and in its plan: the one each was given
+    (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
+    `place:1`, ...), which no mount, read or preparation of its source changes; the two kinds never
+    meet, whatever a name holds. A member keeps its draws and its place across a member joining or
+    leaving by its name; one without keeps them while no other unnamed member joins or leaves ahead
+    of it."""
+    unnamed = itertools.count()
+    return [f"name:{pipeline.name}" if pipeline.name is not None else f"place:{next(unnamed)}"
+            for pipeline in pipelines]
+
+
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it.
     A cache stage is its kind alone. The plan names the rows a cache serves
@@ -536,6 +549,7 @@ def _analyzed(
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
+            "members": _members(source.pipelines),
             "until_steps": list(source.until_steps),
         }
     else:
@@ -544,6 +558,7 @@ def _analyzed(
             **(
                 {
                     "corpora": [child.order for child in children],
+                    "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
                 }
