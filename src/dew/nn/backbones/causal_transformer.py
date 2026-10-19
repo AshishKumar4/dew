@@ -966,7 +966,7 @@ class CausalTransformer(nn.Module):
             routed = None
         else:
             routed = mixture.build(
-                out_features=self.emb_features, hidden_features=self.hidden_features, activation=self.mlp,
+                out_features=self.emb_features, hidden_features=expert_features, activation=self.mlp,
                 dense=gated_mlp, swiglu_limit=self.swiglu_limit,
                 init_std=init_std, output_init_std=output_init_std,
                 norm=functools.partial(
@@ -1939,7 +1939,7 @@ class CausalTransformer(nn.Module):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -2058,16 +2058,15 @@ class CausalTransformer(nn.Module):
         dtype the stage before returns. Under a bf16 policy the dense
         feed-forward returns fp32, so the loops use fp32 from the start. The
         first layer runs abstractly in its own scope (no cache, nothing sown,
-        placeholder RNG keys), and a banked store answers from its first
-        bank's first row without fetching it.
+        a placeholder 'params' key, which flax draws any other stream from),
+        and a banked store answers from its first bank's first row without
+        fetching it.
         """
-        layer, scope = self.layers[0], self.layers[0].scope
-        assert scope is not None
-        rngs = {name: jax.random.key(0) for name in scope.rngs}
+        layer = self.layers[0]
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=True, rngs=rngs,
-            train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+            held, x, mutable=True, rngs={'params': jax.random.key(0)},
+            train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         output = output.streams if isinstance(output, Carried) else output
@@ -2132,6 +2131,14 @@ class CausalTransformer(nn.Module):
                 f"mixture, a layer_types pattern and a K/V sharing that do")
         return count
 
+    @property
+    def _provides(self) -> bool:
+        """Whether a layer leaves what a later one reads (`LayerSpec.provider`): keys and
+        values a sharing layer takes, or a CSA2 layer's publications, which its Reindex
+        and Reuse layers read whether or not any layer shares keys. The stack then
+        threads a kv_store through its layers."""
+        return any(spec.provider is not None for spec in self.specs)
+
     @nn.compact
     def _stacked(self, view: StackView, x, train: bool, decode: bool, per_layer_input,
                  attention_metadata=None):
@@ -2139,7 +2146,7 @@ class CausalTransformer(nn.Module):
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return run_pipeline(
