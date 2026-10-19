@@ -7,6 +7,7 @@ import pytest
 from reference_error import (
     FACTOR,
     ORDERS,
+    REFERENCE,
     ROW_FACTOR,
     STAGES,
     assert_as_exact_as_the_reference,
@@ -122,7 +123,7 @@ def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
         luck = 0.1 if unstable and order == 0 else 1.0
         reference = truth + luck * rounding * unit * rng.normal(size=truth.shape)
         dew = truth + spread * rounding * unit * rng.normal(size=truth.shape)
-        return {"leaf": dew}, {"leaf": reference}, {"leaf": truth}
+        return {"leaf": dew}, {REFERENCE: {"leaf": reference}}, {"leaf": truth}
     return draw
 
 
@@ -159,7 +160,7 @@ def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_el
         reference = truth + unit * rng.normal(size=truth.shape)
         error = unit * rng.normal(size=truth.shape)
         error[2, :4] *= 100
-        return {"leaf": truth + error}, {"leaf": reference}, {"leaf": truth}
+        return {"leaf": truth + error}, {REFERENCE: {"leaf": reference}}, {"leaf": truth}
 
     (dew,), (reference,), (truth,) = (jax.tree.leaves(tree) for tree in draw(0))
     assert distance(dew[2], truth[2]) < ROW_FACTOR * distance(reference[2], truth[2])
@@ -190,7 +191,7 @@ def staged(dew, reference):
 
     def batch(stage):
         asked.append(stage)
-        return dew[stage], reference[stage]
+        return dew[stage], {REFERENCE: reference[stage]}
     return batch, asked
 
 
@@ -240,7 +241,7 @@ def test_two_ports_equally_exact_pass_element_by_element_on_tails_heavier_than_a
     draw = {"gaussian": rng.standard_normal, "laplace": lambda size: rng.laplace(size=size),
             "student-t5": lambda size: rng.standard_t(5, size=size)}[tails]
     sums = [[np.sum(np.abs(draw((ORDERS, 200_000))), axis=0) for _ in range(STAGES)] for _ in range(2)]
-    assert_elements_as_exact(lambda stage: (sums[0][stage], sums[1][stage]), tails)
+    assert_elements_as_exact(lambda stage: (sums[0][stage], {REFERENCE: sums[1][stage]}), tails)
 
 
 def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():

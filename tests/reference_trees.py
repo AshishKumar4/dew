@@ -7,25 +7,27 @@ gate takes the reference's error at an element as the worst over a declared ense
 each summing the same terms in float32 with an error bound of the reference's own:
 
 - "pairwise": adjacent terms added, then their sums, recursively, as a tree reduction does;
-- "blocked": each block of `block` consecutive terms summed pairwise, then the blocks' sums left to
+- "blocked-<b>": each block of b consecutive terms summed pairwise, then the blocks' sums left to
   right, as a tiled kernel accumulates its tiles.
 
 A sequential sum is no member: its error grows with the term count (one large term and 127 ones,
 uniformly placed, part from float64 by 63 on average against pairwise's 1), so it would raise the
 bar past what an equally exact reference allows. A block size is one the reference's own kernels
-could use, and a member is admitted only where, on such adversarial rows, it is no further from
-float64 than the reference (`mean_absolute_error`). A reduction is written once with `tree_sum` or
-`tree_contract` and the tree passed down, so a reference computes the same math under each. Zeros
-padding a sum to whole pairs or blocks add exactly.
+could use. A member is admitted where, on the test's own data, it is no less exact than the
+reference (tests/reference_error.py), and on adversarial rows it can be checked the same way
+(`mean_absolute_error`). A reduction is written once with `tree_sum` or `tree_contract` and the tree
+passed down, so a reference computes the same math under each; a function of several reduction
+classes takes its members' trees from `assignments`. Zeros padding a sum to whole pairs or blocks
+add exactly.
 """
+
+import itertools
+from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Literal
-
-TREES = ("pairwise", "blocked")
-"""The trees a reduction class declares its members from (`tree_sum`)."""
 
 
 def _pairwise(x):
@@ -46,25 +48,42 @@ def _sequential(x):
     return total
 
 
-def tree_sum(x, axis: int, tree: str, *, block: int):
-    """`x` summed over `axis` in its own dtype under `tree` (TREES); "blocked" takes `block` terms
-    a block."""
+def tree_sum(x, axis: int, tree: str):
+    """`x` summed over `axis` in its own dtype under `tree`: "pairwise", or "blocked-<b>", each block
+    of b terms pairwise and the blocks' sums in turn."""
     x = jnp.moveaxis(x, axis, -1)
     if tree == "pairwise":
         return _pairwise(x)
-    if tree != "blocked":
-        raise ValueError(f"no summation tree {tree!r}; the trees are {TREES}")
+    kind, _, size = tree.partition("-")
+    if kind != "blocked" or not size.isdigit():
+        raise ValueError(f"no summation tree {tree!r}: a tree is 'pairwise' or 'blocked-<b>'")
+    block = int(size)
     count = -(-x.shape[-1] // block)
     padded = jnp.concatenate([x, jnp.zeros((*x.shape[:-1], count * block - x.shape[-1]), x.dtype)], axis=-1)
     return _sequential(_pairwise(padded.reshape(*x.shape[:-1], count, block)))
 
 
-def tree_contract(a, b, axis: int, tree: str, *, block: int):
+def tree_contract(a, b, axis: int, tree: str):
     """The products of `a` and `b`, broadcast against each other, summed over `axis` under `tree`
     (`tree_sum`): each product rounded once, as an unfused float32 dot rounds it. The products are
     held apart from the sum (`optimization_barrier`), so the compiler fuses no product into the add
     that takes it, which would round the pair once, as a fused multiply-add does."""
-    return tree_sum(jax.lax.optimization_barrier(a * b), axis, tree, block=block)
+    return tree_sum(jax.lax.optimization_barrier(a * b), axis, tree)
+
+
+def assignments(classes: Mapping[str, Sequence[str]], *, bound: int = 8) -> list[dict[str, str]]:
+    """The tree each member gives each of a computation's reduction classes, declared before any run:
+    every combination of the classes' trees where they number at most `bound`, as a function summing
+    one class's terms under one tree and another's under another can cancel where every homogeneous
+    member does not (f = T_A(a) + T_B(-a)); past `bound`, each class's trees in turn with every other
+    class at its first, which reaches every tree of every class and not every pairing of them."""
+    names = list(classes)
+    product = [dict(zip(names, chosen, strict=True))
+               for chosen in itertools.product(*(classes[name] for name in names))]
+    if len(product) <= bound:
+        return product
+    first = {name: classes[name][0] for name in names}
+    return [first] + [{**first, name: tree} for name in names for tree in classes[name][1:]]
 
 
 def adversarial_rows(terms: int, orders: int, seed: int = 0) -> np.ndarray:
@@ -91,20 +110,20 @@ PRODUCTS = 1 << 26
 right operand's free columns at a time."""
 
 
-def evaluated(function, tree: str, *, block: int):
+def evaluated(function, tree: str):
     """`function` with every sum it makes under `tree` (`tree_sum`): its traced jaxpr evaluated with
     each `dot_general` a `tree_contract` and each `reduce_sum` a `tree_sum`, the jaxprs scan, while,
     cond, jit and the custom-derivative calls hold evaluated alike, and every other primitive as it is.
     A forward only: the same math as `function`, its reductions' order the tree's."""
     def run(*args):
         closed, shapes = jax.make_jaxpr(function, return_shape=True)(*args)
-        found = _evaluate(closed.jaxpr, closed.consts, jax.tree.leaves(args), tree, block)
+        found = _evaluate(closed.jaxpr, closed.consts, jax.tree.leaves(args), tree)
         return jax.tree.unflatten(jax.tree.structure(shapes), found)
 
     return run
 
 
-def _evaluate(jaxpr, consts, args, tree, block):
+def _evaluate(jaxpr, consts, args, tree):
     """`jaxpr` on `consts` and `args` under `tree`, its outputs."""
     env = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
 
@@ -112,44 +131,47 @@ def _evaluate(jaxpr, consts, args, tree, block):
         return var.val if isinstance(var, Literal) else env[var]
 
     for equation in jaxpr.eqns:
-        found = _apply(equation, [read(var) for var in equation.invars], tree, block)
+        found = _apply(equation, [read(var) for var in equation.invars], tree)
         env.update(zip(equation.outvars, found if equation.primitive.multiple_results else [found],
                        strict=True))
     return [read(var) for var in jaxpr.outvars]
 
 
-def _closed(closed, values, tree, block):
+def _closed(closed, values, tree):
     """A closed jaxpr's outputs on `values` under `tree`."""
-    return _evaluate(closed.jaxpr, closed.consts, list(values), tree, block)
+    return _evaluate(closed.jaxpr, closed.consts, list(values), tree)
 
 
-def _apply(equation, values, tree, block):
+def _apply(equation, values, tree):
     """One equation under `tree`: a reduction as the tree sums it, a jaxpr-holding one evaluated
     within, any other bound as it is."""
     name, params = equation.primitive.name, equation.params
-    if name in ORDERED:
+    # Integers and booleans sum exactly in any order: a position's cumulative count binds as it is.
+    exact = not any(jnp.issubdtype(value.dtype, jnp.inexact) for value in values if hasattr(value, "dtype"))
+    if name in ORDERED and not exact:
         raise NotImplementedError(f"{name} sums or calls in an order the tree does not set; evaluate a "
                                   "reference without it (an XLA attention, no fused kernel)")
+    if exact and name in (*ORDERED, "dot_general", "reduce_sum"):
+        return equation.primitive.bind(*values, **params)
     if name == "dot_general":
-        return _contract(*values, params["dimension_numbers"], params.get("preferred_element_type"),
-                         tree, block)
+        return _contract(*values, params["dimension_numbers"], params.get("preferred_element_type"), tree)
     if name == "reduce_sum":
         (operand,), axes = values, tuple(params["axes"])
         kept = [axis for axis in range(operand.ndim) if axis not in axes]
         moved = jnp.transpose(operand, (*kept, *axes))
         flat = moved.reshape(*moved.shape[:len(kept)], -1)
-        return tree_sum(flat, -1, tree, block=block)
+        return tree_sum(flat, -1, tree)
     if name in ("pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
                 "custom_vjp_call", "custom_vjp_call_jaxpr", "custom_lin"):
         held = next(params[key] for key in ("jaxpr", "call_jaxpr", "fun_jaxpr") if key in params)
         if not hasattr(held, "consts"):
             held = ClosedJaxpr(held, ())
-        return _closed(held, values, tree, block)
+        return _closed(held, values, tree)
     if name == "scan":
         consts, carry, xs = (list(part) for part in params["ft_in"].update(values).unpack())
 
         def step(carried, sliced):
-            found = _closed(params["jaxpr"], (*consts, *carried, *sliced), tree, block)
+            found = _closed(params["jaxpr"], (*consts, *carried, *sliced), tree)
             return tuple(list(part) for part in params["ft_out"].update(found).unpack())
 
         carried, ys = jax.lax.scan(step, carry, xs, length=params["length"], reverse=params["reverse"])
@@ -159,18 +181,18 @@ def _apply(equation, values, tree, block):
         cond_consts = values[:params["cond_nconsts"]]
         body_consts = values[params["cond_nconsts"]:params["cond_nconsts"] + params["body_nconsts"]]
         init = values[params["cond_nconsts"] + params["body_nconsts"]:]
-        return jax.lax.while_loop(lambda carried: _closed(cond, (*cond_consts, *carried), tree, block)[0],
-                                  lambda carried: _closed(body, (*body_consts, *carried), tree, block),
+        return jax.lax.while_loop(lambda carried: _closed(cond, (*cond_consts, *carried), tree)[0],
+                                  lambda carried: _closed(body, (*body_consts, *carried), tree),
                                   list(init))
     if name == "cond":
         index, *operands = values
-        branches = [lambda *ops, branch=branch: _closed(branch, ops, tree, block)
+        branches = [lambda *ops, branch=branch: _closed(branch, ops, tree)
                     for branch in params["branches"]]
         return jax.lax.switch(index, branches, *operands)
     return equation.primitive.bind(*values, **params)
 
 
-def _contract(lhs, rhs, dimension_numbers, preferred, tree, block):
+def _contract(lhs, rhs, dimension_numbers, preferred, tree):
     """`lax.dot_general` with its contraction under `tree`: each product rounded once in at least
     float32 and summed by `tree_sum`, the result in the dtype the dot gives. Batch dimensions, then
     the left operand's free ones, then the right's, as `dot_general` orders them."""
@@ -194,7 +216,7 @@ def _contract(lhs, rhs, dimension_numbers, preferred, tree, block):
     pieces = jnp.moveaxis(right.reshape(*batch, count, chunk, terms), -3, 0)
 
     def piece(columns_of):
-        return tree_contract(left[..., :, None, :], columns_of[..., None, :, :], -1, tree, block=block)
+        return tree_contract(left[..., :, None, :], columns_of[..., None, :, :], -1, tree)
 
     found = jax.lax.map(piece, pieces) if count > 1 else piece(pieces[0])[None]
     found = jnp.moveaxis(found, 0, -2).reshape(*batch, rows, count * chunk)[..., :columns]

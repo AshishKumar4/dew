@@ -10,12 +10,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, widened
-from reference_trees import TREES, evaluated, tree_contract, tree_sum
+from reference_trees import evaluated, tree_contract, tree_sum
 
 from dew.interop import Pretrained
 
 TINY = Path(__file__).resolve().parent / "fixtures" / "hf" / "dory-tiny"
-BLOCK = 4
+TREES = ("pairwise", "blocked-4")
+"""The trees the interpreter is checked under: pairwise, and pairwise blocks of 4 summed in turn."""
 
 
 def every_reduction(x, w, scan_x, flag):
@@ -50,7 +51,7 @@ def test_sums_that_round_nowhere_come_out_exactly_under_every_tree(tree):
     """Small integers sum exactly in any order: under each tree the interpreted function gives the
     function's own values to the bit, through jit, scan, while and cond."""
     args = operands(jnp.float32, integers=True)
-    found = evaluated(every_reduction, tree, block=BLOCK)(*args)
+    found = evaluated(every_reduction, tree)(*args)
     for mine, theirs in zip(found, every_reduction(*args), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
@@ -60,11 +61,11 @@ def test_each_reduction_is_summed_as_its_tree_sums_it(tree):
     """A dot and a sum over random terms come out as `tree_contract` and `tree_sum` give them to the
     bit, not as XLA's own order does: each reduction runs under the tree."""
     x, w = jax.random.normal(jax.random.key(1), (3, 37)), jax.random.normal(jax.random.key(2), (37, 5))
-    dot = evaluated(jnp.dot, tree, block=BLOCK)(x, w)
+    dot = evaluated(jnp.dot, tree)(x, w)
     np.testing.assert_array_equal(np.asarray(dot), np.asarray(
-        tree_contract(x[:, None, :], w.T[None, :, :], -1, tree, block=BLOCK)))
-    summed = evaluated(functools.partial(jnp.sum, axis=1), tree, block=BLOCK)(x)
-    np.testing.assert_array_equal(np.asarray(summed), np.asarray(tree_sum(x, 1, tree, block=BLOCK)))
+        tree_contract(x[:, None, :], w.T[None, :, :], -1, tree)))
+    summed = evaluated(functools.partial(jnp.sum, axis=1), tree)(x)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(tree_sum(x, 1, tree)))
 
 
 def test_a_contraction_too_large_for_one_piece_is_taken_a_chunk_of_columns_at_a_time(monkeypatch):
@@ -73,15 +74,23 @@ def test_a_contraction_too_large_for_one_piece_is_taken_a_chunk_of_columns_at_a_
     import reference_trees
 
     x, w = jax.random.normal(jax.random.key(3), (4, 64)), jax.random.normal(jax.random.key(4), (64, 23))
-    whole = evaluated(jnp.dot, "pairwise", block=BLOCK)(x, w)
+    whole = evaluated(jnp.dot, "pairwise")(x, w)
     monkeypatch.setattr(reference_trees, "PRODUCTS", 4 * 64 * 5)
-    chunked = evaluated(jnp.dot, "pairwise", block=BLOCK)(x, w)
+    chunked = evaluated(jnp.dot, "pairwise")(x, w)
     np.testing.assert_array_equal(np.asarray(chunked), np.asarray(whole))
+
+
+def test_an_integer_cumulative_sum_binds_as_it_is_and_a_floating_one_is_refused():
+    """A count cumulated over integers is exact in any order and runs as it is; a floating one's
+    order the tree does not set, so the interpreter refuses it."""
+    counts = jnp.arange(8, dtype=jnp.int32)
+    found = evaluated(jnp.cumsum, "pairwise")(counts)
+    np.testing.assert_array_equal(np.asarray(found), np.cumsum(np.arange(8)))
 
 
 def test_a_primitive_whose_order_the_tree_does_not_set_is_refused():
     with pytest.raises(NotImplementedError, match="cumsum"):
-        evaluated(jnp.cumsum, "pairwise", block=BLOCK)(jnp.ones(8))
+        evaluated(jnp.cumsum, "pairwise")(jnp.ones(8))
 
 
 @pytest.mark.parametrize("tree", TREES)
@@ -91,7 +100,7 @@ def test_the_tiny_dory_under_each_tree_is_as_exact_as_under_xlas(tree):
     config = json.loads((TINY / "config.json").read_text())
     loaded = Pretrained.load(str(TINY), dtype="float32", attention_impl="xla")
     ids = jnp.asarray(np.random.default_rng(0).integers(0, config["vocab_size"], (1, 24)), jnp.int32)
-    mine = evaluated(loaded.model.apply, tree, block=BLOCK)(loaded.variables, ids)
+    mine = evaluated(loaded.model.apply, tree)(loaded.variables, ids)
     plain = loaded.model.apply(loaded.variables, ids)
     with jax.enable_x64(new_val=True):
         truth = np.asarray(loaded.model.clone(dtype=jnp.float64).apply(widened(loaded.variables), ids))
