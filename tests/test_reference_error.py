@@ -20,20 +20,37 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
         assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
-def test_a_small_element_is_held_to_its_own_size_in_a_column_or_a_vector():
+def test_a_small_element_is_held_to_its_terms_in_a_column_or_a_vector():
     """The small row transposed, a column of 5s beside columns of 1e8, puts each wrong element in
-    a row whose RMS it barely moves; a vector is one row. Held to its own size, each element is
-    100% wrong against the reference's 8e-8, though every tensor-wide and row-wide distance passes
-    it."""
+    a row whose RMS it barely moves; a vector is one row. Its terms (`float64_terms`) say the 5s
+    sum terms of their own size, so held to them each element is 100% wrong against the
+    reference's 8e-8, though every tensor-wide and row-wide distance passes it."""
     truth = np.array([[1e8, 5.0], [1e8, 5.0]])
     reference = np.array([[1e8 + 8, 5.0], [1e8 + 8, 5.0]])
     dew = np.array([[1e8, 10.0], [1e8, 10.0]])
     for value, wrong, exact in ((truth, dew, reference), (truth[0], dew[0], reference[0])):
         assert distance(wrong, value) <= FACTOR * distance(exact, value)
         with pytest.raises(AssertionError):
-            assert_as_exact_as_the_reference(wrong, exact, value, "small element")
+            assert_as_exact_as_the_reference(wrong, exact, value, "small element", terms=np.abs(value))
         with pytest.raises(AssertionError):
-            assert_leaves_as_exact({"elements": wrong}, {"elements": exact}, {"elements": value})
+            assert_leaves_as_exact({"elements": wrong}, {"elements": exact}, {"elements": value},
+                                   terms={"elements": np.abs(value)})
+
+
+def test_an_element_near_zero_without_terms_is_held_to_its_row():
+    """Sums of terms of either sign land near zero somewhere in a large tensor, and there one
+    rounding against another parts by any ratio: two runs rounding alike, each by a float32 unit
+    of what the element sums, put their worst element over its own value apart by more than four
+    times in 6.2% of comparisons (2000 draws of these sums), and in none sized by the row. With no
+    terms to size it, an element is sized by its row, and two such runs pass, over 200 draws."""
+    rng = np.random.default_rng(2)
+    unit = float(np.finfo(np.float32).eps)
+    for _ in range(200):
+        terms = rng.normal(size=(64, 32, 16))
+        truth = terms.sum(axis=1)
+        spread = np.sqrt(32) * unit
+        dew, reference = (truth + spread * rng.normal(size=truth.shape) for _ in range(2))
+        assert_as_exact_as_the_reference(dew, reference, truth, "near zero")
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():

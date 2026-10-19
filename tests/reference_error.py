@@ -148,9 +148,15 @@ def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.
     and the RMS of what the row sums, so a row that cancels is sized by its
     terms' rounding and not by its near-zero result; a row below float64's
     `RESOLUTION` of its leaf has size zero. No other row's size enters: a
-    small row beside large ones has its own. A value of rank one or less is
-    one row, which `distance` already judges, and has none here; a scalar
-    has no elements either."""
+    small row beside large ones has its own. An element is sized as its row
+    is where no terms are given: its own value says nothing of the sum that
+    made it, and a sum of terms of either sign lands near zero somewhere in
+    any large tensor, where one rounding against another parts by any ratio
+    (the dv of a packed attention, a UNet's prediction): sized by its own
+    value, two runs rounding alike failed 6.2% of comparisons
+    (test_reference_error.py). Its terms size it alone. A value of rank one
+    or less is one row, which `distance` already judges, and has none here;
+    a scalar has no elements either."""
     truth = np.asarray(truth, np.float64)
     if truth.ndim < (1 if elements else 2):
         return np.zeros(0), np.zeros(0)
@@ -159,7 +165,11 @@ def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.
     def rms(rows):
         return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, width)), axis=1))
 
-    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+    if elements and terms is None:
+        rows = truth.reshape(-1, truth.shape[-1]) if truth.ndim > 1 else truth.reshape(1, -1)
+        sizes = np.repeat(np.sqrt(np.mean(np.square(rows), axis=1)), rows.shape[1])
+    else:
+        sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
     sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
     return sizes, rms(np.asarray(value, np.float64) - truth)
