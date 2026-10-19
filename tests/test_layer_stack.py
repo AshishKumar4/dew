@@ -525,3 +525,44 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
         jax.clear_caches()
         got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
         assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
+
+
+def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
+    """A scanned run of host-resident layers runs one layer at a time in a scope of its
+    own (`decoder_stack.run_stack`, `_prefetched_run`), reading each layer's slice of
+    every collection the caller opens and writing it back stacked: with the routers'
+    balancing biases off zero, the logits and the opened state are the resident
+    stack's over two calls, and a decode through the cache it allocates and then
+    reuses gives the resident stack's tokens' logits and cache."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference", scan_layers=True,
+                              mixture=Mixture(experts=4, top_k=2, bias=True))
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+    variables = {**variables, "moe": jax.tree.map(lambda bias: bias + 4.0 * (jnp.arange(bias.shape[-1]) % 3),
+                                                  variables["moe"])}
+    assert any(count > 1 for _, count in model.bind(variables).groups)
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+    on_host = {**variables, "params": jax.device_put(variables["params"], host)}
+    opened = ["moe", "router"]
+    held = {}
+    for name, tree in (("resident", variables), ("host", on_host)):
+        calls = []
+        for _ in range(2):
+            logits, state = model.apply(tree, tokens, mutable=opened)
+            calls.append((logits, state))
+            tree = {**tree, **state}
+        cache = {}
+        for position in range(3):
+            logits, state = model.apply({**tree, **cache}, tokens[:, position:position + 1],
+                                        decode=True, mutable=["cache", *opened])
+            calls.append((logits, state))
+            cache = {"cache": state["cache"]}
+        held[name] = calls
+    assert jax.tree.structure(held["host"]) == jax.tree.structure(held["resident"])
+    for ours, theirs in zip(jax.tree.leaves(held["host"]), jax.tree.leaves(held["resident"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
