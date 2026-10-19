@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 from jax.typing import DTypeLike
 
 from dew import records
-from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
@@ -240,7 +240,7 @@ class CheckpointBanks(LayerBanks):
                              layers[0], namespace=namespace)
         rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
                           index, namespace=namespace) for index in layers]
-        return jax.jit(_stacked, out_shardings=placement)(*rows)
+        return jax.jit(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings."""
@@ -615,11 +615,6 @@ def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
 # The programs a load runs are module functions, so `jax.jit` of one with the
 # same shardings again reuses its trace and executable, where a lambda is a
 # new function each call and traces and compiles anew.
-
-
-def _stacked(*rows: Variables) -> Variables:
-    """`rows` stacked on a new leading layer axis, a bank (`LayerBanks.bank`)."""
-    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
 
 
 def _cut(bank: jax.Array, *, count: int) -> tuple[jax.Array, ...]:
