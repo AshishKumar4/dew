@@ -26,7 +26,7 @@ from fsspec.utils import infer_compression
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
-from dew.data.storage import Store, content_version, local
+from dew.data.storage import Readable, Store, content_version, local
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest, preparing
@@ -139,10 +139,6 @@ class Files(Dataset):
     CSV is parsed by Python's `csv` module under the process's field size
     limit, 128 KiB a field by default; a source with longer fields reads
     once its caller raises `csv.field_size_limit`.
-
-    `file_info` states the facts of every file the source reads, its offset
-    indexes among them, as their producer published them (a Hub commit's
-    files, a decision export's): an index it does not name is absent.
     """
 
     url: str | tuple[str, ...]
@@ -262,8 +258,7 @@ class Files(Dataset):
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
         for url, fs, path in resolved:
-            if url in indexed and url not in self.declared and (self.file_info is not None
-                                                                or not fs.exists(path)):
+            if url in indexed and not self._present(url):
                 continue
             metadata = self._header(url)
             version = (
@@ -334,16 +329,19 @@ class Files(Dataset):
             return False
         if "index_headers" in self.__dict__:
             return True
-        headers = {}
-        for url in self._indexes:
-            if self.file_info is not None and url not in self.file_info:
-                return False
-            try:
-                headers[url] = self._header(url)
-            except FileNotFoundError:
-                return False
-        self.__dict__["index_headers"] = headers
+        if not all(self._present(url) for url in self._indexes):
+            return False
+        self.__dict__["index_headers"] = {url: self._header(url) for url in self._indexes}
         return True
+
+    def _present(self, url: str) -> bool:
+        """Whether the index at `url` exists: stated by the files' producer,
+        or found in its store, which reads an unreachable store as holding
+        none (`exists`), as the Hub offline is."""
+        if url in self.declared:
+            return True
+        fs, path = Store(url, self.storage_options).resolve()
+        return fs.exists(path)
 
     @staticmethod
     def _index_url(url: str) -> str:
@@ -484,18 +482,21 @@ class Files(Dataset):
         return _ProjectedRows(rows, _Projection(self.columns, self.describe()))
 
     @cached_property
-    def _arrow_files(self) -> tuple[pafs.FileSystem, tuple[str, ...], Mapping[str, str]]:
-        """Where Arrow reads the files (`Store.readable`), one filesystem for all of them, and
-        each path Arrow reads's name where the file is: a Hub dataset's files read from
-        huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
+    def _arrow_files(self) -> tuple[pafs.FileSystem, tuple[str, ...], Mapping[str, str], str | None]:
+        """Where Arrow reads the files (`Store.readable`), one filesystem for all of them; each
+        path Arrow reads's name where the file is; and, where Arrow reads copies, the directory
+        partitions are discovered under, so a copy's location adds none: a Hub dataset's files
+        read from huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
         stores = [Store(url, self.storage_options) for url in self.paths]
-        named = [store.resolve() for store in stores]
         located = [store.readable() for store in stores]
-        if any(fs.protocol != located[0][0].protocol for fs, _ in located):
-            located = named
-        filesystem = _arrow_filesystem(located[0][0])
-        paths = tuple(filesystem.normalize_path(path) for _, path in located)
-        return filesystem, paths, {path: name for path, (_, name) in zip(paths, named, strict=True)}
+        if any(place.fs.protocol != located[0].fs.protocol for place in located):
+            located = [Readable(*store.resolve(), None) for store in stores]
+        filesystem = _arrow_filesystem(located[0].fs)
+        paths = tuple(filesystem.normalize_path(place.path) for place in located)
+        names = {path: store.resolve()[1] for path, store in zip(paths, stores, strict=True)}
+        roots = [place.root for place in located]
+        base = posixpath.commonpath(roots) if all(root is not None for root in roots) else None
+        return filesystem, paths, names, base
 
     def _shard_name(self, path: str) -> str:
         """The name of the file Arrow reads at `path` where the file is,
@@ -504,12 +505,13 @@ class Files(Dataset):
 
     @cached_property
     def arrow(self) -> ds.Dataset:
-        filesystem, paths, _ = self._arrow_files
+        filesystem, paths, _, base = self._arrow_files
         return ds.dataset(
             list(paths),
             filesystem=filesystem,
             format="ipc" if self.kind == "arrow" else "parquet",
             partitioning=self.partitioning,
+            partition_base_dir=base,
         )
 
     @cached_property

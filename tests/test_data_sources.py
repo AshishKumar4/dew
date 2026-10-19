@@ -1148,11 +1148,15 @@ def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub
         assert Hub("owner/elsewhere").commit
 
 
+@pytest.mark.parametrize("named", ["hub", "profile"])
 @pytest.mark.parametrize("format", ["parquet", "jsonl"])
-def test_a_downloaded_hub_split_streams_its_rows_from_the_hub_cache_offline(tmp_path, monkeypatch, format):
+def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, monkeypatch, format, named):
     """A Hub split whose commit was downloaded (huggingface_hub's cache holds its files, as
-    `hf_hub_download`, `snapshot_download` or a prepare leave them) streams its rows from that
-    cache with the Hub offline (HF_HUB_OFFLINE), as `huggingface_hub` reads its own files."""
+    `hf_hub_download`, `snapshot_download` or a prepare leave them) streams from that cache with
+    the Hub offline (HF_HUB_OFFLINE), as `huggingface_hub` reads its own files: the identity,
+    shards and rows it streamed from the Hub online, fields and all, wherever the cache is,
+    through the Hub source or a storage profile over the Hub."""
+    import shutil
     from types import SimpleNamespace
 
     import pyarrow.parquet as pq
@@ -1162,32 +1166,50 @@ def test_a_downloaded_hub_split_streams_its_rows_from_the_hub_cache_offline(tmp_
     from dew.data.compile import iterate
     from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
+    from dew.data.storage import _profile
 
     commit = "0123456789abcdef0123456789abcdef01234567"
-    snapshot = tmp_path / "hub" / "datasets--owner--rows" / "snapshots" / commit / "data"
-    snapshot.mkdir(parents=True)
+    repository = tmp_path / "repository" / "data"
+    repository.mkdir(parents=True)
     rows = [{"id": index, "text": f"row {index}"} for index in range(10)]
     for split, part in (("train", rows[:6]), ("test", rows[6:])):
-        path = snapshot / f"{split}.{format}"
+        path = repository / f"{split}.{format}"
         if format == "parquet":
             pq.write_table(pa.Table.from_pylist(part), path)
         else:
             path.write_text("".join(json.dumps(row) + "\n" for row in part))
     names = [f"data/{split}.{format}" for split in ("train", "test")]
-    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+    # The Hub, online, serving the repository's files at the commit.
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **options: SimpleNamespace(
         sha=commit))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **options: names)
     monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
-        "name": path, "type": "file", "size": (snapshot / Path(path).name).stat().st_size,
+        "name": path, "type": "file", "size": (repository / Path(path).name).stat().st_size,
         "blob_id": f"blob:{Path(path).name}"})
-    answered = Hub("owner/rows").files.fingerprint()
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        (repository / Path(path).name).read_bytes()))
+    # A cache under a directory named as a Hive partition, which the rows do not hold.
+    cache = tmp_path / "experiment=17" / "hub"
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(cache))
+
+    def split():
+        files = Hub("owner/rows").files
+        if named == "hub":
+            return files
+        _profile("hubmirror", "hf", {})
+        url = files.paths[0].replace("hf://", "hubmirror://")
+        return Files(url, format=format, file_info={url: files.declared[files.paths[0]]})
+
+    def streamed(source):
+        read = sorted((int(row["id"]), str(row["text"]), tuple(sorted(row)))
+                      for row in iterate(Pipeline(source), read="streamed"))
+        return source.fingerprint(), [shard.id for shard in source.manifest().shards], read
+
+    online = streamed(split())
+    assert online[2] == [(row["id"], row["text"], ("id", "text")) for row in rows[:6]]
+    shutil.copytree(repository.parent, cache / "datasets--owner--rows" / "snapshots" / commit)
     offline(monkeypatch)
-    source = Hub("owner/rows")
-    assert source.files.fingerprint() == answered
-    streamed_rows = list(iterate(Pipeline(source), read="streamed"))
-    assert sorted((int(row["id"]), str(row["text"])) for row in streamed_rows) == [
-        (row["id"], row["text"]) for row in rows[:6]]
+    assert streamed(split()) == online
 
 
 def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
