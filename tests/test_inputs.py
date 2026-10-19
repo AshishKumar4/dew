@@ -159,3 +159,36 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
                             for inputs in (fields, laid))
         real = np.asarray(jnp.asarray(fields.token_fields["attention_mask"]))
         np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
+
+
+@pytest.mark.parametrize("placed", [False, True])
+def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
+    """An unpacked, left-padded request with its own positions generates the same
+    tokens whether its validity and positions come as `Coordinates` or as the
+    fields, through `generate`'s request (`Request.prepare`), its prefill and every
+    step; on a mesh its rows are padded to the devices, the repeats marked invalid
+    in the form the request holds (`Request.padded`)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import COORDINATES_FIELD, ModelInputs, coordinates
+    from dew.sampling import Sampling, generate
+    from dew.training import MeshSpec
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference")
+    tokens = jnp.asarray([[0, 0, 3, 4, 5], [6, 7, 8, 9, 10]], jnp.int32)
+    valid = tokens != 0
+    positions = jnp.asarray([[0, 0, 4, 5, 6], [0, 1, 2, 3, 4]], jnp.int32)
+    params = model.init(jax.random.key(0), tokens)
+    if placed:
+        params = jax.device_put(params, NamedSharding(MeshSpec().build(), P()))
+    forms = (ModelInputs(tokens, {"attention_mask": valid, "positions": positions}),
+             ModelInputs(tokens, {COORDINATES_FIELD: coordinates(valid=valid, positions=positions)}))
+    fields, laid = (generate(model, params, form, 4, key=jax.random.key(1), sampling=Sampling(temperature=0))
+                    for form in forms)
+    np.testing.assert_array_equal(np.asarray(laid.tokens), np.asarray(fields.tokens))
+    np.testing.assert_array_equal(np.asarray(laid.lengths), np.asarray(fields.lengths))

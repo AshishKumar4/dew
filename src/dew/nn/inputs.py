@@ -545,6 +545,34 @@ def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, 
             None if segments is None else xp.asarray(segments))
 
 
+def token_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]):
+    """The validity `[B, S]` a row's token fields hold, as given: their `Coordinates`' where the fields
+    carry them, else the validity field; None where neither holds one."""
+    laid = fields.get(COORDINATES_FIELD)
+    return laid.valid if isinstance(laid, Coordinates) else fields.get(VALIDITY_FIELD)
+
+
+def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
+                  valid: jax.Array | np.ndarray | None) -> dict:
+    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it:
+    in their `Coordinates` where the fields carry them, which the decoder reads in place of the
+    validity field, else in the validity field."""
+    laid = fields.get(COORDINATES_FIELD)
+    if isinstance(laid, Coordinates):
+        return {**fields, COORDINATES_FIELD: laid.replace(valid=valid)}
+    rest = {name: value for name, value in fields.items() if name != VALIDITY_FIELD}
+    return rest if valid is None else {**rest, VALIDITY_FIELD: valid}
+
+
+def token_positions(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
+    """The logical positions `[B, S]` of a row's token fields as the decoder reads them: their
+    `Coordinates`' where the fields carry them, else the `positions` field; None where neither gives
+    any. `xp` is the array module."""
+    laid = fields.get(COORDINATES_FIELD)
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    return None if positions is None else xp.asarray(positions)
+
+
 def real_slots(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], shape: tuple[int, ...], *, xp=jnp):
     """Which of a request's `shape` `[B, S]` slots hold a real token: those its
     validity marks, every one where it has none, less the padding a packed
@@ -615,17 +643,17 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
 """How each token field Dew's processors write continues into a response."""
 
 
-def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
+def next_position(fields: Mapping[str, jax.Array | Coordinates], valid: jax.Array) -> jax.Array | None:
     """Each row's logical position after its last real token `[B]`, its
     response's first by `RESPONSE_FIELDS`: one past the largest coordinate a
     real token holds on any axis of its `rotary_positions`, else one past its
-    last real token's `positions`, which a document reset may have lowered
-    below an earlier one. None where the request gives neither, and a cache's
-    cursor counts each row on. `valid` is its real slots (`real_slots`)."""
+    last real token's position (`token_positions`), which a document reset may
+    have lowered below an earlier one. None where the request gives neither,
+    and a cache's cursor counts each row on. `valid` is its real slots (`real_slots`)."""
     rotary = fields.get("rotary_positions")
     if rotary is not None:
         return _response_coordinates(rotary, valid, 1).reshape(rotary.shape[0], -1)[:, 0]
-    positions = fields.get("positions")
+    positions = token_positions(fields)
     return None if positions is None else _response_positions(positions, valid, 1)[:, 0]
 
 
@@ -641,11 +669,10 @@ def validity_sites(tree: InputTree) -> list[ModelInputs]:
 
 
 def _validity_agnostic[TreeT](tree: TreeT) -> TreeT:
-    """`tree` with every validity field dropped."""
+    """`tree` with every validity dropped (`with_validity`)."""
     return jax.tree.map(
-        lambda node: (replace(node, token_fields={
-            name: value for name, value in node.token_fields.items()
-            if name != VALIDITY_FIELD}) if isinstance(node, ModelInputs) else node),
+        lambda node: (replace(node, token_fields=with_validity(node.token_fields, None))
+                      if isinstance(node, ModelInputs) else node),
         tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
 
@@ -673,12 +700,12 @@ def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) ->
             return node
         index = next(sites)
         needed = wanted if isinstance(wanted, bool) else bool(wanted[index])
-        if not needed or VALIDITY_FIELD in node.token_fields:
+        if not needed or token_validity(node.token_fields) is not None:
             return node
         shape = np.shape(node.tokens)
         ones = (np.ones(shape, bool) if isinstance(node.tokens, np.ndarray)
                 else jnp.ones(shape, bool))
-        return replace(node, token_fields={**node.token_fields, VALIDITY_FIELD: ones})
+        return replace(node, token_fields=with_validity(node.token_fields, ones))
 
     return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
@@ -704,7 +731,7 @@ def agreed_validity[TreeT: InputTree](tree: TreeT, processes: int, *, controls: 
     count = len(validity_sites(tree))
     if not count:
         return tree
-    present = np.asarray([VALIDITY_FIELD in site.token_fields
+    present = np.asarray([token_validity(site.token_fields) is not None
                           for site in validity_sites(tree)], np.int32)
     gathered = np.asarray(multihost_utils.process_allgather(present)).reshape(-1, count)
     return filled_validity(tree, [bool(present) for present in gathered.max(axis=0)])
@@ -968,9 +995,10 @@ class Request:
         plan, padded = self.plan, self.plan.pad(self.inputs)
         if plan.count == plan.rows:
             return padded
-        valid = padded.token_fields.get(VALIDITY_FIELD, jnp.ones(padded.tokens.shape, bool))
-        valid = jnp.asarray(valid, bool) & ~plan.padding[:, None]
-        return replace(padded, token_fields={**padded.token_fields, VALIDITY_FIELD: valid})
+        valid = token_validity(padded.token_fields)
+        valid = (jnp.ones(padded.tokens.shape, bool) if valid is None else jnp.asarray(valid, bool)
+                 ) & ~plan.padding[:, None]
+        return replace(padded, token_fields=with_validity(padded.token_fields, valid))
 
 
 __all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInputs", "ModelInputs",
