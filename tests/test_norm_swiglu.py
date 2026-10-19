@@ -207,22 +207,19 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     compare((unweighted, fused, unweighted), (x,), seed, ("y", "x"))
 
 
-@pytest.mark.parametrize("composes", [False, True])
-def test_an_unweighted_norm_takes_the_fused_kernel_where_a_staged_jvp_survives_it(monkeypatch, composes):
+def test_an_unweighted_norm_takes_the_fused_kernel_and_keeps_a_staged_jvp():
     """Traced for an A100, whose row names the fused RMSNorm, `unweighted_rmsnorm` (Mamba2's,
-    Nemotron-H's, DeepSeek-V4's and GLM-5's) takes the kernel where this jax composes its linear
-    tangent (`generation.linear_tangents_compose`), else the portable norm, which a jvp of a jit
-    that staged it reaches; on either route that jvp is the portable norm's, and a gradient runs
-    the route's own backward."""
+    Nemotron-H's, DeepSeek-V4's and GLM-5's) takes the kernel, differentiated as one custom JVP
+    (`generation.linear_tangent`): a jvp of a jit that staged it is the portable norm's, and its
+    gradient runs the kernel's backward."""
     from dew.nn.kernels import generation
 
-    monkeypatch.setattr(generation, "linear_tangents_compose", lambda: composes)
     x = jax.random.normal(jax.random.key(28), (4, 64)).astype(jnp.bfloat16)
     tangent = jax.random.normal(jax.random.key(29), (4, 64)).astype(jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as found:
         jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(x)
     (route,) = [route for route in found if route.choice == "rms_norm"]
-    assert route.kernel == ("pallas" if composes else "xla") and route.preferred == "pallas"
+    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
 
     def norm(implementation):
         return jax.jit(lambda x: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation))
@@ -234,7 +231,7 @@ def test_an_unweighted_norm_takes_the_fused_kernel_where_a_staged_jvp_survives_i
     def pulled(x):
         return jax.grad(lambda x: norm("pallas")(x).astype(jnp.float32).sum())(x)
 
-    assert ("rms_norm_backward" in kernels(pulled, x)) == composes
+    assert "rms_norm_backward" in kernels(pulled, x)
     assert pulled(x).dtype == x.dtype
 
 
