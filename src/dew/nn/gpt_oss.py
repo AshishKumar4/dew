@@ -127,6 +127,11 @@ class GptOssMLP(nn.Module):
                 + self.num_experts_per_tok * expert.model_flops(lengths)
                 + projection_flops(lengths, self.num_experts_per_tok, self.hidden_size))
 
+    @property
+    def routes_experts(self) -> bool:
+        """It takes a layer's replayed experts (`RoutesExperts`)."""
+        return True
+
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
         logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,

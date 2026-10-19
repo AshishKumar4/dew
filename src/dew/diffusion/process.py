@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 
-from dew.diffusion.schedules import NoiseScheduler
+from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
 from dew.objectives.base import Variables
 
@@ -108,6 +108,12 @@ class Process:
         `like` is a `[B, ...]` state.
         """
         return broadcast_rates(self.sampler_schedule, t, like)
+
+    def variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Return the sampling schedule's `(alpha^2, sigma^2)` at `t` (`NoiseScheduler.variances`),
+        shaped to broadcast against `like`."""
+        alpha2, sigma2 = self.sampler_schedule.variances(t)
+        return expand(alpha2, like), expand(sigma2, like)
 
     def times(self, steps: int) -> jax.Array:
         """Return the descending grid of `steps` times, from T to 0, that a solver steps through.
