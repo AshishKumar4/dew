@@ -8,7 +8,8 @@ latent position; the prompt states; the timestep divided by a thousand; the
 records the prediction at the image's tokens and, against a fixed cotangent,
 the gradients of the latent, the prompt states and every parameter,
 unmodified, in float32, the reference, and in float64, the truth
-(`diffusers_wan_reference.float64`: the source's float32 pins widened).
+(`diffusers_wan_reference.float64`: the source's float32 pins widened, its
+rotary table rebuilt under them, `widened_rope`).
 
 A row padded behind a shorter prompt is recorded as the source's call for
 that prompt alone, which is what each native row reproduces (see
@@ -76,6 +77,16 @@ CASES: dict[str, Case] = {
 }
 
 
+def widened_rope(transformer):
+    """`transformer` with its rotary table rebuilt where it is built: `QwenImage21Rope` computes
+    its frequencies and angles once, at construction, under `.to(torch.float32)` pins, and keeps
+    them as complex tensors no `.double()` reaches. Rebuilt inside `float64`, which widens those
+    pins, the table is float64's. Returns the transformer."""
+    rope = transformer.pos_embed
+    transformer.pos_embed = type(rope)(theta=rope.theta, axes_dim=rope.axes_dim)
+    return transformer
+
+
 def transformer_call(model, packed, context, times, grid, mask=None):
     """The pipeline's own call for text-to-image: the target's image slots
     follow the prompt in `img_mask`, and the prediction is the last tokens."""
@@ -136,7 +147,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(model, torch.float32)
     with float64():
-        wide = walk(copy.deepcopy(model).double(), torch.float64)
+        wide = walk(widened_rope(copy.deepcopy(model).double()), torch.float64)
     print(f"{name}: grid {case.grid} lengths {case.lengths} "
           f"|output| <= {float(np.abs(narrow['output']).max()):.4g}")
     return {"packed": packed.numpy(), "context": context.numpy(), "mask": mask.numpy(),
@@ -247,7 +258,9 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(pipe, torch.float32)
     with float64():
-        wide = walk(copy.deepcopy(pipe).to(torch.float64), torch.float64)
+        wide = copy.deepcopy(pipe).to(torch.float64)
+        widened_rope(wide.transformer)
+        wide = walk(wide, torch.float64)
     print(f"pipeline: context {narrow['context.0'].shape} latents {narrow['latents.0'].shape} "
           f"images {narrow['images.0'].shape}")
     return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
