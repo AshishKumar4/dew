@@ -148,3 +148,25 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
         "ignore_eos": True, "detokenize": False}
     record = json.loads((tmp_path / "record.json").read_text())
     assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 5
+
+
+def test_a_multimodal_model_serves_its_own_dense_layout(tmp_path):
+    """A multimodal model's wrapper declares no KV layout to replace, so `--kv dense` serves its own dense
+    one, every requested token; `--kv paged` asks the server to replace it, which the server refuses
+    (ledger 637: the wrapper should hand a layout to its text decoder)."""
+    model = ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm"
+
+    def benchmark(kv: str) -> subprocess.CompletedProcess:
+        env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
+               "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
+                               "--backend", "dew", "--model", str(model), "--slots", "2", "--requests", "4",
+                               "--prompt", "8", "--output", "8", "--vocab-limit", "200", "--repeats", "1",
+                               "--kv", kv, "--out", str(tmp_path / f"{kv}.json")],
+                              env=env, cwd=ROOT, capture_output=True, text=True)
+
+    dense = benchmark("dense")
+    assert dense.returncode == 0, dense.stderr[-3000:]
+    record = json.loads((tmp_path / "dense.json").read_text())
+    assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 8
+    assert benchmark("paged").returncode != 0 and not (tmp_path / "paged.json").exists()
