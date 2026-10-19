@@ -122,13 +122,18 @@ def without_deterministic_ops(monkeypatch):
 
 @pytest.fixture
 def caplog(caplog):
-    """Capture Dew's isolated logger as well as the application's root logger."""
+    """Capture Dew's logger as well as the application's root logger. Dew's records reach the
+    capture once, through a handler of their own that does not pass them on to the root, whether
+    or not the run's setup configured the logger (`dew.logging.configure`), which then leaves it."""
     logger = logging.getLogger("dew")
+    propagated = logger.propagate
     logger.addHandler(caplog.handler)
+    logger.propagate = False
     try:
         yield caplog
     finally:
         logger.removeHandler(caplog.handler)
+        logger.propagate = propagated
 
 
 @pytest.fixture

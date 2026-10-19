@@ -298,6 +298,10 @@ class DiffusionGemma(nn.Module):
         None where none does (`CausalTransformer.output_table`)."""
         return self.text.output_table()
 
+    def vocabulary_rows(self) -> jax.Array:
+        """The shared head's rows (`CausalTransformer.vocabulary_rows`)."""
+        return self.text.vocabulary_rows()
+
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None,

@@ -73,10 +73,12 @@ def open_metrics(rate: float, ttft, gaps, wall: float, tokens: int) -> dict[str,
 
 
 def dew_open(server, prompts: np.ndarray, output: int, rate: float):
-    """Open-loop Dew: requests submitted as they arrive, a step whenever any is live."""
+    """Open-loop Dew: requests submitted as they arrive, a step whenever any is live. Each token
+    is stamped when the host reads it (`Ticket.add_tokens_callback`), as the engine side stamps
+    each token it streams, so the tokens one step publishes together share a time."""
     arrivals = arrivals_for(server.slots, len(prompts), rate)
-    tickets, due, gaps = [], [], []
-    stamps: dict[int, float] = {}  # a decoding row's last step
+    tickets, due = [], []
+    stamps: list[list[float]] = []  # each request's token times
     live: list[int] = []
     began = time.perf_counter()
     while len(tickets) < len(prompts) or live:
@@ -84,21 +86,22 @@ def dew_open(server, prompts: np.ndarray, output: int, rate: float):
         while len(tickets) < len(prompts) and arrivals[len(tickets)] <= now:
             due.append(began + arrivals[len(tickets)])
             live.append(len(tickets))
-            tickets.append(server.submit(prompts[len(tickets)], output, key=len(tickets)))
+            read: list[float] = []
+            ticket = server.submit(prompts[len(tickets)], output, key=len(tickets))
+            ticket.add_tokens_callback(lambda ticket, read=read: read.extend(
+                [time.perf_counter()] * (len(ticket.tokens) - len(read))))
+            tickets.append(ticket)
+            stamps.append(read)
         if not live:
             time.sleep(max(0.0, arrivals[len(tickets)] - (time.perf_counter() - began)))
             continue
         server.step()
-        stamp = time.perf_counter()
-        for number in live:
-            if tickets[number].first is not None:
-                if number in stamps:
-                    gaps.append(stamp - stamps[number])
-                stamps[number] = stamp
         live = [number for number in live if not tickets[number].done()]
     wall = time.perf_counter() - began
     server.run()
+    assert all(len(read) == output for read in stamps), [len(read) for read in stamps]
     ttft = [ticket.first - arrival for ticket, arrival in zip(tickets, due, strict=True)]
+    gaps = np.concatenate([np.diff(read) for read in stamps])
     return open_metrics(rate, ttft, gaps, wall, len(prompts) * output)
 
 
