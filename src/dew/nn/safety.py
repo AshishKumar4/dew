@@ -4,7 +4,7 @@ from flax import linen as nn
 from flax.typing import Dtype
 
 from dew.nn.attention import l2_normalized
-from dew.nn.precision import float32_products
+from dew.nn.precision import computes_in, float32_products
 from dew.nn.text_encoders import CLIPVisionTransformer
 
 
@@ -26,7 +26,7 @@ class CLIPSafetyHead(nn.Module):
 
     def setup(self):
         self.visual_projection = nn.Dense(self.projection_dim, use_bias=False, dtype=self.dtype,
-                                          precision=float32_products(self.dtype))
+                                          precision=float32_products(computes_in(self)))
         self.concept_embeds = self.param(
             "concept_embeds", nn.initializers.ones, (self.concepts, self.projection_dim)
         )
