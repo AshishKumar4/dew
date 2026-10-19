@@ -41,13 +41,13 @@ class TokenFeatures(nn.Module):
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
 
-def build_ppo(verifier=verify, gamma=.97, *, split=None, **policy_options):
+def build_ppo(verifier=verify, gamma=.97, *, lam=.9, split=None, **policy_options):
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
                              critic=ValueHead(TokenFeatures()), beta=.03, **policy_options)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), split=split)
     source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
                             PROMPT, RESPONSE, TURNS, sampling=SAMPLING, groups=GROUPS)
-    rollout = PPORollout(objective, source, gamma=gamma, lam=.9)
+    rollout = PPORollout(objective, source, gamma=gamma, lam=lam)
     trainer.rollout = rollout
     return trainer, rollout
 
@@ -106,27 +106,30 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     assert abs(float(before - after)) > .001
 
 
-def test_episode_advantages_hold_at_values_far_above_them():
-    """PPORollout whitens the GAE recursion's own advantages. With every value
-    and every reward 1e8 higher, all exact in float32, each temporal
-    difference is the same, and so is each whitened advantage, bit for bit,
-    where returns less values would round every advantage below 4 away."""
-    def advantages(shift):
-        trainer, rollout = build_ppo(lambda episode: shift + 8 * verify(episode), gamma=1.)
+def test_episode_advantages_hold_at_values_and_rewards_far_above_them():
+    """PPORollout whitens the GAE recursion's own advantages, from centred moments over every process.
+    With every value and every reward 1e8 higher, all exact in float32, each temporal difference is
+    the same, and so is each whitened advantage, bit for bit, where returns less values would round
+    every advantage below 4 away. Undiscounted (gamma = lambda = 1), with every reward 10001 higher and
+    the values still at zero, every advantage is 10001 higher and whitening, which a shift leaves
+    alone, gives the same advantages, where moments of the raw squares cancel to a wrong variance."""
+    def advantages(value_shift, reward_shift, lam=.9):
+        trainer, rollout = build_ppo(lambda episode: reward_shift + 8 * verify(episode), gamma=1., lam=lam)
         state = trainer.initial_state()
         params = state.variables["params"]
         value = params["critic"]["value"]
-        level = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.full_like(value["bias"], shift)}
+        level = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.full_like(value["bias"], value_shift)}
         variables = {**state.variables, "params": {**params, "critic": {**params["critic"], "value": level}}}
         batch = rollout(state.replace(variables=variables), {"task_id": np.array([31], np.int32)},
                         jax.random.key(23))
         actions = batch["response_mask"] != 0
-        assert np.all(batch[OLD_VALUES_KEY][actions] == np.float32(shift))
+        assert np.all(batch[OLD_VALUES_KEY][actions] == np.float32(value_shift))
         return batch["advantages"][actions]
 
-    level = advantages(0.)
+    level = advantages(0., 0.)
     assert np.unique(level).size > 2
-    np.testing.assert_array_equal(advantages(1e8), level)
+    np.testing.assert_array_equal(advantages(1e8, 1e8), level)
+    np.testing.assert_allclose(advantages(0., 10001., lam=1.), advantages(0., 0., lam=1.), rtol=0, atol=2e-6)
 
 
 def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():

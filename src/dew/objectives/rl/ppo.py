@@ -27,7 +27,7 @@ from dew.objectives.base import (
     joined,
     part,
 )
-from dew.rl.advantage import MEAN_EPS, WHITEN_EPS, gae_advantages
+from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
@@ -245,6 +245,12 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.preview(part(params, "policy"), batch, replace(step, ema=None), scored=scored)
 
 
+def _over_processes(moments: jax.Array) -> jax.Array:
+    """`moments` summed over every process of the pool (`from_every_process`), in float64."""
+    shared = from_every_process(np.asarray(moments, np.float64).tolist())
+    return jnp.asarray(np.sum(np.asarray(shared, np.float64), axis=0), moments.dtype)
+
+
 @dataclass(frozen=True)
 class PPORollout:
     """Collects episodes, then adds critic baselines and targets from verl's masked GAE.
@@ -313,11 +319,7 @@ class PPORollout:
         raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
-        moments = [float(np.sum(keep)), float(np.sum(raw * keep)), float(np.sum(raw * raw * keep))]
-        count, total, squares = np.sum(np.asarray(from_every_process(moments), np.float64), axis=0)
-        mean = total / (count + MEAN_EPS)
-        variance = (squares - 2 * mean * total + mean * mean * count) / (count + MEAN_EPS)
-        advantages = (raw - mean) / np.sqrt(variance * (count / (count - 1)) + WHITEN_EPS)
+        advantages = np.asarray(masked_whiten(jnp.asarray(raw), jnp.asarray(keep), _over_processes))
         shape = values.shape
         placed_advantages = np.zeros(flat.shape, np.float32)
         placed_returns = np.zeros(flat.shape, np.float32)
