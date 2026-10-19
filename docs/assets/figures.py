@@ -852,7 +852,8 @@ def jepa_step_figure():
     width, height = 440, 330
     svg = Figure(width, height, seconds=12, label="One I-JEPA step on a flower. The context encoder sees the "
                  "unmasked patches, the predictor guesses the embeddings of the hidden block, and the target "
-                 "encoder, an average of the context encoder's weights, gives the embeddings to match.")
+                 "encoder, an average of the context encoder's weights, reads the whole image and gives the "
+                 "embeddings to match.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     ix, iy = 20, 40
     svg.text(ix, 28, "the image", size=13, color="muted")
@@ -893,7 +894,10 @@ def jepa_step_figure():
         svg.text(367, 314, "guess", size=12, color="accent", anchor="middle")
     svg.appear(predicted, 3.0)
     with svg.group() as targeted:
-        svg.arrow(ix + size + 6, iy + 24, 312, 58)
+        # The target encoder reads the whole image, unmasked.
+        svg.image(214, 30, 56, pixels(x0), photo=True)
+        svg.text(242, 100, "whole image", size=11, color="muted", anchor="middle")
+        svg.arrow(272, 58, 310, 62)
         box(314, 46, 106, "target encoder", "sees everything", "rule")
         svg.arrow(367, 94, 367, 110)
         chips(335, 116, "tint1")
