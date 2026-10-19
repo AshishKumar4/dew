@@ -2,7 +2,7 @@
 
 A serving step decodes every slot of its cache. jax.nn's xla attention, and
 the folded form that reads the cache in its own layout
-(`dew.nn.attention.folded_attention`), compute every row over the cache's
+(`dew.nn.decode_geometry.folded_attention`), compute every row over the cache's
 whole capacity, idle rows and the slots past a row's length included.
 Each program here takes one row and one key head, and reads only the blocks
 of keys below the row's length, with an online softmax over them (flash

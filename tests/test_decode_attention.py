@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 
-from dew.nn.attention import folded_attention, scaled_dot_product_attention, with_key_lengths
+from dew.nn.attention import scaled_dot_product_attention, with_key_lengths
+from dew.nn.decode_geometry import folded_attention
 
 pytestmark = pytest.mark.kernel
 
@@ -92,9 +93,9 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`attention._grouped`) over key lengths on
-    'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the folded attention
-    it stands in for over the prefix those lengths mean."""
+    """fp32 attention of a decode step's grouped query (`decode_geometry.grouped_query`) over key
+    lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the folded
+    attention it stands in for over the prefix those lengths mean."""
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, implementation='xla',
                                             key_value_seq_lengths=lengths)
@@ -131,7 +132,7 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
 def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
     """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
     layout with key lengths: the core reads each key head's query heads as its query positions
-    (`attention._grouped`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    (`decode_geometry.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
     from dew.nn.kernels.generation import assumed, gpu_mesh
     from dew.training._lowering import triton_kernels
 
