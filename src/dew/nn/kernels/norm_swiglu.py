@@ -397,9 +397,9 @@ def _rounded_inverse_cotangent(m, x, inverse, multiplier, narrow, width: int, in
     they cancel, it cancels too. `width` is the row's own, not its padded block's."""
     direct = _round(m * multiplier[:, None], narrow, interpret)
     sensed = _round(jnp.sum(_round(m * x, narrow, interpret), axis=1), narrow, interpret)
-    # rsqrt's half and the square's two apart, as XLA's transposes keep them, so no product overflows
-    # that XLA's does not.
-    correction = (-0.5 * sensed) * (inverse * inverse * inverse) * (1.0 / width)
+    # rsqrt's half in its coefficient and the square's two apart, as XLA's transposes keep them, so no
+    # product overflows, nor a small cotangent's halving rounds, where XLA's does not.
+    correction = sensed * (-0.5 * (inverse * inverse * inverse)) * (1.0 / width)
     reduced = _round((2.0 * x) * correction[:, None], narrow, interpret)
     return direct + reduced
 
