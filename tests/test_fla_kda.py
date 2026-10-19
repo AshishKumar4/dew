@@ -39,6 +39,7 @@ from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import fla_gdn, fla_kda, tuning
 from dew.nn.linear import fla_rule, l2norm
+from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
 
@@ -134,9 +135,9 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
     def loss(params, x):
         return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
 
-    text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile().as_text()
-    assert "__gpu$xla.gpu.triton" in text
-    assert boundary_copies(text) == []
+    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
+    assert triton_calls(lowered)
+    assert boundary_copies(lowered.compile().as_text()) == []
 
 
 GPU_CASES = {

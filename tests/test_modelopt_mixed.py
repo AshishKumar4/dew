@@ -10,7 +10,7 @@ import pytest
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import InputQuantizer, fp8_input_qdq
+from dew.quantization import InputQuantizer, fp8_input_qdq
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'codecs' / 'modelopt' / 'mixed'
 

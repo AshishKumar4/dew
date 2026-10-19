@@ -5,6 +5,11 @@ isolated reference env:
   python tools/diffusers_extended_reference.py BASE_XL OUTPUT TASK
 TASK: xl-img2img, xl-inpaint, refiner, safety. BASE_XL comes from
  diffusers_pipeline_reference.py (use its SD output for safety).
+
+`truth ROOT OUTPUT` reruns each saved task under ROOT in float64, the truth its float32 reference is
+measured from (`diffusers_wan_reference.float64`), every noise the call draws the float32 draw widened
+so the draws are the reference's own, and adds them as `{task}/{name}` to the npz OUTPUT
+(tests/fixtures/tiny_diffusers_f64.npz, which `diffusers_pipeline_reference.py truth` writes first).
 """
 import argparse
 import json
@@ -12,7 +17,6 @@ from pathlib import Path
 import tempfile
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import serialization
@@ -133,7 +137,102 @@ def build(base, directory, task):
     print(task, "saved official PyTorch pipeline; latent sum", float(final.sum()))
 
 
+def truth(root, destination):
+    """Each saved PyTorch task rerun in float64 (see the module docstring)."""
+    import importlib
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    from diffusers.utils import torch_utils
+    from diffusers_wan_reference import float64
+
+    require("diffusers-pipelines")
+    torch.set_num_threads(2)
+    wide = torch.float64
+    draw = torch_utils.randn_tensor
+
+    def narrow_draw(shape, generator=None, device=None, dtype=None, layout=None):
+        return draw(shape, generator=generator, device=device, dtype=torch.float32, layout=layout).to(dtype)
+
+    with np.load(destination) as stored:
+        arrays = dict(stored)
+    with ExitStack() as scope:
+        for name in ("diffusers.utils.torch_utils",
+                     "diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img",
+                     "diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint",
+                     "diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion",
+                     "diffusers.schedulers.scheduling_ddim"):
+            scope.enter_context(patch.object(importlib.import_module(name), "randn_tensor", narrow_draw))
+        scope.enter_context(float64())
+        for task in ("xl-img2img", "xl-inpaint", "refiner", "safety"):
+            directory = Path(root) / task
+            reference = np.load(directory / "reference.npz")
+            meta = json.loads((directory / "reference.json").read_text())
+            got = {}
+            if task == "safety":
+                pipe = StableDiffusionPipeline.from_pretrained(directory, local_files_only=True).to(wide)
+                pipe.set_progress_bar_config(disable=True)
+                noise = torch.from_numpy(reference["noise"].transpose(0, 3, 1, 2).copy()).to(wide)
+                with torch.no_grad():
+                    got["images"] = pipe("cat", num_inference_steps=2, height=32, width=32, guidance_scale=3.0,
+                                         latents=noise, negative_prompt="dog", output_type="np").images
+                    pixels = np.rint(reference["images"] * 255).astype(np.uint8)
+                    # The processor's resize and crop, then its rescale and normalize in float64.
+                    extractor = pipe.feature_extractor
+                    resized = extractor(list(pixels), do_rescale=False, do_normalize=False,
+                                        return_tensors="np").pixel_values.astype(np.float64)
+                    shape = (1, -1, 1, 1)
+                    features = torch.from_numpy(
+                        (resized * extractor.rescale_factor - np.reshape(extractor.image_mean, shape))
+                        / np.reshape(extractor.image_std, shape))
+                    checker = pipe.safety_checker
+                    got["checker_pixels"] = features.numpy()
+                    got["checker_embeddings"] = checker.visual_projection(checker.vision_model(features)[1]).numpy()
+            else:
+                cls = StableDiffusionXLInpaintPipeline if task == "xl-inpaint" else StableDiffusionXLImg2ImgPipeline
+                pipe = cls.from_pretrained(directory, local_files_only=True).to(wide)
+                pipe.set_progress_bar_config(disable=True)
+                processed = torch.from_numpy(reference["processed"]).to(wide)
+                noise = torch.from_numpy(reference["noise"].transpose(0, 3, 1, 2).copy()).to(wide)
+                with torch.no_grad():
+                    scale = pipe.vae.config.scaling_factor
+                    image_latents = pipe.vae.encode(processed).latent_dist.mode() * scale
+                    prompt, _, pooled, _ = pipe.encode_prompt(
+                        "cat", prompt_2="fox", device=torch.device("cpu"), negative_prompt="dog",
+                        negative_prompt_2="owl")
+                    got.update(hidden=prompt.numpy(), pooled=pooled.numpy(),
+                               image_latents=image_latents.permute(0, 2, 3, 1).numpy())
+                    kwargs = dict(prompt="cat", prompt_2="fox", negative_prompt="dog", negative_prompt_2="owl",
+                                  num_inference_steps=meta["steps"], guidance_scale=3.0, height=32, width=32,
+                                  generator=torch.Generator().manual_seed(17), output_type="latent")
+                    if task == "xl-inpaint":
+                        mask = reference["mask"]
+                        masked = processed * torch.tensor(mask[None, None] < 128)
+                        masked_latents = pipe.vae.encode(masked).latent_dist.mode() * scale
+                        kwargs.update(image=Image.fromarray(reference["pixels"]), mask_image=Image.fromarray(mask),
+                                      strength=1.0, latents=noise, masked_image_latents=masked_latents)
+                        got["masked_latents"] = masked_latents.permute(0, 2, 3, 1).numpy()
+                    else:
+                        kwargs.update(image=image_latents, strength=meta["strength"])
+                        if "denoising_start" in meta:
+                            kwargs["denoising_start"] = meta["denoising_start"]
+                    final = pipe(**kwargs).images
+                    decoded = pipe.vae.decode(final / scale, return_dict=False)[0]
+                    got.update(final_latents=final.permute(0, 2, 3, 1).numpy(),
+                               images=(decoded / 2 + 0.5).clamp(0, 1).permute(0, 2, 3, 1).numpy())
+            gaps = {name: float(np.max(np.abs(np.asarray(value, np.float64) - reference[name]))) for name, value in got.items()}
+            print(json.dumps({"task": task, "float32_from_float64": gaps,
+                              "dtypes": sorted({str(np.asarray(value).dtype) for value in got.values()})}))
+            arrays.update({f"{task}/{name}": np.asarray(value) for name, value in got.items()})
+    np.savez_compressed(destination, **arrays)
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 4 and sys.argv[1] == "truth":
+        truth(sys.argv[2], sys.argv[3])
+        raise SystemExit
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base")
     parser.add_argument("directory")
