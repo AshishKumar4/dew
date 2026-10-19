@@ -243,6 +243,115 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
 
 
+@dataclasses.dataclass(frozen=True)
+class Member:
+    """A record marked with the mixture member it came from."""
+
+    index: int
+
+    def __call__(self, element):
+        return {**element, "member": np.int32(self.index)}
+
+
+def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
+    """A random step in a mixture member draws by the name the member goes by, not by its place among
+    the members: a member joining before it leaves its draws as they were, and two members of one
+    name draw apart."""
+    def member(name, index):
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+
+    def draws(members):
+        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return {(int(index), int(of)): int(draw) for batch in stream
+                    for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)}
+        finally:
+            stream.close()
+
+    alone = draws([member("kept", 1)])
+    joined = draws([member("joining", 0), member("kept", 1)])
+    assert {key: draw for key, draw in joined.items() if key[1] == 1} == alone
+    twins = draws([member("twin", 0), member("twin", 1)])
+    assert [twins[index, 0] for index in range(8)] != [twins[index, 1] for index in range(8)]
+
+
+def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_named_one_joins(tmp_path):
+    """A member given no name goes by its place among the members given none, never by where its
+    source sits: one dataset mounted at two paths draws alike in a mixture, whose plans agree, and a
+    named member joining the mixture leaves its draws as they were."""
+    def mounted(directory, joining=False):
+        directory.mkdir(exist_ok=True)
+        (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
+        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
+        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(Draw()).repeat(1)
+        joined = [named] if joining else []
+        return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
+
+    here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
+    assert here.plan.identity() == there.plan.identity()
+    draws = []
+    for data in (here, there, mounted(tmp_path / "here", joining=True)):
+        stream = data.train(DataPartition())
+        try:
+            draws.append({int(index): int(draw) for batch in stream
+                          for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                          if of == 0})
+        finally:
+            stream.close()
+    assert draws[0] == draws[1]
+    # The mixture may end once a member runs out; every row it read draws as it did alone.
+    assert draws[2] and all(draws[0][index] == draw for index, draw in draws[2].items())
+
+
+def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
+    """A member's name and an unnamed member's place are kept apart, whatever the name spells: a
+    member named like a place keeps its draws when an unnamed member joins ahead of it, and an
+    unnamed member keeps its own when that named member joins ahead of it."""
+    def member(name, index):
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+
+    def draws(members, of):
+        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return {int(index): int(draw) for batch in stream
+                    for index, at, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                    if at == of}
+        finally:
+            stream.close()
+
+    for name in ("place:0", "#0", "0"):
+        alone = draws([member(name, 1)], 1)
+        joined = draws([member(None, 0), member(name, 1)], 1)
+        assert joined and all(alone[index] == draw for index, draw in joined.items())
+        unnamed = draws([member(None, 0)], 0)
+        ahead = draws([member(name, 1), member(None, 0)], 0)
+        assert ahead and all(unnamed[index] == draw for index, draw in ahead.items())
+
+
+def test_a_position_is_refused_where_a_mixture_member_was_renamed():
+    """A mixture's plan names its members, whose draws their names key: a position saved under one
+    name is refused by the mixture that renamed it, which would draw other rows."""
+    def mixed(name):
+        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(),
+                   Pipeline(source(4)).random_map(Draw()).repeat()]
+        return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+
+    stream = mixed("first").train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed("second").train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""
