@@ -32,8 +32,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-
-# The SD3 tool restores the transformers names diffusers 0.34.0 imports.
+from diffusers_reference_helpers import restore_transformers_names
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
 from diffusers_wan_reference import float64
 
@@ -168,6 +167,8 @@ def main(destination: str) -> None:
     from reference_releases import require
 
     require("diffusers")
+    # Diffusers 0.34.0's pipeline modules import names transformers 5 dropped.
+    restore_transformers_names()
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
