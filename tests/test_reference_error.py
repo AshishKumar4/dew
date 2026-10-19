@@ -11,6 +11,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
     assert_leaves_as_exact_in_two_stages,
+    assert_rows_as_exact_over_orders,
     distance,
     reduce,
 )
@@ -160,3 +161,17 @@ def test_orders_recorded_apart_reduce_to_the_rule_run_in_one_process(monkeypatch
     assert reduce(tmp_path, stage1=False) == []
     next(tmp_path.glob("*/7.json")).unlink()
     assert reduce(tmp_path, stage1=False)
+
+
+def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
+    """Rows over ORDERS orders (`assert_rows_as_exact_over_orders`): Dew rounding each of 64 rows as the
+    reference does passes; one row rounding six times as far, which moves the RMS over every row by
+    little, fails as its worst row."""
+    rng = np.random.default_rng(5)
+    reference = np.abs(rng.normal(size=(ORDERS, 64)))
+    dew = np.abs(rng.normal(size=(ORDERS, 64)))
+    assert_rows_as_exact_over_orders(dew, reference, "alike")
+    dew[:, 3] *= 6
+    assert np.sqrt(np.mean(dew ** 2)) <= FACTOR * np.sqrt(np.mean(reference ** 2))
+    with pytest.raises(AssertionError):
+        assert_rows_as_exact_over_orders(dew, reference, "one row")

@@ -695,6 +695,24 @@ def assert_as_exact_over_orders(dew, reference, label: str) -> None:
         f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
 
+def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> None:
+    """Each row held over ORDERS rounding orders, beside `assert_as_exact_over_orders`'s global RMS:
+    `dew` and `reference` `[ORDERS, rows]` hold each order's distance of each row from float64, and
+    `sizes` `[rows]` each row's float64 size (its terms', `row_errors`), one where none is given. Each
+    row's RMS over the orders over its size, Dew's worst within ROW_FACTOR of the reference's worst,
+    as `rows_over` holds one draw."""
+    dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
+    assert dew.shape == reference.shape and dew.shape[0] == ORDERS, (
+        f"{label}: {dew.shape} and {reference.shape} rows over orders, the rule takes {ORDERS} orders")
+    sizes = np.ones(dew.shape[1]) if sizes is None else np.asarray(sizes, np.float64)
+    sized = sizes > 0
+    mine, theirs = (np.sqrt(np.mean(np.square(rows), axis=0))[sized] / sizes[sized] for rows in (dew, reference))
+    worst, their_worst = float(np.max(mine)), float(np.max(theirs))
+    assert within(worst, ROW_FACTOR * their_worst), (
+        f"{label}: dew's worst row is {worst:.3e} from float64 (rms over {ORDERS} orders, over its size), "
+        f"the reference's {their_worst:.3e} (ratio {worst / their_worst:.2f}, allowed {ROW_FACTOR:g})")
+
+
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
     """The reference run in float64 within the float64 rounding of the
     computation itself of an independent float64 oracle: FACTOR times
