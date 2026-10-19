@@ -17,6 +17,25 @@ def expand(coefficient, x):
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
+def divided(numerator, rate):
+    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate.
+
+    A workaround for openxla/xla#51148: on CPU, XLA's algebraic simplifier rewrites a division by
+    a broadcast, a per-row rate against a `[B, ...]` state among them, into a multiplication by its
+    reciprocal without fast math (`HandleDivide`, behind `executing_on_cpu` and
+    `enable_sink_broadcast`, which no option turns off), two roundings where the division makes
+    one: 29% of float32 quotients come out an ulp off. The divisor here is the rate plus the
+    numerator times zero, a full-shape operand that no simplification folds back to the broadcast
+    (folding would change an infinite numerator's NaN), so the division stays one, inside the
+    fusion around it and with no buffer of its own. A finite numerator leaves the rate exact.
+    Other backends keep the division as written (the rewrite is the CPU compiler's alone), so
+    there it is the plain one, at the plain one's cost. Remove this once XLA keeps such
+    divisions IEEE.
+    """
+    return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
+                                      default=lambda value, by: value / by)
+
+
 
 def times(t) -> jax.Array:
     """`t` as an array of at least float32: a float64 run's times stay float64."""
@@ -73,6 +92,14 @@ class NoiseScheduler(ABC):
     def half_interval(self, t, t_next) -> jax.Array:
         """Return half a grid interval, where a Runge-Kutta stage places its intermediate points."""
         return (times(t) - times(t_next)) / 2
+
+    def variances(self, t) -> tuple[jax.Array, jax.Array]:
+        """Return `(alpha^2, sigma^2)` at `t`, shaped like `t`: the rates squared, unless the
+        schedule holds the squares themselves, as a beta table's cumulative products are, whose
+        differences a transfer between two of them reads more exactly than the squares of its
+        rounded roots (`DiscreteNoiseScheduler`)."""
+        alpha, sigma = self.rates(t)
+        return alpha ** 2, sigma ** 2
 
     def snr(self, t) -> jax.Array:
         alpha, sigma = self.rates(t)
