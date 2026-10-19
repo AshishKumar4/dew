@@ -6,14 +6,16 @@
     python tools/perf_gate.py report gate.json --table gate.md
 
 `run` measures every row of `BATTERY` in each tree, in alternating rounds (base
-then head, then head then base), each row a process of its own. A row runs a
-tree's own copy of its tool where the tree has one and the head's otherwise,
-with the tree's `src` first on the path, so a tree from before a tool existed
-is measured by the newer tool, and a row a tree cannot run is reported, not
-gated. `report` gates each row by its own noise: a row regresses when the
-head's median is worse than the base's by more than the larger of the two
-trees' spreads across rounds (and at least `FLOOR`), and the head's best
-sample is worse than the base's worst. It writes the table and exits 1 on a
+then head, then head then base), each row a process of its own in the tree's
+own locked environment (tools/environments.py), so a change of a locked
+wheel is measured with the code. A row runs a tree's own copy of its tool
+where the tree has one and the head's otherwise, with the tree's `src` first
+on the path, so a tree from before a tool existed is measured by the newer
+tool, and a row a tree cannot run (a tree older than its tool, or than the
+locks) is reported, not gated. `report` gates each row by its own noise: a
+row regresses when the head's median is worse than the base's by more than
+the larger of the two trees' spreads across rounds (and at least `FLOOR`), and
+the head's best sample is worse than the base's worst. It writes the table and exits 1 on a
 regression.
 
 The battery is the training step (a dense and an MoE decoder, a DiT, an
@@ -41,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import LM_DENSE, LM_MOE
+from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
@@ -213,11 +216,11 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
     return newer
 
 
-def _run(tree: Path, tool: str, argv: list[str], newer: Path,
+def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path,
          timeout: float) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
     env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}"}
-    command = [sys.executable, *([str(tools / tool)] if tool else []), *argv]
+    command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
 
@@ -228,14 +231,14 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
     return None
 
 
-def measure(tree: Path, args: argparse.Namespace, newer: Path, is_head: bool = True) -> dict:
-    """One sample of every row in `tree`: a number, or why the row could not run there."""
+def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True) -> dict:
+    """One sample of every row in `tree`, run by `python`: a number, or why the row could not run there."""
     sample = {}
 
     @functools.cache
     def hardware() -> str:
         """This machine's device kind, read once and only when a row names hardware."""
-        return subprocess.run([sys.executable, "-c", "import jax; print(jax.devices()[0].device_kind)"],
+        return subprocess.run([str(python), "-c", "import jax; print(jax.devices()[0].device_kind)"],
                               capture_output=True, text=True, check=True).stdout.strip()
 
     with tempfile.TemporaryDirectory() as scratch:
@@ -248,14 +251,15 @@ def measure(tree: Path, args: argparse.Namespace, newer: Path, is_head: bool = T
             claiming = args.claim and any(row.hardware for row in probe.rows)
             if args.only and not claiming and not any(word in name for name in names for word in args.only):
                 continue
-            unsupported = {row.name: hardware_status(row, hardware()) for row in probe.rows
-                           if row.hardware is not None}
-            if any(unsupported.values()):
-                sample.update({name: reason for name, reason in unsupported.items() if reason is not None})
-                continue
             done = None
             try:
-                done = _run(tree, probe.tool, probe.arguments(args, out), newer, 3600)
+                unsupported = {row.name: hardware_status(row, hardware()) for row in probe.rows
+                               if row.hardware is not None}
+                if any(unsupported.values()):
+                    sample.update({name: reason for name, reason in unsupported.items()
+                                   if reason is not None})
+                    continue
+                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600)
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
@@ -281,15 +285,26 @@ def run(args: argparse.Namespace) -> int:
 
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
+    # Each tree in the environment its own lock names, so a change of a locked wheel is measured too. A
+    # tree that holds no such lock (one older than the locks) cannot run a row, which its samples say.
+    lock, pythons, unbuilt = machine_lock(), {}, {}
+    for name, path in ((base, base_path), (head, head_path)):
+        try:
+            pythons[name] = environment(path, lock, Path(args.environments or CACHE))
+        except Unlocked as missing:
+            unbuilt[name] = f"not run: {missing}"
     claiming = getattr(args, "claim", False)
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
             or (claiming and row.hardware)]
     results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
-               "samples": {base: [], head: []}, "claim": claiming}
+               "samples": {base: [], head: []}, "claim": claiming,
+               "environments": {name: str(python.parent.parent) for name, python in pythons.items()}}
     for round_ in range(args.rounds):
         order = [(base, base_path), (head, head_path)]
         for name, path in order if round_ % 2 == 0 else order[::-1]:
-            results["samples"][name].append(measure(path, args, head_path / "tools", name == head))
+            results["samples"][name].append(
+                dict.fromkeys((row.name for row in rows if not row.head_only or name == head), unbuilt[name])
+                if name in unbuilt else measure(path, pythons[name], args, head_path / "tools", name == head))
             write_atomically(args.out, json.dumps(results, indent=2))
             print(f"round {round_ + 1}: {name} measured", flush=True)
     return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
@@ -426,6 +441,8 @@ def main() -> int:
     running.add_argument("--model", required=True, help="a local Qwen3-0.6B snapshot")
     running.add_argument("--flowers", required=True, help="the TFDS oxford_flowers102 directory")
     running.add_argument("--out", required=True)
+    running.add_argument("--environments", default="",
+                         help="where each tree's locked environment is built (tools/environments.py's cache)")
     running.add_argument("--torch-python", default="",
                          help="pinned reference interpreter for the Qwen3.5 row")
     running.add_argument("--claim", action="store_true",
