@@ -313,13 +313,16 @@ def test_restore_best_returns_the_best_steps_model_and_the_final_optimizer_state
         return Trainer(Overfit(), optax.adam(0.1), key=jax.random.key(0), checkpoints=checkpoints).fit(
             data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4 if path else None, **options)
 
+    models = []
     for path in (tmp_path / 'run', None):
         # A checkpointed run fit again to the step it reached trains nothing and returns its best.
         final, best = fit(path), fit(path, restore_best=True)
-        assert int(best.step) == int(best.updates) == 3
+        assert int(best.step) == int(best.updates) < int(final.step) == 8
         assert float(best.variables['params']['w']) != float(final.variables['params']['w'])
         for kept, last in zip(jax.tree.leaves(best.opt_state), jax.tree.leaves(final.opt_state), strict=True):
             np.testing.assert_array_equal(np.asarray(kept), np.asarray(last))
+        models.append((int(best.step), float(best.variables['params']['w'])))
+    assert models[0] == models[1] and models[0][0] == Checkpoints(str(tmp_path / 'run')).best
 
 
 def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
