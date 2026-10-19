@@ -399,29 +399,13 @@ def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = Non
     return route(choice, kernel=kernel, preferred=fastest, refusal=refusal).kernel
 
 
-def linear_tangents_compose() -> bool:
-    """Whether this jax batches `jax.custom_derivatives.linear_call` and carries a call's tangent in
-    its residuals, so that a custom JVP whose tangent is one composes with `jax.vmap` of a gradient
-    and with forward over reverse (`jax.jvp` of `jax.grad`): a rule may then transpose to a
-    kernel's own VJP. JAX 0.11.2 and 0.12.0 have neither rule. Dew's build of jax carries both from
-    0.11.2.post5 and 0.12.0.post5, post-releases of versions jax never published as one, so the
-    version says which jax this is; a post-release past those carries every earlier fix. Once a
-    jax release carries both and Dew requires it, this gate and the route it turns away from go."""
-    import jax
-    from packaging.version import Version
-
-    version = Version(jax.__version__)
-    first = {"0.11.2": 5, "0.12.0": 5}.get(version.base_version)
-    return first is not None and version.post is not None and version.post >= first
-
-
 def linear_tangent(kernel: Callable, portable: Callable) -> Callable:
     """`kernel`, a function of arrays with a custom VJP, differentiated as one custom JVP whose
     tangent is `portable`'s, the same arithmetic in XLA, evaluated as a `linear_call` that transposes
     to `kernel`'s own VJP: forward mode (`jax.jvp`, `jax.linearize`) takes the portable tangent
     however a jit or a scan staged the call first, and reverse mode runs the kernel's backward. It
-    composes with `jax.vmap` of a gradient and forward over reverse only where
-    `linear_tangents_compose`, so a caller takes it there alone."""
+    composes with `jax.vmap` of a gradient and with forward over reverse on Dew's jax build, whose
+    `linear_call` batches and carries its residual tangents."""
     import jax
     from jax.custom_derivatives import linear_call
 
