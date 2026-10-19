@@ -615,9 +615,12 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         for layout, rowwise in zip(layouts, split, strict=True):
             for name in ("variables", "opt_state", "ema"):
                 truth_leaves = getattr(exact, name)
-                reference = jax.tree.map(
-                    lambda whole, split, true: whole if distance(whole, true) >= distance(split, true) else split,
-                    *jax.device_get((getattr(alone, name), getattr(rowwise, name))), truth_leaves)
+
+                def farther(whole, split, true):
+                    return whole if distance(whole, true) >= distance(split, true) else split
+
+                reference = jax.tree.map(farther, *jax.device_get((getattr(alone, name), getattr(rowwise, name))),
+                                         truth_leaves)
                 assert_leaves_as_exact(jax.device_get(getattr(layout, name)), reference, truth_leaves,
                                        reductions=reductions, terms=getattr(terms, name), rows=rows)
         return layouts
