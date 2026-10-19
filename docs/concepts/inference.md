@@ -119,7 +119,7 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 import jax.numpy as jnp
 
 import dew
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
@@ -139,7 +139,7 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 import jax.numpy as jnp
 
 from dew.sampling import TextToImage
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
                                    revision="4b322022189373fd9086313241269aa5cea92b86")

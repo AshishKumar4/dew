@@ -83,7 +83,7 @@ def test_a_score_object_names_one_recorded_score_live_and_in_a_checkpoint():
     objective = Overfit()
     metric, other = Value('value', Shown(better='lower')), Value('other', Shown(better='lower'))
     scores = {'val/value': 1.0, 'test/value': 2.0, 'test/other': 3.0, 'train/loss': 4.0}
-    live, kept = MetricScores([metric, other], scores, objective), Metrics(scores)
+    live, kept = MetricScores({'val': [metric], 'test': [metric, other]}, scores, objective), Metrics(scores)
     for read in (live, kept):
         assert read[metric] == 1.0 and read[('test', metric)] == 2.0 and read[('test', other)] == 3.0
         assert read['val/value'] == 1.0 and read['test/other'] == 3.0
@@ -107,6 +107,72 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert scores[3]['train/loss'] > scores[12]['train/loss']
     restored, _ = run.checkpoints.restore({'variables': result.variables}, step='best')
     assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
+
+
+def test_an_aggregate_score_that_fails_fails_its_run(tmp_path):
+    """An aggregate score whose own code fails, here by reading a score no split records, fails
+    the run that asked for it, where it once ranked nothing and the run went on without a best."""
+    metric = Value('accuracy', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    with pytest.raises(KeyError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=2, metrics=[metric],
+                best=Best(lambda scores: scores['val/acuracy']))
+
+
+def test_an_aggregate_is_asked_only_where_an_evaluation_scored(tmp_path):
+    """A run that evaluates every other step asks an aggregate, here one reading a score by its
+    recorded name, only at the steps an evaluation scored, so it always reads a score, and it ranks
+    the checkpoints taken there."""
+    metric = Value('accuracy', Shown(better='higher'))
+    seen = []
+
+    def accuracy(scores):
+        seen.append(scores['val/accuracy'])
+        return seen[-1]
+
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, eval_every=2, checkpoint_every=2, metrics=[metric],
+            best=Best(accuracy, mode='max'))
+    run.checkpoints.wait()
+    assert seen and np.isfinite(seen).all()
+    assert run.checkpoints.resolve('best:aggregate:0') == 4
+
+
+def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_scored(tmp_path):
+    """A split evaluated on a cadence of its own is a score the fit declares that the evaluations
+    between its own do not record: an aggregate reading it by `(split, metric)` reads NaN there,
+    which ranks nothing, and ranks the steps it was scored at. The value rises as training does,
+    so the lowest is each split's first scored step."""
+    from dew.training import EvalSuite
+
+    metric = Value('accuracy', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, eval_every=1, metrics=[metric],
+            validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 2)},
+            best=[Best(lambda scores: scores[('often', metric)], mode='min'),
+                  Best(lambda scores: scores[('rare', metric)], mode='min')])
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best:aggregate:0') == 1
+    assert run.checkpoints.resolve('best:aggregate:1') == 2
+
+
+def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
+    """A training scalar may name itself in parts, as a critic's `critic/loss`: an aggregate reads
+    it by the scalar the objective declares, under its whole name, and ranks by it."""
+    class Critic(Overfit):
+        shown: ClassVar = {'critic/loss': Shown(better='lower')}
+
+        def loss(self, variables, batch, step):
+            statistic, _ = super().loss(variables, batch, step)
+            return statistic, Aux({'critic/loss': statistic})
+
+    objective = Critic()
+    run = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
+                  checkpoints=Checkpoints(str(tmp_path / 'run'), keep=1))
+    run.fit(dataclasses.replace(data(), val=None), steps=4, log_every=1, checkpoint_every=2,
+            best=Best(lambda scores: scores[objective.scalars['critic/loss']]))
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best:aggregate:0') == 4
 
 
 @pytest.mark.parametrize('by_name', [False, True], ids=['object', 'name'])
@@ -198,8 +264,7 @@ def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_val
 def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
     """Without checkpoints, a restore_best whose every evaluation its threshold leaves unranked has
     no state to return: the trackers hear a failed run, as a checkpointed one's do, not the final
-    state handed back as the best. A validation cadence a training-scalar best reads nothing of is
-    refused, as without restore_best."""
+    state handed back as the best."""
     metric = Value('value', Shown(better='lower'))
     tracker = Outcomes()
     run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
@@ -207,9 +272,17 @@ def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
         run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
                 best=Best(metric, threshold=-1.0), restore_best=True)
     assert tracker.ended == ['failed']
-    unread = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError):
-        unread.fit(data(), steps=2, log_every=1, eval_every=1, best=unread.objective.loss, restore_best=True)
+
+
+def test_a_scheduled_validation_records_its_loss_whatever_the_best_ranks_by():
+    """A validation scheduled with no metric and a best that ranks by the training loss still
+    reads its batches: it records the objective's validation loss, and restore_best returns the
+    state the training loss ranked best, as a checkpointed run's best does."""
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    run.fit(data(), steps=4, log_every=1, eval_every=1, best=run.objective.loss, restore_best=True)
+    assert tracker.ended == ['completed']
+    assert any('val/loss' in scalars for scalars in tracker.logged)
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
@@ -305,13 +378,13 @@ def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
 
 
 class Outcomes:
-    """A tracker that keeps the run's reported end."""
+    """A tracker that keeps the run's reported end and the scalars it logged."""
 
     def __init__(self):
-        self.ended = []
+        self.ended, self.logged = [], []
 
     def log(self, scalars, step):
-        pass
+        self.logged.append(dict(scalars))
 
     def artifact(self, value, step):
         if isinstance(value, FitEnded):

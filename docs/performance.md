@@ -2838,7 +2838,7 @@ Open loop at the same rates, Dew's TTFT p50 was 21-39 ms against vLLM's
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
 or fp8 values and their scales, through Qwix's post-training quantization
-(`dew.training.quantization.quantize_for_serving`). `int8` and `fp8`
+(`dew.quantization.quantize_for_serving`). `int8` and `fp8`
 quantize weights and activations, so a matmul of two quantized operands runs
 in the quantized dtype. `int8w` and `fp8w` quantize weights only and
 dequantize them into the compute dtype. The model is dewml/hybrid-dit-176m.
@@ -3249,7 +3249,7 @@ mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 
 A frozen projection takes part in two products a step, its forward and its input's gradient, and
 neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
-(`dew.training.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
+(`dew.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
 operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
 rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
 rows costs a read and a write of them each product, so FP8 pays where the product is wide in both

@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
-    from dew.data.pipeline import ObjectiveData
+    from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
@@ -139,7 +139,7 @@ ROUNDING_STREAM = 0x726F756E
 
 def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
     """The RNG streams a model draws from `key` in a training pass: `dropout`,
-    and `stochastic_rounding`, which a `dew.training.Quantization` with
+    and `stochastic_rounding`, which a `dew.quantization.Quantization` with
     `bwd_stochastic_rounding` rounds its gradients from.
 
     The rounding stream is a fold of `key`, so its draws are not dropout's.
@@ -718,7 +718,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         add: a loss head, a projector, a phase's split. The default adds nothing."""
         return tree
 
-    def program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
+    def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
+                holds: tuple[DeviceStep, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -727,7 +728,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. Keep only the current specialization, not a history of old models.
+        fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
+        step runs: the program is reused only while they are the same objects, and one over others
+        replaces it. Keep only the current specialization, not a history of old models or steps.
         """
         programs = tuple((program.module, program.head_tile) for program in self.program_key())
         cached = vars(self).get('_program_cache')
@@ -740,14 +743,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         # The options follow where the program runs (`compiler_options`), so they key it too.
         options = compiler_options(*(module for module, _ in programs))
         key = (name, trace_context(), tuple(options.items()))
-        if key not in cached[1]:
+        held = cached[1].get(key)
+        if held is None or len(held[0]) != len(holds) or any(
+                now is not was for now, was in zip(holds, held[0], strict=True)):
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][key] = jax.jit(run, static_argnames=static_argnames, compiler_options=options)
-        return cached[1][key]
+            held = (holds, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            cached[1][key] = held
+        return held[1]
 
     @property
     def _validation_loss(self):
@@ -787,7 +793,23 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.loss(variables, batch, replace(step, training=False))
 
     def _check_validation_loss(self) -> None:
-        """Refuse a validation loss this objective cannot define, before fit places its state."""
+        """Refuse a validation loss this objective does not define (`validation_loss_refusal`),
+        before fit places its state."""
+        if (refusal := self.validation_loss_refusal) is not None:
+            raise ValueError(refusal)
+
+    @property
+    def validation_loss_refusal(self) -> str | None:
+        """Why this objective defines no validation loss, None where `validation_loss` scores
+        held-out rows, which a validation pass then records whatever else reads it: the one
+        policy of whether an objective has a validation loss, which an objective that scores
+        held-out rows otherwise overrides."""
+        return None
+
+    @property
+    def defines_validation_loss(self) -> bool:
+        """Whether `validation_loss` scores held-out rows (`validation_loss_refusal`)."""
+        return self.validation_loss_refusal is None
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,

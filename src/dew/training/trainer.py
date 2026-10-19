@@ -283,6 +283,12 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
+def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
+    """Each split's own metrics, by its name: two suites may each hold their own instance of one
+    metric."""
+    return {name: tuple(suite.metrics) for name, suite in suites.items()}
+
+
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
@@ -331,6 +337,11 @@ class _FitPlan:
         """Whether either run-length cap has been reached, after `real` tokens."""
         return ((self.steps is not None and step >= self.steps)
                 or (self.tokens is not None and real >= self.tokens))
+
+    @property
+    def declared(self) -> dict[str, tuple[Metric, ...]]:
+        """Each validation split's metrics, by the split's name (`_split_metrics`)."""
+        return _split_metrics(self.suites)
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -1814,7 +1825,7 @@ class Trainer(Generic[Loss, Effects]):
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
         checkpoints, current = self.checkpoints, run.current
         ranking = rankings(plan.best, scores, validation=next(iter(plan.suites)) if plan.validation else None,
-                           scored=plan.scored, objective=self.objective)
+                           declared=plan.declared, objective=self.objective)
         if plan.held_best and evaluation_due:
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
@@ -1894,8 +1905,7 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        # Each split's own metrics: two suites may each hold their own instance of one metric.
-        scored = {name: tuple(suite.metrics) for name, suite in suites.items()} or {'val': tuple(metrics)}
+        scored = _split_metrics(suites) or {'val': tuple(metrics)}
         raw = (
             ()
             if best is None
@@ -1983,8 +1993,10 @@ class Trainer(Generic[Loss, Effects]):
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
-            # The loss is scored where it ranks the run's checkpoints, or the state it holds.
-            loss = ((self.checkpoints is not None or plan.held_best) and not plan.best
+            # The loss is recorded wherever the objective defines one, and is scored where it ranks
+            # the run's checkpoints or the state it holds, which preflight checks it can.
+            ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
+            loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports))
@@ -2012,14 +2024,16 @@ class Trainer(Generic[Loss, Effects]):
     def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool, loss: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
 
-        A validation pass hands its batches to metrics, to the preview and,
+        A validation pass records the objective's validation loss where it
+        defines one, and hands its batches to metrics, to the preview and,
         under a checkpointer, or with `loss` where its loss ranks the state a
         run holds (`_FitPlan.held_best`), to the loss that ranks the run's
-        steps. Scheduled with none of them, it would open nothing and report
-        nothing, so the contradiction is refused before the run does any work.
+        steps. Only an objective with no validation loss (Flow-GRPO's) and
+        none of the rest would open nothing and report nothing, and that
+        contradiction is refused before the run does any work.
         """
-        ranked = self.checkpoints is not None or loss
-        if not suite.metrics and not ranked and not (preview and self.tracker is not None):
+        read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
+        if not suite.metrics and not read and not (preview and self.tracker is not None):
             raise ValueError(
                 f"{name} is scored every {suite.every} steps and nothing consumes it: "
                 + ("preview=True needs a tracker to receive the samples; "
