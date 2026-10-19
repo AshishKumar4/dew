@@ -366,12 +366,18 @@ def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters |
     return projected
 
 
+def with_projected(variables: Variables, project: Callable[[Variables], Variables]) -> Variables:
+    """`variables` with its `params` collection as `project` returns it. A tree may hold none: flax
+    leaves an empty collection out, so a parameter-free model's tree is `{}` or its state alone."""
+    return {name: project(tree) if name == "params" else tree for name, tree in variables.items()}
+
+
 def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
     """A module's freshly drawn tree as training stores it: its parameters projected
     once by `owner`'s constraint (`updated=True`), as is where it declares none."""
-    if not isinstance(owner, ProjectsParameters) or "params" not in variables:
+    if not isinstance(owner, ProjectsParameters):
         return variables
-    return {**variables, "params": owner.projected(variables["params"], updated=True)}
+    return with_projected(variables, functools.partial(owner.projected, updated=True))
 
 
 def joined(parts: Mapping[str, Variables]) -> Variables:
@@ -702,7 +708,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
         tree = self.complete_variables(key, tree)
-        return {**tree, "params": self.projected(tree["params"], updated=True)}
+        return with_projected(tree, functools.partial(self.projected, updated=True))
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.
