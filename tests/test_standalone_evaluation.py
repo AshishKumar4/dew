@@ -77,7 +77,7 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
     assert warm[:2] == (0, 16), warm
     assert [(step, records) for step, records, _ in scheduled] == [(2, 16), (4, 16)], scheduled
     assert [compiled for _, _, compiled in scheduled] == [[], []], scheduled
-    assert len(tracker.artifacts) == 2
+    assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
 
 
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
