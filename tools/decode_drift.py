@@ -1,5 +1,6 @@
-"""Dew's decode held to its own noise floor over a long greedy decode, as vLLM's Kimi K3 work gates its
-kernels: error a per-kernel test with synthetic inputs cannot see builds up over thousands of steps.
+"""Dew's long greedy decode held to float64 truth within what its own reference path errs and wavers by,
+after vLLM's Kimi K3 work: error a per-kernel test with synthetic inputs cannot see builds up over
+thousands of decode steps.
 
     PYTHONPATH=src python tools/decode_drift.py --model DIR [--steps 1536] [--prompt 64] --out drift.json
 
@@ -9,15 +10,16 @@ kernels: error a per-kernel test with synthetic inputs cannot see builds up over
 2. The reference path (attention_impl="reference", and `dew.nn.kernels.generation.chosen` naming XLA for
    the RMS norm, SwiGLU and the gated delta rule) scores T teacher-forced through its cached decode
    (`dew.sampling.text.prefill_state`, `decode_ops`): at batch 1; at batch 4, T in row 0; and with every
-   embedding entry one ulp up (`jnp.nextafter`). The first two measured beside batch 1 are the noise
-   floor: what the reference itself moves by under a change no answer should depend on.
-3. One forward over the prompt and T scores T again, as a prefill: decode against prefill.
+   embedding entry one ulp up (`jnp.nextafter`). The two variants measured against batch 1 are its noise:
+   what the reference moves by under a change no answer should depend on.
+3. The truth: T scored by one float64 forward of the model over the prompt and T. The reference's and the
+   server's bf16 prefills of the same are recorded beside it: decode against prefill.
 
-Each comparison is the per-step |Δ log p| of T's tokens, its RMS and its largest. The gate holds the
-server's distance from the reference (1 against 2's batch 1) within the floor, by RMS and by largest:
-`passes` in the record, and the exit code. Qwen3.5's gated delta rule decodes through its fused step
-whatever `chosen` names (dew.nn.linear), so its reference is reference attention with a fused delta
-step until the decode honours the choice.
+The gate: the server's per-step distance from the truth, in RMS over the decode and over every 64-step
+block, within the reference's own distance plus its noise over the same steps (`dew.accuracy.within`: a
+NaN or infinite anything fails). `passes` in the record, and the exit code. Qwen3.5's gated delta rule
+decodes through its fused step whatever `chosen` names (dew.nn.linear), so for it the reference shares the
+server's delta step until the decode honours the choice; the record says so (`reference_delta_rule`).
 """
 
 from __future__ import annotations
@@ -33,16 +35,22 @@ import jax.numpy as jnp
 import numpy as np
 
 import dew
+from dew.accuracy import rms, within
 from dew.inference.serving import Server
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.generation import chosen
 from dew.nn.kv_cache import KVCache
+from dew.objectives.base import token_log_probs
 from dew.sampling import Sampling
 from dew.sampling.text import decode_ops, prefill_state
 
 REFERENCE_KERNELS = {"rms_norm": "xla", "swiglu": "xla", "gated_delta_rule": "xla"}
 BATCH = 4
+DELTA_RULE_FAMILIES = ("qwen3_next", "qwen3_5_text", "qwen3_5_moe_text")
+"""The families whose layers decode a gated delta rule (dew.interop.families.qwen)."""
+BLOCK = 64
+"""Steps a block of the gate covers, so error gathered in one stretch of the decode is not averaged away."""
 
 
 def greedy(task):
@@ -77,8 +85,8 @@ def replayed(model, variables, pad: int, rows: np.ndarray, forced: np.ndarray) -
 
     @jax.jit
     def step(state, token):
-        scores = jax.nn.log_softmax(state.logits.astype(jnp.float32), axis=-1)[0, token]
-        return scores, ops.advance(state, jnp.full((len(rows),), token, jnp.int32), active)
+        score = token_log_probs(state.logits[:1], jnp.full((1,), token, jnp.int32))[0]
+        return score, ops.advance(state, jnp.full((len(rows),), token, jnp.int32), active)
 
     scores = []
     for token in forced:
@@ -88,11 +96,22 @@ def replayed(model, variables, pad: int, rows: np.ndarray, forced: np.ndarray) -
 
 
 def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
-    """Each of `forced`'s tokens scored by one forward over the prompt and `forced`."""
+    """Each of `forced`'s tokens scored by one forward over the prompt and `forced`, in the model's dtype."""
     sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
-    logits = model.apply(variables, sequence, train=False, decode=False)
-    scores = jax.nn.log_softmax(logits[0, len(prompt) - 1:].astype(jnp.float32), axis=-1)
-    return np.asarray(jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0], np.float64)
+    logits = model.apply(variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
+    return np.asarray(token_log_probs(logits, jnp.asarray(forced, jnp.int32)), np.float64)
+
+
+def truth(model_dir: str, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
+    """`forced`'s tokens scored by the model in float64: weights, compute and the log partition."""
+    with jax.enable_x64(new_val=True):
+        wide = Pretrained.load(model_dir, dtype=jnp.float64, param_dtype=jnp.float64,
+                               attention_impl="reference")
+        sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
+        logits = wide.model.apply(wide.variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
+        scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
+        chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
+        return np.asarray(chosen_scores, np.float64)
 
 
 def perturbed(variables):
@@ -107,8 +126,20 @@ def perturbed(variables):
 
 def drift(first: np.ndarray, second: np.ndarray) -> dict:
     gap = np.abs(first - second)
-    return {"rms": float(np.sqrt(np.mean(gap ** 2))), "max": float(gap.max()),
-            "worst_step": int(gap.argmax())}
+    return {"rms": rms(gap), "max": float(gap.max()), "worst_step": int(gap.argmax())}
+
+
+def gate(server: np.ndarray, reference: np.ndarray, noise: np.ndarray, true: np.ndarray) -> dict:
+    """The server's distance from the truth against the reference's plus its noise, over the whole decode
+    and each `BLOCK` steps of it (the module's docstring)."""
+    blocks = [slice(start, start + BLOCK) for start in range(0, len(true), BLOCK)]
+    def measured(steps: slice) -> dict:
+        mine, theirs = rms(server[steps] - true[steps]), rms(reference[steps] - true[steps])
+        return {"server": mine, "reference": theirs, "noise": rms(noise[steps]),
+                "passes": within(mine, theirs + rms(noise[steps]))}
+    whole, parts = measured(slice(None)), [measured(steps) for steps in blocks]
+    failed = [index for index, part in enumerate(parts) if not part["passes"]]
+    return {"whole": whole, "blocks_failed": failed, "passes": whole["passes"] and not failed}
 
 
 def main() -> int:
@@ -129,26 +160,32 @@ def main() -> int:
     loaded = Pretrained.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference")
     reference = greedy(loaded.text_generation())
+    pad = task.sampling.pad
     with chosen(**REFERENCE_KERNELS):
-        alone = replayed(reference.model, reference.variables, task.sampling.pad, rows[:1], tokens)
-        batched = replayed(reference.model, reference.variables, task.sampling.pad, rows, tokens)
-        moved = replayed(reference.model, perturbed(reference.variables), task.sampling.pad, rows[:1], tokens)
-        prefill = prefilled(reference.model, reference.variables, rows[0], tokens)
+        alone = replayed(reference.model, reference.variables, pad, rows[:1], tokens)
+        batched = replayed(reference.model, reference.variables, pad, rows, tokens)
+        moved = replayed(reference.model, perturbed(reference.variables), pad, rows[:1], tokens)
+        reference_prefill = prefilled(reference.model, reference.variables, rows[0], tokens)
     served_prefill = prefilled(task.model, task.variables, rows[0], tokens)
-
-    floor = {key: max(drift(alone, batched)[key], drift(alone, moved)[key]) for key in ("rms", "max")}
-    measured = drift(optimized, alone)
+    true = truth(args.model, rows[0], tokens)
+    noise = np.maximum(np.abs(alone - batched), np.abs(alone - moved))
+    verdict = gate(optimized, alone, noise, true)
+    config = json.loads((Path(args.model) / "config.json").read_text())
+    delta_rule = config.get("text_config", config)["model_type"] in DELTA_RULE_FAMILIES
     record = {
         "model": args.model, "steps": args.steps, "prompt": args.prompt,
-        "device": jax.devices()[0].device_kind,
+        "device": jax.devices()[0].device_kind, "gate": verdict, "passes": verdict["passes"],
         "greedy_paths_part_at": int(parted[0]) if len(parted) else None,
         "reference_batch_4": drift(alone, batched), "reference_embedding_ulp": drift(alone, moved),
-        "floor": floor, "server_from_reference": measured,
-        "reference_decode_from_prefill": drift(alone, prefill),
+        "server_from_reference": drift(optimized, alone),
+        "reference_decode_from_prefill": drift(alone, reference_prefill),
         "server_decode_from_its_prefill": drift(optimized, served_prefill),
-        "passes": measured["rms"] <= floor["rms"] and measured["max"] <= floor["max"]}
+        "reference_delta_rule": "the fused decode step (it ignores chosen)" if delta_rule else None,
+        "steps_scored": {"tokens": tokens.tolist(), "server": optimized.tolist(), "reference": alone.tolist(),
+                         "reference_batch_4": batched.tolist(), "reference_embedding_ulp": moved.tolist(),
+                         "truth": true.tolist()}}
     args.out.write_text(json.dumps(record, indent=1) + "\n")
-    print(json.dumps({key: record[key] for key in ("floor", "server_from_reference", "passes")}))
+    print(json.dumps({key: record[key] for key in ("gate", "greedy_paths_part_at", "passes")}))
     return 0 if record["passes"] else 1
 
 
