@@ -1287,6 +1287,47 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
             np.testing.assert_array_equal(first[name], other[name])
 
 
+def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
+    """A map-style torch dataset streams as consecutive ranges of the records it indexes, as a
+    memory source does: a streamed pass holds every record once, and a streamed run resumed after
+    two batches reads the batches the uninterrupted one reads."""
+    import torch
+
+    tensors = torch.utils.data.TensorDataset(torch.arange(12))
+    source = Torch(tensors, fields=("index",), identity="indices@1")
+    reading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    from dew.data.compile import validation
+    from dew.data.pipeline import Pipeline
+
+    passed = validation(Pipeline(source).batch(4), batch=4, read="streamed", loading=reading)(DataPartition())
+    try:
+        assert sorted(int(value) for batch in passed for value in batch["index"]) == list(range(12))
+    finally:
+        passed.close()
+
+    def opened():
+        return loader(RecordsData(source=source), batch=4, seed=0, read="streamed", loading=reading).train(
+            DataPartition())
+
+    whole = opened()
+    try:
+        expected = [np.asarray(next(whole)["index"]).tolist() for _ in range(6)]
+    finally:
+        whole.close()
+    stopped = opened()
+    try:
+        head = [np.asarray(next(stopped)["index"]).tolist() for _ in range(2)]
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert head + [np.asarray(next(resumed)["index"]).tolist() for _ in range(4)] == expected
+    finally:
+        resumed.close()
+
+
 def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
     """`(PIL image, label)` is torchvision's sample; a DataLoader's own
     sampler and collate_fn would be dropped by reading its dataset, so it is

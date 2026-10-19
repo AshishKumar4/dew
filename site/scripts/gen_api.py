@@ -53,7 +53,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
               "dew.data.chat", "dew.data.images", "dew.data.tokens", "dew.data.text", "dew.data.video",
               "dew.data.audio", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
               "dew.data.image_codec"]),
-    ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
+    ("Models", ["dew.registry", "dew.quantization", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
                 "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
                 "dew.nn.backbones.flux2",

@@ -55,14 +55,18 @@ if TYPE_CHECKING:
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.dit import TextContext
+    from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
+    from dew.quantization import InputQuantizer
     from dew.records import JSON
-    from dew.training.quantization import InputQuantizer
 
 __all__ = [
     "AffineHead",
     "BlockDenoiser",
+    "BlockDrafting",
+    "Bounded",
     "CacheCapacity",
     "Counted",
     "CountedCondition",
@@ -83,20 +87,27 @@ __all__ = [
     "CountedTraining",
     "CountedVideo",
     "DecoderTraining",
+    "Decoding",
     "DenoisingModel",
+    "Exposing",
+    "Generating",
     "HiddenStates",
     "IntervalModel",
     "LayerScalars",
+    "LayerStates",
+    "Layered",
     "Logits",
     "LogitsFromHidden",
     "Looping",
     "ModelKwarg",
     "OutputTable",
+    "Predicting",
     "ProjectionGroup",
     "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
+    "Selective",
     "Serving",
     "TimeScaled",
     "TokenModel",
@@ -396,7 +407,7 @@ class VocabularyRows(Protocol):
 @runtime_checkable
 class QuantizesInputs(Protocol):
     """A model computing under a checkpoint's input quantization
-    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    (`dew.quantization.InputQuantization`): the quantizer a bound
     module's input takes, which a head read as a table (`OutputTable`) applies
     as the module's own call does."""
 
@@ -557,21 +568,111 @@ class Serving(Protocol):
 
 
 @runtime_checkable
-class DecoderTraining(Protocol):
-    """What a decoder trains beside its next token: its multi-token prediction
-    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
-    and `'mtp_logits'`), which with `mtp_hyper_connections` set read the
-    residual streams a forward sows under `prediction_inputs/states`, and the
-    MLA mixers it declares with DeepSeek's lightning indexer."""
+class Bounded(Protocol):
+    """A model that declares its vocabulary and cache capacity, which the host
+    checks read to refuse an id outside the vocabulary or a request that would
+    overflow the cache; a model that declares neither is checked for neither."""
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def max_seq_len(self) -> int | None: ...
+
+
+@runtime_checkable
+class Decoding(Protocol):
+    """A decoder that continues its rows token by token: `init_cache` opens the
+    cache its decode calls (`decode=True`) write, a position a call. A caller
+    that appends with those calls itself, past `generate`'s and the server's
+    host checks, reads `dew.nn.kv_cache.overflowed` after them."""
+
+    def init_cache(self, batch_size: int) -> None: ...
+
+
+@runtime_checkable
+class Layered(Protocol):
+    """A decoder that declares its decode cache's layout, as `CausalTransformer` does."""
+
+    @property
+    def kv_cache(self) -> KVCache: ...
+
+
+@runtime_checkable
+class Exposing(Protocol):
+    """A decoder that hands back its hidden states beside its logits, which a
+    drafting strategy seeds from; without them a model decodes but cannot draft."""
+
+    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
+                          ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Selective(Protocol):
+    """A decoder that scores one position per row instead of them all, so its
+    prefill runs the head only on the slot the first draw reads."""
+
+    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
+                             ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Predicting(Protocol):
+    """A decoder that declares how many multi-token prediction depths it carries."""
 
     @property
     def num_nextn_predict_layers(self) -> int: ...
+
+
+@runtime_checkable
+class BlockDrafting(Protocol):
+    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731),
+    which drafts a whole block per pass from the context its target layers
+    record instead of chaining prediction depths."""
+
+    @property
+    def dspark(self) -> DSpark | None: ...
+
+
+@runtime_checkable
+class Generating(Protocol):
+    """A decoder that says, after examining the layers it builds, why a
+    generation loop cannot continue its rows token by token, or None; a
+    sampler refuses with that reason without knowing where a family keeps
+    the layers that cause it."""
+
+    def generation_refusal(self) -> str | None: ...
+
+
+@runtime_checkable
+class DecoderTraining(Predicting, Protocol):
+    """What a decoder trains beside its next token: its multi-token prediction
+    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
+    and `'mtp_logits'`, `Predicting`), which with `mtp_hyper_connections` set
+    read the residual streams a forward sows under `prediction_inputs/states`,
+    and the MLA mixers it declares with DeepSeek's lightning indexer."""
 
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None: ...
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+
+
+@runtime_checkable
+class LayerStates(Protocol):
+    """A model whose forward keeps its layers' residual states, each layer's output before the
+    final norm, for a reader of a middle layer's features: applied with
+    `capture_intermediates=model.capture_layers` and `model.layer_collections` mutable, the
+    collections it returns hold them, and `model.layer_state(collections, index)` reads layer
+    `index`'s (0-based; -1 is the last). A layer a loop runs more than once is read at its last
+    pass, the state the layers after it read."""
+
+    layer_collections: tuple[str, ...]
+
+    def capture_layers(self, module: nn.Module, method: str) -> bool: ...
+
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array: ...
 
 
 @runtime_checkable

@@ -138,7 +138,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
     rounded by the quantizer in its forward; the table a loss, a scorer and
     a sampler read carries the same quantizer, so the table's logits are the
     forward's and the tiled loss is the forward's logits' cross entropy."""
-    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', kind),)).apply(CausalTransformer(
         vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32, max_seq_len=8,
@@ -313,9 +313,9 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.objectives.lm import LMObjective
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import shard_batch
-    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
         vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
