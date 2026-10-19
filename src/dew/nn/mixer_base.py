@@ -166,6 +166,11 @@ class MixerBase:
         it declares `mixed_step`."""
         return None if self.mixed_step else f"{type(self).__name__}'s cache, which a mixed step does not run"
 
+    def generation_refusal(self) -> str | None:
+        """Why a generation loop cannot run the mixer this kind builds, or None
+        (`dew.nn.protocols.Generating`): by default nothing refuses it."""
+        return None
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(

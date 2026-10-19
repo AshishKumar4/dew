@@ -31,14 +31,14 @@ from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
-from dew.nn.protocols import CacheCapacity, TokenModel
+from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
+from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
