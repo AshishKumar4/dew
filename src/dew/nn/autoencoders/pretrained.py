@@ -38,12 +38,14 @@ under `vae/` (a pipeline's, such as Wan's)."""
 class Loader(Protocol):
     """Builds a published autoencoder, its parameters, their source layouts
     and its config from `subfolder` of a directory or Hub repo. Supplied
-    `params` are bound without a weight read, and `lazy` leaves read ones
-    `SourceLeaf`s for a placement to read (`dew.interop.weights.record_layouts`)."""
+    `params` are bound without a weight read, their layouts from the stored
+    tensors' `shapes` where given, and `lazy` leaves read ones `SourceLeaf`s
+    for a placement to read (`dew.interop.weights.record_layouts`)."""
 
     def __call__(self, name_or_dir: str | Path, compute=..., *, revision: str | None = None,
                  subfolder: str = ..., param_dtype: str = "float32", params: Variables | None = None,
-                 lazy: bool = False) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
+                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                 ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
 
 
 LOADERS: Mapping[str, Loader] = MappingProxyType({
@@ -61,7 +63,8 @@ reads an AutoencoderKL its own way."""
 
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                 subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                lazy: bool = False) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
+                lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
     """Build a pipeline's AutoencoderKL, its parameters and their source
     layouts from the torch safetensors in `subfolder`, as `Loader` does. A
     standalone one is read by `StableDiffusionVAE` instead, which also reads
@@ -73,7 +76,7 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         directory, "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
                                          latent_shift=shift, latent_scale=scale),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy)
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
 
 
 def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:

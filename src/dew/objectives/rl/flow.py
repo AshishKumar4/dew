@@ -28,9 +28,10 @@ from flax import linen as nn
 from dew.coordination import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
+from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
+from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import metrics
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -100,7 +101,8 @@ class FlowGRPOObjective(DiffusionObjective):
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
                  steps: int = 41, variables: Variables | None = None, reward: str = "clip_score",
-                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None):
+                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None,
+                 grid: SourceGrid | None | Omitted = OMITTED):
         if ":" not in reward and reward not in metrics:
             raise ValueError(f"reward names {reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
@@ -116,7 +118,7 @@ class FlowGRPOObjective(DiffusionObjective):
             raise ValueError("variables must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
-                         guidance=guidance, steps=steps, variables=variables)
+                         guidance=guidance, steps=steps, variables=variables, grid=grid)
         sde.validate(self.process, self.process.times(rollout_steps))
         if beta == 0:
             self.ema = None
