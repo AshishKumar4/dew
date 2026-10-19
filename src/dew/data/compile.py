@@ -174,10 +174,16 @@ class _Facts:
 
 def _released(pipelines: Sequence[Pipeline]) -> None:
     """Let go of the memory reads pinning took for `pipelines` (`_PinnedRead`), once every branch
-    of their preparation is materialized."""
+    of their preparation is materialized: under each source a memory read made (`_Ran`), its
+    preparation's included, down to the pinned one."""
     for _, source in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
-        if isinstance(source, _Facts) and source.held is not None:
-            source.held.records = None
+        while isinstance(source, (_Facts, _Ran)):
+            if isinstance(source, _Facts):
+                if source.held is not None:
+                    source.held.records = None
+                source = source.source
+            else:
+                source = source.original
 
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
