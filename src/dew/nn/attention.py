@@ -48,6 +48,8 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
+    configurable_precision,
+    configured_precision,
     float32_products,
     operand_precision,
     rounded_to,
@@ -1412,10 +1414,12 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
     """Raise for the arguments only the reference path reads.
 
     A fused kernel accumulates the logits and runs the softmax in fp32 in
-    the inputs' own dtype, whatever the caller asked for. Each message names
+    the inputs' own dtype, whatever the caller asked for; jax.nn's xla kernel
+    multiplies at any precision a config can name (`configurable_precision`). Each message names
     the implementation and the reference path, so a caller can pick one.
     """
-    if not asks_default_precision(precision):
+    honored = implementation == 'xla' and configurable_precision(precision)
+    if not asks_default_precision(precision) and not honored:
         raise ValueError(
             f"attention implementation '{implementation}' cannot honor "
             f"precision={precision}: fused attention accumulates the logits and "
@@ -1491,14 +1495,14 @@ def folded_attention(query, key, value, mask=None):
 
 
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
+                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None, precision=None):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     A narrower value rides in padded and its columns come back out, at no
     runtime branch. 'cudnn' refuses here what its kernel cannot take: sinks, a
     softcap, deterministic ops, and dtypes and head widths outside its tiles.
     `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
-    mask it means.
+    mask it means. 'xla' multiplies at `precision` (`configured_precision`); the others at their own.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
@@ -1584,11 +1588,12 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='xla')
+        with configured_precision(precision):
+            out = jax.nn.dot_product_attention(
+                query, key, value, bias=bias, mask=mask, is_causal=causal,
+                key_value_seq_lengths=key_value_seq_lengths,
+                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+                implementation='xla')
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1708,7 +1713,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation, softcap=softcap, sinks=sinks,
                            segment_ids=segment_ids, max_segments=max_segments,
-                           key_value_seq_lengths=lengths)
+                           key_value_seq_lengths=lengths, precision=precision)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
