@@ -56,6 +56,11 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import hashlib
+import json
+import os
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -259,21 +264,129 @@ def assert_leaves_as_exact(dew, reference, truth, *, terms=None, rows: bool = Tr
     assert not over, "\n".join(over)
 
 
+def _statistics(dew, reference, truth, terms=None, *,
+                rows: bool = True) -> dict[str, tuple[float, float, float]]:
+    """Each leaf's distances from float64, Dew's and the reference's, and the factor they are held to:
+    the leaf's RMS at FACTOR and, unless `rows` is false, its worst row and element over their own
+    sizes at ROW_FACTOR (`row_errors`), keyed by the leaf's path and statistic."""
+    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
+    found = {}
+    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                 sizes, strict=True)
+    for (path, mine), theirs, true, summed in leaves:
+        name = jax.tree_util.keystr(path)
+        found[name] = (distance(mine, true), distance(theirs, true), FACTOR)
+        for kind, elements in (("row", False), ("element", True)) if rows else ():
+            size, ours = row_errors(mine, true, None if terms is None else summed, elements=elements)
+            _, others = row_errors(theirs, true, None if terms is None else summed, elements=elements)
+            sized = size > 0
+            if sized.any():
+                found[f"{name} worst {kind}"] = (float(np.max(ours[sized] / size[sized])),
+                                                 float(np.max(others[sized] / size[sized])), ROW_FACTOR)
+    return found
+
+
+def _over_orders(per_order: list[dict[str, tuple[float, float, float]]], label: str) -> list[str]:
+    """Each statistic held over ORDERS draws: Dew's RMS over them within its factor of the reference's."""
+    over = []
+    for name in per_order[0]:
+        values = zip(*(order[name] for order in per_order), strict=True)
+        mine, theirs, factor = (np.asarray(value, np.float64) for value in values)
+        ours, others = float(np.sqrt(np.mean(mine ** 2))), float(np.sqrt(np.mean(theirs ** 2)))
+        if not within(ours, factor[0] * others):
+            over.append(f"{label} {name}: dew {ours:.3e} from float64 (rms over {len(per_order)} orders), "
+                        f"the reference {others:.3e} (ratio {ours / others:.2f}, allowed {factor[0]:g})")
+    return over
+
+
 def assert_leaves_as_exact_over_orders(draws, label: str) -> None:
-    """Each leaf held over ORDERS rounding draws (`assert_as_exact_over_orders`): `draws` holds that many
-    `(dew, reference, truth)` triples of one tree structure, each an independent draw of the rounding,
-    another input or an exact symmetry of the computation (tests/residual_orders.py). Where one draw
-    of a comparison is unstable, a port as exact as its reference passes ORDERS of them but for
-    FALSE_FAILURE of the time, and one that rounds more fails."""
-    draws = list(draws)
-    assert len(draws) == ORDERS, f"{label}: {len(draws)} draws, the rule takes {ORDERS}"
-    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(draws[0][0])]
-    distances = [[(distance(mine, true), distance(theirs, true))
-                  for mine, theirs, true in zip(*(jax.tree.leaves(tree) for tree in draw), strict=True)]
-                 for draw in draws]
-    for index, path in enumerate(paths):
-        mine, theirs = zip(*(per_draw[index] for per_draw in distances), strict=True)
-        assert_as_exact_over_orders(np.asarray(mine), np.asarray(theirs), f"{label} {path}")
+    """Each leaf held over ORDERS rounding draws: `draws` holds that many `(dew, reference, truth)`
+    triples of one tree structure, or `(dew, reference, truth, terms)`, each an independent draw of
+    the rounding, another input or an exact symmetry of the computation (tests/residual_orders.py).
+    Each leaf's distance from float64, and its worst row and element over their sizes, is held by
+    its RMS over the draws within its factor of the reference's (`assert_as_exact_over_orders`): a
+    port as exact as its reference passes but for FALSE_FAILURE of the time, one that rounds more
+    fails."""
+    per_order = [_statistics(*draw) for draw in draws]
+    assert len(per_order) == ORDERS, f"{label}: {len(per_order)} draws, the rule takes {ORDERS}"
+    over = _over_orders(per_order, label)
+    assert not over, "\n".join(over)
+
+
+ORDERS_REQUESTED = "DEW_ORDERS"
+"""The environment variable naming the orders a CI item computes, comma-separated (`record_orders`):
+where it is set, a two-stage case records those orders' statistics instead of holding them."""
+
+ORDERS_DIR = "DEW_ORDERS_DIR"
+"""The directory a CI item records its orders into, one JSON per case and order (`record_orders`)."""
+
+
+def _case() -> str:
+    """The running test's node id, as pytest names it in PYTEST_CURRENT_TEST."""
+    return os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
+
+
+def record_orders(label: str, statistics: dict[int, dict[str, tuple[float, float, float]]]) -> None:
+    """Each order's statistics into `$DEW_ORDERS_DIR/<case>/<order>.json`, the case a hash of the node
+    id: `{"case", "label", "order", "statistics": {name: [dew, reference, factor]}}`, which `reduce`
+    holds once every item has run."""
+    case = _case()
+    directory = Path(os.environ[ORDERS_DIR]) / hashlib.sha256(case.encode()).hexdigest()[:16]
+    directory.mkdir(parents=True, exist_ok=True)
+    for order, found in statistics.items():
+        stored = {name: list(values) for name, values in found.items()}
+        (directory / f"{order}.json").write_text(json.dumps(
+            {"case": case, "label": label, "order": order, "statistics": stored}))
+
+
+def assert_leaves_as_exact_in_two_stages(draw, label: str, *, rows: bool = True) -> None:
+    """The two-stage rule: `draw(order)` gives one draw `(dew, reference, truth, terms)` of a
+    comparison, order 0 the case's own. Where order 0 holds every leaf, row and element within its
+    factor, the case passes; where it does not, ORDERS draws hold it (`_over_orders`), so a draw whose
+    one rounding parts by luck costs its orders and a port that rounds more still fails. Where the
+    run names orders (`ORDERS_REQUESTED`), the case records those draws' statistics instead
+    (`record_orders`), for CI's `reduce` over items run apart."""
+    if requested := os.environ.get(ORDERS_REQUESTED):
+        record_orders(label, {order: _statistics(*draw(order), rows=rows)
+                              for order in map(int, requested.split(","))})
+        return
+    first = _statistics(*draw(0), rows=rows)
+    if not _over_orders([first], label):
+        return
+    over = _over_orders([first, *(_statistics(*draw(order), rows=rows) for order in range(1, ORDERS))], label)
+    assert not over, "\n".join(over)
+
+
+def reduce(directory: Path, *, stage1: bool) -> list[str]:
+    """The cases CI recorded under `directory` (`record_orders`): with `stage1`, the node ids whose order
+    0 is not within its factors, which need the other orders; else each case's verdict over all
+    ORDERS, which must each be present once, as failures."""
+    failures, needed = [], []
+    for case in sorted(path for path in Path(directory).iterdir() if path.is_dir()):
+        records = [json.loads(path.read_text()) for path in sorted(case.glob("*.json"))]
+        label, node = records[0]["label"], records[0]["case"]
+        by_order = {record["order"]: {name: tuple(values) for name, values in record["statistics"].items()}
+                    for record in records}
+        if stage1:
+            if 0 in by_order and _over_orders([by_order[0]], label):
+                needed.append(node)
+            continue
+        if sorted(by_order) != list(range(ORDERS)) or len(records) != ORDERS:
+            failures.append(f"{node}: orders {sorted(by_order)} recorded, "
+                            f"the rule takes each of 0 to {ORDERS - 1} once")
+            continue
+        failures += _over_orders([by_order[order] for order in range(ORDERS)], f"{node} {label}")
+    return needed if stage1 else failures
+
+
+if __name__ == "__main__":
+    import sys
+
+    _, command, directory, *flags = sys.argv
+    assert command == "reduce", "usage: python tests/reference_error.py reduce <dir> [--stage1]"
+    found = reduce(Path(directory), stage1="--stage1" in flags)
+    print("\n".join(found))
+    sys.exit(0 if "--stage1" in flags or not found else 1)
 
 
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",

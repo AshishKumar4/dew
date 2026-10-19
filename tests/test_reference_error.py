@@ -3,7 +3,17 @@ must refuse, and the rounding it must admit."""
 
 import numpy as np
 import pytest
-from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_leaves_as_exact, distance
+from reference_error import (
+    FACTOR,
+    ORDERS,
+    ORDERS_DIR,
+    ORDERS_REQUESTED,
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    assert_leaves_as_exact_in_two_stages,
+    distance,
+    reduce,
+)
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
@@ -95,3 +105,58 @@ def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
     assert distance(dew, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
+
+
+def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
+    """A comparison's draw by order: a float64 truth of 512 sums, the reference rounding each by
+    `rounding` float32 units of what it sums and Dew by `spread` times that. Where `unstable`, order
+    0's reference rounds a tenth as far, as one lucky draw of a sum's rounding does."""
+    unit = float(np.finfo(np.float32).eps)
+
+    def draw(order):
+        rng = np.random.default_rng(order)
+        truth = rng.normal(size=(16, 32))
+        luck = 0.1 if unstable and order == 0 else 1.0
+        reference = truth + luck * rounding * unit * rng.normal(size=truth.shape)
+        dew = truth + spread * rounding * unit * rng.normal(size=truth.shape)
+        return {"leaf": dew}, {"leaf": reference}, {"leaf": truth}, None
+    return draw
+
+
+def test_a_draw_within_the_factor_passes_and_an_unstable_one_is_held_over_orders(monkeypatch):
+    """The two-stage rule: an equally exact port passes on order 0 alone; one whose order 0 meets a
+    reference rounding by luck a tenth as far goes on to ORDERS draws and passes there; one rounding
+    three times as far fails over the orders as it does on one draw."""
+    monkeypatch.delenv(ORDERS_REQUESTED, raising=False)
+    calls = []
+
+    def counted(draw):
+        def run(order):
+            calls.append(order)
+            return draw(order)
+        return run
+
+    assert_leaves_as_exact_in_two_stages(counted(drawn(1.0)), "equal", rows=False)
+    assert calls == [0]
+    calls.clear()
+    assert_leaves_as_exact_in_two_stages(counted(drawn(1.0, unstable=True)), "lucky", rows=False)
+    assert calls == list(range(ORDERS))
+    with pytest.raises(AssertionError):
+        assert_leaves_as_exact_in_two_stages(drawn(3.0, unstable=True), "rounds more", rows=False)
+
+
+def test_orders_recorded_apart_reduce_to_the_rule_run_in_one_process(monkeypatch, tmp_path):
+    """CI's two passes (`record_orders`, `reduce`): order 0 recorded alone names the case for its other
+    orders where it is over its factor; all ORDERS recorded by items run apart hold it as one process
+    would, and a missing order fails it."""
+    monkeypatch.setenv(ORDERS_DIR, str(tmp_path))
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_x.py::test_case (call)")
+    monkeypatch.setenv(ORDERS_REQUESTED, "0")
+    assert_leaves_as_exact_in_two_stages(drawn(1.0, unstable=True), "lucky", rows=False)
+    assert reduce(tmp_path, stage1=True) == ["tests/test_x.py::test_case"]
+    for group in range(1, ORDERS, 13):
+        monkeypatch.setenv(ORDERS_REQUESTED, ",".join(map(str, range(group, min(group + 13, ORDERS)))))
+        assert_leaves_as_exact_in_two_stages(drawn(1.0, unstable=True), "lucky", rows=False)
+    assert reduce(tmp_path, stage1=False) == []
+    next(tmp_path.glob("*/7.json")).unlink()
+    assert reduce(tmp_path, stage1=False)
