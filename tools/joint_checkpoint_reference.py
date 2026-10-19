@@ -209,18 +209,14 @@ def on_fla() -> None:
 
 
 def fla_precision() -> str:
-    """What logits_fla.npz records of its run's matmuls: 'ieee' where torch,
-    Triton's default and fla's two triangular solves all keep fp32, else those
-    that do not (tests/reference_error.py refuses all but 'ieee')."""
+    """What logits_fla.npz records of its run's matmuls (`recorded_matmuls`), fla's two triangular
+    solves among them."""
     from fla.ops.gated_delta_rule import chunk_fwd
+    from torch_precision import recorded_matmuls
 
-    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
-    modes = {"torch": "tf32" if reduced else "ieee",
-             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
-             "FLA_TRIL_PRECISION": os.environ.get("FLA_TRIL_PRECISION", "ieee"),
-             "the intra-chunk solve": str(getattr(chunk_fwd.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                  chunk_fwd.SOLVE_TRIL_DOT_PRECISION))}
-    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
+    return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"),
+                            **{"the intra-chunk solve": str(getattr(chunk_fwd.SOLVE_TRIL_DOT_PRECISION, "value",
+                                                                    chunk_fwd.SOLVE_TRIL_DOT_PRECISION))})
 
 
 def images() -> None:

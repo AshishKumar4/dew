@@ -105,15 +105,12 @@ def ieee_only(module) -> int:
 
 
 def matmul_precision() -> str:
-    """What each array file records of this run's matmuls: 'ieee' where torch,
-    Triton's default and fla's triangular solve all keep fp32, else those that
-    do not (tests/reference_error.py refuses all but 'ieee'). `released_modules`
-    holds fla's autotuned recompute to its 'ieee' configurations."""
-    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
-    modes = {"torch": "tf32" if reduced else "ieee",
-             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
-             "FLA_TRIL_PRECISION": os.environ.get("FLA_TRIL_PRECISION", "ieee")}
-    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
+    """What each array file records of this run's matmuls (`recorded_matmuls`), fla's triangular
+    solve among them. `released_modules` holds fla's autotuned recompute to its 'ieee'
+    configurations."""
+    from torch_precision import recorded_matmuls
+
+    return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"))
 
 
 def unbiased_gate(released):

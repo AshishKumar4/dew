@@ -195,17 +195,13 @@ def released_modules():
 
 
 def matmul_precision() -> str:
-    """What each array file records of this run's matmuls: 'ieee' where torch,
-    Triton's default and fla's intra-chunk solve all keep fp32, else those
-    that do not (tests/reference_error.py refuses all but 'ieee')."""
+    """What each array file records of this run's matmuls (`recorded_matmuls`), fla's intra-chunk
+    solve among them."""
     from fla.ops.kda import chunk_intra
+    from torch_precision import recorded_matmuls
 
-    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
-    modes = {"torch": "tf32" if reduced else "ieee",
-             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
-             "the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                  chunk_intra.SOLVE_TRIL_DOT_PRECISION))}
-    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
+    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
+                                                                    chunk_intra.SOLVE_TRIL_DOT_PRECISION))})
 
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
