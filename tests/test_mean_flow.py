@@ -2,6 +2,10 @@
 (`tools/meanflow_reference.py`), and the objective and interval sampling
 built around it."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -99,18 +103,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
-@pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
-@pytest.mark.parametrize("kernel", ["triton", "cudnn"])
-def test_meanflow_trains_through_a_fused_attention_kernel(kernel, request):
-    """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
-    traces for forward mode (`forward_mode_attention`): a MeanFlow step through Triton's kernel,
-    which runs under the cuda lane's --xla_gpu_deterministic_ops, and through cuDNN's, which Dew
-    refuses under that flag (openxla/xla#46500) and so runs with it taken out of the environment,
-    runs, and its loss and gradient agree with the xla kernel's within bf16's rounding of the step's
-    scale."""
-    if kernel == "cudnn":
-        request.getfixturevalue("without_deterministic_ops")
-
+def agrees_with_xla(kernel: str) -> None:
+    """A MeanFlow step through the fused attention `kernel` runs, and its loss and gradient agree
+    with the xla kernel's within bf16's rounding of the step's scale."""
     def run(implementation):
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
                           interval=True, attention_impl=implementation, dtype="bfloat16")
@@ -132,3 +127,20 @@ def test_meanflow_trains_through_a_fused_attention_kernel(kernel, request):
     for left, right in zip(fused_grads, xla_grads, strict=True):
         scale = float(jnp.max(jnp.abs(right))) + 1e-12
         assert float(jnp.max(jnp.abs(left - right))) <= 2 * 2 ** -7 * scale
+
+
+@pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
+def test_meanflow_trains_through_a_fused_attention_kernel():
+    """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
+    traces for forward mode (`forward_mode_attention`): a step through Triton's kernel, which runs
+    under the cuda lane's --xla_gpu_deterministic_ops, agrees with the xla kernel's
+    (`agrees_with_xla`), and so does one through cuDNN's, which XLA cannot run under that flag
+    (openxla/xla#46500), in a process of its own whose XLA starts without it."""
+    agrees_with_xla("triton")
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith("--xla_gpu_deterministic_ops")]
+    script = "import test_mean_flow; test_mean_flow.agrees_with_xla('cudnn')"
+    done = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parent,
+                          capture_output=True, text=True, timeout=900,
+                          env={**os.environ, "XLA_FLAGS": " ".join(flags)})
+    assert done.returncode == 0, done.stderr[-4000:]
