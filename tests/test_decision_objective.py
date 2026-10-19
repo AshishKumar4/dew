@@ -277,7 +277,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
     from dew.lora import unadapted
 
     model = tiny_backbone().clone(head_transform="gelu" if head == "transformed" else None,
-                                  tie_embeddings=head == "transformed", max_seq_len=512)
+                                  tie_embeddings=head == "transformed", max_seq_len=1536)
     variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
     if head == "transformed":
         given, backbone, held = model, model, variables
@@ -296,7 +296,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
     np.testing.assert_array_equal(backbone.apply(held, method="vocabulary_rows"), expected)
 
     objective = DecisionObjective(given, variables=joined({"backbone": held}), tokenizer=TOKENIZER,
-                                  specials=SPECIALS, layout=JointLayout(max_len=512),
+                                  specials=SPECIALS, layout=JointLayout(max_len=1536),
                                   head=JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2,
                                                        feedforward=32))
     data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
