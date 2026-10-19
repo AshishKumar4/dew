@@ -911,15 +911,16 @@ def _spelled_in_captured(node: ast.AST, names: Set[str]) -> bool:
             and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
 
 
-def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[frozenset[str], frozenset[str]]:
-    """The names a test binds to an error it caught: an `except` clause's, and a `pytest.raises`
-    block's target, whose `.value` the error is."""
+def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef,
+            raises: Set[int]) -> tuple[frozenset[str], frozenset[str]]:
+    """The names a test binds to an error it caught: an `except` clause's, and the target of a
+    block whose context is one of the `pytest.raises` calls `raises` holds by id, whose `.value`
+    the error is."""
     nodes = list(scopes.own(function))
     caught = {node.name for node in nodes if isinstance(node, ast.ExceptHandler) and node.name}
     raised = {item.optional_vars.id for node in nodes if isinstance(node, ast.With | ast.AsyncWith)
               for item in node.items if isinstance(item.optional_vars, ast.Name)
-              and isinstance(item.context_expr, ast.Call)
-              and _named(item.context_expr.func) == "pytest.raises"}
+              and id(item.context_expr) in raises}
     return frozenset(caught), frozenset(raised)
 
 
@@ -956,17 +957,21 @@ def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
     warning's text matched, a sentence looked for in captured output, in a caught error's text or
-    in a process's output, or source text read."""
+    in a process's output, or source text read. A name is read through the imports of its own
+    scope, so `pytest.raises` imported under another name is `pytest.raises`."""
+    named = list(scopes.scoped(module.tree.body, {}, _parent(module)))
+    raises = {id(node) for node, table in named
+              if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.raises"}
     for function in ast.walk(module.tree):
         if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
-            caught, raised = _errors(function)
+            caught, raised = _errors(function, raises)
             for node in scopes.own(function):
                 if _worded(node, caught, raised):
                     yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                                   "looks for a sentence in an error's or a process's text; assert its "
                                   "type, its exit status or the value it reports")
     held = _held(module.tree)
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+    for node, table in named:
         if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           "looks for a sentence in captured output; assert the state it reports")

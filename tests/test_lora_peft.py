@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from safetensors.numpy import load_file
 
 from dew import lora
@@ -21,10 +21,6 @@ from dew.objectives.lm import LMObjective
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
 FIXTURES = ROOT / "tests" / "fixtures" / "lora_peft"
-
-
-def flat(arrays) -> np.ndarray:
-    return np.concatenate([np.ravel(np.asarray(array, np.float64)) for array in arrays])
 
 
 STEP = Step(step=jnp.int32(0), key=jax.random.key(1), ema=None)
@@ -52,17 +48,16 @@ def assert_trains_as_peft(adapter, reference, tmp_path):
         return objective.reduce_loss(stats)[0]
 
     value, gradient = jax.value_and_grad(loss)(params["params"])
-    np.testing.assert_allclose(float(value), float(reference["loss_f64"]), rtol=1e-6)
+    assert_as_exact_as_the_reference(np.asarray(value), reference["loss"], reference["loss_f64"], "the loss")
     adapter.save(merge(adapter.variables, {"params": gradient}), tmp_path)
     exported = {key.removeprefix(lora.PEFT_PREFIX): value
                 for key, value in load_file(tmp_path / lora.PEFT_WEIGHTS).items()}
     names = sorted(key.removeprefix("grad/") for key in reference
                    if key.startswith("grad/") and not key.endswith("_f64"))
     assert sorted(exported) == names and len(names) == 12
-    assert_as_exact_as_the_reference(flat(exported[name] for name in names),
-                                     flat(reference[f"grad/{name}"] for name in names),
-                                     flat(reference[f"grad/{name}_f64"] for name in names),
-                                     "the factors' gradient")
+    assert_leaves_as_exact({name: np.asarray(exported[name]) for name in names},
+                           {name: reference[f"grad/{name}"] for name in names},
+                           {name: reference[f"grad/{name}_f64"] for name in names})
 
 
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
