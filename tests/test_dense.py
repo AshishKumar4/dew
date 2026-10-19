@@ -1,11 +1,9 @@
 """Dew's dense and convolution layers: flax's, with the bias's gradient summed at fp32.
 
-Every configuration a layer takes initializes what flax's own layer does,
-bit for bit, and with flax's zero bias computes it bit for bit too. The
-gradient of a bias, summed over the positions it is broadcast over, is the
-fp32 sum torch's addmm and convolution take, and a dense layer's product and
-bias round once, as torch's addmm rounds them, where flax rounds the product
-first; a product the layer is given keeps flax's rounding.
+Every configuration a layer takes initializes and computes what flax's own
+layer does, bit for bit. The gradient of a bias, summed over the positions it
+is broadcast over, is the fp32 sum torch's addmm and convolution take, and a
+biased bf16 projection's output is as close to float64 as torch's.
 """
 
 import jax
@@ -13,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
@@ -166,11 +164,11 @@ class _Host(nn.Module):
 
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
-def test_a_biased_bf16_projection_rounds_where_torchs_addmm_does(general):
-    """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, rounds its product
-    and bias once together, as torch's addmm does: within a quarter of torch's own rounding of
-    torch's bfloat16 nn.Linear over the same bfloat16 weights and inputs, both from float64. The
-    product rounded first and the sum again put a Llama 3 query 1.42 times as far from float64."""
+def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
+    """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, is within
+    tests/reference_error.py's rule of torch's bfloat16 nn.Linear over the same bfloat16 weights and
+    inputs, both against float64: torch's addmm rounds product and bias once, Dew as flax does,
+    the product first, 1.37 times torch's rounding here."""
     import torch
 
     rng = np.random.default_rng(7)
@@ -187,7 +185,7 @@ def test_a_biased_bf16_projection_rounds_where_torchs_addmm_does(general):
         weight, shift, inputs = (torch.tensor(a).to(torch.bfloat16).to(dtype) for a in (kernel.T, bias, x))
         return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
 
-    assert_rounds_where_the_reference_does(dew, linear(torch.bfloat16), linear(torch.float64), "projection")
+    assert_as_exact_as_the_reference(dew, linear(torch.bfloat16), linear(torch.float64), "projection")
 
 
 def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
@@ -217,10 +215,8 @@ def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
 def test_a_biased_bf16_layer_quantizes_its_product(general):
-    """A bfloat16 layer whose bias follows its product takes the product unrounded under the
-    BF16_BF16_F32 algorithm (`fp32_result_dot_general`), the default's arithmetic named, not a
-    pinned precision: Qwix quantizes it in training and serving, so both move off the unquantized
-    output."""
+    """A bfloat16 layer whose bias follows its product takes the product as flax does: Qwix
+    quantizes it in training and serving, so both move off the unquantized output."""
     x = jnp.asarray(np.random.default_rng(6).standard_normal((4, 32)), jnp.bfloat16)
     biases = nn.initializers.normal(1.0)
     layer = (DenseGeneral((2, 16), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, bias_init=biases) if general

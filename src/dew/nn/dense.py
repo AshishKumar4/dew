@@ -24,7 +24,7 @@ from flax import linen as nn
 from flax.core import meta
 from flax.typing import Array
 
-from .precision import biased, fp32_result_dot_general
+from .precision import biased
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
@@ -36,19 +36,13 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
             shaped):
-    """The layer's product of `inputs` and `kernel` over `dimensions`, plus `bias` reshaped by `shaped`
-    to broadcast over it: lax's product taken unrounded, its operands' arithmetic kept
-    (`fp32_result_dot_general`), and rounded once with the bias (`biased`), as torch's addmm rounds
-    them, and a product of the layer's own (a `dot_general` it was given) in the dtype it chose, the
-    bias added to it as flax adds it."""
-    own = layer.dot_general_cls is not None or layer.dot_general is not None
-    if bias is None or own:
-        product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision)
-    else:
-        product = fp32_result_dot_general(layer.precision)(inputs, kernel, dimensions)
+    """The layer's product of `inputs` and `kernel` over `dimensions` as flax takes it, plus `bias`
+    reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
+    at fp32)."""
+    product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision)
     if bias is None:
         return product
-    return biased(product, shaped(bias), jnp.result_type(product, bias) if own else inputs.dtype)
+    return biased(product, shaped(bias), jnp.result_type(product, bias))
 
 
 def _reshaped(init, flat_shape):
