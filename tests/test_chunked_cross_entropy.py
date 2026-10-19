@@ -313,9 +313,9 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.objectives.lm import LMObjective
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import shard_batch
-    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
         vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
