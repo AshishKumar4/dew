@@ -664,14 +664,15 @@ class _CachedMap(_Mapped):
         source: Source | None,
     ):
         super().__init__(parent)
-        self.cache, self.key, self.transform, self.source = cache, key, transform, source
+        # Not `source`, which names MapDataset's own constructor.
+        self.cache, self.key, self.transform, self.filled = cache, key, transform, source
         self.writer_lock = threading.RLock()
 
     @property
     def writer(self) -> _Writer:
         with self.writer_lock:
             if "_writer" not in self.__dict__:
-                writer = _Writer(self.cache, self.key, expected=len(self), source=self.source)
+                writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
                 finalizer = weakref.finalize(self, writer.close)
                 finalizer.atexit = False
                 self.__dict__["_writer"] = writer
