@@ -44,7 +44,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import Float32Products, at_least_fp32, float32_products
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
 
 CHUNK_SIZE = 64
@@ -104,7 +104,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
 })
-class Mamba(Float32Products, nn.Module):
+class Mamba(nn.Module):
     """The token mixer of a Mamba layer, `MambaMixer` (modeling_mamba.py:285-482).
 
     `intermediate_size` is the config's `expand * hidden_size`, `state_size`
@@ -158,7 +158,8 @@ class Mamba(Float32Products, nn.Module):
     def setup(self):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.products)
+        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
                              **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,
@@ -166,7 +167,7 @@ class Mamba(Float32Products, nn.Module):
         self.x_proj = dense(self.time_step_rank + 2 * self.state_size, use_bias=False, name='x_proj',
                             **normal_kernel(self.init_std))
         self.dt_proj = _StepProjection(self.intermediate_size, self.time_step_rank, dtype=self.dtype,
-                                       precision=self.products, name='dt_proj')
+                                       precision=self.precision, name='dt_proj')
         # The reference's init (init_mamba_weights, modeling_mamba.py:337-343):
         # A_log = log(1..N) on every channel, D ones.
         self.A_log = self.param('A_log', _log_state_index, (self.intermediate_size, self.state_size))
@@ -223,7 +224,7 @@ class Mamba(Float32Products, nn.Module):
                               jnp.asarray(self.D, wide), held, starts, self.chunk_size)
 
 
-class _StepProjection(Float32Products, nn.Module):
+class _StepProjection(nn.Module):
     """`dt_proj`: the raw step widened to every channel, then its bias and
     the softplus in at least fp32, where the reference adds the fp32 bias
     inside its scan (modeling_mamba.py:467-468, 203-206). The reference's
@@ -243,7 +244,8 @@ class _StepProjection(Float32Products, nn.Module):
             (self.rank, self.features))
         bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
-        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype), precision=self.products)
+        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype),
+                             precision=float32_products(dtype, self.precision))
         wide = at_least_fp32(widened.dtype)
         return nn.softplus(widened.astype(wide) + bias.astype(wide))
 

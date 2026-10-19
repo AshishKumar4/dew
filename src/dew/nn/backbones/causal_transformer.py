@@ -74,9 +74,9 @@ from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain, unit
 from ..precision import (
-    Float32Products,
     at_least_fp32,
     capped_logits,
+    float32_dot_general,
     head_dot_general,
     head_product,
     scaled,
@@ -138,7 +138,7 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
-class CausalTransformer(Float32Products, nn.Module):
+class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
     The defaults train a model from scratch: multi-head attention, swiglu,
@@ -590,7 +590,7 @@ class CausalTransformer(Float32Products, nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.products}
+            "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -907,7 +907,7 @@ class CausalTransformer(Float32Products, nn.Module):
                                       activation=self.mlp, use_bias=self.mlp_bias,
                                       swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
-                                      dtype=self.dtype, precision=self.products)
+                                      dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
         if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
             raise ValueError('swigluoai requires routed experts on every layer')
@@ -919,7 +919,7 @@ class CausalTransformer(Float32Products, nn.Module):
             out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
             swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
             norm_eps=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.products)
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
         # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
         routed, parallel = (None, built) if mixture.beside_dense else (built, None)
         return gated_mlp, routed, parallel
@@ -1104,8 +1104,8 @@ class CausalTransformer(Float32Products, nn.Module):
                 dtype=self.dtype, name='embed_tokens_per_layer')
             self.per_layer_model_projection = nn.Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
-                dtype=self.dtype, precision=self.products,
-                name='per_layer_model_projection')
+                dtype=self.dtype, precision=self.precision,
+                name='per_layer_model_projection', dot_general=float32_dot_general)
             self.per_layer_projection_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
@@ -1140,7 +1140,7 @@ class CausalTransformer(Float32Products, nn.Module):
             # Gemma3nTextModel.altup_projections and altup_unembed_projections).
             projection = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype,
-                precision=self.products)
+                precision=self.precision, dot_general=float32_dot_general)
             self.altup_projections = [
                 projection(projections[f'altup_projections_{index}'][1], name=f'altup_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
@@ -1160,18 +1160,19 @@ class CausalTransformer(Float32Products, nn.Module):
         self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
-                projections['early_exit_gate'][1], dtype=self.dtype, precision=self.products,
-                name='early_exit_gate', **normal_kernel(self.initializer_range))
+                projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
+                name='early_exit_gate', **normal_kernel(self.initializer_range),
+                dot_general=float32_dot_general)
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
-                precision=self.products,
-                dot_general=head_dot_general(self.dtype, self.products),
+                precision=self.precision,
+                dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.head_transform is not None:
             self.head_dense = nn.Dense(
-                projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.products,
-                name='head_dense', **normal_kernel(self.initializer_range))
+                projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
+                name='head_dense', **normal_kernel(self.initializer_range), dot_general=float32_dot_general)
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
@@ -1245,7 +1246,7 @@ class CausalTransformer(Float32Products, nn.Module):
                 EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
-                dtype=self.dtype, precision=self.products),
+                dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
@@ -1268,7 +1269,7 @@ class CausalTransformer(Float32Products, nn.Module):
             dropout_rate=self.dropout_rate,
             remat=self.remat,
             dtype=self.dtype,
-            precision=self.products,
+            precision=self.precision,
             name=name)
 
     @nn.nowrap
@@ -1314,7 +1315,7 @@ class CausalTransformer(Float32Products, nn.Module):
                 wiring=wiring,
                 dropout_rate=self.dropout_rate,
                 remat=self.remat,
-                dtype=self.dtype, precision=self.products, name=f'mtp_{depth}')
+                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
 
     @nn.nowrap
@@ -1340,12 +1341,12 @@ class CausalTransformer(Float32Products, nn.Module):
                     emb_features=self.emb_features, norm_eps=self.norm_eps,
                     scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
                     wiring=wiring, hyper_connections=self.hyper_connections,
-                    dtype=self.dtype, precision=self.products),
+                    dtype=self.dtype, precision=self.precision),
                 emb_features=self.emb_features, vocab_size=self.vocab_size,
                 markov_rank=self.dspark.markov_rank,
                 first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
                 weighted_head=None if hc.single_pass else hc,
-                dtype=self.dtype, precision=self.products, name=f'dspark_{stage}')
+                dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
             for stage in range(stages)]
 
     def _expand(self, x):
@@ -1452,7 +1453,7 @@ class CausalTransformer(Float32Products, nn.Module):
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
             logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding,
-                                  self.products)
+                                  self.precision)
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
@@ -2229,7 +2230,7 @@ class CausalTransformer(Float32Products, nn.Module):
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
-                           self.final_logit_softcap, self.products, compute=self.dtype,
+                           self.final_logit_softcap, self.precision, compute=self.dtype,
                            input_quantizer=quantizer, scale=self._token_gains())
 
     def applied_kernel(self, name: str) -> jax.Array:

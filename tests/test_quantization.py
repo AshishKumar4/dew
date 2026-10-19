@@ -174,7 +174,6 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
     convolution, where before it returned the bf16 input's dtype; and one pinned at the highest
     precision, Dew's Conv and lax's alike, quantizes as any other does, a quantized product having
     no precision to honour, within int8's rounding of the float convolution."""
-    pytest.importorskip("qwix")
     from flax import linen as nn
 
     from dew.nn.conv import Conv
@@ -956,7 +955,6 @@ def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
     """A quantized product has no precision to honour, so a matmul a rule matches quantizes
     whatever precision it pins: a float32 model's layers pin float32 products
     (`float32_products`) and quantize as a bfloat16 model's do."""
-    pytest.importorskip("qwix")
     x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
     model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
     variables = model.init(jax.random.key(0), x)
@@ -1002,7 +1000,6 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
     """Each function `UNQUANTIZED` names runs in a quantized model as in the unquantized one,
     bitwise, in a float32 and a bfloat16 model, where a copy of its code under another name, which
     the table does not reach, quantizes its products and moves."""
-    pytest.importorskip("qwix")
     function, operands, keywords = zone_cases(dtype)[name]
     copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
                               function.__defaults__, function.__closure__)

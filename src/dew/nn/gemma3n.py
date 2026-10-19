@@ -26,7 +26,13 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm
 from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
-from dew.nn.precision import Float32Products, at_least_fp32, sqrt_or_zero
+from dew.nn.precision import (
+    at_least_fp32,
+    float32_dot_general,
+    float32_einsum,
+    float32_products,
+    sqrt_or_zero,
+)
 from dew.nn.sharding import logical_axes
 
 # The reference floors the magnitude a projected copy is rescaled by
@@ -78,7 +84,7 @@ def rescale_to(x, target):
     ("linear_left",): ("embed", "mlp"),
     ("linear_right",): ("mlp", "embed"),
 })
-class LaurelBlock(Float32Products, nn.Module):
+class LaurelBlock(nn.Module):
     """Computes Gemma 3n's learned augmented residual (LAuReL).
 
     The output is `x + post_laurel_norm(linear_right(linear_left(x)))`.
@@ -100,7 +106,7 @@ class LaurelBlock(Float32Products, nn.Module):
     @nn.compact
     def __call__(self, x):
         dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype,
-                                  precision=self.products)
+                                  precision=self.precision, dot_general=float32_dot_general)
         maps = self.projections()
         low = dense(maps['linear_left'][1], name='linear_left')(x)
         projected = dense(maps['linear_right'][1], name='linear_right')(low)
@@ -108,7 +114,7 @@ class LaurelBlock(Float32Products, nn.Module):
                            name='post_laurel_norm')(projected)
 
 
-class _Coefficients(Float32Products, nn.Module):
+class _Coefficients(nn.Module):
     """A bias-free linear map whose kernel is clamped to +-`clip` in the
     training forward pass, as the reference clamps its AltUp coefficient
     weights (modeling_gemma3n.py, Gemma3nTextAltUp); the eval pass reads
@@ -135,7 +141,8 @@ class _Coefficients(Float32Products, nn.Module):
             clipped = jnp.clip(kernel, -self.clip, self.clip)
             kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
-        return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.products)
+        return jnp.dot(x.astype(dtype), kernel.astype(dtype),
+                       precision=float32_products(dtype, self.precision))
 
 
 def clamped_predictions(params, clip: float):
@@ -163,7 +170,7 @@ def clamped_predictions(params, clip: float):
     ("correction_coefs",): (None, None),
     ("prediction_coefs",): (None, None),
 })
-class AltUpLayer(Float32Products, nn.Module):
+class AltUpLayer(nn.Module):
     """Runs one layer's AltUp: `predict` before the block and `correct` after it.
 
     The stream is `[num_inputs, B, S, D]`. Both steps read a token's
@@ -212,14 +219,15 @@ class AltUpLayer(Float32Products, nn.Module):
     def setup(self):
         maps = self.projections()
         coefficients = functools.partial(
-            _Coefficients, clip=self.spec.coef_clip, dtype=self.dtype, precision=self.products)
+            _Coefficients, clip=self.spec.coef_clip, dtype=self.dtype, precision=self.precision)
         self.correct_output_scale = self.param(
             'correct_output_scale', nn.initializers.zeros, (self.emb_features,), jnp.float32)
         self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
         self.prediction_coefs = coefficients(maps['prediction_coefs'][1], stored=True,
                                              name='prediction_coefs')
         self.modality_router = nn.Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
-                                        precision=self.products, name='modality_router')
+                                        precision=self.precision, name='modality_router',
+                                        dot_general=float32_dot_general)
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 
     def modalities(self, x):
@@ -234,8 +242,8 @@ class AltUpLayer(Float32Products, nn.Module):
         # the stream moved to the end (the reference's permute(0, 1, 3, 2)).
         coefs = self.prediction_coefs(modalities, train=train)
         coefs = jnp.swapaxes(coefs.reshape(*modalities.shape[:-1], n, n), -1, -2)
-        predictions = jnp.einsum('nbsd,bsnm->mbsd', stream, coefs,
-                                 precision=self.products)
+        predictions = float32_einsum('nbsd,bsnm->mbsd', stream, coefs,
+                                 precision=self.precision)
         return (predictions + stream).astype(stream.dtype)
 
     def correct(self, predictions, activated, train: bool = False):

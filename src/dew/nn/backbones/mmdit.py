@@ -23,7 +23,7 @@ from ..dit import (
     rope_for_scan,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from ..precision import Float32Products, at_least_fp32
+from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import patchify, unpatchify
 from .joint import DoubleStreamBlock
@@ -79,7 +79,7 @@ class SimpleMMDiT(_DiTStackOptions):
         # text tokens enter the sequence, so they need their own projection
         self.txt_embed = nn.Dense(
             features=self.projections()['txt_embed'][1], dtype=self.dtype,
-            precision=self.products, name="txt_embed")
+            precision=self.precision, name="txt_embed", dot_general=float32_dot_general)
         self.blocks = [_block(self, self.remat, self.emb_features, self.num_heads, f"mmdit_block_{i}")
                        for i in range(self.num_layers)]
         self.output = self._output(self.patch_size, self.output_channels, modulated=True)
@@ -103,7 +103,7 @@ class SimpleMMDiT(_DiTStackOptions):
         return self.output(img, inv_idx, H, W, conditioning=cond_emb)
 
 
-class PatchMerging(Float32Products, nn.Module):
+class PatchMerging(nn.Module):
     """Merges each 2x2 group of patches into one token of `out_features`,
     halving the grid on the way down: a Swin-style layer norm over the
     concatenated group, then a projection."""
@@ -124,12 +124,12 @@ class PatchMerging(Float32Products, nn.Module):
         merged = nn.Dense(
             features=self.out_features,
             dtype=self.dtype,
-            precision=self.products,
-            name="projection"
+            precision=self.precision,
+            name="projection", dot_general=float32_dot_general
         )(merged)
         return merged, H_patches // PATCH_SIDE, W_patches // PATCH_SIDE
 
-class PatchExpanding(Float32Products, nn.Module):
+class PatchExpanding(nn.Module):
     """Expands each token into a 2x2 group of `out_features` tokens, doubling
     the grid on the way up: a projection to the group's width, a layer norm,
     then the rearrangement."""
@@ -152,8 +152,8 @@ class PatchExpanding(Float32Products, nn.Module):
         x = nn.Dense(
             features=self.expanded_features,
             dtype=self.dtype,
-            precision=self.products,
-            name="projection"
+            precision=self.precision,
+            name="projection", dot_general=float32_dot_general
         )(x)
         x = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         new_H, new_W = H_patches * PATCH_SIDE, W_patches * PATCH_SIDE
@@ -235,7 +235,7 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
             PatchMerging(
                 out_features=self.emb_features[s + 1],
                 dtype=self.dtype,
-                precision=self.products,
+                precision=self.precision,
                 norm_epsilon=self.norm_epsilon,
                 name=f"patch_merger_{s}"
             ) for s in range(num_stages - 1)
@@ -253,7 +253,7 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
             PatchExpanding(
                 out_features=self.emb_features[s],
                 dtype=self.dtype,
-                precision=self.products,
+                precision=self.precision,
                 norm_epsilon=self.norm_epsilon,
                 name=f"patch_expander_{s}"
             ) for s in decoder_stages
@@ -262,7 +262,7 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
             nn.Sequential([
                 LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
                 nn.Dense(features=self.projections()[f'fusion_{s}'][1], dtype=self.dtype,
-                         precision=self.products),
+                         precision=self.precision, dot_general=float32_dot_general),
             ], name=f"fusion_{s}") for s in decoder_stages
         ]
         self.decoder_blocks = [self.stage_blocks(s, "decoder") for s in decoder_stages]
@@ -283,13 +283,13 @@ class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
         self.conditioning = self._conditioning(self.emb_features[0])
         self.cond_projs = [
             nn.Dense(features=self.projections()[f'cond_proj_stage{i}'][1], dtype=self.dtype,
-                     precision=self.products, name=f"cond_proj_stage{i}")
+                     precision=self.precision, name=f"cond_proj_stage{i}", dot_general=float32_dot_general)
             for i in range(num_stages)
         ]
         # Per-stage text streams (dims differ per stage)
         self.txt_embeds = [
             nn.Dense(features=self.projections()[f'txt_embed_stage{i}'][1], dtype=self.dtype,
-                     precision=self.products, name=f"txt_embed_stage{i}")
+                     precision=self.precision, name=f"txt_embed_stage{i}", dot_general=float32_dot_general)
             for i in range(num_stages)
         ]
 

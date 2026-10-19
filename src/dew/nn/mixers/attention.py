@@ -51,7 +51,7 @@ from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotat
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import (
     LongRopeScaling,
@@ -236,7 +236,7 @@ class CausalSelfAttention(nn.Module):
                 "and are not the keys")
         dense = functools.partial(
             self.linear, use_bias=self.ctx.attention_bias, dtype=self.ctx.dtype, precision=self.ctx.precision,
-            **normal_kernel(self.ctx.init_std))
+            dot_general=float32_dot_general, **normal_kernel(self.ctx.init_std))
         projections = self.projections()
         if self._packed():
             # A Server packs its constant weights once, not on every decode

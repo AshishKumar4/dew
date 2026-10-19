@@ -15,7 +15,7 @@ from dew import records
 from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
 from dew.registry import Record
 
@@ -50,7 +50,7 @@ def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
     return shuffled.reshape(batch, (side // block) ** 2, grown)
 
 
-class Llama4VisionAdapterMLP(Float32Products, nn.Module):
+class Llama4VisionAdapterMLP(nn.Module):
     """The tower's own projector: no-bias maps around an exact GELU."""
 
     input_dim: int
@@ -60,7 +60,7 @@ class Llama4VisionAdapterMLP(Float32Products, nn.Module):
 
     def setup(self):
         dense = functools.partial(nn.Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.products)
+                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.fc1 = dense(self.input_dim, name="fc1")
         self.fc2 = dense(self.output_dim, name="fc2")
 
@@ -70,7 +70,7 @@ class Llama4VisionAdapterMLP(Float32Products, nn.Module):
         return gelu_exact(self.fc2(gelu_exact(self.fc1(hidden_states))))
 
 
-class Llama4VisionAdapter(Float32Products, nn.Module):
+class Llama4VisionAdapter(nn.Module):
     """Pixel shuffle into the adapter MLP, the tower's last stage."""
 
     ratio: float
@@ -82,13 +82,13 @@ class Llama4VisionAdapter(Float32Products, nn.Module):
     def setup(self):
         self.mlp = Llama4VisionAdapterMLP(
             self.input_dim, self.output_dim, dtype=self.dtype,
-            precision=self.products, name="mlp")
+            precision=self.precision, name="mlp")
 
     def __call__(self, encoded_patches) -> jax.Array:
         return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
 
 
-class Llama4VisionTransformer(Float32Products, nn.Module):
+class Llama4VisionTransformer(nn.Module):
     """The Llama 4 vision trunk, param layout of `Llama4VisionConfig`.
 
     `pixel_values` are what the checkpoint's image processor emits: [B, C, H,
@@ -112,7 +112,7 @@ class Llama4VisionTransformer(Float32Products, nn.Module):
                 f"({cfg.patch_size})")
         self.patch_embedding = nn.Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.products, name="patch_embedding")
+            precision=self.precision, name="patch_embedding", dot_general=float32_dot_general)
         self.class_embedding = self.param(
             "class_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
             (cfg.hidden_size,))
@@ -130,12 +130,12 @@ class Llama4VisionTransformer(Float32Products, nn.Module):
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid * grid + 1,
                        activation="gelu_exact", eps=cfg.layer_norm_eps, rotary_axes=(side, side),
                        rotary_pairs="adjacent", rope_theta=cfg.rope_theta, dtype=self.dtype,
-                       precision=self.products, name=f"layers_{index}")
+                       precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.layernorm_post = norm(name="layernorm_post")
         self.vision_adapter = Llama4VisionAdapter(
             cfg.pixel_shuffle_ratio, cfg.projector_input_dim, cfg.projector_output_dim,
-            dtype=self.dtype, precision=self.products, name="vision_adapter")
+            dtype=self.dtype, precision=self.precision, name="vision_adapter")
 
     def __call__(self, pixel_values) -> jax.Array:
         cfg = self.config
@@ -190,7 +190,7 @@ class Llama4Vision(TowerBase):
                              channels=self.num_channels)
 
 
-class Llama4ProjectorModule(Float32Products, nn.Module):
+class Llama4ProjectorModule(nn.Module):
     """Tower output to text width: one bias-free map."""
 
     text_width: int
@@ -200,7 +200,7 @@ class Llama4ProjectorModule(Float32Products, nn.Module):
     def setup(self):
         self.linear = nn.Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.products, name="linear")
+            precision=self.precision, name="linear", dot_general=float32_dot_general)
 
     def __call__(self, image_features) -> jax.Array:
         return self.linear(image_features)

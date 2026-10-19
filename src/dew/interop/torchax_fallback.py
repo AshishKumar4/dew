@@ -44,7 +44,7 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
-from dew.nn.precision import Float32Products, configured_precision
+from dew.nn.precision import configured_precision, float32_products
 from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -140,7 +140,7 @@ class TorchGraph:
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
-                 precision: PrecisionLike = None) -> tuple[jax.Array, jax.Array]:
+                 precision: jax.lax.PrecisionLike = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
@@ -369,7 +369,7 @@ def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor
     return logits, states[0]
 
 
-class TorchCausalLM(Float32Products, nn.Module):
+class TorchCausalLM(nn.Module):
     """A transformers causal LM as a Flax module, run by torchax.
 
     `apply(variables, tokens)` returns fp32 logits. The variables are the
@@ -426,8 +426,12 @@ class TorchCausalLM(Float32Products, nn.Module):
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
+        # Torch's operators state no precision, so the forward's products take the one its compute
+        # dtype does (`float32_products`): `dtype`, or the dtype its floating parameters hold.
+        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
+                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=self.products)
+                          precision=float32_products(compute, self.precision))
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -456,7 +460,7 @@ class TorchTableLM(TorchCausalLM):
         which casts the product's operands as the forward casts them whatever
         dtype the states arrive in (`head_product`)."""
         return OutputTable(self.variables["params"][self.head], vocab_major=True,
-                           precision=self.products, compute=self.dtype)
+                           precision=self.precision, compute=self.dtype)
 
     def vocabulary_rows(self) -> jax.Array:
         """The output head's rows (`OutputTable.rows`)."""

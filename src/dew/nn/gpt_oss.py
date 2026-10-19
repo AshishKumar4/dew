@@ -21,7 +21,7 @@ from dew.nn.moe import (
     gather_expert_bias,
     renormalized_softmax,
 )
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import LogicalAxes, logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
@@ -33,7 +33,7 @@ FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
 """The fused expert leaves' axes, in the order `GptOssExperts` creates them."""
 
 
-class GptOssExperts(Float32Products, nn.Module):
+class GptOssExperts(nn.Module):
     """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU.
 
     `implementation` names the grouped matmul, as `moe.expert_projection` takes it;
@@ -86,13 +86,13 @@ class GptOssExperts(Float32Products, nn.Module):
                  dtype: Dtype) -> jax.Array:
         gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
-            tokens, gate_up, sizes, dtype, self.implementation, self.products))
+            tokens, gate_up, sizes, dtype, self.implementation, self.precision))
         projected = projected + gather_expert_bias(gate_bias, expert_ids, dtype)
         gate = jnp.minimum(projected[..., ::2], 7.0)
         up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
         activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
         output = jnp.asarray(expert_projection(
-            activated, down, sizes, dtype, self.implementation, self.products))
+            activated, down, sizes, dtype, self.implementation, self.precision))
         return output + gather_expert_bias(down_bias, expert_ids, dtype)
 
 
@@ -100,7 +100,7 @@ class GptOssExperts(Float32Products, nn.Module):
     ("router",): ("embed", "exp"),
     **{("experts", name): axes for name, axes in FUSED_EXPERT_AXES.items()},
 })
-class GptOssMLP(Float32Products, nn.Module):
+class GptOssMLP(nn.Module):
     """Softmax over the selected biased logits, then the selected expert sum.
 
     The experts keep the reference's fused leaves, stacked on the expert
@@ -135,11 +135,11 @@ class GptOssMLP(Float32Products, nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
         logits = nn.Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
-                           precision=self.products, name="router")(x)
+                           precision=self.precision, name="router", dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
             implementation=self.implementation, dispatch=self.dispatch,
             capacity_factor=self.capacity_factor, dtype=self.dtype,
-            precision=self.products, name="experts")(x, renormalized_softmax(logits, indices), indices)
+            precision=self.precision, name="experts")(x, renormalized_softmax(logits, indices), indices)

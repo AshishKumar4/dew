@@ -13,7 +13,6 @@ from ..attention import GroupNorm, RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
 from ..flops import MissingFlopsCount, patch_lengths
-from ..precision import Float32Products
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 
@@ -97,7 +96,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None, operations=None):
     return operations.project(conv(features=model.output_channels), x)
 
 
-class Unet(Float32Products, nn.Module):
+class Unet(nn.Module):
     """Denoises images with a convolutional UNet of residual blocks and cross-attention stages.
 
     Without text, the attention stages self-attend (`TransformerBlock`'s
@@ -128,7 +127,7 @@ class Unet(Float32Products, nn.Module):
 
     @nn.nowrap
     def _convolution(self, features: int, **scope):
-        return Conv(features, (3, 3), dtype=self.dtype, precision=self.products, **scope)
+        return Conv(features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
 
     @nn.nowrap
     def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
@@ -165,5 +164,5 @@ class Unet(Float32Products, nn.Module):
 
     @nn.nowrap
     def time_embedding(self, temb):
-        return TimeProjection(features=self.emb_features, dtype=self.dtype, precision=self.products)(
+        return TimeProjection(features=self.emb_features, dtype=self.dtype, precision=self.precision)(
             FourierEmbedding(features=self.emb_features, dtype=self.dtype)(temb))

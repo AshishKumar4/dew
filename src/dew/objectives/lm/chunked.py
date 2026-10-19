@@ -46,6 +46,7 @@ from dew.nn.precision import (
     at_least_fp32,
     capped_logits,
     compensated_sum,
+    float32_products,
     head_product,
     rounded_operand,
     rounded_to,
@@ -631,7 +632,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
     table = head.matrix if vocab_major else head.matrix.T
-    product = BF16 if rounds_to_bf16(compute, precision) else precision
+    product = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
 
     def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False):
         if tile is None:
@@ -643,7 +644,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     def column_logits(states, rows, cap, columns):
         """The capped logit of each state against its own row of the head,
         as the head's tiles score it."""
-        effective = BF16 if rounds_to_bf16(compute, precision) else precision
+        effective = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
         operands = _operand_dtype(effective, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
@@ -807,7 +808,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
     compute = states.dtype if head.compute is None else head.compute
-    precision = BF16 if rounds_to_bf16(compute, head.precision) else head.precision
+    precision = BF16 if rounds_to_bf16(compute, head.precision) else float32_products(compute, head.precision)
     table = head.matrix if head.vocab_major else head.matrix.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)

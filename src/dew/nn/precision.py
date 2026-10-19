@@ -16,16 +16,11 @@ from __future__ import annotations
 import contextlib
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
-
-if TYPE_CHECKING:
-    from flax.core.scope import Scope
-    from flax.typing import VariableDict
 
 
 def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
@@ -78,7 +73,8 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     return names <= {'DEFAULT'}
 
 
-def float32_products(dtype: Dtype | None, precision: PrecisionLike = None) -> PrecisionLike:
+def float32_products[P: jax.lax.PrecisionLike](dtype: Dtype | None, precision: P = None
+                                                ) -> P | jax.lax.Precision:
     """The precision products computed in `dtype` take where none is stated: float32 ones multiply
     float32 products (`Precision.HIGHEST`), as torch's float32 matmuls do by default; JAX's
     default runs them in TF32 on a GPU, 2.9e-4 from float64 against 2.9e-7. A stated precision
@@ -89,56 +85,45 @@ def float32_products(dtype: Dtype | None, precision: PrecisionLike = None) -> Pr
     return jax.lax.Precision.HIGHEST
 
 
-class Module(Protocol):
-    """What `computes_in` reads of a flax module: its dtype field, scope and variables."""
-
-    @property
-    def dtype(self) -> Dtype | None: ...
-    @property
-    def scope(self) -> Scope | None: ...
-    @property
-    def variables(self) -> VariableDict: ...
-
-
-class PrecisionModule(Module, Protocol):
-    """A flax module that also states a precision, as `Float32Products` reads it."""
-
-    @property
-    def precision(self) -> PrecisionLike: ...
+def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
+                        preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
+    """`jax.lax.dot_general` at the precision its operands' own dtype takes (`float32_products`):
+    the product a flax layer forms (`nn.Dense(dot_general=...)`), resolved where flax has
+    promoted its operands, so a layer of any dtype, unset included, multiplies as it computes."""
+    return jax.lax.dot_general(lhs, rhs, dimension_numbers,
+                               precision=float32_products(jnp.result_type(lhs, rhs), precision),
+                               preferred_element_type=preferred_element_type, **kwargs)
 
 
-def computes_in(module: Module) -> Dtype | None:
-    """The dtype `module` computes in: its `dtype`, or, where that is unset, the dtype its floating
-    parameters promote to, which flax's layers compute in; None for a module holding no
-    parameters yet (one initializing, or unbound)."""
-    if module.dtype is not None or module.scope is None:
-        return module.dtype
-    held = [leaf for leaf in jax.tree.leaves(module.variables.get("params", {}))
-            if jnp.issubdtype(leaf.dtype, jnp.floating)]
-    return jnp.result_type(*held) if held else None
+def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike = None,
+                   **kwargs) -> jax.Array:
+    """`jnp.einsum` at the precision its operands' own dtype takes (`float32_products`), as
+    `float32_dot_general` is a layer's."""
+    return jnp.einsum(subscripts, *operands,
+                      precision=float32_products(jnp.result_type(*operands), precision), **kwargs)
 
 
-class Float32Products:
-    """A model's precision as its layers take it (`float32_products`), over the dtype it computes
-    in (`computes_in`). The module hands `products` to its layers in place of `precision`, which
-    stays what the model was built with, so a record rebuilds it and a clone resolves anew. It
-    mixes into an `nn.Module`."""
-
-    dtype: Dtype | None
-    precision: PrecisionLike
-
-    @functools.cached_property
-    def products(self: PrecisionModule) -> PrecisionLike:
-        return float32_products(computes_in(self), self.precision)
+def float32_matmul(lhs, rhs) -> jax.Array:
+    """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`)."""
+    return jnp.matmul(lhs, rhs, precision=float32_products(jnp.result_type(lhs, rhs)))
 
 
-def configurable_precision(precision: PrecisionLike) -> bool:
+def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLike = None,
+                                 **kwargs) -> jax.Array:
+    """`jax.lax.conv_general_dilated` at the precision its operands' own dtype takes, as
+    `float32_dot_general` is a product's: a flax convolution's
+    (`nn.Conv(conv_general_dilated=...)`)."""
+    return jax.lax.conv_general_dilated(
+        lhs, rhs, *args, precision=float32_products(jnp.result_type(lhs, rhs), precision), **kwargs)
+
+
+def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
     """Whether `jax.default_matmul_precision` can name `precision`: one precision or dot algorithm
     preset, unset or default included; not a pair of precisions or a dot algorithm."""
     return len(precision_names(precision)) <= 1 and not isinstance(precision, jax.lax.DotAlgorithm)
 
 
-def configured_precision(precision: PrecisionLike):
+def configured_precision(precision: jax.lax.PrecisionLike):
     """A context in which a product that takes no precision of its own (jax.nn's xla attention)
     multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
     precision changes nothing. A precision no config names (`configurable_precision`) is
@@ -153,7 +138,7 @@ def configured_precision(precision: PrecisionLike):
     return jax.default_matmul_precision(name if preset else name.lower())
 
 
-def jax_attention_honors(dtype: DTypeLike, precision: PrecisionLike) -> bool:
+def jax_attention_honors(dtype: DTypeLike, precision: jax.lax.PrecisionLike) -> bool:
     """Whether jax.nn's xla attention over `dtype` queries multiplies at `precision`, under its
     `configured_precision`: float32 queries at any a config can name; a 16-bit query's logits take
     jax.nn's own dot algorithm for its dtype whatever the config says, so the default alone."""
@@ -161,7 +146,7 @@ def jax_attention_honors(dtype: DTypeLike, precision: PrecisionLike) -> bool:
     return (configurable_precision if wide else asks_default_precision)(precision)
 
 
-def operand_precision(dtype: Dtype | None, precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
+def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision a product of `dtype` operands takes: float32 products for float32 operands
     where none is stated (`float32_products`), and for bf16 operands at the default precision the
     algorithm that keeps a bf16 dot bf16 in both directions. A caller that asked for more than the
@@ -442,7 +427,7 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
         return bf16_logits(logits)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
-                      precision=precision, preferred_element_type=wide)
+                      precision=float32_products(wide, precision), preferred_element_type=wide)
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:

@@ -62,7 +62,7 @@ from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import Float32Products, at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
@@ -195,7 +195,7 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
     return pooled, emitted, buffers, previous
 
 
-class GroupedLinear(Float32Products, nn.Module):
+class GroupedLinear(nn.Module):
     """Block-diagonal grouped projection: `[..., g, in]` to `[..., g, features]`
     through one `[g, in, features]` kernel (`DeepseekV4GroupedLinear`,
     modeling_deepseek_v4.py:294-323, whose weight `[g * features, in]` is
@@ -211,11 +211,11 @@ class GroupedLinear(Float32Products, nn.Module):
         kernel = self.param('kernel', nn.initializers.lecun_normal(),
                             (self.groups, x.shape[-1], self.features), jnp.float32)
         dtype = x.dtype if self.dtype is None else self.dtype
-        return jnp.einsum('...gi,gio->...go', x.astype(dtype), kernel.astype(dtype),
-                          precision=self.products)
+        return float32_einsum('...gi,gio->...go', x.astype(dtype), kernel.astype(dtype),
+                          precision=self.precision)
 
 
-class CompressedEntries(Float32Products, FakeQuantizing):
+class CompressedEntries(FakeQuantizing):
     """The projections behind a compressor's entries: `kv_proj` and
     `gate_proj` into the entry width (twice it for the two-series CSA layout),
     the position bias and the entry norm; `entries` pools the windows and
@@ -249,7 +249,8 @@ class CompressedEntries(Float32Products, FakeQuantizing):
     def setup(self):
         series = 2 if self.overlap else 1
         projected = self.pool_dtype if self.gated and self.pool_dtype is not None else self.dtype
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=projected, precision=self.products)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=projected, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.kv_proj = dense(series * self.width, name='kv_proj')
         if self.gated:
             self.gate_proj = dense(series * self.width, name='gate_proj')
@@ -339,7 +340,7 @@ class CompressedEntries(Float32Products, FakeQuantizing):
         return entries.value, latents, emitted
 
 
-class IndexScorer(Float32Products, nn.Module):
+class IndexScorer(nn.Module):
     """The lightning indexer's score of every query against every entry:
     `sum_h w_h relu(q_h . k) / sqrt(head_dim)` with `w = weights_proj(x) /
     sqrt(n_heads)`, in fp32 (`DeepseekV4IndexerScorer`,
@@ -352,8 +353,8 @@ class IndexScorer(Float32Products, nn.Module):
     @nn.compact
     def __call__(self, query, keys, x):
         weights = nn.Dense(self.n_heads, use_bias=False, dtype=self.dtype,
-                           precision=self.products, name='weights_proj')(x)
-        return index_scores(query, keys, weights, self.products)
+                           precision=self.precision, name='weights_proj', dot_general=float32_dot_general)(x)
+        return index_scores(query, keys, weights, self.precision)
 
 
 class LightningIndexer(CompressedEntries):
@@ -373,7 +374,8 @@ class LightningIndexer(CompressedEntries):
                 f"of width {self.width}, so the heads have to be wider")
         super().setup()
         self.q_b_proj = nn.Dense(self.n_heads * self.width, use_bias=False,
-                                 dtype=self.dtype, precision=self.precision, name='q_b_proj')
+                                 dtype=self.dtype, precision=self.precision, name='q_b_proj',
+                                 dot_general=float32_dot_general)
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
@@ -425,7 +427,7 @@ class Compressor(CompressedEntries):
         return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
 
 
-class Csa2Indexer(Float32Products, FakeQuantizing):
+class Csa2Indexer(FakeQuantizing):
     """CSA2's indexer (v41:488-580): queries from the query residual, scored
     against index keys a Full layer projects from its compressor's latent (`wk`,
     `k_norm`) and the other layers read from the store, under V3.2's leaf names.
@@ -446,7 +448,8 @@ class Csa2Indexer(Float32Products, FakeQuantizing):
             raise ValueError(
                 f"the indexer rotates a {self.rope_dim}-wide rope slice out of heads "
                 f"of width {self.head_dim}, so the heads have to be wider")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.weights_proj = dense(self.n_heads, name='weights_proj')
         if self.owns_keys:
@@ -469,7 +472,7 @@ class Csa2Indexer(Float32Products, FakeQuantizing):
         query = _rotate_rope(
             self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim), cos, sin)
         return index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
-                            self.products)
+                            self.precision)
 
 
 def _published(kv_store, name: str, layer: str):
@@ -499,7 +502,7 @@ def _published(kv_store, name: str, layer: str):
     ("indexer", "weights_proj"): ("embed", "index"),
     ("scorer", "weights_proj"): ("embed", "index"),
 })
-class DeepseekV4Attention(Float32Products, FakeQuantizing):
+class DeepseekV4Attention(FakeQuantizing):
     """One V4 attention layer, sliding or compressed (see the module doc).
 
     `compressor` is None, 'hca', 'csa' or V4.1's 'csa2', with `compress_rate`
@@ -584,7 +587,8 @@ class DeepseekV4Attention(Float32Products, FakeQuantizing):
         if self.kv_qat and (self.head_dim % 32 or (self.index_head_dim or 32) % 32):
             raise ValueError("the cache rounds the keys per 32 channels and the index keys "
                              "per 32, so head_dim and index_head_dim are multiples of 32")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype)
         self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
         self.q_a_norm = norm(name='q_a_norm')
@@ -592,7 +596,7 @@ class DeepseekV4Attention(Float32Products, FakeQuantizing):
         self.kv_proj = dense(self.head_dim, name='kv_proj')
         self.kv_norm = norm(name='kv_norm')
         self.o_a_proj = GroupedLinear(groups=self.o_groups, features=self.o_lora_rank,
-                                      dtype=self.dtype, precision=self.products, name='o_a_proj')
+                                      dtype=self.dtype, precision=self.precision, name='o_a_proj')
         self.o_b_proj = dense(self.emb_features, name='o_b_proj')
         self.sinks = self.param('sinks', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         if self.compressor == 'csa2':
@@ -603,19 +607,19 @@ class DeepseekV4Attention(Float32Products, FakeQuantizing):
                     rope_dim=self.rope_dim, rope_theta=self.rope_theta, yarn=self.yarn,
                     norm_eps=self.norm_eps, position_bias=False, pool_dtype=at_least_fp32(self.dtype),
                     quantized=self.kv_qat,
-                    dtype=self.dtype, precision=self.products, name='compressor')
+                    dtype=self.dtype, precision=self.precision, name='compressor')
             if not self.kv_shared:
                 self.indexer = Csa2Indexer(
                     n_heads=index[1], head_dim=index[2], rope_dim=self.rope_dim,
                     owns_keys=not self.reindex, quantized=self.kv_qat,
-                    norm_eps=self.norm_eps, dtype=self.dtype, precision=self.products, name='indexer')
+                    norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision, name='indexer')
         elif self.compressor is not None and self.compress_rate is not None:
             self.compress = Compressor(
                 width=self.head_dim, rate=self.compress_rate, overlap=self.compressor == 'csa',
                 rope_dim=self.rope_dim, rope_theta=self.rope_theta, yarn=self.yarn,
                 norm_eps=self.norm_eps, index_n_heads=self.index_n_heads,
                 index_head_dim=self.index_head_dim, index_topk=self.index_topk,
-                dtype=self.dtype, precision=self.products, name='compressor')
+                dtype=self.dtype, precision=self.precision, name='compressor')
 
     def _csa2_geometry(self) -> tuple[int, tuple[int, int, int]]:
         """A CSA2 layer's rate and its indexer's (top_k, heads, head width),
@@ -771,11 +775,11 @@ class DeepseekV4Attention(Float32Products, FakeQuantizing):
         # sink beside the logits, softmax in fp32 and the sink dropped
         # (:708-736).
         wide = at_least_fp32(query.dtype)
-        logits = jnp.einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
-                            precision=self.products) * self.head_dim ** -0.5
+        logits = float32_einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
+                            precision=self.precision) * self.head_dim ** -0.5
         logits = jnp.where(allowed[:, None], logits, -jnp.inf)
         probs = sink_softmax(logits, self.sinks)
-        context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.products)
+        context = float32_einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
         context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
