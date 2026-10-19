@@ -70,10 +70,11 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     """Blocks wider than a call's keys or values shrink to them."""
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
-    h = jax.ShapeDtypeStruct((1, 1, 1, 64, 32), jnp.bfloat16)
+    h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
+    h0 = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.float32)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
     spans = fla_gdn.sequences(1, 64)
-    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
+    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, h0, g, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
         assert fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba) == fla_gdn.Tiles(64, 32, 8, 3)
 
