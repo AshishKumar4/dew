@@ -452,16 +452,20 @@ def test_a_generation_of_one_holdout_part_reads_as_that_part():
     assert served == [ids(tagged(train)), ids(tagged(held))]
 
 
-def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself():
+@pytest.mark.parametrize("scored", ["source", "chain"])
+def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself(scored):
     """A recipe given the generation of its training branch trains on the generation and scores
-    its validation source's own rows; a recipe none of whose rows the generation holds is refused."""
+    its validation source's own rows, through steps no cache could hold too; a recipe none of whose
+    rows the generation holds is refused."""
     from dew.config.data import RecordsData, loader
     from dew.data.compile import publish
     from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
 
     read = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-    recipe = RecordsData(Memory([{"id": index} for index in range(8)]),
-                         validation=Memory([{"id": 100 + index} for index in range(4)]))
+    held = Memory([{"id": 100 + index} for index in range(4)])
+    recipe = RecordsData(Memory([{"id": index} for index in range(8)]), validation=held if scored == "source"
+                         else Pipeline(held).map(lambda row: {**row, "scored": 1}))
     train, _, _ = recipe.pipelines()
     generation = publish(train, _cache(), read="indexed", loading=read)
     data = loader(recipe, batch=2, cache=generation, read="indexed", loading=read)
@@ -475,6 +479,73 @@ def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_sour
         validation.close()
     with pytest.raises(ValueError):
         loader(RecordsData(Memory([{"id": -1}])), batch=2, cache=generation, read="indexed", loading=read)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_loader_reads_a_generation_of_the_store_in_both_parts_of_a_random_holdout(read):
+    """A generation published from the store a recipe holds out from stands in for its steps in
+    the training part and the held part alike, each picking its rows from the generation's."""
+    from dew.config.data import RecordsData, loader
+    from dew.data.compile import iterate, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.holdout import HoldOut
+    from dew.data.pipeline import Pipeline
+    from dew.data.steps.generic import Formatting
+
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+    generation = publish(Pipeline(source).map(Formatting()), _cache(), read=read, loading=loading)
+    recipe = RecordsData(source, validation=HoldOut(records=3, by="random", seed=5))
+    data = loader(recipe, batch=1, cache=generation, read=read, loading=loading)
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    trained, scored, _ = recipe.pipelines()
+    assert scored is not None
+    parts = [sorted(int(row["id"]) for row in iterate(part, read=read, loading=loading))
+             for part in (trained, scored)]
+    training, validation = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        assert sorted(int(next(training)["id"][0]) for _ in range(9)) == parts[0]
+        assert sorted(int(batch["id"][0]) for batch in validation) == parts[1]
+    finally:
+        training.close()
+        validation.close()
+    assert len(parts[1]) == 3 and sorted(parts[0] + parts[1]) == list(range(12))
+
+
+def test_a_generation_of_a_held_out_part_reads_under_the_holdouts_taken_from_that_part():
+    """A generation published from a training part stands in for it under a second holdout taken
+    from that part: the second holdout picks from the generation's rows as from the part's."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(12)])
+
+    def tagged(pipeline):
+        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+    def ids(pipeline):
+        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
+
+    part, _ = Pipeline(source).holdout(records=2)
+    generation = publish(tagged(part), _cache(), read="indexed")
+    for cached, uncached in zip(tagged(part).cache(generation).holdout(records=1),
+                                tagged(part).holdout(records=1), strict=True):
+        assert ids(cached) == ids(uncached)
+
+
+def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
+    """A prompt recipe states its reward width by reading its rows, so the generation a memory
+    read of it published stands in for the same recipe's steps when it reads its rows again."""
+    from dew.config.data import PromptData, loader
+    from dew.data.compile import publish
+
+    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(6)), "byte",
+                        max_prompt_len=8)
+    train, _, _ = recipe.pipelines()
+    generation = publish(train, _cache(), read="memory")
+    data = loader(recipe, batch=2, cache=generation, read="memory")
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    assert data.records == loader(recipe, batch=2, read="memory").records == 6
 
 
 @dataclass(frozen=True)
@@ -543,6 +614,54 @@ def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path)
     assert rows == [(index, index + 10) for index in range(6)] and reading.calls == []
     assert publish(Pipeline(source).map(republished), cache, read="streamed").url == generation.url
     assert republished.calls == []
+
+
+def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(tmp_path):
+    """A spool too small for the fill's one shard (on_full='stop') stops admitting it: the pass
+    reads every row, and the next run, with nothing published, runs the steps again."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(3)])
+    first, again = Offset(1), Offset(1)
+    for step in (first, again):
+        cache = Cache(str(tmp_path / "cache"), spool_bytes=256, shard_bytes=256)
+        chain = Pipeline(source).map(step).cache(cache)
+        assert [int(row["value"]) for row in iterate(chain, read="indexed")] == [1, 2, 3]
+    assert sorted(first.calls) == sorted(again.calls) == [0, 1, 2]
+
+
+def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
+    """A streamed generation names its inputs by the shards of the files where they were filled;
+    the same files mounted elsewhere are the same key, and fill their shards afresh rather than
+    reading inputs the generation names otherwise."""
+    import shutil
+
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Files
+
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(4)))
+    shutil.copytree(first, tmp_path / "second")
+    cache = Cache(str(tmp_path / "cache"))
+    publish(Pipeline(Files(str(first / "rows.jsonl"))).map(Offset(1)), cache, read="streamed")
+    moved = Offset(1)
+    rows = iterate(Pipeline(Files(str(tmp_path / "second" / "rows.jsonl"))).map(moved).cache(cache),
+                   read="streamed")
+    assert sorted(int(row["value"]) for row in rows) == [1, 2, 3, 4]
+
+
+def test_an_empty_stream_publishes_an_empty_generation():
+    """A stream with no records publishes a generation of none, its shards read to their end."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import from_iter
+
+    generation = publish(Pipeline(from_iter(lambda: iter(()), name="empty@1", replay=True)).map(Offset(1)),
+                         _cache(), read="streamed")
+    assert len(generation) == 0
 
 
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():

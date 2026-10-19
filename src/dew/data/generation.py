@@ -307,8 +307,10 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
 def _source_ids(source: Source, *, streamed: bool = False,
                 completed: Iterable[str] = ()) -> Iterator[RowId]:
     """The store's input IDs, refusing subdivided fills before reopening it: a
-    fill keyed by place numbers the records a memory or indexed read holds."""
-    if not streamed:
+    fill keyed by place (`completed` holds its numbers) numbers the records
+    a memory or indexed read holds."""
+    completed = tuple(completed)
+    if not streamed and (source.supports("indexed") or completed):
         yield from range(len(source.records("indexed" if source.supports("indexed") else "memory")))
         return
     manifest = source.manifest()
@@ -432,6 +434,12 @@ class Generation:
 
     def plan_hash(self, name: str) -> str:
         return self.manifest["plan"][name]["sha256"]
+
+    def holds(self, row_id: RowId) -> bool:
+        """Whether this generation holds the input `row_id` names."""
+        row_key = _row_key(row_id)
+        page = hashlib.sha256(row_key.encode()).hexdigest()[:2]
+        return page in self.manifest["pages"] and row_key in self._page(page)
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)

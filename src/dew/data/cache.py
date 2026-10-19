@@ -288,6 +288,7 @@ class _Writer:
         return opened
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+        self._completed()
         row_key = _row_key(row_id)
         with self.lock:
             existing = None if self.closing else self.pending.get(row_key)
@@ -358,7 +359,9 @@ class _Writer:
                 self._flush()
             if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
                 self._flush()
-                self.seal_future = self.pool.submit(self.complete)
+                # A full spool can drop the last shard (on_full='stop'), which leaves the fill partial.
+                whole = self.index.total_changes == self.expected
+                self.seal_future = self.pool.submit(self.complete if whole else self.seal)
 
     def _flush(self) -> None:
         if not self.pending:
@@ -503,15 +506,38 @@ class _Writer:
 
     def complete(self) -> None:
         """Seal a fill holding every input, and publish the generation of its
-        source where it was given one. Another writer that completed the same
-        fill may publish it first, which leaves it published."""
+        source where it was given one and none is published yet. Another
+        writer that completed the same fill may publish it first, which
+        leaves it published."""
         self.seal()
-        if self.source is None:
+        if self.source is None or self.cache.generation(self.key) is not None:
             return
         try:
             self.cache.publish(self.key, self.source)
         except PreconditionFailed:
-            _log.info("cache %s was published by another writer first", self.root.url)
+            if self.cache.generation(self.key) is None:
+                raise
+
+    def _settled(self, work: Callable[[], object]) -> None:
+        """Run `work` (a seal, or reading its outcome): an upload that fails
+        leaves the fill filling, unless the cache blocks on a full spool."""
+        try:
+            work()
+        except OSError as error:
+            if self.cache.on_full == "block":
+                raise
+            _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+
+    def _completed(self) -> None:
+        """The outcome of a fill's completion (`complete`) once it ends,
+        observed once, so a reader that never runs out sees it too."""
+        with self.lock:
+            completion = self.seal_future
+            # A completion a closing reader abandoned was cancelled, and counted (`abandoned`).
+            if completion is None or not completion.done() or completion.cancelled():
+                return
+            self.seal_future = None
+        self._settled(completion.result)
 
     def finish(self) -> None:
         with self.lock:
@@ -519,13 +545,9 @@ class _Writer:
                 return
             self.closing = True
         try:
-            self.seal()
+            self._settled(self.seal)
             if self.seal_future is not None:
-                self.seal_future.result()
-        except OSError as error:
-            if self.cache.on_full == "block":
-                raise
-            _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+                self._settled(self.seal_future.result)
         finally:
             self.closed = True
             self.pool.shutdown(wait=True, cancel_futures=True)
@@ -571,6 +593,7 @@ class _Writer:
             self.directory.cleanup()
             if self.pin is not None:
                 self.pin.close()
+        self._completed()
 
 
 class _Mapped(grain.MapDataset[CachedValue]):
@@ -755,7 +778,11 @@ class _CachedIterator(grain.DatasetIterator):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
         # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
-        self.writer: _Writer | _Published = _Writer(cache, key) if published is None else published
+        # A shard the generation holds under another ID (another mount, a stream cut into more shards
+        # than it has) fills as any shard does.
+        self.writer: _Writer | _Published = (
+            published if published is not None and published.generation.holds((shard.id, 0))
+            else _Writer(cache, key))
         self.ordinal = 0
 
     def __next__(self):
