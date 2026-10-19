@@ -392,6 +392,28 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(
     assert window["text_coordinates"].segments.tolist() == [*segments, *[0] * 7]
 
 
+@pytest.mark.parametrize("pack", ["first-fit", "best-fit", "concat"])
+@pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
+def test_packed_windows_keep_every_next_token_target_of_a_document_longer_than_a_window(tmp_path, read,
+                                                                                       pack):
+    """A document cut across packed windows keeps its boundary token on both sides of the cut, so
+    every token's next token follows it inside one segment of some window: the windows' pairs are
+    the documents' pairs, each once, in every read and packing, the planned packing of an indexed
+    read too. A fitting pack's documents are cut into pieces before it, and a concatenating pack's
+    where its windows end, inside a document that starts partway into a window too."""
+    stream = np.asarray([10, 11, 12, 13, 14, 15, 16, 17, 0, 20, 21, 22, 23, 24, 25, 0, 30, 31, 0], np.uint16)
+    write_token_corpus(tmp_path, stream, stream, eos_id=0)
+    data = loader(TextData(source=str(tmp_path), pack=pack, seq_len=4, packing_bins=2),
+                  batch=1, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+    pairs = Counter()
+    for window in _read(data.val(DataPartition())):
+        tokens, segments = window["text"].tolist(), window["text_coordinates"].segments.tolist()
+        pairs.update((tokens[index], tokens[index + 1]) for index in range(len(tokens) - 1)
+                     if segments[index] and segments[index] == segments[index + 1])
+    documents = [stream[:9].tolist(), stream[9:16].tolist(), stream[16:].tolist()]
+    assert pairs == Counter(pair for document in documents for pair in itertools.pairwise(document))
+
+
 def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_order(tmp_path):
     """The old 65,536-token boundary must not cut a document or change the packed windows."""
     documents = [[10 + index] * (1100 + index % 5) for index in range(60)]
@@ -521,8 +543,9 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
 
 
 def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
-    """Grain's packer refuses an over-long element, so the loader cuts first;
-    each piece is its own segment and its positions start again at 0."""
+    """Grain's packer refuses an over-long element, so the loader cuts first,
+    into pieces that share their boundary token so each keeps its next-token
+    target; each piece is its own segment and its positions start again at 0."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
     data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1,
@@ -530,8 +553,8 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
 
     rows = [batch["text"][0] for batch in data.val(DataPartition())]
     positions = [batch["text_coordinates"].positions[0] for batch in data.val(DataPartition())]
-    assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
-    np.testing.assert_array_equal(np.concatenate(rows)[:10],
+    assert len(rows) == 3  # pieces 3 ids apart, one per window
+    np.testing.assert_array_equal(np.concatenate([rows[0], *(row[1:] for row in rows[1:])])[:10],
                                   [*list(range(10, 19)), 0])
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
@@ -1016,6 +1039,32 @@ def test_a_release_whose_remote_tokenizer_renames_qwen2s_loads_as_qwen2s_without
     text = "<|im_start|>user\nThe Cascade Range: which volcano? ünïcödé\t12345<|im_end|>"
     assert loaded.encode(text) == plain.encode(text)
     assert loaded.decode(loaded.encode(text)) == plain.decode(plain.encode(text))
+
+
+def test_a_tokenizer_whose_model_type_transformers_dispatches_without_remote_code_loads_without_it(tmp_path):
+    """InternLM2's release names a remote tokenizer class beside a model type transformers does not
+    register; transformers lists that type among those whose hub class it overrides
+    (MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS) and reads tokenizer.json without the code. The
+    type, read from config.json, reaches that dispatch through `load_tokenizer` as it does
+    through AutoTokenizer, and the tokenizer encodes as its tokenizer.json does."""
+    from tokenizers import Tokenizer
+    from transformers import AutoTokenizer
+
+    from dew.data.text import load_tokenizer
+
+    source = Path(__file__).parent / "fixtures" / "hf" / "dory-tiny"
+    released = tmp_path / "internlm2"
+    released.mkdir()
+    shutil.copy(source / "tokenizer.json", released / "tokenizer.json")
+    remote = {"AutoTokenizer": ["tokenization_internlm2.InternLM2Tokenizer", None]}
+    (released / "tokenizer_config.json").write_text(json.dumps(
+        {"tokenizer_class": "InternLM2Tokenizer", "auto_map": remote}))
+    (released / "config.json").write_text(json.dumps(
+        {"model_type": "internlm2", "architectures": ["InternLM2ForCausalLM"]}))
+    text = "charged twice, site 500!"
+    expected = Tokenizer.from_file(str(released / "tokenizer.json")).encode(text).ids
+    assert AutoTokenizer.from_pretrained(str(released), local_files_only=True).encode(text) == expected
+    assert load_tokenizer(str(released), local_files_only=True).encode(text) == expected
 
 
 def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):

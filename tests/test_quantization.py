@@ -24,9 +24,9 @@ from dew.config import ObjectiveConfig, OptimConfig
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.quantization import Quantization, quantize_for_serving
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
-from dew.training.quantization import Quantization, quantize_for_serving
 
 import_module("dew.nn.backbones")  # registers the fixture kind
 
@@ -301,7 +301,7 @@ import numpy as np
 import qwix
 
 from dew.nn.conv import Conv
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 dtype = sys.argv[1]
 # Without the bias, which the quantization leaves alone and a bf16
@@ -464,8 +464,8 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     import functools
 
     from dew.inference import TextGeneration
+    from dew.quantization import entry_methods
     from dew.sampling import Sampling
-    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -544,7 +544,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     and the VAE keep their weights, leaf for leaf."""
     import functools
 
-    from dew.training.quantization import entry_methods
+    from dew.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     task = flux_task
@@ -587,8 +587,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     import functools
 
     from dew.inference import TextGeneration
+    from dew.quantization import entry_methods
     from dew.sampling import Sampling
-    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()

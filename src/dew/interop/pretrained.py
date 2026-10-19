@@ -788,6 +788,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     Supplied `variables` are a saved tree of the same pipeline, as a run
     that fine-tuned it wrote them: the modules are built from the
     directory's metadata and bind those variables, and no weight downloads.
+    Their layouts come from the source's weight headers, so `save` writes them
+    back, with the tensors no leaf holds read from the source as it writes.
     `mesh` and `layout` place the weights it reads as `Pretrained.load`'s
     do, streamed one leaf at a time.
 
@@ -818,7 +820,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     return _published(_assembled_pipeline(
         directory, index, None if os.path.isdir(checkpoint) else directory.name,
         lambda values: place(values, mesh, layout) if streaming else values, streaming=streaming,
-        dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype, variables=variables, text=text),
+        dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype, variables=variables, text=text,
+        stored=None if variables is None else sources.StoredWeights(checkpoint, directory)),
         checkpoint, selected=False)
 
 
@@ -843,7 +846,7 @@ def _pipeline_weights(name_or_dir: str | Path, directory: Path, index: Mapping[s
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
                         placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
                         attention_impl: str, param_dtype: str, variables: Variables | None = None,
-                        text: bool = True) -> PretrainedPipeline:
+                        text: bool = True, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
     """The pipeline `index` describes, assembled from the directory its
     source resolved to (a snapshot, a single file's conversion or a DDUF
     file's unpacking), its variables `placed` and `commit` its revision.
@@ -852,7 +855,7 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     them."""
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-        variables=variables, lazy=streaming, text=text))
+        variables=variables, lazy=streaming, text=text, stored=stored))
     return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
@@ -1075,13 +1078,7 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import (
-        INPUT_SCALES,
-        QUANTIZATION,
-        InputKind,
-        InputQuantization,
-        InputQuantizer,
-    )
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputKind, InputQuantization, InputQuantizer
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:

@@ -471,7 +471,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     order 1."""
     pytest.importorskip("qwix")
     from dew.objectives.lm import LMObjective, LMRunConfig
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     batch, seq = 8, 8
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
@@ -727,8 +727,15 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(restored, TextToImage)
     encoder = restored.inputs.conditions["textcontext"].encoder
     assert isinstance(encoder, CharTable)
+    from dew.interop.weights import checkpoint_dtype
+
     stored = merge(state.variables, state.ema)
-    expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
+    # Stored as the load stores them at bfloat16: every floating leaf but those the storage rule
+    # keeps in float32, the `constants` a schedule or embedding holds among them.
+    expected_vars = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf.astype(checkpoint_dtype(
+            leaf.dtype, "bfloat16", path=tuple(jax.tree_util.keystr((key,), simple=True) for key in path))),
+        stored)
     table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype

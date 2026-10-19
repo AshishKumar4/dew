@@ -62,7 +62,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import FORWARD_MODE, unweighted_rmsnorm
+from dew.nn.attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -110,12 +110,6 @@ def segment_sum(x):
     summed = jnp.cumsum(expanded, axis=-2)
     inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
     return jnp.where(inclusive, summed, -jnp.inf)
-
-
-def _expand_groups(x, num_heads: int):
-    """`[B, S, G, N] -> [B, S, H, N]`, the reference's `repeat_interleave`:
-    the `H // G` heads of one group read the same B and C."""
-    return jnp.repeat(x, num_heads // x.shape[2], axis=2)
 
 
 def _chunk_writes(x_c, B_c, a_c):
@@ -227,7 +221,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
         return out.astype(work), final.astype(work)
     ran_kernel('ssd', 'xla', refusal)
     x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
-    B, C = _expand_groups(B, heads), _expand_groups(C, heads)
+    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
+    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
     dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
@@ -305,7 +300,8 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     work = at_least_fp32(jnp.result_type(x, B, C))
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
-    B, C = _expand_groups(B, heads), _expand_groups(C, heads)
+    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
+    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
     if state is None:
         state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
     if starts is None:
@@ -419,9 +415,6 @@ class Mamba2(nn.Module):
         if self.num_heads % self.n_groups:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of n_groups ({self.n_groups})")
-        if self.conv_kernel < 2:
-            raise ValueError(
-                f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(

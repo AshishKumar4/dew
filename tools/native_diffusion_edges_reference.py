@@ -1,4 +1,8 @@
-"""Focused native-image repair oracles: Diffusers 0.34.0 / Transformers 4.49.0.
+"""Focused native-image repair oracles under the diffusers-pipelines cohort (tools/reference_releases.py).
+
+Each walk is recorded in float32, the reference, and in float64 (`.fp64`), the truth: the
+schedulers' walks with their modules' float32 read as float64
+(`diffusers_wan_reference.float64_scheduler`), the UNet widened (`diffusers_wan_reference.float64`).
 
 Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py generate OUTPUT
@@ -6,20 +10,23 @@ Run in the isolated reference environment on CPU:
 No model or source downloads. The reload command executes actual source pipelines.
 """
 import argparse
+import copy
 import json
+import sys
 from pathlib import Path
 
 import diffusers
 import numpy as np
 import torch
-import transformers
 from diffusers import DDIMScheduler, PNDMScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler
 from diffusers import DiffusionPipeline, UNet2DConditionModel
 
+from diffusers_wan_reference import float64, float64_scheduler
+from reference_releases import require
+
 
 def check_versions():
-    if (diffusers.__version__, transformers.__version__) != ("0.34.0", "4.49.0"):
-        raise RuntimeError("Use the pinned isolated reference environment")
+    require("diffusers-pipelines")
     torch.set_num_threads(2)
 
 
@@ -28,7 +35,10 @@ def generate(root):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     common = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
-    arrays = {}
+    # 256 independent rows, so each walk's distance from float64 is an RMS over many roundings
+    # rather than one draw.
+    initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
+    arrays = {"initial": initial.to(torch.float32).numpy()}
     for name, cls, options in (
         ("ddim-linspace", DDIMScheduler, dict(timestep_spacing="linspace", clip_sample=False, set_alpha_to_one=False)),
         ("pndm-linspace", PNDMScheduler, dict(timestep_spacing="linspace", skip_prk_steps=True, set_alpha_to_one=False)),
@@ -36,8 +46,19 @@ def generate(root):
         ("euler-zero-snr", EulerDiscreteScheduler, dict(rescale_betas_zero_snr=True, prediction_type="v_prediction")),
         ("dpm-karras", DPMSolverMultistepScheduler, dict(use_karras_sigmas=True)),
     ):
-        scheduler = cls(**common, **options)
-        scheduler.set_timesteps(4)
+        def walk(dtype):
+            scheduler = cls(**common, **options)
+            scheduler.set_timesteps(4)
+            x = torch.from_numpy(arrays["initial"]).to(dtype) * scheduler.init_noise_sigma
+            trajectory = []
+            for time in scheduler.timesteps:
+                model_input = scheduler.scale_model_input(x, time)
+                prediction = torch.sin(model_input) * 0.07 + time.to(dtype) * 0.001
+                x = scheduler.step(prediction, time, x).prev_sample
+                trajectory.append(x.numpy().copy())
+            return scheduler, np.stack(trajectory)
+
+        scheduler, trajectory = walk(torch.float32)
         scheduler.save_pretrained(root / name)
         config = json.loads((root / name / "scheduler_config.json").read_text())
         arrays[name + ".config"] = np.asarray(json.dumps(config))
@@ -45,15 +66,12 @@ def generate(root):
         arrays[name + ".times"] = scheduler.timesteps.numpy()
         if hasattr(scheduler, "sigmas"):
             arrays[name + ".sigmas"] = scheduler.sigmas.numpy()
-        x = torch.tensor([[10.0, -8.0, 0.3]], dtype=torch.float32) * scheduler.init_noise_sigma
-        trajectory = []
-        for time in scheduler.timesteps:
-            model_input = scheduler.scale_model_input(x, time)
-            prediction = torch.sin(model_input) * 0.07 + time.to(torch.float32) * 0.001
-            x = scheduler.step(prediction, time, x).prev_sample
-            trajectory.append(x.numpy().copy())
-        arrays[name + ".trajectory"] = np.stack(trajectory)
-        arrays[name + ".final"] = x.numpy()
+        arrays[name + ".trajectory"] = trajectory
+        arrays[name + ".final"] = trajectory[-1]
+        with float64_scheduler(sys.modules[cls.__module__]):
+            scheduler, trajectory = walk(torch.float64)
+        arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
+        arrays[name + ".final.fp64"] = trajectory[-1]
     np.savez_compressed(root / "schedulers.npz", **arrays)
     torch.manual_seed(173)
     model = UNet2DConditionModel(sample_size=8, in_channels=4, out_channels=4,
@@ -64,18 +82,25 @@ def generate(root):
     model.save_pretrained(root / "unet", safe_serialization=True)
     arrays = {}
     for name, width in (("norm", 12), ("odd", 10)):
-        value = torch.randn((1, 4, 8, width), generator=torch.Generator().manual_seed(7), requires_grad=True)
+        value = torch.randn((1, 4, 8, width), generator=torch.Generator().manual_seed(7))
         context = torch.randn((1, 8, 8), generator=torch.Generator().manual_seed(8))
         time = torch.tensor([13], dtype=torch.float32)
-        output = model(value, time, encoder_hidden_states=context).sample
-        probe = torch.randn(output.shape, generator=torch.Generator().manual_seed(9))
-        gradient, = torch.autograd.grad((output * probe).sum(), value)
-        arrays[name + ".input"] = value.detach().numpy().transpose(0, 2, 3, 1)
+        probe = torch.randn((1, 4, 8, width), generator=torch.Generator().manual_seed(9))
+
+        def walk(model, dtype, suffix=""):
+            given = value.detach().to(dtype).requires_grad_()
+            output = model(given, time.to(dtype), encoder_hidden_states=context.to(dtype)).sample
+            gradient, = torch.autograd.grad((output * probe.to(dtype)).sum(), given)
+            arrays[name + ".output" + suffix] = output.detach().numpy().transpose(0, 2, 3, 1)
+            arrays[name + ".vjp" + suffix] = gradient.numpy().transpose(0, 2, 3, 1)
+
+        walk(model, torch.float32)
+        with float64():
+            walk(copy.deepcopy(model).double(), torch.float64, ".fp64")
+        arrays[name + ".input"] = value.numpy().transpose(0, 2, 3, 1)
         arrays[name + ".context"] = context.numpy()
         arrays[name + ".time"] = time.numpy()
-        arrays[name + ".output"] = output.detach().numpy().transpose(0, 2, 3, 1)
         arrays[name + ".probe"] = probe.numpy().transpose(0, 2, 3, 1)
-        arrays[name + ".vjp"] = gradient.numpy().transpose(0, 2, 3, 1)
     np.savez_compressed(root / "unet_reference.npz", **arrays)
     print(json.dumps({"directory": str(root), "scheduler_cases": 5, "unet_cases": 2}))
 

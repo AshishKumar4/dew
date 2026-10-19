@@ -22,7 +22,7 @@ from reference_error import assert_as_exact_as_the_reference, ieee_fixture
 
 from dew.interop import Pretrained
 from dew.interop.codecs import decode_e2m1, quantize_packed_mxfp4
-from dew.nn.moe import Situ
+from dew.nn.activations import Situ
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-k3-tiny"

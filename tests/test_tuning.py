@@ -7,33 +7,18 @@ import ast
 import json
 import os
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import pytest
 import tokamax
-from process_support import REPO_ROOT, run_pool
+from process_support import READ_ONLY, REPEATABLE, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
+from dew.nn.activations import gated_product
 from dew.nn.attention import rms_normalized, stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
-from dew.nn.moe import gated_product
-
-READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
-"""The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
-
-REPEATABLE = "--xla_gpu_deterministic_ops=true"
-"""The flag under which a process keeps no picks, so its kernels repeat from run to run."""
-
-
-def keeping_picks() -> str:
-    """This process's XLA flags without `REPEATABLE`, which the cuda lane sets:
-    the stored picks these tests write and read are kept only without it."""
-    return " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                    if not flag.startswith(REPEATABLE.split("=")[0]))
 
 
 def loss(x, branch, scale, gate, up):
@@ -72,15 +57,6 @@ def launched(program) -> list[list]:
             for eqn in equations(program.jaxpr) if eqn.primitive.name == "pallas_call"]
 
 
-def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src") -> list:
-    """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
-    checkout's) and these tests, compiling into `cache_dir` under XLA `flags`."""
-    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
-                   "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests")))}
-    run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
-                         capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr[-3000:]
-    return json.loads(run.stdout.splitlines()[-1])
 
 
 STORED = """
