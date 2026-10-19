@@ -7,6 +7,7 @@ the same treatment as the training maths.
 import importlib.metadata
 import itertools
 import os
+import pathlib
 import threading
 import time
 
@@ -363,6 +364,37 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         assert os.environ["XLA_FLAGS"] == named
     finally:
         jax.config.update("jax_compilation_cache_dir", previous)
+
+
+@pytest.mark.gpu
+@pytest.mark.mesh(devices=1)
+def test_a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
+    """A run `prepare_process` readies with no directory of its own caches under the user's cache
+    directory, and its GPU compile writes the autotuner's picks to this jaxlib's own directory there
+    (`autotune_dir`), which its XLA_FLAGS name before the backend opens; JAX puts none of its own in
+    the cache directory, whose picks would serve every jaxlib alike."""
+    import subprocess
+    import sys
+
+    program = (
+        "from dew.training import prepare_process\n"
+        "prepare_process(multi_host=False)\n"
+        "import jax, jax.numpy as jnp\n"
+        "a = jnp.ones((512, 512), jnp.bfloat16)\n"
+        "jax.jit(lambda x: jax.nn.relu(x @ x.T) @ x)(a).block_until_ready()\n"
+        "print(jax.config.jax_compilation_cache_dir)\n"
+    )
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("XLA_FLAGS", "JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE")}
+    env.update(XLA_FLAGS="--xla_gpu_autotune_level=4", XDG_CACHE_HOME=str(tmp_path))
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env,
+                          timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    cache = pathlib.Path(done.stdout.strip().splitlines()[-1])
+    assert cache.is_relative_to(tmp_path)
+    picks = cache / "autotune" / f"jaxlib-{importlib.metadata.version('jaxlib')}"
+    assert any(path.is_file() for path in picks.rglob("*"))
+    assert not (cache / "xla_gpu_per_fusion_autotune_cache_dir").exists()
 
 
 @pytest.mark.mesh(devices=8)
