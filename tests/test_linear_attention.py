@@ -898,3 +898,67 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     np.testing.assert_array_equal(np.asarray(state[0]), np.asarray(cache["recurrent_state"][0]))
     assert np.any(np.asarray(state[1]) != np.asarray(cache["recurrent_state"][1]))
     assert np.any(np.asarray(history[1]) != np.asarray(cache["conv_state"][1]))
+
+
+@pytest.mark.gpu(reason="the fused step runs on CUDA")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(reference, geometry, dtype):
+    """Qwen 3.5's gated delta net decoding 65 tokens after a 5-token prefill with its generation's
+    choice 'delta_decode' set to 'fused' (`generation.chosen`): the decode tokens run the fused step,
+    and the outputs are within tests/reference_error.py's rule of the unfused layer's against the fp32
+    parallel forward in float64."""
+    from dew.nn.kernels.generation import chosen
+    from dew.training._lowering import triton_kernels
+
+    module = layer(geometry).clone(dtype=dtype)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"]).astype(dtype)
+    with jax.enable_x64(new_val=True):
+        wide = layer(geometry).clone(dtype=jnp.float64)
+        truth = np.asarray(wide.apply(widened(variables), widened(hidden)), np.float64)
+    unfused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
+    with chosen(delta_decode="fused"):
+        fused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
+        _, cache, _ = decode_through(module, variables, hidden[:, :6], prefill=5)
+        step = jax.jit(lambda cache, token: module.apply({**variables, "cache": cache}, token,
+                                                         MixerCall(decode=True), mutable=["cache"]))
+        assert "gated_delta_decode" in triton_kernels(step.trace(cache, hidden[:, 5:6]).lower())
+    assert_as_exact_as_the_reference(fused, unfused, truth, f"{jnp.dtype(dtype).name} decode")
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
+def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(target):
+    """The fused decode step at Qwen3.5-0.8B's widths (16 value heads over 16 key heads of 128, a
+    conv of 4 taps over 6144 channels, a bf16 state) and at Qwen3.5-9B's value heads over half as many
+    key heads, at every config of its space, lowered for each GPU on this CPU and compiled by Triton
+    within its block's shared memory."""
+    pytest.importorskip("triton")
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    from dew.nn.kernels import delta_rule
+
+    def case(key_heads, value_heads, warps):
+        rows, width = 8, 128
+        channels = 2 * key_heads * width + value_heads * width
+        specs = (jax.ShapeDtypeStruct((rows, channels), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((rows, 3, channels), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((channels, 4), jnp.bfloat16),
+                 *(jax.ShapeDtypeStruct((rows, value_heads), jnp.bfloat16),) * 2,
+                 *(jax.ShapeDtypeStruct((value_heads,), jnp.float32),) * 2,
+                 jax.ShapeDtypeStruct((rows, value_heads * width), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((width,), jnp.float32),
+                 jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
+
+        def run(*operands):
+            with tuning.pinned({delta_rule.FusedStep: delta_rule.Warps(warps)}):
+                return delta_rule.fused_step(*operands, key_heads=key_heads, epsilon=1e-6, activation="silu",
+                                             dtype=jnp.bfloat16)
+        return run, specs
+
+    cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
+                        lambda key=key, value=value, warps=warps: case(key, value, warps))
+             for key, value in ((16, 16), (16, 32)) for warps in (4, 8, 16)]
+    found = compile_kernels(cases, target)
+    assert len(found) == len(cases)
+    assert not failures(found), "\n".join(failures(found))
