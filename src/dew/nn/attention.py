@@ -401,7 +401,8 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     """
     def portable(x, gate, scale):
         wide = at_least_fp32(x.dtype)
-        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
+        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla')
+        y = y if scale is None else y * scale.astype(wide)
         gate = gate.astype(wide)
         return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
