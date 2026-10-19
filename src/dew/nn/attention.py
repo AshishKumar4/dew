@@ -1555,7 +1555,15 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
-        out = decode_attention.attend(query, key, value, key_value_seq_lengths)
+        def decoded(query, key, value):
+            return decode_attention.attend(query, key, value, key_value_seq_lengths)
+
+        def folded(query, key, value):
+            return folded_attention(query, key, value,
+                                    with_key_lengths(None, key_value_seq_lengths, key.shape[-3]))
+
+        # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
+        out = forward_differentiable(decoded, folded, query, key, value)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.

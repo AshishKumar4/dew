@@ -18,17 +18,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, distance
+from reference_error import assert_as_exact_as_the_reference, distance
 from test_attention_splash import attention_terms
 
 from dew.nn import kernels
-from dew.nn.attention import (
-    NormalAttention,
-    folded_attention,
-    scaled_dot_product_attention,
-    weighted_values,
-    with_key_lengths,
-)
+from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
 
 pytestmark = pytest.mark.kernel
@@ -65,6 +59,27 @@ def flash_here():
         pytest.skip(f"the installed dew_flash_attn holds code for {', '.join(architectures)}, "
                     f"not {generation}")
     return flash
+
+
+@on_gpu
+def test_flash_refuses_keys_and_values_of_another_batch_rank_or_width():
+    """The wheel's kernels read every key and value stride off the query's batch and width, so keys or
+    values of another batch, rank or width would be read past their end: each is refused by name,
+    batched and packed, before the kernel runs."""
+    flash = flash_here()
+    query = jnp.ones((2, 32, 2, 64), jnp.bfloat16)
+    for key, value in ((jnp.ones((1, 32, 2, 64), jnp.bfloat16),) * 2,
+                       (jnp.ones((2, 32, 2, 32), jnp.bfloat16),) * 2,
+                       (jnp.ones((2, 32, 2, 64), jnp.bfloat16), jnp.ones((2, 16, 2, 64), jnp.bfloat16)),
+                       (jnp.ones((2, 32, 4, 64), jnp.bfloat16),) * 2):
+        with pytest.raises(ValueError):
+            flash.flash_mha(query, key, value)
+    packed = jnp.ones((64, 2, 64), jnp.bfloat16)
+    offsets = jnp.asarray([0, 32, 64], jnp.int32)
+    for shape in ((64, 2, 32), (2, 32, 2, 64)):
+        other = jnp.ones(shape, jnp.bfloat16)
+        with pytest.raises(ValueError):
+            flash.flash_mha_varlen(packed, other, other, offsets, 32)
 
 
 def qkv(shape, seed=0):
@@ -795,114 +810,6 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
         force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
         attn_weights_value_einsum=weighted_values, **drop)
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("heads", [1, 2])
-def test_folded_attention_is_jax_nn_attention(dtype, heads):
-    """Every query head against every (key, head) pair, the other heads'
-    products thrown away, computes jax.nn's xla attention. In fp32 it only
-    reorders three sums, the logits' over the width, the softmax's over the
-    keys and the value product's over keys times heads (exact zeros between),
-    so it sits within their summed chains of jax.nn's
-    (`assert_fp32_reduction_bound`), the logits' rounding carried through the
-    softmax at twice the largest logit magnitude. In bf16 it is within
-    tests/reference_error.py's rule of jax.nn against float64. Rows read 1,
-    17 and all 40 keys."""
-    rng = np.random.default_rng(0)
-    query = rng.normal(size=(3, 4, heads, 256))
-    key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
-    lengths = jnp.asarray([1, 17, 40], jnp.int32)
-    q, k, v = (jnp.asarray(x, dtype) for x in (query, key, value))
-    folded = folded_attention(q, k, v, with_key_lengths(None, lengths, 40))
-    plain = jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
-                                         implementation='xla')
-    assert folded.shape == plain.shape and folded.dtype == plain.dtype
-
-    q, k, v = (np.asarray(x, np.float64) for x in (q, k, v))
-    read = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
-    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    probs /= probs.sum(-1, keepdims=True)
-    truth = np.einsum('bnts,bsnd->btnd', probs, v)
-    if dtype == jnp.float32:
-        spread = np.where(read, np.einsum('btnd,bsnd->bnts', np.abs(q), np.abs(k)) / 16.0, 0).max(-1)
-        carried = 1 + 2 * spread.transpose(0, 2, 1)[..., None]
-        magnitudes = np.einsum('bnts,bsnd->btnd', probs, np.abs(v)) * carried
-        assert_fp32_reduction_bound(folded, plain, magnitudes, terms=256 + 40 + 40 * heads)
-        return
-    assert_as_exact_as_the_reference(np.asarray(folded, np.float32), np.asarray(plain, np.float32), truth,
-                                     "folded")
-
-
-@pytest.mark.gpu(reason="the kernel runs on CUDA")
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
-    """`dew.nn.kernels.decode_attention` reads each row's keys up to its
-    length, block by block, and is within tests/reference_error.py's rule of
-    jax.nn's xla attention against float64: rows reading 1 key (an idle
-    slot), a block's worth, one past it, and the whole capacity, at
-    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256)."""
-    from dew.nn.kernels import decode_attention
-
-    rng = np.random.default_rng(0)
-    capacity = 4 * decode_attention.BLOCK
-    lengths = jnp.asarray([1, decode_attention.BLOCK, decode_attention.BLOCK + 1, 77, capacity], jnp.int32)
-    rows = lengths.shape[0]
-    query = jnp.asarray(rng.normal(size=(rows, 4, 2, 256)), dtype)
-    key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
-    value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
-    assert decode_attention.fits(query, key)
-    out = jax.jit(decode_attention.attend)(query, key, value, lengths)
-    plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                         implementation='xla')
-    assert out.shape == plain.shape and out.dtype == plain.dtype
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-    read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
-    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
-    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                     "decode kernel")
-
-
-@pytest.mark.gpu(reason="the kernel runs on CUDA")
-@pytest.mark.parametrize("page_size", [16, 32])
-def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
-    """`decode_attention.attend_paged` reads a row's pages through its table,
-    shuffled and shared between rows, to the row's length, its query heads
-    sharing key heads as Qwen3-0.6B's do (16 over 8 of 128), and is within
-    tests/reference_error.py's rule of jax.nn's xla attention over the
-    gathered rows against float64: rows reading 1 key, a page, one past a
-    block, and every page."""
-    from dew.nn.kernels import decode_attention
-
-    rng = np.random.default_rng(0)
-    per_row, kv_heads, heads, width = 6, 8, 16, 128
-    capacity = per_row * page_size
-    lengths = jnp.asarray([1, page_size, decode_attention.BLOCK + 1, capacity], jnp.int32)
-    rows = lengths.shape[0]
-    count = rows * per_row + 3
-    table = jnp.asarray(rng.permutation(count)[:rows * per_row].reshape(rows, per_row), jnp.int32)
-    table = table.at[1, 0].set(table[0, 0])
-    query = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.bfloat16)
-    key_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)) * 0.3, jnp.bfloat16)
-    value_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16)
-    assert decode_attention.fits_paged(query, key_pages)
-    out = jax.jit(decode_attention.attend_paged)(query, key_pages, value_pages, table, lengths)
-    key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
-                  for pages in (key_pages, value_pages))
-    plain = jax.nn.dot_product_attention(query[:, None], key, value, key_value_seq_lengths=lengths,
-                                         implementation='xla')[:, 0]
-    assert out.shape == plain.shape and out.dtype == plain.dtype
-    q = np.asarray(query, np.float64).reshape(rows, kv_heads, heads // kv_heads, width)
-    k, v = np.asarray(key, np.float64), np.asarray(value, np.float64)
-    read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
-    logits = np.where(read, np.einsum('bngd,bsnd->bngs', q, k) / np.sqrt(width), -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bngs,bsnd->bngd', probs / probs.sum(-1, keepdims=True), v).reshape(rows, heads, width)
-    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                     "paged decode kernel")
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])

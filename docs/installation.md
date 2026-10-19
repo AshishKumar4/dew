@@ -157,7 +157,7 @@ The `ci` extra is the test suite's environment, every package a test file import
 
 CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one session:
 
-- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_kernels.py::test_the_decode_kernel_reads_each_row_to_its_length`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
+- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
 - `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows. While the cause of the default capture's missing attribution is open, every Colab GPU session runs it first too.
 
 ## Compilation cache
