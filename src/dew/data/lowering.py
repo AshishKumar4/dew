@@ -94,7 +94,7 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import ValidTargets
+from dew.data.steps.text import ValidTargets, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, integers, record
@@ -127,7 +127,8 @@ def _outputs(
 ) -> tuple[Record, ...]:
     """What a record stage makes of one row, the single definition the cache
     fill, memory materialization and Grain lowering all apply: its outputs,
-    with a `Rejected` marker in place of each row it drops. A marker passes
+    with a `Rejected` marker in place of each row it drops, each carrying the
+    targets counted on the row as `recounted` keeps them. A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
     a chunk expansion counts its document and fan-out as it runs.
@@ -144,7 +145,9 @@ def _outputs(
         outputs = tuple(outputs)
         if counts is not None and isinstance(stage.step, Chunks):
             counts.expanded(outputs)
-        return outputs or (Rejected("empty_expansion"),)
+        if not outputs:
+            return (Rejected("empty_expansion"),)
+        return tuple(_counted(element, output) for output in outputs)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -163,7 +166,15 @@ def _outputs(
     if isinstance(output, Rejected) and not stage.rejects:
         raise ValueError(f"step {_identity(stage).name} dropped a record ({output.reason}) under map, which "
                          "keeps every record; apply a step that drops records with filter_map")
-    return (output,)
+    return (_counted(value, output),)
+
+
+def _counted(given: Record, output: Record) -> Record:
+    """`output` as `recounted` carries the targets counted on `given`, where both are records."""
+    if (given is None or output is None or isinstance(given, (bytes, Rejected))
+            or isinstance(output, (bytes, Rejected))):
+        return output
+    return recounted(given, output)
 
 
 _POSITION = "_dew_position"
