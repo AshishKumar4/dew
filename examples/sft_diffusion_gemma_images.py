@@ -189,9 +189,11 @@ def main(config: Config) -> Path:
     (config.out / "data").mkdir(parents=True, exist_ok=True)
     parts = splits(config)
     # Train on train + validation, score on test, which the run never reads.
+    # The crops and flips run on the host, before the caption layout reads their pixels into the
+    # model's inputs; a device augment would run after it, on the batch the layout already made.
     spec = ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
                      caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
-                     augment=Augment(flip=True, crop_scale=(0.6, 1.0)))
+                     augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
     # The label names the dataset's Hugging Face schema records, as its source reads them.
     names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
     labels = tuple(name.strip() for name in strings(names, "class_names.label"))
