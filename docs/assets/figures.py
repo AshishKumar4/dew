@@ -856,7 +856,7 @@ def cfg_step_figure():
     svg.appear(plain, 0.4)
     with svg.group() as captioned:
         svg.arrow(*origin, *(origin + cond), color="text", width=2)
-        svg.text(*(origin + 0.55 * cond + [-86, -10]), "“a red rose”", size=13)
+        svg.text(*(origin + cond + [20, 6]), "“a red rose”", size=13)
     svg.appear(captioned, 1.4)
     pull = svg.line(*(origin + uncond), *(origin + cond), color="accent", width=1.5, dash="4 4")
     svg.appear(pull, 2.6)
