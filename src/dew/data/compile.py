@@ -32,7 +32,8 @@ from dew.data.analysis import (
     _leaves,
     _Lowering,
     _manifest,
-    _member_manifests,
+    _member_keys,
+    _members,
     _name,
     _preferred_read,
     _promoted,
@@ -95,7 +96,7 @@ from dew.data.pipeline import (
     Workers,
     _declares_rejects,
 )
-from dew.data.plan import Plan, StepIdentity, fingerprint
+from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.generic import Coordinated
@@ -315,6 +316,50 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     for step in objective.packed:
         windows = windows.map(step)
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
+
+
+_KEYED_ABOVE = (Map, RandomMap, Filter, BatchStage, Prefetch, Workers, Repeat, Limit, Slice, MapBatch)
+"""The stages above a streamed mix that hold none of its rows across a saved position, so the mix's
+members may be restored by key beneath them: a shuffle's window, a packer's remainder or an
+expansion's tail holds rows of the mix that saved them."""
+
+
+def _member_manifests(pipeline: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+    """What each member of a streamed mix reads and makes, as one digest under its key
+    (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
+    order rests on and its caches; and under the empty key the same of the mixture's own stages
+    and the compile's host steps. A saved position of the mix keeps each member by its key, so a
+    resume takes a member joining or leaving and compares the others member by member
+    (`dew.data.plan.Plan.check`). Nothing where a resume cannot: a pipeline that mixes nothing, a
+    global order, or a mix beneath a stage that holds its rows (`_KEYED_ABOVE`)."""
+    source = pipeline.source
+    if (not isinstance(source, Mixture) or build.global_order
+            or not all(isinstance(stage, _KEYED_ABOVE) for stage in pipeline.stages)):
+        return {}
+
+    def steps(identities: Sequence[StepIdentity]) -> JSON:
+        return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
+
+    corpora = build.lowering.order["corpora"]
+    if not isinstance(corpora, list):
+        raise TypeError("a mixture's order holds its corpora's orders as a list")
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in pipeline.stages
+                                                  if not isinstance(stage, (Workers, Prefetch))),
+                                                *(StepIdentity.of(step) for step in host)])})}
+    for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
+                                             strict=True)):
+        sources = [read for _, read in _leaves(child)]
+        identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
+                      *(_identity(stage) for stage in _steps(child)
+                        if not isinstance(stage, (Workers, Prefetch)))]
+        members[key] = fingerprint({
+            "order": unplaced(json_value(corpora[index], "member order")),
+            "sources": [read.fingerprint() for read in sources],
+            "steps": steps(identities),
+            "derived": dict(_derived(child, build.child(index))),
+            "cache": list(_cache_references(child, build.read)),
+        })
+    return members
 
 
 def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
@@ -546,7 +591,7 @@ def _compiled(
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(original),
+        members=_member_manifests(original, build, host),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
