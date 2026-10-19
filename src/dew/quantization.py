@@ -64,7 +64,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import UNQUANTIZED, unquantized_zone
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -313,11 +313,12 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     """The bound Dense `module`'s output from its frozen FP8 leaves, its
     kernel unread: the product (`frozen_fp8_product`) over the input's
     trailing axis, its bias added in float32, in the dtype the Dense
-    computes in. A module asking for more than the default matmul
-    precision is refused, which an FP8 product cannot honour."""
-    if not asks_default_precision(module.precision):
-        raise ValueError(f"{'/'.join(module.path)} asks for {module.precision} matmul precision, which "
-                         "its frozen FP8 product cannot honour")
+    computes in. A module inside a product zone the quantized model keeps
+    in float (`UNQUANTIZED`) is refused, which an FP8 product would not."""
+    zone = unquantized_zone()
+    if zone is not None:
+        raise ValueError(f"{'/'.join(module.path)} multiplies in FP8 inside the {zone!r} zone, which keeps "
+                         f"{UNQUANTIZED[zone]} in float")
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
@@ -1019,10 +1020,8 @@ def _group_scaled_convolution() -> type:
             unwrapped model after its zero-initialized fusion kernels'
             first update (ColabPlan-2, the RTX 4080)."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            precision = inspect.signature(dew_conv._conv_general_dilated).bind(
-                lhs, rhs, *args, **kwargs).arguments.get("precision")
-            # One pinned past the default runs unquantized (`conv_general_dilated`), in Dew's own form.
-            if rule is None or rule.weight_qtype is None or not asks_default_precision(precision):
+            # One in an unquantized zone runs unquantized (`conv_general_dilated`), in Dew's own form.
+            if rule is None or rule.weight_qtype is None or unquantized_zone() is not None:
                 return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
             return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
@@ -1036,12 +1035,12 @@ def _group_scaled_convolution() -> type:
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
             """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: one
-            that pins a precision past the default has no quantized form and runs unquantized at
-            it, and a quantized one returns the result dtype it asks for, its operands widened to it
+            in a zone the model keeps in float (`UNQUANTIZED`) runs unquantized at its precision,
+            and a quantized one returns the result dtype it asks for, its operands widened to it
             first, which is exact for the narrower floats it accumulates."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             quantized = rule is not None and rule.weight_qtype is not None
-            if quantized and not asks_default_precision(precision):
+            if quantized and unquantized_zone() is not None:
                 return jax.lax.conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision=precision,
@@ -1098,10 +1097,11 @@ def _providers() -> tuple[type, type]:
         drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
         a result dtype by widening the operands to it, exact for the
         narrower floats it accumulates, and an output sharding by
-        constraining the result where the provider drops it. A matmul that
-        pins an accumulation precision past the default, as Dew's fp32
-        zones and its vocabulary head do, has no quantized form and runs
-        unquantized at that precision."""
+        constraining the result where the provider drops it. A matmul in a
+        zone the model keeps in float (`dew.nn.precision.UNQUANTIZED`) runs
+        unquantized at the precision it pins; a quantized one has no
+        precision to honour, so any other matmul a rule matches quantizes
+        whatever precision it pins."""
 
         keeps_out_sharding: ClassVar[bool] = False
 
@@ -1118,7 +1118,7 @@ def _providers() -> tuple[type, type]:
             if not self._matched("dot_general"):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
-            if not asks_default_precision(precision):
+            if unquantized_zone() is not None:
                 return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
                                            preferred_element_type=preferred_element_type,
                                            out_sharding=out_sharding)
@@ -1132,7 +1132,7 @@ def _providers() -> tuple[type, type]:
                 return jnp.einsum(einsum_str, *operands, **kwargs)
             if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
-            if not asks_default_precision(kwargs.get("precision")):
+            if unquantized_zone() is not None:
                 return jnp.einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)
             out_sharding = kwargs.pop("out_sharding", None)

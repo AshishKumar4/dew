@@ -14,7 +14,7 @@ from jax.typing import DTypeLike
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import Float32Products, at_least_fp32
+from .precision import Float32Products, at_least_fp32, unquantized
 from .sharding import constrain, explicit_spec, whole_spec
 
 
@@ -271,6 +271,7 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
     return matrix.astype(np.float32)
 
 
+@unquantized("resample")
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
     """Resample `[B, H, W, C]` to `height` by `width` as torch's
     `F.interpolate(mode="bicubic", align_corners=False)` does.

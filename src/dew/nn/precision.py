@@ -11,8 +11,11 @@ the transpose rules, so the backward follows; jax's own xla attention sets it
 for this reason (jax-ml/jax#24047).
 """
 
+import contextlib
+import contextvars
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +99,46 @@ class Float32Products:
         return float32_products(self.dtype, self.precision)
 
 
+Zone = Literal["ssm", "attention_residual", "quantizer", "kv_cache", "resample", "adapter_merge"]
+
+UNQUANTIZED: dict[Zone, str] = {
+    "ssm": "a diagonal recurrence's chunk products, powers of its pole compounded over every step "
+           "(`dew.nn.ssm.diagonal_recurrence`)",
+    "attention_residual": "the fp32 softmax weights over earlier layers' outputs and their sum "
+                          "(`dew.nn.attention_residuals.DepthAttention`)",
+    "quantizer": "a vector quantizer's codeword distances, whose argmax a rounded product reorders "
+                 "(`dew.nn.quantizers.nearest_codewords`)",
+    "kv_cache": "the rotation a quantized cache applies before it rounds keys and values "
+                "(`dew.nn.kv_cache.rotated`)",
+    "resample": "an image or a position table resampled as torch's bicubic does "
+                "(`dew.nn.blocks.torch_bicubic_resize`)",
+    "adapter_merge": "an adapter's factor product merged into the kernel it updates, a weight and not an "
+                     "activation (`dew.lora`)",
+}
+"""The products a quantized model keeps in float, by zone, with why. `dew.quantization` quantizes
+every other product its rules match, whatever precision it pins (a quantized product has none to
+honour), and these at the precision they pin; their code runs them under `unquantized`."""
+
+_ZONE: contextvars.ContextVar[Zone | None] = contextvars.ContextVar("unquantized_zone", default=None)
+
+
+@contextlib.contextmanager
+def unquantized(zone: Zone) -> Iterator[None]:
+    """Trace the products within as `zone`'s (`UNQUANTIZED`), which quantization leaves in float.
+    A trace-time scope, as `jax.default_matmul_precision` is: a scan or remat body traced inside
+    is inside."""
+    token = _ZONE.set(zone)
+    try:
+        yield
+    finally:
+        _ZONE.reset(token)
+
+
+def unquantized_zone() -> Zone | None:
+    """The `UNQUANTIZED` zone the products being traced belong to, or None outside every zone."""
+    return _ZONE.get()
+
+
 def configurable_precision(precision: PrecisionLike) -> bool:
     """Whether `jax.default_matmul_precision` can name `precision`: one precision or dot algorithm
     preset, unset or default included; not a pair of precisions or a dot algorithm."""
@@ -107,8 +150,6 @@ def configured_precision(precision: PrecisionLike):
     multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
     precision changes nothing. A precision no config names (`configurable_precision`) is
     refused."""
-    import contextlib
-
     if not configurable_precision(precision):
         raise ValueError(f"precision={precision} has no jax_default_matmul_precision name")
     names = precision_names(precision)
