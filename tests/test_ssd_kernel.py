@@ -145,7 +145,7 @@ def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
         assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
-                               reductions=reductions, terms={name: summed})
+                               terms={name: summed})
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):
