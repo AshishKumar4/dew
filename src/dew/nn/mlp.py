@@ -197,7 +197,10 @@ class GatedMLP(nn.Module):
         factor, wide = ngpt.hidden(self.out_features), at_least_fp32(gate.dtype)
         gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
         up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
-        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(wide), up.astype(wide))
+        # XLA fuses the fp32 product with the gains before it and the norm after it; the fused SwiGLU
+        # kernel, a call of its own, cost an 8-layer Dory step 5.4 ms of these to XLA's 2.6 (A100).
+        product = gated_product(activation, implementation='xla', axes=MLP_HIDDEN)
+        hidden = product(gate.astype(wide), up.astype(wide))
         return unit(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
