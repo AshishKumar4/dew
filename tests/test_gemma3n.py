@@ -137,15 +137,12 @@ def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_d
     measured from its float64 run; each tensor alone, since the second step reads the first's
     rounding (`assert_leaves_as_exact`)."""
     import dataclasses
-    import json
 
     import optax
     import torch
-    from safetensors.numpy import load_file
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from dew.interop import Pretrained
-    from dew.interop.hf_decoders import translate_config, translate_weights
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
     from tools.diffusers_wan_reference import float64
@@ -168,8 +165,8 @@ def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_d
     for _ in range(2):
         state, *_ = step(state, {"text": rows})
 
-    stored = set(load_file(str(directory / "model.safetensors")))
-    config = json.loads((directory / "config.json").read_text())
+    trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+    dew = {name: np.asarray(tensor, np.float32) for name, tensor in trained.items()}
 
     def reference(dtype):
         hf_config = AutoConfig.from_pretrained(directory)
@@ -193,15 +190,10 @@ def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_d
                 reference(input_ids=tokens, labels=tokens).loss.backward()
                 solver.step()
                 solver.zero_grad()
-        tensors = {name: value.detach().numpy() for name, value in reference.state_dict().items()
-                   if name in stored}
-        return translate_weights(tensors, translate_config(config), config["model_type"],
-                                 param_dtype="float64" if dtype == torch.float64 else "float32")["params"]
+        state_dict = reference.state_dict()
+        return {name: state_dict[name].detach().numpy() for name in dew}
 
-    dew = jax.tree.map(np.asarray, state.variables["params"])
-    with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, reference(torch.float64))
-    assert_leaves_as_exact(dew, jax.tree.map(np.asarray, reference(torch.float32)), truth, rows=False)
+    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64), rows=False)
 
 
 def test_the_laurel_block_matches_the_reference():
