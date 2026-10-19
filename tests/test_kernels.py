@@ -1,11 +1,12 @@
 """Which kernel the 'auto' rule reaches for, and the XLA flags a run passes
 to the backend.
 
-'auto' asks two predicates per trace: `cudnn_runs` for the fused cudnn kernel
-and then `tpu_runs` for the pallas splash kernel. Both read the backend, so
-both selections are testable anywhere by monkeypatching `jax.default_backend`
-and tracing the call without running it. What actually executes on a CUDA
-device skips elsewhere; run that half with
+'auto' is the attention selector's (`dew.nn.attention_kernels.ATTENTION`): each
+kernel's requirements (its `SUPPORTS`) over the call's case, the target's row
+first. The requirements read the target, so selections are testable anywhere
+within `generation.assumed` by tracing the call without running it, and on a
+GPU each requirement is held to the real kernel: a call it declares taken runs,
+a call it refuses raises. What actually executes on a CUDA device runs with
 `JAX_PLATFORMS=cuda python -m pytest tests/test_kernels.py`. The splash
 kernel's own numbers are tests/test_attention_splash.py.
 """
@@ -918,3 +919,72 @@ def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     assert_as_exact_as_the_reference(np.asarray(module.apply(params, queries, context, mask=kept)),
                                      np.asarray(module.apply(params, queries, context)), truth,
                                      f"{implementation} attention under an all-True mask")
+
+
+def eligibility_cases():
+    """Calls covering each GPU kernel's requirements pairwise: dtypes, head widths, causality, a window,
+    packed documents with and without a bound, a cache call's aligned documents, a softcap and sinks."""
+    return [
+        dict(dtype=jnp.bfloat16, head_dim=64, causal=True),
+        dict(dtype=jnp.bfloat16, head_dim=128, causal=False, window=16),
+        dict(dtype=jnp.bfloat16, head_dim=256, causal=True, window=16),
+        dict(dtype=jnp.float16, head_dim=96, causal=True, documents="own", max_segments=2),
+        dict(dtype=jnp.bfloat16, head_dim=64, causal=True, documents="own"),
+        dict(dtype=jnp.bfloat16, head_dim=128, causal=True, documents="cross", max_segments=1, queries=8),
+        dict(dtype=jnp.bfloat16, head_dim=128, causal=True, softcap=30.0),
+        dict(dtype=jnp.bfloat16, head_dim=64, causal=True, sinks=True),
+        dict(dtype=jnp.float32, head_dim=64, causal=True),
+        dict(dtype=jnp.float32, head_dim=72, causal=False),
+    ]
+
+
+def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_segments=None, softcap=None,
+                     sinks=False, queries=64):
+    """A call of `eligibility_cases` as `scaled_dot_product_attention`'s arguments."""
+    from dew.nn.documents import CrossDocuments
+
+    rng = np.random.default_rng(head_dim)
+    query = jnp.asarray(rng.normal(size=(2, queries, 4, head_dim)), dtype)
+    key, value = (jnp.asarray(rng.normal(size=(2, 64, 2, head_dim)), dtype) for _ in range(2))
+    segment_ids = None
+    if documents == "own":
+        segment_ids = jnp.asarray(np.repeat([[1] * 40 + [2] * 24], 2, axis=0), jnp.int32)
+    elif documents == "cross":
+        filled = np.arange(64)[None, :] < np.asarray([[30], [64]])
+        segment_ids = CrossDocuments(jnp.ones((2, queries), jnp.int32), jnp.asarray(filled, jnp.int32))
+    return (query, key, value), dict(causal=causal, sliding_window=window, segment_ids=segment_ids,
+                                     max_segments=max_segments, softcap=softcap,
+                                     sinks=jnp.zeros((4,), jnp.float32) if sinks else None)
+
+
+@pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
+@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla"])
+@pytest.mark.parametrize("call", eligibility_cases(),
+                         ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))
+def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
+                                                                      without_deterministic_ops):
+    """Each GPU kernel's declared requirements (`attention_kernels.ATTENTION`) hold against the kernel
+    itself on this GPU: a call whose capability requirements all hold runs forced on that kernel to a
+    finite output, and one that fails a capability raises `KernelRefused` naming it; measured
+    requirements, which a forced kernel overrides, never stop it."""
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
+    from dew.nn.kernels.selection import KernelRefused
+
+    operands, arguments = eligibility_call(**call)
+    case = attention_case(operands[0], operands[1], **arguments)
+    failed = [requirement for requirement in ATTENTION.kernel(kernel).failed(case, forced=True)
+              if requirement.kind == 'capability']
+
+    def run():
+        out = jax.jit(lambda *operands: scaled_dot_product_attention(
+            *operands, implementation=kernel, **arguments))(*operands)
+        return np.asarray(out, np.float32)
+
+    if failed:
+        with pytest.raises(KernelRefused) as refused:
+            run()
+        raised = {refusal.code for refusal in refused.value.refusals}
+        assert {requirement.code for requirement in failed} <= raised
+    else:
+        assert np.all(np.isfinite(run()))

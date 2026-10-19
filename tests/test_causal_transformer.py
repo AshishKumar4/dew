@@ -22,6 +22,7 @@ from model_support import TINY_DECODER
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.mixers import AttentionMixer
 
 VOCAB = 37
@@ -765,6 +766,26 @@ def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng, without_determinist
     logits = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert jnp.array_equal(logits, tiny(attention_impl='xla').apply(
         params, ids, positions=positions, segment_ids=segment_ids))
+
+
+def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
+        rng, without_deterministic_ops):
+    """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
+    raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
+    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not, a
+    packed batch's documents among the reasons. 'auto' runs both."""
+    model = tiny(attention_impl='cudnn')
+    ids, segment_ids, positions = packed_pair(rng)
+    params = tiny().init(rng, ids)
+
+    with pytest.raises(KernelRefused) as plain:
+        model.apply(params, ids)
+    with pytest.raises(KernelRefused) as packed:
+        model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    assert plain.value.kernel == packed.value.kernel == "cudnn"
+    assert "dtype" in {refusal.code for refusal in plain.value.refusals}
+    assert {"dtype", "documents"} <= {refusal.code for refusal in packed.value.refusals}
+    tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
 def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(
