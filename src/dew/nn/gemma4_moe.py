@@ -12,18 +12,14 @@ each choice by `per_expert_scale`. The experts are the plain gated MLPs of
 """
 
 
-import functools
-from collections.abc import Callable
-
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.activations import GatedActivation
 from dew.nn.attention import RMSNorm
 from dew.nn.flops import projection_flops
-from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
+from dew.nn.moe import ExpertMLP, GatedActivation, chosen_experts, renormalized_softmax
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Routes
 from dew.nn.sharding import logical_axes
@@ -35,7 +31,7 @@ class Gemma4TextRouter(nn.Module):
 
     num_experts: int
     top_k: int
-    norm: Callable[..., nn.Module] = functools.partial(RMSNorm, epsilon=1e-6)
+    norm_eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -46,7 +42,8 @@ class Gemma4TextRouter(nn.Module):
                 f"top_k selects among the experts, so it is between 1 and "
                 f"{self.num_experts}, got {self.top_k}")
         hidden = x.shape[-1]
-        normed = self.norm(with_scale=False, name='norm')(x)
+        normed = RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
+                         name='norm')(x)
         scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
         logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype,
@@ -64,10 +61,9 @@ class Gemma4Experts(nn.Module):
     """The routed branch summed with the dense MLP's output.
 
     Takes the block's residual `x` and the dense MLP's output `mlp_out` and
-    returns what `post_feedforward_layernorm` then norms; the three norms,
-    each a `norm` (the block's own RMS norm, whose unscaled form the router
-    reads), keep the names of what they normalise, as the block's own sandwich
-    norms do, and the router and experts keep the reference's.
+    returns what `post_feedforward_layernorm` then norms; the three norms
+    keep the names of what they normalise, as the block's own sandwich norms
+    do, and the router and experts keep the reference's.
     """
 
     num_experts: int
@@ -78,7 +74,9 @@ class Gemma4Experts(nn.Module):
     implementation: str = 'auto'
     dispatch: str = 'global'
     capacity_factor: float | None = None
-    norm: Callable[..., nn.Module] = functools.partial(RMSNorm, epsilon=1e-6)
+    norm_eps: float = 1e-6
+    scale_offset: bool = False
+    scale_after_cast: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -94,11 +92,12 @@ class Gemma4Experts(nn.Module):
 
     @nn.compact
     def __call__(self, x, mlp_out, routes: Routes | None = None):
-        def norm(name: str) -> nn.Module:
-            return self.norm(name=name)
+        def norm(name: str) -> RMSNorm:
+            return RMSNorm(epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                           scale_after_cast=self.scale_after_cast, dtype=self.dtype, name=name)
 
         weights, indices = Gemma4TextRouter(
-            num_experts=self.num_experts, top_k=self.top_k, norm=self.norm,
+            num_experts=self.num_experts, top_k=self.top_k, norm_eps=self.norm_eps,
             dtype=self.dtype, precision=self.precision, name='router')(x, routes)
         routed = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,

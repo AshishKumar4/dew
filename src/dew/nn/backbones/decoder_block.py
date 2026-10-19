@@ -215,14 +215,16 @@ class Mixture:
         return self.parallel
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
-              dense: Callable[..., nn.Module], norm: Callable[..., nn.Module],
-              swiglu_limit: float | None = None, init_std: float | None = None,
-              output_init_std: float | None = None, dtype: Dtype | None = None,
-              precision: PrecisionLike = None) -> Callable[..., nn.Module]:
+              dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
+              scale_after_cast: bool = False, swiglu_limit: float | None = None,
+              init_std: float | None = None, output_init_std: float | None = None,
+              dtype: Dtype | None = None, precision: PrecisionLike = None) -> Callable[..., nn.Module]:
         """Build the routed feed-forward of decoder blocks and independent MLP mixers: GPT OSS's
         experts and router under 'swigluoai' (`GptOssMLP`), Gemma 4's branch beside the dense
-        feed-forward where `parallel` (`Gemma4Experts`, `beside_dense`), else `SparseMLP`. `norm`
-        is the block's RMS norm, which a latent mixture's output and Gemma 4's branch take."""
+        feed-forward where `parallel` (`Gemma4Experts`, `beside_dense`), else `SparseMLP`. The
+        experts are `expert_features` wide, else `hidden_features`, the dense width. `norm_eps`,
+        `scale_offset` and `scale_after_cast` are the block's RMS norm, which a latent mixture's
+        output and Gemma 4's branch take."""
         width = hidden_features if self.expert_features is None else self.expert_features
         if activation == 'swigluoai':
             # GPT OSS's experts and router are its own: a knob they do not read is refused.
@@ -245,7 +247,8 @@ class Mixture:
             return functools.partial(
                 Gemma4Experts, num_experts=self.experts, top_k=self.top_k, hidden_features=width,
                 out_features=out_features, activation=activation, implementation=self.implementation,
-                dispatch=self.dispatch, capacity_factor=self.capacity_factor, norm=norm, dtype=dtype,
+                dispatch=self.dispatch, capacity_factor=self.capacity_factor, norm_eps=norm_eps,
+                scale_offset=scale_offset, scale_after_cast=scale_after_cast, dtype=dtype,
                 precision=precision)
         return functools.partial(
             SparseMLP, num_experts=self.experts, top_k=self.top_k,
@@ -260,7 +263,9 @@ class Mixture:
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
             shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
-            latent_features=self.latent_features, latent_norm=norm if self.latent_norm else None,
+            latent_features=self.latent_features, latent_norm=functools.partial(
+                RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
+                dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
 
 

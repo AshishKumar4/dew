@@ -880,15 +880,13 @@ class CausalTransformer(nn.Module):
             raise ValueError('swigluoai requires routed experts on every layer')
         if mixture is None:
             return gated_mlp, None, None
+        # The dense width is read only where the experts take it: layers that differ in it have none.
+        width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
         built = mixture.build(
-            out_features=self.emb_features, hidden_features=self.hidden_features, activation=self.mlp,
-            dense=gated_mlp, swiglu_limit=self.swiglu_limit,
-            init_std=init_std, output_init_std=output_init_std,
-            norm=functools.partial(
-                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype),
-            dtype=self.dtype,
-            precision=self.precision)
+            out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
+            swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
+            norm_eps=self.norm_eps, scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
         # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
         routed, parallel = (None, built) if mixture.beside_dense else (built, None)
         return gated_mlp, routed, parallel
