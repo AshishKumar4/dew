@@ -469,9 +469,13 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     takes it where the target's row names it, rounding the inverse as they do
     (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
-    if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
-        return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False,
-                                    inverse_rounded=True)
+    if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True,
+                              staged_jvp=True) == 'pallas':
+        # Its forward mode is the portable norm's, so a jvp of a jit that staged it keeps working.
+        fused = functools.partial(norm_swiglu.rms_norm, scale=None, epsilon=eps, dtype=x.dtype,
+                                  offset=False, after_cast=False, inverse_rounded=True)
+        portable = functools.partial(unweighted_rmsnorm, eps=eps, implementation='xla')
+        return generation.linear_tangent(fused, portable)(x)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
