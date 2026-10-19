@@ -1040,7 +1040,7 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
-            with tuning.pinned({StepLaunch: Launch(None, warps)}):
+            with tuning.pinned({StepLaunch: Launch(0, warps)}):
                 return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
