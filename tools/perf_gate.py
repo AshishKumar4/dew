@@ -243,7 +243,11 @@ def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, time
     if cache is not None:
         # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
         # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
-        env.update(JAX_ENABLE_COMPILATION_CACHE="true", JAX_COMPILATION_CACHE_DIR=str(cache))
+        # Every program is kept, however quickly it compiled or small it is (the cache's write thresholds,
+        # which Dew's own cache setup clears too); a later round still traces and lowers, then loads.
+        env.update(JAX_ENABLE_COMPILATION_CACHE="true", JAX_COMPILATION_CACHE_DIR=str(cache),
+                   JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="0",
+                   JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="-1")
     command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
@@ -328,6 +332,7 @@ def run(args: argparse.Namespace) -> int:
                "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
     # Each tree's compile cache, for this run alone: removed at its end, so no run loads another's programs.
+    Path(args.out).resolve().parent.mkdir(parents=True, exist_ok=True)
     caching = tempfile.TemporaryDirectory(prefix="perf-gate-cache-", dir=Path(args.out).resolve().parent)
     with caching as caches:
         for round_ in range(args.rounds):
@@ -338,7 +343,7 @@ def run(args: argparse.Namespace) -> int:
                 results["samples"][name].append(
                     dict.fromkeys(kept, unbuilt[name]) if name in unbuilt
                     else measure(path, pythons[name], args, head_path / "tools", name == head,
-                                 Path(caches) / name, first=round_ == 0))
+                                 Path(caches) / ("head" if name == head else "base"), first=round_ == 0))
                 write_atomically(args.out, json.dumps(results, indent=2))
                 print(f"round {round_ + 1}: {name} measured", flush=True)
             spent = time.perf_counter() - began
