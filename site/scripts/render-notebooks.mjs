@@ -95,8 +95,7 @@ for (const file of files) {
 		}
 		if (cell.cell_type !== 'code' || !text.trim()) continue;
 		// A cell tagged skip-execution is shown without output: its notebook says why. An install
-		// cell may be unexecuted too: tools/run_tutorials.py --full, which makes the committed
-		// outputs, skips it because Dew comes from the checkout.
+		// cell may be unexecuted too, in a run that installed Dew before the notebook started.
 		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
 		const install = /^\s*[%!]pip\s/.test(text);
 		if (cell.execution_count == null && !skipped && !install) {
@@ -117,16 +116,6 @@ for (const file of files) {
 		parts.push(block.join('\n'));
 	}
 	if (outputs === 0) throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
-	// Where the outputs come from, as tools/run_tutorials.py --save records it.
-	// tools/check_tutorial_outputs.py reports in CI when the code the notebook imports changes after it.
-	const recorded = notebook.metadata?.dew?.outputs;
-	if (!/^[0-9a-f]{40}$/.test(recorded?.commit ?? '') || !recorded.date || !recorded.device || !recorded.jax) {
-		throw new Error(`${source}: no dew.outputs record (commit, date, device, jax) in its metadata; save it with tools/run_tutorials.py --save`);
-	}
-	const where = recorded.device === 'cpu' ? 'a CPU' : escapeHtml(recorded.device);
-	parts.push(
-		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
-	);
 
 	const live = runsLive(accelerator, liveCells.map(({ code }) => code));
 	if (live) {
@@ -152,8 +141,8 @@ for (const file of files) {
 		},
 		parts.join('\n\n'),
 	);
-	// The numbers the Settings cell assigns at the top level (`STEPS = 6000`), before any smoke-test override,
-	// so other pages can quote a notebook's own settings.
+	// The numbers the Settings cell assigns at the top level (`STEPS = 6000`), so other pages can quote a
+	// notebook's own settings.
 	const settingsCell = cells.find((cell) => cell.cell_type === 'code' && /^STEPS = /m.test(joined(cell.source)));
 	const settings = Object.fromEntries(
 		[...(settingsCell ? joined(settingsCell.source) : '').matchAll(/^([A-Z][A-Z0-9_]*) = ([0-9][0-9_.e+-]*)\s*$/gm)].map((match) => [
