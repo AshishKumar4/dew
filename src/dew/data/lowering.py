@@ -248,9 +248,24 @@ class _Rows(gx.FlatMapTransform):
     def flat_map(self, element: Record, rng: np.random.Generator | None = None) -> tuple[Record, ...]:
         position = _position(element)
         if position is None:
-            return _outputs(self.stage, None, element, rng, counts=self.counts)
-        outputs = _outputs(self.stage, position, _unplaced(element), rng, counts=self.counts)
-        return tuple(_placed(output, position) for output in outputs)
+            return tuple(_recounted(output, element)
+                         for output in _outputs(self.stage, None, element, rng, counts=self.counts))
+        given = _unplaced(element)
+        outputs = _outputs(self.stage, position, given, rng, counts=self.counts)
+        return tuple(_placed(_recounted(output, given), position) for output in outputs)
+
+
+def _recounted(output: Record, given: Record) -> Record:
+    """`output` with the valid targets `CountTargets` counted on `given` kept only where the step
+    left every value they were counted from as it was. A step that changes one, as a crop changes
+    tokens or a chunk step cuts them, drops the count, and `ValidTargets` measures the row it
+    delivers instead of reading a count of the row it was."""
+    if (not isinstance(output, dict) or not isinstance(given, dict) or "_dew_valid_targets" not in given
+            or "_dew_valid_targets" not in output):
+        return output
+    if all(output.get(name) is value for name, value in given.items() if not name.startswith("_dew_")):
+        return output
+    return {name: value for name, value in output.items() if name != "_dew_valid_targets"}
 
 
 def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str) -> pygrain.IterDataset:
