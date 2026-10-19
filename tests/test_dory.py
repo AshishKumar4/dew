@@ -614,14 +614,18 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                 model_code = np.load(recorder.fetched(f'model-{recorder.tag(key)}.npz'))
                 past = len(probe[f'{key}/window_generated'])
                 theirs = {'columns': np.concatenate([theirs['columns'][:, :-past], model_code['columns']], 1),
-                          'squares': np.concatenate([theirs['squares'][:-past], model_code['squares']])}
-            on_columns, squares, draws = np.take_along_axis(truth, columns, axis=1), np.zeros(truth.shape), []
+                          **{part: np.concatenate([theirs[part][:-past], model_code[part]])
+                             for part in ('absolutes', 'squares')}}
+            on_columns, draws = np.take_along_axis(truth, columns, axis=1), []
+            absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
             placed = jax.device_put(loaded.variables)
             for index, order in enumerate(drawn):
                 # Each order's weights are reordered where they sit, on the device.
                 found = rows(programs, permuted(placed, order), key)
+                absolutes += np.abs(found - truth)
                 squares += np.square(found - truth)
                 draws.append((np.take_along_axis(found, columns, axis=1), theirs['columns'][index],
                               on_columns))
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
-            assert_elements_as_exact_over_orders(squares, theirs['squares'], f'Dory 4B {key}, every entry')
+            assert_elements_as_exact_over_orders(absolutes, theirs['absolutes'], f'Dory 4B {key}, every entry',
+                                                 dew_squares=squares, reference_squares=theirs['squares'])

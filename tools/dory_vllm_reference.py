@@ -41,8 +41,8 @@ the continuation's log-probabilities by whole units. So the release is held to v
 (tests/residual_orders.py) and `orders` permutes the engine's weights in place to each
 (`LLM.apply_model`), decoding the identity run's tokens again through a logits processor that
 draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
-order's rows on their columns, and over every row's whole vocabulary each entry's squared distance
-from float64 summed over the orders; `model_orders` does the same with the model code at the
+order's rows on their columns, and over every row's whole vocabulary each entry's absolute and
+squared distance from float64 summed over the orders; `model_orders` does the same with the model code at the
 engine's precision on a last-loop run's rows past the window (`SHARED`). Order zero reproduces
 the probe's rows bit for bit. `publish` puts the probe and the orders in `DATASET`, at a revision
 source.json pins with each file's sha256 (`fetched`).
@@ -425,8 +425,8 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 def model_orders(directory: Path) -> None:
     """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
     throughout, or float32 with TF32 attention products) on the window's rows under every order of
-    `directory/orders.npy`: each order's rows on their columns and each entry's squared distance
-    from `upstream`'s summed over the orders, `directory/model-{run}.npz`."""
+    `directory/orders.npy`: each order's rows on their columns and each entry's absolute and squared
+    distance from `upstream`'s summed over the orders, `directory/model-{run}.npz`."""
     import torch
 
     config, tensors = release()
@@ -440,7 +440,8 @@ def model_orders(directory: Path) -> None:
         model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype), tf32=dtype == 'float32')
         truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
         columns = columns_of(probe, key)[window]
-        current, kept, squares = np.arange(hidden), [], np.zeros(truth.shape)
+        current, kept = np.arange(hidden), []
+        absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
         for index, order in enumerate(drawn):
             seen = permute(model, torch.as_tensor(np.argsort(current)[order]), hidden)
             current = order
@@ -449,11 +450,12 @@ def model_orders(directory: Path) -> None:
             assert np.array_equal(seen, unpermuted[order]), f'{key}: the model holds no order {index}'
             found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
             kept.append(np.take_along_axis(found, columns, axis=1))
+            absolutes += np.abs(found - truth)
             squares += np.square(found - truth)
             print(f'{key} model code, order {index}: {np.sqrt(np.mean(np.square(found - truth))):.4f}',
                   flush=True)
         np.savez(directory / f'model-{tag(key)}.npz', columns=np.stack(kept),
-                 squares=squares.astype(np.float32))
+                 absolutes=absolutes.astype(np.float32), squares=squares.astype(np.float32))
         del model, rows
         gc.collect()
         torch.cuda.empty_cache()
@@ -490,8 +492,8 @@ def permute(model, order, hidden: int) -> np.ndarray:
 def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     """One run under every order of `directory/orders.npy`, the engine's weights permuted in place
     to each and the identity run's tokens drawn again (`Forced`): each order's rows on their
-    columns, and over every row's whole vocabulary the sum over the orders of each entry's squared
-    distance from float64 (`upstream`'s rows), `directory/orders-{run}.npz`."""
+    columns, and over every row's whole vocabulary the sums over the orders of each entry's absolute
+    and squared distance from float64 (`upstream`'s rows), `directory/orders-{run}.npz`."""
     import functools
 
     import torch
@@ -514,7 +516,7 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 
     drawn = np.load(directory / 'orders.npy').astype(np.int64)
     current, kept = np.arange(hidden), []
-    squares = np.zeros(truth.shape)
+    absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
     for index, order in enumerate(drawn):
         # From the order the weights hold to this one.
         step = torch.as_tensor(np.argsort(current)[order])
@@ -531,9 +533,11 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
                 f'{key}: order 0 is not the probe')
         kept.append(on_columns)
         error = found - truth
+        absolutes += np.abs(error)
         squares += np.square(error)
         print(f'{key} order {index}: {np.sqrt(np.mean(np.square(error))):.4f}', flush=True)
-    np.savez(directory / f'orders-{tag(key)}.npz', columns=np.stack(kept), squares=squares.astype(np.float32))
+    np.savez(directory / f'orders-{tag(key)}.npz', columns=np.stack(kept),
+             absolutes=absolutes.astype(np.float32), squares=squares.astype(np.float32))
 
 
 def orders(directory: Path) -> None:
@@ -568,7 +572,8 @@ Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily
 - `upstream-<run>.npy`: every row over the whole vocabulary from vLLM's own model code in float64 on
   the run's tokens, the truth.
 - `orders-<run>.npz`: under each permutation, vLLM's rows on the probe columns, and over every row's
-  whole vocabulary each entry's squared distance from the float64 truth summed over the 52.
+  whole vocabulary each entry's absolute and squared distance from the float64 truth summed over the
+  52.
 - `model-<run>.npz`: the same for a last-loop run's rows past the window from the pull request's
   model code at the engine's precision (bf16, or fp32 with TF32 attention products), the reference
   there: the engine's last-loop cache parts from the model code past the window
