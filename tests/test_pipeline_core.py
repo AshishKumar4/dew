@@ -188,7 +188,9 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
     """A global position counts the records of the batches the run read, in the order its batches
     come in after every stage written after the batch. A run resumed after two batches reads on as
     the uninterrupted run does through a limit, a window shuffle, a random step or a finite repeat
-    after the batch, and reads on alike from two shares, every row's draws included."""
+    after the batch. Two shares resumed there read on the batches' rows the run reads, each as it
+    reads uninterrupted, every leaf included; a random step after the batch draws for each share's
+    part of a batch, so one share's draws are not another's."""
     rows = Pipeline(source(16))
     chain = {"take": rows.batch(2).take(5),
              "window shuffle": rows.repeat(1).batch(2).shuffle(7, window=3),
@@ -212,7 +214,7 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
         assert head + take(resumed, 6) == expected
     finally:
         resumed.close()
-    shares = []
+    shares, uninterrupted = [], []
     for index in range(2):
         reader = data.train(DataPartition(index, 2))
         try:
@@ -220,9 +222,19 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
             shares.append(take(reader, 6))
         finally:
             reader.close()
+        reader = data.train(DataPartition(index, 2))
+        try:
+            uninterrupted.append(take(reader, 8)[2:])
+        finally:
+            reader.close()
+    assert shares == uninterrupted
     joined = [{key: [value for pair in zip(left[key], right[key], strict=True) for value in pair]
                for key in left} for left, right in zip(*shares, strict=True)]
-    assert head + joined == expected
+    if after == "random map":
+        assert all(left["draw"] != right["draw"] for left, right in zip(*shares, strict=True))
+        assert [batch["id"] for batch in head + joined] == [batch["id"] for batch in expected]
+    else:
+        assert head + joined == expected
 
 
 def test_a_random_step_draws_alike_in_every_read_of_one_order():
