@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING
 
 import jax
 from jax.experimental import multihost_utils
+from packaging.version import Version
 
 from dew.cache import enable_compilation_cache
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.pool import (
+    COORDINATOR,
     PREEMPTED_EXIT,
     PROCESS_COUNT,
     PROCESS_ID,
@@ -142,11 +144,11 @@ def _join_process_pool(multi_host: bool | None) -> None:
     count and rank in DEW_PROCESS_COUNT and DEW_PROCESS_ID, which jax has no
     variable for, and those are passed to it with JAX's cluster detection
     off: the launcher placed its processes, and a Slurm step around it would
-    otherwise pin each to the GPU at SLURM_LOCALID. On a machine with no cluster
-    environment it raises a ValueError naming the missing coordinator
-    address, the single-host signature, unless the environment declared a
-    pool of several processes. Every other failure propagates,
-    since a pod run would otherwise continue on one host. multi_host=True
+    otherwise pin each to the GPU at SLURM_LOCALID. A process that nothing
+    declares a pool for (no cluster JAX would detect, no process count or
+    coordinator a launcher set) runs alone without asking JAX; every failure
+    to join a pool propagates, since a pod run would otherwise continue on
+    one host. multi_host=True
     requires the pool, multi_host=False never asks for it. A Slurm step of
     one task forms no pool unless the run asks for one with multi_host=True
     or mpirun started its ranks there, which JAX's detection reads before
@@ -169,21 +171,16 @@ def _join_process_pool(multi_host: bool | None) -> None:
         refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
     if multi_host is False or one_task:
         return
-    try:
-        if PROCESS_COUNT in os.environ:
-            jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
-                                       process_id=int(os.environ[PROCESS_ID]),
-                                       cluster_detection_method="deactivate")
-        else:
-            jax.distributed.initialize()
-    except ValueError as e:
-        # Alone only where nothing declared a pool: a rank whose pool lacks its
-        # coordinator would otherwise train by itself as if it were the pool.
-        declared = int(os.environ.get(PROCESS_COUNT, 1)) > 1 or (cluster is not None and cluster.count > 1)
-        if multi_host or declared or "coordinator_address" not in str(e):
-            raise
+    declared = cluster is not None or any(name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
+    if multi_host is None and not declared:
+        return
+    if PROCESS_COUNT in os.environ:
+        jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
+                                   process_id=int(os.environ[PROCESS_ID]),
+                                   cluster_detection_method="deactivate")
     else:
-        _joined()
+        jax.distributed.initialize()
+    _joined()
 
 
 def _joined() -> None:
@@ -237,14 +234,12 @@ def _pool_keys_alike() -> bool:
     fingerprint, which on a GPU describes the device down to its NVLink
     links. In a pool across GPUs linked differently the processes keyed a
     step apart, and on the next run some loaded it while the others compiled
-    it and waited for ever for their shares of its sharded autotuning. The
-    jax constraints.txt names hashes every process's fingerprint; the 0.11.2
-    release, which the published dewml installs, does not, so the private
-    module is asked at this boundary.
+    it and waited for ever for their shares of its sharded autotuning. No
+    jax release has the fix. The build constraints.txt names carries it, and
+    its branch versions each build as a post-release of 0.11.2, which jax has
+    never published, so the version says which jax this is.
     """
-    from jax._src import cache_key
-
-    return hasattr(cache_key, "_shared_fingerprints")
+    return Version(jax.__version__).is_postrelease
 
 
 class Preempted(SystemExit):

@@ -209,6 +209,15 @@ class TokenFiles(Dataset):
         for a legacy token directory."""
         return Files(self.url, storage_options=self.storage_options).committed
 
+    def holds(self, name: str) -> bool:
+        """Whether the store holds split `name`'s tokens: a binary file of them or ArrayRecord shards (a
+        committed export holds its one split). The files say so, whatever the metadata counts."""
+        if self.committed is not None:
+            return name == self.split
+        other = replace(self, split=name)
+        fs, path = Store(self.url, self.storage_options).child(f"{name}.bin").resolve()
+        return bool(other.array_paths) or fs.exists(path)
+
     def with_split(self, name: str) -> TokenFiles:
         if name != self.split and self.committed is not None:
             raise ValueError(

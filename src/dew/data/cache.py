@@ -393,35 +393,28 @@ class _Writer:
         payload = path.read_bytes()
         shard = f"shards/{self.writer}/{number:06d}.array_record"
         segment = f"segments/{self.writer}/{number:06d}.json"
-        # A remote store's write is retried; a local disk's failure, or its retention refusing room
-        # (`LocalRetention`), is the cache's error at once.
+        # A remote store's write is retried, by the store (`Store.put_immutable`); a local disk's failure,
+        # or its retention refusing room (`LocalRetention`), is the cache's error at once.
         retries = self.cache.retry if self.root.remote else 0
-        for attempt in range(retries + 1):
-            if self.closed:
-                raise RuntimeError("cache upload was cancelled")
-            try:
-                self.root.child(shard).put_immutable(payload)
-                encoded = _json(
-                    {
-                        "schema": 1,
-                        "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
-                        "completions": entries,
-                    }
-                )
-                if self.closed:
-                    raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
-                self.root.child(segment).put_immutable(encoded)
-                with self.lock:
-                    self.spool_bytes -= used
-                    self.uploaded_bytes += used
-                    self.upload_seconds += time.monotonic() - started
-                path.unlink(missing_ok=True)
-                return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
-            except OSError:
-                if attempt == retries:
-                    raise
-                time.sleep(min(0.25 * 2**attempt, 10))
-        raise RuntimeError("cache upload retry budget exhausted")
+        if self.closed:
+            raise RuntimeError("cache upload was cancelled")
+        self.root.child(shard).put_immutable(payload, retries=retries)
+        encoded = _json(
+            {
+                "schema": 1,
+                "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
+                "completions": entries,
+            }
+        )
+        if self.closed:
+            raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
+        self.root.child(segment).put_immutable(encoded, retries=retries)
+        with self.lock:
+            self.spool_bytes -= used
+            self.uploaded_bytes += used
+            self.upload_seconds += time.monotonic() - started
+        path.unlink(missing_ok=True)
+        return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
 
     def metrics(self) -> CacheStats:
         with self.lock:
