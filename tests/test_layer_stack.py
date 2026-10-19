@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import widened
+from reference_error import assert_as_exact_as_the_reference, equations, widened
 from sharded import assert_sharded
 
 from dew.interop import Pretrained
@@ -288,6 +288,53 @@ TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 4
 
 def tiny(**overrides):
     return models.build("causal_transformer", **{**TINY, **overrides})
+
+
+def hybrid(periods: int, **overrides):
+    """A stack of `periods` repeats of three windowed layers and one full one, Qwen3.5's pattern."""
+    return tiny(num_layers=4 * periods, max_seq_len=16,
+                layer_types=(("sliding_attention",) * 3 + ("full_attention",)) * periods,
+                kinds={"sliding_attention": {"window": 4}}, attention_impl="reference", **overrides)
+
+
+def decoded(model, variables, ids):
+    """A prefill of one token and single-token steps through the cache, and the cache's paths."""
+    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    steps = []
+    for position in range(ids.shape[1]):
+        step, state = model.apply({**variables, "cache": cache}, ids[:, position:position + 1],
+                                  decode=True, mutable=["cache"])
+        cache = state["cache"]
+        steps.append(step)
+    return jnp.concatenate(steps, axis=1), paths(cache)
+
+
+def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
+    """A decode step over resident weights scans a stack whose layers repeat one period as one
+    body of the period's layers (`scan_groups(periodic=True)`), whatever `scan_layers` says: the
+    step's program is the same for two periods as for six, and the steps decode as exactly as
+    the plain loop, both from the loop's own float64 steps, the cache kept in the plain loop's
+    layout throughout."""
+    ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
+
+    def program(model, variables):
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
+        return sorted(str(equation.primitive) for equation in equations(graph))
+
+    short, deep = hybrid(2), hybrid(6)
+    short_program = program(short, short.init(jax.random.key(0), ids))
+    assert short_program == program(deep, deep.init(jax.random.key(0), ids))
+
+    variables = deep.init(jax.random.key(0), ids)
+    scanned, scanned_paths = decoded(deep, variables, ids)
+    plain, plain_paths = decoded(deep.clone(scan_decode=False), variables, ids)
+    assert scanned_paths == plain_paths
+    with jax.enable_x64(new_val=True):
+        truth, _ = decoded(hybrid(6, dtype=jnp.float64), widened(variables), ids)
+    assert_as_exact_as_the_reference(np.asarray(scanned, np.float64), np.asarray(plain, np.float64),
+                                     np.asarray(truth), "periodic decode steps")
 
 
 def bf16(**overrides):
