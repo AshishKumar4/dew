@@ -1460,15 +1460,8 @@ class Trainer(Generic[Loss, Effects]):
             trained = dataclasses.replace(trained, compute=None)
             # Whether this fit trained or found the run complete, and inside
             # the lifecycle, so a selection that fails is the run's outcome.
-            if restore_best and checkpoints is not None and run.preempted is None:
-                checkpoints.wait()  # the best may be the last step's save, still in flight
-                model = {name: jax.tree.map(
-                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
-                    getattr(trained, name)) for name in MODEL_STATE if getattr(trained, name) is not None}
-                best, _ = checkpoints.restore(model, step="best")
-                trained = dataclasses.replace(trained, **best)
-            elif restore_best and checkpoints is None and run.preempted is None:
-                trained = run.best.state(trained)
+            if restore_best and run.preempted is None:
+                trained = self._best_model(trained, run)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1795,6 +1788,20 @@ class Trainer(Generic[Loss, Effects]):
             run.preempted = current
             return True
         return False
+
+    def _best_model(self, final: TrainState, run: _FitRun) -> TrainState:
+        """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
+        its best checkpoint, a weights-only one included, or without `Checkpoints` from the copy the
+        run held (`HeldBest`)."""
+        checkpoints = self.checkpoints
+        if checkpoints is None:
+            return run.best.state(final)
+        checkpoints.wait()  # the best may be the last step's save, still in flight
+        template = {name: jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), value)
+            for name in MODEL_STATE if (value := getattr(final, name)) is not None}
+        model, _ = checkpoints.restore(template, step="best")
+        return dataclasses.replace(final, **{name: model[name] for name in template})
 
     def _take(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, *,
               unlogged: bool = False) -> None:
