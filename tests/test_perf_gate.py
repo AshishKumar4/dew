@@ -277,6 +277,66 @@ def test_a_tree_compiles_once_into_its_own_cache_and_later_rounds_load_from_it(g
     assert child(None) == (0, 0)
 
 
+def locked_tree(tree: Path) -> Path:
+    """A tree whose locks name numpy alone, which the install script builds an environment for."""
+    (tree / "locks").mkdir(parents=True)
+    for lock in (ROOT / "locks").glob("*.txt"):
+        (tree / "locks" / lock.name).write_text("numpy\n")
+    (tree / "tools").mkdir()
+    shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+    (tree / ".python-version").write_text("3.12\n")
+    return tree
+
+
+def standing_in_environments(gate, monkeypatch) -> list:
+    """Every tool of the battery stood in (`standing_in`), each environment's build too; returns each row
+    process's environment."""
+    standing_in(gate, monkeypatch, passed=True)
+    measured_row = gate.subprocess.run
+    environments = []
+
+    def child(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
+        if command[0] == "uv":
+            (Path(command[-1]) / "bin").mkdir(parents=True)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[0] == "sh":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        environments.append(kwargs["env"])
+        return measured_row(command, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    return environments
+
+
+def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_alone(
+        gate, tmp_path, monkeypatch):
+    """`--head-env` with one tree as base and head: every row process of the head holds the setting, every
+    process of the base keeps the caller's, and the results and the table name it."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/caller")
+    environments = standing_in_environments(gate, monkeypatch)
+    tree = locked_tree(tmp_path / "main")
+    out = tmp_path / "gate.json"
+    off = "--xla_gpu_enable_command_buffer="
+    args = SimpleNamespace(base=f"main={tree}", head=f"buffers-off={tree}", rounds=2,
+                           only=["serve", "lm-dense"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(out),
+                           environments=str(tmp_path / "environments"), head_env=[f"XLA_FLAGS={off}"])
+    assert gate.run(args) == 0
+    sides = {Path(env["JAX_COMPILATION_CACHE_DIR"]).name: set() for env in environments}
+    for env in environments:
+        sides[Path(env["JAX_COMPILATION_CACHE_DIR"]).name].add(env["XLA_FLAGS"])
+    assert sides == {"base": {"--xla_dump_to=/caller"}, "head": {off}}
+    results = json.loads(out.read_text())
+    assert results["head settings"] == {"XLA_FLAGS": off}
+    table = tmp_path / "gate.md"
+    assert gate.report(SimpleNamespace(results=out, table=str(table), claim=False)) == 0
+    assert f"buffers-off ran with XLA_FLAGS='{off}'" in table.read_text()
+
+
 def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_first_round(
         gate, tmp_path, monkeypatch):
     """A run gives each tree a cache of its own beside its results (made where absent), removes them at
@@ -302,14 +362,7 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
         return measured_row(command, **kwargs)
 
     monkeypatch.setattr(gate.subprocess, "run", child)
-    trees = {name: tmp_path / name for name in ("main", "head")}
-    for tree in trees.values():
-        (tree / "locks").mkdir(parents=True)
-        for lock in (ROOT / "locks").glob("*.txt"):
-            (tree / "locks" / lock.name).write_text("numpy\n")
-        (tree / "tools").mkdir()
-        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
-        (tree / ".python-version").write_text("3.12\n")
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "not" / "yet" / "gate.json"
     args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
                            only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
