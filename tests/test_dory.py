@@ -99,7 +99,7 @@ def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
     loaded = load()
     model, ids = loaded.model.with_passes(loops), REFERENCE['input_ids']
     truth, _ = float64_forward(model, loaded.variables, ids)
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = model.clone(dtype=jnp.float64)
         roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
     assert_computes_the_oracle(np.asarray(truth), REFERENCE[f'logits_{loops}_f64'], f'{loops} loops',
@@ -569,7 +569,6 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     source = json.loads((RELEASED / 'source.json').read_text())
     recorder = load_tool('dory_vllm_reference')
     probe, drawn = np.load(recorder.fetched('probe.npz')), np.load(recorder.fetched('orders.npy'))
-    whole = recorder.positions(probe)
     keys = [recorder.name(*run) for run in recorder.RUNS]
     truths = {key: np.load(recorder.fetched(f'upstream-{recorder.tag(key)}.npy')) for key in keys}
 
@@ -579,7 +578,7 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                                       prompt_rows=part == 'sentence') for part in ('sentence', 'window')])
 
     loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         variables = jax.device_put(widened(loaded.variables))
         for loops, mode, run in recorder.RUNS:
             key = recorder.name(loops, mode, run)

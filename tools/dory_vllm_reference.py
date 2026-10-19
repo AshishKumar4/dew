@@ -407,8 +407,6 @@ def model_orders(directory: Path) -> None:
     precision) on the window's rows under every order of `directory/orders.npy`: each order's rows
     on their columns and each entry's squared distance from `upstream`'s summed over the orders,
     `directory/model-{run}.npz`."""
-    import functools
-
     import torch
 
     config, tensors = release()
