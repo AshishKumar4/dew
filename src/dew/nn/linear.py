@@ -51,7 +51,15 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
+from .kernels.generation import (
+    Refusal,
+    first_refusal,
+    measured_kernel,
+    ran_kernel,
+    refused,
+    route,
+    triton_runs,
+)
 from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
 from .sharding import (
     HEADS,
@@ -1145,13 +1153,13 @@ class GatedDeltaNet(nn.Module):
                   else wide)
         return stored, jnp.promote_types(operand, stored)
 
-    def _fused_refusal(self, x, operand) -> str | None:
-        """Why a decode token does not run in one launch (`delta_rule.fused_step`) here, or None where it
-        does: a GPU the kernel compiles for and the widths Triton's blocks take."""
+    def _fused_refusal(self, x, operand) -> Refusal | None:
+        """Why a decode token does not run in one launch (`delta_rule.fused_step`) on the target, or
+        None where it does: a GPU the kernel compiles for and the widths Triton's blocks take."""
         state = (x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim)
-        return first_refusal(
-            (triton_runs(), "the fused step needs a GPU of sm80 or later"),
-            (delta_rule.fused_fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])),
+        return refused(
+            (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
+            (delta_rule.fused_fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])), 'widths',
              "the state's widths are not powers of two the kernel's blocks take"),
         )
 
@@ -1209,12 +1217,13 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
         operand = mixed.dtype
         token = None
-        if decode and S == 1 and measured_kernel('delta_decode', 'step') == 'fused':
-            refusal = self._fused_refusal(x, operand)
-            if refusal is None:
+        if decode and S == 1:
+            preferred = measured_kernel('delta_decode', 'step')
+            refusal = self._fused_refusal(x, operand) if preferred == 'fused' else None
+            fused = preferred == 'fused' and refusal is None
+            taken = route('delta_decode', kernel='fused' if fused else 'step', refusal=refusal)
+            if taken.kernel == 'fused':
                 token = self._fused_token(z, b, a, valid)
-            else:
-                ran_kernel('delta_decode', 'step', refusal)
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
