@@ -269,14 +269,15 @@ def assert_leaves_as_exact(dew, reference, truth, *, terms=None, rows: bool = Tr
     assert not over, "\n".join(over)
 
 
-def _batch(draw, stage: int, rows: bool) -> tuple[dict, dict, list, list, dict]:
+def _batch(draw, stage: int, terms, rows: bool) -> tuple[dict, dict, list, list, dict]:
     """Batch `stage` of ORDERS draws (`assert_leaves_as_exact_over_orders`), orders `stage` ORDERS on:
     each leaf's absolute distance from float64 at every element summed over them, Dew's and the
     reference's, by the leaf's path; each order's RMS distance of each leaf, both sides, and, where
-    `rows`, of each row (`row_errors`); and each leaf's row sizes, from the batch's first draw."""
+    `rows`, of each row (`row_errors`); and each leaf's row sizes, from the batch's first truth and
+    `terms`."""
     dew_sums, reference_sums, leaves, row_distances, sizes = {}, {}, [], [], {}
     for order in range(stage * ORDERS, (stage + 1) * ORDERS):
-        dew, reference, truth, terms = draw(order)
+        dew, reference, truth = draw(order)
         summed = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
         at_order, rows_at_order = {}, {}
         for (path, mine), theirs, true, size in zip(
@@ -298,12 +299,18 @@ def _batch(draw, stage: int, rows: bool) -> tuple[dict, dict, list, list, dict]:
     return dew_sums, reference_sums, leaves, row_distances, sizes
 
 
-def assert_leaves_as_exact_over_orders(draw, label: str, *, rows: bool = True) -> None:
+def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> None:
     """The K-order gate over a comparison's rounding draws. `draw(order)` gives one draw `(dew,
-    reference, truth, terms)`: order 0 the case's own, every other an independent draw of its rounding
-    (an exact symmetry of the computation, tests/residual_orders.py, or another input), every order's
-    trees in order 0's layout (a permuted parameter's gradient permuted back) and `terms` None or
-    each leaf's float64 terms (`float64_terms`).
+    reference, truth)`: order 0 the case's own, every other the same input under an exact symmetry
+    of the computation that reorders its sums (tests/residual_orders.py), every order's trees in
+    order 0's layout (a permuted output's cotangent permuted with it, a permuted parameter's
+    gradient permuted back). `terms`, None or each leaf's float64 terms in that layout
+    (`float64_terms`, order 0's), size the rows: a symmetry moves no row's size, so a draw computes
+    them once, not once an order. Another input is another element, not another rounding of this
+    one, so it is no order. A sum no symmetry reorders (attention's over keys, where a kernel fixes
+    their order) rounds alike in every order: an element whose error it carries is held to that one
+    rounding, and where Dew stays past the factor at every stage that is a finding to diagnose (the
+    code, the reference arm or the orders), not chance.
 
     Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
     orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
@@ -315,7 +322,7 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, rows: bool = True) -
     first batch is always taken whole. After a second training step a row inherits the first step's
     rounding through the parameters it reads, which its own terms do not see, so such a comparison
     passes `rows=False` and its first step holds the rows."""
-    batches = {0: _batch(draw, 0, rows)}
+    batches = {0: _batch(draw, 0, terms, rows)}
     _, _, leaves, row_distances, sizes = batches[0]
     for name in leaves[0]:
         mine, theirs = (np.asarray([order[name][side] for order in leaves]) for side in (0, 1))
@@ -326,7 +333,7 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, rows: bool = True) -
 
     def batch(stage):
         if stage not in batches:
-            batches[stage] = _batch(draw, stage, rows=False)
+            batches[stage] = _batch(draw, stage, terms, rows=False)
         return batches[stage][0], batches[stage][1]
 
     assert_elements_as_exact(batch, label)
@@ -652,7 +659,9 @@ elements and orders, K = ORDERS a side needs three stages for a familywise FALSE
 43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
 or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage
 count comes from calibrating the rule on held-out real order traces at the real element count, and
-until it has, the rule's false-failure rate on such shapes is unmeasured."""
+until it has, the rule's false-failure rate on such shapes is unmeasured. Nor is it calibrated
+where a sum's order no symmetry changes: that rounding is the same at every stage, so more stages
+do not redraw it, and an element it parts past the factor stays flagged."""
 
 
 def assert_elements_as_exact(batch, label: str) -> None:
