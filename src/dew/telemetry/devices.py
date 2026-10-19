@@ -217,6 +217,10 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
             f"Replace it: uv pip uninstall {stale} && {install}. {on_cpu}")
 
 
+class CPUOnlyJax(RuntimeError):
+    """A machine with an NVIDIA GPU whose JAX opened with none (`refuse_cpu_only_jax`)."""
+
+
 def refuse_cpu_only_jax() -> None:
     """Stop a process whose JAX opened with no GPU on a machine with an NVIDIA GPU, with the
     install that fixes it where one would (`cpu_only_refusal`). It reads the devices JAX opened,
@@ -231,7 +235,7 @@ def refuse_cpu_only_jax() -> None:
     if gpus is None:
         return
     refusal = cpu_only_refusal(os.environ, gpus, cuda_builds(), cuda_driver_version())
-    raise RuntimeError(refusal or (
+    raise CPUOnlyJax(refusal or (
         f"This machine has an NVIDIA GPU (driver {gpus[0]}), and JAX opened with no GPU beside a CUDA "
         f"build that runs on it: {jax.devices()}. Read the CUDA plugin's warning above, or set "
         "JAX_PLATFORMS=cuda to see why it failed; to run on the CPU instead, set JAX_PLATFORMS=cpu."))
