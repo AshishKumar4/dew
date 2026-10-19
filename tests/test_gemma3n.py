@@ -17,8 +17,8 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
-from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
-from dew.nn.mlp import GatedMLP
+from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
+from dew.nn.mlp import GatedMLP, gaussian_topk
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4

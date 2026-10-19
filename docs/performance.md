@@ -601,7 +601,7 @@ as eight bf16 elementwise steps and each kept its rounding. A further
 0.27 ms is the rounding of the residual sums the norms read, which is what
 the policy is for. The MLP's GELU (`dew.nn.dit`, and an ungated decoder's
 `gelu`) now runs in fp32 and rounds once, as torch's bf16 GELU does and as
-the gated MLPs already did (`dew.nn.moe.gated_product`). Over 2^20 bf16
+the gated MLPs already did (`dew.nn.activations.gated_product`). Over 2^20 bf16
 values its RMS error against float64 drops from 2.19e-3 to 1.76e-3, on the
 CPU and the RTX 4080 alike. The RTX 4080 steps are unchanged. The hybrid DiT
 at batch 16 takes 66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32
