@@ -109,8 +109,8 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     eos = int(plain.tokens[0, 4])
     seen = []
 
-    def reward(source, completion, truth, info):
-        seen.append((source, completion, truth, info))
+    def reward(completion, record):
+        seen.append((record.data_source, completion, record.ground_truth, record.extra_info))
         return float(len(completion))
 
     rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,

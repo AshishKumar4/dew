@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -47,6 +48,21 @@ TRUTH_KEY = "ground_truth"
 
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
+
+@dataclass(frozen=True)
+class PromptRecord:
+    """What a reward is told about the prompt it scores, read from the prompt's row.
+
+    `data_source` names the row's dataset or rule, `ground_truth` is its
+    reference answer as the source normalized it, and `extra_info` is any
+    other context the row carries, each the empty string where the row
+    lacks it. A reward reads the fields it needs.
+    """
+
+    data_source: str = ""
+    ground_truth: str = ""
+    extra_info: str = ""
+
 
 FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
 """The fields prompt encoding reads, leaving the others unchanged.
