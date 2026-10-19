@@ -157,7 +157,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     objective = GRPOObjective(model, seq_len=7, variables=params)
     rollout = SampledRollout(
-        objective, lambda source, text, truth, info: float(sum(map(int, text.split()))),
+        objective, lambda text, record: float(sum(map(int, text.split()))),
         groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.2, top_k=7))
     key = jax.random.key(5)
     repeats = max(1, jax.device_count() // 2)
@@ -241,7 +241,7 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
     objective = GRPOObjective(model, seq_len=7)
     params = objective.init(jax.random.key(0))
     sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
-    sampled = SampledRollout(objective, lambda source, text, truth, info: float(len(text) % 3),
+    sampled = SampledRollout(objective, lambda text, record: float(len(text) % 3),
                              groups=2, max_new_tokens=4, sampling=sampling)
     state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
     episodes = EpisodeRollout(
