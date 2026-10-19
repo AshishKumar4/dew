@@ -2,15 +2,15 @@
 #
 #     uv pip install -e '.[ci]' -c constraints.txt
 #
-# jax 0.11.2 with two cache-key fixes no release has yet (AshishKumar4/jax
-# branch v0.11.2-cache-key-pool-fingerprints): the multi-process key
+# jax 0.12.0 with two cache-key fixes no release has yet (AshishKumar4/jax
+# branch v0.12.0-cache-key-pool-fingerprints): the multi-process key
 # (jax-ml/jax#40940), which a pool across GPUs with and without NVLink needs to
 # keep the persistent compilation cache, and a Pallas Triton kernel's key
 # without its source locations (jax-ml/jax#41502), which two checkouts need to
 # share one compiled kernel; docs/installation.md says how a user installs it. It is a constraint and not a dependency because PyPI refuses a
 # package whose requirements name a URL. Return to the release once one ships
 # the fix.
-jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
+jax @ https://github.com/AshishKumar4/jax/archive/65e190f3a4158f51efdbffc6f4864fc26d18a93b.tar.gz
 
 # tokamax, a dependency (dew.nn.kernels.tuning): 0.0.15 is the first release
 # without 0.0.13 and 0.0.14's typeguard==2.13.3, which tyro's typeguard>=4

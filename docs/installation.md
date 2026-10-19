@@ -22,7 +22,7 @@ curl -LsSf https://dewml.dev/install.sh | sh -s -- -y --venv ~/envs/dew --cuda 1
 
 ## uv or pip
 
-Each command installs the accelerator build of JAX 0.11.2, the version Dew requires:
+Each command installs the accelerator build of JAX 0.12.0, the version Dew requires:
 
 | Hardware | uv | pip |
 |---|---|---|
@@ -60,7 +60,7 @@ print("Devices:", jax.devices())
 
 ## GPUs and TPUs
 
-The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JAX 0.12.0, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 ### Which CUDA build
 
@@ -79,7 +79,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 
 ### Process pools across GPUs
 
-JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
+JAX 0.12.0 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.12.0 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.12.0 that `constraints.txt` names:
 
 ```bash
 uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" \

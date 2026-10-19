@@ -200,7 +200,7 @@ def _joined() -> None:
     A GPU pool keeps the persistent compilation cache when its jax keys a
     computation that spans processes alike on every one of them, as the jax
     constraints.txt names does (`_pool_keys_alike`). With another jax, such
-    as the 0.11.2 release, it compiles without the cache and says so on every
+    as the 0.12.0 release, it compiles without the cache and says so on every
     process: some ranks would load a step that the others compile, and that
     compile waits for every rank for ever.
     """
@@ -241,13 +241,13 @@ def _pool_keys_alike() -> bool:
     """Whether this jax keys a computation that spans processes alike on
     every one of them (jax-ml/jax#40940).
 
-    jax 0.11.2 keys an executable by the compiling process's own topology
+    jax 0.12.0 keys an executable by the compiling process's own topology
     fingerprint, which on a GPU describes the device down to its NVLink
     links. In a pool across GPUs linked differently the processes keyed a
     step apart, and on the next run some loaded it while the others compiled
     it and waited for ever for their shares of its sharded autotuning. No
     jax release has the fix. The build constraints.txt names carries it, and
-    its branch versions each build as a post-release of 0.11.2, which jax has
+    its branch versions each build as a post-release of 0.12.0, which jax has
     never published, so the version says which jax this is.
     """
     return Version(jax.__version__).is_postrelease

@@ -141,7 +141,7 @@ jobs:
         assert "site-packages" in dew.__file__, dew.__file__
         print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
               "flax", importlib.metadata.version("flax"))
-        # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
+        # PyPI's jax 0.12.0 lacks jax-ml/jax#40940, and Dew sees that it does.
         assert not _pool_keys_alike()
         import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
         model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
