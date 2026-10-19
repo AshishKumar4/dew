@@ -235,10 +235,12 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
                         - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
         seen = (held > 0) & (queries != 0)
-        if causal or sliding_window is not None:
-            # Aligned to its document's last keys, a query sees the key at its place, or without
-            # causality the nearest one within the window.
-            seen &= aligned_places(segment_ids) >= (0 if causal else 1 - sliding_window)
+        # Aligned to its document's last keys, a query sees the key at its place, or without
+        # causality the nearest one within the window.
+        if causal:
+            seen &= aligned_places(segment_ids) >= 0
+        elif sliding_window is not None:
+            seen &= aligned_places(segment_ids) > -sliding_window
         return seen[:, :, None, None]
     if (mask is not None or isinstance(segment_ids, CrossDocuments)
             or (segment_ids is not None and key_value_seq_lengths is not None)):
