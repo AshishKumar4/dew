@@ -43,9 +43,9 @@ the continuation's log-probabilities by whole units. So the release is held to v
 draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
 order's rows on their columns, and over every row's whole vocabulary each entry's squared distance
 from float64 summed over the orders; `model_orders` does the same with the model code at the
-engine's precision on a last-loop run's rows past the window (`SHARED`). Order zero reproduces the probe's rows bit for
-bit. `publish` puts the probe and the orders in `DATASET`, at a revision source.json pins with each
-file's sha256 (`fetched`).
+engine's precision on a last-loop run's rows past the window (`SHARED`). Order zero reproduces
+the probe's rows bit for bit. `publish` puts the probe and the orders in `DATASET`, at a revision
+source.json pins with each file's sha256 (`fetched`).
 """
 
 from __future__ import annotations
