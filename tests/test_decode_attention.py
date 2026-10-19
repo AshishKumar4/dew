@@ -92,8 +92,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`CausalSelfAttention._decode_attention`) over
-    key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
+    """fp32 attention of a decode step's grouped query (`attention._grouped`) over key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
     folded attention it stands in for over the prefix those lengths mean."""
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, implementation='xla',
@@ -150,15 +149,15 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
 
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
 def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
-    """Grouped in the core, a query of 3 positions and 8 heads over 2 key heads with key lengths gives
-    each head's attention over its key head's keys, within tests/reference_error.py's rule of the
-    reference over the key heads repeated, against float64."""
+    """Grouped in the core, a lone query of 8 heads over 2 key heads with key lengths gives each head's
+    attention over its key head's keys, within tests/reference_error.py's rule of the reference over
+    the key heads repeated, against float64."""
     from dew.nn.attention import reference_attention, repeat_kv_heads
 
     rng = np.random.default_rng(3)
     lengths = jnp.asarray([1, 9, 32], jnp.int32)
     query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
-                         for shape in ((3, 3, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
+                         for shape in ((3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
     found = scaled_dot_product_attention(query, key, value, implementation=implementation,
                                          key_value_seq_lengths=lengths)
 
@@ -170,6 +169,42 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
         truth = alone(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
     assert_as_exact_as_the_reference(np.asarray(found), np.asarray(alone(query, key, value)),
                                      np.asarray(truth), f"grouped {implementation}")
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kv_heads", [2, 1])
+def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
+    """Over a tensor axis of two, a lone query of 8 heads grouped over key heads the axis splits (2)
+    runs each shard on its own key head's group, and over one it cannot split stays ungrouped, its
+    query heads split and the key head repeated (`_per_shard`): each device's program does half the
+    work of the call off the mesh, by XLA's own count, and attends as that call does."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    rng = np.random.default_rng(4)
+    lengths = jnp.asarray([5, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="xla",
+                                            key_value_seq_lengths=lengths)
+
+    def flops(compiled):
+        analysis = compiled.cost_analysis()
+        return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
+
+    whole = jax.jit(attend).lower(query, key, value).compile()
+    mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        heads = NamedSharding(mesh, PartitionSpec(None, None, "tensor"))
+        placed = [jax.device_put(x, heads if x.shape[2] % 2 == 0 else NamedSharding(mesh, PartitionSpec()))
+                  for x in (query, key, value)]
+        compiled = jax.jit(attend).lower(*placed).compile()
+        split = compiled(*placed)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole(query, key, value)), atol=1e-6, rtol=1e-6)
+    assert flops(compiled) <= 0.6 * flops(whole), (flops(compiled), flops(whole))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")

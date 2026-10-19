@@ -1440,8 +1440,7 @@ def folds(query, key, bias, mask, causal, sliding_window) -> bool:
     """Whether an xla call goes to `folded_attention`: on a GPU, a call of
     few query positions over keys of the query's heads, masked at most by a
     mask every head shares (key lengths are one), such as a decode step's
-    grouped query (`CausalSelfAttention._decode_attention`) where cudnn does
-    not run."""
+    grouped query (`_grouped`) where cudnn does not run."""
     return (generation.backend() == 'gpu' and query.shape[-2] == key.shape[-2]
             and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
             and (mask is None or (mask.ndim == 4 and mask.shape[1] == 1))
@@ -1628,9 +1627,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
-    if (key_value_seq_lengths is not None and not causal and sliding_window is None and mask is None
-            and bias is None and sinks is None and segment_ids is None and query.shape[-2] > key.shape[-2]
-            and query.shape[-2] % key.shape[-2] == 0):
+    if (key_value_seq_lengths is not None and query.shape[-3] == 1 and not causal
+            and sliding_window is None and mask is None and bias is None and sinks is None
+            and segment_ids is None and _groups(query, key)):
         return _grouped(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths),
@@ -1660,14 +1659,21 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
+def _groups(query, key) -> bool:
+    """Whether `query`'s heads come in groups over `key`'s heads that the mesh's tensor axes split
+    as they split the query heads (`tensor_shards`), each shard's groups its own."""
+    heads, kv_heads = query.shape[-2], key.shape[-2]
+    return heads > kv_heads and heads % kv_heads == 0 and kv_heads % tensor_shards(query) == 0
+
+
 def _grouped(attend, query, key, value):
     """`attend` over `query` `[B, T, N, D]` with each key head's `N // K` query heads as its query
     positions, `[B, T * N // K, K, D]` over the `K` key heads, and its output back in the query's
-    layout: where every position reads the same keys (key lengths alone end a row's), as a decode
-    step's grouped query does, a group's heads read their key head's keys in one pass. cuDNN
-    otherwise padded a lone query to two positions and ran each query head on its own, 4.7% slower
-    a layer at 64 rows for the same bits, and the decode kernel takes as many query heads as key
-    heads (`decode_attention.fits`)."""
+    layout: a decode step's lone query, whose heads read the same keys (key lengths alone end a
+    row's), reads its key head's keys once a group. cuDNN otherwise padded the lone query to two
+    positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
+    (docs/performance.md), and the decode kernel takes as many query heads as key heads
+    (`decode_attention.fits`)."""
     batch, positions, heads, width = query.shape
     kv_heads = key.shape[-2]
     group = heads // kv_heads
