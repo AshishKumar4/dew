@@ -169,8 +169,12 @@ def joined_pool(world: int, rank: int) -> float:
         os.environ.update({"DEW_PROCESS_COUNT": str(world), "DEW_PROCESS_ID": str(rank),
                            "JAX_COORDINATOR_ADDRESS": "rank0:8476",
                            "JAX_CPU_COLLECTIVES_IMPLEMENTATION": "gloo"})
+    import jax
+
     from dew.training.runtime import prepare_process
 
+    # The compile seconds reported apart are a cold compile's, which no cached executable stands in for.
+    jax.config.update("jax_enable_compilation_cache", val=False)
     prepare_process(multi_host=world > 1)
     return time.monotonic() - began
 
