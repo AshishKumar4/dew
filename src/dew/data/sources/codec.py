@@ -12,6 +12,7 @@ import math
 import struct
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import jax
@@ -85,18 +86,57 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
     return values
 
 
-def _tree(value: Value, leaves: dict[str, bytes], canonical: bool = False, opaque: bool = False) -> JSON:
+class _Stored(dict[str, bytes]):
+    """The leaves an encoded record stores by key: a bytes value, or an array's NPY file."""
+
+    opaque = False
+
+    def add(self, value: bytes | np.ndarray) -> str:
+        key = str(len(self))
+        if isinstance(value, bytes):
+            self[key] = value
+        else:
+            file = io.BytesIO()
+            np.save(file, value, allow_pickle=False)
+            self[key] = file.getvalue()
+        return key
+
+
+class _Hashed:
+    """The leaves a digest of content reads, each hashed as it is written and only its hash kept,
+    so a stream's digest holds no copy of what it reads and bounds no leaf's size
+    (`content_fingerprint` with `opaque`). An array is read in C order, its storage order no part of
+    its content; an object the codec has no schema for is read as the array it offers, else by its
+    type alone."""
+
+    opaque = True
+
+    def __init__(self) -> None:
+        self.hashes: list[bytes] = []
+
+    def add(self, value: bytes | np.ndarray) -> str:
+        leaf = hashlib.sha256()
+        if isinstance(value, bytes):
+            leaf.update(value)
+        else:
+            if value.flags.f_contiguous and not value.flags.c_contiguous:
+                value = value.copy(order="C")
+            # NumPy writes an array's elements in chunks to any object with a `write`.
+            np.save(SimpleNamespace(write=leaf.update), value, allow_pickle=False)
+        self.hashes.append(leaf.digest())
+        return str(len(self.hashes) - 1)
+
+
+def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> JSON:
     if isinstance(value, jax.Array):
         # A record a caller built with jax holds its values on a device; their host copy is the record.
         value = np.asarray(value)
+    if leaves.opaque and isinstance(value, complex):
+        value = np.complex128(value)
     if isinstance(value, np.generic):
-        key = str(len(leaves))
-        file = io.BytesIO()
         array = np.asarray(value)
         dtype = _dtype(array)
-        np.save(file, array.view(np.dtype(array.dtype.str)) if dtype else array, allow_pickle=False)
-        leaves[key] = file.getvalue()
-        return {"scalar": key, **dtype}
+        return {"scalar": leaves.add(array.view(np.dtype(array.dtype.str)) if dtype else array), **dtype}
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": value.hex()}
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -108,42 +148,42 @@ def _tree(value: Value, leaves: dict[str, bytes], canonical: bool = False, opaqu
         return {"timedelta": [value.days, value.seconds, value.microseconds]}
     if isinstance(value, Decimal):
         return {"decimal": str(value)}
-    if isinstance(value, (np.ndarray, bytes)):
-        key = str(len(leaves))
-        if isinstance(value, bytes):
-            leaves[key] = value
-            return {"bytes": key}
+    if isinstance(value, bytes):
+        return {"bytes": leaves.add(value)}
+    if isinstance(value, np.ndarray):
         if value.dtype.hasobject:
             return {"object_array": {"shape": list(value.shape),
-                                     "values": _tree(value.tolist(), leaves, canonical, opaque)}}
-        file = io.BytesIO()
+                                     "values": _tree(value.tolist(), leaves, canonical)}}
         dtype = _dtype(value)
-        np.save(file, value.view(np.dtype(value.dtype.str)) if dtype else value, allow_pickle=False)
-        leaves[key] = file.getvalue()
-        return {"array": key, **dtype}
+        return {"array": leaves.add(value.view(np.dtype(value.dtype.str)) if dtype else value), **dtype}
     if isinstance(value, Mapping):
-        if opaque and not all(isinstance(key, str) for key in value):
-            value = {repr(key): entry for key, entry in value.items()}
+        if leaves.opaque and not all(isinstance(key, str) for key in value):
+            # Keys of any type, each read as content beside its entry, so no two keys read alike.
+            items = sorted(value.items(), key=lambda item: repr(item[0])) if canonical else value.items()
+            return {"entries": [[_tree(key, leaves, canonical), _tree(entry, leaves, canonical)]
+                                for key, entry in items]}
         if not all(isinstance(key, str) for key in value):
             raise TypeError("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
-        return {"mapping": {key: _tree(value[key], leaves, canonical, opaque) for key in keys}}
+        return {"mapping": {key: _tree(value[key], leaves, canonical) for key in keys}}
     if isinstance(value, (list, tuple)):
         return {"tuple" if isinstance(value, tuple) else "list":
-                [_tree(entry, leaves, canonical, opaque) for entry in value]}
+                [_tree(entry, leaves, canonical) for entry in value]}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
-        if not cls.__module__.startswith("dew.") and not opaque:
+        if not cls.__module__.startswith("dew.") and not leaves.opaque:
             raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
         return {
             "dataclass": [cls.__module__, cls.__qualname__],
             "fields": {
-                field.name: _tree(getattr(value, field.name), leaves, canonical, opaque)
+                field.name: _tree(getattr(value, field.name), leaves, canonical)
                 for field in dataclasses.fields(value)
                 if field.init
             },
         }
-    if opaque:
+    if leaves.opaque:
+        if hasattr(type(value), "__array__"):
+            return _tree(np.asarray(value), leaves, canonical)
         # An object no schema reads, whose text may name its address: its type alone.
         return {"opaque": f"{type(value).__module__}.{type(value).__qualname__}"}
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
@@ -194,15 +234,15 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
     raise ValueError("unknown artifact record schema")
 
 
-def _encoded(value: Value, canonical: bool, opaque: bool) -> bytes:
-    leaves: dict[str, bytes] = {}
-    tree = _tree(value, leaves, canonical, opaque)
-    leaves["schema"] = json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
-    return pack_dict_of_byte_arrays(leaves)
+def _schema(tree: JSON) -> bytes:
+    return json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
 def encode(value: Value, *, canonical: bool = False) -> bytes:
-    return _encoded(value, canonical, opaque=False)
+    leaves = _Stored()
+    tree = _tree(value, leaves, canonical)
+    leaves["schema"] = _schema(tree)
+    return pack_dict_of_byte_arrays(leaves)
 
 
 def decode(value: bytes) -> Value:
@@ -211,10 +251,18 @@ def decode(value: bytes) -> Value:
 
 
 def content_fingerprint(value: Value, *, opaque: bool = False) -> bytes:
-    """SHA256 of content with every mapping ordered by key. `opaque` reads what the codec has no
-    schema for by its type alone and mapping keys by their repr, for a digest that guards a stream
-    rather than an artifact anyone decodes (`dew.data.dataset.Replayed`)."""
-    return hashlib.sha256(_encoded(value, canonical=True, opaque=opaque)).digest()
+    """SHA256 of content with every mapping ordered by key. `opaque` reads any object, a mapping's
+    keys of any type and an array in any storage order, hashing each leaf as it is read (`_Hashed`),
+    for a digest that guards a stream rather than an artifact anyone decodes
+    (`dew.data.dataset.Replayed`)."""
+    if not opaque:
+        return hashlib.sha256(encode(value, canonical=True)).digest()
+    leaves = _Hashed()
+    schema = _schema(_tree(value, leaves, canonical=True))
+    digest = hashlib.sha256(struct.pack("<Q", len(schema)) + schema)
+    for leaf in leaves.hashes:
+        digest.update(leaf)
+    return digest.digest()
 
 
 def fingerprint(values: Iterable[Value]) -> str:

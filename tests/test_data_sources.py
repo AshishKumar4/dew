@@ -119,7 +119,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     prepared = datasets.Dataset.from_dict(columns(0))
     builder = SimpleNamespace(
         cache_dir=str(tmp_path),
-        config=SimpleNamespace(data_files=None),
+        config=SimpleNamespace(data_files=None, version="0.0.0"),
+        config_id="default",
         info=SimpleNamespace(features=None, splits={"train": SimpleNamespace(num_examples=32)}),
         as_dataset=lambda **kwargs: prepared,
     )
@@ -1083,7 +1084,8 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 
     (tmp_path / "dataset_info.json").write_text("{}")
     prepared = datasets.Dataset.from_dict({"id": [4, 5, 6]})
-    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
+    builder = SimpleNamespace(cache_dir=str(tmp_path), config_id="default",
+                              config=SimpleNamespace(data_files=None, version="0.0.0"),
                               info=SimpleNamespace(features=None, splits=None),
                               as_dataset=lambda **kwargs: prepared)
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
@@ -1614,7 +1616,7 @@ def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeyp
     assert source.records("indexed")[1] == {"id": 1}
 
 
-def test_torch_source_refuses_streaming_and_cache_without_content_identity():
+def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identity():
     import torch
     from torch.utils.data import TensorDataset
 
@@ -1623,10 +1625,8 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
     from dew.data.sources import Torch
 
     rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
-    assert not rows.supports("streamed")
+    assert rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
-    with pytest.raises(ValueError):
-        rows.records("streamed")
     import grain.python as grain
 
     with pytest.raises(ValueError):
@@ -2376,4 +2376,17 @@ def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):
     rows = source.records("memory")
     assert sorted(int(rows[index]["id"]) for index in range(len(rows))) == [0, 1, 2, 3]
     assert Files(str(tmp_path / "first.feather")).kind == "arrow"
+
+
+def test_a_directory_named_for_its_format_declares_it_with_a_trailing_separator_too(tmp_path):
+    """A directory whose name carries a format's suffix declares that format, spelled with a
+    trailing separator or without: either spelling reads every file it holds."""
+    import pyarrow.parquet as pq
+
+    directory = tmp_path / "train.parquet"
+    directory.mkdir()
+    pq.write_table(pa.table({"id": [0, 1]}), directory / "part-0.parquet")
+    for url in (str(directory), f"{directory}/"):
+        rows = Files(url).records("memory")
+        assert [int(rows[index]["id"]) for index in range(len(rows))] == [0, 1]
 

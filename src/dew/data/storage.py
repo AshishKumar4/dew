@@ -536,7 +536,10 @@ class Store:
             async def read_s3() -> Versioned:
                 bucket, key, _ = fs.split_path(path)
                 client = await fs.set_session()
-                response = await client.get_object(Bucket=bucket, Key=key)
+                try:
+                    response = await client.get_object(Bucket=bucket, Key=key)
+                except client.exceptions.NoSuchKey as error:
+                    raise FileNotFoundError(self.url) from error
                 async with response["Body"] as body:
                     return Versioned(await body.read(), response["ETag"])
 
