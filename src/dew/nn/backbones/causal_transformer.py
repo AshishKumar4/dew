@@ -108,7 +108,7 @@ from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_gro
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
 _FINAL = "final_residual"
-"""The collection the forward sows the state its final norm reads into (`layer_state`)."""
+"""The collection the forward sows its stack's output into (`layer_state`)."""
 
 
 @logical_axes({
@@ -1658,9 +1658,9 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array:
         """Layer `index`'s output out of what the forward kept (`LayerStates`): the last layer's as
-        the stack returns it, which its final norm reads, and another's as `capture_layers` kept it,
-        the last call's, a looped layer's last pass. `index` counts as a Python index does, -1 the
-        last layer."""
+        the stack returns it, and another's as `capture_layers` kept it, the last call's, a looped
+        layer's last pass; a model that carries several residual copies (AltUp's) returns them all
+        at every layer. `index` counts as a Python index does, -1 the last layer."""
         if not -self.num_layers <= index < self.num_layers:
             raise ValueError(f"a {self.num_layers}-layer model has no layer {index}")
         layer = index % self.num_layers
@@ -1764,11 +1764,12 @@ class CausalTransformer(nn.Module):
             per_layer_input=ple,
             attention_metadata=attention_metadata,
         )
-        streams, x = self._collapse(residual)
         if not self.is_initializing() and self.is_mutable_collection(_FINAL):
-            # The state the final norm reads, as the stack returns it whatever runs it
-            # (`layer_state`); it costs nothing unless a caller opens the collection.
-            self.sow(_FINAL, 'states', x, reduce_fn=lambda _, value: value, init_fn=lambda: None)
+            # The last layer's output as the stack returns it whatever runs it (`layer_state`),
+            # before a model that carries several residual copies collapses them; it costs
+            # nothing unless a caller opens the collection.
+            self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
+        streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
