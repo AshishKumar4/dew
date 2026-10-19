@@ -1,7 +1,8 @@
 """Datasets for training and evaluation: a store, and the steps that read it.
 
-A store (`Files`, `Hub`, `TFDS`, `Memory`, or a Grain, Hugging Face or
-PyTorch dataset brought in) is a `Dataset`, and every verb returns a new
+A store (`Files`, `Hub`, `TFDS`, `Memory`, several of them in turn
+(`Concatenate`), or a Grain, Hugging Face or PyTorch dataset brought in) is a
+`Dataset`, and every verb returns a new
 one: `map`, `random_map`, `filter` and `flat_map` per record, `shuffle`,
 `repeat`, `pack` and `batch` across records, `mix` and `holdout` across
 datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
@@ -14,13 +15,26 @@ from .chat import Role
 from .dataset import Batch, Loading
 from .load import load
 from .pipeline import Dataset, Rejected, concat, mix
-from .sources import TFDS, Files, Hub, Memory, Source, Torch, from_grain, from_hf, from_iter, from_torch
+from .sources import (
+    TFDS,
+    Concatenate,
+    Files,
+    Hub,
+    Memory,
+    Source,
+    Torch,
+    from_grain,
+    from_hf,
+    from_iter,
+    from_torch,
+)
 from .text import ByteTokenizer, HFTokenizer
 
 __all__ = [
     "TFDS",
     "Batch",
     "ByteTokenizer",
+    "Concatenate",
     "Dataset",
     "Files",
     "HFTokenizer",

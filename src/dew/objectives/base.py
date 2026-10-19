@@ -1053,9 +1053,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         from dew.checkpoints import Checkpoints
 
-        variables = Checkpoints(directory).variables(
-            step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-            param_dtype=param_dtype, parameter_roots=parameter_roots)
+        with Checkpoints(directory) as checkpoints:
+            variables = checkpoints.variables(
+                step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
+                param_dtype=param_dtype, parameter_roots=parameter_roots)
         return cls._model_tree(variables)
 
     @classmethod

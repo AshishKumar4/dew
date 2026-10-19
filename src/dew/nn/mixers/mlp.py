@@ -69,7 +69,8 @@ class MLPMixer(MixerBase):
 
     residuals = ('gate_proj', 'up_proj', 'down_proj')
 
-    # Tokenwise, with no cache for a mixed call to misread.
+    # Tokenwise, with no cache for a mixed call to misread or a loop's pass to rewrite.
+    keeps_cache = False
     mixed_step = True
 
     intermediate_size: int
@@ -108,7 +109,7 @@ class MLPMixer(MixerBase):
 
         dense = functools.partial(
             GatedMLP, out_features=ctx.emb_features,
-            activation=self.activation, use_bias=self.use_bias, init_std=ctx.init_std,
+            activation=self.activation, use_bias=self.use_bias, ngpt=ctx.ngpt, init_std=ctx.init_std,
             output_init_std=ctx.output_init_std, dtype=ctx.dtype, precision=ctx.precision)
         if self.mixture is None:
             return functools.partial(dense, hidden_features=self.intermediate_size)
