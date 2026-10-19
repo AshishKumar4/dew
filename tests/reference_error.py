@@ -300,10 +300,15 @@ def _batch(draw, stage: int, rows: bool) -> tuple[dict, dict, list, list, dict]:
 
 def assert_leaves_as_exact_over_orders(draw, label: str, *, rows: bool = True) -> None:
     """The K-order gate over a comparison's rounding draws. `draw(order)` gives one draw `(dew,
-    reference, truth, terms)`: order 0 the case's own, every other an independent draw of its rounding
-    (an exact symmetry of the computation, tests/residual_orders.py, or another input), every order's
-    trees in order 0's layout (a permuted parameter's gradient permuted back) and `terms` None or
-    each leaf's float64 terms (`float64_terms`).
+    reference, truth, terms)`: order 0 the case's own, every other the same input under an exact
+    symmetry of the computation that reorders its sums (tests/residual_orders.py), every order's
+    trees in order 0's layout (a permuted output's cotangent permuted with it, a permuted
+    parameter's gradient permuted back) and `terms` None or each leaf's float64 terms
+    (`float64_terms`). Another input is another element, not another rounding of this one, so it
+    is no order. A sum no symmetry reorders (attention's over keys, where a kernel fixes their
+    order) rounds alike in every order: an element whose error it carries is held to that one
+    rounding, and where Dew stays past the factor at every stage that is a finding to diagnose (the
+    code, the reference arm or the orders), not chance.
 
     Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
     orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
@@ -652,7 +657,9 @@ elements and orders, K = ORDERS a side needs three stages for a familywise FALSE
 43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
 or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage
 count comes from calibrating the rule on held-out real order traces at the real element count, and
-until it has, the rule's false-failure rate on such shapes is unmeasured."""
+until it has, the rule's false-failure rate on such shapes is unmeasured. Nor is it calibrated
+where a sum's order no symmetry changes: that rounding is the same at every stage, so more stages
+do not redraw it, and an element it parts past the factor stays flagged."""
 
 
 def assert_elements_as_exact(batch, label: str) -> None:
