@@ -14,7 +14,7 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -288,37 +288,52 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     only when written, never back to the file.
     """
     filename = os.fspath(path)
+    package, _ = _safetensors()
+    # One open file answers for the header, its validation and the bytes: `_publish`
+    # replaces the pathname, so a reopened path can be another file. safe_open takes
+    # only a path, so it validates the open file through its descriptor's name, which
+    # every platform Dew installs on has (grain, a dependency, ships no Windows wheels).
+    with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
+        length = int.from_bytes(stream.read(8), "little")
+        metadata = reader.metadata() or {}
+        stored = [(name, reader.get_slice(name)) for name in reader.offset_keys()]
+        layout = [(name, tuple(view.get_shape()), view.get_dtype()) for name, view in stored]
+        mapping = np.memmap(stream, mode="c" if copy_on_write else "r", dtype=np.uint8)
     tensors: dict[str, np.ndarray] = {}
+    # safe_open has checked that the tensors tile the data in offset order, so
+    # each one starts where the one before it ends.
+    offset = 8 + length
+    for name, shape, tag in layout:
+        spec = stored_spec(name, shape, tag, filename)
+        tensors[name] = np.ndarray(spec.shape, dtype=spec.dtype, buffer=mapping, offset=offset)
+        offset += math.prod(spec.shape) * spec.dtype.itemsize
+    return dict(sorted(tensors.items())), metadata
+
+
+def stored_spec(name: str, shape: Sequence[int], tag: str, filename: str) -> jax.ShapeDtypeStruct:
+    """The array a stored tensor reads as, by its header's shape and dtype tag:
+    the tag's dtype, or for F4 its `PACKED_F4` byte view."""
+    if tag == PACKED_F4:
+        if not shape or shape[-1] % 2:
+            raise ValueError(
+                f"tensor {name!r} in {filename} is F4 with shape {tuple(shape)}; two "
+                "elements share a byte, so its last axis is even")
+        return jax.ShapeDtypeStruct((*shape[:-1], shape[-1] // 2), np.dtype(np.uint8))
+    try:
+        return jax.ShapeDtypeStruct(tuple(shape), _STORED_DTYPES[tag])
+    except KeyError as error:
+        raise ValueError(f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}") from error
+
+
+def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
+    """The arrays a safetensors file's tensors read as (`read_file`), from its header
+    alone; no tensor's bytes are read."""
+    filename = os.fspath(path)
     package, _ = _safetensors()
     with package.safe_open(filename, "np") as reader:
-        with open(filename, "rb") as stream:
-            length = int.from_bytes(stream.read(8), "little")
-            header = json.loads(stream.read(length))
-        mapping = np.memmap(filename, mode="c" if copy_on_write else "r", dtype=np.uint8)
-        metadata = reader.metadata() or {}
         names = reader.keys()
-        for name in names:
-            view = reader.get_slice(name)
-            shape = tuple(view.get_shape())
-            tag = view.get_dtype()
-            if tag == PACKED_F4:
-                if not shape or shape[-1] % 2:
-                    raise ValueError(
-                        f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
-                        "elements share a byte, so its last axis is even")
-                shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
-            else:
-                try:
-                    dtype = _STORED_DTYPES[tag]
-                except KeyError as error:
-                    raise ValueError(
-                        f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
-                    ) from error
-            # safe_open has validated the header's offsets, so they are read as stored.
-            tensors[name] = np.ndarray(
-                shape, dtype=dtype, buffer=mapping, offset=8 + length + header[name]["data_offsets"][0]
-            )
-    return tensors, metadata
+        views = [(name, reader.get_slice(name)) for name in names]
+        return {name: stored_spec(name, view.get_shape(), view.get_dtype(), filename) for name, view in views}
 
 
 class LazyTensors(Mapping[str, np.ndarray]):

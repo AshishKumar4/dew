@@ -147,3 +147,46 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
         else:
             assert wide.dtype == np.float64
             assert_as_exact_as_the_reference(np.asarray(got), want, wide, f"{family} conditioner alone")
+
+
+WIDER_FLUX = """
+import json, shutil, sys
+from pathlib import Path
+import torch
+from diffusers import FluxTransformer2DModel
+
+source, out = Path(sys.argv[1]), Path(sys.argv[2])
+shutil.copytree(source, out)
+for stale in (out / "transformer").glob("diffusion_pytorch_model*"):
+    stale.unlink()
+stated = json.loads((source / "transformer" / "config.json").read_text())
+config = {key: value for key, value in stated.items() if not key.startswith("_")}
+config.update(num_attention_heads=64, num_layers=4, num_single_layers=8)
+FluxTransformer2DModel(**config).to(torch.bfloat16).save_pretrained(out / "transformer")
+"""
+
+
+def test_a_sharded_pipeline_export_holds_a_few_shards_on_the_host(extracted, tmp_path):
+    """The tiny Flux pipeline with a 300 MB bfloat16 transformer, written by
+    Diffusers in one process, then loaded onto a mesh and saved in 25 MB
+    shards by a fresh one (tools/benchmark_streaming_export.py). Each
+    component's tensors are built as their shard is written, so RSS over the
+    save rises by four shards at most (measured 0.07-0.08 GB); building the
+    whole export first rose 0.33 GB."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src")}
+    written = subprocess.run([sys.executable, "-c", WIDER_FLUX, str(extracted["flux"]),
+                              str(tmp_path / "source")], capture_output=True, text=True, env=env)
+    assert written.returncode == 0, written.stderr[-2000:]
+    run = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_streaming_export.py"),
+                          str(tmp_path / "source"), "25MB", str(tmp_path / "out")],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    measured = json.loads(run.stdout.splitlines()[-1])
+    assert measured["shards"] > 8
+    assert measured["rise_gb"] < 4 * 25e6 / 2**30, measured

@@ -445,9 +445,14 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
     one inside the map needs the check off, as MaxText wraps splash. Every
     operand is split on the axes the specs name and nothing is reduced over
     another, so the check has nothing to catch.
+
+    Off a mesh, and inside a map that already holds every axis manual (the
+    sequence exchanges), the arrays are local already, and this is `local`.
     """
     mesh = jax.sharding.get_abstract_mesh()
     manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
+    if not manual:
+        return local
     return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
                          check_vma=False)
 

@@ -40,7 +40,7 @@ from dew.data.pipeline import (
     Windows,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source
+from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountTargets, ValidTargets
 from dew.records import JSON, integer, json_value, record
@@ -85,7 +85,11 @@ class _Memory:
         return self.held
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.original.metadata(), **self.facts, "rows": len(self.held), "accepted": len(self.held)}
+        """Its source's facts, the counts only where it ran no stage over the source's rows, then
+        the counts it measured."""
+        stated = self.original.metadata()
+        return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
+                "accepted": len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured
@@ -279,6 +283,21 @@ def _targeted(
     return kept, {"valid_targets": total}
 
 
+def _measured_targets(child: Pipeline, mixture: Mixture) -> Pipeline:
+    """A corpus a mixture weighs by tokens (`Mixture.tokens`), its valid targets measured where the
+    memory read ran steps over its source's rows, whose stated counts then describe other rows
+    (`_Memory.metadata`): the read holds every row the mixture reads, so it counts their targets
+    by the mixture's own rule, and the mixture weighs the corpus by them as by a source's stated
+    counts."""
+    source = child.source
+    if (mixture.tokens is None or not isinstance(source, _Memory) or "valid_targets" in source.metadata()
+            or any(isinstance(value, bytes) for value in source.held)):
+        return child
+    counted = sum(mixture.tokens(record(value, "mixed row")) for value in source.held)
+    return dataclasses.replace(child, source=dataclasses.replace(source, facts={**source.facts,
+                                                                              "valid_targets": counted}))
+
+
 def _memory_mixture(
     pipeline: Pipeline,
     mixture: Mixture,
@@ -286,7 +305,8 @@ def _memory_mixture(
     *,
     training: bool,
 ) -> Pipeline:
-    children = tuple(_materialize(child, counts, training=training) for child in mixture.pipelines)
+    children = tuple(_measured_targets(_materialize(child, counts, training=training), mixture)
+                     for child in mixture.pipelines)
     kept = tuple(
         (child, weight)
         for child, weight in zip(children, mixture.weights, strict=True)
@@ -301,9 +321,6 @@ def _memory_mixture(
         raise ValueError(
             f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets"
         )
-    if len(kept) == 1:
-        child = kept[0][0]
-        return dataclasses.replace(child, stages=(*child.stages, *pipeline.stages))
     children, weights = zip(*kept, strict=True)
     return dataclasses.replace(
         pipeline, source=dataclasses.replace(mixture, pipelines=tuple(children), weights=tuple(weights))

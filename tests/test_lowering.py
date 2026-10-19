@@ -213,6 +213,33 @@ def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_choo
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
 
 
+def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
+    """On a TPU mesh splitting its rows, a Mamba-2 layer's Pallas scan lowers to Mosaic on each shard
+    (`manual_map`), as Mosaic needs: lowered for an assumed TPU v5p on an abstract two-device mesh,
+    forward and backward, each scan's custom call holds one row of the two, at the layer's widths."""
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    from dew.nn.mixers.mamba2 import Mamba2
+
+    layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
+                   dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("tpu",))
+    calls = [line for line in lowered.as_text().splitlines()
+             if "tpu_custom_call" in line and "stablehlo.custom_call" in line]
+    assert len(calls) == 2, calls
+    for call in calls:
+        assert "tensor<1x128x4x64xf32>" in call or "tensor<1x4x128x64xf32>" in call, call
+
+
 def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
     with assumed("sm80"):
         measured = measured_kernel("attention", "xla")

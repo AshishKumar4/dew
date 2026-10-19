@@ -34,6 +34,8 @@ nothing in this file knows what a model, an objective or a trainer is.
 """
 
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 
@@ -64,7 +66,8 @@ def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
     return jnp.sum(kept * weights, axis=axis) / (jnp.sum(weights, axis=axis) + MEAN_EPS)
 
 
-def masked_whiten(x: jax.Array, mask: jax.Array) -> jax.Array:
+def masked_whiten(x: jax.Array, mask: jax.Array,
+                  total: Callable[[jax.Array], jax.Array] = lambda moments: moments) -> jax.Array:
     """Return `x` centred on its masked mean and scaled by its unbiased masked deviation.
 
     Tunix and verl both whiten GAE advantages this way, Bessel correction
@@ -72,11 +75,18 @@ def masked_whiten(x: jax.Array, mask: jax.Array) -> jax.Array:
     for the loss to mask again. With only one unmasked position the
     correction divides by zero. verl raises an error there; this function
     runs under jit and cannot.
+
+    `total` sums the moments over every share of the data the whitening
+    reads, a pool's processes for PPO's rollout; by default `x` is all of it.
+    The moments are centred, the mean first and then the squared deviations
+    from it, so a shift of every value moves no whitened one.
     """
-    mean = masked_mean(x, mask)
-    variance = masked_mean(jnp.square(x - mean), mask)
-    kept = jnp.sum(mask.astype(x.dtype))
-    return (x - mean) * jax.lax.rsqrt(variance * (kept / (kept - 1)) + WHITEN_EPS)
+    weights = mask.astype(x.dtype)
+    count, kept = total(jnp.stack([jnp.sum(weights), jnp.sum(jnp.where(weights != 0, x, 0) * weights)]))
+    mean = kept / (count + MEAN_EPS)
+    deviations = jnp.where(weights != 0, x - mean, 0)
+    variance = total(jnp.sum(jnp.square(deviations) * weights)) / (count + MEAN_EPS)
+    return (x - mean) * jax.lax.rsqrt(variance * (count / (count - 1)) + WHITEN_EPS)
 
 
 def _grouped(rewards: jax.Array, group: int) -> jax.Array:

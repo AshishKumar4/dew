@@ -28,9 +28,10 @@ from flax import linen as nn
 from dew.coordination import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
+from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
+from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import metrics
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -100,7 +101,8 @@ class FlowGRPOObjective(DiffusionObjective):
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
                  steps: int = 41, variables: Variables | None = None, reward: str = "clip_score",
-                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None):
+                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None,
+                 grid: SourceGrid | None | Omitted = OMITTED):
         if ":" not in reward and reward not in metrics:
             raise ValueError(f"reward names {reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
@@ -116,7 +118,7 @@ class FlowGRPOObjective(DiffusionObjective):
             raise ValueError("variables must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
-                         guidance=guidance, steps=steps, variables=variables)
+                         guidance=guidance, steps=steps, variables=variables, grid=grid)
         sde.validate(self.process, self.process.times(rollout_steps))
         if beta == 0:
             self.ema = None
@@ -146,17 +148,20 @@ class FlowGRPOObjective(DiffusionObjective):
         return FlowRollout(self, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
 
-    def _check_validation_loss(self) -> None:
-        raise ValueError(
-            "Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
-            "with an explicit Best, or pass no validation data")
+    @property
+    def validation_loss_refusal(self) -> str | None:
+        return ("Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
+                "with an explicit Best, or pass no validation data")
 
     def _walk(self, params: Variables, batch: Batch) -> Walk:
         """The walk of the denoiser this batch's conditions select, guided as
         the rollout's walk was: over its `rollout_steps` points, a
         transition's column being its step's index."""
         given = self.encoded_conditions(params, batch)
-        denoise = self.denoiser(params, given, self.blank_conditions(params, given))
+        # An inpainting model's masked-image inputs, as the rollout encoded them (`FlowRollout`).
+        spatial = batch.get("spatial", {})
+        denoise = self.denoiser(params, {**given, **spatial},
+                                {**self.blank_conditions(params, given), **spatial})
         points = jnp.asarray(batch["rollout_steps"], jnp.int32)
         return Walk.over(denoise, self.guidance, points[0] - 1)
 
@@ -313,7 +318,7 @@ class FlowRollout:
             raise ValueError("train_steps must select between one and steps-1 transitions")
         if self.objective.sde.noise_level == 0:
             raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
-        reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps",
+        reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps", "spatial",
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
             raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
@@ -321,11 +326,14 @@ class FlowRollout:
 
 
     def _generate_impl(self, params: Variables, batch: Batch,
-                       key: jax.Array) -> tuple[FlowTrajectory, jax.Array]:
-        """Sample one SDE trajectory per row and decode its final samples."""
+                       key: jax.Array) -> tuple[FlowTrajectory, jax.Array, dict[str, jax.Array]]:
+        """Sample one SDE trajectory per row, decode its final samples, and return the masked-image
+        inputs an inpainting model read, which its rescoring reads again."""
         objective = self.objective
         given = objective.encoded_conditions(params, batch)
-        denoise = objective.denoiser(params, given, objective.blank_conditions(params, given))
+        spatial = objective._spatial(params, batch, key)
+        denoise = objective.denoiser(params, {**given, **spatial},
+                                     {**objective.blank_conditions(params, given), **spatial})
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
@@ -334,7 +342,7 @@ class FlowRollout:
         samples = trajectory.samples
         if objective.autoencoder is not None:
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
-        return trajectory, jnp.clip(samples, -1, 1)
+        return trajectory, jnp.clip(samples, -1, 1), spatial
 
     def _owned_rows(self, source: jax.Array) -> slice | np.ndarray:
         """Select the expanded rows this process owns.
@@ -379,8 +387,8 @@ class FlowRollout:
 
         return jax.tree.map(repeat, batch), owned, count
 
-    def _transitions(self, trajectory: FlowTrajectory, context: Batch, rewards: np.ndarray,
-                     owned: slice | np.ndarray) -> Batch:
+    def _transitions(self, trajectory: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
+                     rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
         """Cut the trajectory into this rank's training rows.
 
         Rewards are centred within their prompt's group, only the first
@@ -413,6 +421,8 @@ class FlowRollout:
             ADVANTAGES_KEY: local_advantages,
             REWARDS_KEY: rewards[owned],
         })
+        if spatial:
+            prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
         return prepared
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
@@ -428,7 +438,7 @@ class FlowRollout:
         # The objective owns the program; the rollout fixes only its count of time points.
         generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
-        (trajectory, images), context = collective_host(
+        (trajectory, images, spatial), context = collective_host(
             (generated, expanded), phase="flow rollout")
 
         def score() -> np.ndarray | None:
@@ -442,7 +452,8 @@ class FlowRollout:
         rewards = agreed("flow rollout reward", score)
         rewards = np.asarray(broadcast_from_process_zero(
             None if rewards is None else rewards.tolist()), np.float64)
-        return agreed("flow rollout batching", lambda: self._transitions(trajectory, context, rewards, owned))
+        return agreed("flow rollout batching",
+                      lambda: self._transitions(trajectory, context, spatial, rewards, owned))
 
 
 __all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout"]

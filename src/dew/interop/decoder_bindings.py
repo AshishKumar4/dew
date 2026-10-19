@@ -16,6 +16,7 @@ import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew.interop import decoder_parts, hf_decoders as decoders
@@ -90,9 +91,10 @@ def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.Deco
     if path[-1] == "kernel" and tensor.ndim == 2:
         lead = _leading_axes(variables, path, expert_index)
         transpose = (*range(lead), lead + 1, lead)
-    # A floating weight is written in its leaf's dtype; an index table
-    # carries the width the checkpoint stored it in back.
-    stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
+    # A floating weight is written in its leaf's dtype, bfloat16 and FP8
+    # included (`weights.checkpoint_dtype`'s test); an index table carries
+    # the width the checkpoint stored it in back.
+    stored = None if jnp.issubdtype(tensor.dtype, jnp.floating) else tensor.dtype
     padded = tensor.shape[0] if part.name.endswith(family.zero_padded) else None
     return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 

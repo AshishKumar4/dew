@@ -464,7 +464,9 @@ def validate_source_aliases(names: Collection[str], read: Callable[[str], np.nda
         tied = _text_aliases(text, lambda name: read(text[name]), record["text"])
         return aliases + tuple((text[a], text[b]) for a, b in tied)
     record = translate_config(config)
-    family = _family_for_config(record)
+    # translate_config refused every model_type but a registered family's name, which
+    # spells the tensors: Kimi K2.5 computes DeepSeek V3 under `language_model.` names.
+    family = families()[records.text(config.get("model_type"), "model_type")]
     return _text_aliases(names, read, record, _tied_names(family, record, names))
 
 
@@ -818,7 +820,7 @@ def export_config(model) -> Mapping[str, object]:
         'head_dim': model.features_per_head,
         'intermediate_size': model.hidden_features,
         'vocab_size': model.vocab_size,
-        'max_position_embeddings': model.max_seq_len,
+        'max_position_embeddings': _RESOLVED['context_length'](model),
         'rms_norm_eps': model.norm_eps,
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
@@ -923,6 +925,7 @@ _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
         model.position_embedding_size or model.max_seq_len if model.position_embedding == "learned" else None
     ),
     "loop": lambda model: model.loop and dataclasses.replace(model.loop, backprop_steps=None),
+    "context_length": lambda model: model.context_length or model.max_seq_len,
 }
 """Fields whose None stands for a value the forward derives, spelled out, and
 the loop without `backprop_steps`, which says how it trains."""

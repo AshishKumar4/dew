@@ -435,7 +435,7 @@ tokenizer = HFTokenizer("gpt2")
 data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory", loading=Loading(workers=0), validation_records=(4) * (32))
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
                           num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
-objective = LMObjective(model, seq_len=256)
+objective = LMObjective(model, seq_len=256, ema_decay=0.999)
 lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
     data, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("Once upon a time")],
@@ -450,7 +450,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-To pack whole documents into the windows instead, set `Text(pack="first-fit")`. It adds segment IDs and positions, and splits the stream at the producer-recorded EOS boundaries. `Chat` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+To pack whole documents into the windows instead, set `TextData(pack="first-fit")`. It adds segment IDs and positions, and splits the stream at the producer-recorded EOS boundaries. `Chat` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -588,7 +588,7 @@ from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = loader(TextData(source="data/tinystories", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
+masked_data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(
@@ -1444,7 +1444,13 @@ The [recipe guide](https://github.com/AshishKumar4/dew/blob/main/docs/recipes.md
 curl -LsSf https://dewml.dev/install.sh | sh
 ```
 
-The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there. Dew requires Python 3.12 or later; I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
+The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there.
+
+<!-- BEGIN least Python (site/scripts/gen_install.py) -->
+Dew needs Python 3.12 or newer.
+<!-- END least Python -->
+
+I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
 
 | Hardware | uv | pip |
 |---|---|---|
@@ -1467,7 +1473,7 @@ uv pip install -e ".[cuda12]"
 
 To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#process-pools-across-gpus) explains how to install it.
 
-The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `mutation`, `plots`, `profile`, `quantization`, `serve`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision`, `wan` and `wandb`. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
+`pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 

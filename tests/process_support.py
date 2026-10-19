@@ -20,6 +20,31 @@ WORKER = Path(__file__).with_name("multiprocess_worker.py")
 DEVICES = 8
 
 
+READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
+"""The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
+
+REPEATABLE = "--xla_gpu_deterministic_ops=true"
+"""The flag under which a process keeps no picks, so its kernels repeat from run to run."""
+
+
+def keeping_picks() -> str:
+    """This process's XLA flags without `REPEATABLE`, which the cuda lane sets: a process
+    keeps and measures picks only without it (`dew.cache.keeps_picks`)."""
+    return " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                    if not flag.startswith(REPEATABLE.split("=")[0]))
+
+
+def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src"):
+    """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
+    checkout's) and these tests, compiling into `cache_dir` under XLA `flags`."""
+    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
+                   "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests")))}
+    run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr[-3000:]
+    return json.loads(run.stdout.splitlines()[-1])
+
+
 def prepare_worker(args, *, multi_host: bool | None = False) -> None:
     """Join a test pool through the same Open MPI detection as a launched run."""
     if args.coordinator:

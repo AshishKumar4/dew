@@ -1,4 +1,4 @@
-"""Focused native-image repair oracles: Diffusers 0.34.0 / Transformers 4.49.0.
+"""Focused native-image repair oracles under the diffusers-pipelines cohort (tools/reference_releases.py).
 
 Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py generate OUTPUT
@@ -12,14 +12,14 @@ from pathlib import Path
 import diffusers
 import numpy as np
 import torch
-import transformers
 from diffusers import DDIMScheduler, PNDMScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler
 from diffusers import DiffusionPipeline, UNet2DConditionModel
 
+from reference_releases import require
+
 
 def check_versions():
-    if (diffusers.__version__, transformers.__version__) != ("0.34.0", "4.49.0"):
-        raise RuntimeError("Use the pinned isolated reference environment")
+    require("diffusers-pipelines")
     torch.set_num_threads(2)
 
 

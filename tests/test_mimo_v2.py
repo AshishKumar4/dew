@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pytest
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
@@ -68,6 +69,26 @@ def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_pat
     assert sorted(written) == sorted(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+@pytest.mark.parametrize('stated', ['absent', 'null'])
+def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_path, stated):
+    """The author's `sliding_window_size` sizes the sliding layers' window
+    where `sliding_window` is absent or null: the same model, its logits bit
+    for bit, and the config written back as it was published."""
+    config = json.loads((TINY / 'config.json').read_text())
+    config.pop('sliding_window')
+    if stated == 'null':
+        config['sliding_window'] = None
+    source = tmp_path / 'size'
+    shutil.copytree(TINY, source)
+    (source / 'config.json').write_text(json.dumps(config))
+    expected, reference = logits(TINY)
+    loaded, actual = logits(source)
+    assert loaded.model == expected.model
+    np.testing.assert_array_equal(actual, reference)
+    loaded.save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text()) == config
 
 
 def test_the_towers_and_prediction_layers_ride_along_unread(tmp_path):

@@ -72,13 +72,15 @@ def main(options: Options) -> None:
                       instructions="Which banking request is this?",
                       validation=HoldOut(fraction=0.1, by="random", most=400))
     training, held, _ = table.pipelines()
-    train = [Example.of(row["example"]) for row in iterate(training, read="memory")]
-    held_out = [] if held is None else [Example.of(row["example"]) for row in iterate(held, read="memory")]
+    # Each Hub split is downloaded and prepared the first time it is read.
+    train = [Example.of(row["example"]) for row in iterate(training, read="memory", provision=True)]
+    held_out = [] if held is None else [
+        Example.of(row["example"]) for row in iterate(held, read="memory", provision=True)]
     # The test split asks the same 77 options, in the training split's order.
     intents = train[0].questions["intent"].options
     test_pipeline, _, _ = replace(table, source=Hub(BANKING77[0], revision=BANKING77[1], split="test"),
                                   validation=None, options=tuple(intents)).pipelines()
-    test = [Example.of(row["example"]) for row in iterate(test_pipeline, read="memory")]
+    test = [Example.of(row["example"]) for row in iterate(test_pipeline, read="memory", provision=True)]
 
     if options.backbone == "laya":
         laya = Decide.from_pretrained(LAYA[0], revision=LAYA[1], dtype="bfloat16")

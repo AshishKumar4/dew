@@ -17,15 +17,16 @@
 #   --pip           use pip instead of uv
 #
 # The CUDA build follows the driver and every GPU's SM, using the generated minima below
-# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python 3.12 or newer.
+# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python python_min or newer.
 set -eu
 
-# BEGIN CUDA minima (site/scripts/gen_install.py)
+# BEGIN install facts (site/scripts/gen_install.py)
+python_min=3.12
 cuda13_driver=580
 cuda13_sm=7.5
 cuda12_driver=525
 cuda12_sm=5.2
-# END CUDA minima
+# END install facts
 
 if [ -t 1 ]; then
 	bold=$(printf '\033[1m') dim=$(printf '\033[2m') green=$(printf '\033[32m')
@@ -159,24 +160,24 @@ if [ -n "$conda_name" ]; then
 	# shellcheck disable=SC2016 # the environment's prefix, as conda run sets it inside
 	prefix() { conda run -n "$conda_name" sh -c 'printf %s "$CONDA_PREFIX"' 2>/dev/null; }
 	where=$(prefix) || {
-		conda create -y -q -n "$conda_name" 'python>=3.12' >/dev/null || die "conda could not create the environment $conda_name"
+		conda create -y -q -n "$conda_name" "python>=$python_min" >/dev/null || die "conda could not create the environment $conda_name"
 		where=$(prefix) || die "conda made $conda_name but cannot run in it"
 	}
 	# The environment's own Python: never one conda run finds on PATH outside it.
-	[ -x "$where/bin/python" ] || conda install -y -q -n "$conda_name" 'python>=3.12' >/dev/null ||
+	[ -x "$where/bin/python" ] || conda install -y -q -n "$conda_name" "python>=$python_min" >/dev/null ||
 		die "the conda environment $conda_name has no Python, and conda could not add one"
 	python=$where/bin/python activate="conda activate $(quote "$conda_name")"
 else
 	if [ ! -x "$target/bin/python" ]; then
-		if [ -z "$use_pip" ]; then uv venv -q --python '>=3.12' "$target" || die "uv could not create $target"
+		if [ -z "$use_pip" ]; then uv venv -q --python ">=$python_min" "$target" || die "uv could not create $target"
 		else python3 -m venv "$target" || die "python3 could not create $target"
 		fi
 	fi
 	python=$target/bin/python activate=". $(quote "$target/bin/activate")"
 	if [ "$target" = "${CONDA_PREFIX:-}" ]; then activate="conda activate $(quote "${CONDA_DEFAULT_ENV:-$CONDA_PREFIX}")"; fi
 fi
-"$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' || die "$python is Python \
-$("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs 3.12 or newer, so choose a new .venv or upgrade it"
+"$python" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$python_min'.split('.'))))" || die "$python is Python \
+$("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs $python_min or newer, so choose a new .venv or upgrade it"
 
 # pip, for --pip, in an environment uv made without it.
 if [ -n "$use_pip" ] && ! "$python" -m pip --version >/dev/null 2>&1; then

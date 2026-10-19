@@ -36,7 +36,7 @@ from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Lo
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.objectives.base import VALID_ROWS, Aux, Objective
+from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -712,16 +712,25 @@ def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
         len(step) for step in ramp)]
 
 
-def test_a_ramped_stream_resumes_on_the_records_it_had_not_read():
+def batch_shuffled_data(records: int, batch: int) -> Loader:
+    """A dataset whose records say which they are, batched in order and its batches shuffled after
+    the batch, so a record count inside a batch names rows of a batch the order moved."""
+    return compile(Pipeline(Memory(Indexed(1, records))).repeat().batch(batch).shuffle(7, window=3),
+                   seed=0, loading=READ)
+
+
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_stream_resumes_on_the_records_it_had_not_read(data):
     """The rolling buffer holds records the run has not trained on, so they
-    are not in the position: a resume reads them, and reads them once."""
+    are not in the position: a resume reads them, and reads them once, in
+    the batches the order put them in, a shuffle after the batch's too."""
     schedule = Ramp(start=2, increment=1, samples=6)
-    stream = ramped(indexed_data(64, 4), schedule).train(DataPartition())
+    stream = ramped(data(64, 4), schedule).train(DataPartition())
     taken(stream, 4)
     state = stream.get_state()
     rest = taken(stream, 6)
 
-    resumed = ramped(indexed_data(64, 4), schedule).train(DataPartition())
+    resumed = ramped(data(64, 4), schedule).train(DataPartition())
     resumed.set_state(state)
 
     assert json.loads(state)["dew_global_position"]["records"] == 11
@@ -743,23 +752,40 @@ def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer():
     assert taken(stream, 6) == rest
 
 
-def test_a_ramped_steps_position_counts_every_process():
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_steps_position_counts_every_process(data):
     """Each process cuts its own share of a stage's batch, and the position
-    is the records all of them handed over: two processes four steps into
-    a ramp of two, then four, have read eight records, and the pool's steps
-    are the single process's steps with the shares interleaved."""
+    is the records all of them handed over: two processes three and four
+    steps into a ramp of two, then four, have read six and eight records,
+    and the pool's steps are the single process's steps with the shares
+    interleaved, resumed inside a batch or after one."""
     schedule = Ramp(start=2, increment=2, samples=8)
 
-    build = ramped(indexed_data(64, 4), schedule).train
+    build = ramped(data(64, 4), schedule).train
 
     whole = pooled(build, 1, 6)
-    stopped = build(DataPartition(1, 2))
-    taken(stopped, 4)
-
     assert [len(step) for step in whole] == [2, 2, 2, 2, 4, 4]
-    assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 8
     assert pooled(build, 2, 6) == whole
-    assert pooled(build, 2, 2, stopped.get_state()) == whole[4:]
+    for steps in (3, 4):
+        stopped = build(DataPartition(1, 2))
+        taken(stopped, steps)
+        assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 2 * steps
+        assert pooled(build, 2, 6 - steps, stopped.get_state()) == whole[steps:]
+
+
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_run_resumed_by_more_processes_inside_a_batch_reads_on_in_order(data):
+    """One process stops a ramp of two, then four, after its first step, two records into a batch
+    of four. Four processes resume it in the four-record stage: the records after the count go to
+    them in turn from the first on, so each takes the place the count leaves it, and the pool's
+    steps are the one process's."""
+    build = ramped(data(64, 4), Ramp(start=2, increment=2, samples=2)).train
+    whole = pooled(build, 1, 5)
+    stopped = build(DataPartition())
+    taken(stopped, 1)
+    assert [len(step) for step in whole] == [2, 4, 4, 4, 4]
+    assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 2
+    assert pooled(build, 4, 4, stopped.get_state()) == whole[1:]
 
 
 def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
@@ -846,13 +872,45 @@ class Regression(Objective):
     def fresh_variables(self, key, held):
         return self.model.init(key, np.zeros((1, FEATURES), np.float32))
 
-    def loss(self, variables, batch, step):
+    def errors(self, variables, batch):
+        """Each record's mean squared error."""
         import jax.numpy as jnp
 
         features = jnp.stack([jnp.sin(batch["id"].astype(jnp.float32) * (index + 1))
                               for index in range(FEATURES)], axis=-1)
         target = jnp.stack([features[:, 0] * 2, features[:, 1] - 1], axis=-1)
-        return jnp.mean((self.model.apply(variables, features) - target) ** 2), Aux({})
+        return jnp.mean((self.model.apply(variables, features) - target) ** 2, axis=-1)
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        return jnp.mean(self.errors(variables, batch)), Aux({})
+
+
+class Composite(Regression):
+    """`Regression` whose statistics are a pair it reduces itself, which an accumulation window keeps
+    by replaying the window's batches."""
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        errors = self.errors(variables, batch)
+        return (jnp.sum(errors), jnp.asarray(errors.shape[0], errors.dtype)), Aux({})
+
+    def reduce_loss(self, stats):
+        total, count = stats
+        return total / count, count > 0
+
+
+class Pooled(Regression):
+    """`Regression` as its records' summed error and their count, which an accumulation window pools by
+    the records each batch read."""
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        errors = self.errors(variables, batch)
+        return Ratio(jnp.sum(errors), jnp.asarray(errors.shape[0], errors.dtype)), Aux({})
 
 
 def regression_trainer(directory: Path) -> Trainer:
@@ -934,14 +992,49 @@ def test_a_ramped_run_killed_mid_ramp_lands_where_the_run_nobody_stopped_lands(t
                 "the resumed ramp did not land on the uninterrupted run")
 
 
-def test_a_ramp_and_an_accumulation_window_are_refused_together():
-    trainer = Trainer(
-        Regression(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
-        layout=Layout(min_shard=1, tolerance=1.0))
+def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp_path):
+    """An accumulation window pools a ramp's batches as it pools any, across a stage's change too: its
+    update is the one a batch of all its records takes, their errors' mean. Three steps of eight and
+    then sixteen, two to a window, land where a batch of sixteen and then one of twenty-four, the
+    same records in the same order, land."""
+    records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
+    ramp = Ramp(start=8, increment=8, samples=24)
+    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout).fit(
+        ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
 
+    def whole(stage: int, batch: int):
+        trainer = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout,
+                          checkpoints=Checkpoints(str(tmp_path / "stitched"), keep=8))
+        return trainer.fit(stitched_data(records, batch, seed), steps=stage + 1, log_every=100,
+                           checkpoint_every=None)
+
+    stitched = [whole(stage, batch) for stage, batch in enumerate([16, 24])][-1]
+
+    assert int(state.step) == 4
+    assert int(state.updates) == int(stitched.updates) == 2
+    pooled, batched = parameters(state), parameters(stitched)
+    assert set(pooled) == set(batched)
+    for name, value in batched.items():
+        np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
+
+
+def test_a_ramp_is_refused_with_a_window_that_replays_its_batches(tmp_path):
+    """A loss of composite statistics replays its window's batches, whose shape a ramp changes at each
+    stage: a ramp with such a window is refused before the run trains, whether the run starts there
+    or resumes a checkpoint whose saved window holds the batches of a fixed-batch run."""
+    layout, ramp = Layout(min_shard=1, tolerance=1.0), Ramp(start=8, increment=8, samples=16)
+
+    def trainer(checkpoints: Checkpoints | None = None) -> Trainer:
+        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout,
+                       checkpoints=checkpoints)
+
+    saved = Checkpoints(str(tmp_path / "run"), keep=8)
+    assert int(trainer(saved).fit(indexed_data(256, 16), steps=2, log_every=100).updates) == 1
     with pytest.raises(ValueError):
-        trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=16)),
-                    steps=2, log_every=100)
+        trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
+            ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+    with pytest.raises(ValueError):
+        trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
 
 
 @pytest.mark.mesh
