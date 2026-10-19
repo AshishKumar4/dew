@@ -412,6 +412,35 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
         assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
 
 
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("output", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 1, 16, 128)])
+def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_float64_gate(activation, output,
+                                                                                           shape):
+    """A decode step's gated norm (Qwen3-Next's, Kimi's): the recurrence's fp32 output gated by its bf16
+    projection, the gate read in fp32 as XLA widens it, cast once to `output`; its output and its input,
+    gate and weight gradients, each in its operand's dtype, within the float64 gate of XLA's."""
+    x, gate, dy = (jax.random.normal(jax.random.key(index), shape) for index in (61, 62, 63))
+    gate, dy = gate.astype(jnp.bfloat16), dy.astype(output)
+    scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(64), shape[-1:])
+    operands = (x, gate, scale)
+
+    def gated(implementation, dtype):
+        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, dtype, activation,
+                                                           implementation=implementation)
+
+    fused = gated("pallas", output)
+    assert "rms_norm_forward" in kernels(fused, *operands)
+    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
+    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
+    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
+    truth, terms = float64(gated("xla", jnp.float64), operands, dy)
+    for label, mine, theirs, want, summed in zip(("y", "x", "gate", "scale"), actual, reference, truth, terms,
+                                                 strict=True):
+        assert mine.dtype == theirs.dtype, label
+        assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+
+
 def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():
     """Traced for an A100, whose row names the fused RMSNorm, the gated norm of a decode step (Qwen3-Next's,
     Kimi's): an fp32 recurrence output gated by its bf16 projection reports the kernel, not a refusal."""
