@@ -166,6 +166,11 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
     return key_heads
 
 
+OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_decay', 'gate', 'beta', 'log_a',
+            'bias', 'skip', 'z', 'weight')
+"""`StepLaunch`'s array operands after `active`, in its order."""
+
+
 def _names(hooks: Hooks) -> tuple[str, ...]:
     """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
     streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
@@ -389,13 +394,13 @@ class _ConvRefs:
 
 @dataclasses.dataclass(frozen=True)
 class Launch:
-    """A decode launch's program: `block` value columns of a head's state (None for all of them, which a
+    """A decode launch's program: `block` value columns of a head's state (0 for all of them, which a
     conv or the epilogue's norm needs, each reading a whole head) and its warps."""
-    block: int | None
+    block: int
     warps: int
 
 
-WARPS = Launch(None, 8)
+WARPS = Launch(0, 8)
 """The launch without a measurement over a whole head."""
 COLUMNS = Launch(32, 8)
 """The launch without a measurement over value columns: 32 a program, 16 to 64 measured within 3% on
@@ -411,9 +416,12 @@ class StepLaunch(tuning.KernelOp):
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
                                        'gate', 'beta', 'z', 'state')
 
-    def _fwd(self, active, state, query=None, key=None, value=None, token=None, held=None, taps=None,
-             log_decay=None, gate=None, beta=None, log_a=None, bias=None, skip=None, z=None, weight=None, *,
-             hooks: Hooks, dtype: str, interpret: bool, config: Launch, return_residuals: bool = False):
+    def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
+             value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
+             log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
+             log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
+             weight: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
@@ -425,7 +433,7 @@ class StepLaunch(tuning.KernelOp):
                      if hooks.conv is not None else given['query'].shape[1])
 
         # A hook that reads a whole head has only whole-head configs in its space (`_whole`).
-        block = value_width if config.block is None else config.block
+        block = config.block or value_width
 
         def whole(array):
             """An array every program reads whole."""
@@ -486,7 +494,7 @@ class StepLaunch(tuning.KernelOp):
         return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
 
     def _get_autotuning_configs(self, ba) -> set[Launch]:
-        whole = {Launch(None, warps) for warps in (4, 8, 16)}
+        whole = {Launch(0, warps) for warps in (4, 8, 16)}
         if _whole(ba.kwargs['hooks']):
             return whole
         width = ba.arguments['state'].shape[-1]
@@ -529,5 +537,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     if hooks.decay == 'scalar' and hooks.gates is None:
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
-    state, *history, out = StepLaunch()(flags, hooks=hooks, dtype=named, interpret=not triton_runs(), **given)
+    # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
+    state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
+                                        dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state

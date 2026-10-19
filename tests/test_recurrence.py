@@ -60,8 +60,8 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) ->
 def configs(hooks: recurrence.Hooks) -> list[recurrence.Launch]:
     """The launch's space for these hooks at the test's widths."""
     if recurrence._whole(hooks):
-        return [recurrence.Launch(None, warps) for warps in (4, 8, 16)]
-    return [recurrence.Launch(None, 8), *(recurrence.Launch(block, 4) for block in (16, 32))]
+        return [recurrence.Launch(0, warps) for warps in (4, 8, 16)]
+    return [recurrence.Launch(0, 8), *(recurrence.Launch(block, 4) for block in (16, 32))]
 
 
 @pytest.mark.parametrize('hooks', HOOKS, ids=str)
