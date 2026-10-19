@@ -34,8 +34,8 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading
-from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
@@ -44,7 +44,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import MeshSpec, ProfileWindow, prepare_process
+from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -118,10 +118,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
                                                 "ema_decay": 0.9}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        # A validation pass needs a consumer; a smoke that walks the
-        # validation path names a metric that downloads nothing (fid and
-        # clip_score pull their own weights).
-        val_metrics=("psnr",),
+        val_metrics=("fid", "clip_score"),
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
@@ -159,17 +156,6 @@ def slice_config(config: Config) -> DiffusionRunConfig:
                               multi_host=True))
 
 
-def held_out(run: DiffusionRunConfig) -> np.ndarray:
-    """The uint8 images of the validation pass, which the run never trained on."""
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
-                validation_records=run.validation_records)
-    if data.val is None:
-        raise ValueError("scoring FID needs an explicit validation source or HoldOut")
-    # This process's share of the pass on the run's plain data-parallel mesh.
-    share = DataPartition.of(run.trainer.mesh.build())
-    return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
-
-
 def grid(images: np.ndarray, path: Path) -> None:
     """The sampled rows side by side as one PNG."""
     pixels = uint8_pixels(images)
@@ -193,20 +179,26 @@ def main(config: Config) -> Path:
     data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
-    run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
-              summary={"prompts": list(PROMPTS)})
+    # The run scores FID and CLIPScore over the held-out split at its end, on every process's
+    # share at once, with the extractor and the CLIP the flags name, and logs them under its
+    # last step.
+    state = run.train(objective, data, name=name,
+                      metrics=(FID(weights=config.inception_weights), CLIPScore(config.clip_model)),
+                      summary={"prompts": list(PROMPTS)})
 
+    # The run directory read back as a pipeline, which draws over every process's
+    # devices; process 0 gathers the grid's rows and writes both files once.
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
-    drawn = pipe(list(PROMPTS), steps=objective.steps, guidance=config.guidance,
-                 solver=Heun(), key=1).host().images
-    grid(drawn, config.out / "samples.png")
-
-    generated = uint8_pixels(drawn)
-    report = {"clip_score": CLIPScore(config.clip_model).score(generated, list(PROMPTS)),
-              "fid": FID(weights=config.inception_weights).score(generated, held_out(run))}
-    (config.out / "eval.json").write_text(json.dumps(report, indent=2))
-    print(f"samples {config.out / 'samples.png'}  {report}")
+    drawn = pipe(list(PROMPTS), steps=objective.steps, guidance=config.guidance, solver=Heun(), key=1)
+    images = collective_host(drawn.images, phase="the sample grid", held_by="first")
+    if images is not None:
+        grid(images[:len(PROMPTS)], config.out / "samples.png")
+        with LocalTracker(run_dir / "tracking") as journal:
+            final = {metric: value for step, scores in journal.scalars() if step == int(state.step)
+                     for metric, value in scores.items() if metric.startswith("val/")}
+        (config.out / "eval.json").write_text(json.dumps(final, indent=2))
+        print(f"samples {config.out / 'samples.png'}  {final}")
     return run_dir
 
 
