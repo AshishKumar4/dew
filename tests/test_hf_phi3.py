@@ -106,6 +106,38 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
     np.testing.assert_array_equal(actual[1], uniform[1])
 
 
+def test_phi3_packed_documents_each_take_their_own_longrope_table():
+    """A packed row selects LongRoPE's short or long factors per document, by how far the
+    document reaches past the 8-token original context, as the document alone does: a 3-token
+    document beside a 9-token one reads the short table, the 9-token one the long table. A slice
+    of a packed row (`ModelInputs.slice_tokens`, as the LM objective cuts its inputs) keeps its
+    documents' ids: the last two tokens of a fourth document, at places 7 and 8, are a two-token
+    row holding id 4, which reads the long table. Each document's logits are as exact as its
+    logits alone."""
+    from dew.nn.inputs import ModelInputs
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    ids = np.load(DIRECTORY / 'input_ids.npy')[0].astype(np.int32)
+    for lengths, start in (((3, 9), None), ((6,), None), ((1, 1, 1, 9), -2)):
+        fill = np.zeros(12 - sum(lengths), np.int32)
+        segments = np.concatenate([np.full(n, i, np.int32) for i, n in enumerate(lengths, 1)] + [fill])
+        places = np.concatenate([np.arange(n, dtype=np.int32) for n in lengths] + [fill])
+        tokens = np.concatenate([ids[:sum(lengths)], fill])
+        inputs = ModelInputs(jnp.asarray(tokens[None]), {'positions': jnp.asarray(places[None]),
+                                                         'segment_ids': jnp.asarray(segments[None])})
+        inputs = inputs.slice_tokens(start)
+        logits = np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))[0]
+        held = {name: np.asarray(value)[0] for name, value in inputs.token_fields.items()}
+        for document in np.unique(held['segment_ids'][held['segment_ids'] > 0]):
+            span = held['segment_ids'] == document
+            alone_ids, alone_places = np.asarray(inputs.tokens)[0][span][None], held['positions'][span][None]
+            alone = np.asarray(loaded.model.apply(loaded.variables, alone_ids, positions=alone_places))[0]
+            truth, terms = float64_forward(loaded.model, loaded.variables, alone_ids, positions=alone_places)
+            assert_as_exact_as_the_reference(logits[span], alone, np.asarray(truth)[0],
+                                             f'document {document} of {lengths} from {start}',
+                                             terms=np.asarray(terms)[0])
+
+
 def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     from dew.inference import TextGeneration
     from dew.inference.serving import Server

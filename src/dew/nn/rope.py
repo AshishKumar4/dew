@@ -137,12 +137,17 @@ def rope_scaling_from_record(record: Mapping[str, object]) -> RopeScaling | Long
 
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | LongRopeScaling | None = None, *, dtype: DTypeLike):
+                 rope_scaling: RopeScaling | LongRopeScaling | None = None, *, dtype: DTypeLike,
+                 documents=None):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` is [P], or [B, P] for a packed batch whose documents restart at
     0. The angles are computed in `dtype` (at least fp32), so a token rotates
     the same in prefill and decode.
+
+    LongRoPE picks its short or long factors by how far a sequence reaches: a
+    row's furthest position, or with `documents` `[B, P]` (`Coordinates.segments`)
+    each document's own, so a packed document rotates as it does alone.
 
     `rot_dim` narrows the rotation to the first rot_dim dimensions, under one
     of two published conventions that rotate different angles:
@@ -172,10 +177,10 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
         short = 1.0 / (np.asarray(rope_scaling.short_factor, dtype=dtype) * powers)
         long = 1.0 / (np.asarray(rope_scaling.long_factor, dtype=dtype) * powers)
         rows = jnp.asarray(positions)
-        expanded = jnp.max(rows, axis=-1) + 1 > rope_scaling.original_max_position_embeddings
+        reach = (jnp.max(rows, axis=-1, keepdims=rows.ndim > 1) if documents is None
+                 else _document_reach(rows, jnp.asarray(documents)))
+        expanded = reach + 1 > rope_scaling.original_max_position_embeddings
         inv_freq = jnp.where(expanded[..., None], long, short)
-        if rows.ndim > 1:
-            inv_freq = inv_freq[..., None, :]
     elif rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
@@ -189,6 +194,19 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     if isinstance(rope_scaling, LongRopeScaling):
         cos, sin = cos * rope_scaling.amplitude, sin * rope_scaling.amplitude
     return cos, sin
+
+
+def _document_reach(positions: jax.Array, documents: jax.Array) -> jax.Array:
+    """Each token's document's furthest position `[B, P]`, read at every token of the document.
+
+    A row's documents are runs of equal ids (`Coordinates.segments`), numbered
+    here by run, so the reduction needs no bound on the ids a row (or a slice of
+    one, `ModelInputs.slice_tokens`) holds."""
+    rows = jnp.broadcast_to(positions, documents.shape)
+    changes = (documents[:, 1:] != documents[:, :-1]).astype(jnp.int32)
+    runs = jnp.cumsum(jnp.pad(changes, ((0, 0), (1, 0))), axis=1)
+    furthest = jax.vmap(lambda row, run: jax.ops.segment_max(row, run, num_segments=row.shape[0]))
+    return jnp.take_along_axis(furthest(rows, runs), runs, axis=1)
 
 
 def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], theta: float, *,
