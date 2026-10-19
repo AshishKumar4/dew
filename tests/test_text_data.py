@@ -392,21 +392,25 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(
     assert window["text_coordinates"].segments.tolist() == [*segments, *[0] * 7]
 
 
+@pytest.mark.parametrize("pack", ["first-fit", "best-fit", "concat"])
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
-def test_packed_windows_keep_every_next_token_target_of_a_document_longer_than_a_window(tmp_path, read):
-    """A document longer than a packed window is cut into pieces that share their boundary token,
-    so every token's next token follows it inside one segment of some window: the windows' pairs
-    are the documents' pairs, each once, in every read, the planned packing of an indexed read too."""
-    stream = np.asarray([10, 11, 12, 13, 14, 15, 16, 17, 0, 20, 21, 0], np.uint16)
+def test_packed_windows_keep_every_next_token_target_of_a_document_longer_than_a_window(tmp_path, read,
+                                                                                       pack):
+    """A document cut across packed windows keeps its boundary token on both sides of the cut, so
+    every token's next token follows it inside one segment of some window: the windows' pairs are
+    the documents' pairs, each once, in every read and packing, the planned packing of an indexed
+    read too. A fitting pack's documents are cut into pieces before it, and a concatenating pack's
+    where its windows end, inside a document that starts partway into a window too."""
+    stream = np.asarray([10, 11, 12, 13, 14, 15, 16, 17, 0, 20, 21, 22, 23, 24, 25, 0, 30, 31, 0], np.uint16)
     write_token_corpus(tmp_path, stream, stream, eos_id=0)
-    data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=4, packing_bins=2),
+    data = loader(TextData(source=str(tmp_path), pack=pack, seq_len=4, packing_bins=2),
                   batch=1, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
     pairs = Counter()
     for window in _read(data.val(DataPartition())):
         tokens, segments = window["text"].tolist(), window["text_coordinates"].segments.tolist()
         pairs.update((tokens[index], tokens[index + 1]) for index in range(len(tokens) - 1)
                      if segments[index] and segments[index] == segments[index + 1])
-    documents = [stream[:9].tolist(), stream[9:].tolist()]
+    documents = [stream[:9].tolist(), stream[9:16].tolist(), stream[16:].tolist()]
     assert pairs == Counter(pair for document in documents for pair in itertools.pairwise(document))
 
 

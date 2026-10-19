@@ -20,6 +20,7 @@ except where it packs several records into one row.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Literal
 
 from dew.data import (
@@ -81,9 +82,13 @@ _CHAT_FIELDS = ("text", chat.ROLES_KEY)
 
 
 def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
-    """Token documents cut into pieces of `pack`'s length overlapping by one token, so each token's
-    next-token target stays in one piece, then packed by `pack`. `lm`, a conversation cut into
-    pieces and the text and chat recipes (`dew.config.data`) prepare text through it."""
+    """Token documents packed by `pack` with every cut through one overlapping by one token, so each
+    token's next-token target stays in one piece: a fitting pack's documents are cut into pieces of
+    its length first, and a concatenating pack overlaps the cuts it makes itself (`Pack.overlap`).
+    `lm`, a conversation cut into pieces and the text and chat recipes (`dew.config.data`) prepare
+    text through it."""
+    if pack.policy == "concat":
+        return documents.then(dataclasses.replace(pack, overlap=1))
     return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1)).then(pack)
 
 
