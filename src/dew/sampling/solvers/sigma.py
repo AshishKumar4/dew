@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import expand
+from dew.diffusion.schedules import divided, expand
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
@@ -26,13 +26,13 @@ def _euler_step(x, denoised, source, target):
     dt = sigma_s - sigma_t
     # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
     x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
-    derivative = (x - x_0_coeff * denoised) / sigma_t
+    derivative = divided(x - x_0_coeff * denoised, sigma_t)
     # The source's x + derivative dt, summed as alpha_s x_0 + sigma_s eps, DDIM's form of it: from a
     # large sigma the source's sum cancels two terms of x's size (x is 4e4 at a zero-SNR sigma of
     # 4096) and keeps dt's rounding times the derivative, and near pure noise on a VP schedule the
     # secant coefficient is in the thousands; this form has neither, and a step to sigma 0 lands on
     # the clean prediction itself. A step of no length leaves x exactly as it is.
-    stepped = alpha_s * denoised + (x - alpha_t * denoised) / sigma_t * sigma_s
+    stepped = alpha_s * denoised + divided(x - alpha_t * denoised, sigma_t) * sigma_s
     return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
 
 
