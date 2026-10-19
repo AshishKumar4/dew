@@ -311,6 +311,29 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, lis
             leaves, row_distances, sizes)
 
 
+ADMISSION_MARGIN = 0.05
+"""How much less exact than the reference a member may be and still be admitted (`admits`): its mean
+squared distance from float64 over a leaf at most 1.05 times the reference's, 2.5% in RMS. A margin
+of none admits an equally exact member about half the time, by its orders' luck alone. Provisional
+until the owner approves it."""
+
+ADMISSION_LEVEL = 2.326
+"""The one-sided confidence of `admits`' bound, in standard errors: 99%."""
+
+
+def admits(member, reference) -> bool:
+    """Whether `member`, its RMS distance from float64 over a leaf at each of the first batch's orders,
+    is no less exact than `reference`, the reference's at the same orders, by ADMISSION_MARGIN: the
+    upper ADMISSION_LEVEL bound on the mean over the orders of their squares' paired difference at
+    most ADMISSION_MARGIN times the reference's mean square. The orders are shared, so their pairing
+    takes out what every member's rounding at an order has in common."""
+    member, reference = (np.square(np.asarray(side, np.float64)) for side in (member, reference))
+    difference = member - reference
+    spread = np.std(difference, ddof=1) / np.sqrt(difference.size)
+    bound = float(np.mean(difference) + ADMISSION_LEVEL * spread)
+    return bound <= ADMISSION_MARGIN * float(np.mean(reference))
+
+
 def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> dict:
     """The K-order gate over a comparison's rounding draws. `draw(order)` gives one draw `(dew,
     members, truth)`: order 0 the case's own, every other the same input under an exact symmetry of
@@ -327,19 +350,20 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
 
     Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
     orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
-    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the worst
-    admitted member's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row
-    within ROW_FACTOR of the admitted members' worst at each row (`assert_rows_as_exact_over_orders`):
-    supplements, the leaf's rule derived for Gaussian roundings independent across orders and the row's
-    uncalibrated (ORDERS, ROW_FACTOR). One draw within its factors is no evidence that a few elements
+    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the
+    reference's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row within
+    ROW_FACTOR of the reference's worst (`assert_rows_as_exact_over_orders`): supplements, the leaf's
+    rule derived for Gaussian roundings independent across orders and the row's uncalibrated (ORDERS,
+    ROW_FACTOR). One draw within its factors is no evidence that a few elements
     are, so the first batch is always taken whole. After a second training step a row inherits the
     first step's rounding through the parameters it reads, which its own terms do not see, so such a
     comparison passes `rows=False` and its first step holds the rows.
 
-    A member other than the reference (`REFERENCE`) is admitted at a leaf only where its RMS distance
-    from float64 over the first batch is no more than the reference's own; the leaf, row and element
-    rules hold Dew to the worst admitted member. Returns `assert_elements_as_exact`'s report: by leaf,
-    the members admitted and the bar's inflation over the reference alone."""
+    A member other than the reference (`REFERENCE`) is admitted at a leaf where it is no less exact than
+    the reference there over the first batch (`admits`), and the element rule holds Dew to the worst
+    admitted member; the leaf and row rules hold it to the reference alone. Returns
+    `assert_elements_as_exact`'s report: by leaf, the members admitted and the bar's inflation over
+    the reference alone."""
     batches = {0: _batch(draw, 0, terms, rows)}
     _, _, leaves, row_distances, sizes = batches[0]
     admitted = {}
@@ -348,16 +372,14 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
         theirs = {member: np.asarray([order[name][1][member] for order in leaves])
                   for member in leaves[0][name][1]}
         assert REFERENCE in theirs, f"{label} {name}: the ensemble {sorted(theirs)} holds no {REFERENCE!r}"
-        rms = {member: float(np.sqrt(np.mean(np.square(distances)))) for member, distances in theirs.items()}
-        # A member is admitted where it is no less exact than the reference over the leaf.
-        admitted[name] = [member for member in theirs if rms[member] <= rms[REFERENCE]]
-        worst = max(admitted[name], key=rms.__getitem__)
-        assert_as_exact_over_orders(mine, theirs[worst], f"{label} {name}")
+        admitted[name] = [member for member in theirs if admits(theirs[member], theirs[REFERENCE])]
+        # The leaf and row supplements hold Dew to the reference alone, so admission moves accuracy
+        # between elements without loosening the leaf's.
+        assert_as_exact_over_orders(mine, theirs[REFERENCE], f"{label} {name}")
         if rows and sizes[name].size:
             ours = np.stack([order[name][0] for order in row_distances])
-            held = np.stack([np.stack([order[name][1][member] for order in row_distances])
-                             for member in admitted[name]])
-            _assert_rows_over_orders(ours, held, f"{label} {name}", sizes[name])
+            reference = np.stack([order[name][1][REFERENCE] for order in row_distances])
+            assert_rows_as_exact_over_orders(ours, reference, f"{label} {name}", sizes[name])
 
     def batch(stage):
         if stage not in batches:
@@ -702,6 +724,22 @@ REFERENCE = "reference"
 """The member of an ensemble that is the reference itself (`assert_elements_as_exact`)."""
 
 
+def _inflation(bar, reference) -> dict:
+    """How far the worst admitted member's sums `bar` raise the bar over the reference's alone, over a
+    leaf's elements: the ratio's mean of sums, its median, 99th percentile and largest at elements
+    where the reference is not exact, and the count of elements it makes positive where the
+    reference is exact."""
+    bar, reference = (np.asarray(side, np.float64).ravel() for side in (bar, reference))
+    moving = reference > 0
+    ratios = bar[moving] / reference[moving]
+    total = float(reference.sum())
+    return {"inflation": float(bar.sum()) / total if total > 0 else 1.0,
+            "median": float(np.median(ratios)) if ratios.size else 1.0,
+            "p99": float(np.percentile(ratios, 99)) if ratios.size else 1.0,
+            "largest": float(ratios.max()) if ratios.size else 1.0,
+            "positive_where_exact": int(np.count_nonzero(~moving & (bar > 0)))}
+
+
 def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, admitted=None) -> dict:
     """Every element on par with the reference at that element, measured over fresh batches of ORDERS
     orders. `batch(stage)` gives `(dew, members)` for stage 0, 1, ...: Dew's sums and the reference's
@@ -726,8 +764,9 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
     once. The mean absolute error rather than the RMS: a bf16 rounding's flips give errors
     heavier-tailed than a Gaussian's, whose squares' mean varies with their kurtosis.
 
-    Returns, by leaf, the members admitted and the bar's inflation over the reference's alone: the
-    worst admitted member's mean absolute error over the leaf's elements, over the reference's."""
+    Returns, by leaf, the members admitted and the bar's inflation over the reference's alone
+    (`_inflation`): the worst admitted member's mean absolute error over the leaf's elements, over the
+    reference's, and its spread over the elements."""
     flagged, report = None, {}
     for stage in range(STAGES):
         dew, members = batch(stage)
@@ -755,9 +794,7 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
             worst = np.max(np.stack([named[member][index] for member in held]), axis=0)
             bars.append(worst)
             if stage == 0:
-                alone = float(np.mean(named[reference][index]))
-                report[name] = {"admitted": held,
-                                "inflation": float(np.mean(worst)) / alone if alone > 0 else 1.0}
+                report[name] = {"admitted": held, **_inflation(worst, named[reference][index])}
         over = [mine > FACTOR * bar for mine, bar in zip(mines, bars, strict=True)]
         # A confirmation clears an element it does not flag again; one flagged before stays so only if it is.
         flagged = over if flagged is None else [now & then for now, then in zip(over, flagged, strict=True)]

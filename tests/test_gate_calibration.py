@@ -161,14 +161,20 @@ def tree_attention(q, k, v, mask, trees):
 
 
 ATTENTION_TREES = {"width": ("pairwise", "blocked-8"), "keys": ("pairwise", "blocked-8")}
-"""Attention's reduction classes and the trees each declares; their four assignments are the members."""
+"""Attention's reduction classes and the trees each declares; their four assignments are members."""
+
+KEY_ORDERS = tuple(range(100, 116))
+"""The seeds of the fixed key orders the reference's own attention is a member under: an exact symmetry
+of its math, the keys, the values and the mask's columns moved alike, so each sums its keys in an
+order of its own that no width order moves."""
 
 
 def attention_draw(dew, length: int, chunk: int):
     """A draw of chunked causal attention, its output and its gradients in q, k and v, Dew's `dew`
-    against XLA's reference attention and the members (ATTENTION_TREES' assignments), over orders that
-    permute the head width, which the scores sum over, and the cotangent with the output; the sums
-    over keys no order moves, and the members' trees are what reorder them."""
+    against XLA's reference attention and the members (ATTENTION_TREES' assignments and the reference
+    over each of KEY_ORDERS), over orders that permute the head width, which the scores sum over, and
+    the cotangent with the output; the sums over keys no order moves, and the members are what
+    reorder them."""
     keys = jax.random.split(jax.random.key(0), 4)
     q = jax.random.normal(keys[0], (2, length, 4, 16), jnp.float32)
     k, v = (jax.random.normal(key, (2, length, 2, 16), jnp.float32) for key in keys[1:3])
@@ -187,7 +193,8 @@ def attention_draw(dew, length: int, chunk: int):
     sides = {"dew": dew(mask), REFERENCE: reference} | {
         f"width {chosen['width']}, keys {chosen['keys']}":
             functools.partial(tree_attention, mask=mask, trees=chosen)
-        for chosen in assignments(ATTENTION_TREES)}
+        for chosen in assignments(ATTENTION_TREES)} | {
+        f"keys in order {seed}": keys_in_order(mask, seed) for seed in KEY_ORDERS}
     compiled = {name: jax.jit(functools.partial(results, fn)) for name, fn in sides.items()}
     with jax.enable_x64(new_val=True):
         truth = [np.asarray(leaf) for leaf in jax.jit(functools.partial(results, reference))(
@@ -205,14 +212,19 @@ def attention_draw(dew, length: int, chunk: int):
     return draw
 
 
-def shuffled_keys(mask):
-    """Dense reference attention over the keys in one fixed shuffled order, the mask's columns with
-    them: the same function, another tree over keys."""
+def keys_in_order(mask, seed: int):
+    """Dense reference attention over the keys in the fixed order `seed` draws, the values and the
+    mask's columns with them: the same function, another tree over keys."""
     def attend(q, k, v):
-        shuffle = np.random.default_rng(7).permutation(k.shape[1])
-        return scaled_dot_product_attention(q, k[:, shuffle], v[:, shuffle], implementation="reference",
-                                            mask=mask[..., shuffle])
+        order = np.random.default_rng(seed).permutation(k.shape[1])
+        return scaled_dot_product_attention(q, k[:, order], v[:, order], implementation="reference",
+                                            mask=mask[..., order])
     return attend
+
+
+def shuffled_keys(mask):
+    """Dew's side of the null: the reference over keys in an order no member holds (seed 7)."""
+    return keys_in_order(mask, 7)
 
 
 @pytest.mark.parametrize("length, chunk", [(37, 8), (64, 16)])
