@@ -474,7 +474,7 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
     query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
     key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
     documents = cache_documents(positions, filled)
-    assert flash_refusal(query, key, True, window, segment_ids=documents, max_segments=1) is None
+    assert flash_refusal(query, key, causal=True, sliding_window=window, segment_ids=documents, max_segments=1) is None
     found = scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
                                          sliding_window=window, segment_ids=documents, max_segments=1)
     plain = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")

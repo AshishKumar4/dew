@@ -269,7 +269,7 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rn
     assert ('dew_flash_mha' in compiled) == flash
     found = np.asarray(prefill(params, cache, prompt), np.float64)
     plain = np.asarray(model.clone(attention_impl='xla').apply(params, prompt), np.float64)
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
         truth = np.asarray(model.clone(dtype=jnp.float64, attention_impl='reference').apply(wide, prompt))
     assert_as_exact_as_the_reference(found, plain, truth, "cached prefill")
