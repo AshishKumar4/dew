@@ -57,6 +57,7 @@ from dew.nn.attention import (
     unweighted_rmsnorm,
 )
 from dew.nn.attention_sinks import sink_softmax
+from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -249,7 +250,7 @@ class CompressedEntries(FakeQuantizing):
     def setup(self):
         series = 2 if self.overlap else 1
         projected = self.pool_dtype if self.gated and self.pool_dtype is not None else self.dtype
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=projected, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision)
         self.kv_proj = dense(series * self.width, name='kv_proj')
         if self.gated:
             self.gate_proj = dense(series * self.width, name='gate_proj')
@@ -351,8 +352,8 @@ class IndexScorer(nn.Module):
 
     @nn.compact
     def __call__(self, query, keys, x):
-        weights = nn.Dense(self.n_heads, use_bias=False, dtype=self.dtype,
-                           precision=self.precision, name='weights_proj')(x)
+        weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype,
+                        precision=self.precision, name='weights_proj')(x)
         return index_scores(query, keys, weights, self.precision)
 
 
@@ -372,8 +373,8 @@ class LightningIndexer(CompressedEntries):
                 f"the indexer rotates a {self.rope_dim}-wide rope slice out of heads "
                 f"of width {self.width}, so the heads have to be wider")
         super().setup()
-        self.q_b_proj = nn.Dense(self.n_heads * self.width, use_bias=False,
-                                 dtype=self.dtype, precision=self.precision, name='q_b_proj')
+        self.q_b_proj = Dense(self.n_heads * self.width, use_bias=False,
+                              dtype=self.dtype, precision=self.precision, name='q_b_proj')
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
@@ -446,7 +447,7 @@ class Csa2Indexer(FakeQuantizing):
             raise ValueError(
                 f"the indexer rotates a {self.rope_dim}-wide rope slice out of heads "
                 f"of width {self.head_dim}, so the heads have to be wider")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.weights_proj = dense(self.n_heads, name='weights_proj')
         if self.owns_keys:
@@ -585,7 +586,7 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.kv_qat and (self.head_dim % 32 or (self.index_head_dim or 32) % 32):
             raise ValueError("the cache rounds the keys per 32 channels and the index keys "
                              "per 32, so head_dim and index_head_dim are multiples of 32")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype)
         self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
         self.q_a_norm = norm(name='q_a_norm')

@@ -10,6 +10,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.dense import Dense
+
 from .activations import UNGATED, Activation
 from .blocks import normal_kernel
 from .flops import projection_flops
@@ -61,7 +63,7 @@ class GatedMLP(nn.Module):
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
     packed: bool = False
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., Dense] = Dense
     dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None

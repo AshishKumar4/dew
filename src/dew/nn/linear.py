@@ -40,6 +40,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
+from dew.nn.dense import Dense
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
 from .attention import FORWARD_MODE, gated_rms_normalized
@@ -1065,7 +1066,7 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
