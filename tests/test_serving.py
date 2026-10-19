@@ -125,7 +125,12 @@ def test_a_dropped_server_frees_its_weights_without_a_collection():
         return Counter(tuple(array.shape) for array in jax.live_arrays())
 
     def serve() -> Counter:
-        bound = task(Sampling(temperature=0, eos_token_ids=None))
+        # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
+        # holding what it drew, which is flax's to drop, not the server's.
+        model = decoder().clone(max_seq_len=128)
+        params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        bound = TextGeneration(model, params, RunProcessor(Digits()),
+                               sampling=Sampling(temperature=0, eos_token_ids=None))
         server = Server.from_task(bound, slots=2, capacity=128)
         server(["12", "34"], 3, key=0)
         return Counter(tuple(leaf.shape) for leaf in jax.tree.leaves(bound.variables))
