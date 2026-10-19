@@ -19,8 +19,7 @@ import numpy as np
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
-from dew.inputs import Condition, Field, unit_range
-from dew.inputs.diffusion import latent_image_conditions
+from dew.inputs import Field, unit_range
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -58,41 +57,38 @@ def task_kind(source, meta):
     return "inpaint" if "Inpaint" in name else "img2img" if "Img2Img" in name else "text"
 
 
-def trajectory(source, reference, meta, key):
-    """Compose the native image initialization, conditions and single solver walk."""
+def selection(source, meta):
+    """The text conditions and the times the source's call walks: all of
+    them, or those its strength or the refiner's denoising_start selects,
+    which is the caller's conversion."""
     kind = task_kind(source, meta)
     given, null = conditions(source, kind.startswith("xl-") or kind == "refiner")
     steps = meta.get("steps", 2)
     process, times = source.schedule.sampling(steps)
-    noise = jnp.asarray(reference["noise"])
-    initial = noise * process.sampler_schedule.prior_scale()
-    pixels = unit_range(jnp.asarray(reference["pixels"][None])) if "pixels" in reference else None
-    if kind in ("img2img", "xl-img2img", "refiner"):
-        clean = source.autoencoder.encode(source.variables["autoencoder"], pixels,
-                                           key if kind == "img2img" else None)
-        if kind == "refiner":
-            model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
-            cutoff = round(len(source.schedule.betas) * (1 - meta["denoising_start"]))
-            times = times[int(np.flatnonzero(model_times < cutoff)[0]):]
-            initial = clean
-        else:
-            start = steps - int(steps * meta.get("strength", 1.0))
-            times = times[start:]
-            alpha, sigma = process.sampler_schedule.rates(jnp.full((noise.shape[0],), times[0]))
-            shape = (-1,) + (1,) * (noise.ndim - 1)
-            initial = alpha.reshape(shape) * clean + sigma.reshape(shape) * noise
-    if kind in ("inpaint", "xl-inpaint"):
-        mask = (jnp.asarray(reference["mask"][None, ..., None]) >= 128).astype(jnp.float32)
-        encode_key = jax.random.split(key)[1] if kind == "inpaint" else None
-        spatial = latent_image_conditions(source.autoencoder, source.variables["autoencoder"], pixels, mask, encode_key)
-        given, null = {**given, **spatial}, {**null, **spatial}
+    if kind == "refiner":
+        model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
+        cutoff = round(len(source.schedule.betas) * (1 - meta["denoising_start"]))
+        times = times[int(np.flatnonzero(model_times < cutoff)[0]):]
+    elif kind in ("img2img", "xl-img2img"):
+        times = times[steps - int(steps * meta.get("strength", 1.0)):]
+    return given, null, process, times
+
+
+def trajectory(source, prepared, given, null, process, times, key):
+    """The single solver walk from the public `prepare`'s start, the one
+    path every caller starts from, and the conditions it walks under: the
+    text ones and the spatial ones `prepare` built. Its real rows: on a mesh
+    the rows pad to fill the devices."""
+    spatial = {name: prepared.conditions[name][:prepared.rows] for name in ("mask", "masked_image")
+               if name in prepared.conditions}
+    given, null = {**given, **spatial}, {**null, **spatial}
     denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, initial, solver=source.schedule.solver, guidance=CFG(3.0), key=key,
-                     times=times, final_denoise=False)
+    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.schedule.solver, guidance=CFG(3.0),
+                     key=key, times=times, final_denoise=False)
     images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
     if source.finish is not None:
         images = source.finish(source.variables, images)
-    return images, latents, given, null, process, times, initial
+    return images, latents, given
 
 
 def public_start(task, source, reference, meta, key, given, null, process, times):
@@ -206,7 +202,11 @@ def check_pipeline(directory, streamed: bool = False):
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
-    images, latents, given, null, process, times, initial = trajectory(source, reference, meta, key)
+    given, null, process, times = selection(source, meta)
+    # The start the public `prepare` makes from what the reference pipeline was handed.
+    task = source.text_to_image()
+    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
+    images, latents, given = trajectory(source, prepared, given, null, process, times, key)
     if "hidden" in reference:
         compare(errors, "hidden", given["conditioning"].context, reference["hidden"])
     if "pooled" in reference:
@@ -225,19 +225,9 @@ def check_pipeline(directory, streamed: bool = False):
         features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]}, pixels,
                                              method=source.finish.model.features)
         compare(errors, "checker_features", features, reference["checker_embeddings"])
-    # The same trajectory through the task facade, its start prepared by the
-    # public `prepare` from the reference's own inputs.
-    task = source.text_to_image()
-    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
-    # Its real rows: on a mesh the rows pad to fill the devices.
-    compare(errors, "prepared", np.asarray(prepared.noise)[:prepared.rows], initial, 1e-6)
-    for name in ("mask", "masked_image"):
-        if name in given:
-            compare(errors, f"prepared_{name}", np.asarray(prepared.conditions[name])[:prepared.rows],
-                    given[name], 1e-6)
+    # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
-    compare(errors, "task", output.host().images, images, 1e-5)
-    compare(errors, "task_reference", (output.host().images + 1) / 2, reference["images"], 1e-4)
+    np.testing.assert_array_equal(output.host().images, images)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
