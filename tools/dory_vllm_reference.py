@@ -466,17 +466,63 @@ def model_orders(directory: Path) -> None:
         torch.cuda.empty_cache()
 
 
-def draw(directory: Path) -> None:
-    """`BATCHES` batches of `ORDERS` residual orders of the release's width, under Dew's environment
-    (tests/residual_orders.py, tests/reference_error.py's ORDERS): the first batch's first order the
-    identity, the others' all fresh."""
+def batch_orders(width: int, batch: int) -> np.ndarray:
+    """Batch `batch`'s `ORDERS` residual orders of `width` units (tests/residual_orders.py), from its
+    own seed, so batches append without redrawing the ones before: the first batch's first order the
+    identity, every other order fresh. Under Dew's environment (tests/reference_error.py's ORDERS)."""
     from reference_error import ORDERS
     from residual_orders import orders
 
+    if batch == 0:
+        return orders(width, ORDERS, ORDERS_SEED)
+    return orders(width, ORDERS + 1, ORDERS_SEED + batch)[1:]
+
+
+def draw(directory: Path) -> None:
+    """`BATCHES` batches of orders of the release's width (`batch_orders`)."""
     width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
-    drawn = [orders(width, ORDERS, ORDERS_SEED),
-             *(orders(width, ORDERS + 1, ORDERS_SEED + batch)[1:] for batch in range(1, BATCHES))]
-    np.save(directory / 'orders.npy', np.stack(drawn).astype(np.int16))
+    np.save(directory / 'orders.npy',
+            np.stack([batch_orders(width, batch) for batch in range(BATCHES)]).astype(np.int16))
+
+
+TRACED = ((1, 'per_loop', 'bfloat16'), (4, 'last_loop', 'bfloat16'))
+"""The runs whose Dew per-order errors `dew_traces` keeps for the element rule's calibration: the run
+whose one draw parted from vLLM's, and the one with the heaviest tails."""
+TRACED_BATCHES = 8
+
+
+def dew_traces(directory: Path) -> None:
+    """Dew's per-order errors on each `TRACED` run, `TRACED_BATCHES` batches of `batch_orders`, as the
+    release test computes them (tests/test_dory.py), each `[ORDERS, rows, vocab]` float32 in
+    `directory/dew-errors-{run}-{batch}.npy`, kept where they are recorded for the element rule's
+    calibration: a split of Dew's own batches is a null the rule must pass, under Dew's environment."""
+    import jax
+    import test_dory
+    from residual_orders import permuted
+
+    from dew.interop import Pretrained
+
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    probe = np.load(FIXTURE / 'probe.npz')
+    width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
+    for loops, mode, dtype in TRACED:
+        key = name(loops, mode, dtype)
+        truth = np.load(directory / f'upstream-{tag(key)}.npy')
+        loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
+        model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
+        programs, placed = test_dory.decoding(model), jax.device_put(loaded.variables)
+        for batch in range(TRACED_BATCHES):
+            drawn = batch_orders(width, batch)
+            held = np.lib.format.open_memmap(directory / f'dew-errors-{tag(key)}-{batch}.npy', mode='w+',
+                                             dtype=np.float32, shape=(len(drawn), *truth.shape))
+            for index, order in enumerate(drawn):
+                found = np.concatenate([test_dory.forced(programs, permuted(placed, order), probe[part],
+                                                         probe[f'{key}/{part}_generated'],
+                                                         prompt_rows=part == 'sentence')
+                                        for part in ('sentence', 'window')])
+                held[index] = np.abs(found - truth)
+                print(f'Dew {key} order {batch}/{index}', flush=True)
+            held.flush()
 
 
 def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
@@ -681,4 +727,5 @@ if __name__ == '__main__':
         (record_run if stage == 'run' else orders_run)(where, int(sys.argv[3]), sys.argv[4], sys.argv[5])
     else:
         {'record': record, 'truth': truth, 'upstream': upstream, 'draw': draw, 'orders': orders,
-         'model_orders': model_orders, 'sums': sums, 'publish': publish}[stage](where)
+         'model_orders': model_orders, 'sums': sums, 'dew_traces': dew_traces,
+         'publish': publish}[stage](where)

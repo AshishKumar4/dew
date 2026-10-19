@@ -17,7 +17,7 @@ from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
-    assert_elements_as_exact_over_orders,
+    assert_elements_as_exact,
     assert_leaves_as_exact_over_orders,
     assert_rounds_where_the_reference_does,
     chain_roundings,
@@ -606,7 +606,9 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     whole units, so one run against one decides nothing there: each run is held to vLLM's over the
     residual orders vLLM ran under (tests/reference_error.py's K-order rule), each row's probe
     columns overall, row by row and entry by entry, and every entry of every row against vLLM's
-    own. On a last-loop run's rows past the window, vLLM's engine parts from its own model code
+    own, each entry's mean error over a batch of orders within FACTOR of vLLM's, an entry flagged
+    on one batch measured again on the next (tests/reference_error.py's element rule). On a
+    last-loop run's rows past the window, vLLM's engine parts from its own model code
     (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
     is that model code at the engine's precision under the same orders, so the engine's departure
     widens no bound.
@@ -652,26 +654,24 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
             key = recorder.name(loops, mode, run)
             model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
             programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
-            theirs = dict(np.load(recorder.fetched(f'orders-{recorder.tag(key)}.npz')))
-            if (loops, mode, run) in recorder.SHARED:
-                # Past the window the engine parts from its own model code's last-loop cache, which
-                # the model code computes as specified: there the model code at the run's precision
-                # is the reference (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659).
-                model_code = np.load(recorder.fetched(f'model-{recorder.tag(key)}.npz'))
-                past = len(probe[f'{key}/window_generated'])
-                theirs = {'columns': np.concatenate([theirs['columns'][:, :-past], model_code['columns']], 1),
-                          **{part: np.concatenate([theirs[part][:-past], model_code[part]])
-                             for part in ('absolutes', 'squares')}}
-            on_columns, draws = np.take_along_axis(truth, columns, axis=1), []
-            absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
-            placed = jax.device_put(loaded.variables)
-            for index, order in enumerate(drawn):
-                # Each order's weights are reordered where they sit, on the device.
-                found = rows(programs, permuted(placed, order), key)
-                absolutes += np.abs(found - truth)
-                squares += np.square(found - truth)
-                draws.append((np.take_along_axis(found, columns, axis=1), theirs['columns'][index],
-                              on_columns))
+            placed, draws = jax.device_put(loaded.variables), []
+
+            def batch(index, key=key, programs=programs, columns=columns, truth=truth, placed=placed,
+                      draws=draws):
+                """Batch `index`'s per-entry errors summed over its orders, Dew's and the reference's;
+                batch 0's columns kept order by order for the rows' rule."""
+                theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-{index}.npy'))
+                absolutes = np.zeros(truth.shape)
+                for order, reference in zip(drawn[index], theirs, strict=True):
+                    # Each order's weights are reordered where they sit, on the device.
+                    found = rows(programs, permuted(placed, order), key)
+                    absolutes += np.abs(found - truth)
+                    if index == 0:
+                        draws.append((np.take_along_axis(found, columns, axis=1), reference,
+                                      np.take_along_axis(truth, columns, axis=1)))
+                return absolutes, np.load(recorder.fetched(f'absolutes-{recorder.tag(key)}-{index}.npy'))
+
+            first = batch(0)
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
-            assert_elements_as_exact_over_orders(absolutes, theirs['absolutes'], f'Dory 4B {key}, entries',
-                                                 dew_squares=squares, reference_squares=theirs['squares'])
+            assert_elements_as_exact(lambda index, first=first, batch=batch: batch(index) if index else first,
+                                     f'Dory 4B {key}, every entry')
