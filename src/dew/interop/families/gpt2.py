@@ -306,6 +306,7 @@ GPT2 = DecoderFamily(
     weight_path=_gpt2_path,
     export_path=partial(renamed_name, GPT2_NAMES),
     prepare=_gpt2_prepare,
+    spelling=_nested,
     packed=_GPT2_PACKED,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),

@@ -688,17 +688,19 @@ class DiffusionObjective(Objective[Ratio]):
         given = self.encoded_conditions(params, batch)
         unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
                                      given, aligned_conditions(given, self.blank_conditions(params, given)))
-        if self.inputs.mask is not None:
-            from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(
-                self.autoencoder,
-                params["autoencoder"],
-                unit_range(batch[self.inputs.sample.key]),
-                batch[self.inputs.mask.key],
-                jax.random.fold_in(key, 1),
-            )
-            return {**given, **spatial}, {**unconditional, **spatial}
-        return given, unconditional
+        spatial = self._spatial(params, batch, key)
+        return {**given, **spatial}, {**unconditional, **spatial}
+
+    def _spatial(self, params, batch, key) -> dict[str, jax.Array]:
+        """The masked-image inputs an inpainting model reads in both guidance branches
+        (`latent_image_conditions`), none where the inputs name no mask."""
+        if self.inputs.mask is None:
+            return {}
+        from dew.inputs.diffusion import latent_image_conditions
+
+        return latent_image_conditions(self.autoencoder, params["autoencoder"],
+                                       unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key],
+                                       jax.random.fold_in(key, 1))
 
     def _dropped(self, given, blank, batch, key):
         """`given` with a drawn share of the batch's rows `blank`, classifier-free guidance's training

@@ -174,16 +174,19 @@ class Epsilon(nn.Module):
         return jnp.tanh(x) * 0.3 + expand(label, x) * jnp.cos(expand(time, x) / 300)
 
 
-def test_cfg_plus_plus_takes_the_papers_ddim_update():
+@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.0, 0.5)])
+def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
     """Algorithm 1 of Chung et al.: x_{t-1} = sqrt(abar_{t-1}) x0(eps_lambda)
     + sqrt(1 - abar_{t-1}) eps_uncond, eps_lambda = eps_u + lambda (eps_c -
-    eps_u), written out step by step over the DDIM grid."""
+    eps_u), written out step by step over the DDIM grid; a step outside the
+    guidance interval takes the conditional denoiser's pair, x0(eps_c) and
+    eps_c."""
     process = Process(LinearNoiseScheduler(1000), EpsilonPredictionTransform())
     rows, scale = 2, 0.6
     conditioned, blank = {"label": jnp.full((rows,), 0.8)}, {"label": jnp.zeros((rows,))}
     denoise = process.denoiser(Epsilon(), {}, conditioned, blank)
     x_T = jax.random.normal(jax.random.PRNGKey(1), (rows, 4, 4, 3))
-    walked = sample(denoise, x_T, 12, solver=DDIM(), guidance=CFGPlusPlus(scale),
+    walked = sample(denoise, x_T, 12, solver=DDIM(), guidance=CFGPlusPlus(scale, interval=interval),
                     key=jax.random.PRNGKey(0), final_denoise=False)
 
     schedule = process.schedule
@@ -191,16 +194,19 @@ def test_cfg_plus_plus_takes_the_papers_ddim_update():
     def walk(dtype):
         x = np.asarray(x_T, dtype)
         times = np.asarray(process.times(12))
-        for t, following in itertools.pairwise(times):
+        for index, (t, following) in enumerate(itertools.pairwise(times)):
             t_row = jnp.full((rows,), t)
             abar = dtype(schedule.rates(t_row)[0][0]) ** 2
             abar_next = dtype(schedule.rates(jnp.full((rows,), following))[0][0]) ** 2
             time = np.asarray(schedule.model_time(t_row), dtype).reshape(rows, 1, 1, 1)
             eps_c = np.tanh(x) * dtype(0.3) + dtype(0.8) * np.cos(time / dtype(300))
             eps_u = np.tanh(x) * dtype(0.3)
-            eps = eps_u + dtype(scale) * (eps_c - eps_u)
+            if interval[0] <= index / (len(times) - 1) <= interval[1]:
+                eps, noise = eps_u + dtype(scale) * (eps_c - eps_u), eps_u
+            else:
+                eps, noise = eps_c, eps_c
             clean = (x - np.sqrt(1 - abar) * eps) / np.sqrt(abar)
-            x = np.sqrt(abar_next) * clean + np.sqrt(1 - abar_next) * eps_u
+            x = np.sqrt(abar_next) * clean + np.sqrt(1 - abar_next) * noise
         return x
 
-    assert_as_exact_as_the_reference(walked, walk(np.float32), walk(np.float64), "cfg++")
+    assert_as_exact_as_the_reference(walked, walk(np.float32), walk(np.float64), f"cfg++ {interval}")

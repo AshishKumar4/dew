@@ -464,7 +464,9 @@ def validate_source_aliases(names: Collection[str], read: Callable[[str], np.nda
         tied = _text_aliases(text, lambda name: read(text[name]), record["text"])
         return aliases + tuple((text[a], text[b]) for a, b in tied)
     record = translate_config(config)
-    family = _family_for_config(record)
+    # translate_config refused every model_type but a registered family's name, which
+    # spells the tensors: Kimi K2.5 computes DeepSeek V3 under `language_model.` names.
+    family = families()[records.text(config.get("model_type"), "model_type")]
     return _text_aliases(names, read, record, _tied_names(family, record, names))
 
 

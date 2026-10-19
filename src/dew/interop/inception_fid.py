@@ -59,28 +59,44 @@ def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
                          repo, filename, revision, digest)
 
 
-# Only what a pickle of numpy arrays needs to rebuild them. The
-# FID weights name these under `numpy.core`, the numpy 1 home; numpy 2 keeps
-# that path as a shim that warns on every attribute read, so a legacy name
-# resolves at its current home instead. Anything outside this set is refused,
-# so a downloaded pickle cannot run code.
+def _empty(subtype, shape, dtype):
+    """The array a pickle of one starts from, which the pickle's state then fills: numpy's
+    `_reconstruct`, an empty array of `subtype`."""
+    return np.ndarray.__new__(subtype, shape, dtype)
+
+
+def _from_buffer(buffer, dtype, shape, order: str, axis_order=None):
+    """An array a pickle carries out of band: numpy's `_frombuffer`, its bytes read as `dtype` and
+    laid out in `shape`. numpy's reducer writes 'C' or 'F' for a contiguous array and 'K' with the
+    axis order that makes it one for any other."""
+    array = np.frombuffer(buffer, dtype=dtype)
+    if order == 'K' and axis_order is not None:
+        return array.reshape(shape, order='C').transpose(axis_order)
+    return array.reshape(shape, order='F' if order == 'F' else 'C')
+
+
+# Only what a pickle of numpy arrays needs to rebuild them, by the names the pickle stream gives
+# them, each built here from numpy's public API. The FID weights name the two constructors under
+# `numpy.core`, numpy 1's home of them; numpy 2 writes `numpy._core`. Anything else is refused, so
+# a downloaded pickle cannot run code.
 _ARRAY_GLOBALS = {
-    ('numpy', 'dtype'),
-    ('numpy', 'ndarray'),
-    ('numpy._core.multiarray', '_reconstruct'),
-    ('numpy._core.numeric', '_frombuffer'),
+    ('numpy', 'dtype'): np.dtype,
+    ('numpy', 'ndarray'): np.ndarray,
+    ('multiarray', '_reconstruct'): _empty,
+    ('numeric', '_frombuffer'): _from_buffer,
 }
 
 
 class _ArrayUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        current = ('numpy._core.' + module[len('numpy.core.'):]
-                   if module.startswith('numpy.core.') else module)
-        if (current, name) not in _ARRAY_GLOBALS:
+        home, _, inner = module.rpartition('.')
+        key = (module, name) if module == 'numpy' else (
+            (inner, name) if home in ('numpy.core', 'numpy._core') else None)
+        if key not in _ARRAY_GLOBALS:
             raise pickle.UnpicklingError(
                 f"the weights file asks for {module}.{name}, which is not one of the "
                 "numpy array constructors this loader allows")
-        return super().find_class(current, name)
+        return _ARRAY_GLOBALS[key]
 
 
 def load_arrays(path) -> ParamTree:

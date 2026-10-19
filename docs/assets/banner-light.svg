@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-labelledby="title description">
-  <title id="title">Dew — model training with JAX and Flax</title>
+  <title id="title">Dew, model training with JAX and Flax</title>
   <desc id="description">Language models, diffusion, and representation learning. Explicit models, objectives, and training state.</desc>
   <defs>
     <linearGradient id="gb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7fe6d8"/><stop offset="1" stop-color="#12a394"/></linearGradient>

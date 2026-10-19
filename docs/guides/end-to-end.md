@@ -6,13 +6,12 @@ Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/e
 
 [`examples/train_flowers_tpu.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers_tpu.py) trains a `simple_dit` denoiser from scratch on Oxford Flowers. One `DiffusionRunConfig` holds the model, the prepared ArrayRecords, CLIP text conditioning, CFG with a Heun solver, EMA and the validation metrics. `config.train` runs it over the whole slice under `MeshSpec(fsdp=jax.device_count())`, with a profiler window. At the end the script loads the run back with `dew.pipeline`, samples a grid of images and scores it with `dew.eval.fid` and `dew.eval.clip_score`.
 
-First prepare the records at the training resolution, then launch the same file on every worker:
+First prepare the TFDS ArrayRecords once, then launch the same file on every worker with the TFDS version directory:
 
 ```bash
-python tools/prepare_images.py --dataset tfds_images \
-    --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \
-    --split all --image-size 256 --out prepared/flowers-256
-python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
+python -c "import tensorflow_datasets as tfds; tfds.builder('oxford_flowers102', \
+    data_dir='~/.cache/dew/datasets').download_and_prepare(file_format='array_record')"
+python examples/train_flowers_tpu.py --data ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --steps 200000
 ```
 
 ```bash

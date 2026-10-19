@@ -56,36 +56,15 @@ from dew.nn.protocols import AffineHead, HiddenStates, Logits, LogitsFromHidden,
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
-def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
-    """Cut `range(vocab_size)` into `chunks` half-open column ranges.
+def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:
+    """The positive column width for the requested vocabulary partition, capped at `columns`.
 
-    The last chunk is the short one when the count does not divide the
-    vocabulary. Uneven tiles are free here: the full-width chunks are the
-    iterations of one loop and the short last one is its own trace
-    (`_over_tiles`), so nothing has to be padded to a common width and
-    masked back out, and only one chunk's slice of the head exists at a
-    time rather than every chunk's, hoisted together ahead of the loop.
+    `_over_tiles` walks the full-width tiles and any short tail. More chunks
+    than columns use one-column tiles, without empty tiles or padding.
     """
     if chunks < 1:
         raise ValueError(f"a vocabulary needs at least one chunk, got {chunks}")
-    if chunks > vocab_size:
-        raise ValueError(
-            f"{chunks} chunks for a vocabulary of {vocab_size} leaves empty tiles")
-    width = -(-vocab_size // chunks)
-    bounds = tuple((start, min(start + width, vocab_size))
-                   for start in range(0, vocab_size, width))
-    if len(bounds) != chunks:
-        # ceil division can cover the vocabulary early (13 columns in 4 chunks
-        # is 4 + 4 + 4 + 1), so the caller's count is the number of tiles.
-        raise ValueError(
-            f"{vocab_size} columns do not split into {chunks} chunks of {width}")
-    return bounds
-
-
-def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:
-    """The vocabulary tile the tiled head walks, forward and backward:
-    `columns` wide, and no wider than one of `vocabulary_chunks`."""
-    return min(columns, vocabulary_chunks(vocab_size, chunks)[0][1])
+    return min(columns, max(1, -(-vocab_size // chunks)))
 
 
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32

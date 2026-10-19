@@ -168,6 +168,26 @@ def chains(out):
     return found
 
 
+def test_a_rollout_packs_into_the_objectives_rows_and_refuses_a_draw_too_long_for_them():
+    """An objective wider than prompt plus budget packs its draws into its own
+    rows, each chain where a narrow objective's sits and padding after it; one
+    too narrow for a prompt and its draw is refused by the packer."""
+    def drawn(seq):
+        rollout = SampledRollout(tiny_objective(seq=seq), Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                                 sampling=Sampling(temperature=0.0))
+        return rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+
+    params = tiny_objective().init(jax.random.key(0))
+    width = PROMPT_WIDTH + NEW_TOKENS
+    out, fitted = drawn(width + 3), drawn(width - 1)
+    assert out["input_ids"].shape == (4, width + 4)
+    for name in ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs", "advantages"):
+        np.testing.assert_array_equal(np.asarray(out[name])[:, :width], fitted[name], name)
+    assert not np.asarray(out["text_segment_ids"])[:, width:].any()
+    with pytest.raises(ValueError):
+        drawn(width - 2)
+
+
 def test_a_sampled_rollout_packs_its_completions():
     """G completions per prompt from the real sampler, greedy and
     deterministic, packed as one-call rollouts: a fixed [prompts * G, prompt

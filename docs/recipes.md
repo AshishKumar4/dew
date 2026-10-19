@@ -203,4 +203,4 @@ A run is a frozen dataclass that extends `RunConfig`: `LMRunConfig` (`dew.object
 
 Before a longer run, check that a small run reaches the number of updates you asked for, reports finite losses, reads the intended split and writes to the intended directory. A larger batch, sequence length or model width needs more memory. A two-step run on one machine does not test multi-host collectives, sustained input throughput, recovery after preemption or final model quality.
 
-[Checkpoints](guides/checkpoints.md) describes what a resume restores. [Evaluation and tracking](guides/evaluation.md) and [Training data](concepts/data.md) describe what validation scores. For example, when validation shards have different lengths, the rows past the end of the shortest shard are not scored.
+[Checkpoints](guides/checkpoints.md) describes what a resume restores. [Evaluation and tracking](guides/evaluation.md) and [Training data](concepts/data.md) describe what validation scores. Every real validation row is scored, however the processes' shards differ in length ([Reproducibility and limits](guides/evaluation.md#reproducibility-and-limits)).

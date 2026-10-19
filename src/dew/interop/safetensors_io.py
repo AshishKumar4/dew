@@ -288,37 +288,39 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     only when written, never back to the file.
     """
     filename = os.fspath(path)
-    tensors: dict[str, np.ndarray] = {}
     package, _ = _safetensors()
-    with package.safe_open(filename, "np") as reader:
-        with open(filename, "rb") as stream:
-            length = int.from_bytes(stream.read(8), "little")
-            header = json.loads(stream.read(length))
-        mapping = np.memmap(filename, mode="c" if copy_on_write else "r", dtype=np.uint8)
+    # One open file answers for the header, its validation and the bytes: `_publish`
+    # replaces the pathname, so a reopened path can be another file. safe_open takes
+    # only a path, so it validates the open file through its descriptor's name, which
+    # every platform Dew installs on has (grain, a dependency, ships no Windows wheels).
+    with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
+        length = int.from_bytes(stream.read(8), "little")
         metadata = reader.metadata() or {}
-        names = reader.keys()
-        for name in names:
-            view = reader.get_slice(name)
-            shape = tuple(view.get_shape())
-            tag = view.get_dtype()
-            if tag == PACKED_F4:
-                if not shape or shape[-1] % 2:
-                    raise ValueError(
-                        f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
-                        "elements share a byte, so its last axis is even")
-                shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
-            else:
-                try:
-                    dtype = _STORED_DTYPES[tag]
-                except KeyError as error:
-                    raise ValueError(
-                        f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
-                    ) from error
-            # safe_open has validated the header's offsets, so they are read as stored.
-            tensors[name] = np.ndarray(
-                shape, dtype=dtype, buffer=mapping, offset=8 + length + header[name]["data_offsets"][0]
-            )
-    return tensors, metadata
+        stored = [(name, reader.get_slice(name)) for name in reader.offset_keys()]
+        layout = [(name, tuple(view.get_shape()), view.get_dtype()) for name, view in stored]
+        mapping = np.memmap(stream, mode="c" if copy_on_write else "r", dtype=np.uint8)
+    tensors: dict[str, np.ndarray] = {}
+    # safe_open has checked that the tensors tile the data in offset order, so
+    # each one starts where the one before it ends.
+    offset = 8 + length
+    for name, shape, tag in layout:
+        if tag == PACKED_F4:
+            if not shape or shape[-1] % 2:
+                raise ValueError(
+                    f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
+                    "elements share a byte, so its last axis is even")
+            shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
+        else:
+            try:
+                dtype = _STORED_DTYPES[tag]
+            except KeyError as error:
+                raise ValueError(
+                    f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
+                ) from error
+        tensors[name] = np.ndarray(shape, dtype=dtype, buffer=mapping, offset=offset)
+        offset += math.prod(shape) * dtype.itemsize
+    return dict(sorted(tensors.items())), metadata
+
 
 
 class LazyTensors(Mapping[str, np.ndarray]):
