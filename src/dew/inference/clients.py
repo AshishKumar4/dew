@@ -569,6 +569,7 @@ class OpenAICompletion:
         completions request's SDK response kept in `responses`, and a detokenization through the
         SDK's call to an engine route it does not name."""
         import httpx2
+        from openai.types import Completion as SDKCompletion
 
         client = self._sync()
 
@@ -577,7 +578,10 @@ class OpenAICompletion:
             if route == "detokenize":
                 return client.post("/detokenize", cast_to=httpx2.Response, body=body).json()
             raw = _invoke(client.completions.with_raw_response.create, body)
-            responses.append(raw.parse())
+            parsed = raw.parse()
+            if not isinstance(parsed, SDKCompletion):
+                raise ValueError("a non-streaming completion request returned a stream")
+            responses.append(parsed)
             return raw.http_response.json()
 
         return answered
@@ -585,6 +589,7 @@ class OpenAICompletion:
     def _answered_async(self, responses: list[OpenAIResponse]) -> Callable[[Call], Awaitable[JSON]]:
         """`_answered` on the async client."""
         import httpx2
+        from openai.types import Completion as SDKCompletion
 
         client = self._async()
 
@@ -593,7 +598,10 @@ class OpenAICompletion:
             if route == "detokenize":
                 return (await client.post("/detokenize", cast_to=httpx2.Response, body=body)).json()
             raw = await _invoke(client.completions.with_raw_response.create, body)
-            responses.append(raw.parse())
+            parsed = raw.parse()
+            if not isinstance(parsed, SDKCompletion):
+                raise ValueError("a non-streaming completion request returned a stream")
+            responses.append(parsed)
             return raw.http_response.json()
 
         return answered
@@ -707,9 +715,12 @@ class OpenAICompletion:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
-        create: Callable[..., Awaitable[AsyncStream[OpenAIResponse]]] = self._async().completions.create
+        from openai import AsyncStream
+
         own = self._own_stops(parameters, max_new_tokens)
-        answer = await _invoke(create, fields)
+        answer = await _invoke(self._async().completions.create, fields)
+        if not isinstance(answer, AsyncStream):
+            raise ValueError("a streaming completion request returned a whole response")
         return answer if own is None else AsyncChecked(answer, own)
 
     async def achat(
