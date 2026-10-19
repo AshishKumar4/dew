@@ -46,6 +46,9 @@ def engine(provider, answer):
 
     def network(request):
         calls.append(json.loads(request.content))
+        if request.url.path.endswith("/detokenize"):
+            # SGLang's decoding of a continued draw's ids (`dew.inference.continuation`).
+            return httpx2.Response(200, json={"text": "".join(f"<{token}>" for token in calls[-1]["tokens"])})
         return httpx2.Response(200, json={"id": "fixture", "model": "tiny", "created": 1,
                                           "object": "text_completion", "choices": [answer(calls[-1])]})
 
@@ -62,7 +65,7 @@ def choice(provider, ids, logprobs, reason):
         rendered, listed = [f"<{token}>" for token in ids], {"token_ids": list(ids)}
     return {"index": 0, "text": "", "finish_reason": reason, **listed,
             "logprobs": {"tokens": rendered, "token_logprobs": logprobs,
-                         "top_logprobs": None, "text_offset": [0] * len(ids)}}
+                         "top_logprobs": None, "text_offset": [0 if provider == "vllm" else -1] * len(ids)}}
 
 
 def pushed(variables, version):
