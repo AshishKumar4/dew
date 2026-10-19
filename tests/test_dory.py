@@ -624,8 +624,4 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                 draws.append((np.take_along_axis(found, columns, axis=1), theirs['columns'][index],
                               on_columns))
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
-            sizes = np.sqrt(np.mean(np.square(truth), axis=1))
-            # Each entry is the hidden state's product with its head row, accumulated in fp32.
-            assert_elements_as_exact_over_orders(squares, theirs['squares'], sizes,
-                                                 f'Dory 4B {key}, every entry',
-                                                 reductions=loaded.model.emb_features, dtype=jnp.float32)
+            assert_elements_as_exact_over_orders(squares, theirs['squares'], f'Dory 4B {key}, every entry')
