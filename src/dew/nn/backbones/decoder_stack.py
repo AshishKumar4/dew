@@ -26,7 +26,7 @@ from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
-from .layer_plan import LayerSpec, group_layers, group_name, run_period
+from .layer_plan import LayerSpec, group_layers, group_name
 
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
@@ -309,7 +309,8 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              kv_store, per_layer_input, attention_metadata=None, banked: bool = False):
+              kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
+              periods: Sequence[int] = ()):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -329,8 +330,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     instead, with map_variables staging one row under remat, so the backward
     refetches the pinned bank rather than keeping a device copy.
     """
-    runs = [layers[first] if count == 1 else _run_module(block, specs, first, count)
-            for first, count in groups]
+    runs = [layers[first] if count == 1 else _run_module(block, specs, first, count,
+                                                         periods[index] if periods else 1)
+            for index, (first, count) in enumerate(groups)]
     streaming = any('streaming' in run.variables for run in runs)
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
@@ -403,11 +405,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _run_module(block: Block, specs: Sequence[LayerSpec], first: int,
-                count: int) -> DecoderBlock | PeriodBlock:
+def _run_module(block: Block, specs: Sequence[LayerSpec], first: int, count: int,
+                period: int) -> DecoderBlock | PeriodBlock:
     """The module a scanned run of `count` layers from `first` repeats: one layer for like layers,
-    a `PeriodBlock` of its period's layers for a periodic run, named for the run's range."""
-    period = run_period(specs, first, count)
+    a `PeriodBlock` of its `period` layers for a periodic run (`StackView.periods`), named for
+    the run's range."""
     if period == 1:
         return block(first, group_name(first, count))
     positions = tuple(range(first, first + period))
@@ -529,15 +531,17 @@ def _stack_leaves(*trees):
 
 
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
-    """Refuse layers one scanned run or the stages' like positions read whose
-    `collection` differs in structure, as layers a checkpoint quantizes
-    differently do; the run reads one body for all of them."""
+    """Refuse layers one bank or the pipeline stages' like positions read
+    whose `collection` differs in structure, as layers a checkpoint quantizes
+    differently do: a bank is one array per leaf, and every stage runs stage
+    0's body. Layers held apart run as scanned runs of their own instead
+    (`StackView.layer_structures`)."""
     structures = [jax.tree.structure(tree) for tree in trees]
     unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
     if unlike:
         raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
-                         "which one scanned run or pipeline stage reads as like layers; run these layers "
-                         "unscanned on one stage")
+                         "which one bank or pipeline stage reads as like layers; hold these layers "
+                         "unbanked, on one stage")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -588,6 +592,29 @@ class StackView:
         """The stored names of a run's layers, one list per stage."""
         return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
                 for stage in range(self.stages)]
+
+    @staticmethod
+    def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
+        """What one scanned body has to share beyond its spec, for each of `layers`
+        stored layers: the runs a collection holds as one bank (`layers_3_7`) that
+        hold it, and the structure of its subtree in every collection that keeps
+        one per layer (`layers_N`), as layers a checkpoint quantizes differently,
+        or adapts in part, differ. A banked run stays the run its store holds
+        (`bank_sites`), each of its layers read as its first, so rows it holds
+        unlike are refused by name where they stack (`StackView.stack`). A
+        collection no layer is held in adds nothing."""
+        banks: list[tuple[str, ...]] = [()] * layers
+        read = list(range(layers))
+        for name in sorted({name for tree in variables.values() for name in tree}):
+            run = group_layers(name)
+            if run is not None and len(run) > 1:
+                for index in range(run.start, min(run.stop, layers)):
+                    banks[index] += (name,)
+                    read[index] = min(read[index], run.start)
+        own = [tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
+                     for collection, tree in sorted(variables.items()) if f'layers_{index}' in tree)
+               for index in range(layers)]
+        return tuple((held, own[first]) for held, first in zip(banks, read, strict=True))
 
     @staticmethod
     def _positions(first: int, count: int, period: int) -> list[list[str]]:

@@ -8,7 +8,7 @@ specs, and `nn.scan` stacks each run into one group.
 """
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 
 from dew.registry import read_arguments
 
@@ -160,14 +160,16 @@ class LayerSpec:
     """Whether the block norms its attention input; ModernBERT's first block does not."""
 
 
-def scan_groups(specs: Sequence[LayerSpec], bank_layers: int | None = None, *,
+def scan_groups(specs: Sequence[Hashable], bank_layers: int | None = None, *,
                 periodic: bool = False) -> tuple[tuple[int, int], ...]:
     """The stack as runs of layers, `(first, count)` each, in order.
 
     Consecutive layers with equal specs form one run, which a scan runs as
     iterations of one body; a layer with no equal neighbour is a run of one,
     which stays unrolled. The grouping is read off the specs, never written
-    by hand, so a model's pattern decides what scans.
+    by hand, so a model's pattern decides what scans. A spec is a layer's
+    `LayerSpec`, or that with what else one body has to share, as the
+    structure of the layer's variables (`CausalTransformer.scan_keys`).
 
     `periodic` lets a run repeat a period of several layers, which a scan runs
     as iterations of one body of the period's layers (`run_period` reads the
@@ -202,7 +204,7 @@ def scan_groups(specs: Sequence[LayerSpec], bank_layers: int | None = None, *,
     return tuple(groups)
 
 
-def run_period(specs: Sequence[LayerSpec], first: int, count: int) -> int:
+def run_period(specs: Sequence[Hashable], first: int, count: int) -> int:
     """The shortest period whose repeats are the run of `count` layers from `first`: one for a run
     of like layers, the period `scan_groups(periodic=True)` found for a periodic one."""
     run = specs[first:first + count]
