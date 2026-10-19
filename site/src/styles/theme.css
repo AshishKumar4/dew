@@ -319,18 +319,6 @@ header.header {
 
 /* Tutorial pages: each code cell with its recorded outputs. */
 
-.sl-markdown-content .nb-provenance {
-	margin-top: 2.5rem;
-	padding-top: 1rem;
-	border-top: 1px solid var(--dew-rule);
-	font-size: var(--sl-text-sm);
-	color: var(--dew-muted);
-}
-
-.sl-markdown-content .nb-provenance a {
-	color: inherit;
-}
-
 .sl-markdown-content .nb-cell {
 	margin-top: 1.5rem;
 }
@@ -423,6 +411,36 @@ header.header {
 
 .sl-markdown-content .nb-output.nb-html table {
 	font-size: 0.78rem;
+}
+
+/* Figures drawn by dew.figures, in a tutorial's text (.nb-figure) or in its outputs. Each keys
+   its own light and dark colors to data-theme, so only its size is set here: it scales down with
+   the column. A figure with a phone layout comes as a pair, and the narrow one shows below 40rem. */
+
+.sl-markdown-content svg.dew-figure {
+	display: block;
+	max-width: 100%;
+	height: auto;
+}
+
+.sl-markdown-content .nb-figure {
+	margin-block: 1.25rem;
+}
+
+.sl-markdown-content .nb-figure-narrow {
+	display: none;
+}
+
+@media (max-width: 40rem) {
+	.sl-markdown-content .nb-output.nb-html {
+		padding: 0.5rem;
+	}
+	.sl-markdown-content .nb-figure-pair .nb-figure-wide {
+		display: none;
+	}
+	.sl-markdown-content .nb-figure-pair .nb-figure-narrow {
+		display: block;
+	}
 }
 
 /* The tutorials grid, on /tutorials/ and on the landing page. */

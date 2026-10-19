@@ -31,7 +31,6 @@ NEWREPO.md
 .claude/
 .venv/
 .worktrees/
-tutorials/executed/
 samples/
 .pytest_cache/
 build/
