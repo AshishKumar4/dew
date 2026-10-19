@@ -19,8 +19,8 @@ import tomllib
 import urllib.parse
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import BinaryIO, Protocol, TypedDict, runtime_checkable
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
 import fsspec
 from filelock import FileLock, Timeout
@@ -362,6 +362,18 @@ class Versioned:
     version: str
 
 
+class Readable(NamedTuple):
+    """Where an object's bytes are read (`Store.readable`): the filesystem,
+    the object's path on it, and, where a copy is read (a Hub revision's
+    downloaded snapshot), the directory the copy's own paths start at; the
+    names above it are the copy's location's, not the object's. None where
+    the object is read in place."""
+
+    fs: AbstractFileSystem
+    path: str
+    root: str | None
+
+
 @dataclass(frozen=True)
 class Store:
     """An object URL with compare-and-swap publication and verified uploads.
@@ -391,7 +403,7 @@ class Store:
                 options.pop(cache, None)
         return fsspec.core.url_to_fs(self.url, **options)
 
-    def readable(self) -> tuple[AbstractFileSystem, str]:
+    def readable(self) -> Readable:
         """Where this object's bytes are read: a Hub repository's file at a
         commit is read from huggingface_hub's own cache where that holds it, as
         huggingface_hub reads its files, so a downloaded revision reads offline
@@ -399,13 +411,14 @@ class Store:
         Hub file the cache lacks, where `resolve` places it."""
         fs, path = self.resolve()
         if isinstance(fs, HfFileSystem):
-            uri = parse_hf_uri(self.url)
+            uri = parse_hf_uri(f"hf://{path}")
             if uri.revision is not None and REGEX_COMMIT_HASH.fullmatch(uri.revision):
                 held = try_to_load_from_cache(uri.id, uri.path_in_repo, revision=uri.revision,
                                               repo_type=uri.type)
                 if isinstance(held, str):
-                    return LocalFileSystem(), held
-        return fs, path
+                    depth = len(PurePosixPath(uri.path_in_repo).parts)
+                    return Readable(LocalFileSystem(), held, str(Path(held).parents[depth - 1]))
+        return Readable(fs, path, None)
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
