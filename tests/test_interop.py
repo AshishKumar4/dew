@@ -26,7 +26,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
-safetensors_numpy = pytest.importorskip("safetensors.numpy")
+safetensors_numpy = import_module("safetensors.numpy")
 safetensors = import_module("safetensors")
 
 

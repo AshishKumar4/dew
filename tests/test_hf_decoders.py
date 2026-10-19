@@ -689,17 +689,7 @@ def biased_qwen3(rng):
         for index, (path, leaf) in enumerate(leaves)])
 
 
-def qwen3_is_available() -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    cached = try_to_load_from_cache("Qwen/Qwen3-0.6B", "model.safetensors")
-    return isinstance(cached, str)
-
-
 @pytest.mark.network
-@pytest.mark.skipif(not qwen3_is_available(),
-                    reason="Qwen3-0.6B is neither cached nor DEW_NETWORK_TESTS=1")
 def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     """The real thing: 28 layers of Qwen3-0.6B, fp32, against torch's top 32."""
     prompt = json.loads((REAL / "prompt.json").read_text())

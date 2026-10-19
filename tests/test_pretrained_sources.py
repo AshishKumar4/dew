@@ -16,10 +16,9 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 import pytest
+import safetensors.numpy as safetensors_numpy
 
 from dew.interop import hf_decoders, sources
-
-safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -35,7 +34,6 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     over 32768 positions at base 1e6, plus vLLM's attn_factor, which
     transformers neither validates nor reads. The frequencies and the cos/sin
     scale are the reference's own `ROPE_INIT_FUNCTIONS['yarn']` values."""
-    pytest.importorskip("torch")
     from transformers import Qwen3Config
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
