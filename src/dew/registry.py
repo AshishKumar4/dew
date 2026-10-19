@@ -849,10 +849,12 @@ def _record_class(member: Callable[..., Configured]) -> type | None:
         return None
     # The generated constructor takes the init fields, InitVars among them, in any order
     # keyword-only ones give it; a constructor of the class's own takes other names. The names
-    # are read from its code, not its signature, whose annotations may name a type not yet bound.
-    code = getattr(member.__init__, "__code__", None)
-    if code is None:
+    # are read from its code (under any wrapper, as Flax wraps a module's), not its signature,
+    # whose annotations may name a type not yet bound.
+    constructor = inspect.unwrap(member.__init__)
+    if not isinstance(constructor, types.FunctionType):
         return None
+    code = constructor.__code__
     taken = set(code.co_varnames[1:code.co_argcount + code.co_kwonlyargcount])
     fields = {f.name for f in dataclasses.fields(member) if f.init}
     return member if fields <= taken <= set(member.__dataclass_fields__) else None
