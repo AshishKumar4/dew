@@ -675,6 +675,15 @@ class Cropped:
 
 
 @dataclasses.dataclass(frozen=True)
+class CroppedTokens:
+    """`Cropped` over a row whose tokens a projection named `tokens`."""
+
+    def __call__(self, row):
+        half = len(row["tokens"]) // 2
+        return {**row, "tokens": row["tokens"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
 class Relabelled:
     """A step that changes only a token row's id, leaving its tokens and roles as they were."""
 
@@ -778,12 +787,15 @@ def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-@pytest.mark.parametrize("after", ["renamed-roles", "selected-then-copied", "counted-again-then-copied",
-                                   "encoded-and-decoded"])
+@pytest.mark.parametrize("after", ["renamed-roles", "renamed-roles-then-copied",
+                                   "renamed-text-then-cropped", "selected-then-copied",
+                                   "counted-again-then-copied", "encoded-and-decoded"])
 def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets(read, after):
     """A row's count, by its role's rule, holds through steps that change no target: its roles
-    renamed, its fields narrowed and then copied, the bytes of an encoding and back; and a second
-    count, by the plain rule, replaces the first one's rule with its own, which a later copy keeps.
+    renamed, and copied after, its fields narrowed and then copied, the bytes of an encoding and
+    back; a crop of tokens a projection renamed counts them again under their new name; and a
+    second count, by the plain rule, replaces the first one's rule with its own, which a later copy
+    keeps.
     Two corpora whose rows score one and three role-1 targets, or seven plain ones each, deliver
     equal targets by the rule last counted, to within one row of each (`delivered`)."""
     from dew.data.steps.text import CountTargets
@@ -792,6 +804,11 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
         chain = Pipeline(roled(source, 8, scored), name=str(source)).filter_map(CountTargets(role=1))
         if after == "renamed-roles":
             return chain.rename_columns({"text_roles": "roles"})
+        if after == "renamed-roles-then-copied":
+            return chain.rename_columns({"text_roles": "roles"}).map(Copied())
+        if after == "renamed-text-then-cropped":
+            return (chain.rename_columns({"text": "tokens"}).map(CroppedTokens())
+                    .rename_columns({"tokens": "text"}))
         if after == "selected-then-copied":
             return chain.select_columns("text", "text_roles", "source").map(Copied())
         if after == "counted-again-then-copied":
@@ -799,9 +816,27 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
         return chain.map(Encoded()).map(Restored())
 
     role = None if after == "counted-again-then-copied" else 1
-    left, right = delivered([corpus(0, 1), corpus(1, 3)], role, read)
-    bound = 7 + 7 if role is None else 1 + 3
+    # A crop halves a row's six role-1 targets to three and leaves the other's two as they were.
+    scored = (6, 2) if after == "renamed-text-then-cropped" else (1, 3)
+    left, right = delivered([corpus(0, scored[0]), corpus(1, scored[1])], role, read)
+    bound = {None: 7 + 7, 1: 3 + 2 if after == "renamed-text-then-cropped" else 1 + 3}[role]
     assert abs(left - right) <= bound
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_tokenized_rows_pack_by_concatenation(read):
+    """Rows a tokenizer made, which carry Dew's own record of their lengths, pack by concatenation
+    into windows of the packed field alone."""
+    from dew.data.text import Tokenize
+
+    rows = Memory(tuple({"text": "abcdefgh"[: 3 + index % 5]} for index in range(12)))
+    chain = Pipeline(rows).map(Tokenize()).pack(4, policy="concat").batch(2)
+    stream = compile(chain, read=read, loading=READ).train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert np.asarray(batch["text"]).shape == (2, 4)
 
 
 def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
