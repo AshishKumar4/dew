@@ -237,8 +237,10 @@ def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]
                 outputs = [_accumulated(inputs[0], tuple(equation.params["shape"]),
                                         tuple(equation.params["broadcast_dimensions"]))]
             else:
-                functions, params = equation.primitive.get_bind_params(equation.params)
-                outputs = equation.primitive.bind(*functions, *inputs, **params)
+                # As `jax.core.eval_jaxpr` binds an equation.
+                params = equation.primitive.get_bind_params(equation.params)
+                with equation.ctx.manager:
+                    outputs = equation.primitive.bind(*inputs, **params)
                 outputs = outputs if equation.primitive.multiple_results else [outputs]
             held.update(zip(equation.outvars, outputs, strict=True))
         return [read(var) for var in jaxpr.outvars]
