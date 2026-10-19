@@ -390,6 +390,15 @@ def _members(pipelines: Sequence[Pipeline]) -> list[str]:
             for pipeline in pipelines]
 
 
+def _member_keys(members: Sequence[str]) -> list[str]:
+    """Each mixture member's key: the name it goes by (`_members`), as the plan's order records it
+    for every read alike, with its place among the members of that name, so two such members are
+    apart. A member's draws and its saved position are keyed by it, so adding or removing another
+    member leaves them as they were."""
+    return [f"{sum(earlier == name for earlier in members[:index])}:{name}"
+            for index, name in enumerate(members)]
+
+
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it.
     A cache stage is its kind alone. The plan names the rows a cache serves
