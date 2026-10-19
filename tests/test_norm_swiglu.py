@@ -690,7 +690,8 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
     reference = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
                              jax.jit(composed("xla"))(operands[0], tangent, *operands[1:]))
     with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(leaf, np.float64)) for leaf in (operands[0], tangent, *operands[1:])]
+        wide = [None if leaf is None else jnp.asarray(np.asarray(leaf, np.float64))
+                for leaf in (operands[0], tangent, *operands[1:])]
         truth = jax.tree.map(np.asarray, composed("xla")(*wide))
     for mine, theirs, want in zip(jax.tree.leaves(found), jax.tree.leaves(reference), jax.tree.leaves(truth),
                                   strict=True):
