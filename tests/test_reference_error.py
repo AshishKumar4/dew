@@ -18,6 +18,7 @@ from reference_error import (
     assert_rows_as_exact_over_orders,
     distance,
     element_factor,
+    error_spread,
     reduce,
 )
 
@@ -182,39 +183,82 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
         assert_rows_as_exact_over_orders(dew, reference, "one row")
 
 
-def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more():
+def _summed_over_orders(errors):
+    """Each element's absolute and squared errors summed over its orders, `errors` `[ORDERS, ...]`."""
+    return np.sum(np.abs(errors), axis=0), np.sum(np.square(errors), axis=0)
+
+
+@pytest.mark.parametrize("tails", ["gaussian", "laplace", "student-t5"])
+def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more(tails):
     """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`), each held to the
-    reference's own error at it: 64 rows of 4096 elements rounding alike pass, as do elements both
-    compute exactly; an element Dew rounds where the reference is exact in every order fails, as does
-    one whose error the reference has elsewhere in its row, one rounding five times as far and a
-    non-finite one. At 43.5M elements the derived factor is 3.16."""
+    reference's own mean absolute error at it, for errors of a Gaussian's tails and heavier ones, as
+    a bf16 rounding's flips give: 64 rows of 4096 elements rounding alike pass, as do elements both
+    compute exactly; an element Dew rounds where the reference is exact in every order fails, as do
+    one whose error the reference has elsewhere in its row, one rounding twice its row's derived
+    factor as far, and a non-finite one."""
     rng = np.random.default_rng(6)
-    shape, spread = (64, 4096), 3e-6
+    shape = (64, 4096)
+    draw = {"gaussian": lambda: rng.standard_normal((ORDERS, *shape)),
+            "laplace": lambda: rng.laplace(size=(ORDERS, *shape)),
+            "student-t5": lambda: rng.standard_t(5, size=(ORDERS, *shape))}[tails]
+    spread = 3e-6
+    dew, reference = (_summed_over_orders(spread * draw()) for _ in range(2))
 
-    def squares():
-        return np.sum(np.square(spread * rng.normal(size=(ORDERS, *shape))), axis=0)
+    def held(dew, reference, label):
+        assert_elements_as_exact_over_orders(dew[0], reference[0], label, dew_squares=dew[1],
+                                             reference_squares=reference[1])
 
-    dew, reference = squares(), squares()
-    assert_elements_as_exact_over_orders(dew, reference, "alike")
-    both, exact = dew.copy(), reference.copy()
-    both[:, :8], exact[:, :8] = 0, 0
-    assert_elements_as_exact_over_orders(both, exact, "both exact")
+    held(dew, reference, "alike")
+    both, exact = (tuple(side.copy() for side in sums) for sums in (dew, reference))
+    for side in (*both, *exact):
+        side[:, :8] = 0
+    held(both, exact, "both exact")
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(dew, exact, "exact only in the reference")
-    moved, misplaced = reference.copy(), dew.copy()
-    moved[3, 0], moved[3, 1] = ORDERS * (30 * spread) ** 2, 0
-    misplaced[3, 0], misplaced[3, 1] = 0, ORDERS * (30 * spread) ** 2
+        held(dew, exact, "exact only in the reference")
+    moved, misplaced = (tuple(side.copy() for side in sums) for sums in (reference, dew))
+    for sums, (at, away) in ((moved, (0, 1)), (misplaced, (1, 0))):
+        sums[0][3, at], sums[1][3, at] = ORDERS * 30 * spread, ORDERS * (30 * spread) ** 2
+        sums[0][3, away], sums[1][3, away] = 0, 0
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(misplaced, moved, "misplaced")
-    wrong = dew.copy()
-    wrong[5, 17] = ORDERS * (5 * 4 * spread) ** 2
+        held(misplaced, moved, "misplaced")
+    spreads = error_spread(np.concatenate([dew[0], reference[0]], axis=1),
+                           np.concatenate([dew[1], reference[1]], axis=1))
+    factor = float(element_factor(dew[0].size, spreads[5]))
+    wrong = tuple(side.copy() for side in dew)
+    wrong[0][5, 17], wrong[1][5, 17] = (2 * factor * reference[0][5, 17],
+                                        (2 * factor) ** 2 * reference[1][5, 17])
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(wrong, reference, "one element")
-    broken = dew.copy()
-    broken[0, 0] = np.nan
+        held(wrong, reference, "one element")
+    broken = tuple(side.copy() for side in dew)
+    broken[0][0, 0] = np.nan
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(broken, reference, "nan")
-    assert round(element_factor(332 * 131072), 2) == 3.16
+        held(broken, reference, "nan")
+
+
+def test_the_element_factor_widens_with_the_errors_tails_and_the_element_count():
+    """The derived factor (`element_factor`): 3.06 at 43.5M elements of a Gaussian's spread, wider
+    for a Laplace's (spread 2), and at least FACTOR; the spread is each row's pooled over its
+    elements (`error_spread`), a Gaussian's where none moves."""
+    assert round(float(element_factor(332 * 131072)), 2) == 3.06
+    assert float(element_factor(332 * 131072, 2.0)) > float(element_factor(332 * 131072)) >= FACTOR
+    assert float(error_spread(np.zeros((1, 4)), np.zeros((1, 4)))[0]) == pytest.approx(np.pi / 2)
+
+
+def test_elements_held_over_orders_keep_their_false_failures_on_heavy_tails():
+    """Two runs as exact as each other, their errors Student-t with 3 degrees of freedom over ORDERS
+    orders (heavier-tailed than any rounding the suite saw, kurtosis past 7), held at a per-element
+    rate of 1e-3: under 2e-3 of 200000 elements fail, where the RMS ratio's F(ORDERS, ORDERS) bound
+    failed 1.4e-2 of them."""
+    from scipy import stats
+
+    rng = np.random.default_rng(9)
+    n = 200_000
+    (mine, mine_squares), (theirs, theirs_squares) = (
+        _summed_over_orders(rng.standard_t(3, size=(ORDERS, n))) for _ in range(2))
+    spread = float(error_spread(np.concatenate([mine, theirs])[None],
+                                np.concatenate([mine_squares, theirs_squares])[None])[0])
+    factor = np.exp(stats.norm.isf(1e-3) * np.sqrt(2 * (spread - 1) / ORDERS))
+    assert np.mean(mine > factor * theirs) < 2e-3
 
 
 def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(tmp_path):
