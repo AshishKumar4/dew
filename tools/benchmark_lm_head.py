@@ -41,7 +41,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels.tuning import samples
 from dew.nn.protocols import OutputTable
-from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, vocabulary_chunks
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
 
 # The loss owns the measured default; reading it keeps one source for it.
 DEFAULT_TILE = inspect.signature(chunked_cross_entropy).parameters["tile"].default
@@ -130,7 +130,9 @@ def retained(states, table, targets, variant: Variant):
 
     if variant.head == "remat":
         tile = jax.checkpoint(tile)
-    for start, stop in vocabulary_chunks(table.shape[0], variant.chunks):
+    width = tile_columns(table.shape[0], variant.chunks, table.shape[0])
+    for start in range(0, table.shape[0], width):
+        stop = min(start + width, table.shape[0])
         inside = (labels >= start) & (labels < stop)
         column = jnp.clip(labels - start, 0, stop - start - 1)
         chunk_z, picked, chunk_best, chunk_column = tile(
@@ -203,7 +205,7 @@ def executable_bytes(executable) -> dict[str, int] | None:
 def measure(variant: Variant, shape: Shape) -> dict[str, object]:
     if min(shape.batch, shape.sequence, shape.features, shape.vocab, shape.repeats) < 1:
         raise ValueError("All workload dimensions and repeats must be positive")
-    vocabulary_chunks(shape.vocab, variant.chunks)
+    tile_columns(shape.vocab, variant.chunks, shape.vocab)
     hidden = jax.random.normal(
         jax.random.PRNGKey(0),
         (shape.batch, shape.sequence, shape.features),
