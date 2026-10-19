@@ -142,14 +142,14 @@ def model_logits(model, variables, read) -> jax.Array:
     return table.logits(read)
 
 
-def _without(logits, first, excluded):
+def _without(logits, first, excluded, *, value: float = -jnp.inf):
     """`logits` of the columns from `first` on, with column `excluded` (a
-    traced id) given no mass: -inf, so its probability is 0. With None the
-    logits pass untouched and the program holds no comparison."""
+    traced id) given no mass: -inf, so its probability is 0, or `value`. With
+    None the logits pass untouched and the program holds no comparison."""
     if excluded is None:
         return logits
     columns = first + jax.lax.broadcasted_iota(jnp.int32, logits.shape, logits.ndim - 1)
-    return jnp.where(columns == excluded, -jnp.inf, logits)
+    return jnp.where(columns == excluded, value, logits)
 
 
 class _Columns(NamedTuple):
@@ -442,7 +442,9 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, 
     target outside the tile one-hots to zero rather than to a wrapped
     column."""
     probabilities = jnp.exp(_without(logits, first, excluded) - peaks[:, None]) / masses[:, None]
-    selected = jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype)
+    # A target at the excluded column scores a constant +inf, which no logit moves.
+    selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
+                        excluded, value=0)
     if picked:
         return d_partition[:, None] * probabilities + d_first[:, None] * selected
     return (d_first + d_partition)[:, None] * probabilities - d_first[:, None] * selected
