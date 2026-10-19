@@ -915,12 +915,76 @@ def jepa_step_figure():
     svg.save(HERE / "jepa-step.svg")
 
 
+def cfg_step_figure():
+    """Classifier-free guidance as arrows: the model's prediction with the caption and without it, the
+    difference between them, and the guided prediction that follows the difference further."""
+    width, height = 440, 300
+    origin, uncond, cond, scale = np.array([60.0, 230.0]), np.array([150.0, -40.0]), np.array([170.0, -95.0]), 2.2
+    guided = uncond + scale * (cond - uncond)
+    svg = Figure(width, height, seconds=11, label="Classifier-free guidance. From the noisy image, the model's "
+                 "prediction without a caption and with the caption 'a red rose'; their difference points where "
+                 "the caption pulls, and the guided prediction follows it further, here at scale 2.2.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.circle(*origin, 6, fill="text")
+    svg.text(origin[0] - 8, origin[1] + 24, "xₜ", size=14, mono=True)
+    with svg.group() as plain:
+        svg.arrow(*origin, *(origin + uncond), color="muted", width=2)
+        svg.text(*(origin + uncond + [8, 18]), "no caption", size=13, color="muted")
+    svg.appear(plain, 0.4)
+    with svg.group() as captioned:
+        svg.arrow(*origin, *(origin + cond), color="text", width=2)
+        svg.text(*(origin + cond + [20, 6]), "“a red rose”", size=13)
+    svg.appear(captioned, 1.4)
+    pull = svg.line(*(origin + uncond), *(origin + cond), color="accent", width=1.5, dash="4 4")
+    svg.appear(pull, 2.6)
+    svg.appear(svg.text(*(origin + (uncond + cond) / 2 + [10, 10]), "the caption's pull", size=13,
+                        color="accent"), 2.8)
+    with svg.group() as followed:
+        svg.line(*(origin + cond), *(origin + guided), color="accent", width=1.5, dash="4 4")
+        svg.arrow(*origin, *(origin + guided), color="accent", width=2.5)
+        svg.text(*(origin + guided + [-40, -14]), f"guided, s = {scale:g}", size=13, color="accent", weight=600)
+    svg.appear(followed, 4.2)
+    svg.appear(svg.text(24, 32, "ε_guided = ε_uncond + s (ε_cond − ε_uncond)", size=13, mono=True), 5.2)
+    svg.save(HERE / "cfg-step.svg")
+
+
+def cfg_sweep_figure():
+    """The guided prediction as the scale s sweeps from 0 to 6: at 0 the plain prediction, at 1 the captioned
+    one, past 1 further along the caption's pull."""
+    width, height = 440, 270
+    origin, uncond, cond = np.array([40.0, 236.0]), np.array([100.0, -10.0]), np.array([125.0, -40.0])
+    scales = [0, 1, 2, 3, 4, 6]
+    svg = Figure(width, height, seconds=11, label="The guided prediction as the guidance scale grows from 0 to 6: "
+                 "at 0 it is the prediction without a caption, at 1 the captioned one, and past 1 it reaches "
+                 "further along the caption's pull.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.circle(*origin, 6, fill="text")
+    far = uncond + scales[-1] * (cond - uncond)
+    svg.line(*(origin + uncond), *(origin + far), color="rule", width=1.25, dash="4 4")
+    svg.arrow(*origin, *(origin + uncond), color="muted", width=1.5)
+    svg.arrow(*origin, *(origin + cond), color="text", width=1.5)
+    svg.text(*(origin + uncond + [6, 20]), "s = 0", size=12, mono=True, color="muted")
+    svg.text(*(origin + cond + [-52, -8]), "s = 1", size=12, mono=True)
+    times = [0.5 + 1.1 * i for i in range(len(scales))]
+    arrows, readouts = [], []
+    for s_ in scales:
+        tip = origin + uncond + s_ * (cond - uncond)
+        arrows.append(svg.arrow(*origin, *tip, color="accent", width=2.5))
+        readouts.append(svg.text(width - 24, 36, f"s = {s_:g}", size=16, mono=True, weight=600, color="accent",
+                                 anchor="end"))
+    svg.show_in_turn(arrows, times)
+    svg.show_in_turn(readouts, times)
+    svg.text(24, 36, "guidance scale", size=13, color="muted")
+    svg.save(HERE / "cfg-sweep.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
-           "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure, "jepa-step": jepa_step_figure}
+           "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "jepa-step": jepa_step_figure}
 
 
 if __name__ == "__main__":
