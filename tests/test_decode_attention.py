@@ -5,13 +5,12 @@ through each row's page table (`dew.nn.kernels.decode_attention`), and the
 dense kernel's derivatives, which are the folded attention's. What runs on
 CUDA skips elsewhere; the derivatives' lowering for a GPU runs on any host."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, float64_terms
+from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from test_attention_splash import attention_terms
 
 from dew.nn.attention import scaled_dot_product_attention, with_key_lengths
 from dew.nn.decode_geometry import folded_attention
@@ -505,10 +504,11 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
         found = pulled(flash, query, key, value)
     reference = pulled(plain, query, key, value)
     with jax.enable_x64(new_val=True):
-        # Each row sized by the float64 terms its sums add (`float64_terms`), as the suite's other
-        # attention gradients are: a query that sees one key has a gradient its terms cancel to zero.
-        exact, terms = float64_terms(functools.partial(pulled, truth),
-                                     *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
+        exact = pulled(truth, *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
+    # Each row sized by the float64 terms of its sums as the suite's flash gradients are
+    # (`attention_terms`): a query that keeps one key has a gradient that cancels to zero, which a
+    # flash kernel forms from its rounded output.
+    terms = attention_terms(query, key, value, cotangent, mask)
     for name, mine, theirs, true, summed in zip(("out", "query", "key", "value"), found, reference, exact,
                                                 terms, strict=True):
         assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
