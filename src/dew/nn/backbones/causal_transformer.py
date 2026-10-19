@@ -105,29 +105,8 @@ from .decoder_block import (
 from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
-INTERMEDIATES = "intermediates"
+_INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
-
-
-def layer_outputs(module: nn.Module, method: str) -> bool:
-    """The `capture_intermediates` filter that keeps every layer's output.
-
-    It matches the `__call__` of the stack's `layers_N` modules, a scanned
-    run's `layers_3_7` and a pipeline stage's `layers_j` included, and
-    `StackView.unstack` lays what those sow out per layer, as the plain loop
-    does; `layer_output` reads one layer back.
-    """
-    return method == "__call__" and (module.name or "").startswith("layers_")
-
-
-def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]], index: int) -> jax.Array:
-    """Layer `index`'s output out of the collection `layer_outputs` filled."""
-    kept = intermediates.get(f"layers_{index}")
-    if kept is None:
-        held = sorted(int(name[len("layers_"):]) for name in intermediates
-                      if name.startswith("layers_") and name[len("layers_"):].isdigit())
-        raise ValueError(f"the model kept no layer {index}; it has layers {held}")
-    return kept["__call__"][0]
 
 
 @logical_axes({
@@ -1658,6 +1637,29 @@ class CausalTransformer(nn.Module):
     def hidden_states(self, tokens, **kwargs):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
+
+    def capture_layers(self, module: nn.Module, method: str) -> bool:
+        """The `capture_intermediates` filter that keeps every layer's output (`LayerStates`).
+
+        It matches the `__call__` of the stack's `layers_N` modules, a scanned
+        run's `layers_3_7` and a pipeline stage's `layers_j` included, and
+        `StackView.unstack` lays what those sow out per layer, as the plain loop
+        does; `layer_state` reads one layer back.
+        """
+        return method == "__call__" and (module.name or "").startswith("layers_")
+
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array:
+        """Layer `index`'s output out of what `capture_layers` kept (`LayerStates`): the last call's,
+        a looped layer's last pass. `index` counts as a Python index does, -1 the last layer."""
+        if not -self.num_layers <= index < self.num_layers:
+            raise ValueError(f"a {self.num_layers}-layer model has no layer {index}")
+        layer = index % self.num_layers
+        kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
+        if kept is None:
+            held = sorted(int(name[len("layers_"):]) for name in collections.get(_INTERMEDIATES, {})
+                          if name.startswith("layers_") and name[len("layers_"):].isdigit())
+            raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
+        return kept["__call__"][-1]
 
     def logits(self, tokens, *, train: bool = False, **fields):
         """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which

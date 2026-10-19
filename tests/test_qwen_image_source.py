@@ -213,24 +213,44 @@ def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded
 
 
 def test_the_prompt_states_are_the_decoders_own_last_layer_output():
-    """The conditioner embeds through the decoder's own path, so a decoder
-    that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier,
-    gives the conditioner the last layer's output of its own forward."""
-    from dew.inputs.diffusion import _residual_states
-    from dew.nn.backbones.causal_transformer import (
-        INTERMEDIATES,
-        CausalTransformer,
-        layer_output,
-        layer_outputs,
-    )
+    """The conditioner reads the decoder's layers through its own forward (`LayerStates`), so a
+    decoder that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier, gives the
+    conditioner the last layer's output: the decoder's layers over its own scaled embeddings."""
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
                               max_seq_len=16, embedding_scale=True, embedding_multiplier=12.0)
     ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
     params = model.init(jax.random.key(1), ids)
-    _, state = model.apply(params, ids, capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
-    np.testing.assert_array_equal(model.apply(params, ids, method=_residual_states),
-                                  layer_output(state[INTERMEDIATES], 1))
+
+    def layers(decoder, ids):
+        embedded = decoder.scaled_embeddings(decoder.token_embeddings(ids))
+        return decoder.stack(embedded, train=False, decode=False, per_layer_input=None)
+
+    (last,) = _layer_states(model, params, ids, (-1,))
+    np.testing.assert_array_equal(last, model.apply(params, ids, method=layers))
+
+
+def test_a_looped_layer_is_read_at_its_last_pass():
+    """A layer a loop runs twice is read at its last pass, which the final norm reads: the looped
+    stack's last layer, normed, is the model's hidden states, and its first pass is not."""
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
+
+    model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, loop=Loop(steps=2))
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
+    params = model.init(jax.random.key(1), ids)
+    (last,) = _layer_states(model, params, ids, (-1,))
+    hidden = model.apply(params, ids, method="hidden_states")
+    normed = model.apply(params, last, method=lambda decoder, x: decoder.norm(x))
+    np.testing.assert_array_equal(normed, hidden)
+    _, kept = model.apply(params, ids, method="hidden_states", capture_intermediates=model.capture_layers,
+                          mutable=["intermediates"])
+    first = kept["intermediates"]["layers_1"]["__call__"][0]
+    assert not np.array_equal(model.apply(params, first, method=lambda decoder, x: decoder.norm(x)), hidden)
 
 
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
