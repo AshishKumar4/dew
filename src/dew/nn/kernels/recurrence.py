@@ -94,13 +94,14 @@ def round_to_bf16(state, key, value):
 
 def update(state, query, key, value, decay, write, *, delta: bool):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
-    Dk]` (`exp(g)`) and `write` `[...]` the write gate: its output `[..., Dv]` and the updated state.
+    Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
+    `[..., Dv]` and the updated state.
     Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
     (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
     them and the write."""
     read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
-    written = corrected * write[..., None]
+    written = corrected * write
     out = read_query + jnp.sum(query * key, axis=-1, keepdims=True) * written
     return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
 
@@ -218,7 +219,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     value_heads, key_width, value_width = state.shape[1:]
     query, key, value, history = _prologue(hooks, operands, work)
     decay, write = _gates(hooks, operands, work, key_width)
-    out, updated = update(state.astype(work), query, key, value, decay, write, delta=hooks.delta)
+    out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
     if hooks.skip:
         out = out + operands.skip.astype(work)[None, :, None] * value
     if hooks.output is not None:
