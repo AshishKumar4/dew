@@ -263,6 +263,9 @@ class StoredWeights:
                                         functools.partial(_hub_header, self.name_or_dir, self.directory.name,
                                                           file)).value
                 except OfflineModeIsEnabled:
+                    _log.warning("%s at %s: offline, and the header of %s was never read online, so the "
+                                 "pipeline binds without the layouts its export writes by; one online "
+                                 "run records them", self.name_or_dir, self.directory.name, file)
                     return None
                 specs = {name: stored_spec(name, shape, tag, file) for name, (shape, tag) in header.items()}
             held.update({name: (file, spec) for name, spec in specs.items()})
