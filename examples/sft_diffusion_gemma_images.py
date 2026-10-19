@@ -36,9 +36,8 @@ import tyro
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.data import Augment, ImageData, loader
-from dew.data import ByteTokenizer, Files, Hub, Loading, Source
+from dew.data import ByteTokenizer, Concatenate, Files, Hub, Loading, Source
 from dew.data.dataset import DataPartition
-from dew.data.sources.concatenate import Concatenate
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
