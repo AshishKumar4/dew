@@ -227,20 +227,25 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
     """T28: the FID weights are a pickle written under numpy 1, whose array
     reconstructor now lives behind a shim that warns on every attribute read,
     so `pickle.load` could not read them under numpy 2 with the suite's
-    filters. The loader resolves the numpy names at their current home, which
-    also means it can allow exactly those names and refuse the rest, so a
-    downloaded pickle cannot run code."""
+    filters. The loader builds the arrays its allowed numpy names stand for from
+    numpy's public API and refuses every other name, so a downloaded pickle
+    cannot run code. Protocol 4 pickles an array through numpy's
+    `_reconstruct`, protocol 5 through `_frombuffer`, whose 'K' layout carries
+    the axis order of a transposed array."""
     import pickle
 
     from dew.interop.inception_fid import load_arrays
 
-    tree = {"conv": {"kernel": np.arange(6, dtype=np.float32).reshape(2, 3),
-                     "bias": np.zeros(3, np.float32)}}
-    path = tmp_path / "weights.pickle"
-    path.write_bytes(pickle.dumps(tree))
-    loaded = load_arrays(path)
-    assert set(loaded) == {"conv"} and set(loaded["conv"]) == {"kernel", "bias"}
-    assert np.array_equal(loaded["conv"]["kernel"], tree["conv"]["kernel"])
+    kernel = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    tree = {"conv": {"kernel": kernel, "bias": np.zeros(3, np.float32),
+                     "fortran": np.asfortranarray(kernel), "permuted": kernel.transpose(2, 0, 1)}}
+    for protocol in (4, 5):
+        path = tmp_path / f"weights-{protocol}.pickle"
+        path.write_bytes(pickle.dumps(tree, protocol=protocol))
+        loaded = load_arrays(path)
+        assert set(loaded) == {"conv"} and set(loaded["conv"]) == set(tree["conv"])
+        for name, value in tree["conv"].items():
+            np.testing.assert_array_equal(loaded["conv"][name], value)
 
     hostile = tmp_path / "hostile.pickle"
     hostile.write_bytes(pickle.dumps(print))

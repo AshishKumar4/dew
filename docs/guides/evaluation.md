@@ -56,7 +56,7 @@ Each row has nine IDs. The model reads the first eight and predicts the last eig
 | `LMObjective` | Teacher-forced `TokenScores`. |
 | Diffusion | One generated image or video per real row. |
 | JEPA | Representations. |
-| Masked diffusion | Generated token rows, one batch's worth, undecoded, for custom text metrics. These are not teacher-forced perplexity and not held-out NELBO. |
+| Masked diffusion | `TokenScores`: each token's weighted negative ELBO, the held-out NELBO and `Perplexity()` read. Generated rows come from `preview`. |
 
 A `Metric[S]` declares which artifact type it `reads`. It computes one batch's sufficient statistics with `__call__`, adds them to the running total with `merge(accumulated, contribution)`, and reports its scalar with `finalize(accumulated)`. The first contribution starts the pass, so a metric has no separate initial value. The trainer keeps only the accumulator and the current contribution, and metric instances keep no state between calls. An accumulator belongs to one pass, so a metric may merge into its own NumPy buffers in place.
 

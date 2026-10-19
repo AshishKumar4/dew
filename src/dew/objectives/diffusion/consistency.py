@@ -35,11 +35,9 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
-from dew.nn.protocols import TimeScaled
 from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables, part
 from dew.sampling.guidance import guide
 
-from .few_step import SMOOTH_TIME_SCALE
 from .objective import FAKE_SCORE, FlowDistillationObjective
 
 Velocity = Callable[[jax.Array, jax.Array], jax.Array]
@@ -220,9 +218,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     is refused. Sampling runs the student's multistep consistency solver,
     `Consistency`.
 
-    sCM's loss differentiates the student with respect to time, so the
-    student's time embedding must be smooth in time. A run config sets
-    `simple_dit(time_scale=0.002)` for this, in place of the default 16.
+    sCM's loss differentiates the student with respect to time. The
+    recommended training default is `simple_dit(time_scale=0.002)`; other
+    continuous Fourier scales remain differentiable.
     """
 
     network = FAKE_SCORE
@@ -243,14 +241,6 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         if isinstance(schedule, FlowMatchingScheduler) and schedule.shift != 1.0:
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
-        # The student starts from the teacher's time features, and sCM
-        # differentiates it in time, which a fast Fourier table makes steep.
-        if (consistency == "continuous" and consistency_weight > 0 and isinstance(self.teacher, TimeScaled)
-                and abs(self.teacher.time_scale) > SMOOTH_TIME_SCALE):
-            raise ValueError(f"sCM differentiates the student in time, and its teacher's time features turn "
-                             f"at time_scale={self.teacher.time_scale}, faster than {SMOOTH_TIME_SCALE}; "
-                             f"train the teacher at time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only "
-                             "(consistency_weight=0)")
         self.consistency_weight, self.dmd_weight = consistency_weight, dmd_weight
         self.teacher_guidance, self.tangent_warmup = teacher_guidance, tangent_warmup
         self.student_update_freq, self.max_simulation_steps = student_update_freq, max_simulation_steps

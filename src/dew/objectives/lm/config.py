@@ -146,7 +146,9 @@ class LMRunConfig(RunConfig):
                              "packing or a filter over an indexed or streamed read cuts its order per share. "
                              "Read it whole first (--data-read memory), read a published packing generation "
                              "by index, or give the run length as --trainer.steps")
-        validation = () if self.trainer.eval_interval(loaded) is None else (Perplexity(),)
+        # The run's own default metric, asked for where its data holds a validation split to score.
+        scored = self.trainer.eval_interval(loaded) is not None and loaded.val is not None
+        validation = (Perplexity(),) if scored else ()
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
 
     def tokens(self) -> TextData:

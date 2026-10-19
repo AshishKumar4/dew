@@ -138,11 +138,11 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """
     if config.tokens is None:
         return {}
-    # The held-out store is the validation the loader compiles; its training side is never read.
+    # The held-out store is the validation the loader compiles, every record of it scored; its
+    # training side is never read.
     held = TokenFiles(str(config.tokens))
     data = loader(TextData(source=held, validation=held, seq_len=config.sequence_length),
-                  batch=config.batch_size, read="memory", validation_records=4 * config.batch_size,
-                  loading=Loading(workers=0))
+                  batch=config.batch_size, read="memory", loading=Loading(workers=0))
     assert data.val is not None
     scored = Evaluation.run(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),

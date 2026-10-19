@@ -842,7 +842,8 @@ def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
     (`manual_map`), the key heads repeated until the tensor axes split them as
     they split the query's; whole off a mesh, or inside a map that already
-    holds every axis manual (the sequence exchanges). A Pallas kernel has no
+    holds every axis manual (the sequence exchanges), where the tensor axes
+    split nothing. A Pallas kernel has no
     partitioning rule, and jax's cuDNN attention partitions through
     `custom_partitioning`, whose lowering on several devices names the
     partitioner by a process address (`str(id(...))` in its backend config),
@@ -851,9 +852,6 @@ def _per_shard(local, query, key, value, **extras):
     further argument to its array, or None, and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
     key, value = split_with_queries(key, value, tensor_shards(query))
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
     names = tuple(given)
@@ -861,7 +859,9 @@ def _per_shard(local, query, key, value, **extras):
     def shard(query, key, value, *arrays):
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
-    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
+    specs = (queries, keys, keys, *(jax.tree.map(lambda leaf, axes=axes: logical_spec(axes, leaf.shape), x)
+                                    for x, axes in given.values()))
     return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
 
 
@@ -1086,7 +1086,8 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     sliding window, sinks or packed documents where the call has them, the
     packing declaring at most `FLASH_PACKED_SEGMENTS` documents a row, the query is bf16 or
     fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
-    than sm80, whose backward takes no wider), a causal call is square, the
+    than sm80, whose backward takes no wider), a causal or windowed call is square
+    (FlashAttention aligns both to the last key, `structural_mask` to the row), the
     call has no mask, bias or softcap, no deterministic ops are asked for,
     which its backward's atomic sum of the query gradient would not keep, and
     the installed dew_flash_attn holds code for this GPU."""
@@ -1111,7 +1112,8 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
          "its empty sequences cost less than the document mask"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
-        (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
+        (not (causal or sliding_window is not None) or query.shape[-3] == key.shape[-3],
+         "a causal or windowed call has another number of keys than of queries"),
         (mask is None, "the call has a mask"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
@@ -1216,16 +1218,17 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
+    plain = functools.partial(jnp.einsum, equation, precision=precision)
     if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
-        return jnp.einsum(equation, weights, value, precision=precision)
-    return _blocked_values(weights, value, precision)
+        return plain(weights, value)
+    # Both modes differentiate the plain product: neither sums over the keys, and the blocked
+    # form's own cost the backward an eighth more on two threads.
+    return forward_differentiable(functools.partial(_blocked_values, precision=precision), plain,
+                                  weights, value)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _blocked_values(weights, value, precision) -> jax.Array:
-    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys. Its
-    gradients are the plain product's: neither sums over the keys, and the
-    blocked form's own cost the backward an eighth more on two threads."""
+    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys."""
     keys = value.shape[-3]
     blocks = -(-keys // VALUE_BLOCK)
     pad = blocks * VALUE_BLOCK - keys
@@ -1235,18 +1238,6 @@ def _blocked_values(weights, value, precision) -> jax.Array:
     value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
     return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
 
-
-def _blocked_values_forward(weights, value, precision):
-    return _blocked_values(weights, value, precision), (weights, value)
-
-
-def _blocked_values_backward(precision, saved, cotangent):
-    weights, value = saved
-    return (jnp.einsum('...qhd,...khd->...hqk', cotangent, value, precision=precision),
-            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent, precision=precision))
-
-
-_blocked_values.defvjp(_blocked_values_forward, _blocked_values_backward)
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
@@ -1556,9 +1547,10 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "attention_impl 'cudnn' or 'xla' for this call.")
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if causal and query.shape[-3] != key.shape[-3]:
-            raise ValueError("flash attention aligns its causal mask to the last key, so a causal call "
-                             f"needs as many queries as keys, not {query.shape[-3]} and {key.shape[-3]}")
+        if (causal or sliding_window is not None) and query.shape[-3] != key.shape[-3]:
+            raise ValueError("flash attention aligns its causal mask and its window to the last key, so a "
+                             "causal or windowed call needs as many queries as keys, not "
+                             f"{query.shape[-3]} and {key.shape[-3]}")
         if deterministic_ops_requested():
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
@@ -1566,7 +1558,20 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
-        out = decode_attention.attend(query, key, value, key_value_seq_lengths)
+        def decoded(query, key, value):
+            # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
+            def attend(query, key, value, lengths):
+                return decode_attention.attend(query, key, value, lengths)
+
+            rows = (key_value_seq_lengths, ("activation_batch",))
+            return _per_shard(attend, query, key, value, lengths=rows)
+
+        def folded(query, key, value):
+            return folded_attention(query, key, value,
+                                    with_key_lengths(None, key_value_seq_lengths, key.shape[-3]))
+
+        # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
+        out = forward_differentiable(decoded, folded, query, key, value)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1650,8 +1655,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
 
 def forward_differentiable(value, tangent, *arrays):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
-    its reverse-mode derivative takes forward mode through a reference
-    computing the same function."""
+    its reverse-mode derivative, or none, takes its derivatives from a
+    reference computing the same function, reverse mode as the transposed JVP."""
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)

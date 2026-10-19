@@ -43,21 +43,14 @@ def reference():
 
 def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
     """The operands as `chunk_ssd` hands them to a scan: groups expanded, the
-    sequence padded out to whole chunks, `x` scaled by its step and the decay
-    `A dt` per step, all chunks leading."""
-    batch, length, heads, _ = x.shape
+    sequence padded out to whole chunks of `chunk_size`, `x` scaled by its
+    step and the decay `A dt` per step."""
+    _, length, heads, _ = x.shape
     B, C = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (B, C))
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
     dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    total = length + pad
-
-    def chunks(t):
-        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
-        return jnp.asarray(jnp.moveaxis(blocked, 1, 0), dtype)
-
-    return (chunks(x * dt[..., None]), chunks(B), chunks(C),
-            jnp.moveaxis(chunks(A[None, None, :] * dt), 3, 2), jnp.asarray(state, dtype))
+    return tuple(jnp.asarray(t, dtype) for t in (x * dt[..., None], B, C, A[None, None, :] * dt, state))
 
 
 def scan_operands(reference, chunk_size: int, dtype=jnp.float32):
@@ -91,27 +84,20 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
 
 
-def stepwise_scan(x_c, b_c, c_c, a_c, state):
+def stepwise_scan(x, b, c, a, state):
     """The recurrence one step at a time, no chunks: `h_t = exp(a_t) h_{t-1}
     + x_t b_t^T`, `y_t = h_t c_t`. Written apart from both chunked paths, so
     in float64 it is an oracle neither of them shares a line with."""
-    chunks, batch, size, heads, width = x_c.shape
-    xs = jnp.swapaxes(x_c, 1, 2).reshape(chunks * size, batch, heads, width)
-    bs = jnp.swapaxes(b_c, 1, 2).reshape(chunks * size, batch, heads, -1)
-    cs = jnp.swapaxes(c_c, 1, 2).reshape(chunks * size, batch, heads, -1)
-    as_ = jnp.moveaxis(a_c, 3, 1).reshape(chunks * size, batch, heads)
-
     def step(h, inputs):
         x, b, c, a = inputs
         h = jnp.exp(a)[..., None, None] * h + x[..., :, None] * b[..., None, :]
         return h, jnp.einsum('bhpn,bhn->bhp', h, c)
 
-    final, ys = jax.lax.scan(step, state, (xs, bs, cs, as_))
-    y = jnp.swapaxes(ys.reshape(chunks, size, batch, heads, width), 1, 2)
-    return y, final
+    final, ys = jax.lax.scan(step, state, tuple(jnp.moveaxis(t, 1, 0) for t in (x, b, c, a)))
+    return jnp.moveaxis(ys, 0, 1), final
 
 
-def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
+def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings: int):
     """The kernel's forward and all five gradients, interpreted or `compiled` for the device this
     process holds, finite and by the float64 rule against the stepwise recurrence in float64 on the
     host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
@@ -122,7 +108,14 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
     if compiled:
         # pallas interprets only for a platform the process holds no device of
         assert any(device.platform == platform for device in jax.devices())
-    seeded = cotangents(*xla_chunk_scan(*operands))
+
+    def xla(*operands):
+        return xla_chunk_scan(*operands, chunk_size)
+
+    def kernel(*operands):
+        return ssd_chunk_scan(*operands, chunk_size, platform)
+
+    seeded = cotangents(*xla(*operands))
     # The float64 oracle runs on the host: a TPU emulates float64, and a 4096-step scan of it did not
     # finish in 20 minutes on a v6e. Only the oracle runs with x64 on.
     with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
@@ -133,22 +126,21 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
         # The XLA path in float64 and each entry's terms, its own sums (`float64_terms`), each entry's
         # size where its sum cancels.
         def twin_and_gradients(*o):
-            return (*xla_chunk_scan(*o), *jax.vjp(xla_chunk_scan, *o)[1](wide_seeds))
+            return (*xla(*o), *jax.vjp(xla, *o)[1](wide_seeds))
 
         twin, terms = float64_terms(twin_and_gradients, *exact)
         truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
         twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
 
-    xla = jax.jit(xla_chunk_scan)(*operands)
-    xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
-    kernel = jax.jit(lambda *o: ssd_chunk_scan(*o, platform))(*operands)
-    kernel_gradients = jax.jit(lambda *o: jax.vjp(lambda *p: ssd_chunk_scan(*p, platform), *o)[1](
-        seeded))(*operands)
+    theirs = jax.jit(xla)(*operands)
+    theirs_gradients = jax.jit(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands)
+    mine = jax.jit(kernel)(*operands)
+    mine_gradients = jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands)
 
-    _, _, size, _, width = operands[0].shape
-    reductions = size * max(width, operands[1].shape[-1])
+    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
     names = ("output", "final", "x", "B", "C", "A dt", "state")
-    pairs = zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients), twin, truth, terms, strict=True)
+    pairs = zip(names, (*mine, *mine_gradients), (*theirs, *theirs_gradients), twin, truth, terms,
+                strict=True)
     for name, mine, theirs, wide, want, summed in pairs:
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
@@ -159,12 +151,12 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
 def fixture_case(reference, chunk_size: int, resets: bool):
     """The reference fixture's scan, at 2 sequences of 70 steps, 4 heads of 6 channels, 2 groups and
     a state of 5; with `resets`, documents starting at a chunk's first step and inside one."""
-    x_c, b_c, c_c, a_c, state = scan_operands(reference, chunk_size)
+    x, b, c, a, state = scan_operands(reference, chunk_size)
     if resets:
-        a_c = a_c.at[0, 0, :, 7].set(RESET_DECAY).at[0, 1, :, 20].set(RESET_DECAY)
-        if a_c.shape[0] > 1:
-            a_c = a_c.at[1, 0, :, 0].set(RESET_DECAY)
-    return (x_c, b_c, c_c, a_c, state), 70 + 6 + 5
+        a = a.at[0, 7].set(RESET_DECAY).at[1, 20].set(RESET_DECAY)
+        if a.shape[1] > chunk_size:
+            a = a.at[0, chunk_size].set(RESET_DECAY)
+    return (x, b, c, a, state), chunk_size, 70 + 6 + 5
 
 
 def shape_case(shape, chunk_size: int):
@@ -173,13 +165,13 @@ def shape_case(shape, chunk_size: int):
     with it), and document resets at a chunk's first step and inside one, in chunks apart from ones
     that carry."""
     x, dt, A, B, C, _, state = mixer_operands(shape)
-    x_c, b_c, c_c, a_c, state = blocks(x, dt / chunk_size, A, B, C, state, chunk_size)
+    x, b, c, a, state = blocks(x, dt / chunk_size, A, B, C, state, chunk_size)
     # A reset zeroes its chunk's carry, so the chunks it misses keep one.
-    if a_c.shape[1] > 1:
-        a_c = a_c.at[0, -1, :, 5].set(RESET_DECAY)
-    if a_c.shape[0] > 1:
-        a_c = a_c.at[1, 0, :, 0].set(RESET_DECAY)
-    return (x_c, b_c, c_c, a_c, state), shape[1] + shape[3] + shape[4]
+    if a.shape[0] > 1:
+        a = a.at[-1, 5].set(RESET_DECAY)
+    if a.shape[1] > chunk_size:
+        a = a.at[0, chunk_size].set(RESET_DECAY)
+    return (x, b, c, a, state), chunk_size, shape[1] + shape[3] + shape[4]
 
 
 on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
@@ -209,5 +201,6 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
     if compiled:
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
-    operands, roundings = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
-    assert_kernel_parity(operands, compiled=compiled, roundings=roundings)
+    built = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
+    operands, chunk_size, roundings = built
+    assert_kernel_parity(operands, chunk_size, compiled=compiled, roundings=roundings)

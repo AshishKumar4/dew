@@ -277,8 +277,8 @@ def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
 
 def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     """A REPA run on the tiny Flux holds the encoder its tree lacks and draws
-    the projector; a step moves both sides. REPA-E needs a run's own autoencoder."""
-    import dataclasses
+    the projector; a step moves both sides. (REPA-E over a published pipeline tunes
+    the pipeline's own autoencoder: test_diffusion_run_sources.)"""
     import tarfile
 
     import optax
@@ -286,7 +286,7 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
 
     from dew.config import ObjectiveConfig
     from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig, EndToEnd
+    from dew.objectives.diffusion import DiffusionRunConfig
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):
@@ -309,6 +309,3 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     state, *_ = trainer.compile(state, batch)(state, batch)
     moved = jax.tree.map(lambda got, want: not np.array_equal(got, want), state.variables["params"], before)
     assert all(any(jax.tree.leaves(moved[name])) for name in (ALIGNMENT, "x_embedder"))
-    with pytest.raises(ValueError):
-        dataclasses.replace(config, objective=ObjectiveConfig("diffusion", {
-            **config.objective.fields, "end_to_end": EndToEnd()}))
