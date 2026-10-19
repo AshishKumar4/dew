@@ -9,7 +9,7 @@ Run in the isolated reference environment with that cohort's releases (tools/ref
   python tools/diffusers_scheduler_pipeline_reference.py BASE_SD OUTPUT.npz
 The source timetable includes PNDM's PRK/PLMS warmup and LMS's sigma-zero interval.
 
-`truth BASE_SD OUTPUT.npz` adds each walk's float64 latents (`{name}.latents.fp64`) to OUTPUT, the
+`--truth BASE_SD OUTPUT.npz` adds each walk's float64 latents (`{name}.latents.fp64`) to OUTPUT, the
 truth its float32 walk is measured from: the Flax pipeline at float64 as
 `diffusers_pipeline_reference.py truth` builds it, each scheduler with its module's float32 read as
 float64 (`diffusers_wan_reference.float64_scheduler`), from the recorded noise.
@@ -124,11 +124,9 @@ def truth(base, destination):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "truth":
-        truth(sys.argv[2], sys.argv[3])
-        raise SystemExit
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base")
     parser.add_argument("destination")
+    parser.add_argument("--truth", action="store_true", help="add each walk's float64 latents to DESTINATION")
     args = parser.parse_args()
-    build(args.base, args.destination)
+    (truth if args.truth else build)(args.base, args.destination)

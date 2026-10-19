@@ -277,7 +277,7 @@ def check_grids(directory, grids, case=None):
         output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0),
                       decode=False)
         # The walk's latents, as near float64 as the source scheduler's float32 walk over the same
-        # predictions (tools/diffusers_scheduler_pipeline_reference.py `truth`).
+        # predictions (tools/diffusers_scheduler_pipeline_reference.py --truth).
         latents = np.asarray(output.host().latents, np.float64)
         errors[name] = {"dew": distance(latents, oracle[name + ".latents.fp64"]),
                         "reference": distance(oracle[name + ".latents"], oracle[name + ".latents.fp64"])}
