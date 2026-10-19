@@ -33,10 +33,10 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
 
 def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, the sum taken at fp32
-    (`at_least_fp32`) and rounded once to `dtype`, the dtype flax's layer gives its output. The
-    caller takes the product at that width (`wide_product`), unrounded, so product and bias round
-    together once, as torch's addmm rounds them: rounding the product first, then the sum, put a
-    Llama 3 query projection's bf16 output 1.42 times as far from float64 as torch's.
+    (`at_least_fp32`) and rounded once to `dtype`, the dtype flax's layer gives its output. A dense
+    layer takes the product at that width (`fp32_result_dot_general`), unrounded, so product and
+    bias round together once, as torch's addmm rounds them: rounding the product first, then the
+    sum, put a Llama 3 query projection's bf16 output 1.42 times as far from float64 as torch's.
 
     JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
@@ -45,14 +45,10 @@ def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
     at fp32, the gradient sums at fp32 and rounds once into the bias.
     """
     wide = at_least_fp32(dtype)
-    return (product.astype(wide) + bias.astype(wide)).astype(dtype)
-
-
-def wide_product(dtype, bias) -> dict:
-    """The product's `preferred_element_type`, as keyword arguments, for a layer computing in `dtype`
-    whose `bias` follows (`biased`): `at_least_fp32(dtype)` where there is one, so the product is not
-    rounded before the bias is added, and nothing where there is none, the product then the output."""
-    return {} if bias is None else {"preferred_element_type": at_least_fp32(dtype)}
+    # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
+    # promoted implicitly.
+    bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
+    return (product.astype(wide) + bias).astype(dtype)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
@@ -92,6 +88,14 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     if not names and configured:
         names = precision_names(jax.config.jax_default_matmul_precision)
     return names <= {'DEFAULT'}
+
+
+def asks_default_arithmetic(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
+    """Whether `precision` asks a product of `dtype` operands for no more than the default: the
+    default precision, or on bf16 operands the `BF16_BF16_F32` algorithm, which names the default's
+    arithmetic (`bf16_operand_precision`)."""
+    return asks_default_precision(precision) or (
+        jnp.dtype(dtype) == jnp.bfloat16 and precision_names(precision) == {'BF16_BF16_F32'})
 
 
 def bf16_operand_precision(dtype: Dtype | None,

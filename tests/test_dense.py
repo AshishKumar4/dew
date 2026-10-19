@@ -1,9 +1,11 @@
 """Dew's dense and convolution layers: flax's, with the bias's gradient summed at fp32.
 
-Every configuration a layer takes initializes and computes what flax's own
-layer does, bit for bit; only the gradient of a bias, summed over the
-positions it is broadcast over, is the fp32 sum torch's addmm and
-convolution take.
+Every configuration a layer takes initializes what flax's own layer does,
+bit for bit, and with flax's zero bias computes it bit for bit too. The
+gradient of a bias, summed over the positions it is broadcast over, is the
+fp32 sum torch's addmm and convolution take, and a dense layer's product and
+bias round once, as torch's addmm rounds them, where flax rounds the product
+first; a product the layer is given keeps flax's rounding.
 """
 
 import jax
@@ -69,6 +71,7 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 @pytest.mark.parametrize(("ours", "flaxs", "build", "dtype", "shape"), [case[1:] for case in CASES],
                          ids=[case[0] for case in CASES])
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
+    """Flax's parameters bit for bit, and with them, its biases zero, flax's output."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     variables = theirs.init(jax.random.key(0), x)
@@ -108,6 +111,42 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     truth = terms.sum(0).reshape(got.shape)
     reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
     assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
+
+
+@pytest.mark.parametrize("layer", [
+    Dense(8, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16),
+    DenseGeneral((2, 4), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16),
+    Conv(8, (3, 3), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16),
+], ids=["dense", "general", "conv"])
+def test_a_layer_adds_its_bias_at_its_outputs_rank(layer):
+    """Under `jax_numpy_rank_promotion='raise'`, which flax's layers run under, a layer adds its
+    bias reshaped to its output's rank, forward and backward, as flax's own does."""
+    x = jnp.ones((2, 7, 7, 6) if isinstance(layer, Conv) else (4, 6), jnp.bfloat16)
+    with jax.numpy_rank_promotion("raise"):
+        variables = layer.init(jax.random.key(0), x)
+        jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, x).astype(jnp.float32)))(
+            variables["params"])
+
+
+class _Doubled:
+    """A convolution hook that doubles lax's, and is false as a truth value, as a provider whose
+    `__len__` is zero is."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self, *args, **kwargs):
+        return 2 * jax.lax.conv_general_dilated(*args, **kwargs)
+
+
+def test_a_convolution_runs_the_hook_it_is_given_whatever_its_truth():
+    """A given `conv_general_dilated` runs, as flax runs it, even one that is false as a truth
+    value: with flax's zero bias the layer's output is twice lax's."""
+    x = jnp.asarray(np.random.default_rng(3).standard_normal((2, 7, 7, 6)), jnp.float32)
+    plain = Conv(8, (3, 3), conv_general_dilated=None)
+    variables = plain.init(jax.random.key(0), x)
+    doubled = Conv(8, (3, 3), conv_general_dilated=_Doubled()).apply(variables, x)
+    np.testing.assert_array_equal(np.asarray(doubled), 2 * np.asarray(plain.apply(variables, x)))
 
 
 def test_dense_general_refuses_an_axis_beyond_its_input_as_flaxs_does():
@@ -174,6 +213,25 @@ def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
     branch = adapted(jax.tree.map(jnp.zeros_like, variables["params"]["proj"]))
     np.testing.assert_array_equal(np.asarray(adapted(variables["params"]["proj"]), np.float32),
                                   np.asarray(plain + branch, np.float32))
+
+
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
+def test_a_biased_bf16_layer_quantizes_its_product(general):
+    """A bfloat16 layer whose bias follows its product takes the product unrounded under the
+    BF16_BF16_F32 algorithm (`fp32_result_dot_general`), the default's arithmetic named, not a
+    pinned precision: Qwix quantizes it in training and serving, so both move off the unquantized
+    output."""
+    x = jnp.asarray(np.random.default_rng(6).standard_normal((4, 32)), jnp.bfloat16)
+    biases = nn.initializers.normal(1.0)
+    layer = (DenseGeneral((2, 16), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, bias_init=biases) if general
+             else Dense(32, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, bias_init=biases))
+    variables = layer.init(jax.random.key(0), x)
+    plain = np.asarray(layer.apply(variables, x), np.float32)
+    trained = np.asarray(Quantization().apply(layer).apply(variables, x), np.float32)
+    model, stored = quantize_for_serving(layer, variables, Quantization(), x)
+    served = np.asarray(model.apply(stored, x), np.float32)
+    assert np.abs(trained - plain).max() > 0
+    assert np.abs(served - plain).max() > 0
 
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])

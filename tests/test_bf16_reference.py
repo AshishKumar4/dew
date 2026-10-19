@@ -29,6 +29,7 @@ Observed RMS |logit - float64|, Dew / transformers:
 The workflow's fp32 rows are tests/test_block_diffusion.py's.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -73,16 +74,20 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
     import torch
     from transformers import AutoModelForCausalLM
 
+    from tools.diffusers_wan_reference import float64
+
     directory = FIXTURES / name
     batches = np.random.default_rng(0).integers(0, 256, (4, 64, 128))
 
-    def torch_gradients(dtype, ids):
+    def torch_gradients(ids, widen=False):
         # Loaded in bfloat16 as transformers loads it, its rotary frequencies kept in float32;
         # `.bfloat16()` would round that buffer too, and the float64 truth would rotate by them.
-        model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
-        model = model if dtype == torch.bfloat16 else model.to(dtype)
-        tokens = torch.from_numpy(ids)
-        model(tokens, labels=tokens).loss.backward()
+        # The truth widens those parameters and every float32 pin of the model (`float64`).
+        with float64() if widen else contextlib.nullcontext():
+            model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
+            model = model.to(torch.float64) if widen else model
+            tokens = torch.from_numpy(ids)
+            model(tokens, labels=tokens).loss.backward()
         return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()
                 if parameter.grad is not None}
 
@@ -100,7 +105,7 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
     assert biases
     truth, reference, dew = ({layout.name: [] for layout in biases} for _ in range(3))
     for ids in batches:
-        exact, rounded = torch_gradients(torch.float64, ids), torch_gradients(torch.bfloat16, ids)
+        exact, rounded = torch_gradients(ids, widen=True), torch_gradients(ids)
         ours = gradient(loaded.variables, jnp.asarray(ids, jnp.int32))
         for layout in biases:
             shape = exact[layout.name].shape

@@ -44,7 +44,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import biased, wide_product
+from .precision import biased
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -335,20 +335,20 @@ class Conv(nn.Conv):
         promoted, kernel, bias = self.promote_dtype(inputs, kernel, bias, dtype=self.dtype)
         if promoted is None or kernel is None:
             raise ValueError("a convolution's promotion must return its input and kernel")
-        own = self.conv_general_dilated_cls is not None or self.conv_general_dilated is not None
         if self.conv_general_dilated_cls is not None:
             convolve = self.conv_general_dilated_cls()
+        elif self.conv_general_dilated is not None:
+            convolve = self.conv_general_dilated
         else:
-            convolve = self.conv_general_dilated or jax.lax.conv_general_dilated
+            convolve = jax.lax.conv_general_dilated
         # Channels last, as flax lays them out: [N, *spatial, C] and a [*spatial, I, O] kernel.
         ndim = promoted.ndim
         lhs = (0, ndim - 1, *range(1, ndim - 1))
         dimensions = jax.lax.ConvDimensionNumbers(lhs, (ndim - 1, ndim - 2, *range(ndim - 2)), lhs)
         y = convolve(promoted, kernel, strides, padding, lhs_dilation=input_dilation,
                      rhs_dilation=kernel_dilation, dimension_numbers=dimensions,
-                     feature_group_count=self.feature_group_count, precision=self.precision,
-                     **({} if own else wide_product(promoted.dtype, bias)))
+                     feature_group_count=self.feature_group_count, precision=self.precision)
         if bias is not None:
-            # lax's product rounds once with the bias (`biased`); one of the layer's own keeps its dtype.
-            y = biased(y, bias, jnp.result_type(y, bias) if own else promoted.dtype)
+            # The convolution rounds to its dtype, as flax's does; the bias adds in fp32 (`biased`).
+            y = biased(y, bias, jnp.result_type(y, bias))
         return y if batch_dims == 1 else jnp.reshape(y, (*batch_shape, *y.shape[1:]))

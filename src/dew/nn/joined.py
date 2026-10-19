@@ -16,7 +16,7 @@ from flax import linen as nn
 from flax.core import meta
 
 from dew.nn.dense import Dense
-from dew.nn.precision import biased, wide_product
+from dew.nn.precision import biased, fp32_result_dot_general
 
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
@@ -81,7 +81,9 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
     biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
               else None)
-    y = jax.lax.dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
-                            precision=projections[0].precision, **wide_product(inputs.dtype, biases))
-    # Added as each Dense adds its own (`dew.nn.dense`).
-    return y if biases is None else biased(y, biases, inputs.dtype)
+    dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
+    precision = projections[0].precision
+    if biases is None:
+        return jax.lax.dot_general(inputs, kernel, dimensions, precision=precision)
+    # Taken and biased as each Dense takes and biases its own (`dew.nn.dense`).
+    return biased(fp32_result_dot_general(precision)(inputs, kernel, dimensions), biases, inputs.dtype)
