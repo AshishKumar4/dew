@@ -36,7 +36,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.documents import with_documents
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of, counted_places
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
@@ -127,8 +127,9 @@ class _Masking(NamedTuple):
     implementation: str
     cursor: jax.Array | None
     key_places: jax.Array
-    """Each key's logical place, which a chunk and ALiBi read: a cached key's where the layer keeps
-    them (`CausalSelfAttention._cached_places`), else its slot."""
+    """Each key's place counted over its document's tokens (`counted_places`), which a chunk and ALiBi
+    read: a cached key's where the layer keeps them (`CausalSelfAttention._cached_places`), else
+    its slot."""
 
 
 @logical_axes({
@@ -421,9 +422,11 @@ class CausalSelfAttention(nn.Module):
         return yarn_rope_freqs(rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, self.ctx.yarn,
                                dtype=dtype)
 
-    def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
+    def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted,
                        batch: int, length: int, key_length: int, decode: bool):
-        """Combine key validity, causality, image groups and the layer's window."""
+        """Combine key validity, causality, image groups and the layer's window, which counts
+        tokens: a cache's slots are its tokens, and an uncached call's are `counted`
+        (`counted_places`), padding among them skipped."""
         query_slots = (slots if decode else jnp.broadcast_to(jnp.arange(length), (batch, length)))
         groups = (None if metadata is None else metadata.image_groups)
         if groups is None:
@@ -445,7 +448,9 @@ class CausalSelfAttention(nn.Module):
                           & (groups[:, :, None] >= 0))
             keep = keep | same_image[:, None]
         if self.ctx.sliding_window is not None and (self.ctx.causal or self.ctx.bidirectional_window):
-            distance = query_slots[:, None, :, None] - jnp.arange(key_length)[None, None, None, :]
+            places = jnp.broadcast_to(query_slots if decode else counted, (batch, length))
+            key_places = jnp.arange(key_length)[None, :] if decode else places
+            distance = places[:, None, :, None] - key_places[:, None, None, :]
             # A causal window bounds only the keys behind the query, so an
             # image's later tokens stay visible to its earlier ones; a
             # two-sided one bounds both (`window_sides`).
@@ -535,6 +540,11 @@ class CausalSelfAttention(nn.Module):
         # The tokens' logical places (`Coordinates.positions`): the caller's, else the slots a cache
         # writes them at or their indices.
         places = positions if logical_positions is None else logical_positions
+        # Windows, chunks and ALiBi count each document's tokens from its first place
+        # (`counted_places`); rotation and NoPE's temperature read the places as given. A cached step
+        # reads its own.
+        counted = places if decode or logical_positions is None else counted_places(
+            segment_ids, tokens.valid, logical_positions)
         rotary_positions = places
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
@@ -572,7 +582,7 @@ class CausalSelfAttention(nn.Module):
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,
-                positions=None if logical_positions is None else positions,
+                places=None if logical_positions is None else counted,
                 segment_ids=segment_ids,
                 max_segments=None if segment_ids is None else tokens.max_segments,
                 valid=tokens.valid, right_padded=tokens.right_padded,
@@ -581,7 +591,7 @@ class CausalSelfAttention(nn.Module):
                 implementation=self.ctx.attention_impl, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), 'context')
             return self._output(attention, gate, B, S, own_value)
-        masking = self._masking(query, key, value, positions, places, held_places, rotary_positions, append,
+        masking = self._masking(query, key, value, positions, counted, held_places, rotary_positions, append,
                                 prefix, kv_len, kv_store, segment_ids, attention_metadata, decode)
         bias = None
         if self.alibi:
@@ -685,7 +695,8 @@ class CausalSelfAttention(nn.Module):
         flag, window, mask, document ids, kernel and key places the layer's
         visibility comes to (the canvas prefix, a shared or cached decode step,
         packed documents, metadata, a pairwise mask, a chunk). `places` are the
-        queries' logical places, and `held_places` a sharing layer's keys'."""
+        queries' places counted over their documents' tokens (`counted_places`),
+        and `held_places` a sharing layer's keys'."""
         B, S = query.shape[:2]
         causal, mask, documents = self.ctx.causal, None, None
         implementation = self.ctx.attention_impl
@@ -755,7 +766,7 @@ class CausalSelfAttention(nn.Module):
             # A decode step's cache mask already holds the rows' validity; only
             # image groups add to it there.
             if not decode or self.bidirectional_images:
-                mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
+                mask = self._metadata_mask(attention_metadata, positions, places, B, S, key.shape[-3], decode)
                 if segment_ids is not None and not decode:
                     mask = with_documents(mask, segment_ids)
             documents = None
@@ -770,7 +781,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.attention_chunk is not None:
             # The decode and diagnostic paths: the chunk joins the mask the
             # branch above built, each query and key in the chunk of its
-            # logical place, never its cache slot.
+            # counted place, never its cache slot.
             chunked = chunk_mask(places, key_places, self.ctx.attention_chunk)
             if documents is not None:
                 mask, documents = with_documents(mask, documents), None
@@ -801,11 +812,11 @@ class CausalSelfAttention(nn.Module):
         return mask, key_positions
 
     def _cached_places(self, places, slots) -> jax.Array:
-        """Each cache slot's logical place `[rows, capacity]`, where a chunk
-        and ALiBi read its key: the place the call that wrote the slot gave
-        its token (`Coordinates.positions`). A slot is that place only by
-        default, so the cache keeps it beside the key, and this call's
-        `places` go in at their `slots` as its keys do."""
+        """Each cache slot's place `[rows, capacity]`, where a chunk and ALiBi
+        read its key: the place the call that wrote the slot counted its token
+        at (`counted_places`). A slot is that place only by default, so the
+        cache keeps it beside the key, and this call's `places` go in at their
+        `slots` as its keys do."""
         allocated = self.has_variable("cache", "cached_places")
         held = self.variable("cache", "cached_places", jnp.zeros, (slots.shape[0], self.ctx.max_seq_len),
                              jnp.int32)

@@ -45,8 +45,9 @@ class LayerKind:
     local_attention // 2). A causal layer ignores it."""
     chunk: int | None = None
     """The chunk size of chunked local attention. A layer of this kind reads
-    only the keys at or before each query whose position has the same
-    `position // chunk` as the query. This is MaxText's
+    only the keys at or before each query whose place has the same
+    `place // chunk` as the query's, places counted over each document's
+    tokens (`dew.nn.inputs.counted_places`). This is MaxText's
     `chunk_attn_window_size` and Llama 4's `attention_chunk_size`. None
     attends to all keys. A kind sets a window or a chunk, not both."""
     num_kv_heads: int | None = None
