@@ -179,6 +179,32 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 2, 128)])
+def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, shape):
+    """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
+    reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
+    unweighted norms round it; its output and input gradient within the float64 gate of XLA's."""
+    def unweighted(implementation, x):
+        return attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation)
+
+    x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
+    seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
+    compare((functools.partial(unweighted, "xla"), functools.partial(unweighted, "pallas"),
+             functools.partial(unweighted, "xla")), (x,), seed, ("y", "x"))
+
+
+def test_an_unweighted_norm_takes_the_fused_kernel_where_its_row_names_it():
+    """Traced for an A100, whose row names the fused RMSNorm, `unweighted_rmsnorm` (Mamba2's,
+    Nemotron-H's, DeepSeek-V4's and GLM-5's) reports the kernel, not a refusal."""
+    from dew.nn.kernels import generation
+
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(jnp.ones((4, 64), jnp.bfloat16))
+    (route,) = [route for route in found if route.choice == "rms_norm"]
+    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
