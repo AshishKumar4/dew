@@ -336,6 +336,180 @@ def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
         assert ahead and all(unnamed[index] == draw for index, draw in ahead.items())
 
 
+def member_rows(members, by="records", saved=None, batches=6, above=lambda chain: chain, host=(),
+                weights=None):
+    """The (member, id) rows a streamed mix of `members` delivers over `batches` batches, and its
+    position after the first two, resumed from `saved` when given."""
+    chain = above(mix(members, weights, by=by)).batch(2)
+    data = compile(chain, read="streamed", loading=READ, seed=5, host=host)
+    stream = data.train(DataPartition())
+    try:
+        if saved is not None:
+            stream.set_state(saved)
+        rows, position = [], None
+        for step in range(batches):
+            if step == 2 and saved is None:
+                position = stream.get_state()
+            batch = next(stream)
+            rows += [(int(of), int(index)) for of, index in zip(batch["source"], batch["id"], strict=True)]
+        return rows, position
+    finally:
+        stream.close()
+
+
+def corpus(name, source, **options):
+    return Pipeline(roled(source, 6, 2, count=8), name=name, **options).repeat()
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("edit", ["joined-last", "joined-first", "left-last", "left-first"])
+def test_a_streamed_mix_resumes_its_members_where_they_were_when_one_joins_or_leaves(by, edit):
+    """A streamed mix keeps each member's position under its key, wherever the member sits among
+    the others: resumed with a member joined, ahead of the others or after them, the members it had
+    read on from where they were and the new one from its first row; resumed with a member gone,
+    ahead of the others or after them, the others read on from where they were."""
+    kept = [corpus("a", 0), corpus("b", 1)]
+    other = [corpus("c", 2)]
+    place = (lambda members: other + members) if edit.endswith("first") else (lambda members: members + other)
+    before, after = (kept, place(kept)) if edit.startswith("joined") else (place(kept), kept)
+    whole, saved = member_rows(before, by)
+    resumed, _ = member_rows(after, by, saved=saved)
+
+    def rows_of(rows, source):
+        return [index for of, index in rows if of == source]
+
+    read = 2 * 2  # the rows of the two batches read before the position was saved
+    for source in (0, 1):
+        ahead = rows_of(whole[read:], source)
+        again = rows_of(resumed, source)
+        # Each kept member reads on as it read uninterrupted, as far as both read.
+        assert again and again[:len(ahead)] == ahead[:len(again)]
+    if edit.startswith("joined"):
+        assert rows_of(resumed, 2)[:1] == [0]
+
+
+@pytest.mark.parametrize("edit", ["member-steps", "mixture-limit", "host-steps", "mixture-stages"])
+def test_a_streamed_mix_refuses_a_resume_whose_kept_rows_changed(edit):
+    """A resume takes members joining, leaving or reweighted, and refuses one where what a kept
+    member reads or makes changed: its own steps, a limit over the whole mix, the compile's host
+    steps, or the mixture's own stages."""
+    members = [corpus("a", 0), corpus("b", 1)]
+    _, saved = member_rows(members, host=(Shift(1),))
+    relabelled = Pipeline(roled(0, 6, 2, count=8), name="a").map(Relabelled()).repeat()
+    changed = {
+        "member-steps": {"members": [relabelled, corpus("b", 1)], "host": (Shift(1),)},
+        "mixture-limit": {"members": members, "weights": [1, 2], "host": (Shift(1),),
+                          "above": lambda chain: chain.take(10_000)},
+        "host-steps": {"members": members, "weights": [1, 2], "host": (Shift(2),)},
+        "mixture-stages": {"members": members, "weights": [1, 2], "host": (Shift(1),),
+                           "above": lambda chain: chain.map(Relabelled())},
+    }[edit]
+    with pytest.raises(ValueError):
+        member_rows(saved=saved, **changed)
+
+
+def test_a_streamed_mix_refuses_a_kept_nested_member_whose_order_changed():
+    """A member that is itself a mix keeps its order whole: one whose limit moved from an inner
+    member to the inner mix, reading the same sources through the same steps, is refused when the
+    outer weights change too, as its saved position counts other rows."""
+    def leaf(name, source):
+        return Pipeline(roled(source, 6, 2, count=8), name=name)
+
+    # The same steps either way, a limit of five; only where it sits differs.
+    limited_inside = mix([leaf("a", 0).take(5), leaf("b", 1)]).named("inner")
+    limited_outside = mix([leaf("a", 0), leaf("b", 1)]).take(5).named("inner")
+    _, saved = member_rows([limited_inside, corpus("c", 2)])
+    with pytest.raises(ValueError):
+        member_rows([limited_outside, corpus("c", 2)], weights=[1, 2], saved=saved)
+
+
+@pytest.mark.parametrize("read", ["streamed", "memory"])
+def test_two_members_of_one_source_keep_their_own_caches_when_one_leaves(read):
+    """Two members may read one source, one of them through a cache: each member's digest holds its
+    own caches, so the one that stays resumes when the other leaves."""
+    shared = roled(0, 6, 2, count=8)
+    cached = Pipeline(shared, name="cached").cache(Cache(f"memory://{uuid4().hex}")).repeat()
+    plain = Pipeline(shared, name="plain").repeat()
+
+    def rows(members, saved=None):
+        data = compile(mix(members).batch(2), read=read, loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            if saved is not None:
+                stream.set_state(saved)
+            next(stream)
+            return stream.get_state()
+        finally:
+            stream.close()
+
+    saved = rows([cached, plain])
+    if read == "memory":
+        # A memory read is a global order, which keeps no member by key: the edit is refused.
+        with pytest.raises(ValueError):
+            rows([cached], saved)
+    else:
+        rows([cached], saved)
+
+
+def test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others():
+    """A memory read drops a member every row of which its steps reject: the mix compiles and reads
+    the other member's rows."""
+    empty = Pipeline(roled(0, 6, 2), name="empty").filter(lambda row: False, identity="none@1").repeat()
+    full = corpus("full", 1)
+    data = compile(mix([empty, full]).workers(1).batch(1), read="memory", loading=READ, seed=5)
+    stream = data.train(DataPartition())
+    try:
+        assert int(next(stream)["source"][0]) == 1
+    finally:
+        stream.close()
+
+
+def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
+    """A shuffle above a mix holds the mix's rows in its window across a saved position, which a
+    member joining would change beneath it: that resume is refused rather than replaying rows."""
+    def shuffled(chain):
+        return chain.shuffle(42, window=10)
+
+    _, saved = member_rows([corpus("a", 0)], above=shuffled)
+    with pytest.raises(ValueError):
+        member_rows([corpus("a", 0), corpus("b", 1)], above=shuffled, saved=saved)
+
+
+def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row():
+    """A member that joins a resumed mix has its first row read ahead before the mix gives one, as
+    every member has at the start, so a member whose every row is rejected exhausts its budget at
+    once rather than after the others have run on."""
+    _, saved = member_rows([corpus("a", 0)])
+    # A member that joins and can give rows resumes beside the other.
+    rows, _ = member_rows([corpus("a", 0), corpus("b", 1)], saved=saved, weights=[1, 1e-9], batches=1)
+    assert rows
+    hopeless = (Pipeline(roled(1, 6, 2, count=8), name="b")
+                .filter(lambda row: False, identity="none@1").repeat())
+    with pytest.raises(ValueError):
+        member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
+
+
+def test_an_indexed_mix_still_refuses_a_member_joining():
+    """An indexed mix reads by one global index over all its members, which a member joining moves:
+    its resume refuses the edit."""
+    def mixed(members):
+        return compile(mix(members).batch(2), read="indexed", loading=READ, seed=5)
+
+    members = [Pipeline(roled(0, 6, 2), name="a").repeat(), Pipeline(roled(1, 6, 2), name="b").repeat()]
+    stream = mixed(members).train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed([*members, Pipeline(roled(2, 6, 2), name="c").repeat()]).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
 def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
@@ -564,7 +738,7 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"])
+    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], keys=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
@@ -952,10 +1126,11 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
+                              keys=["all-zero", "useful"],
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
-    counts = reader.get_state()["parents"][0]["counts"]
+    counts = reader.get_state()["parents"]["all-zero"]["counts"]
     assert counts["attempted"] == 5
     assert counts["rejected"] == {"zero_targets": 5}
     reader.close()
@@ -1348,6 +1523,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
+                              keys=["normal", "tiny"],
                               budget=SearchBudget(consecutive=3)))
     try:
         if tiny_targets:
