@@ -722,6 +722,36 @@ def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_grad
     assert jnp.all(got_grads[1][:, excluded] == 0)
 
 
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused"])
+def test_a_target_at_the_excluded_column_scores_infinity_and_moves_no_logit(path):
+    """A target at the excluded column scores +inf, a constant, in every head: its token's loss
+    moves no logit, so the head's excluded column takes no gradient from it, and the other
+    columns' gradient is the partition's alone."""
+    excluded = 41
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS))
+    targets = targets.at[0, 0].set(excluded)
+    precision = jax.lax.Precision.HIGHEST
+
+    def scored(states, matrix):
+        table = OutputTable(matrix, vocab_major=False, precision=precision)
+        if path == "fused":
+            total, (losses, _, _) = fused_head_loss(states, table, targets, jnp.ones(targets.shape),
+                                                    z_loss=1.0, tile=RAGGED, excluded=excluded)
+            return total, (losses, total)
+        losses, _, log_z = chunked_cross_entropy(states, table, targets, 4,
+                                                 tile=RAGGED if path == "tiled" else None, excluded=excluded)
+        # The sum is +inf; each token's loss, the excluded target's included, takes a cotangent of 1.
+        total = jnp.sum(losses + log_z)
+        return total, (losses, total)
+
+    (_, (losses, total)), (_, d_matrix) = jax.value_and_grad(scored, argnums=(0, 1), has_aux=True)(
+        hidden, head)
+    assert jnp.isinf(losses[0, 0]) and losses[0, 0] > 0
+    assert jnp.isinf(total) and total > 0
+    assert jnp.all(jnp.isfinite(d_matrix))
+    assert jnp.all(d_matrix[:, excluded] == 0)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     """257 tokens is three tiles; rounding per tile would lose the last ones.
