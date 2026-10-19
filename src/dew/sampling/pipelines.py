@@ -145,8 +145,7 @@ class ImageSettings:
     (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
     (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
     A run trained from a loaded pipeline samples on that pipeline's own grid, recorded as `grid`
-    (`SourceGrid`), and ends as its solver does (`final_denoise` False), as `TextToImage`'s fields
-    of those names say."""
+    (`SourceGrid`), and ends as its solver does, with no closing denoise (`TextToImage.grid`)."""
 
     process: Process
     inputs: JSON
@@ -157,7 +156,6 @@ class ImageSettings:
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
     grid: JSON = None
-    final_denoise: bool = True
 
     def __post_init__(self) -> None:
         from dew.records import integer
@@ -303,7 +301,7 @@ class TextToImage:
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
-                   grid=grid, final_denoise=settings.final_denoise)
+                   grid=grid, final_denoise=grid is None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,

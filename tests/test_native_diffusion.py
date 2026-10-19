@@ -246,10 +246,10 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
                                                                               scheduler):
     """A loaded pipeline samples on its scheduler's own grid and ends as its solver does, without a
     closing denoise (`SourceTask.grid`), which its training process's times and finish do not give;
-    an LMS scheduler's solver runs on that grid alone. An objective trained from the pipeline keeps
-    both: its evaluation draws on that grid whatever process it trains on, its task draws the
-    pipeline's own task's images, and the settings a saved run records rebuild that grid and
-    finish."""
+    an LMS scheduler's solver runs on that grid alone. An objective trained from the pipeline, built
+    directly or by a run config, keeps both: its evaluation is the solver's walk over that grid from
+    the same noise, whatever process trains, its task draws the pipeline's own task's images, and the
+    grid a saved run records rebuilds a task that draws them too."""
     import dataclasses
     import shutil
 
@@ -257,11 +257,14 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     import jax.numpy as jnp
     from diffusion_stubs import PROMPTS, batch_for
 
+    from dew.config import ObjectiveConfig
+    from dew.config.data import ImageData
     from dew.diffusion.schedules import DiscreteNoiseScheduler
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives import Step
-    from dew.objectives.diffusion import DiffusionObjective
+    from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
     from dew.registry import from_record, to_record
+    from dew.sampling import sample
     from dew.sampling.pipelines import ImageSettings
 
     directory = tmp_path / "sd"
@@ -270,23 +273,39 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
         with np.load(SCHEDULER_GRIDS) as grids:
             (directory / "scheduler" / "scheduler_config.json").write_text(str(grids["lms.config"]))
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
-    objective = DiffusionObjective(source, guidance=None, steps=3, ema_decay=None)
+    size = source.inputs.sample.shape[0]
+    settings = {"guidance": None, "steps": 3, "ema_decay": None}
+    objective = DiffusionObjective(source, **settings)
     other = DiscreteNoiseScheduler(np.linspace(1e-3, 0.2, 20), p2_loss_weight_gamma=0)
-    retrained = DiffusionObjective(source, guidance=None, steps=3, ema_decay=None,
+    retrained = DiffusionObjective(source, **settings,
                                    process=dataclasses.replace(source.process, schedule=other))
+    model = DiffusionRunConfig().model
+    configured = DiffusionRunConfig(
+        pretrained=str(directory), preset=None,
+        model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32",
+                                                 "attention_impl": "xla"}),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {**settings, "unconditional_prob": 0.0})).build()
     variables = source.variables
-    batch = batch_for(objective, source.inputs.sample.shape[0])
-    step = Step(jnp.asarray(0), jax.random.PRNGKey(4), None)
-    np.testing.assert_array_equal(objective.evaluate(variables, batch, step).images,
-                                  retrained.evaluate(variables, batch, step).images)
+    batch = batch_for(objective, size)
+    key = jax.random.PRNGKey(4)
+    step = Step(jnp.asarray(0), key, None)
+
+    process, times = source.task.grid(3)
+    denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
+    noise_key, sample_key = jax.random.split(key)
+    x_T = process.noise(noise_key, (batch["image"].shape[0], *objective.latent_shape))
+    walked = sample(denoise, x_T, solver=source.schedule.solver, key=sample_key, times=np.asarray(times),
+                    final_denoise=False)
+    expected = jnp.clip(source.autoencoder.decode(variables["autoencoder"], walked), -1.0, 1.0)
+    for built in (objective, retrained, configured):
+        np.testing.assert_array_equal(built.evaluate(variables, batch, step).images, expected)
 
     own = source.text_to_image()(PROMPTS, steps=3, guidance=None, key=0).host().images
-    np.testing.assert_array_equal(objective.build_task(variables)(PROMPTS, steps=3, guidance=None,
-                                                                  key=0).host().images, own)
+    task = objective.build_task(variables)
+    np.testing.assert_array_equal(task(PROMPTS, steps=3, guidance=None, key=0).host().images, own)
     from dew.diffusion.schedules.source import SourceGrid
 
-    settings = from_record(ImageSettings, to_record(objective.task_settings(), ImageSettings))
-    assert settings.final_denoise is False and settings.grid is not None
-    rebuilt, grid = from_record(SourceGrid, settings.grid)(3), source.task.grid(3)
-    np.testing.assert_array_equal(np.asarray(rebuilt[1]), np.asarray(grid[1]))
-    assert type(rebuilt[0].schedule) is type(grid[0].schedule)
+    recorded = from_record(ImageSettings, to_record(configured.task_settings(), ImageSettings))
+    rebuilt = dataclasses.replace(task, grid=from_record(SourceGrid, recorded.grid))
+    np.testing.assert_array_equal(rebuilt(PROMPTS, steps=3, guidance=None, key=0).host().images, own)
