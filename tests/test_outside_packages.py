@@ -3,6 +3,7 @@ recorded and loaded back with nothing registered, each checked in a fresh
 process against a toy package on the path. A record imports such a package
 only once it is imported or the loader trusts it."""
 
+import json
 import os
 import subprocess
 import sys
@@ -66,8 +67,8 @@ class Shift(Objective):
 def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
     """A package's objective declares its task the way Dew's do. A run of it,
     as a Hub download would hold it, is refused in a process that has not
-    imported the package, naming the module and the flag; trusted, it loads
-    by the objective's import path as that task, equal to the task
+    imported the package, and the refusal imports none of it; trusted, it
+    loads by the objective's import path as that task, equal to the task
     `pipeline` returns in place."""
     _install(tmp_path, "toypackage", PACKAGE_OBJECTIVE)
     run = tmp_path / "run"
@@ -86,10 +87,14 @@ def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
              "print(trainer.objective.pipeline(state).value)\n")
     trained = _run(tmp_path, train)
     assert trained.returncode == 0, trained.stderr[-2000:]
-    refused = _run(tmp_path, f"import dew\ndew.pipeline({str(run)!r})\n")
-    assert refused.returncode != 0
-    assert ("names toypackage.models, which is outside Dew and not imported" in refused.stderr
-            and "trust=('toypackage',), --trust toypackage" in refused.stderr)
+    refuse = ("import json, sys\nimport dew\n"
+              "try:\n"
+              f"    dew.pipeline({str(run)!r})\n"
+              "except ValueError:\n"
+              "    print(json.dumps({'refused': True, 'imported': 'toypackage' in sys.modules}))\n")
+    refused = _run(tmp_path, refuse)
+    assert refused.returncode == 0, refused.stderr[-2000:]
+    assert json.loads(refused.stdout.splitlines()[-1]) == {"refused": True, "imported": False}
     load = ("import dew\n"
             f"task = dew.pipeline({str(run)!r}, trust=('toypackage',))\n"
             "print(type(task).__module__, type(task).__name__, task.value)\n")
@@ -229,7 +234,8 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
     record = str(tmp_path / "first" / "activity" / "run.json")
     again = ("-m", "dew.cli.main", "train", record, "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
     refused = run(*again)
-    assert refused.returncode != 0 and "--trust toypackage" in refused.stderr
+    # Refused before anything trains: the run writes nothing of its own.
+    assert refused.returncode != 0 and not (tmp_path / "again").exists()
     retrained = run(*again, "--trust", "toypackage")
     assert retrained.returncode == 0, retrained.stderr[-3000:]
     assert scalars(tmp_path / "again", "train/loss") == scalars(tmp_path / "first", "train/loss")

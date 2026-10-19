@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
@@ -45,11 +45,6 @@ def record(source):
 @pytest.fixture(scope="module")
 def arrays(source):
     return fixture_arrays(source / "qwen_image.npz")
-
-
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
 def nhwc(packed: np.ndarray, rows: int, columns: int) -> np.ndarray:

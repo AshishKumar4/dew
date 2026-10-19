@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, packed, unpacked
+from interop_support import extract_fixture, packed, scaled_gap as relative_gap, unpacked
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -33,11 +33,6 @@ CASES = ("schnell", "dev", "rect", "deep", "mixed")
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/flux_source.tar.xz", tmp_path_factory.mktemp("flux-source"))
-
-
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
 

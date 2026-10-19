@@ -289,17 +289,19 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
 
-def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
+@pytest.mark.parametrize("states_dtype", ["float32", "bfloat16"])
+def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dtype):
     """stored and remat are the baseline head rearranged into vocabulary
     tiles, so on one small case all three agree on the loss, the top-1
-    accuracy and both gradients. The vocabulary of 12 does not split into
-    4 equal tiles, so the short last tile is on the path."""
+    accuracy and both gradients, in the states' own precision: bf16 states
+    take the bf16 head product in every variant. The vocabulary of 12 does
+    not split into 4 equal tiles, so the short last tile is on the path."""
     tool = load("benchmark_lm_head")
     key = jax.random.PRNGKey(0)
-    states = jax.random.normal(key, (2, 3, 8), jnp.float32)
+    states = jax.random.normal(key, (2, 3, 8), jnp.float32).astype(states_dtype)
     table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
-    variant = tool.parse_variant("stored4-fp32")
+    variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
     outputs = {}
     for name in ("baseline", "stored", "remat"):
@@ -309,11 +311,15 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]
+    # The loop adds each tile's state gradient in the states' dtype, one rounding a tile, where the
+    # baseline's one product rounds once: in bf16 up to a 2^-8 of the largest entry each.
+    states_bound = 1e-5 if states_dtype == "float32" else 4 * 2**-8 * np.abs(reference[2]).max()
     for name in ("stored", "remat"):
         loss, accuracy, d_states, d_table = outputs[name]
         assert loss == pytest.approx(reference[0], abs=1e-5), name
         assert accuracy == reference[1], name
-        np.testing.assert_allclose(d_states, reference[2], atol=1e-5, err_msg=name)
+        np.testing.assert_allclose(np.asarray(d_states, np.float32), np.asarray(reference[2], np.float32),
+                                   atol=states_bound, err_msg=name)
         np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
 
 
@@ -951,6 +957,52 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
         "    report['err'] = capsys.readouterr().err\n"
         "    assert 'tokens' in report\n")})
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
+
+
+def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_not(tmp_path):
+    """SLOP011: a sentence the test spells, looked for in a raised error's text (`str` or `repr` of
+    an `except` name or of `pytest.raises`'s value, imported under another name too) or in a
+    process's `stdout` or `stderr`, by `in`, `==`, `startswith`, `endswith` or `count`, proves
+    wording. A refusal's type, a process's exit code, a value the process prints and the test
+    parses, and an error's own attribute hold behaviour, as does a process's whole output compared
+    with the value it computes, and are not reported."""
+    found = _linted(tmp_path, {"tests/test_refusal.py": (
+        "import json\n"
+        "import subprocess\n"
+        "import pytest\n"
+        "def test_caught():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert 'invalid literal' in str(error)\n"
+        "def test_raised():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert str(raised.value).startswith('invalid')\n"
+        "    assert repr(raised.value) == 'ValueError()'\n"
+        "def test_aliased():\n"
+        "    from pytest import raises as refused\n"
+        "    with refused(ValueError) as caught:\n"
+        "        int('x')\n"
+        "    assert str(caught.value).startswith('invalid')\n"
+        "def test_process():\n"
+        "    done = subprocess.run(['false'], capture_output=True, text=True)\n"
+        "    assert 'refused' in done.stderr\n"
+        "    assert done.stdout.count('saved')\n"
+        "def test_behaviour():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert raised.type is ValueError\n"
+        "    done = subprocess.run(['true'], capture_output=True, text=True)\n"
+        "    assert done.returncode == 0\n"
+        "    assert json.loads(done.stdout) == {'refused': True}\n"
+        "    assert done.stdout.split()[-1] == 'Scalar'\n"
+        "    assert done.stdout == '42\\n'\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert error.args\n")})
+    assert found == [("tests/test_refusal.py", line, "SLOP011") for line in (8, 12, 13, 18, 21, 22)]
 
 
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):

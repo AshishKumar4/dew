@@ -46,6 +46,10 @@ from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
 _log = logging.getLogger(__name__)
+
+
+class Abandoned(RuntimeError):
+    """An upload or a seal the cache's writer was closed before, which it counts (`abandoned`)."""
 type Transform = Callable[[int, Record], Outputs]
 type CachedValue = Record | Outputs
 
@@ -397,7 +401,7 @@ class _Writer:
         # or its retention refusing room (`LocalRetention`), is the cache's error at once.
         retries = self.cache.retry if self.root.remote else 0
         if self.closed:
-            raise RuntimeError("cache upload was cancelled")
+            raise Abandoned("cache upload was cancelled")
         self.root.child(shard).put_immutable(payload, retries=retries)
         encoded = _json(
             {
@@ -407,7 +411,7 @@ class _Writer:
             }
         )
         if self.closed:
-            raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
+            raise Abandoned(f"cache upload abandoned before segment publication: {shard}")
         self.root.child(segment).put_immutable(encoded, retries=retries)
         with self.lock:
             self.spool_bytes -= used
@@ -446,7 +450,7 @@ class _Writer:
             }
         )
         if self.closed:
-            raise RuntimeError(f"cache writer was abandoned before its seal: {self.writer}")
+            raise Abandoned(f"cache writer was abandoned before its seal: {self.writer}")
         try:
             self.root.child(f"segments/{self.writer}/seal.json").put_if_absent(payload)
         except PreconditionFailed:

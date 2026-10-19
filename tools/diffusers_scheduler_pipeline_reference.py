@@ -1,29 +1,28 @@
-"""Full learned-model trajectories with Diffusers 0.34.0 source schedulers.
+"""Full learned-model trajectories with the diffusers-pipelines cohort's source schedulers.
 
 The official Flax UNet/text towers supply identical predictions to both sides;
 the official Torch schedulers supply the reference updates. This isolates solver
 semantics from known Flax-versus-Torch UNet arithmetic differences. Reference
 host transfers occur only in this tool, never in Dew's denoising loop.
 
-Run in the isolated Transformers 4.49.0 reference environment:
+Run in the isolated reference environment with that cohort's releases (tools/reference_releases.py):
   python tools/diffusers_scheduler_pipeline_reference.py BASE_SD OUTPUT.npz
 The source timetable includes PNDM's PRK/PLMS warmup and LMS's sigma-zero interval.
 """
 import argparse
 import json
 
-import diffusers
 import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-import transformers
 from diffusers import FlaxStableDiffusionPipeline, PNDMScheduler, LMSDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler
+
+from reference_releases import require
 
 
 def build(base, destination):
-    if (diffusers.__version__, transformers.__version__) != ("0.34.0", "4.49.0"):
-        raise RuntimeError("Use the pinned isolated reference environment")
+    require("diffusers-pipelines")
     pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
         base, local_files_only=True, safety_checker=None, feature_extractor=None)
     ids = pipe.prepare_inputs(["dog", "cat"])

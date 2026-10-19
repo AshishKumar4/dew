@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import extract_fixture
+from interop_support import extract_fixture, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
@@ -31,11 +31,6 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/sd3_source.tar.xz", tmp_path_factory.mktemp("sd3-source"))
-
-
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
 def transformer_case(directory: Path, arrays, name: str):

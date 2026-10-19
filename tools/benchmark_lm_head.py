@@ -111,7 +111,7 @@ def fused(states, table, targets, variant: Variant):
 def retained(states, table, targets, variant: Variant):
     """The pre-bounded vocabulary loop, held here so the baseline does not
     move when the shipped kernel does; `remat` is it under `jax.checkpoint`."""
-    flat = states.astype(jnp.float32).reshape(-1, states.shape[-1])
+    flat = states.reshape(-1, states.shape[-1])
     labels = targets.reshape(-1)
     total = jnp.full(labels.shape, -jnp.inf, jnp.float32)
     target_logit = jnp.zeros(labels.shape, jnp.float32)

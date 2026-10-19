@@ -25,6 +25,11 @@ CASES = {
     "inside a function": (f"def when_asked():\n    {WRITE}", False),
     "inside a method": (f"class Configured:\n    def when_asked(self):\n        {WRITE}", False),
     "under the script guard": (f"if __name__ == '__main__':\n    {WRITE}", False),
+    "in a function's default": (f"def when_asked(enabled={WRITE}):\n    return enabled", True),
+    "in a decorator": (f"@({WRITE} or (lambda function: function))\ndef decorated():\n    pass", True),
+    "in a class's base": (f"class Configured({WRITE} or object):\n    pass", True),
+    "in a class's keyword": (f"class Configured(object, metaclass={WRITE} or type):\n    pass", True),
+    "inside a lambda": (f"later = lambda: {WRITE}", False),
 }
 
 
