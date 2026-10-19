@@ -578,12 +578,17 @@ def _analyzed(
 def _states_its_targets(pipeline: Pipeline) -> bool:
     """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
     valid targets count, so a weight from them holds its share of the targets (`token_weights`):
-    a source that states them, whose epoch reads every row alike: no slice, limit or token split
-    before its repeat takes a part of them. Any other corpus's targets are counted as its rows
-    arrive (`TokenDeficit`)."""
+    a source that states them, whose epoch only orders and places those rows before its repeat
+    (`_KEEPS_TARGETS`). A step still to run over them, a random crop or a filter, or a slice, limit
+    or token split that takes a part of them, delivers other rows than the stated ones, so that
+    corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
     source, epoch = pipeline.source, pipeline.stages[: _until(pipeline.stages, (Repeat,))]
     return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
-            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in epoch))
+            and all(isinstance(stage, _KEEPS_TARGETS) for stage in epoch))
+
+
+_KEEPS_TARGETS = (Shuffle, Prefetch, Workers, Interleave, Artifact)
+"""The stages that order or place a corpus's rows, each row and its targets as they arrive."""
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
