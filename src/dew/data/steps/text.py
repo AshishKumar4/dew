@@ -106,14 +106,15 @@ def rebound(element: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
 
 
 def targets_changed(given: Batch, output: Batch) -> bool:
-    """Whether a step that made `output` of `given` changed a field its targets are counted from, in
-    place: a field it left where it was but holding other values. A field the step moved or
-    removed, as a projection does (`rebound`), says nothing of the targets, which no field it
-    still holds could count again."""
-    bound = _bound(given)
-    held = [name for name in bound if name in given]
-    return ("" not in bound and all(name in output for name in held)
-            and any(output[name] is not given[name] for name in held))
+    """Whether a step that made `output` of `given` changed a field its targets are counted from:
+    each read where the record names it before the step and where `output` names it after
+    (`rebound`), so a projection that moves a field, or names another field as it was, changes
+    nothing; a field the step removed pins the count, which nothing it still holds could give
+    again."""
+    pairs = [(before, after) for before, after in zip(_bound(given), _bound(output), strict=True)
+             if before in given]
+    return ("" not in _bound(output) and all(after in output for _, after in pairs)
+            and any(output[after] is not given[before] for before, after in pairs))
 
 
 def recounted(given: Batch, output: Batch) -> Batch:
@@ -123,7 +124,7 @@ def recounted(given: Batch, output: Batch) -> Batch:
     does, from the fields as they are named now."""
     if "_dew_valid_targets" not in output or not targets_changed(given, output):
         return output
-    view = {counted: output[name] for counted, name in zip(_COUNTED, _bound(given), strict=True)
+    view = {counted: output[name] for counted, name in zip(_COUNTED, _bound(output), strict=True)
             if name in output}
     rule = ValidTargets(role=output.get("_dew_target_role"), pad_id=output.get("_dew_target_pad"),
                         measured=False)
