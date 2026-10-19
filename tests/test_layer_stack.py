@@ -139,7 +139,15 @@ def deepseek_shaped(dtype=jnp.float32, **overrides):
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
 # one-ULP weight perturbations without any sparse-ReLU branch changing.
-SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped}
+def deepseek_widths(dtype=jnp.float32, **overrides):
+    """The DeepSeek-shaped stack with a dense width per layer beside the routed
+    experts' own width, and no prediction depth, which would need one width."""
+    return deepseek_shaped(dtype, **{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
+                                     **overrides})
+
+
+SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
+          "deepseek_widths": deepseek_widths}
 
 FLOOR_FACTOR = 4.0
 """How far a scanned stack may sit from the plain loop, in multiples of the
@@ -564,3 +572,61 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
         jax.clear_caches()
         got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
         assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
+
+
+def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
+    """A scanned run of host-resident layers runs one layer at a time in a scope of its
+    own (`decoder_stack.run_stack`, `_prefetched_run`), reading each layer's slice of
+    every collection the caller opens and writing it back stacked: with the routers'
+    balancing biases off zero, two calls and a decode through the cache they allocate
+    and reuse give the resident stack's state, its routing exactly, and its logits, scores
+    and cache as exact as the resident's own, both measured from the resident stack in
+    float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
+    from reference_error import assert_leaves_as_exact
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference", scan_layers=True,
+                              mixture=Mixture(experts=4, top_k=2, bias=True))
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+    variables = {**variables, "moe": jax.tree.map(lambda bias: bias + 4.0 * (jnp.arange(bias.shape[-1]) % 3),
+                                                  variables["moe"])}
+    assert any(count > 1 for _, count in model.bind(variables).groups)
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+    layers = {name: jax.device_put(tree, host) for name, tree in variables["params"].items()
+              if name.startswith("layers_")}
+    on_host = {**variables, "params": {**variables["params"], **layers}}
+    opened = ["moe", "router"]
+
+    def run(model, tree):
+        calls = []
+        for _ in range(2):
+            logits, state = model.apply(tree, tokens, mutable=opened)
+            calls.append((logits, state))
+            tree = {**tree, **state}
+        cache = {}
+        for position in range(3):
+            logits, state = model.apply({**tree, **cache}, tokens[:, position:position + 1],
+                                        decode=True, mutable=["cache", *opened])
+            calls.append((logits, state))
+            cache = {"cache": state["cache"]}
+        return jax.tree.map(np.asarray, calls)
+
+    resident, hosted = run(model, variables), run(model, on_host)
+    with jax.enable_x64(new_val=True):
+        truth = run(model.clone(dtype=jnp.float64), widened(variables))
+    assert jax.tree.structure(hosted) == jax.tree.structure(resident)
+    pairs = zip(jax.tree.leaves(hosted), jax.tree.leaves(resident), strict=True)
+    exact = [(ours, theirs) for ours, theirs in pairs if not np.issubdtype(theirs.dtype, np.floating)]
+    assert exact
+    for ours, theirs in exact:
+        np.testing.assert_array_equal(ours, theirs)
+
+    def floating(tree):
+        return [leaf for leaf in jax.tree.leaves(tree) if np.issubdtype(leaf.dtype, np.floating)]
+
+    assert_leaves_as_exact(floating(hosted), floating(resident), floating(truth))
