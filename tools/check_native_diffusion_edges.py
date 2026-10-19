@@ -1,6 +1,9 @@
-"""Native edge checks against tools/native_diffusion_edges_reference.py oracles."""
+"""Native edge checks against tools/native_diffusion_edges_reference.py oracles: the source's
+tables and timesteps exactly, and every walk as near float64 as the source's float32
+(tests/reference_error.py)."""
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -33,32 +36,33 @@ def check(directory, case):
         value = jnp.asarray(ref[case + ".input"])
         output = jax.jit(predict)(value)
         gradient = jax.jit(jax.grad(lambda x: jnp.sum(predict(x) * ref[case + ".probe"])))(value)
-        for name, actual, expected in (("prediction", output, ref[case + ".output"]),
-                                       ("vjp", gradient, ref[case + ".vjp"])):
-            errors[name] = float(np.max(np.abs(actual - expected)))
-            np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-4)
+        for name, actual in (("output", output), ("vjp", gradient)):
+            errors[name] = float(np.max(np.abs(actual - ref[f"{case}.{name}"])))
+            assert_as_exact_as_the_reference(actual, ref[f"{case}.{name}"], ref[f"{case}.{name}.fp64"],
+                                             f"{case} {name}")
     else:
         ref = np.load(directory / "schedulers.npz")
         policy = SourceSchedule.from_config(json.loads(str(ref[case + ".config"])))
-        errors["betas"] = float(np.max(np.abs(policy.betas - ref[case + ".betas"])))
-        np.testing.assert_allclose(policy.betas, ref[case + ".betas"], atol=2e-6, rtol=2e-6)
+        np.testing.assert_array_equal(policy.betas, ref[case + ".betas"])
         process, times = policy.sampling(4)
         model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
         expected_times = ref[case + ".times"]
         if case == "pndm-linspace":
             expected_times = np.concatenate([expected_times[:1], expected_times[2:]])
-        errors["times"] = float(np.max(np.abs(model_times - expected_times)))
-        np.testing.assert_allclose(model_times, expected_times, atol=1e-5, rtol=1e-5)
+        np.testing.assert_array_equal(model_times, expected_times)
         initial = jnp.asarray([[10.0, -8.0, 0.3]]) * process.sampler_schedule.prior_scale()
         denoise = process.denoiser(Oracle(), {}, {})
         result = sample(denoise, initial, solver=policy.solver, times=times,
                         key=jax.random.PRNGKey(0), final_denoise=False)
         errors["trajectory"] = float(np.max(np.abs(result - ref[case + ".final"])))
-        np.testing.assert_allclose(result, ref[case + ".final"], atol=1e-4, rtol=1e-4)
+        assert_as_exact_as_the_reference(result, ref[case + ".final"], ref[case + ".final.fp64"], f"{case} walk")
     print(json.dumps({"case": case, "errors": errors}))
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import assert_as_exact_as_the_reference
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
     parser.add_argument("case")
