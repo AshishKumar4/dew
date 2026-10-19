@@ -170,7 +170,7 @@ def truth(root, destination):
             meta = json.loads((directory / "reference.json").read_text())
             got = {}
             if task == "safety":
-                pipe = StableDiffusionPipeline.from_pretrained(directory, torch_dtype=wide, local_files_only=True)
+                pipe = StableDiffusionPipeline.from_pretrained(directory, local_files_only=True).to(wide)
                 pipe.set_progress_bar_config(disable=True)
                 noise = torch.from_numpy(reference["noise"].transpose(0, 3, 1, 2).copy()).to(wide)
                 with torch.no_grad():
@@ -183,7 +183,7 @@ def truth(root, destination):
                     got["checker_embeddings"] = checker.visual_projection(checker.vision_model(features)[1]).numpy()
             else:
                 cls = StableDiffusionXLInpaintPipeline if task == "xl-inpaint" else StableDiffusionXLImg2ImgPipeline
-                pipe = cls.from_pretrained(directory, torch_dtype=wide, local_files_only=True)
+                pipe = cls.from_pretrained(directory, local_files_only=True).to(wide)
                 pipe.set_progress_bar_config(disable=True)
                 processed = torch.from_numpy(reference["processed"]).to(wide)
                 noise = torch.from_numpy(reference["noise"].transpose(0, 3, 1, 2).copy()).to(wide)
