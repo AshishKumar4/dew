@@ -157,7 +157,7 @@ from dew.training.planning import Candidate, Planned, Timer, plan_step, settled,
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import Accumulation, TrainState
+from dew.training.state import MODEL_STATE, Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
 
@@ -1406,8 +1406,13 @@ class Trainer(Generic[Loss, Effects]):
         several, each a Dataset, a reader scored as `dataset.val` would be or an
         `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
-        `restore_best=True` returns the state the run ranked best: its best
-        checkpoint, or without `Checkpoints` the state it held (`HeldBest`).
+        `restore_best=True` returns the model the run ranked best: the final
+        state with the counters, variables and EMA of the best step
+        (`MODEL_STATE`), read from its best checkpoint, a weights-only one
+        included, or without `Checkpoints` from the copy it held
+        (`HeldBest`). Its optimizer state and the rest stay the final step's,
+        so it is the best model, not a point to resume training from, which
+        the run's checkpoints are.
 
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
@@ -1441,7 +1446,7 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
+        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every)
         self._preflight(loader, stop, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1466,16 +1471,8 @@ class Trainer(Generic[Loss, Effects]):
             trained = dataclasses.replace(trained, compute=None)
             # Whether this fit trained or found the run complete, and inside
             # the lifecycle, so a selection that fails is the run's outcome.
-            if restore_best and checkpoints is not None and run.preempted is None:
-                checkpoints.wait()  # the best may be the last step's save, still in flight
-                trained, _ = checkpoints.restore(
-                    jax.tree.map(
-                        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
-                        trained),
-                    step="best",
-                )
-            elif restore_best and checkpoints is None and run.preempted is None:
-                trained = run.best.state()
+            if restore_best and run.preempted is None:
+                trained = self._best_model(trained, run)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1803,6 +1800,20 @@ class Trainer(Generic[Loss, Effects]):
             return True
         return False
 
+    def _best_model(self, final: TrainState, run: _FitRun) -> TrainState:
+        """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
+        its best checkpoint, a weights-only one included, or without `Checkpoints` from the copy the
+        run held (`HeldBest`)."""
+        checkpoints = self.checkpoints
+        if checkpoints is None:
+            return run.best.state(final)
+        checkpoints.wait()  # the best may be the last step's save, still in flight
+        template = {name: jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), value)
+            for name in MODEL_STATE if (value := getattr(final, name)) is not None}
+        model, _ = checkpoints.restore(template, step="best")
+        return dataclasses.replace(final, **{name: model[name] for name in template})
+
     def _take(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, *,
               unlogged: bool = False) -> None:
         """Take the log of the interval ending at the current step (`Interval.take`); with
@@ -1902,7 +1913,7 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is not None:
             checkpoints.wait()
 
-    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
+    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
         scored = _split_metrics(suites) or {'val': tuple(metrics)}
@@ -1944,9 +1955,6 @@ class Trainer(Generic[Loss, Effects]):
                 )
             stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(scored)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
-        if restore_best and self.checkpoints is not None and any(
-                choice.weights_only for choice in selection):
-            raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
 
     @staticmethod

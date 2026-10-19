@@ -522,7 +522,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
     """`--trainer.quantization` wraps the module block-diffusion SFT trains, as it does any
     objective's (`quantize_trunk`): the recipe takes it, its step runs on the quantized forward,
     and it moves the checkpoint other than the same step without it does."""
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
     directory = tmp_path / "tokens"
