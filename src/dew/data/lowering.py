@@ -480,11 +480,11 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
         return {name: np.concatenate([value[piece] for piece in pieces]) if name in self._stage.fields
                 else value for name, value in document.items()}
 
-    def get_state(self) -> dict[str, object]:
+    def get_state(self) -> Mapping[str, object]:
         return {"documents": self._documents.get_state(), "room": self._room}
 
-    def set_state(self, state: dict[str, object]) -> None:
-        self._documents.set_state(state["documents"])
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._documents.set_state(record(state["documents"], "packed documents"))
         self._room = integer(state["room"], "packed window room")
 
 
