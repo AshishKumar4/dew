@@ -187,7 +187,7 @@ class TextData(_Loadable):
             raise ValueError(
                 "token-store validation uses its named split; slice a windows Pipeline for HoldOut"
             )
-        if held is None and stored.metadata().get("val_tokens", 0):
+        if held is None and stored.holds("val"):
             held = _named_split(stored, "val")
         sources = (stored, None if held is None or isinstance(held, Pipeline) else _source(held))
 
@@ -554,17 +554,11 @@ def loader(
             raise ValueError("load needs a recipe or alias; a bare URI names a source")
         from dew.registry import datasets
 
-        resolved = datasets.build(recipe, **fields)
-        if not isinstance(resolved, RunData):
-            raise TypeError(f"dataset alias {recipe!r} does not name a Pipeline recipe")
-        recipe = resolved
+        recipe = datasets.build(recipe, **fields)
     elif fields:
         if not dataclasses.is_dataclass(recipe):
             raise TypeError("recipe field overrides require a frozen dataclass")
-        declared = {field.name for field in dataclasses.fields(recipe)}
-        unknown = fields.keys() - declared
-        if unknown:
-            raise ValueError(f"unknown recipe fields {sorted(unknown)}")
+        # The recipe's own constructor refuses a field it does not declare.
         recipe = dataclasses.replace(recipe, **fields)
     if not isinstance(recipe, RunData):
         raise TypeError("load expects a typed recipe with pipelines()")

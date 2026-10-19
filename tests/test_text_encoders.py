@@ -39,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
 from dew.nn.text_encoders import CLIPModel, translate_config
@@ -340,6 +341,41 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
     text = largest_difference(text_embeds, expected["text_embeds"])
     assert image < REAL_TOLERANCE, f"max |image embedding difference| {image:.3e}"
     assert text < REAL_TOLERANCE, f"max |text embedding difference| {text:.3e}"
+
+
+def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
+    """FP32 masters under `dtype=bfloat16`: the token and relative-bias tables
+    are read in bfloat16, as transformers' T5 reads its own in the dtype the
+    model runs in, so the residual stream every block adds to is bfloat16
+    (the tables read at their FP32 storage had kept it FP32). The last hidden
+    state is as exact as transformers' bfloat16 encoder from its float64 one
+    (tests/reference_error.py's rule); observed 6.6e-3 and 6.8e-3 RMS."""
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from transformers import T5EncoderModel
+
+    directory = Path(__file__).resolve().parent / "fixtures/t5/tiny"
+    expected = reference(directory)
+    ids, mask = expected["input_ids"], expected["attention_mask"]
+    encoder = T5Text.from_pretrained(str(directory), dtype=jnp.bfloat16)
+    _, state = encoder.transformer.apply(encoder.params, jnp.asarray(ids), jnp.asarray(mask),
+                                         capture_intermediates=True, mutable=["intermediates"])
+    sites = {name: site for name, site in state["intermediates"].items() if name != "__call__"}
+    assert {"embed_tokens", "relative_attention_bias_0", "layers_0", "layers_1"} <= sites.keys()
+    for name, site in sites.items():
+        for output in jax.tree.leaves(site["__call__"]):
+            assert output.dtype == jnp.bfloat16, name
+
+    def transformers(dtype):
+        model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
+        with torch.no_grad():
+            return model(input_ids=torch.from_numpy(ids.astype(np.int64)),
+                         attention_mask=torch.from_numpy(mask.astype(np.int64))).last_hidden_state.float().numpy()
+
+    real = mask.astype(bool)
+    assert_as_exact_as_the_reference(hidden(encoder, ids, mask)[real], transformers(torch.bfloat16)[real],
+                                     transformers(torch.float64)[real], "T5 bfloat16 hidden states")
 
 
 @pytest.mark.parametrize("kind", ["clip-text", "clip", "t5"])

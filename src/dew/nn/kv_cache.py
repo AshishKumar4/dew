@@ -454,16 +454,17 @@ class KVStore:
         through Dew's Pallas decode kernel where it fits the query's heads
         over the pool's and the page (`decode_attention.fits_paged`). A
         grouped pool also uses the gather, which keeps each group's pages
-        where they are.
+        where they are, and so does a mesh splitting the query heads past the
+        pool's key heads: either device's kernel runs per shard (`decode`),
+        each holding the pool's key heads its query heads read.
         """
         page_size = self.layout.page_size
         if (page_size is None or self.layout.quantized is not None
-                or self.layout.groups != 1 or self.dtype != jnp.bfloat16):
+                or self.layout.groups != 1 or self.dtype != jnp.bfloat16
+                or self.kv_heads % _head_shards(query)):
             return False
         if backend() == "tpu":
-            # On a mesh the kernel runs per shard (`decode`), each holding the pool's key heads its
-            # query heads read.
-            return self.kv_heads % _head_shards(query) == 0
+            return True
         if backend() != "gpu":
             return False
         from dew.nn.attention import FORWARD_MODE
@@ -478,28 +479,25 @@ class KVStore:
         Decode runs the device's paged kernel. The TPU kernel does not scale
         the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
         same scale every other attention path applies. A Mosaic kernel cannot
-        be partitioned automatically, so on a mesh the TPU kernel runs per
-        shard (`manual_map`): each holds its rows' queries, lengths and page
-        tables, and the key heads of the pool its query heads read, with every
-        page, as the tables index the whole pool. On a GPU, a `softcap` raises
-        `ValueError`.
+        be partitioned automatically, and neither can the GPU's Pallas kernel,
+        so on a mesh each runs per shard (`manual_map`): each holds its rows'
+        queries, lengths and page tables, and the key heads of the pool its
+        query heads read, with every page, as the tables index the whole pool.
+        On a GPU, a `softcap` raises `ValueError`.
         """
-        if backend() == "gpu":
-            if softcap is not None:
-                raise ValueError("the GPU paged decode kernel does not apply a logit softcap")
-            return _gpu_paged(query, self._get("cached_key"), self._get("cached_value"),
-                              self._get(TABLE), lengths)
-        from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
+        if backend() == "gpu" and softcap is not None:
+            raise ValueError("the GPU paged decode kernel does not apply a logit softcap")
 
         def local(query, key, value, lengths, table):
+            if backend() == "gpu":
+                return _gpu_paged(query, key, value, table, lengths)
+            from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
+
             scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
             return paged_attention(scaled, key, value, lengths, table, attn_logits_soft_cap=softcap,
                                    pages_per_compute_block=_pages_per_block(table.shape[1]))
 
         arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE))
-        mesh = jax.sharding.get_abstract_mesh()
-        if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-            return local(*arrays)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]

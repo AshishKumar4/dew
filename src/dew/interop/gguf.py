@@ -37,16 +37,6 @@ whose `general.architecture` is also its HF model_type and its Dew family.
 Architectures whose llama.cpp conversion rewrites more than the Q/K rows
 (Gemma adds one to its norm scales, MoE files fuse experts) are refused."""
 
-_TOP_NAMES = ("model.embed_tokens", "model.norm", "lm_head")
-_LAYER_NAMES = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-                "self_attn.q_norm", "self_attn.k_norm", "input_layernorm",
-                "post_attention_layernorm", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
-"""The module names transformers' LlamaForCausalLM, Qwen2ForCausalLM and
-Qwen3ForCausalLM hold. transformers resolves a GGUF name by asking gguf-py's
-table for each name in the torch model's state dict; these names stand in
-for that state dict, and the same table answers."""
-
-
 _HEAD_WIDTHS = frozenset({"rope.dimension_count", "attention.key_length", "attention.value_length"})
 """Keys the table drops or maps to head_dim that are inert at the head width:
 a rotary over part of each head, or keys and values wider or narrower than
@@ -140,14 +130,19 @@ def tokenizer(path: str | os.PathLike[str]) -> PreTrainedTokenizerFast:
 
 
 def _hf_names(architecture: str, layers: int) -> dict[str, str]:
-    """Map each GGUF tensor stem this architecture can hold to its HF module name."""
+    """Map each GGUF tensor stem this architecture can hold to its HF module name.
+
+    transformers resolves a GGUF name by asking gguf-py's table for each name in
+    the torch model's state dict; the dense decoder schema the safetensors codec
+    maps (`decoder_parts.dense_modules`) stands in for that state dict, and the
+    same table answers."""
     from gguf import MODEL_ARCH_NAMES, get_tensor_name_map
+
+    from dew.interop.decoder_parts import dense_modules
 
     arch = next(key for key, value in MODEL_ARCH_NAMES.items() if value == architecture)
     table = get_tensor_name_map(arch, layers)
-    names = [*_TOP_NAMES, *(f"model.layers.{layer}.{name}"
-                            for layer in range(layers) for name in _LAYER_NAMES)]
-    return {stem: name for name in names if (stem := table.get_name(name)) is not None}
+    return {stem: name for name in dense_modules(layers) if (stem := table.get_name(name)) is not None}
 
 
 def unpermute(weight: np.ndarray, heads: int) -> np.ndarray:

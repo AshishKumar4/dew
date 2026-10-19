@@ -21,6 +21,7 @@ from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, P
 from dew.diffusion.presets import JiT
 from dew.diffusion.transforms import ConsistencyBoundary, EpsilonPredictionTransform, VPredictionTransform
 from dew.inputs import Field, InputSpec
+from dew.nn.autoencoders.api import AutoEncoder
 from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.sampling import CFG, sample
@@ -291,6 +292,65 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         Step(jnp.asarray(0), jax.random.key(24), None))[0])(variables["params"])
     norm = float(optax.tree.norm(gradients))
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5
+
+
+class Inpainting(nn.Module):
+    """A velocity of the latents beside an inpainting model's masked-image inputs, refused
+    without them as an inpainting UNet's input-channel check refuses."""
+
+    @nn.compact
+    def __call__(self, x, temb, mask=None, masked_image=None):
+        if mask is None or masked_image is None:
+            raise ValueError("an inpainting model reads mask and masked_image")
+        gain = self.param("gain", nn.initializers.constant(0.25), ())
+        return gain * x + 0.3 * masked_image * (1 - mask) + (temb / 1000)[:, None, None, None] * 0.1
+
+
+class Pooled(AutoEncoder):
+    """Latents of the 2x2 means of the pixels' first channel, decoded by repeating them."""
+
+    def __init__(self):
+        self.params = {}
+
+    def encode_batch(self, params, x, key=None):
+        rows, height, width, _ = x.shape
+        return x[..., :1].reshape(rows, height // 2, 2, width // 2, 2, 1).mean(axis=(2, 4))
+
+    def decode_batch(self, params, z):
+        return jnp.repeat(jnp.repeat(jnp.repeat(z, 2, axis=1), 2, axis=2), 3, axis=-1)
+
+    @property
+    def downscale_factor(self):
+        return 2
+
+    @property
+    def latent_channels(self):
+        return 1
+
+
+def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
+    """Flow-GRPO samples an inpainting model with the masked image and mask its inputs give,
+    records them with each transition and rescores the transitions with them: the recorded
+    likelihoods come back, and a policy step through them has a gradient."""
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    inputs = InputSpec(Field("image", (4, 4, 3)), mask=Field("mask", (4, 4, 1)))
+    objective = FlowGRPOObjective(Inpainting(), process, inputs, autoencoder=Pooled(), guidance=None, steps=4)
+    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(40)).initial_state()
+    pixels = np.asarray(jax.random.randint(jax.random.key(41), (2, 4, 4, 3), 0, 256), np.uint8)
+    mask = np.zeros((2, 4, 4, 1), np.float32)
+    mask[:, :, 2:] = 1
+
+    def reward(images, context):
+        return -np.square(images.mean(axis=(1, 2, 3)))
+
+    batch = FlowRollout(objective, reward, groups=2, steps=4, train_steps=2)(
+        state, {"image": pixels, "mask": mask}, jax.random.key(42))
+    variables = state.variables
+    np.testing.assert_allclose(objective.log_probs(variables, batch), batch["old_log_probs"], atol=5e-6)
+    step = Step(jnp.asarray(0), jax.random.key(43), None)
+    gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch, step)[0])(
+        variables["params"])
+    assert np.isfinite(float(optax.tree.norm(gradients)))
 
 
 def test_transition_matches_released_sampler_and_torch_distribution():

@@ -73,6 +73,19 @@ def runs(tmp_path_factory, request):
     return root, student, batch
 
 
+def test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused(runs):
+    """The student regresses onto the teacher's raw output, so their schedules and prediction
+    transforms are one configuration, not only one class: a student whose EDM sigma_data or flow
+    shift differs from its teacher run's is refused, and the student as configured builds."""
+    _, student, _ = runs
+    preset = student.preset
+    changed = (dataclasses.replace(preset, sigma_data=0.25) if isinstance(preset, EDM)
+               else dataclasses.replace(preset, shift=3.0))
+    with pytest.raises(ValueError):
+        dataclasses.replace(student, preset=changed).build()
+    assert isinstance(student.build(), GuidanceDistillationObjective)
+
+
 def test_the_loss_is_the_papers_equation(runs):
     """Per row a scale w ~ U(1, 6); the student reads it as its guidance and
     matches u + w (c - u) of the teacher's two branches on the same noised

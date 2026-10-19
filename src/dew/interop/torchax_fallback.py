@@ -25,7 +25,6 @@ import contextlib
 import fnmatch
 import importlib.metadata
 import json
-import math
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -37,7 +36,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import sources
 from dew.interop.generation_config import read_generation_config
@@ -45,9 +43,9 @@ from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.nn.protocols import OutputTable
-from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
+from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
-from dew.training.distributed import Layout, Placement, parameter_axes
+from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch
@@ -115,22 +113,11 @@ class TorchLayout(Layout):
                 return axes
         return None
 
-    def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
-        placed = super().shardings(mesh, tree)
-        sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
-
-        def leaf_sharding(path, value, heuristic: NamedSharding) -> NamedSharding:
-            names = parameter_path(path)
-            axes = self.axes(names[-1], len(value.shape)) if names else None
-            if axes is None:
-                return heuristic
-            if sharded_devices == 1 or math.prod(value.shape) < self.min_shard:
-                return NamedSharding(mesh, P())
-            return NamedSharding(
-                mesh, logical_spec(axes, tuple(value.shape), rules=self.axis_rules, mesh=mesh)
-            )
-
-        return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree), placed)
+    def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+        """The axes the name table gives the leaf's torch name, else `Layout`'s."""
+        names = parameter_path(path)
+        axes = self.axes(names[-1], ndim) if names else None
+        return super()._axes(path, ndim, declared) if axes is None else axes
 
 
 @dataclass(frozen=True, eq=False)

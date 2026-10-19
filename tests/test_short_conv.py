@@ -10,10 +10,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from fla_gdn_support import CONV_SHAPES
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_rounds_where_the_reference_does,
+    equations,
+    within,
+)
+from tuned import each_config, launches, timed
 
-from dew.nn.kernels import generation, short_conv
+from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
 
 pytestmark = pytest.mark.kernel
@@ -115,6 +122,63 @@ def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias,
             assert_follows_xla(grad, reference, value, f"d{name}")
 
 
+def configs(op) -> list:
+    """Every config of `op`'s space, as its key declares it for the CPU tests' delta conv
+    (`each_config` reads them from a lowering, which a CPU's interpreted kernels describe too)."""
+    x, weights, _, _ = operands(2, 37, DELTA)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    return each_config(op, lambda x, weights: run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16,
+                                                  grads), x, weights)
+
+
+def test_the_tuner_reads_times_and_stores_the_convs_launches():
+    """A right-padded delta conv and its gradients, traced as the tuner reads a program: one forward
+    launch and one backward launch a piece, each a tuner op keyed by its pieces; each timed on rows
+    whose every token is real (`KernelOp.operands`), so every token's output and the taps' gradients
+    are written, where the default operands' zero validity masks every token; and a pick for each
+    stored and read back as the tuner stores them, by the same launch and key."""
+    x, weights, _, kept = operands(2, 37, DELTA, valid=True)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    found = launches(lambda x, weights: run(kernel_conv, x, weights, None, kept, DELTA, jnp.bfloat16, grads),
+                     x, weights)
+    assert sorted(type(ba.op).__name__ for ba in found) == ["ConvBackward"] * len(DELTA) + ["ConvForward"]
+    for ba in found:
+        written = timed(ba) if type(ba.op) is short_conv.ConvForward else timed(ba)[1:2]
+        for array in written:
+            assert np.all(np.any(np.asarray(array, np.float32) != 0, axis=-1)), type(ba.op).__name__
+    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                                   metadata={})
+    keyed = [ba.op.keyed(ba) for ba in found]
+    stored = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
+        (ba, tuning.AutotuningData({ba.heuristics_config: timing})) for ba in keyed))
+    read = tokamax.AutotuningResult.loads(stored.dumps())
+    assert [(type(ba.op), ba.autotuning_cache_key) for ba, _ in read.data] == [
+        (type(ba.op), ba.autotuning_cache_key) for ba in keyed]
+
+
+@pytest.mark.parametrize("op", [short_conv.ConvForward, short_conv.ConvBackward])
+def test_every_config_of_the_kernels_computes_causal_conv1d(op):
+    """Each config of each launch's space (`tuning.pinned`) gives each piece and the gradients of the
+    projection and the taps as XLA computes them, over packed documents at a length that leaves runs and
+    a tile partly past the end: the configs order the tap gradients' sums, and every one is within the
+    gate the heuristic is."""
+    x, weights, _, _ = operands(2, 37, DELTA)
+    segments = documents(2, 37)
+    grads = cotangents(x, DELTA, jnp.bfloat16)
+    want, want_grads = run(xla_conv1d, x, weights, None, None, DELTA, jnp.bfloat16, grads, segments=segments)
+    exact, exact_grads = truth(x, weights, None, None, DELTA, grads, segments=segments)
+    found = configs(op)
+    assert len(found) > 1
+    for config in found:
+        with tuning.pinned({op: config}):
+            got, got_grads = run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16, grads,
+                                 segments=segments)
+        for label, mine, theirs, value in zip(("q", "k", "v", "dx", "dtaps"), (*got, *got_grads[:2]),
+                                              (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
+                                              strict=True):
+            assert_follows_xla(mine, theirs, value, f"{config} {label}")
+
+
 def test_padding_tokens_are_zero_and_pass_no_gradient():
     """A right-padded row's padding slots come out zero and their cotangents reach nothing."""
     x, weights, _, kept = operands(2, 24, DELTA, valid=True)
@@ -146,21 +210,40 @@ def test_a_gpu_runs_the_kernels_both_ways():
         assert not kernels(jax.grad(loss), x)
 
 
-@pytest.mark.parametrize("dtype, out, parts, taps, reason", [
-    (jnp.float64, jnp.float64, DELTA, 4, "float64"),
-    (jnp.float32, jnp.float64, DELTA, 4, "into float64"),
-    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4, "its block"),
-    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (40, 32)), 4, "its block"),
+@pytest.mark.parametrize("dtype, out, parts, taps", [
+    (jnp.float64, jnp.float64, DELTA, 4),
+    (jnp.float32, jnp.float64, DELTA, 4),
+    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4),
     # One key head of 16 and a value head of 8: no 16-channel block holds the values.
-    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4, "its block"),
-    (jnp.bfloat16, jnp.bfloat16, DELTA, 12, "12 taps"),
+    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4),
+    (jnp.bfloat16, jnp.bfloat16, DELTA, 12),
 ])
-def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason):
+def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, taps):
+    """On a GPU whose row names the kernels, a conv they do not take (`conv_refusal`: float64, a piece
+    off its block, more taps than they hold) runs XLA's conv: the same values and gradients, and no
+    kernel launch."""
     with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
-        x = jnp.zeros((1, 8, sum(width for width, _ in parts)), dtype)
+        keys = jax.random.split(jax.random.key(89), 3)
+        x = jax.random.normal(keys[0], (1, 8, sum(width for width, _ in parts))).astype(dtype)
+        taps = 0.3 * jax.random.normal(keys[1], (x.shape[-1], taps))
+        probe = [jax.random.normal(key, (1, 8, width)) for key, (width, _) in zip(
+            jax.random.split(keys[2], len(parts)), parts, strict=True)]
+
+        def loss(conv):
+            def run(x, taps):
+                return sum(jnp.sum(piece.astype(jnp.float32) * weight) for piece, weight in zip(
+                    conv(x, taps, parts=parts, dtype=out), probe, strict=True))
+            return jax.value_and_grad(run, argnums=(0, 1))
+
         with generation.assumed("sm80"):
-            refused = conv_refusal(x, jnp.zeros((x.shape[-1], taps), jnp.float32), parts, out)
-    assert refused is not None and reason in refused
+            assert conv_refusal(x, taps, parts, out) is not None
+            launched = [equation for equation in equations(jax.make_jaxpr(loss(causal_conv1d))(x, taps))
+                        if equation.primitive.name == "pallas_call"]
+            got = jax.jit(loss(causal_conv1d))(x, taps)
+        want = jax.jit(loss(xla_conv1d))(x, taps)
+    assert not launched
+    for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
@@ -170,20 +253,30 @@ def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason)
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
-    XLA's own conv (`assert_as_exact_as_the_reference`). Two rows: a row's tokens are the distances'
+    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's heuristic and, at the 0.8b's
+    width, at every config of its space (`tuning.pinned`). Two rows: a row's tokens are the distances'
     terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
     (_, length), parts = CONV_SHAPES[model]
     x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
     grads = cotangents(x, parts, dtype)
-    got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+
+    def kernels(x, weights):
+        return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
     exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
-    labels = ("q", "k", "v", "dx", "dtaps")
-    # The gradients of the projection and the taps; there is no bias.
-    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                          (*exact, *exact_grads[:2]), strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
+    # Every config of each launch's space at the 0.8b's width, the heuristics at the other's.
+    pins = [{}] + ([{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
+                    for config in each_config(op, kernels, x, weights)] if model == "0.8b" else [])
+    for pin in pins:
+        with tuning.pinned(pin):
+            got, got_grads = kernels(x, weights)
+        labels = ("q", "k", "v", "dx", "dtaps")
+        # The gradients of the projection and the taps; there is no bias.
+        for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
+                                              (*exact, *exact_grads[:2]), strict=True):
+            assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}")
 
 
 @pytest.mark.mesh(devices=2)

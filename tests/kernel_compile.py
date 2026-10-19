@@ -16,12 +16,12 @@ import numpy as np
 from jax.sharding import Mesh
 
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.training._lowering import TritonCall, triton_calls
 
 HUNG = 600.0
 """Wall seconds after which a compile's child session is stopped as hung: the process boundary's
 guard, not a bound on the kernel. How long a compile takes on a shared CPU says nothing about it."""
 
-_TRITON_CALL = "__gpu$xla.gpu.triton"
 _COMPILE = """import json, sys
 import triton
 from triton.backends.compiler import GPUTarget
@@ -33,37 +33,17 @@ print(json.dumps({"shared": kernel.metadata.shared}))
 """
 
 
-def _triton_calls(lowered: jax.stages.Lowered) -> list[dict]:
-    """Each Pallas-Triton call of a lowered program: its Triton IR as text, its warps and stages."""
-    # The custom call's Triton IR is reachable only through JAX's MLIR bindings, jaxlib's and its own.
+def _triton_text(calls: list[TritonCall]) -> list[str]:
+    """Each call's Triton IR as text, without debug locations."""
+    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
     from jax._src.interpreters import mlir
     from jax._src.lib.triton import dialect
     from jaxlib.mlir import ir
 
-    found = []
-
-    def visit(operation) -> None:
-        if (operation.name == "stablehlo.custom_call"
-                and ir.StringAttr(operation.attributes["call_target_name"]).value == _TRITON_CALL):
-            config = ir.DictAttr(operation.attributes["mhlo.backend_config"])
-            found.append({"ir": ir.StringAttr(config["ir"]).value_bytes,
-                          "warps": ir.IntegerAttr(config["num_warps"]).value,
-                          "stages": ir.IntegerAttr(config["num_stages"]).value})
-        for region in operation.regions:
-            for block in region.blocks:
-                for inner in block.operations:
-                    visit(inner.operation)
-
-    module = lowered.compiler_ir("stablehlo")
-    if module is None:
-        raise ValueError("the lowered program has no StableHLO module")
-    visit(module.operation)
     context = mlir.make_ir_context()
     dialect.register_dialect(context)
     with context:
-        for call in found:
-            call["ir"] = ir.Module.parse(call["ir"]).operation.get_asm(enable_debug_info=False)
-    return found
+        return [ir.Module.parse(call.ir).operation.get_asm(enable_debug_info=False) for call in calls]
 
 
 def _compiled(entry: dict) -> dict:
@@ -113,14 +93,15 @@ def compile_kernels(cases, generation: str) -> list[dict]:
             except Exception as error:  # A case that does not lower is its own failure.
                 record["error"] = f"it does not lower: {str(error)[-800:]}"
                 continue
-            for call in _triton_calls(lowered):
-                named = f"{generation}|{call['warps']}|{call['stages']}|{call['ir']}"
+            triton = triton_calls(lowered)
+            for call, text in zip(triton, _triton_text(triton), strict=True):
+                named = f"{generation}|{call.warps}|{call.stages}|{text}"
                 key = hashlib.sha256(named.encode()).hexdigest()
                 if key not in calls:
                     path = Path(scratch) / f"{len(calls)}.ttir"
-                    path.write_text(call["ir"])
+                    path.write_text(text)
                     calls[key] = ({"path": str(path), "capability": int(generation.removeprefix("sm")),
-                                   "warps": call["warps"], "stages": call["stages"]}, [])
+                                   "warps": call.warps, "stages": call.stages}, [])
                 calls[key][1].append(record)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as pool:
             entries = [entry for entry, _ in calls.values()]
