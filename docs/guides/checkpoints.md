@@ -182,7 +182,7 @@ for checkpoint in trainer.checkpoints.kept():
     print(checkpoint.step, checkpoint.kind, checkpoint.metrics, checkpoint.rankings)
 ```
 
-`restore_best=True` on `fit` returns the whole training state of the best step, with that step's optimizer state, counters and RNG, so you do not get earlier weights paired with the final optimizer. Without it, `fit` returns the final state as usual.
+`restore_best=True` on `fit` returns the whole training state of the best step, with that step's optimizer state, counters and RNG, so you do not get earlier weights paired with the final optimizer. With `Checkpoints` it restores the best checkpoint. Without `Checkpoints`, the run holds the best state in host memory as it trains (`dew.training.selection.HeldBest`): one copy, replaced whenever an evaluation's first ranking beats the held one, an earlier evaluation winning a tie, and `fit` puts it back where it was placed. A run whose ranking scored no evaluation has no best state, and `fit` raises `ValueError`. Without `restore_best`, `fit` returns the final state as usual.
 
 `Best(fid, weights_only=True)` writes only the parameters and EMA for a winner that falls between checkpoint steps. Such a snapshot is for inference only, and full-state restore and `restore_best=True` refuse it. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
 
