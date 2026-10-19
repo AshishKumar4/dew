@@ -16,6 +16,7 @@ Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
 the fused VJPs to Liger's measured float64 distances.
 """
 
+import contextlib
 import functools
 import json
 
@@ -409,20 +410,24 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
-@pytest.mark.parametrize("dtype, kernel", [(jnp.bfloat16, "pallas"), (jnp.float32, "xla")])
-def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, kernel):
+@pytest.mark.parametrize("named", [None, "chosen", "call"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("packed", [False, True])
+def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named, packed):
     """On an A100's row (`generation.assumed`), a bf16 SiLU product with no kernel named takes the
     Pallas kernel the row measured, and an fp32 one, which no row measured and XLA fuses with its
-    neighbours, takes XLA, the route saying why; a named 'pallas' still runs the kernel at fp32."""
+    neighbours, takes XLA as its own preference; a kernel named by `chosen` or per call runs at
+    either width. Each product, apart or packed, reports the route it took."""
     from dew.nn.kernels import generation, norm_swiglu
 
-    gate = up = jnp.ones((2, 4096), dtype)
-    with generation.assumed("sm80"), generation.routes() as found:
-        assert norm_swiglu.swiglu_kernel("auto", gate, up) == kernel
+    operands = (jnp.ones((2, 2, 4096), dtype),) if packed else (jnp.ones((2, 4096), dtype),) * 2
+    resolve = norm_swiglu.packed_swiglu_kernel if packed else norm_swiglu.swiglu_kernel
+    kernel = "pallas" if named or dtype == jnp.bfloat16 else "xla"
+    named_by = generation.chosen(swiglu="pallas") if named == "chosen" else contextlib.nullcontext()
+    with generation.assumed("sm80"), named_by, generation.routes() as found:
+        assert resolve("pallas" if named == "call" else "auto", *operands) == kernel
     (route,) = found
-    assert route.kernel == kernel and route.preferred == "pallas"
-    if dtype == jnp.float32:
-        assert "bf16 products alone" in str(route.refusal)
+    assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
 
 
 @pytest.mark.gpu

@@ -280,14 +280,15 @@ def device_generation() -> str:
     return device.platform
 
 
-def measured_kernel(choice: str, default: str) -> str:
-    """The kernel `chosen` names for `choice`, else `KERNELS` on this generation, else `default`."""
+def measured_kernel(choice: str, default: str, *, fastest: str | None = None) -> str:
+    """The kernel `chosen` names for `choice`, else `fastest`, the site's own measurement of a call
+    no row measured (an fp32 SiLU product), else `KERNELS` on this generation, else `default`."""
     from dew import cache
 
     _named((choice,))
     if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
         return kernel
-    return gpu_target(device_generation()).kernels.get(choice, default)
+    return fastest or gpu_target(device_generation()).kernels.get(choice, default)
 
 
 @dataclasses.dataclass(frozen=True)

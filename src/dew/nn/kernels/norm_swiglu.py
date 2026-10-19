@@ -192,22 +192,26 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
     return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
 
 
-def _selected(choice: str, implementation: str, refusal: str | None) -> str:
+def _selected(choice: str, implementation: str, refusal: str | None, fastest: str | None = None) -> str:
+    """The kernel a call runs, reported as `generation.route` reports it: the one `implementation`
+    names, or for 'auto' the one `chosen` names, else `fastest` (`_measured_width`), else the
+    target's row; Pallas where it runs and nothing refuses it, else XLA."""
     from ..attention import FORWARD_MODE
 
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"implementation must be one of {IMPLEMENTATIONS}, got {implementation!r}")
-    chosen = generation.measured_kernel(choice, 'xla') if implementation == 'auto' else implementation
+    chosen = (generation.measured_kernel(choice, 'xla', fastest=fastest) if implementation == 'auto'
+              else implementation)
     if chosen != 'pallas':
-        return chosen
+        return generation.route(choice, kernel=chosen, preferred=chosen).kernel
     placed = generation.triton_runs() or (implementation == 'pallas' and generation.backend() == 'cpu')
     reason = first_refusal(
         (placed, "the Pallas kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention needs a JVP; these kernels implement VJPs"),
     ) or refusal
     if reason is None:
-        return generation.route(choice, kernel='pallas').kernel
-    return generation.ran_kernel(choice, 'xla', reason)
+        return generation.route(choice, kernel='pallas', preferred='pallas').kernel
+    return generation.ran_kernel(choice, 'xla', reason, fastest='pallas')
 
 
 def _split() -> bool:
@@ -296,38 +300,37 @@ def _swiglu_refusal(operands, axes) -> str | None:
     )
 
 
-def _measured_width(implementation: str, dtype) -> str | None:
-    """Why an fp32 SiLU product takes XLA where no kernel is named: every target row measured the
-    kernel on bf16 products alone, and at fp32 XLA fuses the product's converts and neighbours into
-    one pass the kernel's launch splits (8 layers of Dory's 1 x 2048 nGPT block on an A100: 5.4 ms a
-    step through the kernel, 2.6 through XLA). A named 'pallas' runs it."""
-    if implementation == 'auto' and jnp.dtype(dtype) == jnp.float32:
-        return "the target row measured the SwiGLU kernel on bf16 products alone; XLA fuses an fp32 one"
-    return None
+def _measured_width(dtype) -> str | None:
+    """The kernel measured fastest for a SiLU product of `dtype` where the target's row does not
+    speak for it: every row measured the kernel on bf16 products alone, and at fp32 XLA fuses the
+    product's converts and neighbours into one pass the kernel's launch splits (8 layers of Dory's
+    1 x 2048 nGPT block on an A100: 5.4 ms a step through the kernel, 2.6 through XLA). A kernel
+    named per call or by `chosen` runs as named."""
+    return 'xla' if jnp.dtype(dtype) == jnp.float32 else None
 
 
 def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
     arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
-    return _selected('swiglu', implementation, _measured_width(implementation, gate.dtype) or first_refusal(
+    return _selected('swiglu', implementation, first_refusal(
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
-    ) or _swiglu_refusal((gate, up), axes))
+    ) or _swiglu_refusal((gate, up), axes), _measured_width(gate.dtype))
 
 
 def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    measured = _measured_width(implementation, gate_up.dtype)
-    return _selected('swiglu', implementation, measured or first_refusal(
+    return _selected('swiglu', implementation, first_refusal(
         (gate_up.dtype in DTYPES, "SwiGLU needs float32 or bfloat16 operands"),
         (gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
          "a packed SwiGLU takes a nonempty [..., 2, H] gate and up"),
-    ) or _swiglu_refusal((gate_up,), None if axes is None else (*axes[:-1], None, axes[-1])))
+    ) or _swiglu_refusal((gate_up,), None if axes is None else (*axes[:-1], None, axes[-1])),
+        _measured_width(gate_up.dtype))
 
 
 def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: bool):
