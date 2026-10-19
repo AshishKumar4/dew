@@ -14,7 +14,7 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -304,23 +304,36 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     # each one starts where the one before it ends.
     offset = 8 + length
     for name, shape, tag in layout:
-        if tag == PACKED_F4:
-            if not shape or shape[-1] % 2:
-                raise ValueError(
-                    f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
-                    "elements share a byte, so its last axis is even")
-            shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
-        else:
-            try:
-                dtype = _STORED_DTYPES[tag]
-            except KeyError as error:
-                raise ValueError(
-                    f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
-                ) from error
-        tensors[name] = np.ndarray(shape, dtype=dtype, buffer=mapping, offset=offset)
-        offset += math.prod(shape) * dtype.itemsize
+        spec = stored_spec(name, shape, tag, filename)
+        tensors[name] = np.ndarray(spec.shape, dtype=spec.dtype, buffer=mapping, offset=offset)
+        offset += math.prod(spec.shape) * spec.dtype.itemsize
     return dict(sorted(tensors.items())), metadata
 
+
+def stored_spec(name: str, shape: Sequence[int], tag: str, filename: str) -> jax.ShapeDtypeStruct:
+    """The array a stored tensor reads as, by its header's shape and dtype tag:
+    the tag's dtype, or for F4 its `PACKED_F4` byte view."""
+    if tag == PACKED_F4:
+        if not shape or shape[-1] % 2:
+            raise ValueError(
+                f"tensor {name!r} in {filename} is F4 with shape {tuple(shape)}; two "
+                "elements share a byte, so its last axis is even")
+        return jax.ShapeDtypeStruct((*shape[:-1], shape[-1] // 2), np.dtype(np.uint8))
+    try:
+        return jax.ShapeDtypeStruct(tuple(shape), _STORED_DTYPES[tag])
+    except KeyError as error:
+        raise ValueError(f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}") from error
+
+
+def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
+    """The arrays a safetensors file's tensors read as (`read_file`), from its header
+    alone; no tensor's bytes are read."""
+    filename = os.fspath(path)
+    package, _ = _safetensors()
+    with package.safe_open(filename, "np") as reader:
+        names = reader.keys()
+        views = [(name, reader.get_slice(name)) for name in names]
+        return {name: stored_spec(name, view.get_shape(), view.get_dtype(), filename) for name, view in views}
 
 
 class LazyTensors(Mapping[str, np.ndarray]):
