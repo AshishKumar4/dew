@@ -856,7 +856,7 @@ def cfg_step_figure():
     svg.appear(plain, 0.4)
     with svg.group() as captioned:
         svg.arrow(*origin, *(origin + cond), color="text", width=2)
-        svg.text(*(origin + cond + [-150, -10]), "“a red rose”", size=13)
+        svg.text(*(origin + 0.55 * cond + [-86, -10]), "“a red rose”", size=13)
     svg.appear(captioned, 1.4)
     pull = svg.line(*(origin + uncond), *(origin + cond), color="accent", width=1.5, dash="4 4")
     svg.appear(pull, 2.6)
@@ -867,15 +867,15 @@ def cfg_step_figure():
         svg.arrow(*origin, *(origin + guided), color="accent", width=2.5)
         svg.text(*(origin + guided + [-40, -14]), f"guided, s = {scale:g}", size=13, color="accent", weight=600)
     svg.appear(followed, 4.2)
-    svg.appear(svg.text(24, 32, "ε̂ = ε_uncond + s (ε_cond − ε_uncond)", size=14, mono=True), 5.2)
+    svg.appear(svg.text(24, 32, "ε_guided = ε_uncond + s (ε_cond − ε_uncond)", size=13, mono=True), 5.2)
     svg.save(HERE / "cfg-step.svg")
 
 
 def cfg_sweep_figure():
     """The guided prediction as the scale s sweeps from 0 to 6: at 0 the plain prediction, at 1 the captioned
     one, past 1 further along the caption's pull."""
-    width, height = 440, 260
-    origin, uncond, cond = np.array([50.0, 210.0]), np.array([110.0, -20.0]), np.array([125.0, -55.0])
+    width, height = 440, 270
+    origin, uncond, cond = np.array([40.0, 236.0]), np.array([100.0, -10.0]), np.array([125.0, -40.0])
     scales = [0, 1, 2, 3, 4, 6]
     svg = Figure(width, height, seconds=11, label="The guided prediction as the guidance scale grows from 0 to 6: "
                  "at 0 it is the prediction without a caption, at 1 the captioned one, and past 1 it reaches "
