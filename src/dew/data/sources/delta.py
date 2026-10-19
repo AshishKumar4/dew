@@ -31,6 +31,10 @@ class Delta(Files):
     def arrow(self):
         return self.table.to_pyarrow_dataset()
 
+    def _shard_name(self, path: str) -> str:
+        """The file as the table's log names it, where Delta's dataset reads it."""
+        return path
+
     @cached_property
     def paths(self) -> tuple[str, ...]:
         return tuple(self.table.file_uris())

@@ -1155,6 +1155,7 @@ def test_a_downloaded_hub_split_streams_its_rows_from_the_hub_cache_offline(tmp_
     cache with the Hub offline (HF_HUB_OFFLINE), as `huggingface_hub` reads its own files."""
     from types import SimpleNamespace
 
+    import pyarrow.parquet as pq
     from hub_support import offline
     from huggingface_hub import HfApi, HfFileSystem, constants
 
@@ -1169,7 +1170,7 @@ def test_a_downloaded_hub_split_streams_its_rows_from_the_hub_cache_offline(tmp_
     for split, part in (("train", rows[:6]), ("test", rows[6:])):
         path = snapshot / f"{split}.{format}"
         if format == "parquet":
-            pa.parquet.write_table(pa.Table.from_pylist(part), path)
+            pq.write_table(pa.Table.from_pylist(part), path)
         else:
             path.write_text("".join(json.dumps(row) + "\n" for row in part))
     names = [f"data/{split}.{format}" for split in ("train", "test")]
