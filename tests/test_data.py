@@ -1232,7 +1232,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 # ---------------------------------------------------------------------------------
@@ -1475,4 +1475,4 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

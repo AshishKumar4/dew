@@ -39,8 +39,9 @@ def test_a_mix_reads_memory_grain_and_files_members_at_their_shares(tmp_path):
         origins = np.concatenate([batch["origin"] for batch in itertools.islice(stream, 32)])
     finally:
         stream.close()
-    shares = {origin: float(np.mean(origins == origin)) for origin in ("memory", "grain", "files")}
-    assert shares == pytest.approx({"memory": 0.5, "grain": 0.25, "files": 0.25}, abs=0.05)
+    # A mix places each member's records at its exact share of every prefix of the order, 2:1:1 here.
+    counts = {origin: int(np.sum(origins == origin)) for origin in ("memory", "grain", "files")}
+    assert counts == {"memory": 128, "grain": 64, "files": 64}
 
 
 @pytest.fixture
@@ -452,8 +453,10 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
         origins = np.concatenate([next(reader)["origin"] for _ in range(40)])
     finally:
         reader.close()
-    # Three-token records carry two targets, nine-token records eight: equal targets, four short to one long.
-    assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
+    # Three-token records carry two targets, nine-token records eight. The member furthest below its
+    # share of the targets goes next, ties to the first: one short record, then a long one and four
+    # short ones in turn, so 1 + 63 * 4 + 3 of the 320 records are short.
+    assert int(np.sum(origins == "short")) == 256
 
 
 class Countdown:
