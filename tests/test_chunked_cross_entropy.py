@@ -19,6 +19,7 @@ the one case whose head is bf16 rounds at the end and holds to 1e-4.
 """
 
 import contextlib
+import math
 
 import jax
 import jax.extend
@@ -32,6 +33,7 @@ from dew.nn.precision import rounded_operand, rounded_to
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns, vocabulary_chunks
+from sharded import collectives
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
@@ -239,8 +241,6 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     of the 20 tokens each column's gradients sum (`assert_leaves_as_exact`),
     and no collective carries an array the head's size: each device's columns,
     scale and bias stay in its shard."""
-    import re
-
     from jax.sharding import NamedSharding, PartitionSpec as P
     from reference_error import assert_leaves_as_exact, float64_terms
 
@@ -276,11 +276,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
                                      *(jnp.asarray(term, jnp.float64) for term in terms))
     assert_leaves_as_exact(jax.tree.map(np.asarray, split), reference, exact, reductions=targets.size,
                            terms=sizes)
-    collective = re.compile(r'=\s*(.*?)\s(?:all-gather|all-reduce|reduce-scatter|collective-permute|'
-                            r'all-to-all)(?:-start)?\(')
-    moved = [int(np.prod([int(size) for size in dims.split(',') if size], dtype=np.int64))
-             for line in program.splitlines() if (match := collective.search(line))
-             for dims in re.findall(r'\w+\[([0-9,]*)\]', match.group(1))]
+    moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < matrix.size // 2, moved
 
 
@@ -314,8 +310,6 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
     a mesh, scores each token as one device does, and no collective of the
     step carries an array the head's size: tokens and per-token terms cross
     devices, the head stays in its shards."""
-    import re
-
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.objectives.lm import LMObjective
@@ -351,11 +345,7 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
     assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
     np.testing.assert_array_equal(actual.correct, expected.correct)
     head = 512 * 16
-    collective = re.compile(r'=\s*(.*?)\s(?:all-gather|all-reduce|reduce-scatter|collective-permute|'
-                            r'all-to-all)(?:-start)?\(')
-    moved = [int(np.prod([int(size) for size in dims.split(',') if size], dtype=np.int64))
-             for line in program.splitlines() if (match := collective.search(line))
-             for dims in re.findall(r'\w+\[([0-9,]*)\]', match.group(1))]
+    moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < head // 2, moved
 
 
