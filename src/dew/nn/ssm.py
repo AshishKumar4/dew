@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import Float32Products, at_least_fp32, float32_products, unquantized
+from .precision import Float32Products, at_least_fp32, float32_products
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
@@ -68,7 +68,6 @@ def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
     return jnp.pad(ends[:, :, :-1], ((0, 0), (0, 0), (1, 0), (0, 0)))
 
 
-@unquantized("ssm")
 def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CHUNK) -> jax.Array:
     """The states `x_k = pole * x_(k-1) + v_k`, from `x = 0` before the
     first position, of N diagonal complex recurrences over axis 1, in real

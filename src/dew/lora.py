@@ -56,7 +56,6 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from dew.nn.precision import unquantized
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -439,7 +438,6 @@ def _scale(target: Target, rslora: bool) -> float:
     return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
 
 
-@unquantized("adapter_merge")
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
     and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""

@@ -10,6 +10,7 @@ import itertools
 import os
 import subprocess
 import sys
+import types
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
@@ -27,13 +28,12 @@ from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
-from dew.nn.precision import UNQUANTIZED
 from dew.nn.quantizers import nearest_codewords
 from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.quantization import Quantization, quantize_for_serving
+from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 
@@ -973,7 +973,7 @@ class Calls(nn.Module):
 
 
 def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]:
-    """Each `UNQUANTIZED` zone's code, its operands in `dtype` and its keywords."""
+    """Each `UNQUANTIZED` function, its operands in `dtype` and its keywords."""
     keys = iter(jax.random.split(jax.random.key(0), 8))
 
     def normal(*shape):
@@ -981,23 +981,26 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
 
     pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
     return {
-        "ssm": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
-        "attention_residual": (depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
-        "quantizer": (nearest_codewords, (normal(64, 32), normal(512, 32)), {}),
-        "kv_cache": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
-        "resample": (torch_bicubic_resize, (normal(1, 4, 5, 3), 7, 9), {}),
-        "adapter_merge": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
+        "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
+        "dew.nn.attention_residuals.depth_mixed": (
+            depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
+        "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (normal(64, 32), normal(512, 32)), {}),
+        "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
+        "dew.nn.blocks.torch_bicubic_resize": (torch_bicubic_resize, (normal(1, 4, 5, 3), 7, 9), {}),
+        "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
     }
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("zone", sorted(UNQUANTIZED))
-def test_a_zone_the_model_keeps_in_float_runs_unquantized(zone, dtype):
-    """Each zone's products (`UNQUANTIZED`) run in a quantized model as in the unquantized one,
-    bitwise, in a float32 and a bfloat16 model, where the same code outside its zone
-    (`__wrapped__`) quantizes and moves."""
+@pytest.mark.parametrize("name", sorted(UNQUANTIZED))
+def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
+    """Each function `UNQUANTIZED` names runs in a quantized model as in the unquantized one,
+    bitwise, in a float32 and a bfloat16 model, where a copy of its code under another name, which
+    the table does not reach, quantizes its products and moves."""
     pytest.importorskip("qwix")
-    function, operands, keywords = zone_cases(dtype)[zone]
+    function, operands, keywords = zone_cases(dtype)[name]
+    copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
+                              function.__defaults__, function.__closure__)
 
     def ran(function, quantize: bool) -> np.ndarray:
         model = Calls(functools.partial(function, **keywords))
@@ -1005,7 +1008,8 @@ def test_a_zone_the_model_keeps_in_float_runs_unquantized(zone, dtype):
 
     plain = ran(function, quantize=False)
     np.testing.assert_array_equal(ran(function, quantize=True), plain)
-    assert not np.array_equal(ran(function.__wrapped__, quantize=True), plain)
+    np.testing.assert_array_equal(ran(copy, quantize=False), plain)
+    assert not np.array_equal(ran(copy, quantize=True), plain)
 
 
 def assert_computed_as_on_the_host(run, label: str) -> None:

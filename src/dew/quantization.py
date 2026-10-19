@@ -64,7 +64,6 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import UNQUANTIZED, unquantized_zone
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -82,6 +81,23 @@ Rounding = Literal["uniform", "low_bit_uniform"]
 CALIBRATIONS = ("absmax", "minmax", "rms", "fixed")
 """The weight calibration methods Qwix parses, before an optional `,args`
 suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
+
+UNQUANTIZED = {
+    "dew.nn.ssm.diagonal_recurrence":
+        "a diagonal recurrence's chunk products, powers of its pole compounded over every step",
+    "dew.nn.attention_residuals.depth_mixed":
+        "depth attention's fp32 softmax over earlier layers' outputs and their weighted sum",
+    "dew.nn.quantizers.nearest_codewords":
+        "a vector quantizer's codeword distances, whose argmax a rounded product reorders",
+    "dew.nn.kv_cache.rotated": "the rotation a quantized cache applies before it rounds keys and values",
+    "dew.nn.blocks.torch_bicubic_resize": "an image or a position table resampled as torch's bicubic does",
+    "dew.lora._updated": "an adapter's factor product merged into the kernel it updates, a weight and not an "
+                         "activation",
+}
+"""The functions whose products a quantized model keeps in float, at the precision they pin, each
+with why. Every other product a rule matches quantizes, whatever precision it pins: a quantized
+product has none to honour. The providers run each through Qwix's intercept map (`_providers`), as
+Qwix runs `pallas_call`, and inside a handler Qwix leaves the products unintercepted."""
 
 def entry_methods(model: nn.Module) -> tuple[str, ...]:
     """Every method of `model`'s class that a caller can enter it through,
@@ -313,12 +329,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     """The bound Dense `module`'s output from its frozen FP8 leaves, its
     kernel unread: the product (`frozen_fp8_product`) over the input's
     trailing axis, its bias added in float32, in the dtype the Dense
-    computes in. A module inside a product zone the quantized model keeps
-    in float (`UNQUANTIZED`) is refused, which an FP8 product would not."""
-    zone = unquantized_zone()
-    if zone is not None:
-        raise ValueError(f"{'/'.join(module.path)} multiplies in FP8 inside the {zone!r} zone, which keeps "
-                         f"{UNQUANTIZED[zone]} in float")
+    computes in."""
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
@@ -1020,8 +1031,7 @@ def _group_scaled_convolution() -> type:
             unwrapped model after its zero-initialized fusion kernels'
             first update (ColabPlan-2, the RTX 4080)."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            # One in an unquantized zone runs unquantized (`conv_general_dilated`), in Dew's own form.
-            if rule is None or rule.weight_qtype is None or unquantized_zone() is not None:
+            if rule is None or rule.weight_qtype is None:
                 return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
             return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
@@ -1034,17 +1044,11 @@ def _group_scaled_convolution() -> type:
                                  precision: jax.lax.PrecisionLike = None,
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
-            """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: one
-            in a zone the model keeps in float (`UNQUANTIZED`) runs unquantized at its precision,
-            and a quantized one returns the result dtype it asks for, its operands widened to it
-            first, which is exact for the narrower floats it accumulates."""
+            """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: a
+            quantized one returns the result dtype it asks for, its operands widened to it first,
+            which is exact for the narrower floats it accumulates."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             quantized = rule is not None and rule.weight_qtype is not None
-            if quantized and unquantized_zone() is not None:
-                return jax.lax.conv_general_dilated(
-                    lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                    feature_group_count, batch_group_count, precision=precision,
-                    preferred_element_type=preferred_element_type, out_sharding=out_sharding)
             returned = jnp.dtype(preferred_element_type or lhs.dtype)
             if quantized:
                 lhs, rhs = _widened((lhs, rhs), preferred_element_type)
@@ -1097,13 +1101,19 @@ def _providers() -> tuple[type, type]:
         drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
         a result dtype by widening the operands to it, exact for the
         narrower floats it accumulates, and an output sharding by
-        constraining the result where the provider drops it. A matmul in a
-        zone the model keeps in float (`dew.nn.precision.UNQUANTIZED`) runs
-        unquantized at the precision it pins; a quantized one has no
-        precision to honour, so any other matmul a rule matches quantizes
-        whatever precision it pins."""
+        constraining the result where the provider drops it. The functions
+        `UNQUANTIZED` names run unquantized, through the intercept map; any
+        other matmul a rule matches quantizes, whatever precision it pins."""
 
         keeps_out_sharding: ClassVar[bool] = False
+
+        def get_intercept_map(self):
+            # A handler that calls its function again runs the original with this provider's
+            # interception off for the thread (qwix/_src/interception.py:361-387), so none of
+            # its products quantize.
+            functions = {name: getattr(importlib.import_module(module), function)
+                         for name in UNQUANTIZED for module, _, function in [name.rpartition(".")]}
+            return {**super().get_intercept_map(), **functions}
 
         def _matched(self, op: str) -> bool:
             rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
@@ -1118,10 +1128,6 @@ def _providers() -> tuple[type, type]:
             if not self._matched("dot_general"):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
-            if unquantized_zone() is not None:
-                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                           preferred_element_type=preferred_element_type,
-                                           out_sharding=out_sharding)
             kept = out_sharding if self.keeps_out_sharding else None
             out = super().dot_general(*_widened((lhs, rhs), preferred_element_type), dimension_numbers,
                                       out_sharding=kept)
@@ -1132,8 +1138,6 @@ def _providers() -> tuple[type, type]:
                 return jnp.einsum(einsum_str, *operands, **kwargs)
             if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
-            if unquantized_zone() is not None:
-                return jnp.einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)
             out_sharding = kwargs.pop("out_sharding", None)
             kwargs.pop("precision", None)

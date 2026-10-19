@@ -33,7 +33,7 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .flops import projection_flops
-from .precision import at_least_fp32, unquantized
+from .precision import at_least_fp32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,7 +100,6 @@ class DepthAttention(nn.Module):
         return depth_mixed(keys, query, work).astype(values.dtype)
 
 
-@unquantized("attention_residual")
 def depth_mixed(keys: jax.Array, query: jax.Array, values: jax.Array) -> jax.Array:
     """`values` `[B, S, n, D]` summed over their `n` sources by the softmax of `keys` (alike) against
     `query` `[D]`, both contractions at full precision."""
