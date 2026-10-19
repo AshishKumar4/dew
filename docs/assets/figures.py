@@ -1,4 +1,8 @@
-"""Draw the docs' figures, each in a light and a dark variant.
+"""Draw the docs' and the tutorials' figures.
+
+The docs' figures come in a light and a dark variant. The tutorials' figures
+are one file each, whose colors follow the theme of the page that shows them
+(dew.figures), and most of them animate.
 
 The sharding and diffusion figures are computed by Dew itself: the mesh
 figure reads the placements `MeshSpec.build`, `Layout` and `batch_shardings`
@@ -6,17 +10,18 @@ give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
 (src/dew/training/trainer.py) and in its compiled step
-(src/dew/training/transaction.py).
+(src/dew/training/transaction.py). The RLVR figures score their answers
+with the counting task of tutorials/10-rl-with-verifiable-rewards.ipynb, and
+take their advantages and clipped objective from dew.rl.
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
-        python docs/assets/figures.py
+        python docs/assets/figures.py [NAME_PREFIX ...]
 """
 
 from __future__ import annotations
 
-import base64
-import io
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -27,78 +32,20 @@ import numpy as np
 from PIL import Image
 
 from dew.diffusion.presets import Cosine, Flow
+from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
+from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
-SANS = "Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
-MONO = "'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace"
-
-# The site's own colors (site/src/styles/theme.css).
-THEMES = {
-    "dark": dict(text="#d8e5e2", muted="#93aba7", rule="#243639", fill="#0f191c",
-                 raised="#131f23", accent="#2fb8a8", accent_fill="#0b3531",
-                 tints=["#12433d", "#1d3a52", "#3f3358", "#4f3a22"]),
-    "light": dict(text="#16282b", muted="#4d6763", rule="#c9d9d5", fill="#f2f6f5",
-                  raised="#ffffff", accent="#0b7d71", accent_fill="#d3f1ec",
-                  tints=["#cdeee8", "#d6e6f5", "#e6ddf3", "#f5e6cf"]),
-}
 
 
-class Svg:
-    def __init__(self, width: int, height: int, theme: dict):
-        self.t, self.parts = theme, []
-        self.head = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-                     f'width="{width}" height="{height}" role="img">')
-
-    def rect(self, x, y, w, h, fill=None, stroke=None, rx=6):
-        self.parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
-                          f'fill="{fill or self.t["fill"]}" stroke="{stroke or self.t["rule"]}" '
-                          'stroke-width="1"/>')
-
-    def text(self, x, y, s, size=13, color=None, mono=False, anchor="start", weight=400):
-        s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        self.parts.append(f'<text x="{x}" y="{y}" font-family="{MONO if mono else SANS}" '
-                          f'font-size="{size}" font-weight="{weight}" fill="{color or self.t["text"]}" '
-                          f'text-anchor="{anchor}">{s}</text>')
-
-    def arrow(self, x1, y1, x2, y2, color=None):
-        c = color or self.t["muted"]
-        self.parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{c}" stroke-width="1.25"/>')
-        # A small filled head at (x2, y2), pointing along the line.
-        d = np.array([x2 - x1, y2 - y1], float)
-        d /= np.linalg.norm(d)
-        n = np.array([-d[1], d[0]])
-        tip = np.array([x2, y2])
-        a, b = tip - 7 * d + 3.5 * n, tip - 7 * d - 3.5 * n
-        self.parts.append(f'<path d="M{tip[0]:.1f},{tip[1]:.1f} L{a[0]:.1f},{a[1]:.1f} '
-                          f'L{b[0]:.1f},{b[1]:.1f} z" fill="{c}"/>')
-
-    def polyline(self, points, color, width=1.75, dash=None):
-        pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-        dashed = f' stroke-dasharray="{dash}"' if dash else ""
-        self.parts.append(f'<polyline points="{pts}" fill="none" stroke="{color}" '
-                          f'stroke-width="{width}"{dashed}/>')
-
-    def image(self, x, y, size, pixels: np.ndarray):
-        buffer = io.BytesIO()
-        Image.fromarray(pixels).save(buffer, format="PNG")
-        data = base64.b64encode(buffer.getvalue()).decode()
-        self.parts.append(f'<image x="{x}" y="{y}" width="{size}" height="{size}" '
-                          f'style="image-rendering:pixelated" href="data:image/png;base64,{data}"/>')
-
-    def write(self, name: str, variant: str):
-        (HERE / f"{name}-{variant}.svg").write_text("\n".join([self.head, *self.parts, "</svg>"]) + "\n")
-
-
-def box(svg: Svg, x, y, w, h, title, lines=(), accent=False):
-    t = svg.t
-    svg.rect(x, y, w, h, fill=t["accent_fill"] if accent else t["fill"],
-             stroke=t["accent"] if accent else t["rule"])
+def box(svg: Figure, x, y, w, h, title, lines=(), accent=False):
+    svg.rect(x, y, w, h, fill="accent_fill" if accent else "surface", stroke="accent" if accent else "rule")
     svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
     for i, line in enumerate(lines):
-        svg.text(x + 12, y + 45 + 19 * i, line, size=13, color=t["muted"])
+        svg.text(x + 12, y + 45 + 19 * i, line, size=13, color="muted")
 
 
 def mesh_figure():
@@ -126,34 +73,34 @@ def mesh_figure():
     kernel_blocks = holders(kernel, kernel_shape)
 
     for variant, t in THEMES.items():
-        svg = Svg(760, 540, t)
+        svg = Figure(760, 540, palette=t)
         # The mesh: data picks the panel, fsdp the row, tensor the column.
         svg.text(24, 30, "MeshSpec(fsdp=2, tensor=2) on 8 devices", size=14, weight=600)
-        svg.text(24, 50, "data takes the rest: 8 / (2 × 2) = 2", size=13, color=t["muted"])
+        svg.text(24, 50, "data takes the rest: 8 / (2 × 2) = 2", size=13, color="muted")
         for d in range(2):
             ox, oy = 24 + d * 172, 80
-            svg.text(ox, oy - 8, f"data {d}", size=13, color=t["muted"])
+            svg.text(ox, oy - 8, f"data {d}", size=13, color="muted")
             for f in range(2):
                 for k in range(2):
                     device = next(i for i, c in coords.items() if c == (d, f, k))
                     x, y = ox + k * 80, oy + f * 64
-                    svg.rect(x, y, 74, 56, fill=t["tints"][2 * f + k], stroke=t["rule"])
+                    svg.rect(x, y, 74, 56, fill=f"tint{2 * f + k}", stroke="rule")
                     svg.text(x + 37, y + 25, f"device {device}", size=13, mono=True, anchor="middle", weight=600)
-                    svg.text(x + 37, y + 44, f"f{f} t{k}", size=12, color=t["muted"], anchor="middle")
-        svg.text(24, 228, "f = fsdp index, t = tensor index", size=13, color=t["muted"])
+                    svg.text(x + 37, y + 44, f"f{f} t{k}", size=12, color="muted", anchor="middle")
+        svg.text(24, 228, "f = fsdp index, t = tensor index", size=13, color="muted")
 
         # The batch: rows split over data and fsdp; tensor pairs hold the same rows.
         bx, by = 400, 80
         svg.text(bx, 30, "batch: text (16, 65) int32", size=14, weight=600)
-        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=13, color=t["muted"])
+        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=13, color="muted")
         for (rows, _), devices in sorted(batch_blocks.items()):
             y = by + rows[0] * 8
             f = coords[devices[0]][1]
-            svg.rect(bx, y, 336, 29, fill=t["tints"][2 * f], rx=3)
+            svg.rect(bx, y, 336, 29, fill=f"tint{2 * f}", rx=3)
             svg.text(bx + 12, y + 20, f"rows {rows[0]}–{rows[1] - 1}", size=13, mono=True)
             svg.text(bx + 324, y + 20, "devices " + ", ".join(map(str, sorted(devices))), size=13,
-                     color=t["muted"], anchor="end")
-        svg.text(bx, 228, "Both devices of a tensor pair hold the same rows.", size=13, color=t["muted"])
+                     color="muted", anchor="end")
+        svg.text(bx, 228, "Both devices of a tensor pair hold the same rows.", size=13, color="muted")
 
         # The kernel: (embed, mlp) split fsdp × tensor; each block on one device per data index.
         kx, ky = 24, 300
@@ -162,24 +109,24 @@ def mesh_figure():
         for (rows, cols), devices in sorted(kernel_blocks.items()):
             f, k = coords[devices[0]][1], coords[devices[0]][2]
             x, y = kx + (cols[0] // 512) * 216, ky + (rows[0] // 128) * 76
-            svg.rect(x, y, 208, 70, fill=t["tints"][2 * f + k], rx=3)
+            svg.rect(x, y, 208, 70, fill=f"tint{2 * f + k}", rx=3)
             svg.text(x + 12, y + 26, f"[{rows[0]}:{rows[1]}, {cols[0]}:{cols[1]}]", size=13, mono=True)
             svg.text(x + 12, y + 50, "devices " + ", ".join(map(str, sorted(devices))), size=13,
-                     color=t["muted"])
-        svg.text(476, 326, "Rows (embed) split over fsdp,", size=13, color=t["muted"])
-        svg.text(476, 346, "columns (mlp) over tensor.", size=13, color=t["muted"])
-        svg.text(476, 376, "Each block is held by one", size=13, color=t["muted"])
-        svg.text(476, 396, "device of each data index.", size=13, color=t["muted"])
+                     color="muted")
+        svg.text(476, 326, "Rows (embed) split over fsdp,", size=13, color="muted")
+        svg.text(476, 346, "columns (mlp) over tensor.", size=13, color="muted")
+        svg.text(476, 376, "Each block is held by one", size=13, color="muted")
+        svg.text(476, 396, "device of each data index.", size=13, color="muted")
         svg.text(24, 500, "Placements read from MeshSpec.build, Layout().shardings and batch_shardings",
-                 size=13, color=t["muted"])
-        svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color=t["muted"])
-        svg.write("mesh", variant)
+                 size=13, color="muted")
+        svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color="muted")
+        svg.save(HERE / f"mesh-{variant}.svg")
 
 
 def training_step_figure():
     """The order of work in Trainer.fit and in one compiled step."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 610, t)
+        svg = Figure(760, 610, palette=t)
         svg.text(24, 30, "Trainer.fit(dataset, steps=...)", size=15, mono=True, weight=600)
         box(svg, 24, 50, 224, 86, "Trainer.place()", ["init or restore TrainState,", "placed on the mesh"])
         box(svg, 24, 162, 224, 86, "dataset.train(partition)", ["this process's rows of", "every global batch"])
@@ -188,8 +135,8 @@ def training_step_figure():
         svg.arrow(136, 248, 136, 272)
 
         # The compiled step.
-        svg.rect(272, 50, 464, 360, fill=t["raised"], stroke=t["accent"], rx=10)
-        svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color=t["accent"])
+        svg.rect(272, 50, 464, 360, fill="raised", stroke="accent", rx=10)
+        svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color="accent")
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
             ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
@@ -209,16 +156,16 @@ def training_step_figure():
         for i, (name, what) in enumerate(rows):
             box(svg, 24 + i * 242, 462, 228, 66, name, [what])
         svg.text(24, 568, "TrainState holds params, opt_state, ema, key and three counters:", size=13,
-                 color=t["muted"])
+                 color="muted")
         svg.text(24, 588, "step counts attempts, microstep accepted microbatches, updates optimizer updates.",
-                 size=13, color=t["muted"])
-        svg.write("training-loop", variant)
+                 size=13, color="muted")
+        svg.save(HERE / f"training-loop-{variant}.svg")
 
 
 def data_figure():
     """A Dataset's iterators, the process's share and the global batch."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 390, t)
+        svg = Figure(760, 390, palette=t)
         box(svg, 24, 24, 280, 104, "Dataset", ["train(partition) → iterator", "val(partition) → one pass",
                                                "records, batch"])
         box(svg, 456, 24, 280, 104, "DataPartition", ["index, count: which share of", "every global batch",
@@ -230,15 +177,15 @@ def data_figure():
         svg.arrow(304, 76, 454, 76)
         svg.arrow(456, 128, 306, 196)
         svg.arrow(304, 248, 454, 248)
-        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
-        svg.text(400, 170, "next(train(partition))", size=12, mono=True, color=t["muted"])
-        svg.text(380, 238, "shard_batch", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color="muted", anchor="middle")
+        svg.text(400, 170, "next(train(partition))", size=12, mono=True, color="muted")
+        svg.text(380, 238, "shard_batch", size=12, mono=True, color="muted", anchor="middle")
         svg.text(24, 336, "One process: DataPartition() reads every row; the host batch is the global batch.",
-                 size=13, color=t["muted"])
+                 size=13, color="muted")
         svg.text(24, 358, "Several processes: each reads B / count rows of every step, and", size=13,
-                 color=t["muted"])
-        svg.text(24, 378, "jax.make_array_from_process_local_data joins them.", size=13, color=t["muted"])
-        svg.write("data-pipeline", variant)
+                 color="muted")
+        svg.text(24, 378, "jax.make_array_from_process_local_data joins them.", size=13, color="muted")
+        svg.save(HERE / f"data-pipeline-{variant}.svg")
 
 
 def diffusion_figure():
@@ -255,7 +202,7 @@ def diffusion_figure():
         return alpha, sigma, np.clip((x + 1) * 127.5, 0, 255).astype(np.uint8)
 
     for variant, t in THEMES.items():
-        svg = Svg(760, 700, t)
+        svg = Figure(760, 700, palette=t)
         for row, (name, schedule) in enumerate([("Cosine()", cosine), ("Flow()", flow)]):
             y = 30 + row * 200
             svg.text(24, y, f"{name}, T = {schedule.T:g}", size=14, mono=True, weight=600)
@@ -264,27 +211,27 @@ def diffusion_figure():
                 x = 24 + i * 120
                 svg.image(x, y + 12, 112, image)
                 svg.text(x + 56, y + 146, f"t = {fraction * schedule.T:g}", size=13, mono=True, anchor="middle")
-                svg.text(x + 56, y + 165, f"α {alpha:.2f}  σ {sigma:.2f}", size=12, color=t["muted"],
+                svg.text(x + 56, y + 165, f"α {alpha:.2f}  σ {sigma:.2f}", size=12, color="muted",
                          anchor="middle")
 
         # alpha_t and sigma_t against t / T for both presets.
         px, py, pw, ph = 24, 444, 280, 220
         svg.text(px, py - 14, "α and σ against t / T", size=14, weight=600)
-        svg.rect(px, py, pw, ph, fill=t["raised"], rx=4)
+        svg.rect(px, py, pw, ph, fill="raised", rx=4)
         grid = np.linspace(0, 1, 101)
         for schedule, dash in [(cosine, None), (flow, "5 4")]:
             rates = np.array([[float(v) for v in schedule.rates(jnp.asarray(g * schedule.T))] for g in grid])
-            for column, color in [(0, t["accent"]), (1, t["muted"])]:
+            for column, color in [(0, "accent"), (1, "muted")]:
                 svg.polyline([(px + g * pw, py + ph - r * ph) for g, r in zip(grid, rates[:, column])],
-                             color, dash=dash)
-        svg.text(px, py + ph + 20, "0", size=12, color=t["muted"])
-        svg.text(px + pw, py + ph + 20, "1", size=12, color=t["muted"], anchor="end")
+                             color=color, dash=dash)
+        svg.text(px, py + ph + 20, "0", size=12, color="muted")
+        svg.text(px + pw, py + ph + 20, "1", size=12, color="muted", anchor="end")
         legend = ["α: accent, σ: grey", "solid: Cosine(), dashed: Flow()", "",
                   "Each image is α x₀ + σ ε with the same ε,", "at the rates schedule.rates(t) returns.",
                   "", "x₀ is a 64 × 64 image sampled from a model", "trained with Dew, scaled to [-1, 1]."]
         for i, line in enumerate(legend):
-            svg.text(340, py + 20 + 22 * i, line, size=13, color=t["muted"])
-        svg.write("diffusion-forward", variant)
+            svg.text(340, py + 20 + 22 * i, line, size=13, color="muted")
+        svg.save(HERE / f"diffusion-forward-{variant}.svg")
 
 
 def moe_routing_figure():
@@ -303,28 +250,28 @@ def moe_routing_figure():
         layers.append((indices, chosen / chosen.sum(-1, keepdims=True)))
     shown = 22
     for variant, t in THEMES.items():
-        svg = Svg(760, 490, t)
+        svg = Figure(760, 490, palette=t)
         svg.text(20, 30, 'mixture={"experts": 4, "top_k": 2}, layer 0', size=14, mono=True, weight=600)
         svg.text(20, 52, f"The router's choices for the first {shown} of 64 tokens.", size=13,
-                 color=t["muted"])
+                 color="muted")
         indices, weights = layers[0]
         cell, x0, y0 = 28, 100, 70
         for expert in range(4):
             svg.text(x0 - 10, y0 + expert * (cell + 4) + 19, f"expert {expert}", size=12, mono=True,
-                     anchor="end", color=t["muted"])
+                     anchor="end", color="muted")
             for token in range(shown):
                 x, y = x0 + token * cell, y0 + expert * (cell + 4)
                 hit = np.nonzero(indices[token] == expert)[0]
                 if hit.size:
-                    svg.rect(x, y, cell - 2, cell, fill=t["tints"][expert], rx=3)
+                    svg.rect(x, y, cell - 2, cell, fill=f"tint{expert}", rx=3)
                     svg.text(x + (cell - 2) / 2, y + 19, f"{weights[token, hit[0]]:.2f}"[1:], size=12,
                              mono=True, anchor="middle")
                 else:
-                    svg.rect(x, y, cell - 2, cell, fill=t["fill"], rx=3)
+                    svg.rect(x, y, cell - 2, cell, fill="surface", rx=3)
         for token in range(0, shown, 4):
             svg.text(x0 + token * cell + (cell - 2) / 2, y0 + 4 * (cell + 4) + 16, str(token), size=12,
-                     mono=True, anchor="middle", color=t["muted"])
-        svg.text(x0, y0 + 4 * (cell + 4) + 36, "token position", size=12, color=t["muted"])
+                     mono=True, anchor="middle", color="muted")
+        svg.text(x0, y0 + 4 * (cell + 4) + 36, "token position", size=12, color="muted")
 
         # Tokens per expert over all 64 tokens, per layer.
         by, bh = 300, 80
@@ -336,22 +283,22 @@ def moe_routing_figure():
             for expert, count in enumerate(counts):
                 h = bh * count / 64
                 x = lx + expert * 60
-                svg.rect(x, by + bh - h, 44, h, fill=t["tints"][expert], rx=3)
+                svg.rect(x, by + bh - h, 44, h, fill=f"tint{expert}", rx=3)
                 svg.text(x + 22, by + bh - h - 6, str(int(count)), size=13, mono=True, anchor="middle")
                 svg.text(x + 22, by + bh + 18, f"e{expert}", size=12, mono=True, anchor="middle",
-                         color=t["muted"])
+                         color="muted")
             svg.text(lx, by + bh + 42, f"layer {layer}", size=13, mono=True)
         svg.text(20, 455, "Cell numbers: the token's normalized routing weight for that expert.",
-                 size=13, color=t["muted"])
+                 size=13, color="muted")
         svg.text(20, 476, "Read from the 'router' collection of a fresh init: random weights and tokens, "
-                 "so the load is uneven.", size=13, color=t["muted"])
-        svg.write("moe-routing", variant)
+                 "so the load is uneven.", size=13, color="muted")
+        svg.save(HERE / f"moe-routing-{variant}.svg")
 
 
 def post_training_figure():
     """The data each post-training objective reads, from dew.data, dew.objectives.rl and pack."""
     for variant, t in THEMES.items():
-        svg = Svg(760, 372, t)
+        svg = Figure(760, 372, palette=t)
         lanes = [
             ("SFT", "Chat", ["conversations, rendered by", "the chat template"],
              "text, text_roles", ["[B, L + 1]"], "LMObjective", ["loss_role=Role.ASSISTANT"]),
@@ -371,17 +318,324 @@ def post_training_figure():
             svg.arrow(270, y + 42, 288, y + 42)
             svg.arrow(500, y + 42, 518, y + 42)
         # GRPO samples with the policy it trains.
-        svg.polyline([(630, 312), (630, 336), (395, 336)], t["muted"], width=1.25)
+        svg.polyline([(630, 312), (630, 336), (395, 336)], color="muted", width=1.25)
         svg.arrow(395, 336, 395, 314)
-        svg.text(512, 360, "the current policy samples the next batch", size=13, color=t["muted"],
+        svg.text(512, 360, "the current policy samples the next batch", size=13, color="muted",
                  anchor="middle")
-        svg.write("post-training", variant)
+        svg.save(HERE / f"post-training-{variant}.svg")
+
+
+# The counting task of tutorials/10: after the prompt's last digit, each written digit should be
+# one more than the digit before it, 9 wrapping to 0.
+PROMPT = "7294"
+ANSWERS = ["567890", "561290", "314159", "567823"]
+
+
+def right_digits(previous: int, digits: str) -> list[bool]:
+    marks = []
+    for digit in map(int, digits):
+        marks.append(digit == (previous + 1) % 10)
+        previous = digit
+    return marks
+
+
+def digit_boxes(svg: Figure, x, y, digits, fills, size=26, step=4):
+    for j, (digit, fill) in enumerate(zip(digits, fills)):
+        svg.rect(x + j * (size + step), y, size, size + 4, fill=fill,
+                 stroke="rule" if fill == "surface" else "none", rx=4)
+        svg.text(x + j * (size + step) + size / 2, y + size / 2 + 7, digit, size=15, mono=True,
+                 anchor="middle")
+
+
+def save_both(svg: Figure, name: str, narrow: bool):
+    """A figure's wide layout is <name>.svg, which notebooks embed; the site swaps in <name>-narrow.svg
+    on a phone."""
+    svg.save(HERE / f"{name}{'-narrow' if narrow else ''}.svg")
+
+
+def rlvr_loop_figure():
+    """The loop: the policy writes several answers, the checker scores them, and the update makes the
+    answers that beat their group more likely."""
+    marks = [right_digits(int(PROMPT[-1]), answer) for answer in ANSWERS]
+    rewards = np.array([np.mean(m) for m in marks], np.float32)
+    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))
+    after = np.exp(0.6 * advantages) / np.exp(0.6 * advantages).sum()
+    label = ("The policy writes four answers to a prompt, a checker scores each one, and the update makes "
+             "the answers that scored above the group's mean more likely.")
+    for narrow in (False, True):
+        # Where each part sits in the wide (left to right) and narrow (top to bottom) layouts.
+        width, height = (360, 392) if narrow else (720, 316)
+        prompt_x, prompt_y = (16, 44) if narrow else (24, 138)
+        box_x, box_y = (170, 14) if narrow else (154, 86)
+        rows_x, rows_y, row_step = (44, 180, 44) if narrow else (370, 44, 58)
+        checker_x, reward_x = (226, 334) if narrow else (570, 678)
+        size, step = (22, 4) if narrow else (26, 4)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        svg.text(prompt_x, prompt_y - 10, "prompt", size=13, color="muted")
+        digit_boxes(svg, prompt_x, prompt_y, PROMPT, ["surface"] * 4, size=22)
+        svg.arrow(prompt_x + 104, prompt_y + 17, box_x - 4, prompt_y + 17 if narrow else box_y + 69)
+        svg.rect(box_x, box_y, 124, 140 if not narrow else 124, fill="raised", stroke="accent", rx=8)
+        svg.text(box_x + 62, box_y + 24, "policy", size=15, weight=600, anchor="middle")
+        svg.text(box_x + 62, box_y + 44, "P(answer)", size=12, color="muted", anchor="middle")
+        bars_y = box_y + (54 if narrow else 60)
+        for k, letter in enumerate("abcd"):
+            x = box_x + 18 + k * 24
+            svg.rect(x, bars_y, 16, 46, fill="rule", stroke="none", rx=2)
+            column = svg.rect(x, bars_y, 16, 46, fill="accent", stroke="none", rx=2)
+            svg.animate(column, {6.4: {"transform": "scaleY(0.25)"},
+                                 7.6: {"transform": f"scaleY({after[k]:.3f})"}}, origin="50% 100%")
+            svg.text(x + 8, bars_y + 64, letter, size=12, mono=True, color="muted", anchor="middle")
+        svg.text(rows_x, rows_y - 14, "answers", size=13, color="muted")
+        svg.text(reward_x, rows_y - 14, "reward", size=13, color="muted", anchor="end")
+        rows_end = rows_y + 3 * row_step + size + 4
+        with svg.group() as checker:
+            svg.rect(checker_x, rows_y, 62 if not narrow else 50, rows_end - rows_y, fill="raised",
+                     stroke="text", rx=8)
+            svg.text(checker_x + (31 if not narrow else 25), (rows_y + rows_end) / 2 + 4, "checker", size=12,
+                     anchor="middle")
+        svg.appear(checker, 2.9)
+        if narrow:
+            # One trunk from the policy down the left edge, a branch to each answer.
+            svg.polyline([(box_x + 62, box_y + 124), (box_x + 62, rows_y - 36), (14, rows_y - 36),
+                          (14, rows_y + 3 * row_step + size / 2)], color="muted", width=1.25)
+        for i, (answer, right) in enumerate(zip(ANSWERS, marks)):
+            y = rows_y + i * row_step
+            with svg.group() as row:
+                if narrow:
+                    svg.arrow(14, y + size / 2 + 2, rows_x - 16, y + size / 2 + 2)
+                else:
+                    svg.arrow(box_x + 126, box_y + 70, rows_x - 28, y + 15)
+                svg.text(rows_x - 8, y + size / 2 + 7, "abcd"[i], size=13, mono=True, color="muted",
+                         anchor="end")
+                digit_boxes(svg, rows_x, y, answer, ["surface"] * 6, size=size, step=step)
+            svg.appear(row, 0.8 + 0.45 * i)
+            with svg.group() as scored:
+                digit_boxes(svg, rows_x, y, answer, ["accent_fill" if r else "warm_fill" for r in right],
+                            size=size, step=step)
+                checker_end = checker_x + (62 if not narrow else 50)
+                svg.arrow(checker_end, y + size / 2 + 2, checker_end + 8, y + size / 2 + 2)
+                svg.text(reward_x, y + size / 2 + 8, f"{rewards[i]:.2f}", size=15, mono=True, weight=600,
+                         anchor="end", color="accent" if rewards[i] > rewards.mean() else "warm")
+            svg.appear(scored, 3.4 + 0.35 * i)
+        if narrow:
+            back = [(reward_x - 16, rows_end + 6), (reward_x - 16, rows_end + 18), (352, rows_end + 18),
+                    (352, box_y + 62), (box_x + 128, box_y + 62)]
+            tip_x, tip_y = box_x + 125, box_y + 62
+            head = f"M{tip_x},{tip_y} L{tip_x + 7},{tip_y - 3.5} L{tip_x + 7},{tip_y + 3.5} z"
+            note_x, note_y = 180, rows_end + 44
+        else:
+            back = [(660, 274), (660, 298), (216, 298), (216, 232)]
+            head = "M216,229 L212.5,236 L219.5,236 z"
+            note_x, note_y = 438, 290
+        svg.draw(svg.polyline(back, color="accent", width=1.5), 5.2, 6.2)
+        svg.appear(svg.add("path", {"d": head}, {"fill": svg.palette["accent"]}), 6.1, 0.2)
+        note = "update: answers that beat the group's mean get more likely"
+        if narrow:
+            note = "update: answers above the mean get more likely"
+        svg.appear(svg.text(note_x, note_y, note, size=13, color="accent", anchor="middle"), 5.8)
+        save_both(svg, "rlvr-loop", narrow)
+
+
+def rlvr_advantage_figure():
+    """GRPO's advantage: each reward against its group's mean, in units of the group's deviation."""
+    rewards = np.array([1.0, 0.67, 0.0, 0.83, 0.17, 0.5, 0.0, 0.33], np.float32)
+    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(rewards)))
+    mean, deviation = float(rewards.mean()), float(rewards.std(ddof=1))
+    label = ("Eight rewards, their group mean, and the advantages: each reward minus the mean, divided by "
+             "the group's standard deviation.")
+    for narrow in (False, True):
+        width, height = (360, 560) if narrow else (720, 300)
+        # Each panel's top-left corner: rewards, then advantages beside them or below.
+        rx_, ry_ = 20, 0
+        ax_, ay_ = (20, 270) if narrow else (380, 0)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        floor, tall, slot = ry_ + 236, 150, 38
+        svg.text(rx_ + 8, ry_ + 32, "reward R of 8 answers to one prompt", size=13, color="muted")
+        svg.line(rx_ + 8, floor, rx_ + 320, floor, color="rule")
+        level = floor - tall * mean
+        for i, reward in enumerate(rewards):
+            x = rx_ + 16 + i * slot
+            up = reward > mean
+            # The bar grows in a neutral color, then takes the color of its side of the mean.
+            for fill, at in (("tint1", 0.0), ("accent" if up else "warm", 3.6 + 0.1 * i)):
+                with svg.group() as colored:
+                    column = svg.rect(x, floor - tall, 26, tall, fill=fill, stroke="none", rx=3)
+                    svg.animate(column, {0.3 + 0.15 * i: {"transform": "scaleY(0)"},
+                                         0.9 + 0.15 * i: {"transform": f"scaleY({reward:.3f})"}},
+                                origin="50% 100%")
+                if at:
+                    svg.appear(colored, at)
+            svg.text(x + 13, floor + 18, f"{reward:.2f}", size=12, mono=True, color="muted", anchor="middle")
+            gap = svg.line(x + 13, floor - tall * reward, x + 13, level, color="accent" if up else "warm",
+                           width=2, dash="2 3")
+            svg.appear(gap, 3.6 + 0.1 * i)
+        with svg.group() as average:
+            svg.line(rx_ + 8, level, rx_ + 324, level, color="text", width=1.5, dash="5 4")
+            svg.text(rx_ + 324, level - 8, f"mean {mean:.2f}", size=13, mono=True, anchor="end")
+        svg.animate(average, {2.4: {"opacity": 0, "transform": "translateX(-24px)"},
+                              3.0: {"opacity": 1, "transform": "translateX(0px)"}})
+        zero, unit = ay_ + 146, 44
+        svg.text(ax_ + 12, ay_ + 32, f"advantage A = (R − {mean:.2f}) / {deviation:.2f}", size=13,
+                 color="muted")
+        svg.line(ax_ + 8, zero, ax_ + 320, zero, color="rule")
+        for i, advantage in enumerate(advantages):
+            x = ax_ + 16 + i * slot
+            up = advantage > 0
+            column = svg.rect(x, zero - unit * advantage if up else zero, 26, unit * abs(advantage),
+                              fill="accent" if up else "warm", stroke="none", rx=3)
+            svg.animate(column, {4.8 + 0.1 * i: {"transform": "scaleY(0)"},
+                                 5.6 + 0.1 * i: {"transform": "scaleY(1)"}},
+                        origin="50% 100%" if up else "50% 0%")
+            y = zero - unit * advantage - 8 if up else zero + unit * abs(advantage) + 18
+            svg.appear(svg.text(x + 13, y, f"{advantage:+.1f}", size=12, mono=True, anchor="middle",
+                                color="accent" if up else "warm"), 6.2)
+        svg.appear(svg.text(ax_ + 164, ay_ + 280, "above the mean is pushed up, below is pushed down",
+                            size=13, color="muted", anchor="middle"), 6.6)
+        save_both(svg, "rlvr-advantage", narrow)
+
+
+def rlvr_clip_figure():
+    """PPO's clipped objective against the ratio, from dew.rl's terms, with its flat stretches shaded."""
+    ratios = np.linspace(0.02, 3.5, 351)
+    log_ratio = jnp.log(jnp.asarray(ratios, jnp.float32))
+    label = ("The clipped objective against the ratio for a positive and a negative advantage. Where it is "
+             "flat, the clipped term gives the token no gradient.")
+    for narrow in (False, True):
+        width, height = (360, 590) if narrow else (720, 304)
+        svg = Figure(width, height, seconds=9, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        for panel, advantage in enumerate((1.0, -1.0)):
+            left, top = (40, 58 + panel * 270) if narrow else (52 + panel * 352, 58)
+            wide, high = 300, 170
+
+            def objective(log_ratio, advantage=advantage):
+                terms, _ = clipped_surrogate_terms(log_ratio[None, :], jnp.asarray([advantage]),
+                                                   jnp.ones((1, log_ratio.size)))
+                return -terms[0]
+
+            values = np.asarray(objective(log_ratio))
+            slope = jax.grad(lambda r, objective=objective: objective(r[None])[0])
+            slopes = np.asarray(jax.vmap(slope)(log_ratio))
+            low, high_value = (0.0, 1.5) if advantage > 0 else (-3.5, 0.0)
+
+            def at(r, v, left=left, top=top, low=low, high_value=high_value):
+                return left + wide * r / 3.5, top + high - high * (v - low) / (high_value - low)
+
+            flat = slopes == 0
+            edges = np.flatnonzero(np.diff(np.concatenate([[0], flat.astype(int), [0]])))
+            for start, stop in zip(edges[::2], edges[1::2]):
+                x0, _ = at(ratios[start], low)
+                x1, _ = at(ratios[stop - 1], low)
+                with svg.group() as shade:
+                    svg.rect(x0, top, x1 - x0, high, fill="tint1", stroke="none", rx=0).style["opacity"] = "0.6"
+                    name = "dual clip" if ratios[start] > 2 else "clipped"
+                    svg.text(min((x0 + x1) / 2, left + wide - 26), top - 7, name, size=12, color="muted",
+                             anchor="middle")
+                svg.appear(shade, 3.6)
+            svg.line(left, top + high, left + wide, top + high, color="rule")
+            svg.line(left, top, left, top + high, color="rule")
+            for tick in (0, 1, 2, 3):
+                x, _ = at(tick, low)
+                svg.text(x, top + high + 18, str(tick), size=12, mono=True, color="muted", anchor="middle")
+            x1, _ = at(1.0, low)
+            svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
+            title = ("A > 0: raise π(y), up to ρ = 1 + ε" if advantage > 0
+                     else "A < 0: lower π(y), down to ρ = 1 − ε")
+            svg.text(left, top - 28, title, size=13, weight=600)
+            svg.text(left + wide, top + high + 38, "ratio ρ = π / π_old", size=12, color="muted",
+                     anchor="end")
+            name = svg.text(left - 12, top + high / 2, "objective", size=12, color="muted", anchor="middle")
+            name.attributes["transform"] = f"rotate(-90 {left - 12} {top + high / 2})"
+            line = svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5)
+            svg.draw(line, 0.4, 3.2)
+        svg.appear(svg.text(width / 2, height - 12, "shaded: flat, so the clipped term gives no gradient",
+                            size=12, color="muted", anchor="middle"), 4.0)
+        save_both(svg, "rlvr-clip", narrow)
+
+
+def rlvr_sequence_figure():
+    """One completion as the loss reads it: its tokens, the mask that keeps the written ones, and the
+    completion's advantage on each written token."""
+    answer = ANSWERS[1]
+    rewards = np.array([np.mean(right_digits(int(PROMPT[-1]), a)) for a in ANSWERS], np.float32)
+    advantage = float(np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))[1])
+    width, height, left, step = 440, 236, 108, 32
+    svg = Figure(width, height, seconds=9, label=f"The tokens of one completion: the prompt {' '.join(PROMPT)} "
+                 f"with mask 0, and the written digits {' '.join(answer)} with mask 1, each carrying the "
+                 f"completion's advantage {advantage:+.2f}.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    rows = [("tokens", 30), ("mask m", 82), ("A × m", 134)]
+    for name, y in rows:
+        svg.text(left - 14, y + 20, name, size=14, color="muted", anchor="end")
+    for j, token in enumerate(PROMPT + answer):
+        x, y = left + j * step, rows[0][1]
+        written = j >= len(PROMPT)
+        svg.rect(x, y, step - 4, 30, fill="tint1" if written else "surface",
+                 stroke="none" if written else "rule", rx=4)
+        svg.text(x + (step - 4) / 2, y + 21, token, size=15, mono=True, anchor="middle",
+                 color="text" if written else "muted")
+        mask = svg.text(x + (step - 4) / 2, rows[1][1] + 21, "1" if written else "0", size=15, mono=True,
+                        anchor="middle", color="text" if written else "muted")
+        svg.appear(mask, 1.2 + 0.08 * j)
+        with svg.group() as credit:
+            if written:
+                svg.rect(x, rows[2][1], step - 4, 30, fill="accent_fill", stroke="none", rx=4)
+            svg.text(x + (step - 4) / 2, rows[2][1] + 20, f"{advantage:+.1f}" if written else "0", size=12,
+                     mono=True, anchor="middle", color="accent" if written else "muted")
+        svg.appear(credit, 3.2 + 0.1 * j)
+    svg.appear(svg.text(width / 2, 204, f"reward {rewards[1]:.2f} gives A = {advantage:+.2f} on each written digit, "
+                        "0 on the prompt", size=13, color="muted", anchor="middle"), 4.6)
+    svg.save(HERE / "rlvr-sequence.svg")
+
+
+def rlvr_kl_figure():
+    """The k3 estimate against π / π_ref, from dew.rl.k3_kl: zero at 1, and a slope that pulls back to 1."""
+    ratios = np.geomspace(0.25, 4, 161)
+    values = np.asarray(k3_kl(jnp.log(jnp.asarray(ratios, jnp.float32)), jnp.zeros(ratios.size)))
+    width, height = 440, 280
+    left, top, wide, high = 56, 44, 360, 180
+    svg = Figure(width, height, seconds=9, label="The k3 estimate of the KL divergence against the ratio of "
+                 "the policy to the reference: zero where they agree and rising on both sides, so its "
+                 "gradient pulls the policy back toward the reference.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+
+    def at(r, v):
+        return left + wide * np.log(r / 0.25) / np.log(16), top + high - high * v / values.max()
+
+    svg.line(left, top + high, left + wide, top + high, color="rule")
+    svg.line(left, top, left, top + high, color="rule")
+    for tick in (0.25, 0.5, 1, 2, 4):
+        x, _ = at(tick, 0)
+        svg.text(x, top + high + 20, f"{tick:g}", size=13, mono=True, color="muted", anchor="middle")
+    svg.text(left + wide, top + high + 42, "π / π_ref, the policy over the reference", size=13, color="muted",
+             anchor="end")
+    svg.text(left, 28, "k3 per token", size=14, weight=600)
+    x1, _ = at(1, 0)
+    svg.line(x1, top, x1, top + high, color="muted", dash="3 4")
+    svg.draw(svg.polyline([at(r, v) for r, v in zip(ratios, values)], color="accent", width=2.5), 0.4, 2.8)
+    # A token that drifted to twice the reference's probability slides back toward it.
+    slide = np.geomspace(2.6, 1.0, 9)
+    heights = np.asarray(k3_kl(jnp.log(jnp.asarray(slide, jnp.float32)), jnp.zeros(slide.size)))
+    path = [at(r, v) for r, v in zip(slide, heights)]
+    ball = svg.circle(*path[0], 6, fill="text")
+    moves = {3.2 + 0.45 * i: {"transform": f"translate({x - path[0][0]:.1f}px,{y - path[0][1]:.1f}px)",
+                              "opacity": 1} for i, (x, y) in enumerate(path)}
+    svg.animate(ball, moves | {2.8: {"transform": "translate(0px,0px)", "opacity": 0}})
+    svg.appear(svg.text(x1 + 8, top + 16, "zero where π = π_ref", size=13, color="muted"), 3.0)
+    svg.save(HERE / "rlvr-kl.svg")
+
+
+FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
+           "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
+           "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
+           "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
 
 
 if __name__ == "__main__":
-    mesh_figure()
-    training_step_figure()
-    data_figure()
-    diffusion_figure()
-    moe_routing_figure()
-    post_training_figure()
+    prefixes = tuple(sys.argv[1:]) or ("",)
+    for name, draw in FIGURES.items():
+        if name.startswith(prefixes):
+            draw()
