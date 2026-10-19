@@ -126,6 +126,64 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
         assert written.dtype == source.dtype and written.tobytes() == source.tobytes(), name
 
 
+_OFFLINE_REBIND = """
+import json, sys
+from dew.interop.pretrained import load_diffusion_source
+
+published = load_diffusion_source(sys.argv[1], dtype="float32", attention_impl="xla", size=(16, 16))
+pipeline = load_diffusion_source("dew/flux-tiny", dtype="float32", attention_impl="xla", size=(16, 16),
+                                 variables=published.variables)
+try:
+    pipeline.save(sys.argv[2])
+except ValueError as refused:
+    print(json.dumps({"saved": False, "refused": str(refused)}))
+else:
+    print(json.dumps({"saved": True}))
+"""
+
+
+@pytest.mark.parametrize("cached", ["whole", "metadata"])
+def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_headers_it_holds(
+        pipelines, tmp_path, cached):
+    """A saved tree rebound over a Hub pipeline needs no Hub request: offline, over a cache
+    holding the whole pipeline at one commit, it binds and exports by the headers of the files
+    the cache holds, and the export reloads leaf for leaf; over a cache holding the commit's
+    listing and configs but no weight file, it binds, and its export, which has no header to
+    write by, refuses and writes nothing."""
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    directory = pipelines / "flux" / "pipeline"
+    commit = hub_cache(tmp_path / "hub", "dew/flux-tiny", directory)
+    snapshot = tmp_path / "hub" / "models--dew--flux-tiny" / "snapshots" / commit
+    if cached == "metadata":
+        for weights in snapshot.rglob("*.safetensors"):
+            weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
+           "DEW_HUB_ANSWERS": str(tmp_path / "answers"),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    done = subprocess.run([sys.executable, "-c", _OFFLINE_REBIND, str(directory), str(tmp_path / "export")],
+                          env=env, check=False, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-3000:]
+    [outcome] = [json.loads(line) for line in done.stdout.split("\n") if line.startswith("{")]
+    assert outcome["saved"] == (cached == "whole"), outcome
+    if cached == "metadata":
+        assert not (tmp_path / "export").exists()
+        return
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
     """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
     and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""

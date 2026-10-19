@@ -697,8 +697,10 @@ def component_present(index: Mapping[str, object], name: str) -> bool:
 def _shapes(stored: StoredWeights | None, folder: str) -> dict[str, tuple[int, ...]] | None:
     """The shapes of `folder`'s stored tensors, by their headers, where a pipeline
     bound from saved variables writes its export through its source's layouts
-    (`StoredWeights`); None for a pipeline read from its weights."""
-    return None if stored is None else {name: spec.shape for name, (_, spec) in stored.specs(folder).items()}
+    (`StoredWeights`); None for a pipeline read from its weights, or where the
+    headers cannot be read offline."""
+    held = None if stored is None else stored.specs(folder)
+    return None if held is None else {name: spec.shape for name, (_, spec) in held.items()}
 
 
 def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
@@ -870,9 +872,9 @@ def _bind_language_model[C: ConditionEncoder](
         variables, bound, unread = read(tensors, lazy=lazy)
         return (conditioner({"text_encoder": variables}), bound,
                 {f"text_encoder/{name}": tensors[name] for name in unread})
-    if stored is None:
+    held = None if stored is None else stored.specs("text_encoder")
+    if held is None:
         return conditioner(params), (), {}
-    held = stored.specs("text_encoder")
     _, bound, unread = read({name: np.broadcast_to(np.zeros((), spec.dtype), spec.shape)
                              for name, (_, spec) in held.items()}, lazy=True)
     source = stored.tensors({name: held[name] for name in unread})
