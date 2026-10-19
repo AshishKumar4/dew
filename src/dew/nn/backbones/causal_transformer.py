@@ -39,7 +39,7 @@ from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
-from ..activations import ungated_activation
+from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
@@ -72,7 +72,6 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
-from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record

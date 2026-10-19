@@ -17,6 +17,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.records import JSON
 
+from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
@@ -33,7 +34,7 @@ from ..hyper_connections import (
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes

@@ -28,9 +28,9 @@ from reference_error import assert_as_exact_as_the_reference, distance, float64_
 from tuned import each_config
 
 from dew.nn import attention
+from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
-from dew.nn.moe import gated_product, packed_gated_product
 
 pytestmark = pytest.mark.kernel
 
