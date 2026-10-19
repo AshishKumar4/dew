@@ -140,9 +140,13 @@ def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
     input it received, rounds where Qwen2RMSNorm does (modeling_qwen2.py:247-252): the
     normalized activations cast to bfloat16 before the weight multiplies them. Scaling
     before the cast is the more accurate order, so only the per-norm check tells them apart."""
+    import contextlib
+
     import torch
     from transformers import Qwen2Config, Qwen2Model
     from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+    from tools.diffusers_wan_reference import float64
 
     config, variables, refs = load()
     audio = json.loads((FIXTURE / "config.json").read_text())["audio_config"]
@@ -178,25 +182,29 @@ def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
             np.asarray(normed, np.float64), theirs.double().numpy(), truth, "/".join(path))
 
     def reference(dtype):
-        model = Qwen2Model(Qwen2Config(
-            hidden_size=audio["input_local_dim"], num_hidden_layers=audio["input_local_layers"],
-            num_attention_heads=audio["input_local_attn_heads"],
-            num_key_value_heads=audio["input_local_attn_heads"],
-            intermediate_size=audio["input_local_intermediate_size"], rope_theta=audio["rope_theta"])).eval()
-        model.load_state_dict({name.removeprefix("input_local_transformer."): torch.from_numpy(value)
-                               for name, value in encoder.items()
-                               if name.startswith("input_local_transformer.")}, strict=False)
-        model = model.to(dtype)
-        group, frames = audio["group_size"], len(codes)
-        groups = -(-frames // group)
-        held = torch.from_numpy(np.concatenate([codes, codes[-1:].repeat(groups * group - frames, 0)]))
-        tables = [torch.from_numpy(encoder[f"speech_embeddings.{channel}.weight"]).to(dtype)
-                  for channel in range(audio["audio_channels"])]
-        embedded = sum(torch.nn.functional.embedding(held[:, channel].long(), table)
-                       for channel, table in enumerate(tables))
-        with torch.no_grad():
-            return model(inputs_embeds=embedded.reshape(groups, group, -1), use_cache=False,
-                         is_causal=not audio["input_full_attention"]).last_hidden_state.double().numpy()
+        # The float64 truth is built and run under `float64`, so the norms' and the
+        # rotary's float32 pins compute in float64 too.
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            model = Qwen2Model(Qwen2Config(
+                hidden_size=audio["input_local_dim"], num_hidden_layers=audio["input_local_layers"],
+                num_attention_heads=audio["input_local_attn_heads"],
+                num_key_value_heads=audio["input_local_attn_heads"],
+                intermediate_size=audio["input_local_intermediate_size"],
+                rope_theta=audio["rope_theta"])).eval()
+            model.load_state_dict({name.removeprefix("input_local_transformer."): torch.from_numpy(value)
+                                   for name, value in encoder.items()
+                                   if name.startswith("input_local_transformer.")}, strict=False)
+            model = model.to(dtype)
+            group, frames = audio["group_size"], len(codes)
+            groups = -(-frames // group)
+            held = torch.from_numpy(np.concatenate([codes, codes[-1:].repeat(groups * group - frames, 0)]))
+            tables = [torch.from_numpy(encoder[f"speech_embeddings.{channel}.weight"]).to(dtype)
+                      for channel in range(audio["audio_channels"])]
+            embedded = sum(torch.nn.functional.embedding(held[:, channel].long(), table)
+                           for channel, table in enumerate(tables))
+            with torch.no_grad():
+                return model(inputs_embeds=embedded.reshape(groups, group, -1), use_cache=False,
+                             is_causal=not audio["input_full_attention"]).last_hidden_state.double().numpy()
 
     assert_as_exact_as_the_reference(ours.reshape(-1, ours.shape[-1]),
                                      reference(torch.bfloat16).reshape(-1, ours.shape[-1]),
