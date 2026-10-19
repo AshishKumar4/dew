@@ -627,11 +627,54 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def sft_mask_figure():
+    """One conversation through a chat template: the messages, the tokens the template writes with each
+    one's role, and the loss mask, 1 on the assistant's reply and its closing marker."""
+    width, height = 440, 300
+    svg = Figure(width, height, seconds=11, label="A conversation through the chat template. The user's "
+                 "question and the assistant's reply become one row of tokens with their roles, and the loss "
+                 "mask is 1 only on the reply and its end-of-turn marker.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(20, 30, "messages", size=13, color="muted")
+    svg.rect(20, 40, 196, 30, fill="tint1", stroke="none", rx=6)
+    svg.text(30, 60, "user: Why is the sky blue?", size=12)
+    svg.rect(226, 40, 196, 30, fill="accent_fill", stroke="none", rx=6)
+    svg.text(236, 60, "assistant: Light scatters.", size=12)
+    rows = [("<|im_start|>", "none"), ("user", "none"), ("Why", "tint1"), ("is", "tint1"), ("the", "tint1"),
+            ("sky", "tint1"), ("blue", "tint1"), ("?", "tint1"), ("<|im_end|>", "none"),
+            ("<|im_start|>", "none"), ("assistant", "none"), ("Light", "accent_fill"),
+            ("scatters", "accent_fill"), (".", "accent_fill"), ("<|im_end|>", "accent_fill")]
+    x, y, line = 20, 112, 0
+    svg.text(20, 100, "tokens the template writes", size=13, color="muted")
+    placed = []
+    for k, (token, fill) in enumerate(rows):
+        w = 12 + 7.2 * len(token)
+        if x + w > width - 20:
+            x, line = 20, line + 1
+        top = y + line * 66
+        with svg.group() as box:
+            svg.rect(x, top, w, 26, fill=fill, stroke="rule" if fill == "none" else "none", rx=4)
+            svg.text(x + w / 2, top + 18, token, size=12, mono=True, anchor="middle",
+                     color="muted" if fill == "none" else "text")
+        svg.appear(box, 0.6 + 0.12 * k)
+        placed.append((x, top, w, fill == "accent_fill"))
+        x += w + 4
+    svg.appear(svg.text(20, 268, "loss mask m", size=13, color="muted"), 3.4)
+    for k, (bx, top, w, scored) in enumerate(placed):
+        mark = svg.text(bx + w / 2, top + 44, "1" if scored else "0", size=13, mono=True, anchor="middle",
+                        weight=600 if scored else 400, color="accent" if scored else "muted")
+        svg.appear(mark, 3.8 + 0.1 * k)
+    svg.appear(svg.text(width - 20, 268, "only the reply is trained", size=13, color="accent", anchor="end"),
+               5.6)
+    svg.save(HERE / "sft-mask.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
-           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure,
+           "sft-mask": sft_mask_figure}
 
 
 if __name__ == "__main__":
