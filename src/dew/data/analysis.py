@@ -297,10 +297,14 @@ def _member(pipeline: Pipeline) -> str:
     its own members' names."""
     if pipeline.name is not None:
         return pipeline.name
+    from dew.data.materialize import _Memory
+
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         return f"mixture:{fingerprint([_member(child) for child in source.pipelines])[:16]}"
-    return f"content:{fingerprint(source.fingerprint())[:16]}"
+    # A memory read's rows are its source's, whichever steps it ran ahead of the lowering.
+    read = source.original if isinstance(source, _Memory) else source
+    return f"content:{fingerprint(read.fingerprint())[:16]}"
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
