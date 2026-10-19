@@ -983,15 +983,17 @@ def placed(tree, dtype):
 
 def with_triton_gemms(flow) -> None:
     """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
-    two that keep XLA's Triton GEMM fusion out of a program: deterministic ops and
-    `--xla_gpu_enable_triton_gemm=false` (tests/lane_environment.py's `REPEATABLE_GPU_FLAGS`), and with
-    every dot a Triton fusion and no cuBLAS fallback, so each GEMM a program leaves to XLA runs on
-    Triton, as XLA's own autotuner may pick at small contractions, where it computed int8 dots as two
-    or four times their product (openxla/xla#51016). XLA reads its flags once a process."""
+    three that keep XLA's Triton GEMM fusion out of a program or pin its config: deterministic ops,
+    `--xla_gpu_enable_triton_gemm=false` and autotuning off (tests/lane_environment.py's
+    `REPEATABLE_GPU_FLAGS`), and with every dot a Triton fusion and no cuBLAS fallback. Each GEMM a
+    program leaves to XLA then runs on the Triton config XLA's autotuner picks, which at small
+    contractions computed int8 dots as two or four times their product (openxla/xla#51016). XLA
+    reads its flags once a process."""
     pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm",
+                                     "--xla_gpu_autotune_level"))]
     flags += ["--xla_gpu_triton_gemm_any=true", "--xla_gpu_cublas_fallback=false"]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
