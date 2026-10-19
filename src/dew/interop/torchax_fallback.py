@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.extend.core import Literal, primitives
 
 from dew.interop import sources
 from dew.interop.generation_config import read_generation_config
@@ -212,15 +213,15 @@ def _Draws():
 
 
 def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]:
-    """`closed` evaluated on `arguments` with each broadcast of a floating
-    value narrower than fp32 summing its gradient in fp32 (`_accumulated`),
-    a jit's body inlined so its broadcasts are found too. jax transposes a
-    broadcast into a sum in the broadcast value's own dtype
-    (jax-ml/jax#30310), where torch's autograd reduces a bf16 gradient in
-    fp32 and rounds the sum once, so a norm weight's gradient summed in bf16
-    sat 2.3-2.8 times further from float64 than torch's."""
-    from jax.extend.core import Literal
-    from jax.extend.core.primitives import broadcast_in_dim_p, jit_p
+    """`closed` evaluated on `arguments` with each broadcast of a floating value
+    narrower than fp32 summing its gradient in fp32 (`_accumulated`): an explicit
+    `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
+    broadcasts implicitly (`_BROADCASTING`), each made explicit first; a jit's body
+    is inlined so its broadcasts are found too. jax transposes a broadcast into a
+    sum in the broadcast value's own dtype (jax-ml/jax#30310), where torch's
+    autograd reduces a bf16 gradient in fp32 and rounds the sum once, so a norm
+    weight's or a bias's gradient summed in bf16 sat 2-5 times further from
+    float64 than torch's."""
 
     def evaluate(jaxpr, consts, values):
         held = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, values, strict=True))
@@ -237,13 +238,18 @@ def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]
             for var in equation.invars:
                 if not isinstance(var, Literal) and last[var] == index and var not in kept:
                     held.pop(var, None)
-            if equation.primitive is jit_p:
+            if equation.primitive is primitives.jit_p:
                 inner = equation.params["jaxpr"]
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
-            elif equation.primitive is broadcast_in_dim_p and _narrow_float(inputs[0]):
+            elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [_accumulated(inputs[0], tuple(equation.params["shape"]),
                                         tuple(equation.params["broadcast_dimensions"]))]
             else:
+                if equation.primitive in _BROADCASTING:
+                    shape = equation.outvars[0].aval.shape
+                    inputs = [_accumulated(value, shape, tuple(range(len(shape))))
+                              if _narrow_float(value) and jnp.shape(value) != shape else value
+                              for value in inputs]
                 # As `jax.core.eval_jaxpr` binds an equation.
                 params = equation.primitive.get_bind_params(equation.params)
                 with equation.ctx.manager:
@@ -253,6 +259,13 @@ def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]
         return [read(var) for var in jaxpr.outvars]
 
     return evaluate(closed.jaxpr, closed.consts, arguments)
+
+
+_BROADCASTING = frozenset((primitives.add_p, primitives.sub_p, primitives.mul_p, primitives.div_p,
+                           primitives.max_p, primitives.min_p, primitives.pow_p, primitives.atan2_p,
+                           primitives.rem_p, primitives.nextafter_p, primitives.select_n_p,
+                           primitives.clamp_p))
+"""The elementwise primitives that broadcast an operand's size-1 dimensions implicitly."""
 
 
 def _narrow_float(value) -> bool:
