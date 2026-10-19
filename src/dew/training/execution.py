@@ -280,22 +280,6 @@ def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
     return loss(variables, batch, execution)
 
 
-class _Same:
-    """A value a program key holds as itself: equal only to the same object, so two device steps
-    whose reprs agree are two programs, and held, so its identity is not reused while keyed."""
-
-    __slots__ = ("value",)
-
-    def __init__(self, value: DeviceStep):
-        self.value = value
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, _Same) and other.value is self.value
-
-    def __hash__(self) -> int:
-        return id(self.value)
-
-
 def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     """`loss` of the moving leaves `primal` beside the `frozen` ones, the
     store's other collections, the batch and the step's clock and keys, with
@@ -355,11 +339,11 @@ class HostExecution:
     def forward(self):
         """The loss and its pullback, compiled for the objective's modules as they are now: the
         objective owns the program, which its fit ladder replaces with its model. The dataset's
-        device steps run in it, on the accelerator, before the loss; its key holds the steps themselves."""
+        device steps run in it, on the accelerator, before the loss, so it holds them (`holds`)."""
         return self.objective.program(
-            ("host_forward", *(_Same(step) for step in self.device)),
+            "host_forward",
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
-            static_argnames=("layout",))
+            static_argnames=("layout",), holds=self.device)
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.
