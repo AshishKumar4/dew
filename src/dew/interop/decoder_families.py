@@ -13,6 +13,7 @@ from dew.interop.families.deepseek import (
     MINIMAX_M2,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
+from dew.interop.families.dory import DORY
 from dew.interop.families.falcon import FALCON
 from dew.interop.families.gemma import GEMMA, GEMMA2, GEMMA3_TEXT, GEMMA3N_TEXT, GEMMA4_TEXT
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
@@ -48,6 +49,7 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    DORY,
     OURO,
     BLOOM,
     GPT_NEO,

@@ -304,6 +304,10 @@ class TorchTableLM(TorchCausalLM):
         return OutputTable(self.variables["params"][self.head], vocab_major=True,
                            precision=self.precision, compute=self.dtype)
 
+    def vocabulary_rows(self) -> jax.Array:
+        """The output head's rows (`OutputTable.rows`)."""
+        return self.output_table().rows()
+
 
 def _refuse_packing(packing: Mapping[str, object]) -> None:
     """Refuse every field past the tokens: transformers' forward takes whole
