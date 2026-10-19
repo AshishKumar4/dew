@@ -334,8 +334,8 @@ class Collectives:
     def broadcast(self, comm, pointer, count, dtype):
         self.calls.append((next(ORDER), "broadcast", comm, count, dtype))
 
-    def synchronize(self):
-        self.calls.append((next(ORDER), "synchronize", None, None, None))
+    def settled(self, comms, failed):
+        self.calls.append((next(ORDER), "settled", tuple(comms), None, None))
 
     def abort(self, comm):
         self.calls.append((next(ORDER), "abort", comm, None, None))
@@ -379,6 +379,53 @@ def test_an_nccl_push_makes_the_calls_its_replicas_and_groups_expect(replicas):
     sent = [call[0] for call in collectives.calls if call[1] == "broadcast"]
     assert all(server.order[3] < min(sent) and max(sent) < server.order[5] for server in engines)
     assert not [call for call in collectives.calls if call[1] == "abort"]
+
+
+@pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
+def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
+    """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
+    the join never enters the rendezvous, so the push aborts the group and raises within seconds,
+    where a blocking open waited on that peer for ever."""
+    import http.server
+    import importlib.util
+
+    locations = importlib.util.find_spec("nvidia.nccl").submodule_search_locations
+    library = Path(next(iter(locations))) / "lib" / "libnccl.so.2"
+
+    class Replica(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"world_size": 1}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Replica)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    source = Pretrained.load(FIXTURE, dtype="float32")
+    push = NCCLPush(source, (f"http://127.0.0.1:{server.server_port}",), str(library), timeout=30)
+    raised = []
+
+    def attempt():
+        try:
+            push(source.variables, 1)
+        except BaseException as error:
+            raised.append(error)
+
+    pushing = threading.Thread(target=attempt, daemon=True)
+    pushing.start()
+    pushing.join(120)
+    server.shutdown()
+    assert not pushing.is_alive() and len(raised) == 1 and isinstance(raised[0], RuntimeError)
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
