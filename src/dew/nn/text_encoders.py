@@ -234,12 +234,14 @@ class CLIPVisionTransformer(nn.Module):
     layer_norm_eps: float = 1e-5
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    activation: str = "quick_gelu"
 
     @nn.nowrap
     def _layer(self, name=None):
         patches = (self.image_size // self.patch_size) ** 2
         return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
-                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+                          activation=tower_activation(self.activation), eps=self.layer_norm_eps,
+                          dtype=self.dtype, precision=self.precision, name=name)
 
     @nn.nowrap
     def _patch_embedding(self, **scope):
@@ -330,14 +332,6 @@ class CLIPFields(TypedDict):
     projection_dim: int
 
 
-def _quick_gelu_only(config: Mapping[str, object]) -> None:
-    activation = config.get("hidden_act", "quick_gelu")
-    if activation != "quick_gelu":
-        raise ValueError(
-            f"hidden_act {activation!r} is not expressible: this MLP is CLIP's "
-            "quick-GELU")
-
-
 def translate_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPTextTransformer]:
     """A CLIP config into `CLIPTextTransformer` fields.
 
@@ -378,7 +372,6 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLI
     config or from a `CLIPVisionConfig` on its own."""
     vision = records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
-    _quick_gelu_only(vision)
     return native_fields(CLIPVisionTransformer)(
         hidden_size=records.integer(vision["hidden_size"], "hidden_size"),
         intermediate_size=records.integer(vision["intermediate_size"], "intermediate_size"),
@@ -388,6 +381,7 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLI
         patch_size=records.integer(vision["patch_size"], "patch_size"),
         num_channels=records.integer(vision.get("num_channels", 3), "num_channels"),
         layer_norm_eps=records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        activation=records.text(vision.get("hidden_act", "quick_gelu"), "hidden_act"),
     )
 
 
