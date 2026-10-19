@@ -43,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import LM_DENSE, LM_MOE
-from environments import CACHE, environment, machine_lock
+from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
@@ -287,12 +287,12 @@ def run(args: argparse.Namespace) -> int:
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     # Each tree in the environment its own lock names, so a change of a locked wheel is measured too. A
     # tree that holds no such lock (one older than the locks) cannot run a row, which its samples say.
-    lock, pythons, unbuilt = machine_lock(head_path), {}, {}
+    lock, pythons, unbuilt = machine_lock(), {}, {}
     for name, path in ((base, base_path), (head, head_path)):
         try:
             pythons[name] = environment(path, lock, Path(args.environments or CACHE))
-        except FileNotFoundError as missing:
-            unbuilt[name] = f"not run: the tree has no locked environment ({missing})"
+        except Unlocked as missing:
+            unbuilt[name] = f"not run: {missing}"
     claiming = getattr(args, "claim", False)
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
             or (claiming and row.hardware)]
