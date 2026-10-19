@@ -303,8 +303,9 @@ def _swiglu_refusal(operands, axes) -> str | None:
 
 
 def _measured_width(dtype) -> str | None:
-    """The kernel measured fastest for a SiLU product of `dtype` where the target's row does not
-    speak for it: every row measured the kernel on bf16 products alone, and at fp32 XLA fuses the
+    """The kernel measured fastest for a SiLU product of `dtype` (its operands' common dtype, so a bf16
+    gate over an fp32 up, Gemma-4's per-layer input, is an fp32 product) where the target's row does
+    not speak for it: every row measured the kernel on bf16 products alone, and at fp32 XLA fuses the
     product's converts and neighbours into one pass the kernel's launch splits (8 layers of Dory's
     1 x 2048 nGPT block on an A100: 5.4 ms a step through the kernel, 2.6 through XLA). A kernel
     named per call or by `chosen` runs as named."""
@@ -320,7 +321,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
-    ) or _swiglu_refusal((gate, up), axes), _measured_width(gate.dtype))
+    ) or _swiglu_refusal((gate, up), axes), _measured_width(jnp.result_type(gate, up)))
 
 
 def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
