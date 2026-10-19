@@ -126,6 +126,84 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
                            reductions=stream.shape[1] * stream.shape[2])
 
 
+@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
+def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_does(optimizer):
+    """Two training steps of the gemma3n-tiny decoder through the Trainer, with half of every
+    layer's AltUp prediction coefficients past `coef_clip`, against the reference's two steps
+    from the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
+    clamps the stored prediction weight in place, so the update applies to the clamped weight
+    (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1 stores 0.9, not 1.9).
+    Every stored parameter after the steps is as exact as the reference's float32 run, both
+    measured from its float64 run; each tensor alone, since the second step reads the first's
+    rounding (`assert_leaves_as_exact`)."""
+    import dataclasses
+    import json
+
+    import optax
+    import torch
+    from safetensors.numpy import load_file
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from dew.interop import Pretrained
+    from dew.interop.hf_decoders import translate_config, translate_weights
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from tools.diffusers_wan_reference import float64
+
+    directory = Path(__file__).resolve().parent / "fixtures" / "hf" / "gemma3n-tiny"
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    layers = [tree["altup"]["prediction_coefs"]["kernel"] for name, tree in loaded.variables["params"].items()
+              if name.startswith("layers_")]
+    clip = float(np.median(np.abs(np.concatenate([np.ravel(kernel) for kernel in layers]))))
+    model = loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip))
+    ids = np.load(directory / "input_ids.npy").astype(np.int32)
+    rows = ids[np.arange(jax.device_count()) % len(ids)]
+    rate, decay = (0.1, 0.0) if optimizer == "sgd" else (1e-2, 0.1)
+    tx = optax.sgd(rate) if optimizer == "sgd" else optax.adamw(rate, eps=1e-8, weight_decay=decay)
+
+    trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
+                      key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    step = trainer.compile(state, {"text": rows})
+    for _ in range(2):
+        state, *_ = step(state, {"text": rows})
+
+    stored = set(load_file(str(directory / "model.safetensors")))
+    config = json.loads((directory / "config.json").read_text())
+
+    def reference(dtype):
+        hf_config = AutoConfig.from_pretrained(directory)
+        hf_config.altup_coef_clip = clip
+        reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
+                                                         attn_implementation="eager").float()
+        if dtype == torch.float64:
+            with float64():
+                wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64,
+                                                        attn_implementation="eager")
+                wide.load_state_dict(reference.state_dict())
+            reference = wide
+        reference.train()
+        if optimizer == "sgd":
+            solver = torch.optim.SGD(reference.parameters(), lr=rate)
+        else:
+            solver = torch.optim.AdamW(reference.parameters(), lr=rate, eps=1e-8, weight_decay=decay)
+        tokens = torch.from_numpy(rows).long()
+        with float64() if dtype == torch.float64 else torch.enable_grad():
+            for _ in range(2):
+                reference(input_ids=tokens, labels=tokens).loss.backward()
+                solver.step()
+                solver.zero_grad()
+        tensors = {name: value.detach().numpy() for name, value in reference.state_dict().items()
+                   if name in stored}
+        return translate_weights(tensors, translate_config(config), config["model_type"],
+                                 param_dtype="float64" if dtype == torch.float64 else "float32")["params"]
+
+    dew = jax.tree.map(np.asarray, state.variables["params"])
+    with jax.enable_x64(new_val=True):
+        truth = jax.tree.map(np.asarray, reference(torch.float64))
+    assert_leaves_as_exact(dew, jax.tree.map(np.asarray, reference(torch.float32)), truth, rows=False)
+
+
 def test_the_laurel_block_matches_the_reference():
     """`x + post_laurel_norm(linear_right(linear_left(x)))`. Tolerance
     1e-5; observed 4.8e-07."""

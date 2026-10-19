@@ -48,7 +48,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, rescale_to
+from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
@@ -2214,6 +2214,15 @@ class CausalTransformer(nn.Module):
                                                                    if backprop_steps is None
                                                                    else backprop_steps),
                                                    remat=self.loop.remat if remat is None else remat))
+
+    @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
+        coefficients clamped to `altup.coef_clip`, as the reference clamps its stored weight before
+        a training forward (`clamped_predictions`); the updated parameters as they are."""
+        if updated or self.altup is None or self.altup.coef_clip is None:
+            return params
+        return clamped_predictions(params, self.altup.coef_clip)
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:

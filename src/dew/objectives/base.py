@@ -42,6 +42,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
+from dew.nn.protocols import ProjectsParameters
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -671,6 +672,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             tree = held
         elif held is None or self._held_parts:
             tree = self.fresh_variables(key, held)
+            tree = {**tree, "params": self.projected(tree["params"], updated=True)}
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
@@ -915,6 +917,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         with no such head has only None to restore."""
         if tile is not None:
             raise ValueError(f"{type(self).__name__} has no head to tile, so no tile {tile} to restore")
+
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """Return the stored parameters a training step reads and updates: the trainable `params`
+        projected by the model's constraint (`dew.nn.protocols.ProjectsParameters`), as is where the
+        model declares none.
+
+        The trainer's commit applies the step's update to `projected(params, updated=False)`, which
+        the optimizer sees, and stores `projected(updated, updated=True)`; a freshly drawn tree is
+        projected once with `updated=True`. The default projects the `model` this objective trains;
+        an objective that trains several networks projects each one's own tree."""
+        model = vars(self).get("model")
+        return model.projected(params, updated=updated) if isinstance(model, ProjectsParameters) else params
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Return replacement nonparameter collections computed from one accepted window's `effects`.

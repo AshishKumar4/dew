@@ -12,7 +12,7 @@ from flax import linen as nn, struct
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.nn.protocols import HiddenStates
+from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -137,6 +137,14 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         *actor, self.critic = modules
         self.actor.substitute(actor)
 
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The actor's projection of the policy's tree, and the critic's of its own
+        (`dew.nn.protocols.ProjectsParameters`)."""
+        critic = params["critic"]
+        if isinstance(self.critic, ProjectsParameters):
+            critic = self.critic.projected(critic, updated=updated)
+        return {**params, "policy": self.actor.projected(params["policy"], updated=updated), "critic": critic}
+
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the actor's head, the vocabulary head this objective trains."""
         return self.actor.tile_head(tile)
@@ -156,6 +164,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
         critic = self.critic.init(jax.random.fold_in(key, 1),
                                   jnp.zeros((1, self.seq_len), jnp.int32))
+        if isinstance(self.critic, ProjectsParameters):
+            critic = {**critic, "params": self.critic.projected(critic["params"], updated=True)}
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
