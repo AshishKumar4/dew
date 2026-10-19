@@ -27,7 +27,10 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
 
     CPU cardinality is launch-time JAX configuration, never changed here.
     Pairing by device-id rank within each process survives arbitrary mesh
-    ordering. A mismatch is refused before any model state is allocated.
+    ordering; a process's CPUs beyond its accelerator devices, and processes
+    the mesh leaves out, stay out of the companion. A process with fewer
+    CPUs than accelerator devices is refused before any model state is
+    allocated.
     """
     try:
         cpus = jax.devices("cpu") if devices is None else devices
@@ -43,18 +46,17 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
         if device.platform != "cpu":
             raise ValueError("the companion mesh must contain CPU devices")
         targets[device.process_index].append(device)
-    if set(sources) != set(targets):
-        raise ValueError("the CPU companion and accelerator must participate on the same processes")
     partners = {}
     for process, held in sources.items():
         local = targets[process]
-        if len(held) != len(local):
+        if len(local) < len(held):
             raise ValueError(
                 f"process {process} has {len(held)} accelerator devices and {len(local)} CPU devices; "
                 f"set JAX_NUM_CPU_DEVICES={len(held)} or "
                 f"--xla_force_host_platform_device_count={len(held)} in the existing xla_flags "
                 "before any JAX initialization, and restart; no backend configuration was changed")
-        partners.update(zip(sorted(held, key=lambda d: d.id), sorted(local, key=lambda d: d.id), strict=True))
+        chosen = sorted(local, key=lambda d: d.id)[:len(held)]
+        partners.update(zip(sorted(held, key=lambda d: d.id), chosen, strict=True))
     devices = np.asarray([partners[d] for d in accelerator.devices.flat], dtype=object)
     mesh = Mesh(devices.reshape(accelerator.devices.shape), accelerator.axis_names,
                 axis_types=accelerator.axis_types)

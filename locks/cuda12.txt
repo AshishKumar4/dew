@@ -777,6 +777,7 @@ outlines-core==0.2.14
     # via dewml (pyproject.toml)
 packaging==26.3
     # via
+    #   dewml (pyproject.toml)
     #   accelerate
     #   anybadge
     #   datasets
