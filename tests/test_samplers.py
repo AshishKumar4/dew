@@ -787,15 +787,16 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
     """DDIM at eta 1 draws its step from the forward posterior q(x_s | x_t, x_0) of the process it
     walks, variance preserving, exploding or a rectified flow: its mean alpha_s x_0 +
     alpha_t sigma_s^2 / (alpha_s sigma_t) eps and its standard deviation sigma_s sigma_{t|s} /
-    sigma_t, with sigma_{t|s}^2 = sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2. Through the sampling
-    walk, one interval, on the walk's own draw, it is as near the posterior's float64 value as the
-    posterior written plainly in float32 is. The variance-preserving special case of that deviation
-    drew no noise on a variance-exploding process and the wrong amount on a flow."""
+    sigma_t, with sigma_{t|s}^2 = sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2. DDIM's own form,
+    alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64; through the
+    sampling walk, one interval of the process's own grid, on the walk's own draw, Dew's step is as
+    near it as DDIM's form written plainly in float32 is. The variance-preserving special case of
+    the deviation drew no noise on a variance-exploding process and the wrong amount on a flow."""
     from dew.nn.inputs import request_key
 
     build, shape, _ = PROCESS_CASES[case]
     process, model = build()
-    times = jnp.asarray([0.6, 0.3], jnp.float32)
+    times = process.times(10)[3:5]
     x_T = jax.random.normal(jax.random.key(4), (64, *shape), jnp.float32) * 2
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
@@ -807,13 +808,22 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
     (alpha_t, sigma_t), (alpha_s, sigma_s) = (
         (float(rate) for rate in process.sampler_schedule.rates(time)) for time in (times[0], target))
 
-    def posterior(dtype):
+    def deviation(dtype):
         a_t, s_t, a_s, s_s = (np.asarray(rate, dtype) for rate in (alpha_t, sigma_t, alpha_s, sigma_s))
-        transition = s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2
-        mean = a_s * denoised.astype(dtype) + a_t * s_s ** 2 / (a_s * s_t) * eps.astype(dtype)
-        return mean + s_s / s_t * np.sqrt(transition) * noise.astype(dtype)
+        return a_t, s_t, a_s, s_s, s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
 
-    assert_as_exact_as_the_reference(stepped, posterior(np.float32), posterior(np.float64),
+    def ddim(dtype):
+        _, _, a_s, s_s, std = deviation(dtype)
+        return (a_s * denoised.astype(dtype) + np.sqrt(s_s ** 2 - std ** 2) * eps.astype(dtype)
+                + std * noise.astype(dtype))
+
+    a_t, s_t, a_s, s_s, std = deviation(np.float64)
+    posterior = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+    assert std > 0
+    # The two forms are one in float64, to its rounding of each term.
+    scale = float(np.abs(posterior).max())
+    np.testing.assert_allclose(ddim(np.float64), posterior, rtol=1e-12, atol=1e-12 * scale)
+    assert_as_exact_as_the_reference(stepped, ddim(np.float32), posterior,
                                      f"DDIM at eta 1 on the {case} process")
 
 
