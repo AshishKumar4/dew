@@ -619,11 +619,13 @@ def fused_function(name, implementation):
         return lambda gate, up: packed_gated_product("swiglu", implementation=implementation)(
             jnp.stack([gate, up], -2))
     if name == "rms":
-        return lambda x, other, scale: rms_normalized(x, scale, 1e-5, x.dtype, True, True,
-                                                      fp32_statistics=True, implementation=implementation)
+        return lambda x, other, scale: rms_normalized(x, scale, 1e-5, x.dtype, scale_offset=True,
+                                                      scale_after_cast=True, fp32_statistics=True,
+                                                      implementation=implementation)
     if name == "stream":
         return lambda x, other, scale: stream_rms_normalized(
-            x, other, scale, 1e-5, x.dtype, False, False, fp32_statistics=True, implementation=implementation)
+            x, other, scale, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+            implementation=implementation)
     if name == "unweighted":
         return lambda x, other, scale: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation)
     return lambda x, other, scale: gated_rms_normalized(x, other, scale, 1e-6, x.dtype, "silu",
