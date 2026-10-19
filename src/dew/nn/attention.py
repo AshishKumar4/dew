@@ -29,13 +29,11 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .activations import gated_product
 from .attention_kernels import (
     ATTENTION,
-    CUDNN_DTYPES,
     DECODE,
     SPLASH_BLOCK,
     SPLASH_DTYPES,
     SPLASH_LANES,
     AttentionCase,
-    cudnn_max_head_dim,
     decodes,
     flash_architectures,
     flash_built_for,
