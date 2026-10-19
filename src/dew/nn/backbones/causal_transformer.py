@@ -1175,9 +1175,12 @@ class CausalTransformer(nn.Module):
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
+        # What one scanned body shares: the layers' spec and how their variables are stored.
+        structures = StackView.layer_structures(self.variables, self.num_layers)
+        self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1923,7 +1926,7 @@ class CausalTransformer(nn.Module):
             x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
-        spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
+        spanned = tuple((first + start, count) for start, count in scan_groups(self.scan_keys[first:end],
                                                                                self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
@@ -1989,7 +1992,7 @@ class CausalTransformer(nn.Module):
                     f"{rows // shards}, or a batch that is a multiple of "
                     f"{count_microbatches * shards} rows")
             view = StackView(
-                scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
+                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
