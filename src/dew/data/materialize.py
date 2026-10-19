@@ -241,9 +241,9 @@ def _memory_stages(
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
-            counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
-            if counts_targets:
-                measure = ValidTargets(role=stage.step.role, pad_id=stage.step.pad_id)
+            counts_targets = False
+            if isinstance(stage, Map) and isinstance(stage.step, CountTargets):
+                counts_targets, measure = True, ValidTargets(role=stage.step.role, pad_id=stage.step.pad_id)
             for identifier, value in rows:
                 outputs = _outputs(stage, identifier[0], value, counts=counter)
                 for child, output in enumerate(outputs):
