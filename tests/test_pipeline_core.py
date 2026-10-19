@@ -382,24 +382,48 @@ def test_a_streamed_mix_resumes_its_members_where_they_were_when_one_joins_or_le
         assert rows_of(resumed, 2)[:1] == [0]
 
 
-@pytest.mark.parametrize("edit", ["member-steps", "nested-order", "host-steps", "mixture-stages"])
+@pytest.mark.parametrize("edit", ["member-steps", "mixture-limit", "host-steps", "mixture-stages"])
 def test_a_streamed_mix_refuses_a_resume_whose_kept_rows_changed(edit):
     """A resume takes members joining, leaving or reweighted, and refuses one where what a kept
-    member reads or makes changed: its own steps, where its limit sits against the mix's, the
-    compile's host steps, or the mixture's own stages."""
+    member reads or makes changed: its own steps, a limit over the whole mix, the compile's host
+    steps, or the mixture's own stages."""
     members = [corpus("a", 0), corpus("b", 1)]
     _, saved = member_rows(members, host=(Shift(1),))
     relabelled = Pipeline(roled(0, 6, 2, count=8), name="a").map(Relabelled()).repeat()
     changed = {
         "member-steps": {"members": [relabelled, corpus("b", 1)], "host": (Shift(1),)},
-        "nested-order": {"members": members, "weights": [1, 2], "host": (Shift(1),),
-                         "above": lambda chain: chain.take(10_000)},
+        "mixture-limit": {"members": members, "weights": [1, 2], "host": (Shift(1),),
+                          "above": lambda chain: chain.take(10_000)},
         "host-steps": {"members": members, "weights": [1, 2], "host": (Shift(2),)},
         "mixture-stages": {"members": members, "weights": [1, 2], "host": (Shift(1),),
                            "above": lambda chain: chain.map(Relabelled())},
     }[edit]
     with pytest.raises(ValueError):
         member_rows(saved=saved, **changed)
+
+
+def test_a_streamed_mix_refuses_a_kept_nested_member_whose_order_changed():
+    """A member that is itself a mix keeps its order whole: one whose limit moved from an inner
+    member to the inner mix, reading the same sources through the same steps, is refused when the
+    outer weights change too, as its saved position counts other rows."""
+    limited_inside = mix([corpus("a", 0).take(5), corpus("b", 1)]).named("inner")
+    limited_outside = mix([corpus("a", 0), corpus("b", 1)]).take(5).named("inner")
+    _, saved = member_rows([limited_inside, corpus("c", 2)])
+    with pytest.raises(ValueError):
+        member_rows([limited_outside, corpus("c", 2)], weights=[1, 2], saved=saved)
+
+
+def test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others():
+    """A memory read drops a member every row of which its steps reject: the mix compiles and reads
+    the other member's rows."""
+    empty = Pipeline(roled(0, 6, 2), name="empty").filter(lambda row: False, identity="none@1").repeat()
+    full = corpus("full", 1)
+    data = compile(mix([empty, full]).workers(1).batch(1), read="memory", loading=READ, seed=5)
+    stream = data.train(DataPartition())
+    try:
+        assert int(next(stream)["source"][0]) == 1
+    finally:
+        stream.close()
 
 
 def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():

@@ -324,26 +324,41 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(pipeline: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+def _member_manifests(original: Pipeline, train: Pipeline, build: _Build,
+                      host: Sequence[HostStep]) -> dict[str, str]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
     and the compile's host steps. A saved position of the mix keeps each member by its key, so a
     resume takes a member joining or leaving and compares the others member by member
     (`dew.data.plan.Plan.check`). Nothing where a resume cannot: a pipeline that mixes nothing, a
-    global order, or a mix beneath a stage that holds its rows (`_KEYED_ABOVE`)."""
-    source = pipeline.source
+    global order, or a mix beneath a stage that holds its rows (`_KEYED_ABOVE`).
+
+    Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
+    memory read made of `original` and which holds no member that accepted no row; its caches are
+    its counterpart's in `original`, found by the sources both read."""
+    source = train.source
     if (not isinstance(source, Mixture) or build.global_order
-            or not all(isinstance(stage, _KEYED_ABOVE) for stage in pipeline.stages)):
+            or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
         return {}
+
+    def read_of(read: Source) -> Source:
+        while isinstance(read, _Memory):
+            read = read.original
+        return read
+
+    def provenance(child: Pipeline) -> tuple[int, ...]:
+        return tuple(id(read_of(read)) for _, read in _leaves(child))
 
     def steps(identities: Sequence[StepIdentity]) -> JSON:
         return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
 
+    written = original.source.pipelines if isinstance(original.source, Mixture) else ()
+    counterparts = {provenance(child): child for child in written}
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in pipeline.stages
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in train.stages
                                                   if not isinstance(stage, (Workers, Prefetch))),
                                                 *(StepIdentity.of(step) for step in host)])})}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
@@ -354,10 +369,10 @@ def _member_manifests(pipeline: Pipeline, build: _Build, host: Sequence[HostStep
                         if not isinstance(stage, (Workers, Prefetch)))]
         members[key] = fingerprint({
             "order": unplaced(json_value(corpora[index], "member order")),
-            "sources": [read.fingerprint() for read in sources],
+            "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
-            "cache": list(_cache_references(child, build.read)),
+            "cache": list(_cache_references(counterparts.get(provenance(child), child), build.read)),
         })
     return members
 
@@ -591,7 +606,7 @@ def _compiled(
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(original, build, host),
+        members=_member_manifests(original, train, build, host),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
