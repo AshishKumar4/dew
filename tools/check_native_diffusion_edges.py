@@ -50,7 +50,7 @@ def check(directory, case):
         if case == "pndm-linspace":
             expected_times = np.concatenate([expected_times[:1], expected_times[2:]])
         np.testing.assert_array_equal(model_times, expected_times)
-        initial = jnp.asarray([[10.0, -8.0, 0.3]]) * process.sampler_schedule.prior_scale()
+        initial = jnp.asarray(ref["initial"]) * process.sampler_schedule.prior_scale()
         denoise = process.denoiser(Oracle(), {}, {})
         result = sample(denoise, initial, solver=policy.solver, times=times,
                         key=jax.random.PRNGKey(0), final_denoise=False)
