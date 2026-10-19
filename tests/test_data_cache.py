@@ -1,5 +1,6 @@
 """Artifact coverage, crash boundaries, duplicate records and bounded admission."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ import fsspec
 import grain.python as grain
 import pytest
 
-from dew.data.cache import Cache
+from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
 from dew.data.sources import Memory
 from dew.data.storage import Store
@@ -622,10 +623,8 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
     finally:
         release.set()
         for future in rows.writer.futures:
-            try:
+            with contextlib.suppress(Abandoned):
                 future.result(timeout=5)
-            except RuntimeError as error:
-                assert "abandoned" in str(error) or "cancelled" in str(error)
     assert stored and not any("/segments/" in path for path in stored)
 
 
