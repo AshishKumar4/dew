@@ -182,37 +182,37 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
 
 
 def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more():
-    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`) of a sum of 1024 fp32
-    terms, rounding as such a sum does: 64 rows of 4096 elements rounding alike pass, as do elements
-    the reference rounds exactly, held to a correct rounding; an element whose error the reference
-    has elsewhere in its row, computing it exactly, fails, as does one rounding five times as far
-    and a non-finite one. At 43.5M elements the derived factor is 3.16."""
+    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`), each held to the
+    reference's own error at it: 64 rows of 4096 elements rounding alike pass, as do elements both
+    compute exactly; an element Dew rounds where the reference is exact in every order fails, as does
+    one whose error the reference has elsewhere in its row, one rounding five times as far and a
+    non-finite one. At 43.5M elements the derived factor is 3.16."""
     rng = np.random.default_rng(6)
     shape, spread = (64, 4096), 3e-6
-    rounded = {"reductions": 1024, "dtype": np.float32}
 
     def squares():
         return np.sum(np.square(spread * rng.normal(size=(ORDERS, *shape))), axis=0)
 
-    sizes = np.ones(shape[0])
     dew, reference = squares(), squares()
-    assert_elements_as_exact_over_orders(dew, reference, sizes, "alike", **rounded)
-    exact = reference.copy()
-    exact[:, :8] = 0
-    assert_elements_as_exact_over_orders(dew, exact, sizes, "exactly rounded", **rounded)
+    assert_elements_as_exact_over_orders(dew, reference, "alike")
+    both, exact = dew.copy(), reference.copy()
+    both[:, :8], exact[:, :8] = 0, 0
+    assert_elements_as_exact_over_orders(both, exact, "both exact")
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact_over_orders(dew, exact, "exact only in the reference")
     moved, misplaced = reference.copy(), dew.copy()
     moved[3, 0], moved[3, 1] = ORDERS * (30 * spread) ** 2, 0
     misplaced[3, 0], misplaced[3, 1] = 0, ORDERS * (30 * spread) ** 2
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(misplaced, moved, sizes, "misplaced", **rounded)
+        assert_elements_as_exact_over_orders(misplaced, moved, "misplaced")
     wrong = dew.copy()
     wrong[5, 17] = ORDERS * (5 * 4 * spread) ** 2
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(wrong, reference, sizes, "one element", **rounded)
+        assert_elements_as_exact_over_orders(wrong, reference, "one element")
     broken = dew.copy()
     broken[0, 0] = np.nan
     with pytest.raises(AssertionError):
-        assert_elements_as_exact_over_orders(broken, reference, sizes, "nan", **rounded)
+        assert_elements_as_exact_over_orders(broken, reference, "nan")
     assert round(element_factor(332 * 131072), 2) == 3.16
 
 
