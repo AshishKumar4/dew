@@ -14,8 +14,10 @@ client's. TTFT is then from the request's arrival, and the token gaps are
 per token: each decoding row's time between consecutive tokens.
 
 Start vLLM in its own environment with bf16, --generation-config vllm and
---gpu-memory-utilization 0.90. Pass the same snapshot and --vocab-limit to
-all runs. Warmup uses disjoint prompts and the full measured output length.
+--gpu-memory-utilization 0.90. sglang-engine runs SGLang's engine in-process,
+in its own environment, the same way (bf16, 0.90 of the GPU, no prefix cache).
+Pass the same snapshot and --vocab-limit to all runs. Warmup uses disjoint
+prompts and the full measured output length.
 
 `--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
 server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
@@ -73,10 +75,12 @@ def open_metrics(rate: float, ttft, gaps, wall: float, tokens: int) -> dict[str,
 
 
 def dew_open(server, prompts: np.ndarray, output: int, rate: float):
-    """Open-loop Dew: requests submitted as they arrive, a step whenever any is live."""
+    """Open-loop Dew: requests submitted as they arrive, a step whenever any is live. Each token
+    is stamped when the host reads it (`Ticket.add_tokens_callback`), as the engine side stamps
+    each token it streams, so the tokens one step publishes together share a time."""
     arrivals = arrivals_for(server.slots, len(prompts), rate)
-    tickets, due, gaps = [], [], []
-    stamps: dict[int, float] = {}  # a decoding row's last step
+    tickets, due = [], []
+    stamps: list[list[float]] = []  # each request's token times
     live: list[int] = []
     began = time.perf_counter()
     while len(tickets) < len(prompts) or live:
@@ -84,21 +88,22 @@ def dew_open(server, prompts: np.ndarray, output: int, rate: float):
         while len(tickets) < len(prompts) and arrivals[len(tickets)] <= now:
             due.append(began + arrivals[len(tickets)])
             live.append(len(tickets))
-            tickets.append(server.submit(prompts[len(tickets)], output, key=len(tickets)))
+            read: list[float] = []
+            ticket = server.submit(prompts[len(tickets)], output, key=len(tickets))
+            ticket.add_tokens_callback(lambda ticket, read=read: read.extend(
+                [time.perf_counter()] * (len(ticket.tokens) - len(read))))
+            tickets.append(ticket)
+            stamps.append(read)
         if not live:
             time.sleep(max(0.0, arrivals[len(tickets)] - (time.perf_counter() - began)))
             continue
         server.step()
-        stamp = time.perf_counter()
-        for number in live:
-            if tickets[number].first is not None:
-                if number in stamps:
-                    gaps.append(stamp - stamps[number])
-                stamps[number] = stamp
         live = [number for number in live if not tickets[number].done()]
     wall = time.perf_counter() - began
     server.run()
+    assert all(len(read) == output for read in stamps), [len(read) for read in stamps]
     ttft = [ticket.first - arrival for ticket, arrival in zip(tickets, due, strict=True)]
+    gaps = np.concatenate([np.diff(read) for read in stamps])
     return open_metrics(rate, ttft, gaps, wall, len(prompts) * output)
 
 
@@ -322,8 +327,23 @@ async def vllm_points(args):
     return {"label": args.hardware}, points
 
 
+def closed_loop(streamed):
+    """A closed-loop request over `streamed(prompt, output)`, the time each of a request's tokens reached
+    the client: the in-process engines' one set of clocks."""
+    async def request(prompt, output, gate, queued):
+        async with gate:
+            sent = time.perf_counter()
+            stamps = await streamed(prompt, output)
+            assert len(stamps) == output, (len(stamps), output)
+            return {"tokens": output, "ttft": stamps[0] - sent,
+                    "itl": (stamps[-1] - stamps[0]) / max(output - 1, 1),
+                    "latency": stamps[-1] - sent, "client_queue": sent - queued}
+    return request
+
+
 async def engine_points(args):
-    """The same scheduler/stream clocks, without HTTP serialization."""
+    """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
+    Dew's and SGLang's do (`detokenize=False`)."""
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -334,28 +354,10 @@ async def engine_points(args):
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
         generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True))
 
-    async def request(prompt, output, gate, queued):
-        async with gate:
-            sent = time.perf_counter()
-            policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                    repetition_penalty=1, max_tokens=output, ignore_eos=True)
-            stream = engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy, uuid.uuid4().hex)
-            first = last = None
-            tokens = 0
-            async for result in stream:
-                count = len(result.outputs[0].token_ids)
-                if count > tokens:
-                    last = time.perf_counter()
-                    first = last if first is None else first
-                    tokens = count
-            assert first is not None and last is not None and tokens == output, (tokens, output)
-            return {"tokens": tokens, "ttft": first - sent, "itl": (last - first) / max(tokens - 1, 1),
-                    "latency": last - sent, "client_queue": sent - queued}
-
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
-        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                repetition_penalty=1, max_tokens=output, ignore_eos=True)
+        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
+                                max_tokens=output, ignore_eos=True, detokenize=False)
         stamps: list[float] = []
         async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
                                             uuid.uuid4().hex):
@@ -364,7 +366,33 @@ async def engine_points(args):
         return stamps
 
     try:
-        points = await async_sweep(args, request, streamed)
+        points = await async_sweep(args, closed_loop(streamed), streamed)
+    finally:
+        engine.shutdown()
+    return {"label": args.hardware}, points
+
+
+async def sglang_points(args):
+    """SGLang's engine in-process, on the same clocks as vllm-engine, its output token ids."""
+    import sglang
+
+    engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
+                           max_running_requests=max(args.slots), mem_fraction_static=0.90,
+                           disable_radix_cache=True, skip_tokenizer_init=True, log_level="error")
+    policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
+              "ignore_eos": True}
+
+    async def streamed(prompt, output):
+        """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
+        stamps: list[float] = []
+        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
+                                                       sampling_params={**policy, "max_new_tokens": output}):
+            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
+            stamps.extend([time.perf_counter()] * arrived)
+        return stamps
+
+    try:
+        points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
         engine.shutdown()
     return {"label": args.hardware}, points
@@ -372,7 +400,7 @@ async def engine_points(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine"), required=True)
+    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine", "sglang-engine"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8100/v1")
     parser.add_argument("--hardware", default="")
@@ -396,15 +424,15 @@ def main():
     args.slots = [int(value) for value in args.slots.split(",")]
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
-        parser.error("--rate runs Dew and vllm-engine in-process")
+        parser.error("--rate runs Dew and the in-process engines")
     if args.mesh is not None and args.backend != "dew":
         parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    run = engine_points if args.backend == "vllm-engine" else vllm_points
-    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(run(args))
+    engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
+    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,

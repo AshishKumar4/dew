@@ -185,7 +185,7 @@ For int8 quantization-aware training, install the `quantization` extra
 (`uv pip install "dewml[quantization]"`, which installs Qwix) and wrap the model before you construct the objective:
 
 ```python
-from dew.training import Quantization
+from dew.quantization import Quantization
 
 model = Quantization(dtype="int8", patterns=(".*dit_block_.*",)).apply(model)
 ```

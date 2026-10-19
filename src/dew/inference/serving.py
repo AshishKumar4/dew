@@ -105,13 +105,13 @@ from dew.inference.tasks import (
     decoded_rows,
     generation_budget,
     prepared_inputs,
+    resident,
     shape_bucket,
 )
-from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
-from dew.nn.protocols import ProjectionGroup
+from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.protocols import Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -393,17 +393,21 @@ class PagedRows:
 Rows = DenseRows | PagedRows
 
 
-def _refuse_longrope_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
+def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
                            prefix: bool = False, mixed: bool = False) -> None:
-    """Refuse serving modes whose cache cannot rebuild a crossing request (`rebuild_position`)."""
+    """Refuse the serving modes that would change what `model` computes: a prompt prefilled in
+    pieces or after a reused prefix where the model takes each prompt whole
+    (`Serving.split_prefill_refusal`), and a paged or mixed cache where LongRoPE rebuilds a crossing
+    request's (`rebuild_position`)."""
+    whole = model.split_prefill_refusal() if isinstance(model, Serving) else None
+    split = [name for name, active in (('chunked prefill', chunked), ('prefix reuse', prefix)) if active]
+    if whole is not None and split:
+        raise ValueError(f'{" and ".join(split)} would change what this model computes: {whole}')
     position = rebuild_position(model)
-    if position is not None:
-        modes = [name for name, active in (('paged', paged), ('chunked', chunked),
-                                          ('prefix', prefix), ('mixed admission', mixed)) if active]
-        if modes:
-            raise ValueError(
-                f'LongRoPE crossing position {position} '
-                f'cannot rebuild {", ".join(modes)} serving; use whole-prompt dense admission')
+    rebuilt = [name for name, active in (('paged', paged), ('mixed admission', mixed)) if active]
+    if position is not None and rebuilt:
+        raise ValueError(f'LongRoPE crossing position {position} cannot rebuild {", ".join(rebuilt)} '
+                         'serving; use whole-prompt dense admission')
 
 
 class Server:
@@ -435,11 +439,13 @@ class Server:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
             raise ValueError("admission must be between one and the slot count")
-        _refuse_longrope_modes(model, paged=isinstance(rows, PagedRows),
-                               chunked=rows.chunk is not None, mixed=rows.placement.mixed)
+        _refuse_unserved_modes(
+            model, paged=isinstance(rows, PagedRows), chunked=rows.chunk is not None,
+            prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages),
+            mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
-        variables = decoding_storage(model, variables)
+        variables = resident(model, variables)
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
@@ -587,8 +593,6 @@ class Server:
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
             model = model.clone(kv_cache=kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
-        _refuse_longrope_modes(model, paged=layout.page_size is not None,
-                               chunked=chunk is not None, prefix=prefix_cache)
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.
@@ -613,7 +617,7 @@ class Server:
                               for _ in range(groups)], chunk, rounded // layout.page_size)
         return cls(
             model,
-            task.variables,
+            task.placed,
             task.processor,
             sampling=policy,
             transforms=transforms,

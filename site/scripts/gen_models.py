@@ -39,6 +39,7 @@ DECODERS = {
     "qwen2": ("Qwen 2", "Dense decoders"),
     "qwen3": ("Qwen 3", "Dense decoders"),
     "ouro": ("Ouro (looped)", "Dense decoders"),
+    "dory": ("Dory (looped nGPT)", "Dense decoders"),
     "qwen3_5_text": ("Qwen 3.5, text", "Dense decoders"),
     "k2_horizon": ("K2 Horizon", "Dense decoders"),
     "muse_glimmer_text": ("Muse Glimmer, text", "Dense decoders"),
@@ -110,11 +111,9 @@ PIPELINES = {
     "FlaxStableDiffusionXLPipeline": ("Stable Diffusion XL, Flax weights", "Text to image"),
 }
 # Where a released checkpoint's config.json names a different model_type than the
-# decoder's own, the one a reader will find in config.json, and the file whose
-# loader dispatches on it (checked, so the two cannot drift apart).
-CHECKPOINT_TYPES = {
-    "diffusion_gemma_text": ("diffusion_gemma", "src/dew/interop/diffusion_gemma.py"),
-}
+# decoder's own, the one a reader will find in config.json
+# (tests/test_diffusion_gemma_workflow.py loads one).
+CHECKPOINT_TYPES = {"diffusion_gemma_text": "diffusion_gemma"}
 # Families checked against a released checkpoint at full size, with the checkpoint.
 FULL_SIZE = {
     "llama": "SmolLM2-135M, logits against transformers; its GGUF Q8_0 and Q4_K_M files",
@@ -184,9 +183,6 @@ def main() -> None:
     problems = (check("decoder model_type", [t for t, _, _ in decoders], DECODERS)
                 + check("multimodal model_type", wrapped, WRAPPERS)
                 + check("diffusers pipeline", pipes, PIPELINES))
-    for text_type, (checkpoint_type, loader) in CHECKPOINT_TYPES.items():
-        if f'"{checkpoint_type}"' not in (REPO / loader).read_text():
-            problems.append(f"{loader} no longer dispatches on {checkpoint_type!r}, the checkpoint type of {text_type!r}")
     if problems:
         print("gen_models: the model list and the code disagree:", file=sys.stderr)
         for problem in problems:
@@ -213,7 +209,7 @@ def main() -> None:
                 continue
             seen.add(name)
             checked = FULL_SIZE.get(model_type, "A fixture shaped like the release")
-            shown = [f"`{CHECKPOINT_TYPES[t][0]}` (text config `{t}`)" if t in CHECKPOINT_TYPES else f"`{t}`" for t in same]
+            shown = [f"`{CHECKPOINT_TYPES[t]}` (text config `{t}`)" if t in CHECKPOINT_TYPES else f"`{t}`" for t in same]
             rows.append([name, ", ".join(shown), f"`{architecture[model_type]}`", checked])
         sections += [f"## {group}", "", table(["Family", "`model_type`", "Architecture", "Checked with"], rows), ""]
     sections += ["## Multimodal checkpoints", "",

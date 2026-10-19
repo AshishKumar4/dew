@@ -505,7 +505,8 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None,
-               lazy: bool = False) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
+               lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+               ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published DC-AE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo holding its config.json and
     weights, such as `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers` (the root)
@@ -525,4 +526,5 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
         directory, "vae", config, model, dc_ae_path,
         lambda bound: DCAutoencoder(model=model, params=bound,
                                     latent_scale=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
+        shapes=shapes)

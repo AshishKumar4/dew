@@ -655,7 +655,7 @@ class MultiHeadLatentAttention(nn.Module):
         linear map of its input. The layer's own Dense is linear; a method
         interceptor that changes that answers for itself: `dew.lora`'s dropout
         draws on its targets' inputs, and a checkpoint's input quantization
-        (`dew.training.quantization`) rounds them."""
+        (`dew.quantization`) rounds them."""
         del name
         return False
 

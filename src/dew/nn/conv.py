@@ -26,7 +26,7 @@ forward and VJP take 0.097 ms (dilation 2) against 1.6 ms dilated, and the
 176M hybrid DiT's bf16 step runs 70.2 ms against 75.3
 (`tools/benchmark_depthwise.py`). Accumulation stays fp32 and ordinary JAX
 differentiation keeps higher-order derivatives; other backends use lax, as
-does a convolution a Qwix rule quantizes (`dew.training.quantization`).
+does a convolution a Qwix rule quantizes (`dew.quantization`).
 """
 
 import math

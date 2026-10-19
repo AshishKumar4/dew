@@ -90,14 +90,6 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     return names <= {'DEFAULT'}
 
 
-def asks_default_arithmetic(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
-    """Whether `precision` asks a product of `dtype` operands for no more than the default: the
-    default precision, or on bf16 operands the `BF16_BF16_F32` algorithm, which names the default's
-    arithmetic (`bf16_operand_precision`)."""
-    return asks_default_precision(precision) or (
-        jnp.dtype(dtype) == jnp.bfloat16 and precision_names(precision) == {'BF16_BF16_F32'})
-
-
 def bf16_operand_precision(dtype: Dtype | None,
                            precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision that keeps a bf16 dot bf16 in both directions.
@@ -339,8 +331,11 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     return dot_general
 
 
-def biased_logits(logits: jax.Array, bias: jax.Array | None) -> jax.Array:
-    """The vocabulary bias after the product's rounding, in fp32 or wider."""
+def scaled_logits(logits: jax.Array, scale: jax.Array | None, bias: jax.Array | None) -> jax.Array:
+    """A vocabulary head's per-column terms after its product's rounding, in fp32 or wider: each
+    column times its `scale` (nGPT's per-token logit gain), then plus its `bias`."""
+    if scale is not None:
+        logits = logits * jnp.asarray(scale, logits.dtype)
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
@@ -405,3 +400,11 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
 
     run.defvjp(forward, backward)
     return run
+
+
+def sqrt_or_zero(square):
+    """`sqrt(square)`, and zero with a zero gradient where `square` is zero:
+    sqrt's infinite derivative there would turn a masked row's zero upstream
+    gradient into NaN for every parameter it touches."""
+    positive = square > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, square, 1.0)), 0.0)

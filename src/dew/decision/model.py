@@ -10,7 +10,7 @@ from flax.typing import Dtype
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import AffineHead, HiddenStates, OutputTable
+from dew.nn.protocols import HiddenStates, VocabularyRows
 from dew.objectives.base import Variables, part, thaw
 
 
@@ -67,15 +67,11 @@ class DecisionModel:
                                           rngs=rngs))
 
     def table(self, variables: Variables) -> jax.Array:
-        """Return the backbone's output table as `[V, D]` rows, which a head may read (`AffineHead`)."""
-        if not isinstance(self.backbone, AffineHead):
-            raise TypeError(f"the head reads its backbone's output table (`AffineHead`), which a "
+        """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
+        if not isinstance(self.backbone, VocabularyRows):
+            raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
                             f"{type(self.backbone).__name__} does not give")
-        table = self.backbone.apply(thaw(part(variables, "backbone")), method="output_table")
-        if not isinstance(table, OutputTable):
-            raise ValueError("the head reads its backbone's output table, and no matrix alone gives "
-                             "this backbone's logits")
-        return table.matrix if table.vocab_major else table.matrix.T
+        return jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows"))
 
     @staticmethod
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:

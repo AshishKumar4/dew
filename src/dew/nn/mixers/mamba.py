@@ -156,9 +156,6 @@ class Mamba(nn.Module):
         return self.model_flops(lengths) - ssd_flops(lengths, 1, self.state_size, self.intermediate_size)
 
     def setup(self):
-        if self.conv_kernel < 2:
-            raise ValueError(
-                f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision)
