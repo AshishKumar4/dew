@@ -40,7 +40,7 @@ TRUTH = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers_f64
 and tools/diffusers_extended_reference.py)."""
 
 
-def held(errors, directory.name, name, actual, reference, key):
+def held(errors, task, name, actual, reference, key):
     """`actual` as near float64 as the source's float32 `reference`, the truth
     the same saved pipeline computes in float64 (tests/reference_error.py)."""
     from reference_error import assert_as_exact_as_the_reference, distance
@@ -124,9 +124,19 @@ def public_start(task, source, reference, meta, key, given, null, process, times
         return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
 
     if kind == "xl-img2img":
+        from reference_error import assert_as_exact_as_the_reference
+
         prepared = task.prepare(**shared, image=pixels, noise=noise)
         bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
-        np.testing.assert_allclose(bypassed.noise, prepared.noise, atol=1e-6, rtol=0)
+        # Both starts from Dew's own encoding (compiled in `prepare`, eager here), held to the
+        # start the source's float64 encoding makes under the same rates and noise.
+        alpha, sigma = (np.asarray(rate, np.float64).reshape(-1, 1, 1, 1)
+                        for rate in process.sampler_schedule.rates(jnp.full((1,), times[0])))
+        with np.load(TRUTH) as truth:
+            start = alpha * truth["xl-img2img/image_latents"] + sigma * np.asarray(noise, np.float64)
+        rows = prepared.rows
+        assert_as_exact_as_the_reference(np.asarray(bypassed.noise)[:rows], np.asarray(prepared.noise)[:rows],
+                                         start, "bypassed image latents")
         return prepared
     if kind == "refiner":
         return task.prepare(**shared, initial=clean())
@@ -248,6 +258,8 @@ def check_pipeline(directory, streamed: bool = False):
 
 
 def check_grids(directory, grids, case=None):
+    from reference_error import assert_as_exact_as_the_reference, distance
+
     oracle = np.load(grids)
     source = bundle(directory)
     given, null = conditions(source)
@@ -259,9 +271,15 @@ def check_grids(directory, grids, case=None):
         process, times = schedule.sampling(4)
         noise = jnp.asarray(oracle["noise"]) * process.sampler_schedule.prior_scale()
         task = replace(source.text_to_image(), grid=lambda count: (process, times), solver=schedule.solver)
-        output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0))
-        expected = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(oracle[name + ".latents"])), -1, 1)
-        compare(errors, name, output.host().images, expected, 1e-4)
+        output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0),
+                      decode=False)
+        # The walk's latents, as near float64 as the source scheduler's float32 walk over the same
+        # predictions (tools/diffusers_scheduler_pipeline_reference.py `truth`).
+        latents = np.asarray(output.host().latents, np.float64)
+        errors[name] = {"dew": distance(latents, oracle[name + ".latents.fp64"]),
+                        "reference": distance(oracle[name + ".latents"], oracle[name + ".latents.fp64"])}
+        assert_as_exact_as_the_reference(latents, oracle[name + ".latents"], oracle[name + ".latents.fp64"],
+                                         f"{name} grid")
     print(json.dumps({"grids": errors}))
 
 
@@ -364,8 +382,8 @@ def regress(directory, case):
             index = json.loads((Path(saved) / "model_index.json").read_text())
             index["force_zeros_for_empty_prompt"] = False
             (Path(saved) / "model_index.json").write_text(json.dumps(index))
-            np.testing.assert_allclose(bundle(saved).text_to_image()(["cat"], **options).host().images, expected, atol=1e-5, rtol=1e-5)
-        assert not np.allclose(task(["cat"], **options).host().images, expected, atol=1e-7)
+            np.testing.assert_array_equal(bundle(saved).text_to_image()(["cat"], **options).host().images, expected)
+        assert not np.array_equal(task(["cat"], **options).host().images, expected)
     elif case == "handoff":
         handoff(directory, source, task, key)
     elif case == "mask-levels":
