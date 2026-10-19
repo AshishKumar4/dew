@@ -246,7 +246,10 @@ def check_pipeline(directory, streamed: bool = False):
         raw = np.rint(reference["images"] * 255).astype(np.uint8)
         pixels = source.finish.transform(raw)
         held(errors, directory.name, "checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
-        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]}, pixels,
+        # The tower on the source's own pixels, each stage held on the input the source gave it:
+        # Dew's pixels carry their own float32 rounding, held above, which the tower amplifies.
+        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]},
+                                             jnp.asarray(reference["checker_pixels"]),
                                              method=source.finish.model.features)
         held(errors, directory.name, "checker_features", features, reference["checker_embeddings"], "checker_embeddings")
     # The same walk through the task facade: the same images.
