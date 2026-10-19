@@ -63,6 +63,7 @@ from dew.nn.protocols import (
     CountedPredictionTraining,
     DecoderTraining,
     LayerStates,
+    OutputTable,
     TokenModel,
 )
 from dew.nn.sharding import LOGITS, constrain
@@ -867,11 +868,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        head = None
-        if z_loss is not None and self.head_tile is not None and reads_states(self.model):
-            head = head_table(self.model, params)
-            self._head_matrices[id(self.model)] = (self.model, head is not None)
-        table = head if self.head_fused else None
+        table = self._fused_head(params) if z_loss is not None else None
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
@@ -951,6 +948,16 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         self.head_tile = chunked_tile() if tile is None else tile
         self.head_fused = True
         return f"the head tiled {self.head_tile}"
+
+    def _fused_head(self, params) -> OutputTable | None:
+        """The head as the one matrix a summed loss takes its gradient through in the forward
+        (`token_scores`' `z_loss`), None where it keeps the whole logits, is not fused or is no
+        matrix. What the trace finds of the decoder's head is kept (`_head_matrices`)."""
+        if self.head_tile is None or not reads_states(self.model):
+            return None
+        head = head_table(self.model, params)
+        self._head_matrices[id(self.model)] = (self.model, head is not None)
+        return head if self.head_fused else None
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.head_tile = tile
