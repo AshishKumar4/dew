@@ -954,8 +954,8 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
 
     Megatron-LM's parallel cross entropy (Shoeybi et al., 2019). The log
     partition is the logsumexp of the shards' own, the
-    target's logit the sum of theirs (one shard holds it), the prediction
-    the best of their best columns. Differentiated through the shard_map as
+    target's logit the sum of theirs (one shard holds it, its row's logit),
+    the prediction the best of their best columns. Differentiated through the shard_map as
     written, and correct unchecked: after the combine each device keeps its
     own tokens, so a psum's cotangent, summed over the group, is every
     device's share of it, and the gather's transpose scatters the states'
@@ -969,12 +969,24 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
     labels = jax.lax.all_gather(targets.reshape(count), group, axis=0, tiled=True) - offset
     # The excluded column, like the targets, in this device's own numbering.
     local_excluded = None if excluded is None else excluded - offset
-    losses, predicted, log_z = head(states, table, labels, local_excluded, cap, columns)
+    _, predicted, log_z = head(states, table, labels, local_excluded, cap, columns)
     # Stopped before the max: pmax has no derivative rule, and a stop after it
     # still differentiates it.
     peak = jax.lax.pmax(jax.lax.stop_gradient(log_z), group)
     whole = peak + jnp.log(jax.lax.psum(jnp.exp(log_z - peak), group))
-    target = jax.lax.psum(log_z - losses, group)
+    # The target's logit as its own term, read off its row of the head where this device holds it,
+    # not as log Z less the shard's loss: the loss's gradient would then reach this shard's softmax
+    # as (1 + (w - 1)) with w the shard's share of the row's mass, which rounds away the low bits of
+    # a small share, and this way it is w, from log Z's alone.
+    rows = table.shape[0]
+    held = (labels >= 0) & (labels < rows)
+    clipped = jnp.clip(labels, 0, rows - 1)
+    logit = column_logits(states, jnp.take(table, clipped, axis=0), cap,
+                          jax.tree.map(lambda terms: jnp.take(terms, clipped, axis=0), columns))
+    if local_excluded is not None:
+        # A target at the excluded column scores +inf, as the head scores it.
+        logit = jnp.where(labels == local_excluded, -jnp.inf, logit)
+    target = jax.lax.psum(jnp.where(held, logit, 0), group)
     start = jax.lax.axis_index(group) * count
 
     def own(value):
