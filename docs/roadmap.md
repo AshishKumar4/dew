@@ -69,6 +69,7 @@ The kernel direction was approved on 2026-10-19:
 - Translate per-share streamed, filtered and packed positions across host counts without changing their order. Global record-count positions already support host-count changes. [722]
 - Fuse adjacent per-record stages without reordering them. [723]
 - Measure loader defaults against step time; memory-sized worker selection alone does not tune the training pipeline. [724]
+- Qualify NUMA-local data workers and memory on multi-socket GPU hosts; retain affinity only where measured. Add host-sized offline IO-thread and CPU-process stages with bounded backpressure through the existing publication path. Current publication drains the chain's own workers and read threads, writes shards serially and uploads cache shards on its writer pool.
 - Add GPU image and video decode where profiling justifies it. [725]
 - Record reconstructible library stages and importable user functions in `run.json`. [213]
 - Qualify deterministic online shard coverage and replay on multiple physical hosts. [227]

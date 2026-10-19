@@ -23,6 +23,8 @@ Each scenario runs the lifecycle once and asserts every contract it touches. It 
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
+Every Pallas or FFI kernel runs per shard through `tests/sharded.py::assert_runs_per_shard`, with the layer's mesh axes and no unintended collectives. The same flow checks its numerical result against the unsharded reference; compilation alone does not prove shard placement or communication behavior.
+
 ## Settings and devices
 
 Choose a pairwise covering set over precision (fp32, bf16 and qualified fp8), padding and packing, memory-plan choices, devices, quantization, and memory/indexed/streamed data. Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
