@@ -172,10 +172,10 @@ tensor stated as a sequence, and metadata holding an unpaired surrogate."""
 
 @pytest.mark.parametrize("corruption", [*CORRUPTIONS, "length"])
 def test_a_read_accepts_and_refuses_what_safetensors_does(tmp_path, corruption):
-    """Dew validates the header of the file it holds open through safe_open, on
-    a stand-in of that header: a file safe_open reads reads to the same tensors
-    and metadata, and each one safe_open refuses, Dew refuses with safe_open's
-    error. `length` states a header longer than the file."""
+    """Dew validates the header of the file it holds open through safe_open: a
+    file safe_open reads reads to the same tensors and metadata, and each one
+    safe_open refuses, Dew refuses with safe_open's error. `length` states a
+    header longer than the file."""
     text, payload = CORRUPTIONS.get(corruption, CORRUPTIONS["valid"])
     header = text.encode("utf-16" if corruption == "utf-16" else "utf-8")
     stated = 10 ** 9 if corruption == "length" else len(header)
