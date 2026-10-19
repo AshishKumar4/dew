@@ -30,9 +30,11 @@ def ci(tmp_path, monkeypatch):
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
     """On 3.12 files are packed near the target by armada's medians, else
     the recorded durations; a file nothing has timed runs alone; a file
-    heavier than the target splits into groups of itself. 3.14 runs its own
-    files (NEWEST_FILES) the same way and imports every other one in a few
-    collect-only tasks. Every row is named once, test_gen_api never."""
+    heavier than the target splits into groups of itself. On a pushed run
+    3.14 runs its own files (NEWEST_FILES) the same way and imports every
+    other one in a few collect-only tasks; the daily run (DEW_TEST_CACHE off)
+    runs every file on both, with nothing only collected. Every row is named
+    once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
@@ -55,6 +57,15 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     rows = [name for entry in entries for name in entry["rows"]]
     assert len(rows) == len(set(rows)) == 11
     assert "3.14:tests/test_heavy.py#collect" in rows
+
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    daily = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    for python in ("3.12", "3.14"):
+        ran = [(entry["tests"], entry["split"]) for entry in daily if entry["python"] == python]
+        assert {name for tests, _ in ran for name in tests.split()} == {
+            "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
+            "tests/test_new.py"}
+    assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
 def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_path):
