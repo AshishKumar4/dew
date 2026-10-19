@@ -791,8 +791,12 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
     alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64. Each row steps
     over its own interval of the process's grid, as the walk passes a row's times, so the
     coefficients' roundings are many: Dew's step is as near the float64 posterior as DDIM's form
-    written plainly in float32 is. The variance-preserving special case of the deviation drew no
-    noise on a variance-exploding process and the wrong amount on a flow."""
+    written plainly in float32 is. Over one interval shared by every row, the coefficients round
+    once and the distance is that one rounding's: over each of a 65-point grid's 63 intervals
+    apart, Dew's step against the plain form has a median ratio of 1.00 on every process and
+    passes 2 on 2 to 3% of them, a single draw the rule's estimate does not rest on. The
+    variance-preserving special case of the deviation drew no noise on a variance-exploding
+    process and the wrong amount on a flow."""
     build, shape, _ = PROCESS_CASES[case]
     process, model = build()
     grid = np.asarray(process.times(65))
@@ -841,15 +845,17 @@ def test_a_step_between_equal_levels_draws_no_noise(solver):
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
     x = jax.random.normal(jax.random.key(2), (8, 4), jnp.float32)
-    t = jnp.full((8,), 0.4, jnp.float32)
+    level = jnp.full((8,), 0.4, jnp.float32)
 
+    # The two levels are separate inputs, equal only in their values, as two positions of a walk's
+    # grid are, so the compiled step computes each from its own rates.
     @jax.jit
-    def stepped(key):
+    def stepped(t, t_next, key):
         denoised, eps = denoise(x, t)
-        return solver.step(x, t, t, denoised, eps, solver.init(x, jnp.asarray([0.4, 0.4]), process, key=key),
-                           key, process, denoise)[0]
+        state = solver.init(x, jnp.stack([t[0], t_next[0]]), process, key=key)
+        return solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)[0]
 
-    first, second = (np.asarray(stepped(jax.random.key(seed))) for seed in (3, 4))
+    first, second = (np.asarray(stepped(level, jnp.array(level), jax.random.key(seed))) for seed in (3, 4))
     np.testing.assert_array_equal(first, second)
 
 
