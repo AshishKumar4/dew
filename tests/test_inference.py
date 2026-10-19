@@ -283,11 +283,15 @@ def validated_run(directory, validates: bool, **fields):
 def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_names(tmp_path, monkeypatch):
     """An image run's default metric is CLIP's distance where its data validates: the run trains,
     validates and logs `val/clip_similarity` from the CLIP its metric names, here the committed tiny
-    one (`MetricConfig("clip", {"modelname": ...})`, what the default holds with the published model,
-    which only a download reads). Data with no validation split builds no default metric and trains."""
+    one, given on the command line (`MetricConfig("clip", {"modelname": ...})`, what the default
+    holds with the published model, which only a download reads). Data with no validation split
+    builds no default metric and trains."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    scalars, _ = validated_run(tmp_path / "named", True,
-                               val_metrics=(MetricConfig("clip", {"modelname": TINY_CLIP}),))
+    # Named as a command line names it: one JSON list of the metrics' records.
+    named = DiffusionRunConfig.cli(["--val-metrics", json.dumps([{"name": "clip",
+                                                                  "fields": {"modelname": TINY_CLIP}}])])
+    assert named.val_metrics == (MetricConfig("clip", {"modelname": TINY_CLIP}),)
+    scalars, _ = validated_run(tmp_path / "named", True, val_metrics=named.val_metrics)
     final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
     assert 0.0 <= final["val/clip_similarity"] <= 2.0
     assert run_config(tmp_path).build_eval_metrics(validates=True)[0].name == "clip_similarity"
