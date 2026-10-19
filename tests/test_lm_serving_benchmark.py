@@ -58,7 +58,7 @@ def test_a_model_served_over_a_mesh_decodes_what_it_decodes_with_its_weights_who
         np.testing.assert_array_equal(split[name], generated[name], err_msg=name)
 
 
-SGLANG = '''"""SGLang's in-process engine, standing in: a request streams its output ids, one chunk a token."""
+SGLANG = '''"""SGLang's in-process engine, standing in: a request streams its ids, one chunk a token."""
 import asyncio, json, os
 
 class Engine:
