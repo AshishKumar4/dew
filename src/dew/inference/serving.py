@@ -110,7 +110,7 @@ from dew.inference.tasks import (
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import Layered, ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
@@ -339,7 +339,7 @@ class PagedRows:
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
         for path, _ in leaves:
-            if leaf_name(path) not in POOLED | {TABLE, CURSOR}:
+            if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS:
                 raise ValueError(f"a paged server needs every cached layer to be paged attention; "
                                  f"{jax.tree_util.keystr(path)} is not")
 

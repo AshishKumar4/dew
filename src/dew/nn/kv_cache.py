@@ -54,6 +54,11 @@ TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
 CURSOR = "cache_index"
 """The per-row count of tokens a cache holds (`attention.cache_positions`)."""
+POSITION = "next_position"
+"""A wrapper's per-row next position, past the last its row holds (`dew.nn.inputs.next_position`),
+which for a text row is its cursor's count of tokens."""
+ROW_CURSORS = frozenset({CURSOR, POSITION})
+"""The per-row cursors a paged server seats a row at, from the row's own place in its pages."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale"})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
