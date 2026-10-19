@@ -264,7 +264,9 @@ def test_a_read_racing_overwrites_holds_one_whole_file(tmp_path):
     """A writer replaces the file between two tables of other dtypes and
     shapes while a reader reads it. Each read holds one table whole: its
     header, its offsets and its bytes come from the one file the reader
-    opened, never one file's header over the other's bytes."""
+    opened, never one file's header over the other's bytes. Each read is
+    checked and dropped before the next: its map holds a descriptor, and
+    2000 held at once pass a container's 1024."""
     import threading
 
     path = tmp_path / "model.safetensors"
@@ -279,18 +281,19 @@ def test_a_read_racing_overwrites_holds_one_whole_file(tmp_path):
             count += 1
             write_file(tables[count % 2], path, {})
 
+    def whole(read):
+        return any(read.keys() == table.keys() and all(
+            read[name].dtype == table[name].dtype and np.array_equal(read[name], table[name])
+            for name in table) for table in tables)
+
     writer = threading.Thread(target=overwrite)
     writer.start()
     try:
-        reads = [read_file(path)[0] for _ in range(2000)]
+        mixed = sum(not whole(read_file(path)[0]) for _ in range(2000))
     finally:
         done.set()
         writer.join()
-    mixed = [read for read in reads if not any(
-        read.keys() == table.keys() and all(read[name].dtype == table[name].dtype
-                                            and np.array_equal(read[name], table[name]) for name in table)
-        for table in tables)]
-    assert not mixed, f"{len(mixed)} of {len(reads)} reads paired one file's header with another's bytes"
+    assert not mixed, f"{mixed} of 2000 reads paired one file's header with another's bytes"
 
 
 @pytest.mark.parametrize("publish", _PUBLISHERS)
