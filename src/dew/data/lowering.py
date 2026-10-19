@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
@@ -97,7 +98,7 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import ValidTargets, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.records import integer, integers, record
+from dew.records import integer, integers, record, strings
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -613,6 +614,15 @@ _UNPLACED = (Prefetch, Workers, MapBatch)
 batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
+def _member_key(members: Sequence[str], index: int) -> int:
+    """A mixture member's key for its random draws: the name it goes by (`_members`), as the plan's
+    order records it for every read alike, so adding or removing another member leaves its draws as
+    they were, and among members of one name its place among them, so two such members draw apart."""
+    name = members[index]
+    alike = sum(member == name for member in members[:index])
+    return int.from_bytes(hashlib.blake2b(f"{alike}:{name}".encode(), digest_size=8).digest(), "big")
+
+
 @dataclasses.dataclass(frozen=True)
 class _Build:
     read: Read
@@ -623,19 +633,22 @@ class _Build:
     lowering: _Lowering
     training: bool
     corpus: tuple[int, ...] = ()
-    """Where the corpus this builds sits in the mixtures above it, an index per mixture."""
+    """The key of the corpus this builds in each mixture above it (`_member_key`)."""
 
     @property
     def global_order(self) -> bool:
         return not self.lowering.per_share
 
     def child(self, index: int) -> _Build:
-        """The build of the `index`th corpus a mixture or phases reads, by its own analysis."""
-        return dataclasses.replace(self, lowering=self.lowering.children[index], corpus=(*self.corpus, index))
+        """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
+        by the name it goes by there (`_member_key`)."""
+        members = strings(self.lowering.order["members"], "mixture members")
+        return dataclasses.replace(self, lowering=self.lowering.children[index],
+                                   corpus=(*self.corpus, _member_key(members, index)))
 
     def stage_seed(self, pipeline: Pipeline, at: int) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
-        place in its mixtures and how many random stages its corpus wrote before this one. No stage
+        key in each of its mixtures and how many random stages its corpus wrote before this one. No stage
         a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
         the steps a memory read runs over the whole source), so this count is the same in every
         read. Grain's default seed counts the datasets between a step and the nearest seeded one
@@ -1017,7 +1030,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     def counted(pipeline: Pipeline, build: _Build) -> int | None:
         source = pipeline.source
         if isinstance(source, Mixture):
-            sizes = [counted(child, build.child(index)) for index, child in enumerate(source.pipelines)]
+            sizes = [counted(child, build.child(index))
+                     for index, child in enumerate(source.pipelines)]
             known = [size for size in sizes if size is not None]
             if len(known) != len(sizes):
                 return None
