@@ -11,7 +11,7 @@ import pytest
 
 from dew.interop import codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import InputQuantizer, nvfp4_input_qdq
+from dew.quantization import InputQuantizer, nvfp4_input_qdq
 
 ROOT = Path(__file__).parent / "fixtures" / "codecs" / "modelopt"
 
