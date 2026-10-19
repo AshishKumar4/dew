@@ -1038,3 +1038,30 @@ def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_tak
     with chosen(delta_decode="fused"):
         assert decode_routes(32)[-1] == ("fused", "fused", None)
         assert decode_routes(24)[-1] == ("step", "fused", "widths")
+
+
+@pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
+def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
+    """The fused decode step at each config of its space, run 20 times, each run beside a large matmul
+    that holds most of the GPU or alone, gives the same output, history and state bits every run: no
+    value head reads a history or state another program is writing, whatever order they run in."""
+    from dew.nn.kernels import delta_rule
+
+    layer, variables, cache, token = fused_case(16, 128, 4, jnp.bfloat16, jnp.bfloat16)
+    operands = fused_inputs(layer, variables, cache, token)
+    load = jnp.ones((8192, 8192), jnp.bfloat16)
+    busy = jax.jit(lambda a: a @ a)
+
+    def fused(*operands):
+        return delta_rule.fused_step(*operands, epsilon=layer.norm_eps, activation=layer.gate_activation,
+                                     dtype=jnp.bfloat16)
+
+    for config in each_config(delta_rule.FusedStep, fused, *operands):
+        with tuning.pinned({delta_rule.FusedStep: config}):
+            run = jax.jit(fused)
+            first = jax.tree.map(np.asarray, run(*operands))
+            for repeat in range(20):
+                if repeat % 2:
+                    busy(load)
+                for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
+                    np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"{config}, run {repeat}")
