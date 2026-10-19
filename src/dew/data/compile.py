@@ -118,15 +118,24 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     )
 
 
+@dataclasses.dataclass(eq=False)
+class _PinnedRead:
+    """The memory read source pinning took (`_pin_sources`), which the compile's memory reads of
+    the source take in place of another until it has materialized every branch and lets the read go
+    (`_staged`), so a compile reads each source once and a loader holds only the rows it made."""
+
+    records: Records | None
+
+
 @dataclasses.dataclass(frozen=True)
 class _Facts:
     source: Source
     read: Read
     stated_snapshot: Mapping[str, object]
     stated_metadata: Mapping[str, object]
-    held: Records | None = None
-    """The memory read pinning took, which every later memory read of the source reuses, so its facts
-    and the rows a run materializes are one read's."""
+    held: _PinnedRead | None = None
+    """The memory read pinning took, which the compile's memory reads of the source reuse, so its
+    facts and the rows a run materializes are one read's."""
 
     def describe(self) -> str:
         return self.source.describe()
@@ -141,7 +150,8 @@ class _Facts:
         return read == self.read or self.source.supports(read)
 
     def records(self, read: Read) -> Records:
-        return self.held if read == "memory" and self.held is not None else self.source.records(read)
+        held = None if self.held is None else self.held.records
+        return held if read == "memory" and held is not None else self.source.records(read)
 
     def manifest(self) -> ShardManifest:
         return self.source.manifest()
@@ -162,6 +172,14 @@ class _Facts:
         return self.source.locality()
 
 
+def _released(pipelines: Sequence[Pipeline]) -> None:
+    """Let go of the memory reads pinning took for `pipelines` (`_PinnedRead`), once every branch
+    of their preparation is materialized."""
+    for _, source in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
+        if isinstance(source, _Facts) and source.held is not None:
+            source.held.records = None
+
+
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
     sources = {id(source): source for branch in pipelines for _, source in _leaves(branch)}
 
@@ -170,7 +188,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
             return source
         source = _consumed(source, read)
         # A source may measure a fact as it reads (a prompt's reward bound), so the facts follow the read.
-        held = source.records(read) if read == "memory" else None
+        held = _PinnedRead(source.records(read)) if read == "memory" else None
         return _Facts(source, read, source.fingerprint(), source.metadata(), held)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
@@ -477,6 +495,7 @@ def _staged(
         )
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
+        _released(branches)
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
@@ -931,10 +950,12 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         pipeline = dataclasses.replace(pipeline, stages=tuple(
             dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, TokenBudget) else stage
             for stage in pipeline.stages))
-    (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
-                            counts=(counts,) if records is None else None)
+    (pinned,) = _prepared((pipeline,), read, provision=True, training=True,
+                          counts=(counts,) if records is None else None)
+    pipeline = pinned
     if read == "memory" and records is None:
-        pipeline = _materialize(pipeline, counts)
+        pipeline = _materialize(pinned, counts)
+        _released((pinned,))
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read)
     if records is not None:
@@ -966,9 +987,11 @@ def iterate(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
-    (pipeline,) = _prepared((pipeline,), read, provision=provision, counts=({},))
+    (pinned,) = _prepared((pipeline,), read, provision=provision, counts=({},))
+    pipeline = pinned
     if read == "memory":
-        pipeline = _materialize(pipeline, {}, training=False)
+        pipeline = _materialize(pinned, {}, training=False)
+        _released((pinned,))
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, 0, 1, budget, lowering, training=False)
     rows = build.records(pipeline, DataPartition())
@@ -1034,11 +1057,13 @@ def validation(
     read = read or _preferred_read(lambda _: (pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
-    (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    (pinned,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
     # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = _output_batch(pipeline)
+    batch = _output_batch(pinned)
+    pipeline = pinned
     if read == "memory":
-        pipeline = _materialize(pipeline, {}, training=False)
+        pipeline = _materialize(pinned, {}, training=False)
+        _released((pinned,))
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)

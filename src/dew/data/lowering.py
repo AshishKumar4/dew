@@ -943,7 +943,11 @@ class _Build:
         elif self.training and not self.lowering.endless and drop:
             rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
         whole = rows
-        rows = rows[partition.index :: partition.count]
+        # The records after a resume's count go to the shares in turn from the first of them on
+        # (`GlobalStream`), so a count that ends inside a batch hands this share the rows the share
+        # that many places on holds.
+        share = (partition.index + offset) % partition.count
+        rows = rows[share :: partition.count]
         empty = not self.training and not len(rows) and bool(len(whole))
         if empty:
             rows = whole[:1]
@@ -962,11 +966,11 @@ class _Build:
             batches = ordered
         batches = batches[offset // batch_stage.size :]
         # A count of records that ends inside a batch, as a batch ramp saves, resumes past the
-        # records of that batch the run read, in the order it read its batches: this share's rows
+        # records of that batch the run read, in the order it read its batches: the share's rows
         # among the batch's first `read`, which the shares hold in turn.
         read = offset % batch_stage.size
-        if read > partition.index:
-            batches = batches.map_with_index(_Rest(-(-(read - partition.index) // partition.count)))
+        if read > share:
+            batches = batches.map_with_index(_Rest(-(-(read - share) // partition.count)))
         stream = _as_iter(batches, self.loading)
         for at, stage in enumerate(pipeline.stages[:batched_at]):
             if isinstance(stage, Prefetch):
