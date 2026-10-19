@@ -324,8 +324,10 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
 def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
     """Each field `_member_flags` flags: its name, its default
     (`dataclasses.MISSING` for none) and its annotation (None where its
-    module cannot resolve it)."""
-    if isinstance(member, type) and dataclasses.is_dataclass(member):
+    module cannot resolve it). A dataclass with a constructor of its own (a
+    metric over its base's fields) has that constructor's arguments, as the
+    registry builds it (`registry.record_class`)."""
+    if registry.record_class(member) is not None:
         for field in dataclasses.fields(member):
             if field.init and field.name not in ("parent", "name"):
                 default = (field.default_factory() if callable(field.default_factory) else field.default)
