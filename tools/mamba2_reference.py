@@ -35,6 +35,7 @@ import numpy as np
 import torch
 import transformers
 from hf_reference import FIXTURES, write_tiny
+from torch_precision import default_dtype, float_as, replaced, widened_to
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
     Mamba2ForCausalLM,
@@ -118,18 +119,12 @@ def write_ssd() -> None:
 
 @contextlib.contextmanager
 def float64():
-    """The reference in float64 throughout: torch's default dtype float64, so a tensor it makes without
-    one is float64, and each of its casts to float32 (`Tensor.float`) keeping a float64 operand, as
-    the reference's own fp32 run keeps an fp32 one."""
-    previous, cast = torch.get_default_dtype(), torch.Tensor.float
-    torch.set_default_dtype(torch.float64)
-    torch.Tensor.float = lambda tensor, *args, **kwargs: (
-        tensor if tensor.dtype == torch.float64 else cast(tensor, *args, **kwargs))
-    try:
+    """The reference in float64 throughout (tools/torch_precision.py): torch's default dtype float64,
+    and each of its casts to float32, `.float()` and the gated norm's `.to(torch.float32)`
+    (modeling_mamba2.py:113,116), casting to float64 instead."""
+    with default_dtype(torch.float64), replaced(float_as(torch.float64),
+                                                (torch.Tensor, "to", widened_to(torch.Tensor.to))):
         yield
-    finally:
-        torch.set_default_dtype(previous)
-        torch.Tensor.float = cast
 
 
 def write_float64() -> None:
