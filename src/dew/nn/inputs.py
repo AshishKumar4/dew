@@ -311,7 +311,13 @@ class Coordinates:
         places are the slots its cache writes them at where none are given."""
         if self.positions is not None or self.valid is None:
             return self.positions
-        return jnp.maximum(jnp.cumsum(self.valid, axis=1, dtype=jnp.int32) - 1, 0)
+        return real_places(self.valid)
+
+
+def real_places(valid: jax.Array) -> jax.Array:
+    """Each slot's rank among its row's real tokens under `valid` `[B, S]`: a real token's place, a
+    padding slot's the rank before it, 0 before any (`Coordinates.places` where no positions are given)."""
+    return jnp.maximum(jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, 0)
 
 
 def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
