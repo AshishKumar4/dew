@@ -788,28 +788,32 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
     walks, variance preserving, exploding or a rectified flow: its mean alpha_s x_0 +
     alpha_t sigma_s^2 / (alpha_s sigma_t) eps and its standard deviation sigma_s sigma_{t|s} /
     sigma_t, with sigma_{t|s}^2 = sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2. DDIM's own form,
-    alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64; through the
-    sampling walk, one interval of the process's own grid, on the walk's own draw, Dew's step is as
-    near it as DDIM's form written plainly in float32 is. The variance-preserving special case of
-    the deviation drew no noise on a variance-exploding process and the wrong amount on a flow."""
-    from dew.nn.inputs import request_key
-
+    alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64. Each row steps
+    over its own interval of the process's grid, as the walk passes a row's times, so the
+    coefficients' roundings are many: Dew's step is as near the float64 posterior as DDIM's form
+    written plainly in float32 is. The variance-preserving special case of the deviation drew no
+    noise on a variance-exploding process and the wrong amount on a flow."""
     build, shape, _ = PROCESS_CASES[case]
     process, model = build()
-    times = process.times(10)[3:5]
-    x_T = jax.random.normal(jax.random.key(4), (64, *shape), jnp.float32) * 2
+    grid = np.asarray(process.times(65))
+    rows = np.random.default_rng(6).integers(0, len(grid) - 2, 512)
+    t, t_next = jnp.asarray(grid[rows]), jnp.asarray(grid[rows + 1])
+    x_T = jax.random.normal(jax.random.key(4), (len(rows), *shape), jnp.float32) * 2
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
-    stepped = np.asarray(sample(denoise, x_T, solver=DDIM(eta=1.0), key=5, times=times, final_denoise=False))
-    t = jnp.full((x_T.shape[0],), times[0])
-    denoised, eps = (np.asarray(value) for value in denoise(x_T, t))
-    noise = np.asarray(jax.random.normal(jax.random.fold_in(request_key(5), 0), x_T.shape))
-    target = times[0] - process.sampler_schedule.step_interval(times[0], times[1])
-    (alpha_t, sigma_t), (alpha_s, sigma_s) = (
-        (float(rate) for rate in process.sampler_schedule.rates(time)) for time in (times[0], target))
+    key = jax.random.key(5)
+    denoised, eps = denoise(x_T, t)
+    solver = DDIM(eta=1.0)
+    stepped = np.asarray(jax.jit(lambda: solver.step(x_T, t, t_next, denoised, eps, (), key, process,
+                                                      denoise)[0])())
+    denoised, eps = np.asarray(denoised), np.asarray(eps)
+    noise = np.asarray(jax.random.normal(key, x_T.shape))
+    target = t - process.sampler_schedule.step_interval(t, t_next)
+    rates = [np.asarray(rate, np.float64).reshape((-1,) + (1,) * len(shape))
+             for time in (t, target) for rate in process.sampler_schedule.rates(time)]
 
     def deviation(dtype):
-        a_t, s_t, a_s, s_s = (np.asarray(rate, dtype) for rate in (alpha_t, sigma_t, alpha_s, sigma_s))
+        a_t, s_t, a_s, s_s = (rate.astype(dtype) for rate in rates)
         return a_t, s_t, a_s, s_s, s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
 
     def ddim(dtype):
@@ -819,7 +823,7 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
 
     a_t, s_t, a_s, s_s, std = deviation(np.float64)
     posterior = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
-    assert std > 0
+    assert np.all(std > 0)
     # The two forms are one in float64, to its rounding of each term.
     scale = float(np.abs(posterior).max())
     np.testing.assert_allclose(ddim(np.float64), posterior, rtol=1e-12, atol=1e-12 * scale)
