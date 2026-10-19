@@ -12,7 +12,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
+from delta_rule_support import (
+    NAMES,
+    fla_decay_terms,
+    fla_side,
+    float64_truth,
+    math as portable,
+    recurrence,
+    rule_math,
+    through,
+)
 from jax.core import ShapedArray
 from reference_error import (
     assert_as_exact_as_the_reference,
@@ -661,14 +670,6 @@ def routed_operands(dtypes, width, heads, seed=0):
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, 128, value_heads))).astype(dtypes[2])
     h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, columns))
     return q, k, v, g, beta, h0
-
-
-def portable(q, k, v, g, beta, h0):
-    """The portable math the rule refuses the port for (`chunk_delta_rule`), on the operands as they
-    come, each key head repeated over the value heads it serves and the decay one per head."""
-    group = v.shape[2] // k.shape[2]
-    q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    return linear.chunk_delta_rule(q, k, v, g[..., None], beta, h0)
 
 
 def run_rule(rule, mode, operands, cotangents):

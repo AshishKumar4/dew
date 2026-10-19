@@ -1,8 +1,8 @@
 """The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
 grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
-float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), and the port's plain decay
-prefix and formula in the portable math where fla cannot run (`plain_prefix`, `port_formula`)."""
+float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), the port's plain decay
+prefix (`plain_prefix`), and the portable rule as the port runs it (`math`)."""
 
 import functools
 import itertools
@@ -82,37 +82,42 @@ import sys, numpy as np, torch
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from fla.ops.kda import chunk_kda
 given, dtype = np.load(sys.argv[1]), getattr(torch, sys.argv[3])
+kinds = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"), str(given["dtypes"]).split(",")))
 load = lambda name, as_dtype: torch.from_numpy(given[name]).to("cuda", as_dtype)
-q, k, v, do, beta = (load(n, dtype) for n in ("q", "k", "v", "do", "beta"))
-g, h0, dht = (load(n, torch.float32) for n in ("g", "h0", "dht"))
+q, k, v, g, beta, h0, do, dht = (load(n, getattr(torch, kinds[n])) for n in kinds)
 cu_seqlens = load("cu_seqlens", torch.long) if "cu_seqlens" in given else None
 leaves = [x.requires_grad_() for x in (q, k, v, g, beta, h0)]
 rule = chunk_kda if g.dim() == 4 else chunk_gated_delta_rule
-o, final = rule(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True,
+# Each leaf in its own dtype, its copy in the kernels' (fla's layer's common dtype), so a gradient
+# rounds back to its leaf's dtype as a mixed call's does.
+o, final = rule(*(x.to(dtype) for x in leaves[:3]), leaves[3].float(), leaves[4].to(dtype),
+                scale=q.shape[-1] ** -0.5, initial_state=leaves[5].float(), output_final_state=True,
                 cu_seqlens=cu_seqlens)
-torch.autograd.backward((o, final), (do, dht))
+torch.autograd.backward((o, final), (do.to(o.dtype), dht.float()))
 np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
                          zip(sys.argv[4:], (o, final, *(leaf.grad for leaf in leaves)), strict=True)})
 '''
 """fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda`, or
-`chunk_gated_delta_rule` for a decay per head, on the operands of an npz, its outputs and gradients
-into another under the names it is given (`NAMES`); packed documents as its varlen sequences, each
-with a memory of its own."""
+`chunk_gated_delta_rule` for a decay per head, on the operands of an npz, each leaf in the dtype it
+names and the kernels in the given one, its outputs and gradients into another under the names it is
+given (`NAMES`); packed documents as its varlen sequences, each with a memory of its own."""
 
 NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """The outputs and gradients each side gives, in `through`'s order."""
 
 
 def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
-    """fla's outputs and gradients on `inputs` (one row), run in a process of its own. Packed into
-    documents at `cuts`, the row's memory is its first document's and its final memory and cotangent
-    its last's: the others start from zero and give theirs no cotangent."""
+    """fla's outputs and gradients on `inputs` (one row), run in a process of its own, its kernels in
+    `dtype` and each input a leaf in its own dtype. Packed into documents at `cuts`, the row's memory
+    is its first document's and its final memory and cotangent its last's: the others start from
+    zero and give theirs no cotangent."""
     python = os.environ.get("DEW_FLA_PYTHON")
     if not python:
         pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
                     "which a run selecting fla's gate gives it")
     given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
                      (np.asarray(x, np.float32) for x in inputs), strict=True))
+    given["dtypes"] = np.asarray(",".join(jnp.dtype(x.dtype).name for x in inputs))
     if cuts is not None:
         others = np.zeros((len(cuts) - 1, *given["h0"].shape[1:]), np.float32)
         given["h0"] = np.concatenate([given["h0"], others])
