@@ -882,7 +882,7 @@ def packed_swiglu(gate_up, portable, *, axes=None):
     as `stream_rms_norm`'s does."""
     interpret = not generation.triton_runs()
     local = generation.linear_tangent(lambda gate_up: (_packed(gate_up, interpret), ()),
-                                      lambda saved, operands, dy: _packed_bwd(interpret, *operands, dy),
+                                      lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
                                       portable)
 
     if not _split():

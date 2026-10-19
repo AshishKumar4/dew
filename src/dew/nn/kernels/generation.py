@@ -459,8 +459,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [jnp.zeros(direction.aval.shape, direction.aval.dtype)
-                     if isinstance(direction, SymbolicZero) else None for direction in directions]
+            whole = [jnp.zeros_like(operand) for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
