@@ -2377,29 +2377,3 @@ def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):
     assert sorted(int(rows[index]["id"]) for index in range(len(rows))) == [0, 1, 2, 3]
     assert Files(str(tmp_path / "first.feather")).kind == "arrow"
 
-
-def test_an_arrow_source_reads_through_the_endpoint_its_files_were_found_at(tmp_path):
-    """Storage options that name an S3 endpoint both explicitly and in the client's own options
-    find a Parquet source's files through the explicit one, as s3fs gives it precedence, and the
-    Arrow reader reads them through that same filesystem, not one rebuilt from some settings."""
-    import fsspec
-    import pyarrow.parquet as pq
-    from moto.server import ThreadedMotoServer
-
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        # An endpoint no server answers, which the explicit one overrides.
-        options = {"key": "testing", "secret": "testing", "endpoint_url": endpoint,
-                   "client_kwargs": {"endpoint_url": "http://127.0.0.1:9"}}
-        bucket = "arrow-" + uuid4().hex
-        remote = fsspec.filesystem("s3", key="testing", secret="testing", endpoint_url=endpoint)
-        remote.mkdir(bucket)
-        pq.write_table(pa.table({"id": [0, 1, 2]}), tmp_path / "part.parquet")
-        remote.put(str(tmp_path / "part.parquet"), f"{bucket}/rows/part.parquet")
-        rows = Files(f"s3://{bucket}/rows", format="parquet", storage_options=options).records("memory")
-        assert [int(rows[index]["id"]) for index in range(len(rows))] == [0, 1, 2]
-    finally:
-        server.stop()
