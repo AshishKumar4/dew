@@ -345,7 +345,16 @@ class Transaction:
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
-        return forward_variables(variables, state.compute), batch, step_info
+        return self.read(variables, state.compute), batch, step_info
+
+    def read(self, variables, compute):
+        """The variables a step's forward reads: the narrow copies in place of
+        their parameters (`forward_variables`), projected as the step's update
+        reads them (`Objective.projected`), whether or not the objective's
+        forward trains the model, so the loss and its gradient are taken where
+        the update applies. The projection is not differentiated."""
+        read = forward_variables(variables, compute)
+        return {**read, "params": self.objective.projected(read["params"], updated=False)}
 
     @staticmethod
     def unscaled(gradient, factor):
@@ -526,7 +535,7 @@ class Transaction:
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(forward_variables(state.variables, state.compute), batch, step_info)
+            realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             gradient = realized.pullback(cotangent)
             if state.compute is None or self.size > 1:

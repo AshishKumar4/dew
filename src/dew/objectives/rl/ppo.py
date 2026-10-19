@@ -12,7 +12,7 @@ from flax import linen as nn, struct
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.nn.protocols import HiddenStates, ProjectsParameters
+from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -26,6 +26,8 @@ from dew.objectives.base import (
     Variables,
     joined,
     part,
+    projected_draw,
+    projected_parts,
 )
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
@@ -138,12 +140,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         self.actor.substitute(actor)
 
     def projected(self, params: Variables, *, updated: bool) -> Variables:
-        """The actor's projection of the policy's tree, and the critic's of its own
-        (`dew.nn.protocols.ProjectsParameters`)."""
-        critic = params["critic"]
-        if isinstance(self.critic, ProjectsParameters):
-            critic = self.critic.projected(critic, updated=updated)
-        return {**params, "policy": self.actor.projected(params["policy"], updated=updated), "critic": critic}
+        """The actor's projection of the policy's tree, and the critic's of its own."""
+        return projected_parts(params, {"policy": self.actor, "critic": self.critic}, updated=updated)
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the actor's head, the vocabulary head this objective trains."""
@@ -162,10 +160,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.held_variables()
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        critic = self.critic.init(jax.random.fold_in(key, 1),
-                                  jnp.zeros((1, self.seq_len), jnp.int32))
-        if isinstance(self.critic, ProjectsParameters):
-            critic = {**critic, "params": self.critic.projected(critic["params"], updated=True)}
+        critic = projected_draw(self.critic, self.critic.init(jax.random.fold_in(key, 1),
+                                                              jnp.zeros((1, self.seq_len), jnp.int32)))
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:

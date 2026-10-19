@@ -81,9 +81,13 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     clamps inside its product, which zeroes the clamped ones' gradient. The
     outputs and the gradients of all five AltUp leaves are as exact as the
     reference's, both measured from the reference in float64."""
+    import contextlib
+
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+
+    from tools.diffusers_wan_reference import float64
 
     tensors = fixture()
     clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
@@ -98,17 +102,19 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     names = ("correction_coefs", "prediction_coefs", "modality_router")
 
     def reference(dtype):
-        altup = Gemma3nTextAltUp(config).to(dtype).train()
-        with torch.no_grad():
-            for name in names:
-                getattr(altup, name).weight.copy_(torch.from_numpy(tensors[f"altup.{name}.weight"]))
-            altup.router_norm.weight.copy_(torch.from_numpy(tensors["altup.router_norm.weight"]))
-            altup.correct_output_scale.copy_(torch.from_numpy(tensors["altup.correct_output_scale"]))
-        predictions = altup.predict(torch.tensor(stream, dtype=dtype))
-        corrected = altup.correct(predictions, torch.tensor(activated, dtype=dtype))
-        outputs = (predictions, corrected, altup.scale_corrected_output(corrected[0]))
-        sum((output * torch.tensor(cotangent, dtype=dtype)).sum()
-            for output, cotangent in zip(outputs, cotangents, strict=True)).backward()
+        # The float64 truth runs under `float64`, the norm's and the router's float32 pins included.
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            altup = Gemma3nTextAltUp(config).to(dtype).train()
+            with torch.no_grad():
+                for name in names:
+                    getattr(altup, name).weight.copy_(torch.from_numpy(tensors[f"altup.{name}.weight"]))
+                altup.router_norm.weight.copy_(torch.from_numpy(tensors["altup.router_norm.weight"]))
+                altup.correct_output_scale.copy_(torch.from_numpy(tensors["altup.correct_output_scale"]))
+            predictions = altup.predict(torch.tensor(stream, dtype=dtype))
+            corrected = altup.correct(predictions, torch.tensor(activated, dtype=dtype))
+            outputs = (predictions, corrected, altup.scale_corrected_output(corrected[0]))
+            sum((output * torch.tensor(cotangent, dtype=dtype)).sum()
+                for output, cotangent in zip(outputs, cotangents, strict=True)).backward()
         return {"outputs": [output.detach().numpy() for output in outputs], "params": {"altup": {
             **{name: {"kernel": getattr(altup, name).weight.grad.numpy().T} for name in names},
             "router_norm": {"scale": altup.router_norm.weight.grad.numpy()},
@@ -126,47 +132,56 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
                            reductions=stream.shape[1] * stream.shape[2])
 
 
-@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
-def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_does(optimizer):
-    """Two training steps of the gemma3n-tiny decoder through the Trainer, with half of every
-    layer's AltUp prediction coefficients past `coef_clip`, against the reference's two steps
-    from the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
-    clamps the stored prediction weight in place, so the update applies to the clamped weight
-    (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1 stores 0.9, not 1.9).
-    Every stored parameter after the steps is as exact as the reference's float32 run, both
-    measured from its float64 run; each tensor alone, since the second step reads the first's
-    rounding (`assert_leaves_as_exact`)."""
+def clipped_gemma3n():
+    """The gemma3n-tiny decoder with its AltUp clip at the median prediction
+    coefficient, so half of every layer's coefficients start past it, and its
+    loaded source and clip."""
     import dataclasses
 
-    import optax
-    import torch
-    from transformers import AutoConfig, AutoModelForCausalLM
-
     from dew.interop import Pretrained
-    from dew.objectives.lm import LMObjective
-    from dew.training import Trainer
-    from tools.diffusers_wan_reference import float64
 
     directory = Path(__file__).resolve().parent / "fixtures" / "hf" / "gemma3n-tiny"
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     layers = [tree["altup"]["prediction_coefs"]["kernel"] for name, tree in loaded.variables["params"].items()
               if name.startswith("layers_")]
     clip = float(np.median(np.abs(np.concatenate([np.ravel(kernel) for kernel in layers]))))
-    model = loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip))
+    return loaded, loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip)), clip
+
+
+@pytest.mark.parametrize("decay", [0.0, 0.1])
+def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_does(decay):
+    """Two SGD steps of the gemma3n-tiny decoder through the Trainer, with half of every layer's
+    AltUp prediction coefficients past `coef_clip`, against the reference's two steps from the
+    same weights: torch's SGD over Gemma3nForCausalLM in train mode, whose forward clamps the
+    stored prediction weight in place, so its update, its weight decay included, applies to the
+    clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and a rate of 0.1 stores
+    0.9, not 1.9). Every stored parameter after each step is as exact as the reference's float32
+    run, both measured from its float64 run: the first step row by row, the second tensor by
+    tensor, since its rows read the first step's rounding (`assert_leaves_as_exact`). SGD, as
+    Adam's per-entry normalization makes a near-zero gradient's last-bit difference a whole step."""
+    import optax
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from tools.diffusers_wan_reference import float64
+
+    loaded, model, clip = clipped_gemma3n()
+    directory = loaded.source
     ids = np.load(directory / "input_ids.npy").astype(np.int32)
     rows = ids[np.arange(jax.device_count()) % len(ids)]
-    rate, decay = (0.1, 0.0) if optimizer == "sgd" else (1e-2, 0.1)
-    tx = optax.sgd(rate) if optimizer == "sgd" else optax.adamw(rate, eps=1e-8, weight_decay=decay)
-
+    rate = 0.1
+    tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
     trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
                       key=jax.random.key(0))
     state, _, _ = trainer.place()
     step = trainer.compile(state, {"text": rows})
+    dew = []
     for _ in range(2):
         state, *_ = step(state, {"text": rows})
-
-    trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
-    dew = {name: np.asarray(tensor, np.float32) for name, tensor in trained.items()}
+        trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+        dew.append({name: np.asarray(tensor, np.float32) for name, tensor in trained.items()})
 
     def reference(dtype):
         hf_config = AutoConfig.from_pretrained(directory)
@@ -180,20 +195,57 @@ def test_training_steps_update_the_clamped_altup_coefficients_as_the_reference_d
                 wide.load_state_dict(reference.state_dict())
             reference = wide
         reference.train()
-        if optimizer == "sgd":
-            solver = torch.optim.SGD(reference.parameters(), lr=rate)
-        else:
-            solver = torch.optim.AdamW(reference.parameters(), lr=rate, eps=1e-8, weight_decay=decay)
+        solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
         tokens = torch.from_numpy(rows).long()
+        stored = []
         with float64() if dtype == torch.float64 else torch.enable_grad():
             for _ in range(2):
                 reference(input_ids=tokens, labels=tokens).loss.backward()
                 solver.step()
                 solver.zero_grad()
-        state_dict = reference.state_dict()
-        return {name: state_dict[name].detach().numpy() for name in dew}
+                state_dict = reference.state_dict()
+                stored.append({name: state_dict[name].detach().clone().numpy() for name in dew[0]})
+        return stored
 
-    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64), rows=False)
+    theirs, truth = reference(torch.float32), reference(torch.float64)
+    for index in range(2):
+        assert_leaves_as_exact(dew[index], theirs[index], truth[index], rows=index == 0)
+
+
+@pytest.mark.parametrize("objective", ["lm", "grpo"])
+def test_a_step_from_coefficients_past_the_clip_is_the_step_from_the_clamped_ones(objective):
+    """The reference clamps the stored prediction weight in place before its forward, so a
+    training step from AltUp coefficients past `coef_clip` is the step from the clamped ones.
+    Dew's are bit for bit, under an LM loss, whose forward trains the model, and under GRPO's,
+    whose token scores read it without training: the step reads the coefficients and updates
+    them as the model's constraint projects them (`Objective.projected`)."""
+    import optax
+    from objective_cases import SEQ_LEN, packed
+
+    from dew.nn.gemma3n import clamped_predictions
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.rl import GRPOObjective
+    from dew.training import Trainer
+
+    loaded, model, clip = clipped_gemma3n()
+    clamped = {**loaded.variables, "params": clamped_predictions(loaded.variables["params"], clip)}
+    assert not all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in
+                   zip(jax.tree.leaves(clamped), jax.tree.leaves(loaded.variables), strict=True))
+
+    def stepped(variables):
+        if objective == "lm":
+            task = LMObjective(model, SEQ_LEN, head_chunks=1, variables=variables)
+            batch = {"text": np.tile(np.arange(1, SEQ_LEN + 2, dtype=np.int32), (jax.device_count(), 1))}
+        else:
+            task, batch = packed(lambda seq_len: GRPOObjective(model, seq_len, variables=variables))
+        trainer = Trainer(task, optax.sgd(0.1), key=jax.random.key(0))
+        state, _, _ = trainer.place()
+        state, *_ = trainer.compile(state, batch)(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    for ours, theirs in zip(jax.tree.leaves(stepped(loaded.variables)), jax.tree.leaves(stepped(clamped)),
+                            strict=True):
+        np.testing.assert_array_equal(ours, theirs)
 
 
 def test_the_laurel_block_matches_the_reference():
