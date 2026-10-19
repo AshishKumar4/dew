@@ -66,7 +66,9 @@ def generate(root):
         arrays[name + ".trajectory"] = trajectory
         arrays[name + ".final"] = trajectory[-1]
         with float64_scheduler(sys.modules[cls.__module__]):
-            arrays[name + ".final.fp64"] = walk(torch.float64)[1][-1]
+            scheduler, trajectory = walk(torch.float64)
+        arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
+        arrays[name + ".final.fp64"] = trajectory[-1]
     np.savez_compressed(root / "schedulers.npz", **arrays)
     torch.manual_seed(173)
     model = UNet2DConditionModel(sample_size=8, in_channels=4, out_channels=4,
