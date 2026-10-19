@@ -103,12 +103,19 @@ def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.nd
 
 
 def truth(model_dir: str, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
-    """`forced`'s tokens scored by the model in float64: weights, compute and the log partition."""
+    """`forced`'s tokens scored by the model in float64: its float32 load, every module and weight widened
+    (as tests/reference_error.py's float64_forward widens one), and the log partition in float64."""
+    loaded = Pretrained.load(model_dir, dtype=jnp.float32, param_dtype=jnp.float32,
+                             attention_impl="reference")
+    model = loaded.model
     with jax.enable_x64(new_val=True):
-        wide = Pretrained.load(model_dir, dtype=jnp.float64, param_dtype=jnp.float64,
-                               attention_impl="reference")
+        inner = {"language_model": model.language_model.clone(dtype=jnp.float64)} \
+            if hasattr(model, "language_model") else {}
+        wide = model.clone(dtype=jnp.float64, **inner)
+        variables = jax.tree.map(lambda leaf: np.asarray(
+            leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), loaded.variables)
         sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
-        logits = wide.model.apply(wide.variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
+        logits = wide.apply(variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
         scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
         chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
         return np.asarray(chosen_scores, np.float64)
