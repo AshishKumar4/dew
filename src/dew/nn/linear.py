@@ -1217,10 +1217,11 @@ class GatedDeltaNet(nn.Module):
             dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(mixed.dtype)
 
             def local(token, history, taps, gate, beta, log_a, bias, z, weight, state, active):
-                out, history, state = recurrence.step(self._fused_hooks(), recurrence.Step(
+                out, moved, state = recurrence.step(self._fused_hooks(), recurrence.Step(
                     state, token=token, held=history, taps=taps, gate=gate, beta=beta, log_a=log_a, bias=bias,
                     z=z, weight=weight, active=active), dtype=dtype)
-                return out, history, state
+                assert moved is not None, 'a step with a conv moves its history'
+                return out, moved, state
 
             def ordered(x, axis):
                 return x if shards == 1 else jnp.take(x, order, axis=axis)
