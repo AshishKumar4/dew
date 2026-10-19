@@ -24,6 +24,7 @@ from packaging.version import Version
 
 from dew.cache import enable_compilation_cache
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
+from dew.logging import configure as configure_logging
 from dew.pool import (
     COORDINATOR,
     PREEMPTED_EXIT,
@@ -35,7 +36,6 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.logging import configure as configure_logging
 from dew.telemetry.devices import (
     apply_xla_flags,
     cuda_plugin,
