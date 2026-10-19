@@ -207,9 +207,9 @@ def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
         run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
                 best=Best(metric, threshold=-1.0), restore_best=True)
     assert tracker.ended == ['failed']
+    unread = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
     with pytest.raises(ValueError):
-        Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
-            data(), steps=2, log_every=1, eval_every=1, best=run.objective.loss, restore_best=True)
+        unread.fit(data(), steps=2, log_every=1, eval_every=1, best=unread.objective.loss, restore_best=True)
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
