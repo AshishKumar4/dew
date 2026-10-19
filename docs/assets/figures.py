@@ -814,12 +814,158 @@ def edm_noise_figure():
     svg.save(HERE / "edm-noise.svg")
 
 
+def samplers_paths_figure():
+    """Euler and Heun on the probability-flow ODE of a five-point data set, against its exact path.
+
+    The data are five points on a circle, like petals, so the denoiser D(x; sigma), the mean of the data
+    under the posterior, has a closed form. Both solvers take three steps down EDM's Karras grid (rho = 7)
+    from sigma = 4, along dx / dsigma = (x - D(x; sigma)) / sigma; the exact path takes 2,000 Heun steps.
+    """
+    petals = np.stack([np.cos(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3),
+                       np.sin(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3)], axis=1)
+
+    def denoised(x, sigma):
+        logits = -np.sum((x - petals) ** 2, axis=1) / (2 * sigma ** 2)
+        weights = np.exp(logits - logits.max())
+        return weights @ petals / weights.sum()
+
+    def slope(x, sigma):
+        return (x - denoised(x, sigma)) / sigma
+
+    def grid(steps, high=4.0, low=0.01, rho=7.0):
+        ramp = np.linspace(0, 1, steps + 1)
+        return (high ** (1 / rho) + ramp * (low ** (1 / rho) - high ** (1 / rho))) ** rho
+
+    def euler(x, sigmas):
+        path = [x]
+        for now, then in zip(sigmas[:-1], sigmas[1:]):
+            x = x + (then - now) * slope(x, now)
+            path.append(x)
+        return np.array(path)
+
+    def heun(x, sigmas):
+        path = [x]
+        for now, then in zip(sigmas[:-1], sigmas[1:]):
+            first = slope(x, now)
+            guess = x + (then - now) * first
+            x = x + (then - now) * (first + slope(guess, then)) / 2
+            path.append(x)
+        return np.array(path)
+
+    start = np.array([1.35, 1.86])
+    exact, coarse = heun(start, grid(2000)), grid(3)
+    paths = {"Euler, 3 calls": euler(start, coarse), "Heun, 6 calls": heun(start, coarse)}
+    width, height = 440, 320
+    view_x, view_y, scale = 150, 205, 88
+
+    def at(point):
+        return view_x + scale * point[0], view_y - scale * point[1]
+
+    svg = Figure(width, height, seconds=11, label="Five data points on a circle and the paths three solvers take "
+                 "to them from the same starting noise: the exact path, Euler in three steps, which stops short "
+                 "between the points, and Heun in three steps, which lands on one.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    # The direction the ODE pushes, at a middling noise level, as faint arrows.
+    for gx in np.linspace(-1.3, 1.7, 8):
+        for gy in np.linspace(-1.1, 2.0, 8):
+            point = np.array([gx, gy])
+            push = -slope(point, 0.6)
+            push = 0.16 * push / (np.linalg.norm(push) + 1e-9)
+            (x1, y1), (x2, y2) = at(point), at(point + push)
+            svg.arrow(x1, y1, x2, y2, color="rule", width=1)
+    for petal in petals:
+        svg.circle(*at(petal), 6, fill="accent")
+    svg.text(*at(petals[3] + [-0.1, -0.32]), "data", size=13, color="accent")
+    svg.circle(*at(start), 5, fill="text")
+    svg.text(at(start)[0] + 10, at(start)[1] + 5, "x_T", size=13, mono=True)
+    svg.draw(svg.polyline([at(p) for p in exact], color="muted", width=1.5, dash=None), 0.4, 2.2)
+    styles = (("text", "5 4", 2.6), ("accent", None, 5.6))
+    for (name, path), (color, dash, begin) in zip(paths.items(), styles):
+        line = svg.polyline([at(p) for p in path], color=color, width=2, dash=dash)
+        svg.appear(line, begin, 0.3)
+        for index, point in enumerate(path[1:]):
+            svg.appear(svg.circle(*at(point), 4, fill=color), begin + 0.4 * index, 0.2)
+    legend_x = 286
+    rows = [("exact path", "muted", None), *((name, color, dash) for name, (color, dash, _) in
+                                             zip(paths, styles))]
+    for row, (name, color, dash) in enumerate(rows):
+        y = 250 + 24 * row
+        svg.line(legend_x, y - 5, legend_x + 20, y - 5, color=color, width=2, dash=dash)
+        svg.text(legend_x + 28, y, name, size=13, color=color)
+    svg.save(HERE / "samplers-paths.svg")
+
+
+def cfg_step_figure():
+    """Classifier-free guidance as arrows: the model's prediction with the caption and without it, the
+    difference between them, and the guided prediction that follows the difference further."""
+    width, height = 440, 300
+    origin, uncond, cond, scale = np.array([60.0, 230.0]), np.array([150.0, -40.0]), np.array([170.0, -95.0]), 2.2
+    guided = uncond + scale * (cond - uncond)
+    svg = Figure(width, height, seconds=11, label="Classifier-free guidance. From the noisy image, the model's "
+                 "prediction without a caption and with the caption 'a red rose'; their difference points where "
+                 "the caption pulls, and the guided prediction follows it further, here at scale 2.2.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.circle(*origin, 6, fill="text")
+    svg.text(origin[0] - 8, origin[1] + 24, "xₜ", size=14, mono=True)
+    with svg.group() as plain:
+        svg.arrow(*origin, *(origin + uncond), color="muted", width=2)
+        svg.text(*(origin + uncond + [8, 18]), "no caption", size=13, color="muted")
+    svg.appear(plain, 0.4)
+    with svg.group() as captioned:
+        svg.arrow(*origin, *(origin + cond), color="text", width=2)
+        svg.text(*(origin + cond + [20, 6]), "“a red rose”", size=13)
+    svg.appear(captioned, 1.4)
+    pull = svg.line(*(origin + uncond), *(origin + cond), color="accent", width=1.5, dash="4 4")
+    svg.appear(pull, 2.6)
+    svg.appear(svg.text(*(origin + (uncond + cond) / 2 + [10, 10]), "the caption's pull", size=13,
+                        color="accent"), 2.8)
+    with svg.group() as followed:
+        svg.line(*(origin + cond), *(origin + guided), color="accent", width=1.5, dash="4 4")
+        svg.arrow(*origin, *(origin + guided), color="accent", width=2.5)
+        svg.text(*(origin + guided + [-40, -14]), f"guided, s = {scale:g}", size=13, color="accent", weight=600)
+    svg.appear(followed, 4.2)
+    svg.appear(svg.text(24, 32, "ε_guided = ε_uncond + s (ε_cond − ε_uncond)", size=13, mono=True), 5.2)
+    svg.save(HERE / "cfg-step.svg")
+
+
+def cfg_sweep_figure():
+    """The guided prediction as the scale s sweeps from 0 to 6: at 0 the plain prediction, at 1 the captioned
+    one, past 1 further along the caption's pull."""
+    width, height = 440, 270
+    origin, uncond, cond = np.array([40.0, 236.0]), np.array([100.0, -10.0]), np.array([125.0, -40.0])
+    scales = [0, 1, 2, 3, 4, 6]
+    svg = Figure(width, height, seconds=11, label="The guided prediction as the guidance scale grows from 0 to 6: "
+                 "at 0 it is the prediction without a caption, at 1 the captioned one, and past 1 it reaches "
+                 "further along the caption's pull.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.circle(*origin, 6, fill="text")
+    far = uncond + scales[-1] * (cond - uncond)
+    svg.line(*(origin + uncond), *(origin + far), color="rule", width=1.25, dash="4 4")
+    svg.arrow(*origin, *(origin + uncond), color="muted", width=1.5)
+    svg.arrow(*origin, *(origin + cond), color="text", width=1.5)
+    svg.text(*(origin + uncond + [6, 20]), "s = 0", size=12, mono=True, color="muted")
+    svg.text(*(origin + cond + [-52, -8]), "s = 1", size=12, mono=True)
+    times = [0.5 + 1.1 * i for i in range(len(scales))]
+    arrows, readouts = [], []
+    for s_ in scales:
+        tip = origin + uncond + s_ * (cond - uncond)
+        arrows.append(svg.arrow(*origin, *tip, color="accent", width=2.5))
+        readouts.append(svg.text(width - 24, 36, f"s = {s_:g}", size=16, mono=True, weight=600, color="accent",
+                                 anchor="end"))
+    svg.show_in_turn(arrows, times)
+    svg.show_in_turn(readouts, times)
+    svg.text(24, 36, "guidance scale", size=13, color="muted")
+    svg.save(HERE / "cfg-sweep.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
-           "edm-noise": edm_noise_figure, "lm-next-token": lm_next_token_figure}
+           "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure,
+           "lm-next-token": lm_next_token_figure}
 
 
 if __name__ == "__main__":
