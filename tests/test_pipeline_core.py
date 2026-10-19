@@ -502,6 +502,39 @@ class Stated(Memory):
         return {"rows": len(rows), "valid_targets": sum(len(row["text"]) - 1 for row in rows)}
 
 
+class Doubled:
+    """A step over a token row that makes another row of it, as tokenizing or chunking does, so a
+    store's stated counts describe rows the corpus no longer holds."""
+
+    def __call__(self, row):
+        return {**row, "text": np.concatenate([row["text"], row["text"]])}
+
+
+def test_a_memory_read_weighs_a_token_mixture_by_the_targets_of_the_rows_it_holds():
+    """A memory read that runs steps over its stores holds every row a mixture by tokens reads, so it
+    counts their valid targets by the mixture's rule, not by the stores' stated counts of rows the
+    steps changed: the order stays global, an epoch of it has a record count, and the corpora
+    deliver equal targets by what their rows hold."""
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    parts = [Pipeline(corpus("long", (2, 10, 10, 10)), name="long").map(Doubled()),
+             Pipeline(corpus("short", (2, 2)), name="short")]
+    mixed = mix([part.repeat() for part in parts], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    assert data.plan is not None and data.plan.lowering == "global" and data.steps_per_epoch is not None
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 8):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 19
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
