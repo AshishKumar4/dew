@@ -41,9 +41,9 @@ class Recording:
 
 
 def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
-    """A run that evaluates between steps scores each suite's first batch, its preview included,
-    beside its step's compile and before its first step, reporting nothing of it: the evaluations
-    it schedules then compile no program, and the tracker holds those alone."""
+    """A run that evaluates between steps scores each suite's first batch twice, its preview
+    included, beside its step's compile and before its first step, reporting nothing of it: the
+    evaluations it schedules then compile no program, and the tracker holds those alone."""
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
@@ -74,7 +74,7 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
     finally:
         logger.removeHandler(handler)
     warm, *scheduled = evaluations
-    assert warm[:2] == (0, 8), warm
+    assert warm[:2] == (0, 16), warm
     assert [(step, records) for step, records, _ in scheduled] == [(2, 16), (4, 16)], scheduled
     assert [compiled for _, _, compiled in scheduled] == [[], []], scheduled
     assert len(tracker.artifacts) == 2

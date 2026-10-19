@@ -289,13 +289,15 @@ def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, .
     return {name: tuple(suite.metrics) for name, suite in suites.items()}
 
 
-def _first_batch(reader: Reader) -> Reader:
-    """`reader`'s first batch alone, its iterator closed once that is read."""
+def _first_batch_twice(reader: Reader) -> Reader:
+    """`reader`'s first batch, twice: a pass over it runs every program a pass of more batches does,
+    the one that pools a later batch into the first's included. Its iterator closes once that is
+    read."""
     def read(partition: DataPartition) -> Iterator[Batch]:
         source = reader(partition)
         with contextlib.closing(source) if isinstance(source, Closeable) else contextlib.nullcontext():
             first = next(source, None)
-        return iter(() if first is None else (first,))
+        return iter(() if first is None else (first, first))
     return read
 
 
@@ -2005,7 +2007,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _warm_evaluations(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
         """Compile the programs a run's evaluations run before its first step, where any runs between
-        steps (`_FitPlan.evaluates_midway`): every suite scores its first batch, its preview
+        steps (`_FitPlan.evaluates_midway`): every suite scores its first batch twice, its preview
         included, and nothing is reported.
 
         An evaluation's programs compile on their first call. Inside the run that call is an
@@ -2024,7 +2026,7 @@ class Trainer(Generic[Loss, Effects]):
 
         With no suite at all, the evaluation carries the training values a
         ranking or a stopping rule reads. `warm` scores each suite's first
-        batch alone and reports nothing (`_warm_evaluations`)."""
+        batch twice and reports nothing (`_warm_evaluations`)."""
         ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
         reports = training if ranks else None
         chosen = list(plan.suites if names is None else names)
@@ -2039,7 +2041,7 @@ class Trainer(Generic[Loss, Effects]):
             ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
             loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
-            data = _first_batch(suite.data) if warm else suite.data
+            data = _first_batch_twice(suite.data) if warm else suite.data
             evaluations.append(self._evaluate(state, shardings, data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, report=not warm))
         return dataclasses.replace(
