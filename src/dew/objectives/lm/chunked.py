@@ -677,8 +677,11 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         targets = jax.lax.dynamic_slice_in_dim(labels, start, size)
         logits, pullback = jax.vjp(lambda raw, terms: capped_logits(terms.logits(raw), cap, temperature),
                                    _tile_logits(states, matrix, precision), columns)
-        log_z, top, (peaks, masses) = _row_terms(_without(logits, 0, excluded), predict)
-        values = [log_z - _target_logits(logits, targets), log_z]
+        # One masked row for the partition and the target: a target at the excluded column scores
+        # +inf, as the chunked heads score it, and its gradient moves no logit.
+        kept = _without(logits, 0, excluded)
+        log_z, top, (peaks, masses) = _row_terms(kept, predict)
+        values = [log_z - _target_logits(kept, targets), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
