@@ -62,13 +62,16 @@ np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
 
 def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path):
     """Importing dew.data reads no storage configuration, so a broken one fails the first store
-    that resolves, not the import, and a data pass with worker processes runs in a program that
-    never parsed absl's flags (`import dew` marks them parsed, as absl.app would)."""
+    that resolves, not the import, yet registers Dew's bounded cache, which fsspec opens before any
+    store resolves; and a data pass with worker processes runs in a program that never parsed
+    absl's flags (`import dew` marks them parsed, as absl.app would)."""
     broken = tmp_path / "storage.toml"
     broken.write_text("this is not toml [")
     script = r"""
 import numpy as np
 import dew.data
+import fsspec
+cache_class = fsspec.get_filesystem_class("dewcache").__name__
 from dew.data.pipeline import Pipeline
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
@@ -82,7 +85,8 @@ except Exception as error:
 data = compile(Pipeline(Memory([{"id": np.int32(i)} for i in range(8)])).repeat(1).batch(2),
                read="memory", loading=Loading(workers=2, threads=1, read_buffer=0, worker_buffer=1))
 reader = data.train(DataPartition())
-print(json.dumps({"refused": refused, "ids": sorted(int(v) for batch in reader for v in batch["id"])}))
+print(json.dumps({"refused": refused, "cache": cache_class,
+                  "ids": sorted(int(v) for batch in reader for v in batch["id"])}))
 reader.close()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
@@ -90,4 +94,4 @@ reader.close()
                                  "DEW_STORAGE_CONFIG": str(broken)})
     assert result.returncode == 0, result.stderr[-2000:]
     reported = json.loads(result.stdout.splitlines()[-1])
-    assert reported == {"refused": "TOMLDecodeError", "ids": list(range(8))}
+    assert reported == {"refused": "TOMLDecodeError", "cache": "BoundedFileCache", "ids": list(range(8))}
