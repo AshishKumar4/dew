@@ -264,10 +264,10 @@ def test_a_tree_compiles_once_into_its_own_cache_and_its_later_rounds_load_from_
         return tuple(int(word) for word in done.stdout.split()[-2:])
 
     caches = tmp_path / "caches"
-    assert child(caches / "base") == (0, 1)
-    assert any((caches / "base").iterdir())
-    assert child(caches / "base") == (1, 0)
-    assert child(caches / "head") == (0, 1)
+    hits, compiled = child(caches / "base")
+    assert hits == 0 and compiled > 0 and any((caches / "base").iterdir())
+    assert child(caches / "base") == (compiled, 0)
+    assert child(caches / "head") == (0, compiled)
     assert child(None) == (0, 0)
 
 
