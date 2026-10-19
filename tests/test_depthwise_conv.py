@@ -192,7 +192,7 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives(oper
 def test_depthwise_quantization_keeps_the_original_provider_output(training):
     """QT and PTQ still reach the provider, with identical scales and output."""
     pytest.importorskip('qwix')
-    from dew.training.quantization import Quantization, quantize_for_serving
+    from dew.quantization import Quantization, quantize_for_serving
 
     fields = {'features': 8, 'kernel_size': (3, 3), 'feature_group_count': 8,
               'use_bias': False, 'dtype': jnp.bfloat16}
