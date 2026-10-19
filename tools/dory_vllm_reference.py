@@ -598,8 +598,10 @@ def publish(directory: Path) -> None:
                     *(CommitOperationAdd(path_in_repo=file, path_or_fileobj=str(path))
                       for file, path in kept.items())])
     source = json.loads((FIXTURE / 'source.json').read_text())
-    source['probe'].update(dataset=DATASET, revision=commit.oid, files={
-        file: hashlib.sha256(path.read_bytes()).hexdigest() for file, path in kept.items()})
+    source['probe'].update(
+        dataset=DATASET, revision=commit.oid,
+        truth="the pull request's model code in float64 (upstream), tools/dory_reference.py held to it",
+        files={file: hashlib.sha256(path.read_bytes()).hexdigest() for file, path in kept.items()})
     (FIXTURE / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
     print(f'{DATASET}@{commit.oid}: {len(kept)} files')
 
