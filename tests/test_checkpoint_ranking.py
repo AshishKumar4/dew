@@ -162,17 +162,24 @@ def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suit
     assert run.checkpoints.resolve('best:rare/value') == 1
 
 
-def test_restore_best_without_checkpoints_is_refused_before_training():
-    """The best state restore_best returns is a checkpoint, restored: a trainer that writes none is
-    refused before it trains, rather than handing back its final weights as the best. A best policy
-    alone ranks checkpoints, of which there are none to rank, and the run trains as asked."""
-    metric = Value('value', Shown(better='higher'))
-    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError):
-        unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], restore_best=True)
-    state = unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], best=metric)
-    assert int(state.step) == 2
+def leaf_values(leaf) -> np.ndarray:
+    """A state leaf's values, a random key's as its key data."""
+    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
 
+
+def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_path):
+    """A trainer that writes no checkpoints keeps its best state in host memory as it evaluates, so
+    restore_best returns the state a checkpointed run restores as its best, every leaf of it: by the
+    validation loss, an earlier state than the last, and by a best policy in its own direction."""
+    metric = Value('value', Shown(better='higher'))
+    for name, policy in (('loss', {}), ('value', {'metrics': [metric], 'best': metric})):
+        saved = trainer(tmp_path / name).fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4,
+                                             restore_best=True, **policy)
+        unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+            data(), steps=8, log_every=1, eval_every=1, restore_best=True, **policy)
+        assert int(unsaved.step) == int(saved.step) == (3 if name == 'loss' else 8)
+        for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+            np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))

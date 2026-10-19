@@ -320,6 +320,9 @@ class _FitPlan:
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
+    held_best: bool = False
+    """Whether the run keeps its best state in host memory, for a `restore_best` without
+    `Checkpoints` to restore."""
     """Every validation split by name, its metrics and cadence resolved."""
 
     @property
@@ -373,6 +376,8 @@ class _FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    best: tuple[float, TrainState] | None = None
+    """The best ranking's score so far and its state, held in host memory (`_FitPlan.held_best`)."""
     """The log taken at the latest logging step and not yet read."""
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
@@ -1390,6 +1395,11 @@ class Trainer(Generic[Loss, Effects]):
         several, each a Dataset, a reader scored as `dataset.val` would be or an
         `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
+        `restore_best=True` returns the state the run ranked best (by `best`, else
+        the validation loss, else the training loss): its best checkpoint, or,
+        without `Checkpoints`, the state itself, which the run keeps in host memory
+        as it evaluates, one copy of it.
+
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
         of that cadence. A duration is checked at each `log_every` step, so
@@ -1419,7 +1429,7 @@ class Trainer(Generic[Loss, Effects]):
         suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         self._preflight(loader, stop, suites, preview=preview,
-                        loss=self.checkpoints is not None and not selection)
+                        loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1435,6 +1445,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
+                held_best=restore_best and checkpoints is None,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1449,6 +1460,9 @@ class Trainer(Generic[Loss, Effects]):
                         trained),
                     step="best",
                 )
+            elif restore_best and run.best is not None and run.preempted is None:
+                from dew.training.host import place_held
+                trained = place_held(run.best[1], trained)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1783,6 +1797,8 @@ class Trainer(Generic[Loss, Effects]):
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
         checkpoints, current = self.checkpoints, run.current
         ranking = self._ranking(plan, scores)
+        if plan.held_best and evaluation_due:
+            self._hold_best(run, ranking, state)
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
         candidate = bool(winners)
@@ -1858,9 +1874,6 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        if restore_best and self.checkpoints is None:
-            # It would return the final weights as the best: the best is a checkpoint, restored.
-            raise ValueError("restore_best restores the best checkpoint; give the Trainer Checkpoints")
         # Each split's own metrics: two suites may each hold their own instance of one metric.
         scored = {name: tuple(suite.metrics) for name, suite in suites.items()} or {'val': tuple(metrics)}
         raw = (
@@ -1901,9 +1914,22 @@ class Trainer(Generic[Loss, Effects]):
                 )
             stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(scored)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
-        if restore_best and any(choice.weights_only for choice in selection):
+        if restore_best and self.checkpoints is not None and any(
+                choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
+
+    @staticmethod
+    def _hold_best(run: _FitRun, ranking: Sequence[Ranking], state: TrainState) -> None:
+        """Keep `state` in host memory where its first ranking, the one a checkpointed run's best
+        restores by, beats the state held: one copy of the state, replaced as the best moves."""
+        rank = next(iter(ranking), None)
+        if rank is None or not math.isfinite(rank.value):
+            return
+        score = rank.value if rank.mode == 'min' else -rank.value
+        if run.best is None or score < run.best[0]:
+            from dew.training.host import hold_on_host
+            run.best = (score, hold_on_host(dataclasses.replace(state, compute=None)))
 
     def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
         if not plan.best:
