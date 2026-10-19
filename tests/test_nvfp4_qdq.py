@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
 
-from dew.training.quantization import InputQuantizer, nvfp4_input_qdq
+from dew.quantization import InputQuantizer, nvfp4_input_qdq
 
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
