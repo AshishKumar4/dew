@@ -1146,7 +1146,7 @@ class GatedDeltaNet(nn.Module):
             (tokens.segments is None, "a decode token continues one document"),
             (grouped_heads((*x.shape[:2], self.num_v_heads, self.head_v_dim), self.num_k_heads)[1] is None,
              "a mesh axis splits the heads"),
-            (delta_rule.fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])),
+            (delta_rule.fused_fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])),
              "the state's widths are not powers of two the kernel's blocks take"),
         )
 
