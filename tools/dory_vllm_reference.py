@@ -563,7 +563,7 @@ def dew_traces(directory: Path) -> None:
             held.flush()
 
 
-TREES = {'pairwise': ('pairwise', 0), 'blocked-32': ('blocked', 32), 'blocked-128': ('blocked', 128)}
+TREES = ('pairwise', 'blocked-32', 'blocked-128')
 """The ensemble's members besides vLLM, each Dew's same math with every sum under a declared tree
 (tests/reference_trees.py): vLLM's key order is fixed, so the trees are what vary its key sums."""
 
@@ -595,8 +595,8 @@ def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
                                  attention_impl='xla')
         model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
         placed = jax.device_put(loaded.variables)
-        for member, (tree, block) in TREES.items():
-            programs = test_dory.decoding(model, tree, block=block)
+        for member in TREES:
+            programs = test_dory.decoding(model, member)
             for batch in range(BATCHES):
                 total, began = np.zeros(truth.shape), time.perf_counter()
                 for index in range(orders_of):

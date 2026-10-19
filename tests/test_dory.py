@@ -633,13 +633,13 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
     return permuted({**variables, 'params': params}, residual)
 
 
-def decoding(model: CausalTransformer, tree: str | None = None, *, block: int = 0):
+def decoding(model: CausalTransformer, tree: str | None = None):
     """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
     token, and its log-probabilities from logits, each compiled once for every set of weights of its
     shapes and binding no weights past its call; with `tree`, every sum each makes under it
     (tests/reference_trees.py), the same math summed in another order."""
     def staged(function):
-        return jax.jit(function if tree is None else evaluated(function, tree, block=block))
+        return jax.jit(function if tree is None else evaluated(function, tree))
 
     opened = staged(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
                                                   mutable=['cache'])[1]['cache'])
