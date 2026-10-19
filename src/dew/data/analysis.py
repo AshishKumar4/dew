@@ -176,9 +176,9 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
     fill = record(dependency.get("fill", {}), "generation fill")
-    read = next((mode for mode in READS if mode == fill.get("read")), None)
-    if read is None:
+    if fill.get("read") not in READS:
         return None, ("fill",)
+    read = READS[READS.index(fill["read"])]
     published = dependency.get("source")
     stored = next((candidate for candidate in selecting(source)
                    if not isinstance(candidate, (Mixture, Phases))
