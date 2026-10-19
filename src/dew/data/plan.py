@@ -434,9 +434,14 @@ class Plan:
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
-        changes = _changed(
-            record(saved.get("environment"), "saved data environment"), self.manifest.environment()
-        )
+        environment = self.manifest.environment()
+        saved_environment = record(saved.get("environment"), "saved data environment")
+        if edited is not None:
+            # Each kept member's modules are its own digest's, which `_edited_members` compared.
+            environment = {name: value for name, value in environment.items() if name != "modules"}
+            saved_environment = {name: value for name, value in saved_environment.items()
+                                 if name != "modules"}
+        changes = _changed(saved_environment, environment)
         if changes and self.lowering == "per-share":
             raise ValueError(f"saved per-share data environment changed: {', '.join(changes)}")
         if changes:

@@ -323,9 +323,13 @@ def _member_manifests(pipeline: Pipeline) -> dict[str, str]:
         return {}
 
     def digest(stages: Iterator[Stage], sources: Sequence[Source] = ()) -> str:
+        # What the member computes and the code that computes it, whose bytes a resume of a
+        # per-share plan holds as it holds the plan's (`Plan.check`).
+        steps = [*(_identity(stage) for read in sources for stage in _written(read, ())),
+                 *(_identity(stage) for stage in stages if not isinstance(stage, (Workers, Prefetch)))]
         return fingerprint({"sources": [read.fingerprint() for read in sources],
-                            "steps": [_identity(stage).semantic() for stage in stages
-                                      if not isinstance(stage, (Workers, Prefetch))]})
+                            "steps": [step.semantic() for step in steps],
+                            "modules": [list(step.modules) for step in steps]})
 
     keys = _member_keys(_members(source.pipelines))
     return {"": digest(iter(pipeline.stages)),

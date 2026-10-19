@@ -1026,7 +1026,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
-    counts = reader.get_state()["parents"][0]["counts"]
+    counts = reader.get_state()["parents"]["0:all-zero"]["counts"]
     assert counts["attempted"] == 5
     assert counts["rejected"] == {"zero_targets": 5}
     reader.close()
