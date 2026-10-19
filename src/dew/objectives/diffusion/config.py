@@ -353,7 +353,6 @@ class DiffusionRunConfig(RunConfig):
 
     def _objective(self, variables: Variables | None) -> DiffusionObjective:
         """The configured objective over `variables`."""
-        sampling: dict[str, object] = {}
         if self.pretrained is None:
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
@@ -372,21 +371,17 @@ class DiffusionRunConfig(RunConfig):
             if source.inputs.mask is not None:
                 raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
                                  "on masks an image dataset does not carry")
-            model, conditions, autoencoder = source.model, dict(source.inputs.conditions), source.autoencoder
+            # The objective is built over the pipeline itself, which brings the sampling policy it
+            # samples by (`DiffusionObjective`'s `model`); the run's own process, inputs and tree
+            # stand over the pipeline's.
+            model, conditions, autoencoder = source, dict(source.inputs.conditions), source.autoencoder
             variables, convention = source.variables if trained is None else trained, source.process
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
-            # The pipeline's own sampling policy, which its evaluation and task sample by, as
-            # `DiffusionObjective(pipeline)` takes it; what the run states is its own.
-            policy = {"solver": source.schedule.solver, "steps": source.task.steps,
-                      "guidance": source.task.guidance}
-            stated = self.objective.fields
-            sampling = {"grid": source.task.grid,
-                        **{name: value for name, value in policy.items() if name not in stated}}
         inputs = InputSpec(sample=sample, conditions=conditions)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
-                                         autoencoder=autoencoder, variables=variables, **sampling)
+                                         autoencoder=autoencoder, variables=variables)
         assert isinstance(objective, DiffusionObjective)
         return objective
 
