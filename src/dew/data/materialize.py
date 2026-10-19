@@ -248,10 +248,10 @@ def _memory_stages(
                     else:
                         output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
                         expanded.append((output_id, output))
-                        if counts_targets:
+                        if counts_targets or counted is not None:
+                            # The count a row carries while its values are as they were counted,
+                            # else its own, as a step that changed them leaves it (`_recounted`).
                             expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
-                        elif counted is not None:
-                            expanded_counts[output_id] = counted[identifier]
             rows = expanded
             if counts_targets or counted is not None:
                 counted = expanded_counts
