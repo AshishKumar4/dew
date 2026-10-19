@@ -17,7 +17,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import device_generation
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
-from dew.training.quantization import QUANTIZATION, InputQuantization
+from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
 

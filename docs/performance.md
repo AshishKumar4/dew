@@ -604,7 +604,7 @@ as eight bf16 elementwise steps and each kept its rounding. A further
 0.27 ms is the rounding of the residual sums the norms read, which is what
 the policy is for. The MLP's GELU (`dew.nn.dit`, and an ungated decoder's
 `gelu`) now runs in fp32 and rounds once, as torch's bf16 GELU does and as
-the gated MLPs already did (`dew.nn.moe.gated_product`). Over 2^20 bf16
+the gated MLPs already did (`dew.nn.activations.gated_product`). Over 2^20 bf16
 values its RMS error against float64 drops from 2.19e-3 to 1.76e-3, on the
 CPU and the RTX 4080 alike. The RTX 4080 steps are unchanged. The hybrid DiT
 at batch 16 takes 66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32
@@ -2839,7 +2839,7 @@ Open loop at the same rates, Dew's TTFT p50 was 21-39 ms against vLLM's
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
 or fp8 values and their scales, through Qwix's post-training quantization
-(`dew.training.quantization.quantize_for_serving`). `int8` and `fp8`
+(`dew.quantization.quantize_for_serving`). `int8` and `fp8`
 quantize weights and activations, so a matmul of two quantized operands runs
 in the quantized dtype. `int8w` and `fp8w` quantize weights only and
 dequantize them into the compute dtype. The model is dewml/hybrid-dit-176m.
@@ -3250,7 +3250,7 @@ mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 
 A frozen projection takes part in two products a step, its forward and its input's gradient, and
 neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
-(`dew.training.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
+(`dew.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
 operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
 rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
 rows costs a read and a write of them each product, so FP8 pays where the product is wide in both
