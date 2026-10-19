@@ -241,10 +241,6 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     sums it adds: Kimi delta attention's second layer's A_log, its terms 2.7 times its size, rounds
     to 6.6e-06 packed under its floor of 7.3e-06, where the documents alone round to 5.6e-07 at their
     own chunk phase and 6.6e-06 at the packed one."""
-    if jax.default_backend() == "gpu":
-        pytest.skip("a GPU's XLA picks GEMM algorithms by shape, so a packed row and its documents "
-                    "alone sum in different orders and one draw of each measures luck; isolation on a "
-                    "GPU is test_no_token_reaches_another_document's, bitwise")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
