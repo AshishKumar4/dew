@@ -36,7 +36,7 @@ from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.registry import models, wrapper_layers
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.quantization import (
+from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
     InputQuantization,
@@ -329,7 +329,7 @@ import jax.numpy as jnp
 import numpy as np
 from dew import cache
 from dew.nn.kernels.generation import device_generation
-from dew.training.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
+from dew.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
 
 if not cache.measures_picks():
     print(json.dumps(None))
