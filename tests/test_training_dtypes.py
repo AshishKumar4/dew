@@ -147,6 +147,10 @@ def exercise_updates_and_resume(
     y = jnp.array([[.01234567890123], [1.2345678901234]], dtype)
     batch = {"x": jnp.tile(x, (jax.device_count(), 1)), "y": jnp.tile(y, (jax.device_count(), 1))}
     step = train.compile(state, batch)
+    # Each device reads one copy of the rows, whose mean is the whole batch's: the reference and
+    # its truth update over that copy, the reduction each device runs. Over every copy at once,
+    # the reference sums the rows in an order no device does.
+    shared = {"x": x, "y": y}
     tolerance = 2e-13 if parameter_kind == "float64" else 2e-6
     # Compile the independent Linen loss and native Optax update together, as a
     # real training loop does. Eager Adam rounds every bf16 intermediate; GPU
@@ -164,11 +168,11 @@ def exercise_updates_and_resume(
         with jax.enable_x64():
             truth = widened((expected_params, expected_opt, expected_ema))
     for window in range(2):
-        expected_loss, expected_params, expected_opt = reference_update(expected_params, expected_opt, batch)
+        expected_loss, expected_params, expected_opt = reference_update(expected_params, expected_opt, shared)
         if widths:
             with jax.enable_x64():
                 truth_params, truth_opt, truth_ema = truth
-                _, truth_params, truth_opt = reference_update(truth_params, truth_opt, widened(batch))
+                _, truth_params, truth_opt = reference_update(truth_params, truth_opt, widened(shared))
                 if truth_ema is not None:
                     truth_ema = jax.tree.map(lambda old, new: ema_decay * old + (1 - ema_decay) * new,
                                              truth_ema, {"params": truth_params})
