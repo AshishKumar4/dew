@@ -17,6 +17,7 @@ identity's within float64 rounding.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.sharding import declarations, declared_axes, parameter_path
@@ -50,7 +51,8 @@ def residual_width(variables) -> int:
 
 
 def permuted(variables, order: np.ndarray):
-    """`variables` with the residual stream's units in `order`."""
+    """`variables` with the residual stream's units in `order`, each leaf where it is: a device
+    array reordered on its device, a host array on the host."""
     width = len(order)
     declared = declarations(variables["params"])
 
@@ -59,6 +61,8 @@ def permuted(variables, order: np.ndarray):
         if axis is None:
             return leaf
         grouped = (np.arange(leaf.shape[axis] // width)[:, None] * width + order).reshape(-1)
+        if isinstance(leaf, jax.Array):
+            return jnp.take(leaf, jnp.asarray(grouped), axis=axis)
         return np.take(np.asarray(leaf), grouped, axis=axis)
 
     return {**variables, "params": jax.tree_util.tree_map_with_path(reorder, variables["params"])}
