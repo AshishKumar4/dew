@@ -1,12 +1,12 @@
 """Dew's stderr diagnostics, with the training display's console when live.
 
-A run's setup (`dew.training.runtime.ready_process`) gives ``logging.getLogger("dew")``
-a stderr handler of Dew's own, unless the application's root logger or Dew's
-logger already has a handler: an application that configured its logging
-receives Dew's records through its root handlers, as any library's. Set levels
-or handlers on ``logging.getLogger("dew")`` to configure diagnostics; to route
-them through the root handlers after Dew attached its own, remove Dew's
-handlers and set ``propagate = True``. Dew never changes the root logger.
+A process's first run setup (`dew.training.runtime.ready_process`) gives
+``logging.getLogger("dew")`` a stderr handler of Dew's own, unless the logger
+already has one; later setups leave the logger as they find it. Set levels or
+handlers on ``logging.getLogger("dew")`` to configure diagnostics. To route
+them through an application's root handlers, give Dew's logger a handler of
+your own before the run's setup (a ``logging.NullHandler()`` does) or remove
+Dew's after it, and set ``propagate = True``. Dew never changes the root logger.
 """
 
 from __future__ import annotations
@@ -50,15 +50,19 @@ class _TerminalDiagnostics(logging.Handler):
 
 
 _handler: _TerminalDiagnostics | logging.StreamHandler | None = None
+_configured = False
 
 
 def configure() -> None:
-    """Attach one default handler where no handler would receive Dew's records: neither Dew's
-    logger nor the root logger has one. A caller's handlers, on either, are left as they are."""
-    global _handler
+    """Attach one default handler, once a process, to a Dew logger with none: a caller's
+    handlers are left as they are, and so is a logger a caller rerouted after Dew's first setup."""
+    global _handler, _configured
     logger = logging.getLogger("dew")
     with _lock:
-        if logger.handlers or logging.getLogger().handlers:
+        if _configured:
+            return
+        _configured = True
+        if logger.handlers:
             return
         if sys.stderr.isatty():
             diagnostics = _TerminalDiagnostics(Console(stderr=True, soft_wrap=True))
