@@ -40,9 +40,11 @@ from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
-BASE = {"all_patch_size": [2], "all_f_patch_size": [1], "in_channels": 4, "dim": 64, "n_layers": 2,
+# Every case records every parameter's gradient in float32 and in float64, so the
+# width is as narrow as two heads with three rotary axes allow.
+BASE = {"all_patch_size": [2], "all_f_patch_size": [1], "in_channels": 4, "dim": 32, "n_layers": 2,
         "n_refiner_layers": 1, "n_heads": 2, "n_kv_heads": 2, "norm_eps": 1e-5, "qk_norm": True,
-        "cap_feat_dim": 24, "rope_theta": 256.0, "t_scale": 1000.0, "axes_dims": [8, 12, 12],
+        "cap_feat_dim": 24, "rope_theta": 256.0, "t_scale": 1000.0, "axes_dims": [4, 6, 6],
         "axes_lens": [160, 32, 32]}
 SEED = 31
 
