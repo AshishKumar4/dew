@@ -22,7 +22,7 @@ from flax.core import unfreeze
 from dew.interop.streaming import SourceLeaf
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
-from dew.training.quantization import QUANTIZATION
+from dew.quantization import QUANTIZATION
 
 
 def _node(variables: Variables, collection: str, path: Sequence[str]) -> dict:

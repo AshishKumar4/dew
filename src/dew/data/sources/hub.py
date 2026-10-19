@@ -16,7 +16,7 @@ from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
 from .files import Files, Format
-from .hf import class_names
+from .hf import _undecoded, class_names
 from .memory import _record
 
 
@@ -110,9 +110,9 @@ class Hub(Dataset):
         splits = whole.config.data_files or {}
         built = whole if len(splits) < 2 or self.split not in splits else load_dataset_builder(
             self.repo, **pinned, data_files={self.split: list(splits[self.split])})
-        # Where it prepares, `<owner>___<name>/<configuration>/<version>/<commit>`, which offline only
-        # this record names (`builder`).
-        configuration, version = Path(built.cache_dir).parts[-3:-1]
+        # The configuration (its id keeps a split's own files' hash) and version it prepares under,
+        # which offline only this record names (`builder`).
+        configuration, version = built.config_id, str(built.config.version)
         hub_answer(question, lambda: {"configuration": configuration, "version": version})
         return built
 
@@ -271,16 +271,13 @@ class Hub(Dataset):
                 "run dew data provision or set provision=True"
             )
         dataset = self.builder.as_dataset(split=self.split, in_memory=read == "memory")
-        from datasets import Dataset, Image
+        from datasets import Dataset
 
         if not isinstance(dataset, Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
         if self.columns is not None:
             dataset = dataset.select_columns(list(self.columns))
-        for name, feature in dataset.features.items():
-            if isinstance(feature, Image) and feature.decode:
-                dataset = dataset.cast_column(name, Image(decode=False))
-        return grain.MapDataset.source(dataset).map(_record)
+        return grain.MapDataset.source(_undecoded(dataset)).map(_record)
 
     def manifest(self) -> ShardManifest:
         return self.files.manifest()
