@@ -3,14 +3,15 @@
 The reference is vLLM's (vllm-project/vllm#60149, vllm/model_executor/models/dory.py and
 vllm/transformers_utils/configs/dory.py at 55076950); no transformers class computes it.
 
-A Dory layer is one sublayer, an attention or an MLP, and the released layout pairs them, an
-attention then an MLP, so each pair is one Dew block (`layers_{j // 2}`), the attention's three
-sliding to one full. The blocks run under nGPT (`dew.nn.ngpt.NGPT`): no norm has a weight, every
-state is a unit vector and each sublayer steps the residual along the sphere at its own learned
-rate. The stack's input, recurrent and output layers are a `Loop`'s prelude, block and coda: the
-block runs `n_recurrent_loops` times, each pass reading the prelude's output added to the last
-pass's state under the unit norm (`Loop.reinject`), and the coda reads the last state.
-`recurrent_kv_cache_mode` 'last_loop' keeps one cache entry a recurrent layer, every pass
+A Dory layer is one sublayer, an attention or an MLP, and each is one Dew block (`layers_j`
+for layer j) with no second feed-forward: an attention layer's block runs the attention alone, an
+'mlp' layer's an `MLPMixer` in the mixer's slot, as Nemotron-H's separate MLP layers do. The
+blocks run under nGPT (`dew.nn.ngpt.NGPT`): no norm has a weight, every state is a unit vector
+and each sublayer steps the residual along the sphere at its own learned rate. The stack's input,
+recurrent and output layers are a `Loop`'s prelude, block and coda, of any sizes and kinds
+DoryConfig takes: the block runs `n_recurrent_loops` times, each pass reading the prelude's output
+added to the last pass's state under the unit norm (`Loop.reinject`), and the coda reads the last
+state. `recurrent_kv_cache_mode` 'last_loop' keeps one cache entry a recurrent layer, every pass
 overwriting the step's keys and values (`Loop.shared_cache`); 'per_loop' keeps one a pass.
 
 A run picks its loop count as vLLM's `--hf-overrides` does: the loaded model's
@@ -36,6 +37,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mixers.mlp import MLPMixer
 
 _SPELLING = RopeSpelling(theta=10000.0, per_kind=True, local_theta=10000.0)
 """DoryConfig's rope: one record per attention kind at the class's default base
@@ -54,8 +56,9 @@ _DEFAULTS = {'vocab_size': 131072, 'hidden_size': 2560, 'num_hidden_layers': 72,
 (`DecoderFamily.defaults`): transformers writes a config's non-default keys alone."""
 
 
-def _pairs(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
-    """The attention kind of each (attention, MLP) pair of layers, which the released layout is."""
+def _layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
+    """Each layer's kind, the stated ones or DoryConfig's default pattern (configs/dory.py:41-49):
+    an attention, sliding or full, or an MLP, as DoryConfig validates them (configs/dory.py:63-74)."""
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     stated = hf_config.get('layer_types')
     used.add('layer_types')
@@ -64,11 +67,10 @@ def _pairs(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
         for index in range(layers)))
     if len(types) != layers:
         refuse(f'layer_types of {len(types)} entries', f'num_hidden_layers is {layers}')
-    if layers % 2 or any(types[index] not in _SUBLAYERS or types[index + 1] != 'mlp'
-                         for index in range(0, layers, 2)):
-        refuse('layer_types other than (attention, mlp) pairs',
-               "a Dew block is one attention and one feed-forward, the released Dory's pairs")
-    return types[::2]
+    unknown = sorted(set(types) - {*_SUBLAYERS, 'mlp'})
+    if unknown:
+        refuse(f'layer_types {unknown}', 'a Dory layer is sliding_attention, full_attention or mlp')
+    return types
 
 
 def _rope(hf_config: Mapping[str, object], kinds: tuple[str, ...], used: set[str]):
@@ -95,11 +97,11 @@ def _rope(hf_config: Mapping[str, object], kinds: tuple[str, ...], used: set[str
 
 
 def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a Dory config into `CausalTransformer` fields: half its layers as blocks, the loop over
-    the recurrent ones and nGPT's gains (dory.py:53-280), refusing what DoryConfig refuses
-    (configs/dory.py:39-133) and a partition Dew's blocks cannot run."""
-    kinds = _pairs(hf_config, used)
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    """Read a Dory config into `CausalTransformer` fields: a block a layer, the loop over the
+    recurrent ones and nGPT's gains (dory.py:53-280), refusing what DoryConfig refuses
+    (configs/dory.py:39-133)."""
+    types = _layer_types(hf_config, used)
+    layers = len(types)
     first = records.integer(hf_config['n_input_layers'], 'n_input_layers')
     outputs = records.integer(hf_config['n_output_layers'], 'n_output_layers')
     given = hf_config['n_recurrent_layers']
@@ -107,9 +109,6 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
     if min(first, recurrent, outputs) < 0 or first + recurrent + outputs != layers:
         refuse(f'n_input_layers {first}, n_recurrent_layers {recurrent}, n_output_layers {outputs}',
                f'they partition the {layers} layers')
-    if first % 2 or recurrent % 2 or not recurrent:
-        refuse(f'n_input_layers {first} and n_recurrent_layers {recurrent}',
-               'a Dew loop runs whole (attention, mlp) pairs, at least one')
     loops = records.integer(hf_config['n_recurrent_loops'], 'n_recurrent_loops')
     mode = records.text(hf_config['recurrent_kv_cache_mode'], 'recurrent_kv_cache_mode')
     if mode not in ('per_loop', 'last_loop'):
@@ -132,54 +131,62 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
         refuse(f"hidden_act {hf_config['hidden_act']!r} or tied embeddings",
                'Dory requires SiLU and untied embeddings')
     used.update(('attention_bias', 'mlp_bias'))
-    pairs = {**hf_config, 'num_hidden_layers': layers // 2, 'layer_types': list(kinds)}
-    rope, factors = _rope(hf_config, kinds, used)
-    config = base_config(pairs, used, layer_types=kinds, rope=rope,
+    attention = tuple(kind for kind in _SUBLAYERS if kind in types)
+    rope, factors = _rope(hf_config, attention, used)
+    config = base_config({**hf_config, 'layer_types': list(types)}, used, rope=rope,
                          reads=frozenset({'layer_types', 'sliding_window'}))
+    kinds = kinds_of(config)
     for kind, factor in factors.items():
-        if factor != 1.0 and kind in kinds:
-            kinds_of(config).setdefault(kind, native_fields(LayerKind)())['partial_rotary_factor'] = factor
+        if factor != 1.0 and kind in attention:
+            kinds.setdefault(kind, native_fields(LayerKind)())['partial_rotary_factor'] = factor
+    if 'mlp' in types:
+        kinds['mlp'] = native_fields(LayerKind)(mixer={'class': 'mlp', 'fields': {
+            'intermediate_size': config['mlp_features'], 'activation': 'swiglu'}})
     config.update(
-        partial_rotary_type='default', narrow_rotary_tables=True,
+        mlp_features=0, partial_rotary_type='default', narrow_rotary_tables=True,
         qk_norm=False, pre_norms=False, output_gate=True,
         mixer={'class': 'attention', 'fields': {'gate_projection': 'own'}},
         ngpt={'std': std, 'alpha': alpha, 'gate_logit': gate},
-        loop={'steps': loops, 'layers': [first // 2, (first + recurrent) // 2], 'reinject': True,
+        loop={'steps': loops, 'layers': [first, first + recurrent], 'reinject': True,
               'shared_cache': mode == 'last_loop'})
     return config
 
 
 _ATTENTION: dict[str, tuple[str, ...]] = {
-    **{f'{name}.weight': ('self_attn', name, 'kernel') for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
-    'g_proj.weight': ('self_attn', 'gate_proj', 'kernel'),
-    'sqk': ('self_attn', 'sqk'), 's_gate': ('self_attn', 's_gate')}
-"""An attention layer's tensors under `mixer.`, by their paths in its block."""
+    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel') for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
+    'mixer.g_proj.weight': ('self_attn', 'gate_proj', 'kernel'),
+    'mixer.sqk': ('self_attn', 'sqk'), 'mixer.s_gate': ('self_attn', 's_gate'), 'attn_alpha': ('attn_alpha',)}
+"""An attention layer's tensors, by their paths in its block."""
 _MLP: dict[str, tuple[str, ...]] = {
-    **{f'{name}.weight': ('mlp', name, 'kernel') for name in ('gate_proj', 'up_proj', 'down_proj')},
-    'suv_gate': ('mlp', 'suv_gate'), 'suv_up': ('mlp', 'suv_up')}
-"""An MLP layer's tensors under `mixer.`, by their paths in its block."""
+    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel') for name in ('gate_proj', 'up_proj', 'down_proj')},
+    'mixer.suv_gate': ('self_attn', 'suv_gate'), 'mixer.suv_up': ('self_attn', 'suv_up'),
+    'mlp_alpha': ('attn_alpha',)}
+"""An MLP layer's tensors, by their paths in its block: the MLP in the mixer's slot, and its step's
+rate the slot's own."""
 _TRUNK: dict[str, tuple[str, ...]] = {
     'backbone.embeddings.weight': ('embed_tokens', 'embedding'),
     'lm_head.weight': ('lm_head', 'kernel'), 'lm_head.logit_scale': ('logit_scale',)}
 _LAYER = re.compile(r'backbone\.layers\.(\d+)\.(.+)')
 
 
+def _sublayer(index: int, config: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
+    """Layer `index`'s tensors by their paths: an MLP's or an attention's, as its kind says."""
+    kind = records.strings(config['layer_types'], 'layer_types')[index]
+    return _MLP if kind == 'mlp' else _ATTENTION
+
+
 def _dory_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """A Dory tensor's path: layer j's sublayer is block j // 2's attention (even j) or MLP (odd j)."""
+    """A Dory tensor's path: layer j's in block j."""
     if name in _TRUNK:
         return ('params', *_TRUNK[name])
     match = _LAYER.fullmatch(name)
     if match is None:
         raise ValueError(f'{name!r} is no Dory tensor')
-    index, rest = int(match[1]), match[2]
-    block = f'layers_{index // 2}'
-    if rest == ('mlp_alpha' if index % 2 else 'attn_alpha'):
-        return ('params', block, rest)
-    table = _MLP if index % 2 else _ATTENTION
-    tail = rest.removeprefix('mixer.')
-    if not rest.startswith('mixer.') or tail not in table:
-        raise ValueError(f'{name!r} is no tensor of a Dory {"mlp" if index % 2 else "attention"} layer')
-    return ('params', block, *table[tail])
+    index, tail = int(match[1]), match[2]
+    table = _sublayer(index, config)
+    if tail not in table:
+        raise ValueError(f'{name!r} is no tensor of a Dory {"mlp" if table is _MLP else "attention"} layer')
+    return ('params', f'layers_{index}', *table[tail])
 
 
 def _dory_name(dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -188,27 +195,27 @@ def _dory_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     trunk = next((name for name, leaf in _TRUNK.items() if leaf == path), None)
     if trunk is not None:
         return trunk
-    block = int(path[0].removeprefix('layers_'))
-    if path[1:] in (('attn_alpha',), ('mlp_alpha',)):
-        return f'backbone.layers.{2 * block + (path[1] == "mlp_alpha")}.{path[1]}'
-    for offset, table in ((0, _ATTENTION), (1, _MLP)):
-        tail = next((name for name, leaf in table.items() if leaf == path[1:]), None)
-        if tail is not None:
-            return f'backbone.layers.{2 * block + offset}.mixer.{tail}'
-    raise ValueError(f'{dew_name!r} is no Dory parameter')
+    index = int(path[0].removeprefix('layers_'))
+    tail = next((name for name, leaf in _sublayer(index, config).items() if leaf == path[1:]), None)
+    if tail is None:
+        raise ValueError(f'{dew_name!r} is no Dory parameter')
+    return f'backbone.layers.{index}.{tail}'
 
 
 def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
-    """Dory's config of `model`: its blocks as (attention, mlp) pairs, its loop and nGPT's
-    constants, and one rope record per attention kind, which DoryConfig reads (the generic flat
-    rope fields cleared). An nGPT stack Dory does not run, one without its reinjecting loop or with
-    a tied head, refuses."""
+    """Dory's config of `model`: its blocks as layers, its loop and nGPT's constants, and one rope
+    record per attention kind, which DoryConfig reads (the generic flat rope fields cleared). An
+    nGPT stack Dory does not run is refused: one without its reinjecting loop or with a tied head,
+    or whose block holds a feed-forward beside its mixer, which no one Dory layer is."""
     ngpt, loop = model.ngpt, model.loop
-    if ngpt is None or loop is None or not loop.reinject or model.tie_embeddings:
-        refuse('an nGPT decoder without a reinjecting loop or with tied embeddings',
-               "Dory reinjects its input layers' output into every pass and keeps its own head")
+    mixers = {kind: model.kind_of(kind).mixer for kind in model.per_layer_types}
+    mlp = mixers.pop('mlp', None)
+    if (ngpt is None or loop is None or not loop.reinject or model.tie_embeddings or model.mlp_features
+            or set(mixers) - set(_SUBLAYERS) or not isinstance(mlp, MLPMixer | None)):
+        refuse('an nGPT decoder without a reinjecting loop, with tied embeddings, or with a block of '
+               'two sublayers or of another kind', "a Dory layer is an attention or an MLP, the "
+               "recurrent ones reinjecting the input layers' output, under a head of its own")
     first, end = loop.layers or (0, model.num_layers)
-    layer_types = [kind for attention in model.per_layer_types for kind in (attention, 'mlp')]
 
     def rope(kind: str) -> Mapping[str, object]:
         resolved = model.kind_of(kind)
@@ -218,13 +225,14 @@ def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
         'rope_parameters': {kind: rope(kind) for kind in _SUBLAYERS if kind in model.per_layer_types},
         'rope_theta': None, 'rope_local_base_freq': None, 'rope_scaling': None,
-        'num_hidden_layers': 2 * model.num_layers, 'layer_types': layer_types,
-        'n_input_layers': 2 * first, 'n_recurrent_layers': 2 * (end - first),
-        'n_output_layers': 2 * (model.num_layers - end), 'n_recurrent_loops': loop.steps,
+        'num_hidden_layers': model.num_layers, 'layer_types': list(model.per_layer_types),
+        'n_input_layers': first, 'n_recurrent_layers': end - first,
+        'n_output_layers': model.num_layers - end, 'n_recurrent_loops': loop.steps,
         'recurrent_kv_cache_mode': 'last_loop' if loop.shared_cache else 'per_loop',
         'initializer_range': ngpt.std, 'ngpt_alpha_init': ngpt.alpha,
         'attention_output_gate_logit_scale_init': ngpt.gate_logit,
         'attention_bias': False, 'mlp_bias': False,
+        **({} if mlp is None else {'intermediate_size': mlp.intermediate_size}),
     }
 
 

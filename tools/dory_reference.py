@@ -14,7 +14,7 @@ earlier ones (dory.py:146-149).
     PYTHONPATH=src:tools .venv/bin/python tools/dory_reference.py
 
 writes tests/fixtures/hf/dory-tiny/: a random DoryForCausalLM of eight
-layers, four (attention, mlp) pairs over a width of 32 with a window of 5,
+layers, attentions and MLPs alternating as the release's do, over a width of 32 with a window of 5,
 its middle four layers looped, a tokenizer of the release's kind, fp32 and
 float64 logits at one, two and four loops, both caches' greedy continuations
 with each step's logits, packed documents, prompts of two lengths, and the
@@ -317,9 +317,12 @@ VARIANTS = {
         'full_attention': {'rope_type': 'default', 'rope_theta': 1000000, 'partial_rotary_factor': 0.25}}},
     'zero_alpha': {'ngpt_alpha_init': 0.0},
     'zero_gate': {'attention_output_gate_logit_scale_init': 0.0},
+    'odd_partition': {'n_input_layers': 1, 'n_recurrent_layers': 4, 'n_output_layers': 3},
+    'no_recurrent': {'n_input_layers': 4, 'n_recurrent_layers': 0, 'n_output_layers': 4},
 }
 """Configs over the same tensors that DoryConfig accepts and the released one does not take: a
-partial rotary per kind, and an nGPT step or gate logit scale of zero."""
+partial rotary per kind, an nGPT step or gate logit scale of zero, a loop whose block starts at an
+MLP and ends at an attention, and a loop over no layer."""
 
 
 PACKING = ((4, 7), (9, 2), (3, 3, 5))
