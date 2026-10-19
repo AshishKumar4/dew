@@ -105,6 +105,7 @@ from dew.inference.tasks import (
     decoded_rows,
     generation_budget,
     prepared_inputs,
+    resident,
     shape_bucket,
 )
 from dew.interop.weights import decoding_storage
@@ -445,7 +446,7 @@ class Server:
             mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
-        variables = decoding_storage(model, variables)
+        variables = resident(decoding_storage(model, variables))
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:

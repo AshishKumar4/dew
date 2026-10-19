@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
 from dew.cache import persist_compilations
@@ -421,6 +422,20 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
     return None if settings.tokenizer is None else RunProcessor(tokenizer_for(settings.tokenizer))
 
 
+def resident(variables: Variables) -> Variables:
+    """`variables` with each leaf held in host memory as a NumPy array, as `Pretrained.load`
+    returns them without a mesh, placed on the device once: replicated on the mesh the tree's
+    arrays sit on, or on the default device. A jax.Array stays where it is, a pinned-host bank's
+    among them. A task and a server hold their weights so, and every call they make reads them
+    where they are, where a host leaf would be copied to the device again at each call."""
+    mesh = mesh_of(variables)
+    target = jax.devices()[0] if mesh is None else NamedSharding(mesh, P())
+    def placed(leaf):
+        return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
+
+    return jax.tree.map(placed, variables)
+
+
 class _NativeTextTask:
     """The lifecycle Dew's three text tasks share, over their own `model`,
     `variables` and `processor`: frozen weights, rebinding, loading a run or
@@ -433,7 +448,7 @@ class _NativeTextTask:
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
         # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
-        object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
+        object.__setattr__(self, "variables", resident(freeze(dict(thaw(self.variables)))))
 
     def bind(self, variables: Variables) -> Self:
         """Return the same task over other weights, such as a policy snapshot."""

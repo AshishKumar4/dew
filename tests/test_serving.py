@@ -113,6 +113,32 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
         assert_same_generation(actual, expected)
 
 
+def test_a_server_over_loaded_weights_places_them_once():
+    """`Pretrained.load` returns its weights in host memory, which a task and a server place on the
+    device once, as they are built: the task's leaves and the server's are device arrays, decode
+    steps after a request's admission move nothing from the host, and the server draws the task's
+    tokens. A host leaf was once copied to the device again at every step."""
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="float32",
+                             attention_impl="xla", max_seq_len=64)
+    assert any(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables))
+    bound = loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+    server = Server.from_task(bound, slots=2, capacity=32)
+    for held in (bound.variables, server.variables):
+        assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(held))
+    prompt = np.asarray([1, 2, 3], np.int32)
+    ticket = server.submit(prompt, 8, key=0)
+    server.step()  # admits the request, whose rows move to the device
+    with guarded():
+        server.step()
+        server.step()
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 8, key=0))
+
+
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
