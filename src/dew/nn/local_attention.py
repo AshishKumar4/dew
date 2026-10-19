@@ -21,8 +21,17 @@ from .attention import (
     tensor_shards,
 )
 from .documents import with_documents
-from .inputs import valid_order
-from .sharding import HEADS, KV_HEADS, SEQUENCE_AXIS, logical_spec, manual_map, rows_spec, sequence_shards
+from .inputs import document_starts, valid_order
+from .sharding import (
+    HEADS,
+    KV_HEADS,
+    SEQUENCE_AXIS,
+    logical_spec,
+    manual_map,
+    rows_like,
+    rows_spec,
+    sequence_shards,
+)
 
 
 def _blocks(x, block: int, blocks: int):
@@ -43,6 +52,40 @@ def _banded(x, before=None):
     return jnp.concatenate([jnp.concatenate([before, x[:, :-1]], axis=1), x], axis=2)
 
 
+def token_places(segment_ids=None, valid=None, positions=None) -> jax.Array | None:
+    """Where windows and chunks count from, `[B, S]`: each real token's
+    document's first place (`positions` `[S]` or `[B, S]` there, 0 where none
+    are given) plus the real tokens before it in its document; a padding slot
+    takes the place before it. Places that count a document's real tokens, as
+    `Coordinates.positions` does, come back as given, so a continuation or a
+    canvas starting at a later place cuts its chunks as its whole pass does;
+    any other places move the rotation alone, and a window or chunk still
+    counts the tokens. None where no field is given: each token's place is
+    its index."""
+    fields = [jnp.asarray(x) for x in (segment_ids, valid) if x is not None]
+    if not fields and positions is None:
+        return None
+    # The counts run along the sequence, which JAX refuses over an Explicit axis that splits it;
+    # these `[B, S]` fields are small, so each device takes its rows whole.
+    like = fields[0] if fields else jnp.atleast_2d(jnp.asarray(positions))
+    shape = like.shape
+    real = jnp.ones(shape, bool) if valid is None else rows_like(jnp.asarray(valid, bool), like)
+    if segment_ids is not None:
+        segment_ids = rows_like(jnp.asarray(segment_ids), like)
+        real = real & (segment_ids != 0)
+    rank = jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1
+    first = real & (rank == 0)
+    if segment_ids is not None:
+        first = first | document_starts(segment_ids, real)
+    begun = jax.lax.cummax(jnp.where(first, rank, 0), axis=1)
+    count = jnp.maximum(rank - begun, 0)
+    if positions is None:
+        return count
+    slots = jax.lax.cummax(jnp.where(first, jnp.arange(shape[1]), 0), axis=1)
+    given_places = rows_like(jnp.broadcast_to(jnp.asarray(positions), shape), like)
+    return jnp.take_along_axis(given_places, slots, axis=1) + count
+
+
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
                     positions=None, segment_ids=None, max_segments=None, valid=None,
                     right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
@@ -53,12 +96,14 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     `window=w` is sliding attention: a query reads itself and the w - 1 keys
     before it (Mistral, Gemma, MaxText's `sliding_window_size`). `chunk=c` is
     chunked local attention: a query reads the keys at or before it in its
-    chunk, `position // c` (Llama 4's `attention_chunk_size`). Exactly one is
-    set. `positions` `[S]` or `[B, S]` places the chunks (None is the row
-    index), `segment_ids` keeps packed documents apart (0 is padding), at
-    most `max_segments` a row (`Coordinates.max_segments`), and
-    `valid` `[B, S]` drops the keys it marks False; `right_padded` says each
-    row's valid slots come first (`AttentionMetadata.right_padded`).
+    chunk, `place // c` (Llama 4's `attention_chunk_size`). Exactly one is
+    set. Both count tokens from their document's first place
+    (`token_places`): `positions` `[S]` or `[B, S]` gives the places (None
+    counts from 0), `segment_ids` keeps packed documents apart (0 is padding)
+    and restarts their counts, at most `max_segments` a row
+    (`Coordinates.max_segments`), and `valid` `[B, S]` drops the keys it marks
+    False, its tokens counted without them; `right_padded` says each row's
+    valid slots come first (`AttentionMetadata.right_padded`).
 
     No `[S, S]` array is built above two spans. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
@@ -66,9 +111,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     Chunks that start at row multiples fold into the batch. Everything else
     runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
-    pads to whole spans, so at most two spans take the dense call. A chunk
-    over a row with padding among its tokens runs on the real tokens alone
-    (`_compacted`), so its keys stay within the band.
+    pads to whole spans, so at most two spans take the dense call. A row with
+    padding among its tokens runs on its real tokens alone (`_compacted`), so
+    a window's or a chunk's keys sit within the band, as the cache holds them.
     """
     if (window is None) == (chunk is None):
         raise ValueError("local attention takes exactly one of window and chunk")
@@ -81,12 +126,30 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
-    if chunk is not None and valid is not None and not right_padded:
-        return _compacted(
-            functools.partial(local_attention, chunk=chunk, max_segments=max_segments, right_padded=True,
-                              dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-                              implementation=implementation, sinks=sinks, softcap=softcap),
-            query, key, value, positions, segment_ids, valid)
+    # A window counts tokens by their distance alone; a chunk reads their places, which are the
+    # row index where nothing places or restarts them.
+    places = (None if chunk is None or (positions is None and segment_ids is None)
+              else token_places(segment_ids, valid, positions))
+    attend = functools.partial(
+        _local_attention, window=window, chunk=chunk, max_segments=max_segments, dtype=dtype,
+        precision=precision, force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
+        sinks=sinks, softcap=softcap)
+    holes = valid is not None and not right_padded
+    # Compacting sorts the sequence axis, which a sequence-sharded call keeps split; there the
+    # tokens are counted in place (`_local_attention`).
+    if holes and sequence_shards() == 1:
+        return _compacted(functools.partial(attend, holes=False), query, key, value, places, segment_ids, valid)
+    return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid, holes=holes)
+
+
+def _local_attention(query, key, value, *, window, chunk, places, segment_ids, max_segments, valid,
+                     holes: bool, dtype, precision, force_fp32_for_softmax, implementation, sinks, softcap):
+    """`local_attention` over each token's chunk place (`places`, None for the
+    row index), with padding among a row's tokens (`holes`) only where a
+    sequence axis splits the row, which takes the dense call."""
+    length = query.shape[1]
+    span = window if window is not None else chunk
+    assert span is not None
     whole = functools.partial(
         scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
@@ -122,10 +185,22 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     # slice is at least that long. A wider span takes the dense call, whose
     # mask the sequence exchange carries.
     halo = length % shards == 0 and length // shards >= span
-    if length <= 2 * span or not halo:
-        places = jnp.arange(length) if positions is None else positions
-        mask = (None if chunk is None or (positions is None and length <= chunk)
-                else chunk_mask(places, places, chunk))
+    if length <= 2 * span or not halo or holes:
+        # A mask pairs every query with every key, which an Explicit axis splitting both sides of
+        # it would place twice, so the `[B, S]` fields it is built from are each device's whole.
+        segment_ids, valid = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
+                              for x in (segment_ids, valid))
+        # Padding among the tokens left in place: a window counts them as `token_places` does.
+        counted = token_places(segment_ids, valid) if holes else None
+        chunked = counted if places is None else places
+        if chunk is None or (chunked is None and length <= chunk):
+            mask = None
+        else:
+            chunked = jnp.arange(length) if chunked is None else chunked
+            mask = chunk_mask(chunked, chunked, chunk)
+        if counted is not None and window is not None:
+            near = counted[:, :, None] - counted[:, None, :] < window
+            mask = near[:, None] if mask is None else mask & near[:, None]
         if segment_ids is not None:
             mask = with_documents(mask, segment_ids)
         if valid is not None:
@@ -134,33 +209,36 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         if mask is None:
             return whole(implementation=implementation, causal=True, sliding_window=window)
         return whole(implementation=masked, mask=combined_attention_mask(
-            length, length, causal=True, sliding_window=window, mask=mask))
+            length, length, causal=True, sliding_window=None if counted is not None else window, mask=mask))
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
     if shards > 1:
         out = _local_over_sequence(
-            kernel, query, key, value, shards, window=window, chunk=chunk, positions=positions,
+            kernel, query, key, value, shards, window=window, chunk=chunk, places=places,
             segment_ids=segment_ids, valid=valid, sinks=sinks, implementation=implementation,
             masked=masked)
     else:
         out = _local_blocks(functools.partial(kernel, sinks=sinks), query, key, value,
-                            window=window, chunk=chunk, positions=positions,
+                            window=window, chunk=chunk, places=places,
                             segment_ids=segment_ids, valid=valid,
                             implementation=implementation, masked=masked)
     return checkpoint_name(out, 'attention_output')
 
 
-def _compacted(attend, query, key, value, positions, segment_ids, valid):
+def _compacted(attend, query, key, value, places, segment_ids, valid):
     """`attend` over each row's real tokens moved to its front in order, their
     places and documents with them, and its outputs moved back to their slots.
 
-    A chunk spans `chunk` places, and padding among a row's tokens spreads
-    them over more slots than the band before a query holds: real slots 0, 3,
-    6 and 9 at places 0 to 3 are one chunk of 4 the band of slot 9 reads only
-    from slot 4 on. Compacted, a chunk's real tokens sit within `chunk`
-    consecutive slots. The places stay those given, the row index where none
-    are; the padding's outputs come back unspecified."""
+    A window spans `window` tokens and a chunk `chunk` places, and padding
+    among a row's tokens spreads them over more slots than the band before a
+    query holds: real slots 0, 3, 6 and 9 at places 0 to 3 are one chunk of 4
+    the band of slot 9 reads only from slot 4 on, and a window of 2 at slot 9
+    reads slot 6 though no slot between holds a token. Compacted, a window's
+    or a chunk's real tokens sit within that many consecutive slots. Given
+    places move with their tokens; without them each token's place is its
+    compacted slot, its rank among the row's tokens. The padding's outputs
+    come back unspecified."""
     batch, length = valid.shape
     real = jnp.asarray(valid, bool)
     order, count = valid_order(real)
@@ -172,19 +250,18 @@ def _compacted(attend, query, key, value, positions, segment_ids, valid):
         return jnp.take_along_axis(x, to.reshape(*to.shape, *(1,) * (x.ndim - 2)), axis=1,
                                    mode='promise_in_bounds')
 
-    places = jnp.broadcast_to(jnp.arange(length) if positions is None else jnp.asarray(positions),
-                              (batch, length))
-    out = attend(*(moved(x, order) for x in (query, key, value)), positions=moved(places, order),
+    out = attend(*(moved(x, order) for x in (query, key, value)),
+                 places=None if places is None else moved(places, order),
                  segment_ids=None if segment_ids is None else moved(segment_ids, order),
                  valid=moved(real, order))
     return moved(out, column)
 
 
-def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, positions,
+def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, places,
                          segment_ids, valid, sinks, implementation, masked):
     """`_local_blocks` over a sequence the mesh's sequence axis splits, in a
     `shard_map`: each shard computes its own rows, and one `ppermute` hands its
-    first block the previous shard's last `span` keys, values, positions,
+    first block the previous shard's last `span` keys, values, places,
     segment ids and validity (zeros on the first shard). That halo is all that
     crosses the interconnect; chunks starting at the shard boundaries need none.
     Heads split over the tensor axis as the exchanges split them."""
@@ -195,8 +272,8 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     key, value = split_with_queries(key, value, tensor_shards(query))
     keys = logical_spec(KV_HEADS, key.shape)
     fields = {}
-    if positions is not None:
-        fields['positions'] = jnp.broadcast_to(jnp.asarray(positions), (batch, length))
+    if places is not None:
+        fields['places'] = jnp.broadcast_to(jnp.asarray(places), (batch, length))
     if segment_ids is not None:
         fields['segment_ids'] = segment_ids
     if valid is not None:
@@ -209,7 +286,7 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     names = tuple(fields)
     local_length = length // shards
     # Chunks that start at every shard's first row stay inside their shard.
-    aligned = chunk is not None and positions is None and local_length % chunk == 0
+    aligned = chunk is not None and places is None and local_length % chunk == 0
 
     def local(query, key, value, *arrays):
         given = dict(zip(names, arrays, strict=True))
@@ -221,11 +298,11 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
             return jax.lax.ppermute(x[:, local_length - span:], SEQUENCE_AXIS, forward)
 
         before = None if aligned else tuple(
-            last_rows(x) for x in (key, value, given.get('positions'),
+            last_rows(x) for x in (key, value, given.get('places'),
                                    given.get('segment_ids'), given.get('valid')))
         return _local_blocks(
             functools.partial(kernel, sinks=given.get('sinks')), query, key, value,
-            window=window, chunk=chunk, positions=given.get('positions'),
+            window=window, chunk=chunk, places=given.get('places'),
             segment_ids=given.get('segment_ids'), valid=given.get('valid'),
             implementation=implementation, masked=masked,
             offset=jax.lax.axis_index(SEQUENCE_AXIS) * local_length, before=before)
@@ -234,13 +311,13 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     return attended(query, key, value, *fields.values())
 
 
-def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segment_ids, valid,
+def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_ids, valid,
                   implementation, masked, offset=0, before=None):
     """`local_attention`'s blocked computation over the `[B, S, ...]` rows it
     is handed, which start at row `offset` of the sequence.
 
     `before` holds what the first rows read before them: the previous `span`
-    rows' keys, values, positions, segment ids and validity, each None where
+    rows' keys, values, places, segment ids and validity, each None where
     the call has none. None is the start of the sequence, where nothing comes
     before, and chunks start at row multiples from there."""
     batch, length = query.shape[0], query.shape[1]
@@ -259,7 +336,7 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segmen
         # The halo field at `index`, as the one block before the first.
         return None if before is None else before[index][:, None]
 
-    if chunk is not None and positions is None and before is None:
+    if chunk is not None and places is None and before is None:
         mask = None
         if not flags_only:
             keep = jnp.ones((batch, blocks, span, span), bool)
@@ -281,10 +358,10 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segmen
         if window is not None:
             keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
         keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
-        if chunk is not None and positions is None:
+        if chunk is not None and places is None:
             keep = keep & (rows[..., :, None] // chunk == key_rows[..., None, :] // chunk)
         elif chunk is not None:
-            places = row_blocks(positions) // chunk
+            places = row_blocks(places) // chunk
             earlier = preceding(2)
             keep = keep & (places[..., :, None] == _banded(
                 places, None if earlier is None else earlier // chunk)[..., None, :])
