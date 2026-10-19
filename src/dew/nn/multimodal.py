@@ -492,6 +492,15 @@ class MultimodalTransformer(nn.Module):
         return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
 
     @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """The language model's projection of its own parameters (`ProjectsParameters`); the
+        towers' as they are."""
+        if 'language_model' not in params:
+            return params
+        return {**params, 'language_model': self.language_model.projected(params['language_model'],
+                                                                           updated=updated)}
+
+    @nn.nowrap
     def generation_refusal(self) -> str | None:
         return self.language_model.generation_refusal()
 
