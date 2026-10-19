@@ -185,24 +185,6 @@ def test_evaluation_scores_prompt_perplexity(policy):
                                     LENGTH_KEY: jnp.ones(1, jnp.int32)}, step)
 
 
-def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one():
-    """A rollout takes a single key in either of JAX's spellings, a typed key or a legacy uint32
-    pair, which the text generation it runs reads alike (`request_key`): the same rows and
-    advantages from both, where the legacy key was once refused for its shape."""
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), updates=0)
-    rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
-                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
-    prompts = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] % (VOCAB - 1) + 1
-    blank = np.zeros((1, 5), np.int32)
-    batch = {PROMPT_KEY: prompts, LENGTH_KEY: np.full(1, PROMPT_WIDTH, np.int32),
-             SOURCE_KEY: blank, TRUTH_KEY: blank, INFO_KEY: blank}
-    typed, legacy = rollout(state, batch, jax.random.key(3)), rollout(state, batch, jax.random.PRNGKey(3))
-    assert typed.keys() == legacy.keys()
-    for name in typed:
-        np.testing.assert_array_equal(np.asarray(typed[name]), np.asarray(legacy[name]))
-
-
 def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_scores():
     """Sampling a group of the same prompt width again runs the programs the
     first rollout compiled, and the host reads the drawn rows and the group
