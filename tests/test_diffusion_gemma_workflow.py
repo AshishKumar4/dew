@@ -190,13 +190,13 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
     exported.save(tmp_path / "export")
     assert (tmp_path / "export" / "tokenizer.json").read_bytes() == (FIXTURE / "tokenizer.json").read_bytes()
     # transformers reads the same text and vision configs out of the export as
-    # out of the checkpoint the run started from, but for the run's own
-    # max_seq_len, and the fixture's default_output_length, which no class
-    # of transformers 5.16.1 declares. The image token ids are transformers'
-    # defaults: Dew places images by position and keeps none.
+    # out of the checkpoint the run started from, its stated context too beside
+    # the run's smaller cache, but for the fixture's default_output_length,
+    # which no class of transformers 5.16.1 declares. The image token ids are
+    # transformers' defaults: Dew places images by position and keeps none.
     ours, published = (AutoConfig.from_pretrained(str(path)) for path in (tmp_path / "export", FIXTURE))
-    assert ours.text_config.to_dict() == {**published.text_config.to_dict(),
-                                          "max_position_embeddings": exported.model.max_seq_len}
+    assert exported.model.max_seq_len < published.text_config.max_position_embeddings
+    assert ours.text_config.to_dict() == published.text_config.to_dict()
     vision = published.vision_config.to_dict()
     del vision["default_output_length"]
     assert ours.vision_config.to_dict() == vision
