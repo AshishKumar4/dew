@@ -34,7 +34,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import dtype_name, from_record, record_fields
+from dew.registry import from_record, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -72,16 +72,14 @@ class Head(nn.Module):
         return {"name": type(self).__name__, "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int, *, dtype: Dtype | None = None) -> "Head":
-        """Rebuild the head a run recorded, reading states `width` wide. A
-        record written before heads recorded their numerics computes in
-        `dtype`, the backbone's, as that run's head did."""
+    def from_record(record: JSON, width: int) -> "Head":
+        """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
+        recorded."""
         held = records.record(record, "head")
         name = records.text(held.get("name"), "head.name")
         if name not in HEADS:
             raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = {"dtype": None if dtype is None else dtype_name(dtype),
-                  **records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
+        fields = {**records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
         return from_record(HEADS[name], fields)
 
 
