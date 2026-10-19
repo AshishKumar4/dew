@@ -20,7 +20,8 @@ except where it packs several records into one row.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, Literal
 
 from dew.data import (
     audio as audio_steps,
@@ -29,6 +30,7 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
+from dew.data.pipeline import Pack
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -45,7 +47,7 @@ def images(dataset: Dataset, size: int, *, batch: int, augment: bool | RandomSte
     the uninterrupted one would. A user random step instead runs on the
     host right after resizing."""
 
-    resized = dataset.filter_map(image_steps.DecodeImage("image")).map(image_steps.Resize(size))
+    resized = _decoded_images(dataset, size)
     if augment is False:
         return resized.batch(batch)
     if augment is True:
@@ -61,9 +63,8 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: i
     first-fit into rows of `seq_len + 1` tokens (the last a target), in
     batches of `batch` rows."""
 
-    return (dataset.map(text_steps.tokenize(tokenizer, field=field))
-            .flat_map(text_steps.Chunks(seq_len + 1, overlap=1))
-            .pack(seq_len + 1).batch(batch))
+    documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
+    return _next_token_windows(documents, Pack(seq_len + 1)).batch(batch)
 
 
 def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
@@ -72,8 +73,34 @@ def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: 
     cut to `seq_len + 1` tokens and packed first-fit into rows of that
     length, in batches of `batch` rows."""
 
-    return (dataset.map(chat.template(tokenizer)).map(chat.fit_length(seq_len + 1))
-            .pack(seq_len + 1, fields=("text", "text_roles")).batch(batch))
+    return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
+                                 long="truncate").batch(batch)
+
+
+_CHAT_FIELDS = ("text", chat.ROLES_KEY)
+"""The per-token fields a rendered conversation packs: its ids and each one's speaker."""
+
+
+def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
+    """Token documents packed by `pack` with every cut through one overlapping by one token, so each
+    token's next-token target stays in one piece: a fitting pack's documents are cut into pieces of
+    its length first, and a concatenating pack overlaps the cuts it makes itself (`Pack.overlap`).
+    `lm`, a conversation cut into pieces and the text and chat recipes (`dew.config.data`) prepare
+    text through it."""
+    if pack.policy == "concat":
+        return documents.then(dataclasses.replace(pack, overlap=1))
+    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1)).then(pack)
+
+
+def _conversation_windows(rendered: Dataset, pack: Pack, *,
+                          long: Literal["truncate", "drop", "chunk"]) -> Pipeline:
+    """Rendered conversations (`chat.template`) packed by `pack` with their speakers: one longer
+    than a window cut at its end, dropped and counted, or cut into pieces (`_next_token_windows`),
+    as `long` says. `sft` and the chat recipe (`dew.config.data.ChatData`) share it."""
+    if long == "chunk":
+        return _next_token_windows(rendered, pack)
+    fitted = chat.fit_length(pack.seq_len, long=long)
+    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted)).then(pack)
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
@@ -86,8 +113,34 @@ def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
     than the window, or that does not decode, is counted and dropped; the
     media and its window are read here and leave the record."""
 
-    picked = (dataset.random_filter_map(video_steps.PickClip(seconds))
-              .filter_map(video_steps.DecodeVideo(frames, fps=fps, size=size)))
+    return _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
+                  missing="silence").batch(batch)
+
+
+def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,
+                    rejects: bool = True) -> Pipeline:
+    """The images in `field` decoded, reduced no further than `at_least` pixels where given, and
+    resized to `size` squares. With `rejects` an image that does not decode is dropped and counted,
+    else it stops the run. `images` and the image recipe (`dew.config.data.ImageData`) share it."""
+    decode = image_steps.DecodeImage(field, at_least=at_least, rejects=rejects)
+    return (rows.filter_map(decode) if rejects else rows.map(decode)).map(image_steps.Resize(size))
+
+
+def _clips(media: Dataset, seconds: float, *, frames: int, fps: float, size: int, margin: float = 0.0,
+           sample_rate: int | None = None, context: float = 0.0, missing: Literal["reject", "silence"],
+           rejects: bool = True) -> Pipeline:
+    """Windows of `seconds` drawn `margin` clear of the media's ends in `mp4`, each record's own on
+    every read and resume, as `frames` frames at `fps` in `size` squares, and with `sample_rate`
+    the window's sound `context` seconds wider (`missing` says what media without sound gives).
+    The media and its window leave the record. With `rejects` media too short or that does not
+    decode is dropped and counted, else it stops the run. `clips` and the video recipe
+    (`dew.config.data.VideoData`) share it."""
+    pick = video_steps.PickClip(seconds, margin=margin, rejects=rejects)
+    decoders: list[video_steps.DecodeVideo | audio_steps.DecodeAudio] = [
+        video_steps.DecodeVideo(frames, fps=fps, size=size, rejects=rejects)]
     if sample_rate is not None:
-        picked = picked.filter_map(audio_steps.DecodeAudio(sample_rate, missing="silence"))
-    return picked.remove_columns("mp4", "clip").batch(batch)
+        decoders.append(audio_steps.DecodeAudio(sample_rate, context=context, missing=missing,
+                                                rejects=rejects))
+    picked = media.random_filter_map(pick) if rejects else media.random_map(pick)
+    decoded = picked.filter_map(*decoders) if rejects else picked.map(*decoders)
+    return decoded.remove_columns("mp4", "clip")

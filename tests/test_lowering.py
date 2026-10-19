@@ -18,11 +18,17 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
+    UNCLASSIFIED,
+    Refusal,
+    Route,
     assumed,
     chosen as kernel_choices,
     gpu_mesh,
     gpu_target,
     measured_kernel,
+    refused,
+    route,
+    routes,
     triton_runs,
 )
 from dew.training._lowering import triton_kernels
@@ -327,3 +333,62 @@ def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_cal
                            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
     logged = json.loads(fresh.stdout)
     assert logged["records"] == [[logging.INFO, ["attention", logged["selected"], "flash"]]]
+
+
+def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
+    """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
+    outer's too, as the target decides it: its generation within `assumed`, the kernel the row or
+    `chosen` prefers, a refusal's stable code (`refused`, the first check that fails) or a text's
+    `UNCLASSIFIED`, what the host ran, and the reporting function."""
+    def dispatch(kernel, refusal=None, ran=None):
+        return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
+
+    with assumed("sm90"), routes() as outer:
+        assert dispatch("pallas").kernel == "pallas"
+        row = measured_kernel("ssd", "pallas")
+        with kernel_choices(ssd="pallas"), routes() as inner:
+            refusal = refused((True, "dtype", "a bf16 call"), (False, "head_dim", "a 320-wide head"),
+                              (False, "window_mask", "a window"))
+            dispatch("xla", refusal, ran="xla")
+            dispatch("xla", "a reason in text")
+    test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
+    site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
+    head_dim, text = Refusal("head_dim", "a 320-wide head"), Refusal(UNCLASSIFIED, "a reason in text")
+    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site),
+                     Route("ssd", "xla", "pallas", text, "xla", "sm90", site)]
+    assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
+    assert refused((True, "dtype", "a bf16 call")) is None
+
+
+def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route():
+    """The attention dispatch, sending a packed bf16 call off the flash kernel an sm80 measured
+    fastest, reports that route from its own function, as the target decides it on this CPU."""
+    from dew.nn import attention
+
+    query = jnp.zeros((1, 8, 2, 64), jnp.bfloat16)
+    with assumed("sm80"), routes() as found:
+        selected = attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)),
+                                                    max_segments=2)
+    [taken] = [found_route for found_route in found if found_route.choice == "attention"]
+    assert (taken.kernel, taken.preferred, taken.target) == (selected, "flash", "sm80")
+    assert taken.refusal is not None and taken.site == "dew.nn.attention:resolve_implementation"
+
+
+def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
+    """A jitted function traced and cached before a `routes` block, warm in an inner jit too, reports
+    its routes again in each block: every block is a fresh collection JAX keys its traces on."""
+    @jax.jit
+    def inner(x):
+        route("ssd", kernel="xla")
+        return x + 1
+
+    @jax.jit
+    def outer(x):
+        return inner(x) * 2
+
+    x = jnp.zeros(3)
+    jax.block_until_ready(outer(x))
+    for _ in range(2):
+        with routes() as found:
+            jax.block_until_ready(outer(x))
+        assert [found_route.choice for found_route in found] == ["ssd"]
