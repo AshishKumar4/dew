@@ -188,11 +188,17 @@ def source_layouts(component: str, shapes: Mapping[str, tuple[int, ...]], path_o
     tensor's leaf under `prefix` and the transpose that writes it back, named under
     `component` (as stored where it is empty), for a tree bound from saved variables
     rather than read (`components.bind_component`)."""
+    return tuple(_layout(component, name, shape, path, prefix)
+                 for name, shape in shapes.items() if (path := path_of(name)) is not None)
+
+
+def _layout(component: str, name: str, shape: tuple[int, ...], path: tuple[str, ...],
+            prefix: tuple[str, ...]) -> WeightLayout:
+    """The layout that writes the leaf at `prefix + path` back as the `shape`d tensor `name`."""
     from dew.interop.streaming import WeightLayout
 
-    return tuple(WeightLayout(f"{component}/{name}" if component else name, ((*prefix, *path),),
-                              tuple(shape), _orders(path, len(shape))[1])
-                 for name, shape in shapes.items() if (path := path_of(name)) is not None)
+    return WeightLayout(f"{component}/{name}" if component else name, ((*prefix, *path),), tuple(shape),
+                        _orders(path, len(shape))[1])
 
 
 def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
@@ -209,14 +215,16 @@ def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: 
     """`translate_parameters`' tree, with the layout that writes each tensor it placed back
     under its own name from its path in that tree; a tensor `path_of` leaves out has none.
     Each tensor binds as `record_layouts` binds it, read whole: source aliases share the leaf of
-    the first (`_aliased`), and the layouts are `source_layouts`' under no component."""
+    the first (`_aliased`), and each layout is `source_layouts`' under no component (`_layout`),
+    from the path the binding read, so `path_of` is asked once a tensor."""
     parameters: ParamTree = {}
+    layouts = []
     owners, locate = _aliased(tensors, path_of)
     for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, _copy):
         if owners[path] == name:
             insert(parameters, path, leaf, name)
-    return parameters, source_layouts("", {name: np.shape(tensor) for name, tensor in tensors.items()},
-                                      path_of, ())
+        layouts.append(_layout("", name, np.shape(tensors[name]), path, ()))
+    return parameters, tuple(layouts)
 
 
 def _aliased(tensors: Mapping[str, np.ndarray], path_of: TensorPath
