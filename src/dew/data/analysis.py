@@ -180,7 +180,8 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     return None, changed
 
 
-def _serves(cache: Cache | Generation | str, source: Source, prefix: Sequence[Stage]) -> bool:
+def _serves(cache: Cache | Generation | str, source: Source | Mixture | Phases,
+            prefix: Sequence[Stage]) -> bool:
     """Whether `cache` after `prefix` over `source` holds the rows those
     steps make: a cache fills what they make, and a named generation holds
     the rows of the one prefix it was published from (`_in_place`)."""
