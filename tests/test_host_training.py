@@ -735,21 +735,43 @@ class _Scaled(DeviceStep):
         return {**batch, "x": batch["x"] * self.scale}
 
 
+def _scaled_fit(objective, step: DeviceStep):
+    """Two steps of a host-held run of `objective` over batches that `step` runs on the device."""
+    from affine_run import batches as affine_batches
+
+    from dew.data.dataset import Loader
+
+    data = Loader(lambda partition: affine_batches(), None, None, 8, device=(step,))
+    return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=HOST).fit(
+        data, steps=2, log_every=1)
+
+
 def test_runs_of_one_objective_with_unlike_device_steps_each_train_on_their_own():
     """A host-held run compiles its forward with the dataset's device steps inside, under the
     objective's program cache: two runs of one objective whose steps differ only in a setting
     their reprs leave out each train on their own steps, as a fresh objective does."""
-    from affine_run import Regression, batches as affine_batches
-
-    from dew.data.dataset import Loader
-
-    def fit(objective, scale):
-        data = Loader(lambda partition: affine_batches(), None, None, 8, device=(_Scaled(scale),))
-        return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=HOST).fit(
-            data, steps=2, log_every=1)
+    from affine_run import Regression
 
     shared = Regression()
-    fit(shared, 1.0)
-    reused, fresh = fit(shared, 3.0), fit(Regression(), 3.0)
+    _scaled_fit(shared, _Scaled(1.0))
+    reused, fresh = _scaled_fit(shared, _Scaled(3.0)), _scaled_fit(Regression(), _Scaled(3.0))
     for left, right in zip(jax.tree.leaves(reused.variables), jax.tree.leaves(fresh.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_a_later_run_of_one_objective_releases_the_device_steps_an_earlier_run_compiled():
+    """The objective keeps the host forward of its latest run alone: a run's device steps, which
+    its forward runs, are released once a later run of the objective compiles its own, so runs
+    repeated in one process hold one forward, not one per run."""
+    import gc
+    import weakref
+
+    from affine_run import Regression
+
+    shared, first = Regression(), _Scaled(1.0)
+    _scaled_fit(shared, first)
+    released = weakref.ref(first)
+    del first
+    _scaled_fit(shared, _Scaled(1.0))
+    gc.collect()
+    assert released() is None

@@ -283,6 +283,12 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
+def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
+    """Each split's own metrics, by its name: two suites may each hold their own instance of one
+    metric."""
+    return {name: tuple(suite.metrics) for name, suite in suites.items()}
+
+
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
@@ -331,6 +337,11 @@ class _FitPlan:
         """Whether either run-length cap has been reached, after `real` tokens."""
         return ((self.steps is not None and step >= self.steps)
                 or (self.tokens is not None and real >= self.tokens))
+
+    @property
+    def declared(self) -> dict[str, tuple[Metric, ...]]:
+        """Each validation split's metrics, by the split's name (`_split_metrics`)."""
+        return _split_metrics(self.suites)
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -1814,7 +1825,7 @@ class Trainer(Generic[Loss, Effects]):
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
         checkpoints, current = self.checkpoints, run.current
         ranking = rankings(plan.best, scores, validation=next(iter(plan.suites)) if plan.validation else None,
-                           scored=plan.scored, objective=self.objective)
+                           declared=plan.declared, objective=self.objective)
         if plan.held_best and evaluation_due:
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
@@ -1894,8 +1905,7 @@ class Trainer(Generic[Loss, Effects]):
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        # Each split's own metrics: two suites may each hold their own instance of one metric.
-        scored = {name: tuple(suite.metrics) for name, suite in suites.items()} or {'val': tuple(metrics)}
+        scored = _split_metrics(suites) or {'val': tuple(metrics)}
         raw = (
             ()
             if best is None

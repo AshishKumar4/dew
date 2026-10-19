@@ -107,13 +107,16 @@ def _declared_shown(metric: Metric) -> Shown | None:
 
 
 def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: str | None,
-             scored: Sequence[Metric], objective) -> tuple[Ranking, ...]:
+             declared: Mapping[str, Sequence[Metric]], objective) -> tuple[Ranking, ...]:
     """How an evaluation's `scores` rank its state: by each `best` policy, a threshold it misses
     ranking nothing (a NaN), or without one by the `validation` split's loss, else the training
-    loss. `scored` and `objective` read an aggregate's scores (`MetricScores`)."""
+    loss. A step no evaluation scored ranks nothing, and asks no aggregate. `declared` (each
+    split's metrics) and `objective` read an aggregate's scores (`MetricScores`)."""
     from dew.checkpoints import Ranking
     from dew.training.evaluation import MetricScores
 
+    if not scores:
+        return ()
     if not best:
         name = f"{validation}/loss" if validation is not None else "train/loss"
         return (Ranking(name, scores[name]),) if name in scores else ()
@@ -126,7 +129,7 @@ def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: s
             value = scores.get(name, float('nan'))
         else:
             name = f'aggregate:{index}'
-            value = float(metric(MetricScores(scored, scores, objective)))
+            value = float(metric(MetricScores(declared, scores, objective)))
         mode = selection.mode or 'min'
         threshold = selection.threshold
         if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):
