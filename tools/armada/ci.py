@@ -667,8 +667,8 @@ def marked(python: str) -> dict[str, int]:
     """Each test file of this checkout with tests marked one of `MARKS`, and how many, as pytest
     collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-p",
-                           "no:cacheprovider", "-m", " or ".join(MARKS), *every],
+    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
+                           "-m", " or ".join(MARKS), *every],
                           capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     if done.returncode not in (0, 5):
         raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
