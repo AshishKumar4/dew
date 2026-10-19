@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from typing import Literal
 
 import grain.python as grain
@@ -73,7 +74,7 @@ class CountTargets(grain.MapTransform):
             return Rejected("zero_targets")
         rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
                 if value is not None}
-        kept = {name: value for name, value in element.items() if name not in _RULE}
+        kept = {name: value for name, value in element.items() if name not in (*_RULE, _BOUND)}
         return {**kept, "_dew_valid_targets": count, **rule}
 
 
@@ -82,16 +83,36 @@ _RULE = ("_dew_target_role", "_dew_target_pad")
 
 
 _COUNTED = ("text", "text_segment_ids", "text_roles")
-"""The fields a record's targets are counted from (`ValidTargets`)."""
+"""The fields a record's targets are counted from (`ValidTargets`), as they are first named."""
+
+_BOUND = "_dew_target_fields"
+"""Where a counted record names the fields its targets were counted from, as projections since
+renamed them (`rebound`), one entry each of `_COUNTED`; an empty name is one a projection removed."""
+
+
+def _bound(row: Batch) -> tuple[str, ...]:
+    return tuple(row.get(_BOUND, _COUNTED))
+
+
+def rebound(element: Batch, held: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
+    """`held`, Dew's bookkeeping of `element` a projection carries (`Fields`), naming the fields its
+    count was counted from as the projection leaves them: renamed where it renames one, empty where
+    it drops one, which no step can count from again."""
+    if "_dew_valid_targets" not in held:
+        return held
+    names = tuple(renamed.get(name, name) if name in kept else "" if name in element else name
+                  for name in _bound(element))
+    return {**held, _BOUND: names}
 
 
 def targets_changed(given: Batch, output: Batch) -> bool:
     """Whether a step that made `output` of `given` changed a field its targets are counted from, in
     place: a field it left where it was but holding other values. A field the step moved or
-    removed, as a renaming or a selection does, says nothing of the targets, which no field it
+    removed, as a projection does (`rebound`), says nothing of the targets, which no field it
     still holds could count again."""
-    held = [name for name in _COUNTED if name in given]
-    return (all(name in output for name in held)
+    bound = _bound(given)
+    held = [name for name in bound if name in given]
+    return ("" not in bound and all(name in output for name in held)
             and any(output[name] is not given[name] for name in held))
 
 
@@ -99,12 +120,14 @@ def recounted(given: Batch, output: Batch) -> Batch:
     """`output` with the targets counted on `given` (`CountTargets`): kept while the step left every
     field they were counted from as it was, as a map of a record's other fields or a projection
     does, and counted again by the rule that counted them where it changed one in place, as a crop
-    does."""
+    does, from the fields as they are named now."""
     if "_dew_valid_targets" not in output or not targets_changed(given, output):
         return output
+    view = {counted: output[name] for counted, name in zip(_COUNTED, _bound(given), strict=True)
+            if name in output}
     rule = ValidTargets(role=output.get("_dew_target_role"), pad_id=output.get("_dew_target_pad"),
                         measured=False)
-    return {**output, "_dew_valid_targets": rule(output)}
+    return {**output, "_dew_valid_targets": rule(view)}
 
 
 @dataclasses.dataclass(frozen=True)
