@@ -1,5 +1,5 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
-(dew.telemetry.devices.CUDA_BUILDS) and Dew's least Python (pyproject.toml's requires-python),
+(dew.telemetry.builds.CUDA_BUILDS) and Dew's least Python (pyproject.toml's requires-python),
 into the standalone installer, docs/installation.md's table and the least Python the README and
 docs/installation.md state."""
 
@@ -18,7 +18,7 @@ LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END 
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str]:
     """The CUDA builds and the least Python, read as literals so the installer stays independent
     of Dew's runtime imports."""
-    source = ast.parse((REPO / "src/dew/telemetry/devices.py").read_text())
+    source = ast.parse((REPO / "src/dew/telemetry/builds.py").read_text())
     builds = next(ast.literal_eval(node.value) for node in source.body
                   if isinstance(node, ast.Assign)
                   and any(isinstance(name, ast.Name) and name.id == "CUDA_BUILDS" for name in node.targets))
