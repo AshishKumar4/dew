@@ -622,29 +622,29 @@ def _span(span_ref, length: int, chunk: int, aligned: bool):
 def _entered(h_ref, h0_ref, slot, start, length: int, *index):
     """The memory a chunk enters, its `index` in `h_ref`'s dtype: the stored one at `slot` where its
     sequence goes on from an earlier chunk, its row's initial memory (`h0_ref`) where the chunk begins
-    its row, and none where it begins a sequence inside its row. Each is loaded only where it is the
-    one."""
-    from jax.experimental.pallas import triton as plgpu
-
-    held = h_ref.at[(jnp.maximum(slot, 0), *index)]
-    initial = h0_ref.at[(start // length, *index)]
-    stored = plgpu.load(held, mask=jnp.full(held.shape, slot >= 0), other=0)
-    begun = plgpu.load(initial, mask=jnp.full(initial.shape, start % length == 0), other=0)
-    return stored + begun.astype(stored.dtype)
+    its row, and none where it begins a sequence inside its row. One of them is loaded, a branch each,
+    so a program holds one tile of it."""
+    return _one_of(h_ref, slot, h0_ref, start // length, start % length == 0, index)
 
 
 def _left(dh_ref, dht_ref, slot, end, length: int, *index):
     """The gradient of the memory a chunk ending at token `end` leaves, its `index` in `dh_ref`'s
     dtype: the stored one at `slot` where its sequence goes on to a later chunk, its row's final
     memory's (`dht_ref`) where the chunk ends its row, and none where it ends a sequence inside its
-    row."""
-    from jax.experimental.pallas import triton as plgpu
+    row, one of them loaded (`_entered`)."""
+    return _one_of(dh_ref, slot, dht_ref, (end - 1) // length, end % length == 0, index)
 
-    held = dh_ref.at[(jnp.maximum(slot, 0), *index)]
-    final = dht_ref.at[((end - 1) // length, *index)]
-    stored = plgpu.load(held, mask=jnp.full(held.shape, slot >= 0), other=0)
-    ended = plgpu.load(final, mask=jnp.full(final.shape, end % length == 0), other=0)
-    return stored + ended.astype(stored.dtype)
+
+def _one_of(stored_ref, slot, row_ref, row, at_row, index):
+    """`stored_ref` at `slot` where it is one (`slot >= 0`), else `row_ref` at `row` where `at_row`,
+    else zeros, each `index` in `stored_ref`'s dtype."""
+    view = stored_ref.at[(0, *index)]
+
+    def row_memory():
+        return jax.lax.cond(at_row, lambda: row_ref[(row, *index)].astype(view.dtype),
+                            lambda: jnp.zeros(view.shape, view.dtype))
+
+    return jax.lax.cond(slot >= 0, lambda: stored_ref[(jnp.maximum(slot, 0), *index)], row_memory)
 
 
 def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *,
