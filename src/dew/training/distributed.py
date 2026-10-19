@@ -88,7 +88,7 @@ def stage_microbatches(mesh: Mesh, asked: int | None) -> int:
     """The microbatches a pipelined step feeds through `mesh`'s stage axis: as
     `asked`, else one a stage. A mesh without a stage axis has one stage."""
     stages = mesh.shape.get(STAGE_AXIS, 1)
-    if asked is None:
+    if asked is None or asked == stages:
         return stages
     if stages == 1:
         raise ValueError(f"microbatches ({asked}) feed the stage axis, which this mesh does not split; "
@@ -568,8 +568,10 @@ class Layout:
     gradient accumulation. The optimizer update then runs on a CPU companion of
     this mesh, and the parameter copies on the accelerators are read-only
     snapshots for running the step, never a second master copy. Every process
-    must have as many CPU devices as accelerators, set before JAX initializes;
-    neither this layout nor the trainer changes the count.
+    needs at least as many CPU devices as accelerators, set before JAX
+    initializes; neither this layout nor the trainer changes the count, and a
+    process's surplus CPUs, and the processes the mesh leaves out, stay out of
+    the companion (`companion_mesh`).
 
     `host_parameters` lists the variables an inference placement keeps in
     pinned host memory, as globs over their logical paths (`params/layers_*`).
@@ -1196,7 +1198,14 @@ class DevicePrefetchIterator:
                         self._prefetch()
                     raise
                 # A worker still placing a batch when Python finalizes would abort the process.
-                self._withdraw_exit = stop_at_exit(self._thread, self._cancel, timeout=5.0)
+                self._withdraw_exit = stop_at_exit(self._thread, self._cancel, timeout=self._budget())
+
+    def _budget(self) -> float | None:
+        """The seconds the source gives itself to stop (`Budgeted.stop_seconds`), None for a
+        source that sets no deadline of its own."""
+        source = self._iterator
+        seconds = source.stop_seconds if isinstance(source, Budgeted) else None
+        return None if seconds is None else float(seconds)
 
     def _cancel(self) -> None:
         """Ask the worker to stop between batches, and a stoppable source to stop its own work."""
@@ -1294,8 +1303,9 @@ class DevicePrefetchIterator:
         """Stop the worker and wait for it, discarding unread batches but keeping `source_state`.
 
         The wait lasts `timeout` seconds, else the source's own `stop_seconds`
-        (a grain pipeline joins one worker process after another), else 5 s. If
-        the worker is still alive after that, this raises TimeoutError.
+        (a grain pipeline joins one worker process after another), else until
+        the worker ends: the source, the external reader, owns its deadline. If
+        the worker is still alive after a deadline, this raises TimeoutError.
         Cancellation stays requested and a later close may wait again, but the
         source's in-flight work and buffers may not have been released. An
         error from the source's own close is raised here too.
@@ -1303,9 +1313,7 @@ class DevicePrefetchIterator:
         if threading.current_thread() is self._thread:
             raise RuntimeError("a prefetch worker cannot close itself")
         if timeout is None:
-            source = self._iterator
-            seconds = source.stop_seconds if isinstance(source, Budgeted) else None
-            timeout = 5.0 if seconds is None else float(seconds)
+            timeout = self._budget()
         error = None
         try:
             self._cancel()
