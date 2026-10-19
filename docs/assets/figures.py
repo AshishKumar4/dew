@@ -762,7 +762,7 @@ def samplers_paths_figure():
 
     The data are five points on a circle, like petals, so the denoiser D(x; sigma), the mean of the data
     under the posterior, has a closed form. Both solvers take three steps down EDM's Karras grid (rho = 7)
-    from sigma = 4, along dx / dsigma = (x - D(x; sigma)) / sigma; the exact path takes 2,000 Heun steps.
+    from sigma = 4, along dx / dsigma = (x - D(x; sigma)) / sigma; the reference path takes 2,000 Heun steps.
     """
     petals = np.stack([np.cos(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3),
                        np.sin(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3)], axis=1)
@@ -796,7 +796,7 @@ def samplers_paths_figure():
         return np.array(path)
 
     start = np.array([1.35, 1.86])
-    exact, coarse = heun(start, grid(2000)), grid(3)
+    reference, coarse = heun(start, grid(2000)), grid(3)
     paths = {"Euler, 3 calls": euler(start, coarse), "Heun, 6 calls": heun(start, coarse)}
     width, height = 440, 320
     view_x, view_y, scale = 150, 205, 88
@@ -805,7 +805,7 @@ def samplers_paths_figure():
         return view_x + scale * point[0], view_y - scale * point[1]
 
     svg = Figure(width, height, seconds=11, label="Five data points on a circle and the paths three solvers take "
-                 "to them from the same starting noise: the exact path, Euler in three steps, which stops short "
+                 "to them from the same starting noise: a fine-step reference path, Euler in three steps, which stops short "
                  "between the points, and Heun in three steps, which lands on one.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     # The direction the ODE pushes, at a middling noise level, as faint arrows.
@@ -821,7 +821,7 @@ def samplers_paths_figure():
     svg.text(*at(petals[3] + [-0.1, -0.32]), "data", size=13, color="accent")
     svg.circle(*at(start), 5, fill="text")
     svg.text(at(start)[0] + 10, at(start)[1] + 5, "x_T", size=13, mono=True)
-    svg.draw(svg.polyline([at(p) for p in exact], color="muted", width=1.5, dash=None), 0.4, 2.2)
+    svg.draw(svg.polyline([at(p) for p in reference], color="muted", width=1.5, dash=None), 0.4, 2.2)
     styles = (("text", "5 4", 2.6), ("accent", None, 5.6))
     for (name, path), (color, dash, begin) in zip(paths.items(), styles):
         line = svg.polyline([at(p) for p in path], color=color, width=2, dash=dash)
@@ -829,7 +829,7 @@ def samplers_paths_figure():
         for index, point in enumerate(path[1:]):
             svg.appear(svg.circle(*at(point), 4, fill=color), begin + 0.4 * index, 0.2)
     legend_x = 286
-    rows = [("exact path", "muted", None), *((name, color, dash) for name, (color, dash, _) in
+    rows = [("reference path", "muted", None), *((name, color, dash) for name, (color, dash, _) in
                                              zip(paths, styles))]
     for row, (name, color, dash) in enumerate(rows):
         y = 250 + 24 * row
