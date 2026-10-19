@@ -153,8 +153,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """Tile the student's head, the vocabulary head this objective trains."""
         return self.student.tile_head(tile)
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        self.student.restore_head_tile(tile)
+    def unfuse_head(self) -> str | None:
+        return self.student.unfuse_head()
+
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        self.student.restore_head(tile, fused=fused)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
