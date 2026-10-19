@@ -49,8 +49,10 @@ def tree_of(tree):
     return lambda squares: tree_sum(squares, -1, tree)[..., None]
 
 
-NORM_TREES = ("pairwise", "blocked-8", "blocked-32")
-"""The norm's members: the trees its one reduction class, the sum of squares over the width, declares."""
+NORM_TREES = ("pairwise", "blocked-64", "blocked-128")
+"""The norm's members: the trees its one reduction class, the sum of squares over the width, declares;
+blocks of 8 or 32 summed in turn are less exact than XLA's own sum at 256 terms, and admission would
+leave them out."""
 
 
 def norm_draw(dew_sum, shape, *, seed: int = 0):
@@ -86,10 +88,14 @@ def test_an_rms_norm_summed_in_halves_is_as_exact_as_the_ensemble(shape):
     assert REFERENCE in report["['output']"]["admitted"]
 
 
+def reversed_sum(squares):
+    """XLA's own sum over the terms in reverse: another tree, as exact, that the ensemble does not hold."""
+    return jnp.sum(squares[..., ::-1], axis=-1, keepdims=True)
+
+
 def test_a_tree_the_ensemble_does_not_hold_passes():
-    """A held-out tree, pairwise within blocks of 4, is as exact as the ensemble's and passes."""
-    assert_leaves_as_exact_over_orders(norm_draw(tree_of("blocked-4"), (32, 256)), "held-out tree",
-                                       rows=False)
+    """A held-out tree, XLA's sum over the terms reversed, is as exact as the reference and passes."""
+    assert_leaves_as_exact_over_orders(norm_draw(reversed_sum, (32, 256)), "held-out tree", rows=False)
 
 
 def lost_term(squares):
