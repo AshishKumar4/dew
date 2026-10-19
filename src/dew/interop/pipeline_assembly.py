@@ -11,7 +11,6 @@ scheduler file into the source's training process and its sampling policy
 
 from __future__ import annotations
 
-import functools
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -25,7 +24,7 @@ from flax import linen as nn
 
 from dew import records
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import Origin, SourceSchedule
+from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.pipeline import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.inputs.diffusion import (
@@ -153,7 +152,7 @@ class SourceTask:
 
     steps: int
     guidance: CFG | None
-    grid: Callable[[int], tuple[Process, jax.Array]]
+    grid: SourceGrid
 
 
 @dataclass(frozen=True)
@@ -380,7 +379,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     tokens = (height // patch) * (width // patch)
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
-                      functools.partial(schedule.sampling, origin=denoiser.origin, tokens=tokens))
+                      SourceGrid(dict(schedule.config), tokens, denoiser.origin))
     variables = {**denoiser_variables, "encoders": encoders, "autoencoder": vae_params}
     geometry = {"dew_height": height, "dew_width": width}
     if denoiser.frames is not None:

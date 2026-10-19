@@ -371,7 +371,10 @@ class DiffusionRunConfig(RunConfig):
             if source.inputs.mask is not None:
                 raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
                                  "on masks an image dataset does not carry")
-            model, conditions, autoencoder = source.model, dict(source.inputs.conditions), source.autoencoder
+            # The objective is built over the pipeline itself, which brings the sampling policy it
+            # samples by (`DiffusionObjective`'s `model`); the run's own process, inputs and tree
+            # stand over the pipeline's.
+            model, conditions, autoencoder = source, dict(source.inputs.conditions), source.autoencoder
             variables, convention = source.variables if trained is None else trained, source.process
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
