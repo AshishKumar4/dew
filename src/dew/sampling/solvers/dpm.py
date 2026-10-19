@@ -36,11 +36,10 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
     alpha_s = jnp.where(alpha_s == 0, 1.0, alpha_s)
     if algorithm == "dpmsolver++":
         phi = jnp.exp(-h) - 1.0
-        sample_scale = sigma_t / sigma_s
-        # exp(-h) = alpha_s / alpha_t * sigma_t / sigma_s. Use the
-        # rates directly rather than round them through logarithms and exp.
-        clean_scale = alpha_t - sample_scale * alpha_s
-        return (sample_scale, clean_scale, 0.5 * clean_scale,
+        # The source's -alpha_t (e^-h - 1). The same scale written from the rates,
+        # alpha_t - (sigma_t / sigma_s) alpha_s, cancels two terms of alpha_t's size.
+        clean_scale = -(alpha_t * phi)
+        return (sigma_t / sigma_s, clean_scale, 0.5 * clean_scale,
                 alpha_t * (phi / h + 1.0), -alpha_t * ((phi + h) / h ** 2 - 0.5), 0.0)
     if algorithm == "dpmsolver":
         psi = jnp.exp(h) - 1.0
