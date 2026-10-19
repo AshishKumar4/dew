@@ -514,6 +514,8 @@ def run(config: BenchmarkConfig) -> list[Row]:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
+    # A step's compile seconds are a cold compile's, which no cached executable stands in for.
+    jax.config.update("jax_enable_compilation_cache", val=False)
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
     prepare_process(xla_flags=config.xla_flags)
