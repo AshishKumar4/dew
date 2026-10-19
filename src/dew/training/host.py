@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 
 from dew.objectives.base import Variables
 from dew.training.distributed import Placement
@@ -167,7 +167,37 @@ class Held:
         """Keep the copy for the next placement."""
 
 
-def place_leaf(value, target: NamedSharding) -> jax.Array:
+@dataclasses.dataclass(frozen=True)
+class _HeldKey:
+    """A random key array held as its key data (`hold_on_host`), and the implementation that wraps it."""
+    data: Held
+    impl: object
+
+
+def hold_on_host[TreeT](tree: TreeT) -> TreeT:
+    """`tree`'s arrays copied to host memory, each process its own addressable shards (`Held`) and
+    a random key as its key data, so `place_held` puts the same values back after the arrays were
+    donated or released: one copy of the tree in host memory. Anything but an array is kept."""
+    def hold(leaf):
+        if not isinstance(leaf, jax.Array):
+            return leaf
+        if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key):
+            return _HeldKey(Held.of(jax.random.key_data(leaf)), jax.random.key_impl(leaf))
+        return Held.of(leaf)
+    return jax.tree.map(hold, tree)
+
+
+def place_held[TreeT](tree: TreeT, like: TreeT) -> TreeT:
+    """A tree `hold_on_host` held put back on the devices, each array where `like`'s matching one is."""
+    def place(value, target):
+        if isinstance(value, _HeldKey):
+            data = place_leaf(value.data, jax.random.key_data(target).sharding)
+            return jax.random.wrap_key_data(data, impl=value.impl)
+        return place_leaf(value, target.sharding) if isinstance(value, Held) else value
+    return jax.tree.map(place, tree, like, is_leaf=lambda leaf: isinstance(leaf, (Held, _HeldKey)))
+
+
+def place_leaf(value, target: Sharding) -> jax.Array:
     """Move one array into `target`, releasing the source once it lands.
 
     A host array or a single device's array is cut into shards by each
@@ -176,8 +206,8 @@ def place_leaf(value, target: NamedSharding) -> jax.Array:
     at a time. Memory-mapped
     source pages are given back to the kernel, which is what keeps a large
     checkpoint from being resident twice."""
-    if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
-                                         or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
+    if isinstance(value, jax.Array) and isinstance(target, NamedSharding) and (
+            isinstance(value.sharding, NamedSharding) or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)
     if isinstance(value, HostSource):
         # make_array_from_callback would hold every addressable shard on
