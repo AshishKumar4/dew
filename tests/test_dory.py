@@ -327,12 +327,52 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
+def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
+    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself: its LoRA
+    layers injected by the adapter's own config into a torch module of the checkpoint's linear
+    projections under their checkpoint names, the saved factors loaded as PEFT loads them, and each
+    layer's merge."""
+    import torch
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+    from peft.tuners.lora import LoraLayer
+    from safetensors.numpy import load_file
+
+    tensors = load_file(str(checkpoint / 'model.safetensors'))
+    base = torch.nn.Module()
+    for name, value in tensors.items():
+        *path, leaf, kind = name.split('.')
+        if kind != 'weight' or value.ndim != 2 or leaf == 'embeddings':
+            continue
+        parent = base
+        for part in path:
+            if not hasattr(parent, part):
+                parent.add_module(part, torch.nn.Module())
+            parent = getattr(parent, part)
+        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
+        linear.weight.data = torch.as_tensor(value)
+        parent.add_module(leaf, linear)
+    model = inject_adapter_in_model(LoraConfig.from_pretrained(str(adapter)), base)
+    saved = load_file(str(adapter / 'adapter_model.safetensors'))
+    set_peft_model_state_dict(model, {name.removeprefix('base_model.model.'): torch.as_tensor(value)
+                                      for name, value in saved.items()})
+    merged = dict(tensors)
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer) and module.lora_A:
+            module.merge()
+            merged[f'{name}.weight'] = module.base_layer.weight.detach().numpy()
+    targets = {name.removeprefix('base_model.model.').split('.lora_')[0] + '.weight' for name in saved}
+    assert {name for name in merged if merged[name] is not tensors[name]} == targets
+    return merged
+
+
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
-    steps end; the saved factors load back to the same logits; and the merged checkpoint reloads
-    to the adapted model's logits within the rule of the adapted model's own run against float64."""
+    steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
+    merges it into the checkpoint's projections by their names, and the transcription over that
+    merge computes the adapted model's logits within the rule of its own run against float64; and
+    the merged checkpoint reloads to the adapted model's logits within the same rule."""
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
 
@@ -356,6 +396,12 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     ids = REFERENCE['input_ids']
     logits = np.asarray(adapted.model.apply(resumed, ids))
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
+    import torch
+
+    config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
+    assert_as_exact_as_the_reference(logits, TOOL.DoryReference(config, peft, torch.float32).forward(ids),
+                                     TOOL.DoryReference(config, peft, torch.float64).forward(ids),
+                                     'the adapter as PEFT merges it')
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
     truth, terms = float64_forward(adapted.model, resumed, ids)
