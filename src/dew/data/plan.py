@@ -72,7 +72,9 @@ class StepIdentity:
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @classmethod
-    def of(cls, step: object, identity: str | None = None) -> StepIdentity:
+    def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
+        """`step`'s identity, refused where a cache keys it (`cache`) and
+        cannot (`keyable`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -100,17 +102,16 @@ class StepIdentity:
         )
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
-        return cls(name, config, exact, modules, declared, dependencies)
+        named = cls(name, config, exact, modules, declared, dependencies)
+        if cache and not named.keyable(function=inspect.isfunction(step), external=external):
+            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
+        return named
 
-    @classmethod
-    def keyed(cls, step: object, identity: str | None = None) -> bool:
-        """Whether a cache can key what `step` computes: a stable identity,
-        declared wherever its code is a function or outside Dew, which Dew's
-        revision does not name."""
-        named = cls.of(step, identity)
-        function = inspect.isfunction(step)
-        external = not (step if function else type(step)).__module__.startswith("dew.")
-        return named.exact and not ((external or function) and named.declared is None)
+    def keyable(self, *, function: bool, external: bool) -> bool:
+        """Whether a cache can key what the step computes: a stable identity,
+        declared wherever the step is a function or its code is outside Dew,
+        which Dew's revision does not name."""
+        return self.exact and not ((external or function) and self.declared is None)
 
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its

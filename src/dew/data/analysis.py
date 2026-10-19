@@ -22,6 +22,7 @@ support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -403,20 +404,18 @@ def _member_keys(members: Sequence[str]) -> list[str]:
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it,
-    refused for a cache's key where none can key it (`_keyed`). A cache stage
-    is its kind alone. The plan names the rows a cache serves by their key
-    (`Cache.reference`), and where the cache lives is no part of the data, so
-    a run resumes against the same rows cached anywhere. A step a
-    `Configured` stage resolved names its factory by what it computes and
+    refused for a cache's key where none can key it (`StepIdentity.of`). A
+    cache stage is its kind alone. The plan names the rows a cache serves by
+    their key (`Cache.reference`), and where the cache lives is no part of
+    the data, so a run resumes against the same rows cached anywhere. A step
+    a `Configured` stage resolved names its factory by what it computes and
     carries the factory's modules after its own."""
-    if cache and not _keyed(stage):
-        raise ValueError(f"cache prefix step {_identity(stage).name} needs identity='name@version'")
     if isinstance(stage, Artifact):
         return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", "", exact=True)
     if isinstance(stage, Configured):
-        return StepIdentity.of(stage.factory)
+        return StepIdentity.of(stage.factory, cache=cache)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
-        identity = StepIdentity.of(stage.step, stage.identity)
+        identity = StepIdentity.of(stage.step, stage.identity, cache=cache)
         if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
             bound = stage.configured
             factory = _identity(bound.step)
@@ -428,11 +427,11 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
             )
         return identity
     if isinstance(stage, Filter):
-        return StepIdentity.of(stage.predicate, stage.identity)
+        return StepIdentity.of(stage.predicate, stage.identity, cache=cache)
     if isinstance(stage, Native):
-        return StepIdentity.of(stage.function, stage.identity)
+        return StepIdentity.of(stage.function, stage.identity, cache=cache)
     if isinstance(stage, Batched):
-        step = StepIdentity.of(stage.step, stage.identity)
+        step = StepIdentity.of(stage.step, stage.identity, cache=cache)
         # The group size and whether the rows keep their count decide what a resume reads.
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
         return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
@@ -479,22 +478,32 @@ def _configured(
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
+type _Step = Callable[..., object] | pygrain.MapTransform | pygrain.RandomMapTransform | Expansion
+
+
 def _keyed(stage: Stage) -> bool:
-    """Whether a cache can key what `stage` runs (`StepIdentity.keyed`): the
-    steps `_identity` names it by, a configured one's factory included."""
+    """Whether a cache can key what `stage` runs (`StepIdentity.keyable`):
+    the steps `_identity` names it by, a configured one's factory included,
+    as `_identity(stage, cache=True)` refuses them."""
     if isinstance(stage, Artifact):
         return True
     if isinstance(stage, Configured):
-        return StepIdentity.keyed(stage.factory)
+        return _step_keyed(stage.factory)
     if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
-        return StepIdentity.keyed(stage.step, stage.identity) and _keyed(stage.configured.step)
+        return _step_keyed(stage.step, stage.identity) and _keyed(stage.configured.step)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch, Batched)):
-        return StepIdentity.keyed(stage.step, stage.identity)
+        return _step_keyed(stage.step, stage.identity)
     if isinstance(stage, Filter):
-        return StepIdentity.keyed(stage.predicate, stage.identity)
+        return _step_keyed(stage.predicate, stage.identity)
     if isinstance(stage, Native):
-        return StepIdentity.keyed(stage.function, stage.identity)
-    return StepIdentity.keyed(stage)
+        return _step_keyed(stage.function, stage.identity)
+    return True
+
+
+def _step_keyed(step: _Step, identity: str | None = None) -> bool:
+    function = inspect.isfunction(step)
+    external = not (step if function else type(step)).__module__.startswith("dew.")
+    return StepIdentity.of(step, identity).keyable(function=function, external=external)
 
 
 def _manifest(
