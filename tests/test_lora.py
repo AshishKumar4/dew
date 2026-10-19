@@ -28,8 +28,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
 from affine_run import Replaying
+from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
