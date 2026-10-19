@@ -301,7 +301,6 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     """
     from diffusers_wan_reference import float64
 
-    model.config._attn_implementation = 'eager'
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
@@ -534,7 +533,6 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
         global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
         max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
         cls_token_id=1, sep_token_id=2))
-    model.config._attn_implementation = 'eager'
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')

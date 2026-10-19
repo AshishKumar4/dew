@@ -26,7 +26,7 @@ duplicates=$(mktemp)
 scan=$!
 gate locks sh -c 'sh tools/lock_environment.sh && git diff --exit-code --stat locks/'
 gate flake8 "$python" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
-  --extend-exclude=site/src/data/sampler.py,site/src/data/text.py,.venv*
+  --extend-exclude=.venv*
 gate ruff "$python" -m ruff check $ruff_inputs
 gate slop env JAX_PLATFORMS=cpu "$python" tools/lint_slop.py
 gate complexity sh -c "\"$python\" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json"

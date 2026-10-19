@@ -1177,6 +1177,26 @@ def _plus_one(batch):
     return {**batch, "x": batch["x"] + 1}
 
 
+def _missing_field(row):
+    return {"x": row["absent"]}
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixed_corpus_whose_first_record_fails_raises_its_own_error(read):
+    """A mixture reads each corpus's first record before it mixes: one whose step fails there
+    raises its own error, a KeyError here, with its own traceback, where it was once rewritten
+    into a ValueError naming the corpus."""
+    broken = Pipeline(Memory([{"x": np.int32(0)}] * 4, identity="broken")).map(_missing_field)
+    plain = Pipeline(Memory([{"x": np.int32(1)}] * 4, identity="plain"))
+    stream = compile(mix([broken.repeat(), plain.repeat()]).batch(2), read=read, loading=READ).train(
+        DataPartition())
+    try:
+        with pytest.raises(KeyError):
+            next(stream)
+    finally:
+        stream.close()
+
+
 def test_a_mixture_refuses_a_batched_member_rather_than_drop_its_stages():
     """A mixture reads its members' records and batches once, after mix: a member batched
     before it, with a step after its batch, is refused, where the mixture once read the

@@ -82,3 +82,42 @@ def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
     for path, bias in flatten_dict(source.variables["moe"]).items():
         unchanged = np.array_equal(np.asarray(moved[path]), np.asarray(bias))
         assert unchanged == (path[0] not in ran), path
+
+
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_does(source, scan_layers):
+    """The layers left in host memory run one at a time in a scope of their own
+    (`decoder_stack.run_stack`), and read and write every collection the caller
+    opens as a resident stack does: with the routers' balancing biases moved off
+    zero and opened beside the DSpark target layers' `prediction_inputs` and the
+    router's choices, the logits, the state and the drafted context are the
+    resident stack's, on a first call and on a second reading the first's state."""
+    model = source.model.clone(scan_layers=scan_layers)
+    ids = jnp.asarray(REFERENCE["input_ids"])[:, :6]
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+
+    def hosted(path, leaf):
+        names = [getattr(key, "key", str(key)) for key in path]
+        return jax.device_put(leaf, host) if names[0] == "params" and names[1].startswith("layers_") else leaf
+
+    def biased(leaf):
+        floating = jnp.issubdtype(leaf.dtype, jnp.floating)
+        return leaf + 4.0 * (jnp.arange(leaf.shape[-1]) % 3) if floating else leaf
+
+    resident = {**source.variables, "moe": jax.tree.map(biased, source.variables["moe"])}
+    opened = ["prediction_inputs", "router", "moe"]
+    unbiased = model.apply(source.variables, ids, mutable=opened)[0]
+    held = {}
+    for name, variables in (("resident", resident),
+                            ("host", jax.tree_util.tree_map_with_path(hosted, resident))):
+        calls = []
+        for _ in range(2):
+            logits, state = model.apply(variables, ids, mutable=opened)
+            context = model.apply(variables, state["prediction_inputs"], method="draft_context")
+            calls.append((logits, state, context))
+            variables = {**variables, **state}
+        held[name] = calls
+    assert not np.array_equal(np.asarray(held["resident"][0][0]), np.asarray(unbiased))
+    for ours, theirs in zip(jax.tree.leaves(held["host"]), jax.tree.leaves(held["resident"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert jax.tree.structure(held["host"]) == jax.tree.structure(held["resident"])
