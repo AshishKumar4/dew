@@ -107,8 +107,8 @@ class _Writer:
     def __init__(self) -> None:
         self.digest = hashlib.sha256()
 
-    def write(self, data: bytes) -> None:
-        self.digest.update(data)
+    def write(self, chunk: bytes) -> None:
+        self.digest.update(chunk)
 
 
 class _Hashed:
