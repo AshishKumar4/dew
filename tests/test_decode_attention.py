@@ -292,3 +292,83 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     assert not failures(found), "\n".join(failures(found))
     # Each case lowered to a kernel Triton compiled, which takes shared memory.
     assert all(record["shared"] > 0 for record in found), found
+
+
+def cache_call(window=None):
+    """A cache call of 6 tokens over 16 slots: row 0 left-padded by 2 after an empty cache, row 1
+    right-padded by 1 after 3 held tokens, row 2 with a hole after 7, and row 3 all padding; the
+    tokens' slots (`open_kv_cache`'s positions, -1 for padding), the slots filled after the call, and
+    the cache's mask over them (`causal_attention_mask`), a window's where given."""
+    from dew.nn.attention import causal_attention_mask
+
+    held = np.array([0, 3, 7, 5])
+    valid = np.array([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0], [1, 1, 0, 1, 1, 1], [0, 0, 0, 0, 0, 0]], bool)
+    positions = np.where(valid, held[:, None] + np.cumsum(valid, axis=1) - 1, -1)
+    filled = np.arange(16)[None, :] < (held + valid.sum(axis=1))[:, None]
+    return (jnp.asarray(positions, jnp.int32), jnp.asarray(filled),
+            causal_attention_mask(positions, 16, window, key_valid=filled))
+
+
+def cache_documents(positions, filled):
+    """A cache call's tokens as one document a row whose last keys they are (`CrossDocuments`)."""
+    from dew.nn.documents import CrossDocuments
+
+    return CrossDocuments(jnp.asarray(positions >= 0, jnp.int32), jnp.asarray(filled, jnp.int32))
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_calls_documents_aligned_to_their_last_keys_are_its_mask(window):
+    """A cache call's tokens, as one document a row whose last keys they are (`CrossDocuments`
+    under causality and a window, `cross_document_mask`), see the keys the cache's own mask over its
+    slots gives them, row by row, left, right and inner padding alike."""
+    from dew.nn.documents import cross_document_mask
+
+    positions, filled, mask = cache_call(window)
+    aligned = cross_document_mask(cache_documents(positions, filled), causal=True, sliding_window=window)
+    np.testing.assert_array_equal(np.asarray(aligned), np.asarray(mask))
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, window):
+    """Attention of a cache call over its documents (causal, windowed, `CrossDocuments`) is bitwise
+    the attention over the cache's mask on the kernels that build it, a padding row's output zero."""
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(7)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 32)), jnp.float32)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 32)), jnp.float32) for _ in range(2))
+    read = scaled_dot_product_attention(query, key, value, implementation=implementation, causal=True,
+                                        sliding_window=window, segment_ids=cache_documents(positions, filled),
+                                        max_segments=1)
+    masked = scaled_dot_product_attention(query, key, value, implementation=implementation, mask=mask)
+    np.testing.assert_array_equal(np.asarray(read), np.asarray(masked))
+    np.testing.assert_array_equal(np.asarray(read[3]), 0)
+
+
+@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
+@pytest.mark.parametrize("window", [None, 4])
+def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
+                                                                                 window):
+    """FlashAttention over a cache call's documents (its packed sequences, the queries put in id
+    order and back), as 'auto' routes it where the target row names flash for packed documents, is
+    within tests/reference_error.py's rule of jax.nn's xla attention over the cache's mask, against
+    float64, padding rows zero."""
+    from dew.nn.attention import flash_refusal
+
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(8)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
+    documents = cache_documents(positions, filled)
+    assert flash_refusal(query, key, True, window, segment_ids=documents, max_segments=1) is None
+    found = scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
+                                         sliding_window=window, segment_ids=documents, max_segments=1)
+    plain = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    logits = np.where(np.asarray(mask), np.einsum("btnd,bsnd->bnts", q, k) / 8.0, -np.inf)
+    seen = np.isfinite(logits).any(-1, keepdims=True)
+    probs = np.where(seen, np.exp(logits - np.where(seen, logits.max(-1, keepdims=True), 0)), 0)
+    probs = probs / np.where(seen, probs.sum(-1, keepdims=True), 1)
+    truth = np.einsum("bnts,bsnd->btnd", probs, v)
+    plain = np.where(np.asarray(positions >= 0)[:, :, None, None], np.asarray(plain, np.float32), 0)
+    assert_as_exact_as_the_reference(np.asarray(found, np.float32), plain, truth, f"window {window}")
