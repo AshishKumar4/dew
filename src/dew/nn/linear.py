@@ -1145,15 +1145,36 @@ class GatedDeltaNet(nn.Module):
                   else wide)
         return stored, jnp.promote_types(operand, stored)
 
-    def _fused_refusal(self, x, operand) -> Refusal | None:
-        """Why a decode token does not run in one launch (`delta_rule.fused_step`) on the target, or
-        None where it does: a GPU the kernel compiles for and the widths Triton's blocks take."""
-        state = (x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim)
-        return refused(
-            (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
-            (delta_rule.fused_fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])), 'widths',
-             "the state's widths are not powers of two the kernel's blocks take"),
-        )
+    def _decode_kernel(self, x, operand) -> str:
+        """The kernel a decode token runs on the target, reported as its route ('delta_decode'): the
+        fused step (`delta_rule.fused_step`), the step kernel (`delta_rule.step`) between the layer's
+        own conv and norm, or the portable recurrence ('xla'). Its row's choice, else the step
+        kernel where the rule's own row names the port and the portable recurrence where it names
+        the math, so a caller choosing the rule's math (`generation.chosen`) decodes unfused; a kernel
+        the token's state does not fit hands it to the next."""
+        state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                                     self._stored(operand)[0])
+        preferred = measured_kernel(
+            'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
+        refusal = None
+        if preferred == 'fused':
+            refusal = refused(
+                (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
+                (delta_rule.fused_fits(state), 'widths',
+                 "the state's widths are not powers of two the fused step's blocks take"),
+            )
+            if refusal is None:
+                return route('delta_decode', kernel='fused', preferred=preferred).kernel
+        if preferred in ('fused', 'step'):
+            stepping = refused(
+                (delta_rule.fits(state), 'step_widths',
+                 "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
+                 "or later"),
+            )
+            if stepping is None:
+                return route('delta_decode', kernel='step', preferred=preferred, refusal=refusal).kernel
+            refusal = refusal or stepping
+        return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
 
     def _fused_token(self, z, b, a, valid):
         """A decode token's conv, gates, update and gated norm in one launch (`delta_rule.fused_step`),
@@ -1208,14 +1229,11 @@ class GatedDeltaNet(nn.Module):
         mixed, z, b, a = self._project(x)
         key_dim = self.key_features
         operand = mixed.dtype
-        token = None
+        token, stepped = None, False
         if decode and S == 1:
-            preferred = measured_kernel('delta_decode', 'step')
-            refusal = self._fused_refusal(x, operand) if preferred == 'fused' else None
-            fused = preferred == 'fused' and refusal is None
-            taken = route('delta_decode', kernel='fused' if fused else 'step', refusal=refusal)
-            if taken.kernel == 'fused':
-                token = self._fused_token(z, b, a, valid)
+            kernel = self._decode_kernel(x, operand)
+            token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
+            stepped = kernel == 'step'
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
@@ -1245,7 +1263,7 @@ class GatedDeltaNet(nn.Module):
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
                                               ported=ported, starts=starts, max_segments=tokens.max_segments)
             query, key = self._expand_kv(query), self._expand_kv(key)
-            if S == 1 and held is not None and delta_rule.fits(held):
+            if stepped and held is not None:
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)

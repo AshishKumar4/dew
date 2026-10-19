@@ -1039,8 +1039,10 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
 
 def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
     """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
-    'delta_decode' set to 'fused', reports the fused step as its route; at widths the kernel's blocks do
-    not take, the step with the refusal's code; with no choice, the step its row prefers."""
+    'delta_decode' set to 'fused', reports the fused step as its route; at widths neither the fused nor
+    the step kernel's blocks take, the portable recurrence with the refusal's code; with no choice, the
+    step kernel, as the rule's row names the port; and with the rule's math chosen, the portable
+    recurrence, so an unfused reference decodes unfused."""
     from dew.nn.kernels.generation import assumed, chosen, routes
 
     def decode_routes(width):
@@ -1056,9 +1058,11 @@ def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_tak
                 for found_route in found if found_route.choice == "delta_decode"]
 
     assert decode_routes(32)[-1] == ("step", "step", None)
+    with chosen(gated_delta_rule="xla"):
+        assert decode_routes(32)[-1] == ("xla", "xla", None)
     with chosen(delta_decode="fused"):
         assert decode_routes(32)[-1] == ("fused", "fused", None)
-        assert decode_routes(24)[-1] == ("step", "fused", "widths")
+        assert decode_routes(24)[-1] == ("xla", "fused", "widths")
 
 
 @pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
