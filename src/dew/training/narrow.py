@@ -75,6 +75,11 @@ def _uses(var, jaxpr) -> list[tuple]:
     return [(eqn, index) for eqn in jaxpr.eqns for index, operand in enumerate(eqn.invars) if operand is var]
 
 
+def _read_once(var, jaxpr) -> bool:
+    """Whether `var` is read by one equation of `jaxpr` and returned by none."""
+    return len(_uses(var, jaxpr)) == 1 and var not in jaxpr.outvars
+
+
 def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     """The narrower float dtype `var`'s one use in `jaxpr` casts it to, or None: through a call
     that passes it on (`_inner`), and through the stack a scanned run builds of its layers'
@@ -82,10 +87,9 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     followed only where every operand is a weight (`weights`, the variables in `jaxpr` the
     parameters are bound to) of the one dtype read nowhere else, each copied as the others are: the
     stack takes one dtype, which a copy of some and not others would split."""
-    uses = _uses(var, jaxpr)
-    if len(uses) != 1 or var in jaxpr.outvars:
+    if not _read_once(var, jaxpr):
         return None
-    eqn, index = uses[0]
+    eqn, index = _uses(var, jaxpr)[0]
     if eqn.primitive.name == "convert_element_type":
         dtype = jnp.dtype(eqn.params["new_dtype"])
         narrower = jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize < var.aval.dtype.itemsize
@@ -93,11 +97,8 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     if eqn.primitive.name in _STACKING and len(eqn.outvars) == 1:
         stacked = eqn.outvars[0]
         operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
-        def sole(operand) -> bool:
-            return (operand in weights and operand.aval.dtype == var.aval.dtype
-                    and len(_uses(operand, jaxpr)) == 1 and operand not in jaxpr.outvars)
-
-        if len(operands) > 1 and not all(sole(operand) for operand in operands):
+        if len(operands) > 1 and not all(operand in weights and operand.aval.dtype == var.aval.dtype
+                                         and _read_once(operand, jaxpr) for operand in operands):
             return None
         # A broadcast that repeats elements would read one weight in many places, whose
         # cotangents it sums in the weight's dtype.
@@ -109,10 +110,11 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     called = _inner(eqn, index)
     if called is None:
         return None
-    # The weights the callee binds: each of the call's operands that is a weight, where it is
-    # passed on unchanged.
+    # The weights the callee binds: each of the call's operands that is a weight read by the call
+    # alone, where it is passed on unchanged.
     inner = frozenset(bound[1] for position, operand in enumerate(eqn.invars)
-                      if operand in weights and (bound := _inner(eqn, position)) is not None)
+                      if isinstance(operand, core.Var) and operand in weights and _read_once(operand, jaxpr)
+                      and (bound := _inner(eqn, position)) is not None)
     return _cast_once(called[1], called[0], inner)
 
 
