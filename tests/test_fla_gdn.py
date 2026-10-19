@@ -711,6 +711,21 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
     jax.tree.map(np.testing.assert_array_equal, found, want)
 
 
+@pytest.mark.parametrize("label", sorted(ROUTES))
+def test_both_routes_return_the_operands_common_dtype(label):
+    """One contract whichever route a GPU's row picks: the port (`fla_rule`) and the portable math
+    (`chunk_delta_rule`) return the output in the queries', keys' and values' common dtype, the final
+    memory in at least fp32, and each operand's gradient in its own, at every geometry."""
+    dtypes, width, heads, _, _, _ = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    cotangents = route_cotangents("reverse", operands)
+    common = jnp.result_type(*dtypes)
+    want = [common, jnp.promote_types(common, jnp.float32), *(jnp.dtype(x.dtype) for x in operands)]
+    for rule in (fla_rule, portable):
+        found = [jnp.dtype(x.dtype) for x in through(rule, *cotangents)(*operands)]
+        assert found == want, (rule.__name__, found, want)
+
+
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items() if route[5]))
 def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
