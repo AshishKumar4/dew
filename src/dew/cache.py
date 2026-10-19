@@ -228,16 +228,12 @@ def persist_compilations() -> None:
     """
     if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    directory = default_compilation_cache_dir()
-    if _pool_size() > 1 and not _shared_by_pool(directory):
-        return
-    enable_compilation_cache(directory)
-
-
-def _pool_size() -> int:
     from dew.coordination import pool_size
 
-    return pool_size()
+    directory = default_compilation_cache_dir()
+    if pool_size() > 1 and not _shared_by_pool(directory):
+        return
+    enable_compilation_cache(directory)
 
 
 @functools.cache
