@@ -400,6 +400,10 @@ class StepLaunch(tuning.KernelOp):
             return (pl.BlockSpec((None, 1), lambda r, h, c: (r, h)) if rows
                     else pl.BlockSpec((1,), lambda r, h, c: (h,)))
 
+        def keyed_by_value(array):
+            """The program's value head's `[rows, Hv, Dk]` block, `[Dk]`."""
+            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
+
         held_state = pl.BlockSpec((None, None, key_width, block), lambda r, h, c: (r, h, 0, c))
         specs = {
             'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole, 'query': keyed, 'key': keyed,
@@ -407,8 +411,7 @@ class StepLaunch(tuning.KernelOp):
             'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
             'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
             'skip': functools.partial(one, rows=False),
-            'log_decay': (lambda array: pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
-                          if hooks.decay == 'vector' else functools.partial(one, rows=True)),
+            'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
         }
         in_specs = [pl.BlockSpec((None, 1), lambda r, h, c: (r, 0)), *(specs[name](given[name]) for name in given)]
         out_specs = [held_state]
