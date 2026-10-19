@@ -36,9 +36,9 @@ print(json.dumps({"shared": kernel.metadata.shared}))
 def _triton_text(calls: list[TritonCall]) -> list[str]:
     """Each call's Triton IR as text, without debug locations."""
     # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
-    from jax._src.interpreters import mlir
-    from jax._src.lib.triton import dialect
+    from jax.interpreters import mlir
     from jaxlib.mlir import ir
+    from jaxlib.triton import dialect
 
     context = mlir.make_ir_context()
     dialect.register_dialect(context)
