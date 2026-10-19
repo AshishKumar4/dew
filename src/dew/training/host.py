@@ -191,8 +191,8 @@ def place_held[TreeT](tree: TreeT, like: TreeT) -> TreeT:
     """A tree `hold_on_host` held put back on the devices, each array where `like`'s matching one is."""
     def place(value, target):
         if isinstance(value, _HeldKey):
-            data = place_leaf(value.data, jax.random.key_data(target).sharding)
-            return jax.random.wrap_key_data(data, impl=value.impl)
+            bits = place_leaf(value.data, jax.random.key_data(target).sharding)
+            return jax.random.wrap_key_data(bits, impl=value.impl)
         return place_leaf(value, target.sharding) if isinstance(value, Held) else value
     return jax.tree.map(place, tree, like, is_leaf=lambda leaf: isinstance(leaf, (Held, _HeldKey)))
 
