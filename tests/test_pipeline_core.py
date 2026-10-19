@@ -283,8 +283,8 @@ def test_an_unnamed_member_draws_by_its_content_wherever_a_host_mounts_it(tmp_pa
         directory.mkdir()
         (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
         chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
-        return compile(mix([chain.repeat(1), Pipeline(source(4)).map(Member(1)).repeat(1)]).batch(4),
-                       read="memory", loading=READ, seed=5)
+        other = Pipeline(source(4)).map(Member(1)).random_map(Draw())
+        return compile(mix([chain.repeat(1), other.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
 
     here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
     assert here.plan.identity() == there.plan.identity()
@@ -302,7 +302,8 @@ def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
     def mixed(name):
-        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(), Pipeline(source(4)).repeat()]
+        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(),
+                   Pipeline(source(4)).random_map(Draw()).repeat()]
         return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
 
     stream = mixed("first").train(DataPartition())
