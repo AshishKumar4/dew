@@ -351,6 +351,25 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
+def projected_parts(params: Variables, owners: Mapping[str, object], *, updated: bool) -> Variables:
+    """`params` with each part `owners` names projected by its owner's constraint
+    (`dew.nn.protocols.ProjectsParameters`, which an objective's `projected` also
+    answers), where the tree holds that part and the owner declares one; the rest
+    as they are. The projection of an objective that nests several networks'
+    parameters under their names (`joined`)."""
+    return {name: owners[name].projected(tree, updated=updated)
+            if isinstance(owners.get(name), ProjectsParameters) else tree
+            for name, tree in params.items()}
+
+
+def projected_draw(owner: object, variables: Variables) -> Variables:
+    """A freshly drawn tree as training stores it: its parameters projected once by
+    `owner`'s constraint (`updated=True`), as is where it declares none."""
+    if not isinstance(owner, ProjectsParameters) or "params" not in variables:
+        return variables
+    return {**variables, "params": owner.projected(variables["params"], updated=True)}
+
+
 def joined(parts: Mapping[str, Variables]) -> Variables:
     """Nest each module's tree under its name in every collection it holds;
     the inverse of `part`."""
@@ -671,8 +690,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is not None and "params" in held:
             tree = held
         elif held is None or self._held_parts:
-            tree = self.fresh_variables(key, held)
-            tree = {**tree, "params": self.projected(tree["params"], updated=True)}
+            tree = projected_draw(self, self.fresh_variables(key, held))
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
@@ -923,10 +941,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         projected by the model's constraint (`dew.nn.protocols.ProjectsParameters`), as is where the
         model declares none.
 
-        The trainer's commit applies the step's update to `projected(params, updated=False)`, which
-        the optimizer sees, and stores `projected(updated, updated=True)`; a freshly drawn tree is
-        projected once with `updated=True`. The default projects the `model` this objective trains;
-        an objective that trains several networks projects each one's own tree."""
+        A step's forward reads `projected(params, updated=False)`, and its update applies to them,
+        which the optimizer sees; the step stores the updated ones `projected(..., updated=True)`.
+        A freshly drawn tree is projected once with `updated=True` (`projected_draw`). The default
+        projects the `model` this objective trains; an objective that trains several networks
+        projects each one's own tree (`projected_parts`)."""
         model = vars(self).get("model")
         return model.projected(params, updated=updated) if isinstance(model, ProjectsParameters) else params
 
