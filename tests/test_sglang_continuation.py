@@ -38,6 +38,8 @@ SPECIAL = (NATIVE, EOS)
 CONTEXT = 5
 """How many prompt ids SGLang decodes a draw after (`INIT_INCREMENTAL_DETOKENIZATION_OFFSET`)."""
 VOCABULARY = 10
+TEMPLATE_HEAD = [9, 9]
+"""The ids a server's completion template puts before a token row."""
 POLICY = Sampling(eos_token_ids=EOS)
 
 
@@ -93,8 +95,8 @@ class SGLang:
     model ending a draw on `NATIVE` where `own_eos`; every request it answered is in `requests`
     with its headers."""
 
-    def __init__(self, own_eos=True, asynchronous=False):
-        self.own_eos, self.asynchronous, self.requests = own_eos, asynchronous, []
+    def __init__(self, own_eos=True, asynchronous=False, template=False):
+        self.own_eos, self.asynchronous, self.template, self.requests = own_eos, asynchronous, template, []
         self.unseeded = np.random.default_rng(0)
 
     def __call__(self, request):
@@ -109,14 +111,18 @@ class SGLang:
                                               else decoded(tokens, skip)})
         chat = path.endswith("/chat/completions")
         budget = body.get("max_completion_tokens" if chat else "max_tokens")
-        prompts = [[9, 9]] if chat else [list(row) for row in body["prompt"]]
+        asked = [[9, 9]] if chat else [list(row) for row in body["prompt"]]
+        # A completion template the server holds wraps each token row, as SGLang's may, unless
+        # the request's empty suffix passes it through as it is.
+        prompts = asked if chat or body.get("suffix") == "" or not self.template else [
+            [*TEMPLATE_HEAD, *row] for row in asked]
         adapters = body.get("lora_path")
         n = body.get("n", 1)
         choices = []
         for index in range(len(prompts) * n):
             row = index // n
             adapter = adapters[row] if isinstance(adapters, list) else adapters
-            choices.append(self.draw(index, prompts[row], adapter, body, budget))
+            choices.append({**self.draw(index, prompts[row], adapter, body, budget), "asked": asked[row]})
         if body.get("stream"):
             return self.stream(choices, chat, body)
         produced = sum(len(choice["ids"]) for choice in choices)
@@ -160,7 +166,7 @@ class SGLang:
         if choice["matched"] is not None and not body.get("no_stop_trim"):
             ids = ids[:-1]
         text = generated(choice["prompt"], ids, body.get("skip_special_tokens", True))
-        return decoded(choice["prompt"]) + text if body.get("echo") else text
+        return decoded(choice["asked"]) + text if body.get("echo") else text
 
     def rendered(self, choice, chat, body):
         if chat:
@@ -194,8 +200,8 @@ class SGLang:
                                headers={"Content-Type": "text/event-stream"})
 
 
-def sglang(own_eos=True, asynchronous=False):
-    engine = SGLang(own_eos, asynchronous)
+def sglang(own_eos=True, asynchronous=False, template=False):
+    engine = SGLang(own_eos, asynchronous, template)
     if asynchronous:
         async def answer(request):
             await request.aread()
@@ -330,11 +336,13 @@ def test_a_control_a_continuation_cannot_carry_is_refused_where_a_draw_needs_one
     assert completion([[1]], 8, key=0, sampling=stopping, **fields).tokens
 
 
-def test_an_echoed_prompt_heads_the_continued_draw_as_sglang_writes_it():
-    """An echoed prompt heads each choice's text, a token row decoded with special tokens skipped:
-    a draw that goes on is the policy's own engine's, echo included."""
-    completion, engine = sglang()
-    reference, _ = sglang(own_eos=False)
+@pytest.mark.parametrize("template", [False, True])
+def test_an_echoed_prompt_heads_the_continued_draw_as_sglang_writes_it(template):
+    """An echoed prompt heads each choice's text, the request's own token row decoded with special
+    tokens skipped, not the model prompt a server's completion template made of it: a draw that
+    goes on is the policy's own engine's, echo included."""
+    completion, engine = sglang(template=template)
+    reference, _ = sglang(own_eos=False, template=template)
     continued = 0
     for key in range(12):
         engine.requests.clear()
@@ -344,13 +352,14 @@ def test_an_echoed_prompt_heads_the_continued_draw_as_sglang_writes_it():
     assert continued >= 3 and all("echo" not in body for body in completions(engine)[1:])
 
 
-def test_an_owed_minimum_output_is_refused_before_a_draw():
-    """SGLang masks its model's own EOS ids beside the requested stops while min_tokens is owed, ids
-    the policy draws as any other, so a request owing one is refused before it is sent, on every
-    route."""
+@pytest.mark.parametrize("policy", [POLICY, Sampling()])
+def test_an_owed_minimum_output_is_refused_before_a_draw(policy):
+    """SGLang masks its model's own EOS ids while min_tokens is owed, ids the policy draws as any
+    other, and a policy with no stop ids of its own too, so a request owing one is refused before it
+    is sent, on every route."""
     completion, engine = sglang()
-    for draw in (lambda: completion([[1]], 8, key=0, sampling=POLICY, extra_body={"min_tokens": 2}),
-                 lambda: completion.chat([{"role": "user", "content": "hi"}], 8, key=0, sampling=POLICY,
+    for draw in (lambda: completion([[1]], 8, key=0, sampling=policy, extra_body={"min_tokens": 2}),
+                 lambda: completion.chat([{"role": "user", "content": "hi"}], 8, key=0, sampling=policy,
                                          extra_body={"min_tokens": 2})):
         with pytest.raises(ValueError):
             draw()

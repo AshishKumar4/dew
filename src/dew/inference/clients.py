@@ -596,12 +596,12 @@ class OpenAICompletion:
         its stop ids are not all a draw ends on; None on another engine or a policy without stop ids.
         Raises `ValueError` for a request that cannot draw the policy there (`OwnStops.refusal`)."""
         sampling = parameters.get("sampling")
-        if self.provider != "sglang" or not isinstance(sampling, Sampling) or not sampling.stops:
+        if self.provider != "sglang" or not isinstance(sampling, Sampling):
             return None
         own = OwnStops(frozenset(sampling.stops), budget)
         if (refusal := own.refusal(fields)) is not None:
             raise ValueError(refusal)
-        return own
+        return own if sampling.stops else None
 
     def _answered(self, responses: list[OpenAIResponse]) -> Callable[[Call], JSON]:
         """Each request a continuation sends (`continuation.Call`), answered on the sync client: a

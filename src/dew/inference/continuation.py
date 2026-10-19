@@ -163,13 +163,14 @@ class OwnStops:
 
     def refusal(self, request: Request) -> str | None:
         """Why `request` cannot draw the policy on SGLang whatever it draws, or None: an owed
-        minimum output, while which SGLang masks its model's own EOS ids beside the policy's
-        (penaltylib/min_new_tokens.py), ids the policy draws as any other."""
+        minimum output, while which SGLang masks its model's own EOS ids (penaltylib/
+        min_new_tokens.py), ids a policy draws as any other where its stops leave them out, a
+        policy with no stops of its own among them."""
         least = _effective(request).get("min_tokens")
         if least in (None, 0):
             return None
-        return (f"min_tokens={least!r} masks SGLang's model EOS ids as well as the policy's stops while "
-                "it is owed, and the policy draws those ids as any other; drop min_tokens or draw on vLLM")
+        return (f"min_tokens={least!r} masks SGLang's model EOS ids while it is owed, and the policy "
+                "draws those ids as any other; drop min_tokens or draw on vLLM")
 
     def ended_outside(self, reason: JSON, matched: JSON) -> bool:
         """Whether SGLang ended a choice on an id of its own the policy's stops leave out."""
@@ -232,10 +233,11 @@ class OwnStops:
                 "tokens": [context, [*context, *(ids[:-1] if trimmed else ids)]],
                 "skip_special_tokens": _switch(fields, "skip_special_tokens", default=True)}
 
-    def echoed(self, request: Request, index: int, prompt: Sequence[int]) -> Call | str | None:
+    def echoed(self, request: Request, index: int) -> Call | str | None:
         """What a continued choice's text starts with where `request` echoes its prompt, as SGLang
-        writes it (serving_completions.py `_prepare_echo_prompts`): a text prompt's row itself, or
-        the request to decode a token row with special tokens skipped; None without echo."""
+        writes it (serving_completions.py `_prepare_echo_prompts`): the request's own prompt row,
+        not the model prompt a completion template may have made of it, its text as it is or its
+        token ids decoded with special tokens skipped; None without echo."""
         fields = _effective(request)
         if not _switch(fields, "echo", default=False):
             return None
@@ -243,13 +245,15 @@ class OwnStops:
         row = index // (samples if isinstance(samples, int) and samples > 0 else 1)
         if isinstance(prompts, str):
             return prompts
-        if isinstance(prompts, list) and prompts and isinstance(prompts[0], str):
-            text = prompts[row]
-            if not isinstance(text, str):
-                raise ValueError("a batch of text prompts must hold text")
-            return text
+        if not isinstance(prompts, list) or not prompts:
+            raise ValueError("an echoed request needs its prompt")
+        chosen = prompts if isinstance(prompts[0], int) else prompts[row]
+        if isinstance(chosen, str):
+            return chosen
+        if not isinstance(chosen, list) or any(type(token) is not int for token in chosen):
+            raise ValueError("a prompt row is text or token ids")
         return "detokenize", {**{name: request[name] for name in TRANSPORT if name in request},
-                              "model": request.get("model"), "tokens": list(prompt),
+                              "model": request.get("model"), "tokens": list(chosen),
                               "skip_special_tokens": True}
 
     def completed(self, payload: JSON, request: Request) -> Plan[JSON]:
@@ -288,7 +292,7 @@ class OwnStops:
                 # SGLang's own offset, not a prefix match: a prompt's broken UTF-8 tail can read
                 # otherwise once the draw completes it.
                 text = whole[len(context):]
-                echo = self.echoed(request, index if type(index) is int else 0, prompt)
+                echo = self.echoed(request, index if type(index) is int else 0)
                 if isinstance(echo, tuple):
                     echo = _record((yield echo), "detokenized echo").get("text")
                     if not isinstance(echo, str):
