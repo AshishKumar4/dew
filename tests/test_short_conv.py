@@ -278,9 +278,9 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
             got, got_grads = kernels(x, weights)
         labels = ("q", "k", "v", "dx", "dtaps")
         # The gradients of the projection and the taps; there is no bias.
-        for label, mine, theirs, value, summed in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                                      (*exact, *exact_grads[:2]), (*terms, *grad_terms[:2]),
-                                                      strict=True):
+        sides = ((*got, *got_grads[:2]), (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
+                 (*terms, *grad_terms[:2]))
+        for label, mine, theirs, value, summed in zip(labels, *sides, strict=True):
             assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}", terms=summed)
 
 
