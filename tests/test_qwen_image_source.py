@@ -21,7 +21,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays, scaled_gap as relative_gap
+from interop_support import extract_fixture, fixture_arrays
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
@@ -80,23 +81,25 @@ def qwen_walk(source, arrays, record, name: str):
 @pytest.mark.parametrize("name", CASES)
 def test_native_qwen_image_matches_the_source_forward_and_every_gradient(
         name, source, arrays, record):
-    """The source at the suite's fixed bounds: 1e-5 scaled error on the
-    prediction, 1e-4 on every gradient, every parameter included."""
+    """The prediction, the latent's and the prompt's gradients and every
+    parameter's, each as near float64 as the source's float32."""
     rows, columns = record["cases"][name]["grid"]
     output, (grad_params, grad_latent, grad_context), layouts = qwen_walk(
         source, arrays, record, name)
-    assert relative_gap(output, nhwc(arrays[f"{name}.output"], rows, columns)) < 1e-5
-    assert relative_gap(grad_latent, nhwc(arrays[f"{name}.grad_packed"], rows, columns)) < 1e-4
-    assert relative_gap(grad_context, arrays[f"{name}.grad_context"]) < 1e-4
-    gaps = {}
+    for key, value, layout in (("output", output, True), ("grad_packed", grad_latent, True),
+                               ("grad_context", grad_context, False)):
+        expected, truth = (arrays[f"{name}.{kind}{key}"] for kind in ("", "fp64."))
+        if layout:
+            expected, truth = nhwc(expected, rows, columns), nhwc(truth, rows, columns)
+        assert_as_exact_as_the_reference(value, expected, truth, f"{name} {key}")
     prefix = f"{name}.grad_param."
-    for key in (key for key in arrays if key.startswith(prefix)):
-        tensor = key.removeprefix(prefix)
-        gaps[tensor] = relative_gap(layouts[f"transformer/{tensor}"].export({"params": grad_params}),
-                                    arrays[key])
-    assert len(gaps) == len(layouts) == 27
-    worst = max(gaps.items(), key=lambda item: item[1])
-    assert worst[1] < 1e-4, worst
+    tensors = [key.removeprefix(prefix) for key in arrays if key.startswith(prefix)]
+    assert len(tensors) == len(layouts) == 27
+    assert_leaves_as_exact(
+        {tensor: np.asarray(layouts[f"transformer/{tensor}"].export({"params": grad_params}))
+         for tensor in tensors},
+        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
+        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
 
 
 def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
@@ -116,7 +119,9 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     np.testing.assert_allclose(run(filled), run(context), atol=1e-6)
     # Without the mask the short row reads its padding as prompt.
     unmasked = model.apply({"params": params}, latent, times, DenoisingCondition(jnp.asarray(context)))
-    assert relative_gap(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1]) > 1e-3
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1],
+                                         nhwc(arrays["padded.fp64.output"], rows, columns)[1], "unmasked")
 
 
 @pytest.mark.gpu(reason="needs a cuda device")
@@ -197,7 +202,8 @@ def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded
         length = expected.shape[0]
         np.testing.assert_array_equal(np.asarray(condition.mask[row]),
                                       np.arange(encoder.tokens) < length)
-        assert relative_gap(condition.context[row, :length], expected) < 1e-5
+        assert_as_exact_as_the_reference(condition.context[row, :length], expected,
+                                         arrays[f"pipeline.fp64.context.{row}"][0], f"prompt {row}")
         assert not np.asarray(condition.context[row, length:]).any()
     assert encoder.captions(encoder.tokenize(prompts)) == tuple(prompts)
     # The pipeline encodes an empty prompt as one space.
@@ -246,12 +252,15 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, r
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     for row, prompt in enumerate(pipeline["prompts"]):
-        expected = nhwc(arrays[f"pipeline.latents.{row}"], rows, columns)[0]
-        assert relative_gap(np.asarray(walked.latents)[row], expected) < 2e-5
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5
+        expected, truth = (nhwc(arrays[f"pipeline.{kind}latents.{row}"], rows, columns)[0]
+                           for kind in ("", "fp64."))
+        assert_as_exact_as_the_reference(np.asarray(walked.latents)[row], expected, truth, f"latents {row}")
+        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
+                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")
         alone = task(task.prepare([prompt], initial=initial[row:row + 1], key=0),
                      key=jax.random.PRNGKey(0)).host()
-        assert relative_gap(np.asarray(alone.latents)[0], expected) < 2e-5
+        assert_as_exact_as_the_reference(np.asarray(alone.latents)[0], expected, truth,
+                                         f"latents {row} alone")
 
 
 def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, record, tmp_path):

@@ -6,10 +6,9 @@ instances, saves each with `save_pretrained`, and runs each the way
 latent position; the prompt states; the timestep divided by a thousand; the
 `img_mask` with one image slot per 2x2 group of target tokens appended. It
 records the prediction at the image's tokens and, against a fixed cotangent,
-the gradients of the latent, the prompt states and every parameter, in
-float32. The source's sinusoidal frequency table is replaced by the one
-rounded from float64, which is Dew's; the gap the source's own float32 `exp`
-makes is recorded beside it.
+the gradients of the latent, the prompt states and every parameter,
+unmodified, in float32, the reference, and in float64, the truth
+(`diffusers_wan_reference.float64`: the source's float32 pins widened).
 
 A row padded behind a shorter prompt is recorded as the source's call for
 that prompt alone, which is what each native row reproduces (see
@@ -21,18 +20,18 @@ encoder, the 2.1 VAE, the transformer, the published scheduler config and a
 processor over a byte-level vocabulary carrying the published special tokens
 and chat template - and walks the unmodified pipeline once per prompt from
 fixed latents, recording the prompt states, the walked latents and the
-decoded images.
+decoded images, the same two ways.
 
 Run in the isolated reference environment on CPU (torch 2.14.0, transformers
 5.17.0, diffusers at 6256aa7666cedd47443adc8f82da9a10e110b09c):
 
     python tools/diffusers_qwen_image_reference.py OUTPUT_DIR
     python tools/diffusers_qwen_image_reference.py bundle OUTPUT_DIR tests/fixtures/qwen_image_source.tar.xz
-    python tools/diffusers_qwen_image_reference.py reload EXPORT_DIR RECORDED.npz
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -40,7 +39,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import frequency_exponent, perturb, saved_pipeline, torch_exp_disagreements
+from diffusers_reference_helpers import perturb, saved_pipeline
+from diffusers_wan_reference import float64
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
@@ -76,14 +76,6 @@ CASES: dict[str, Case] = {
 }
 
 
-def rounded_frequencies(model) -> None:
-    """Replace the source's float32 `exp` frequency table with the one rounded
-    once from float64, which Dew builds on the host."""
-    projector = model.time_text_embed.time_proj
-    half = projector.timestep_dim // 2
-    projector.freqs = torch.exp(frequency_exponent(half, 0, 10000).double()).float()
-
-
 def transformer_call(model, packed, context, times, grid, mask=None):
     """The pipeline's own call for text-to-image: the target's image slots
     follow the prompt in `img_mask`, and the prediction is the last tokens."""
@@ -97,7 +89,9 @@ def transformer_call(model, packed, context, times, grid, mask=None):
     return output[:, -rows * columns:]
 
 
-def build(name: str, case: Case, root: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
+    """The case's saved transformer and its walk in float32 and, widened, in
+    float64 (`fp64.`)."""
     from diffusers import QwenImage21Transformer2DModel
 
     config = {**BASE, **case.config}
@@ -119,40 +113,35 @@ def build(name: str, case: Case, root: Path) -> tuple[dict[str, np.ndarray], dic
     context = context * mask[..., None]
     times = torch.tensor(case.times, dtype=torch.float32)
     probe = torch.randn((batch, rows * columns, config["out_channels"]), generator=generator)
-    named = list(model.named_parameters())
 
-    def walk():
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        named = list(model.named_parameters())
         outputs, grad_packed, grad_context = [], [], []
         grad_params = [torch.zeros_like(value) for _, value in named]
         for row, length in enumerate(case.lengths):
-            latent = packed[row:row + 1].clone().requires_grad_(True)
-            text = context[row:row + 1, :length].clone().requires_grad_(True)
-            output = transformer_call(model, latent, text, times[row:row + 1], case.grid)
-            gradients = torch.autograd.grad((output * probe[row:row + 1]).sum(),
+            latent = packed[row:row + 1].clone().to(dtype).requires_grad_()
+            text = context[row:row + 1, :length].clone().to(dtype).requires_grad_()
+            output = transformer_call(model, latent, text, times[row:row + 1].to(dtype), case.grid)
+            gradients = torch.autograd.grad((output * probe[row:row + 1].to(dtype)).sum(),
                                             [latent, text] + [value for _, value in named])
             outputs.append(output.detach())
             grad_packed.append(gradients[0])
             grad_context.append(torch.nn.functional.pad(gradients[1], (0, 0, 0, tokens - length)))
             for index, gradient in enumerate(gradients[2:]):
                 grad_params[index] += gradient
-        return (torch.cat(outputs).numpy(), torch.cat(grad_packed).numpy(),
-                torch.cat(grad_context).numpy(), [gradient.numpy() for gradient in grad_params])
+        return {"output": torch.cat(outputs).numpy(), "grad_packed": torch.cat(grad_packed).numpy(),
+                "grad_context": torch.cat(grad_context).numpy(),
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, grad_params, strict=True)}}
 
-    _, _, _, unmodified = walk()
-    rounded_frequencies(model)
-    output, grad_packed, grad_context, grads = walk()
-    arrays = {"packed": packed.numpy(), "context": context.numpy(), "mask": mask.numpy(),
-              "times": times.numpy(), "output": output, "probe": probe.numpy(),
-              "grad_packed": grad_packed, "grad_context": grad_context}
-    gaps = {}
-    for (key, _), gradient, theirs in zip(named, grads, unmodified, strict=True):
-        arrays[f"grad_param.{key}"] = gradient
-        gaps[key] = float(np.abs(gradient - theirs).max() / max(1.0, float(np.abs(gradient).max())))
-    tensor, gap = max(gaps.items(), key=lambda item: item[1])
-    print(f"{name}: grid {case.grid} lengths {case.lengths} |output| <= "
-          f"{float(np.abs(output).max()):.4g} parameters {len(named)}; torch's own exp moves "
-          f"{tensor} by {gap:.3g}")
-    return arrays, {"tensor": tensor, "gap": gap}
+    narrow = walk(model, torch.float32)
+    with float64():
+        wide = walk(copy.deepcopy(model).double(), torch.float64)
+    print(f"{name}: grid {case.grid} lengths {case.lengths} "
+          f"|output| <= {float(np.abs(narrow['output']).max()):.4g}")
+    return {"packed": packed.numpy(), "context": context.numpy(), "mask": mask.numpy(),
+            "times": times.numpy(), "probe": probe.numpy(), **narrow,
+            **{f"fp64.{key}": value for key, value in wide.items()}}
 
 
 # The pipeline half.
@@ -233,57 +222,36 @@ def build_pipeline(root: Path):
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
+    """Each prompt's states and the unmodified call's walk from fixed latents,
+    in float32 and, the pipeline widened, in float64 (`fp64.`)."""
     pipe = build_pipeline(root)
-    rounded_frequencies(pipe.transformer)
     rows, columns = HEIGHT // 16, WIDTH // 16
     generator = torch.Generator().manual_seed(SEED + 9)
-    arrays: dict[str, np.ndarray] = {}
     latents = torch.randn((len(PROMPTS), rows * columns, PIPELINE["in_channels"]),
                           generator=generator)
-    arrays["pipeline.x_T"] = latents.numpy()
-    for row, prompt in enumerate(PROMPTS):
-        with torch.no_grad():
-            embeds, mask, slots = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
-            walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH,
-                          latents=latents[row:row + 1].clone(), output_type="latent").images
-            images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH,
-                          latents=latents[row:row + 1].clone(), output_type="np").images
-        assert mask is None and not bool(slots.any())
-        arrays[f"pipeline.context.{row}"] = embeds.numpy()
-        arrays[f"pipeline.latents.{row}"] = walked.numpy()
-        arrays[f"pipeline.images.{row}"] = images
-        print(f"pipeline {prompt!r}: context {tuple(embeds.shape)} latents {tuple(walked.shape)} "
-              f"images {images.shape}")
-    return arrays
 
+    def walk(pipe, dtype) -> dict[str, np.ndarray]:
+        arrays = {}
+        for row, prompt in enumerate(PROMPTS):
+            start = latents[row:row + 1].to(dtype)
+            with torch.no_grad():
+                embeds, mask, slots = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
+                walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
+                              output_type="latent").images
+                images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
+                              output_type="np").images
+            assert mask is None and not bool(slots.any())
+            arrays.update({f"context.{row}": embeds.numpy(), f"latents.{row}": walked.numpy(),
+                           f"images.{row}": images})
+        return arrays
 
-def reload(directory: str, recorded: str) -> None:
-    """Read a native export with the actual source classes.
-
-    `directory` is a directory Dew wrote after a native training step and
-    `recorded` the arrays that step left behind. The pipeline is loaded from
-    those files and the actual transformer recomputes the native forward
-    with the trained weights, and the actual text encoder the prompt states.
-    """
-    from diffusers import QwenImage21Pipeline
-
-    arrays = np.load(recorded)
-    pipe = QwenImage21Pipeline.from_pretrained(directory, torch_dtype=torch.float32,
-                                               local_files_only=True)
-    rounded_frequencies(pipe.transformer)
-    grid = tuple(int(size) for size in arrays["grid"])
-    with torch.no_grad():
-        output = transformer_call(pipe.transformer.eval(), torch.from_numpy(arrays["packed"]),
-                                  torch.from_numpy(arrays["context"]),
-                                  torch.from_numpy(arrays["times"]), grid)
-    native = arrays["native"]
-    gap = float(np.abs(output.numpy() - native).max() / max(1.0, float(np.abs(native).max())))
-    trained = float(np.abs(pipe.transformer.proj_out.weight.detach().numpy().T
-                           - arrays["proj_out"]).max())
-    print(f"reimported forward gap {gap:.3g}; trained kernel gap {trained:.3g}")
-    if not (gap < 1e-5 and trained == 0.0):
-        raise SystemExit("the source did not read the native update")
-    print("the source reads the native update")
+    narrow = walk(pipe, torch.float32)
+    with float64():
+        wide = walk(copy.deepcopy(pipe).to(torch.float64), torch.float64)
+    print(f"pipeline: context {narrow['context.0'].shape} latents {narrow['latents.0'].shape} "
+          f"images {narrow['images.0'].shape}")
+    return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
+            **{f"pipeline.fp64.{key}": value for key, value in wide.items()}}
 
 
 def main(destination: str) -> None:
@@ -302,17 +270,14 @@ def main(destination: str) -> None:
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
     for name, case in CASES.items():
-        built, unmodified = build(name, case, root)
-        arrays.update({f"{name}.{key}": value for key, value in built.items()})
+        arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
         cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
-                       "lengths": list(case.lengths), "times": list(case.times),
-                       "unmodified_exp_gap": unmodified}
+                       "lengths": list(case.lengths), "times": list(case.times)}
     arrays.update(pipeline_record(root))
     defaults = inspect.signature(QwenImage21Pipeline.__call__).parameters
     record = {"diffusers": diffusers.__version__, "diffusers_commit": DIFFUSERS_COMMIT,
               "transformers": transformers.__version__, "torch": torch.__version__,
               "base": BASE, "cases": cases,
-              "torch_exp_off_by_one_ulp": {"entries": 128, "count": torch_exp_disagreements(128)},
               "pipeline": {"config": PIPELINE, "vae": VAE, "prompts": PROMPTS,
                            "height": HEIGHT, "width": WIDTH,
                            "default_steps": defaults["num_inference_steps"].default,
@@ -328,7 +293,5 @@ if __name__ == "__main__":
         from diffusers_dc_ae_reference import bundle
 
         bundle(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) > 3 and sys.argv[1] == "reload":
-        reload(sys.argv[2], sys.argv[3])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-qwen-image-reference")
