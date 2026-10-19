@@ -44,7 +44,7 @@ from etils import epath
 
 import dew.io
 from dew import registry
-from dew.cache import default_compilation_cache_dir, dew_cache_dir
+from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -64,6 +64,7 @@ from dew.registry import (
     datasets,
     declared_type,
     from_record,
+    metrics,
     models,
     objectives,
     parameter_type,
@@ -239,6 +240,48 @@ class ObjectiveConfig:
         return objectives.build(self.name, self.arguments, **derived)
 
 
+@dataclasses.dataclass(frozen=True)
+class MetricConfig:
+    """A metric's class and the arguments the run gives it.
+
+    `name` is an alias of `dew.registry.metrics` or an import path, held as
+    the path. `fields` are the constructor arguments the run states, as
+    `ObjectiveConfig` holds an objective's: a CLIP metric's `modelname`, an
+    FID's `weights`. `defaults` holds every other argument the class defaults,
+    so a metric whose default model changes later scores a recorded run as it
+    did.
+    """
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks takes the class's default now."""
+
+    def __post_init__(self) -> None:
+        member = _metric_class(self.name)
+        object.__setattr__(self, "name", registry.import_path(member))
+        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    def build(self, **derived) -> Metric:
+        """Build the metric from its arguments and those the run `derived`
+        where it states none of its own (the field a video run's sample
+        is read from, say)."""
+        unstated = {name: value for name, value in derived.items() if name not in self.fields}
+        arguments = _arguments(_metric_class(self.name), self.fields, self.defaults)
+        return metrics.build(self.name, arguments, **unstated)
+
+
+def _metric_class(name: str) -> type:
+    """The metric class `name` names, an alias or import path: a run's metric is a class, whose
+    arguments its record holds."""
+    member = metrics[name]
+    if not isinstance(member, type):
+        raise TypeError(f"{name!r} names {member!r}, which is no metric class")
+    return member
+
+
 def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
     `given` over the member's defaults, and the value each flag starts at.
@@ -281,8 +324,10 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
 def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
     """Each field `_member_flags` flags: its name, its default
     (`dataclasses.MISSING` for none) and its annotation (None where its
-    module cannot resolve it)."""
-    if isinstance(member, type) and dataclasses.is_dataclass(member):
+    module cannot resolve it). A dataclass with a constructor of its own (a
+    metric over its base's fields) has that constructor's arguments, as the
+    registry builds it (`registry.record_class`)."""
+    if registry.record_class(member) is not None:
         for field in dataclasses.fields(member):
             if field.init and field.name not in ("parent", "name"):
                 default = (field.default_factory() if callable(field.default_factory) else field.default)
@@ -675,11 +720,12 @@ class TrainerConfig:
 
     Unset traces nothing.
     """
-    compilation_cache_dir: str | None = dataclasses.field(
-        default_factory=default_compilation_cache_dir)
-    """The directory for a persistent XLA cache, so a restart skips recompiling the step.
+    compilation_cache_dir: str | None = None
+    """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
 
-    None compiles from scratch every run.
+    None caches under the user's cache directory wherever the run's processes share it
+    (`dew.training.runtime.ready_process`); a pool across hosts without shared storage names one
+    they share. JAX_ENABLE_COMPILATION_CACHE=false compiles from scratch every run.
     """
     wandb: Wandb | None = None
     """An optional W&B telemetry sink, in addition to the local tracking journal.
@@ -1358,5 +1404,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared", "RunConfig",
-           "ScheduleSpec", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
+           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]

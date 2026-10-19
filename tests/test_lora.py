@@ -1034,7 +1034,7 @@ def _recipe_run(tmp_path, image_size, *args):
                 str(image_size),
         "--data.validation", "None", "--objective.solver",
         '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
-        "--objective.ema-decay", "None", "--val-metrics",
+        "--objective.ema-decay", "None", "--val-metrics", "[]",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
