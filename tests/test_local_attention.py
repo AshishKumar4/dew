@@ -171,6 +171,33 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
 
 
 @pytest.mark.mesh(devices=2)
+def test_chunks_from_a_shared_vector_of_places_split_over_an_explicit_sequence_axis():
+    """Places given as one `[S]` vector the rows share, from 2, split over an Explicit sequence axis
+    with the tokens: the chunks are cut from the given origin, as on one device, the vector counted as
+    a row (`counted_places`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length = 16
+    query, key, value = inputs(length, batch=1)
+    positions = jnp.arange(length) + 2
+    rows = np.arange(length)
+    keep = (rows[None, :] <= rows[:, None]) & ((rows[:, None] + 2) // 4 == (rows[None, :] + 2) // 4)
+    truth = dense_reference(query, key, value, keep[None])
+
+    def attend(q, k, v, positions):
+        return local_attention(q, k, v, chunk=4, places=counted_places(positions=positions), implementation="xla")
+
+    alone = attend(query, key, value, positions)
+    mesh = MeshSpec(sequence=2, explicit=("sequence",)).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence"))) for x in (query, key, value)]
+        split = jax.jit(attend)(*placed, jax.device_put(positions, NamedSharding(mesh, PartitionSpec("sequence"))))
+    assert_as_exact_as_the_reference(np.asarray(split), np.asarray(alone), truth, "shared places split")
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis():
     """Split over a sequence axis, a row with padding among its tokens still runs its window
     banded, on its real tokens compacted: its temporaries a fraction of the dense windowed call's
