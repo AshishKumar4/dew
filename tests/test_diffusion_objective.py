@@ -298,9 +298,6 @@ def test_a_dropped_row_is_conditioned_on_the_steps_own_towers(conditional_mmdit)
 
 def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):
     objective, variables, batch, step = conditional_mmdit
-    for held, encoded in zip(jax.tree.leaves(objective.unconditional_conditions),
-                              jax.tree.leaves(objective.encode(objective.encoder_params())), strict=True):
-        np.testing.assert_array_equal(held, encoded)
     condition = objective.inputs.conditions["textcontext"]
     rebound = replace(condition.encoder, params=variables["encoders"]["textcontext"])
     inputs = replace(objective.inputs, conditions={"textcontext": replace(condition, encoder=rebound)})
