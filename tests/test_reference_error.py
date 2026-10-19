@@ -11,12 +11,12 @@ from reference_error import (
     ORDERS_DIR,
     ORDERS_REQUESTED,
     assert_as_exact_as_the_reference,
+    assert_elements_as_exact_over_orders,
     assert_leaves_as_exact,
     assert_leaves_as_exact_in_two_stages,
-    assert_elements_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
-    element_factor,
     distance,
+    element_factor,
     reduce,
 )
 
