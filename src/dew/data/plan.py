@@ -72,7 +72,7 @@ class StepIdentity:
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @classmethod
-    def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
+    def of(cls, step: object, identity: str | None = None) -> StepIdentity:
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -82,10 +82,6 @@ class StepIdentity:
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
         exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
-        if cache and (
-            not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
-        ):
-            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
@@ -105,6 +101,16 @@ class StepIdentity:
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
         return cls(name, config, exact, modules, declared, dependencies)
+
+    @classmethod
+    def keyed(cls, step: object, identity: str | None = None) -> bool:
+        """Whether a cache can key what `step` computes: a stable identity,
+        declared wherever its code is a function or outside Dew, which Dew's
+        revision does not name."""
+        named = cls.of(step, identity)
+        function = inspect.isfunction(step)
+        external = not (step if function else type(step)).__module__.startswith("dew.")
+        return named.exact and not ((external or function) and named.declared is None)
 
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its

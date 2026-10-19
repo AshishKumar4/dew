@@ -170,7 +170,8 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     (`Manifest.semantic`); the code and machine that filled it
     (`Manifest.environment`) do not change them. A step bound to the whole
     run's facts (scope='run') binds to another run's facts in a generation
-    than in this run, so no generation stands for one."""
+    than in this run, and a step no cache can key (`_keyed`) is in no
+    generation's prefix, so no generation stands for either."""
     from dew.data.holdout import rebased, selecting
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
@@ -184,10 +185,11 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
                    and json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
     if stored is None:
         return None, ("source",)
-    run = next((stage for stage in prefix if isinstance(stage, Configured) and stage.scope == "run"), None)
-    if run is not None:
-        raise ValueError(f"generation {generation.url} cannot stand for {_identity(run).name}, which binds "
-                         "to the whole run's facts (scope='run'); cache before it")
+    unkeyed = [_identity(stage).name for stage in prefix if not _keyed(stage)
+               or (isinstance(stage, Configured) and stage.scope == "run")]
+    if unkeyed:
+        return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
+                      "identity='name@version', which no generation holds)",)
     changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
     if changed:
         return None, changed
@@ -212,9 +214,9 @@ def _standing_in(generation: Generation, pipeline: Pipeline, source: Source | Mi
     replacement, changed = _in_place(generation, source, prefix)
     if replacement is None:
         raise ValueError(
-            f"generation {generation.url} holds rows of another {', '.join(changed)} than the steps before "
-            f"it in {_name(pipeline)} make; cache it after the source and steps it was published from, or "
-            "read it as a source of its own (`Pipeline(generation.source())`)"
+            f"generation {generation.url} does not hold the rows the steps before it in {_name(pipeline)} "
+            f"make: their {', '.join(changed)} differ; cache it after the source and steps it was published "
+            "from, or read it as a source of its own (`Pipeline(generation.source())`)"
         )
     return replacement
 
@@ -400,18 +402,21 @@ def _member_keys(members: Sequence[str]) -> list[str]:
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
-    """What a stage runs, as the plan's manifest and a cache's key record it.
-    A cache stage is its kind alone. The plan names the rows a cache serves
-    by their key (`Cache.reference`), and where the cache lives is no part of
-    the data, so a run resumes against the same rows cached anywhere. A step
-    a `Configured` stage resolved names its factory by what it computes and
+    """What a stage runs, as the plan's manifest and a cache's key record it,
+    refused for a cache's key where none can key it (`_keyed`). A cache stage
+    is its kind alone. The plan names the rows a cache serves by their key
+    (`Cache.reference`), and where the cache lives is no part of the data, so
+    a run resumes against the same rows cached anywhere. A step a
+    `Configured` stage resolved names its factory by what it computes and
     carries the factory's modules after its own."""
+    if cache and not _keyed(stage):
+        raise ValueError(f"cache prefix step {_identity(stage).name} needs identity='name@version'")
     if isinstance(stage, Artifact):
         return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", "", exact=True)
     if isinstance(stage, Configured):
-        return StepIdentity.of(stage.factory, cache=cache)
+        return StepIdentity.of(stage.factory)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
-        identity = StepIdentity.of(stage.step, stage.identity, cache=cache)
+        identity = StepIdentity.of(stage.step, stage.identity)
         if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
             bound = stage.configured
             factory = _identity(bound.step)
@@ -423,11 +428,11 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
             )
         return identity
     if isinstance(stage, Filter):
-        return StepIdentity.of(stage.predicate, stage.identity, cache=cache)
+        return StepIdentity.of(stage.predicate, stage.identity)
     if isinstance(stage, Native):
-        return StepIdentity.of(stage.function, stage.identity, cache=cache)
+        return StepIdentity.of(stage.function, stage.identity)
     if isinstance(stage, Batched):
-        step = StepIdentity.of(stage.step, stage.identity, cache=cache)
+        step = StepIdentity.of(stage.step, stage.identity)
         # The group size and whether the rows keep their count decide what a resume reads.
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
         return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
@@ -472,6 +477,24 @@ def _configured(
         else:
             stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
+
+
+def _keyed(stage: Stage) -> bool:
+    """Whether a cache can key what `stage` runs (`StepIdentity.keyed`): the
+    steps `_identity` names it by, a configured one's factory included."""
+    if isinstance(stage, Artifact):
+        return True
+    if isinstance(stage, Configured):
+        return StepIdentity.keyed(stage.factory)
+    if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
+        return StepIdentity.keyed(stage.step, stage.identity) and _keyed(stage.configured.step)
+    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch, Batched)):
+        return StepIdentity.keyed(stage.step, stage.identity)
+    if isinstance(stage, Filter):
+        return StepIdentity.keyed(stage.predicate, stage.identity)
+    if isinstance(stage, Native):
+        return StepIdentity.keyed(stage.function, stage.identity)
+    return StepIdentity.keyed(stage)
 
 
 def _manifest(
@@ -526,8 +549,9 @@ stream whose shards reshuffle each epoch."""
 
 def _cacheable(stage: Stage) -> bool:
     """Whether a cache can hold what `stage` makes: a deterministic record
-    step, or a configured one, which binds to such a step."""
-    return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage)
+    step, or a configured one, which binds to such a step, that a cache can
+    key (`_keyed`)."""
+    return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage) and _keyed(stage)
 
 
 def _cache_at(stages: Sequence[Stage]) -> int:
@@ -804,11 +828,11 @@ def _checked(
                 raise ValueError(
                     f"cache prefix in {name} contains random step {random}; cache before stochastic steps"
                 )
+            for earlier in prefix:
+                _identity(earlier, cache=True)
             mixed = isinstance(pipeline.source, (Mixture, Phases))
             if not mixed and _cache_at(pipeline.stages[:index]) < index:
                 raise ValueError(f"cache prefix in {name} must hold only deterministic record steps")
-            for earlier in prefix:
-                _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:

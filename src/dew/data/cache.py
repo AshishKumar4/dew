@@ -213,6 +213,9 @@ class Cache:
         *,
         plan: Callable[[Generation], Mapping[str, np.ndarray]] | None = None,
     ) -> Generation:
+        """The generation of `source` under `key`, once its sealed fills cover
+        every input: the one published already, unless `plan` adds a packing
+        plan, which a new generation carries."""
         with ExitStack() as pins:
             return _publish(self, key, source, plan, pins)
 
@@ -231,6 +234,23 @@ class _Published:
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         return self(row_id)
+
+    def finish(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def metrics(self) -> CacheStats:
+        return _READING
+
+
+class _Computed:
+    """Rows computed and kept nowhere: the inputs of a key published under other IDs."""
+
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+        outputs = _transformed(ordinal, value, transform)
+        return outputs if transform is not None else outputs[0]
 
     def finish(self) -> None:
         pass
@@ -506,11 +526,11 @@ class _Writer:
 
     def complete(self) -> None:
         """Seal a fill holding every input, and publish the generation of its
-        source where it was given one and none is published yet. Another
-        writer that completed the same fill may publish it first, which
-        leaves it published."""
+        source where it was given one, which keeps a generation published
+        under its key (`Cache.publish`). Another writer that completed the
+        same fill may publish it first, which leaves it published."""
         self.seal()
-        if self.source is None or self.cache.generation(self.key) is not None:
+        if self.source is None:
             return
         try:
             self.cache.publish(self.key, self.source)
@@ -779,10 +799,11 @@ class _CachedIterator(grain.DatasetIterator):
         self.parent, self.shard, self.transform = parent, shard, transform
         # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
         # A shard the generation holds under another ID (another mount, a stream cut into more shards
-        # than it has) fills as any shard does.
-        self.writer: _Writer | _Published = (
-            published if published is not None and published.generation.holds((shard.id, 0))
-            else _Writer(cache, key))
+        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs.
+        self.writer: _Writer | _Published | _Computed = (
+            _Writer(cache, key) if published is None
+            else published if published.generation.holds((shard.id, 0))
+            else _Computed())
         self.ordinal = 0
 
     def __next__(self):
