@@ -494,8 +494,8 @@ class Files(Dataset):
         filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
         names = {path: store.resolve()[1] for path, store in zip(paths, stores, strict=True)}
-        roots = [place.root for place in located]
-        base = posixpath.commonpath(roots) if all(root is not None for root in roots) else None
+        roots = [place.root for place in located if place.root is not None]
+        base = posixpath.commonpath(roots) if len(roots) == len(located) else None
         return filesystem, paths, names, base
 
     def _shard_name(self, path: str) -> str:
