@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_decay_terms, fla_side, recurrence, rule_math, through
+from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
 from jax.core import ShapedArray
 from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
 from sharded import assert_runs_per_shard, boundary_copies
@@ -75,11 +75,12 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     """fla's chunk_fwd_o per chunk and head, grouped value heads included, at each of fla's block
     configs, the launch configured with it: within one rounding of its dtype of the same expression in
     XLA."""
-    operands = output_operands(*shape, dtype)
+    q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(*operands, *fla_gdn.sequences(*shape[:2]), scale=scale, chunk=64, interpret=INTERPRETED)
-    want = support.reference_o(*operands, scale=scale)
+    got = launch(q, k, v, support.entered_states(h), g, *fla_gdn.sequences(*shape[:2]), scale=scale,
+                 chunk=64, interpret=INTERPRETED)
+    want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
@@ -159,7 +160,9 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
-    want = support.reference_h(k, w, u, g, h0)
+    h, corrected, final = support.reference_h(k, w, u, g, h0)
+    # The port stores each memory at its slot (`fla_gdn.Sequences`).
+    want = support.entered_states(h), corrected, final
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
         for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
@@ -184,7 +187,9 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
+    dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
+    # The port stores each memory's gradient at its slot (`fla_gdn.Sequences`).
+    want = support.left_grads(dh), dh0, dv2
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
         for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
@@ -230,7 +235,8 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     scale = width ** -0.5
     want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, g, h, dv, do, dh):
+    states = (support.entered_states(h), dv, do, support.left_grads(dh))
+    for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, g, *states):
         for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
             assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
             assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -483,11 +489,41 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
         assert relative(mine, theirs) < 1e-4, name
 
 
+@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_packed_documents_on_the_port_are_as_exact_as_flas_own_sequences(dtype):
+    """Packed documents through `fla_rule`, a decay per head, each document a sequence of its own:
+    each output and gradient as near the float64 recurrence run document by document as fla 0.5.2's
+    own varlen sequences on the same operands (`fla_side`), each sized by its float64 terms
+    (`float64_truth`). Documents start on and off the chunk grid, one shorter than a
+    chunk, in fp32 too, whose products the port takes in TF32x3 and fla in one TF32. test_fla_kda's
+    packed case holds Kimi's decay per key dimension alike."""
+    length, key_heads, value_heads, width, cuts = 4096, 8, 8, 128, (0, 1000, 1037, 2500)
+    keys = jax.random.split(jax.random.key(61), 8)
+    q = l2norm(jax.random.normal(keys[0], (1, length, key_heads, width))).astype(dtype)
+    k = l2norm(jax.random.normal(keys[1], (1, length, key_heads, width))).astype(dtype)
+    v = jax.random.normal(keys[2], (1, length, value_heads, width)).astype(dtype)
+    g = -jnp.exp(jax.random.normal(keys[3], (1, length, value_heads)) - 2.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, value_heads))).astype(dtype)
+    h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, width))
+    do = jax.random.normal(keys[6], (1, length, value_heads, width)).astype(dtype)
+    dht = 0.1 * jax.random.normal(keys[7], (1, value_heads, width, width))
+    starts = np.zeros((1, length), bool)
+    starts[0, list(cuts[1:])] = True
+    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
+    mine = [np.asarray(x, np.float64)
+            for x in jax.jit(through(packed, do.astype(jnp.float32), dht))(q, k, v, g, beta, h0)]
+    inputs = (q, k, v, g, beta, h0, do, dht)
+    theirs = fla_side(inputs, cuts, dtype)
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, cuts), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, name, terms=summed)
+
+
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
     not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
                             "is fla's own distance (test_fla_kda's packed case)"))])
 def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
-    """Packed documents (`starts`, each first token forgetting the memory, `linear.FORGET`), with a
+    """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
     and gradients within fp32 rounding of the token recurrence run document by document in float64.
@@ -507,7 +543,7 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
     do = jax.random.normal(keys[6], v.shape)
     dht = 0.1 * jax.random.normal(keys[7], h0.shape)
 
-    packed = functools.partial(fla_rule, starts=jnp.asarray(starts))
+    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=max(map(len, cuts)))
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
         operands = widened((q, k, v, g, beta, h0, do, dht))

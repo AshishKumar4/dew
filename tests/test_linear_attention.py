@@ -27,6 +27,7 @@ catch them.
 """
 
 import functools
+import itertools
 import json
 from pathlib import Path
 
@@ -34,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, port_formula, recurrence, through
+from delta_rule_support import recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
@@ -187,56 +188,76 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
         assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
 
 
-@pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
-def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key):
-    """The port's output at each packed token and its gradients of the token's query, key and decay
-    (`linear.fla_rule`, a row of
-    documents as one sequence, each document's first token forgetting the memory by `linear.FORGET`)
-    as near the float64 recurrence run document by document as the port's formula in the portable
-    math (`port_formula`) on the same row, its every range two plain fp32 base-2 prefixes apart as
-    the port's: no token's gradient carries another document's. Per token, these hold what the
-    per-head decay parameters only sum: their gradients, `A_log`'s and `dt_bias`'s over a layer's few
-    heads, are two draws of sums of every token's prefix rounding, which a model's packed tests do
-    not hold (test_decision_packing, test_mixers). Documents of 40, 60, 1, 49, 40, 10 and 56
-    tokens, one of a single token and resets two apart in a chunk."""
-    batch, length, heads, width = 1, 256, 2, 64
-    begins = (0, 40, 100, 101, 150, 190, 200)
-    starts = np.zeros((batch, length), bool)
-    starts[0, list(begins[1:])] = True
+def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_alone_does(per_key):
+    """The port (`linear.fla_rule`, interpreted off a GPU) runs each packed document as a sequence of
+    its own, so each packed token's output and its gradients of the token's query, key, value, decay
+    and beta are bitwise those of the same row with every other document's tokens zero: no token's
+    value or gradient carries another document's, the decay's rounding included. The same program
+    on the same shapes, so any difference is information crossing a document boundary. Documents of
+    40, 60, 1, 49, 40, 10 and 56 tokens, one of a single token, resets two apart in a chunk, and on
+    and off the chunk grid. The port's arithmetic is held against fla's own packed sequences (test_fla_gdn,
+    test_fla_kda); a row of 32 two-token documents once lost the decays of its later ones to an fp32
+    prefix that every earlier document's reset had shifted."""
+    length, heads, width = 256, 2, 64
+    begins = (0, 40, 100, 101, 150, 190, 200, length)
     keys = jax.random.split(jax.random.key(29), 6)
-    q = 0.3 * jax.random.normal(keys[0], (batch, length, heads, width))
-    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
-    v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (batch, length, heads, *(width,) * per_key)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    q = 0.3 * jax.random.normal(keys[0], (1, length, heads, width))
+    k = l2norm(jax.random.normal(keys[1], (1, length, heads, width)))
+    v = jax.random.normal(keys[2], (1, length, heads, width))
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (1, length, heads, *(width,) * per_key)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
     do = jax.random.normal(keys[5], v.shape)
 
-    def taken(rule):
-        def run(q, k, g):
-            def loss(q, k, g):
-                out = rule(q, k, v.astype(q.dtype), g, beta.astype(q.dtype))[0]
-                return jnp.sum(out * do.astype(q.dtype)), out
-            (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(q, k, g)
-            return {"out": out, **dict(zip(("q", "k", "g"), grads, strict=True))}
-        return run
+    def taken(starts):
+        def run(*operands):
+            *rule, do = operands
 
-    def packed(rule):
-        return lambda *args: rule(*args, None, starts=jnp.asarray(starts))
+            def loss(*rule):
+                out = linear.fla_rule(*rule, starts=starts)[0]
+                return jnp.sum(out * do), out
+            (_, out), grads = jax.value_and_grad(loss, argnums=tuple(range(5)), has_aux=True)(*rule)
+            return {"out": out, **dict(zip(("q", "k", "v", "g", "beta"), grads, strict=True))}
+        return jax.jit(run)
 
-    def alone(q, k, v, g, beta):
-        decay = g if per_key else g[..., None]
-        out, _ = recurrence(q, k, v, decay, beta, jnp.zeros((batch, heads, width, width), q.dtype),
-                            cuts=(begins,))
-        return out, None
+    run = taken(jnp.asarray(np.isin(np.arange(length), begins[1:-1])[None]))
+    packed = run(q, k, v, g, beta, do)
+    for begin, end in itertools.pairwise(begins):
+        mine = (begin <= np.arange(length)) & (np.arange(length) < end)
 
-    got = jax.jit(taken(packed(linear.fla_rule)))(q, k, g)
-    formula = jax.jit(taken(packed(port_formula)))(q, k, g)
-    with jax.enable_x64(new_val=True):
-        wide = widened((q, k, g))
-        want = widened(taken(alone)(*wide))
-        _, terms = float64_terms(taken(packed(port_formula)), *wide)
-    assert_leaves_as_exact(got, formula, want, reductions=CHUNKED, terms=terms)
+        def alone(x, mine=mine):
+            return jnp.where(mine.reshape(1, length, *(1,) * (x.ndim - 2)), x, 0)
+
+        found = run(*(alone(x) for x in (q, k, v, g, beta, do)))
+        for name, value in packed.items():
+            np.testing.assert_array_equal(np.asarray(value)[:, mine], np.asarray(found[name])[:, mine],
+                                          err_msg=f"{name} of the document at {begin}")
+
+
+def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
+    """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
+    bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
+    port (`linear.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
+    A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
+    document on from its first."""
+    from dew.nn.inputs import coordinates
+
+    segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
+    tokens = coordinates(segments=segments, max_segments=2, right_padded=True)
+    keys = jax.random.split(jax.random.key(31), 5)
+    q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
+    beta = jnp.full((2, 128, 1), 0.5)
+    h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
+    packed = jax.jit(lambda *a: linear.fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
+    out, _ = packed(q, k, v, g, beta, h0)
+    rule = jax.jit(linear.fla_rule)
+    for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
+        for begin, end in itertools.pairwise(cuts):
+            alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
+                            h0[row:row + 1] if begin == 0 else None)
+            np.testing.assert_array_equal(np.asarray(out[row:row + 1, begin:end]), np.asarray(alone),
+                                          err_msg=f"row {row} from {begin}")
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
