@@ -11,7 +11,8 @@ set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.4 was published, past the pins the
-# locks hold (-P); nothing else moves.
+# locks hold (-P); nothing else moves. jax itself, which constraints.txt pins to one build of Dew's package
+# index, takes no date: that index's static pages give no upload times, which a date would need.
 FLASH=2026-10-17T18:46:06Z
 lock() {
   name=$1
@@ -19,6 +20,7 @@ lock() {
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
+    --exclude-newer-package jax=false --emit-index-url \
     --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
 lock cpu --universal --torch-backend cpu
