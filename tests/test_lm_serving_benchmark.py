@@ -110,7 +110,8 @@ class SamplingParams:
 ''',
     "inputs.py": "class TokensPrompt(dict):\n    pass\n",
     "engine/__init__.py": "",
-    "engine/arg_utils.py": "class AsyncEngineArgs:\n    def __init__(self, **settings):\n        self.settings = settings\n",
+    "engine/arg_utils.py": ("class AsyncEngineArgs:\n    def __init__(self, **settings):\n"
+                            "        self.settings = settings\n"),
     "v1/__init__.py": "", "v1/engine/__init__.py": "",
     "v1/engine/async_llm.py": '''import asyncio, types
 
