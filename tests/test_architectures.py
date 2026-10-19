@@ -33,13 +33,13 @@ from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
 from dew.config.data import ImageData
 from dew.data.dataset import Loader
 from dew.diffusion import presets
+from dew.eval.images import DEFAULT_MODEL
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
-from dew.eval.images import DEFAULT_MODEL
 from dew.registry import from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
