@@ -12,7 +12,6 @@ import math
 import struct
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import jax
@@ -102,12 +101,22 @@ class _Stored(dict[str, bytes]):
         return key
 
 
+class _Writer:
+    """A file that hashes what is written to it, as NumPy writes an array's elements, in chunks."""
+
+    def __init__(self) -> None:
+        self.digest = hashlib.sha256()
+
+    def write(self, data: bytes) -> None:
+        self.digest.update(data)
+
+
 class _Hashed:
     """The leaves a digest of content reads, each hashed as it is written and only its hash kept,
     so a stream's digest holds no copy of what it reads and bounds no leaf's size
     (`content_fingerprint` with `opaque`). An array is read in C order, its storage order no part of
-    its content; an object the codec has no schema for is read as the array it offers, else by its
-    type alone."""
+    its content; an object the codec has no schema for is read as the array NumPy makes of it, else
+    by its type alone."""
 
     opaque = True
 
@@ -115,15 +124,14 @@ class _Hashed:
         self.hashes: list[bytes] = []
 
     def add(self, value: bytes | np.ndarray) -> str:
-        leaf = hashlib.sha256()
         if isinstance(value, bytes):
-            leaf.update(value)
+            self.hashes.append(hashlib.sha256(value).digest())
         else:
             if value.flags.f_contiguous and not value.flags.c_contiguous:
                 value = value.copy(order="C")
-            # NumPy writes an array's elements in chunks to any object with a `write`.
-            np.save(SimpleNamespace(write=leaf.update), value, allow_pickle=False)
-        self.hashes.append(leaf.digest())
+            writer = _Writer()
+            np.save(writer, value, allow_pickle=False)
+            self.hashes.append(writer.digest.digest())
         return str(len(self.hashes) - 1)
 
 
@@ -159,9 +167,9 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
     if isinstance(value, Mapping):
         if leaves.opaque and not all(isinstance(key, str) for key in value):
             # Keys of any type, each read as content beside its entry, so no two keys read alike.
-            items = sorted(value.items(), key=lambda item: repr(item[0])) if canonical else value.items()
+            entries = sorted(value.items(), key=lambda entry: repr(entry[0])) if canonical else value.items()
             return {"entries": [[_tree(key, leaves, canonical), _tree(entry, leaves, canonical)]
-                                for key, entry in items]}
+                                for key, entry in entries]}
         if not all(isinstance(key, str) for key in value):
             raise TypeError("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
@@ -182,9 +190,11 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
             },
         }
     if leaves.opaque:
-        if hasattr(type(value), "__array__"):
-            return _tree(np.asarray(value), leaves, canonical)
-        # An object no schema reads, whose text may name its address: its type alone.
+        # An object no schema reads is read as the array NumPy makes of it, or where that array
+        # holds the object whole, whose text may name its address, by its type alone.
+        array = np.asarray(value)
+        if array.ndim or not array.dtype.hasobject:
+            return _tree(array, leaves, canonical)
         return {"opaque": f"{type(value).__module__}.{type(value).__qualname__}"}
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
 
