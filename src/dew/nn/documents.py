@@ -66,27 +66,43 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
     return jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts.reshape(-1), dtype=jnp.int32)])
 
 
-def document_ranks(ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Each token's rank among its row's tokens of its own id, and how many tokens that id holds in its
-    row, both `[B, N]` for `ids` `[B, N]` in any order."""
-    order = jnp.argsort(ids, axis=-1, stable=True)
-    ordered = jnp.take_along_axis(ids, order, axis=-1)
-    first, last = (jax.vmap(lambda row, side=side: jnp.searchsorted(row, row, side=side))(ordered)
-                   for side in ("left", "right"))
-    sorted_rank = jnp.arange(ids.shape[-1])[None, :] - first
-    rows = jnp.arange(ids.shape[0])[:, None]
-    return (jnp.zeros_like(sorted_rank).at[rows, order].set(sorted_rank),
-            jnp.zeros_like(sorted_rank).at[rows, order].set(last - first))
+def _padding_last(ids: jax.Array) -> jax.Array:
+    """`ids` with padding (0) ordered after every document."""
+    return jnp.where(ids == 0, jnp.iinfo(ids.dtype).max, ids)
+
+
+def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
+    """Each of `wanted` `[B, N]`'s position in its row of `ordered` `[B, M]` (`jnp.searchsorted`)."""
+    return jax.vmap(lambda row, items: jnp.searchsorted(row, items, side=side))(ordered, wanted)
+
+
+def query_order(ids: jax.Array) -> jax.Array:
+    """The stable permutation `[B, Q]` that puts each row's queries `ids` in document order, padding
+    last: the order FlashAttention's packed sequences take them in, and the one their ranks come
+    from (`aligned_places`)."""
+    return jnp.argsort(_padding_last(ids), axis=-1, stable=True)
+
+
+def held_keys(segment_ids: CrossDocuments) -> jax.Array:
+    """How many keys each query's document holds in its row, `[B, Q]`, searched in the keys'
+    ascending order (`CrossDocuments`), which needs no sort."""
+    queries, keys = document_ids(segment_ids)
+    ordered = _padding_last(keys)
+    return _searched(ordered, queries, "right") - _searched(ordered, queries, "left")
 
 
 def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
     """Each query's place among its document's keys under causality or a window, `[B, Q]`: a document's
     query of rank r among its Q queries sits at rank K - Q + r among its K keys (`CrossDocuments`)."""
-    queries, keys = document_ids(segment_ids)
-    rank, count = document_ranks(queries)
-    held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
-                    - jnp.searchsorted(row, wanted, side="left"))(jnp.sort(keys, axis=-1), queries)
-    return held - count + rank
+    queries, _ = document_ids(segment_ids)
+    order = query_order(queries)
+    ordered = jnp.take_along_axis(_padding_last(queries), order, axis=-1)
+    first = _searched(ordered, ordered, "left")
+    count = _searched(ordered, ordered, "right") - first
+    rows = jnp.arange(queries.shape[0])[:, None]
+    # A query's rank among its document's queries and their count, put back in the queries' order.
+    placed = jnp.zeros_like(order).at[rows, order].set(jnp.arange(queries.shape[-1])[None, :] - first - count)
+    return held_keys(segment_ids) + placed
 
 
 def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
@@ -94,8 +110,11 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     """`[B, 1, Q, K]`: each query's document's keys (`document_mask`), under causality and a window
     aligned to the document's last key (`aligned_places`); causality keeps the keys at or before a
     query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
-    (`dew.nn.attention.window_sides`)."""
-    key_rank, _ = document_ranks(document_ids(segment_ids)[1])
+    (`dew.nn.attention.window_sides`). A key's rank in its document is its distance from the
+    document's first key, the keys running in ascending id order."""
+    _, keys = document_ids(segment_ids)
+    ordered = _padding_last(keys)
+    key_rank = jnp.arange(keys.shape[-1])[None, :] - _searched(ordered, ordered, "left")
     distance = aligned_places(segment_ids)[:, :, None] - key_rank[:, None, :]
     keep = document_mask(segment_ids)
     if causal:

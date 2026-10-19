@@ -9,6 +9,7 @@ layers, the Gemma flags) and the param tree the interop map renames.
 
 import functools
 import math
+import re
 from pathlib import Path
 
 import jax
@@ -266,7 +267,8 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rn
     compiled = prefill.lower(params, cache, prompt).compile().as_text()
     flash = (measured_kernel('attention_packed', 'xla') == 'flash'
              and measured_kernel('attention', 'cudnn') == 'flash')
-    assert ('dew_flash_mha' in compiled) == flash
+    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
+    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
     found = np.asarray(prefill(params, cache, prompt), np.float64)
     plain = np.asarray(model.clone(attention_impl='xla').apply(params, prompt), np.float64)
     with jax.enable_x64(new_val=True):
