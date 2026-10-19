@@ -35,7 +35,7 @@ from typing import TypedDict
 
 import numpy as np
 
-from dew.data.prompts import PromptRecord
+from dew.data.prompts import PromptRecord, RowValue
 from dew.records import integer, integers, record as section, text
 
 from .records import real, reals, sequence
@@ -325,7 +325,7 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
     return tuple(trajectories)
 
 
-type ComputeScore = Callable[[str, str, object, object], float]
+type ComputeScore = Callable[[str, str, RowValue, RowValue], float]
 """verl's reward function: `(data_source, solution_str, ground_truth, extra_info) -> score`, where
 verl may pass a ground truth or extra info that is not a string."""
 
@@ -343,7 +343,7 @@ def compute_score(reward: Reward) -> ComputeScore:
     """verl's `compute_score` for the Dew `reward`: verl's arguments, read back as the record a
     prompt batch would hold (`PromptRecord.of`)."""
 
-    def score(data_source: str, solution_str: str, ground_truth: object, extra_info: object) -> float:
+    def score(data_source: str, solution_str: str, ground_truth: RowValue, extra_info: RowValue) -> float:
         return reward(solution_str, PromptRecord.of(data_source, ground_truth, extra_info))
 
     return score
