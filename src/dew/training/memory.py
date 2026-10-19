@@ -113,7 +113,7 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
-        if not str(error).startswith('RESOURCE_EXHAUSTED'):
+        if error.error_code_string != 'RESOURCE_EXHAUSTED':
             raise
         _log.info("XLA refused the step for memory: %s", error)
         refusals.append(error)

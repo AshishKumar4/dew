@@ -518,6 +518,41 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
                                   trained(prompt, 4, key=9).host().tokens)
 
 
+def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
+    """`--trainer.quantization` wraps the module block-diffusion SFT trains, as it does any
+    objective's (`quantize_trunk`): the recipe takes it, its step runs on the quantized forward,
+    and it moves the checkpoint other than the same step without it does."""
+    from dew.quantization import Quantization
+
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    directory = tmp_path / "tokens"
+    directory.mkdir()
+    for split, count in (("train", 160), ("val", 32)):
+        ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
+        (directory / f"{split}.bin").write_bytes(ids.tobytes())
+    (directory / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
+
+    def run(name, *quantized):
+        return LMRunConfig.cli([
+            "--pretrained", str(checkpoint), "--objective", "block_diffusion",
+            "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
+            "--objective.prompt-length", "4", "--loading.workers", "0",
+            "--model.dtype", "float32", "--model.attention-impl", "xla",
+            "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+            "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
+            "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized])
+
+    quantized = run("quantized")
+    quantized = dataclasses.replace(quantized, trainer=dataclasses.replace(
+        quantized.trainer, quantization=Quantization()))
+    state, plain = quantized.run(), run("plain").run()
+    assert int(state.updates) == int(plain.updates) == 1
+    assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(state.variables),
+                                                      jax.tree.leaves(plain.variables), strict=True))
+
+
 def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     """The SFT trains the per-layer skip scale, which the source declares a
     constant and the objective moves into `params`, so a trained tree and the
