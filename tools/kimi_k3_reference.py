@@ -13,8 +13,8 @@ reference computes with the library's own decompression of them, so the
 packed file and the logits describe one model. `calculate_qparams` clamps
 the scale exponents and substitutes a finite scale for an all-zero group.
 
-Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
-transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
+Environment: tools/kimi_k3_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1).
 
 Three things change how the reference runs, neither what it computes:
 

@@ -7,8 +7,8 @@ revision into CACHE. Its KDA layers call fla-core's Triton kernels, whose
 runs on a CUDA device, in fp32, with TRITON_F32_DEFAULT=ieee for every dot
 that leaves its precision unset.
 
-Environment (~/.cache/dew/reference-venvs/kimi-linear): torch 2.8.0+cu128,
-transformers 4.57.1, fla-core 0.4.0.
+Environment: tools/kimi_linear_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.57.1, fla-core 0.4.0).
 
 Four things change how the reference runs, not what it computes:
 
