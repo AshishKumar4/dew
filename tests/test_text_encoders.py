@@ -33,7 +33,6 @@ multiplies the logits after (modeling_clip.py, eager_attention_forward).
 """
 
 import json
-import os
 import shutil
 from pathlib import Path
 
@@ -286,18 +285,7 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
     np.testing.assert_allclose(actual, expected, atol=1e-6)
 
 
-def real_checkpoint_is_available() -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    repo = json.loads((REAL / "prompts.json").read_text())["repo"]
-    return isinstance(try_to_load_from_cache(repo, "model.safetensors"), str)
-
-
 @pytest.mark.network
-@pytest.mark.skipif(not real_checkpoint_is_available(),
-                    reason="openai/clip-vit-large-patch14 is neither cached nor "
-                           "DEW_NETWORK_TESTS=1")
 def test_the_real_checkpoint_matches_the_reference():
     """The flagship: twelve layers of clip-vit-large-patch14, fp32, from the
     checkpoint's own safetensors, against what transformers computes for the
@@ -321,9 +309,6 @@ def test_the_real_checkpoint_matches_the_reference():
 
 
 @pytest.mark.network
-@pytest.mark.skipif(not real_checkpoint_is_available(),
-                    reason="openai/clip-vit-large-patch14 is neither cached nor "
-                           "DEW_NETWORK_TESTS=1")
 def test_the_real_checkpoint_embeddings_match_the_reference():
     """Both heads of clip-vit-large-patch14, the twenty-four vision layers
     behind one of them, against what transformers computes for the same

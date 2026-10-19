@@ -546,9 +546,8 @@ def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
     its declared terms (`decay_invariants`), leaf by leaf."""
     def raise_tree(name, tree):
         def leaf(key, value):
-            text = jax.tree_util.keystr(key)
             for path, scale in scales.get(name, {}).items():
-                if text.endswith("".join(f"['{part}']" for part in path)):
+                if key[len(key) - len(path):] == tuple(jax.tree_util.DictKey(part) for part in path):
                     value = np.maximum(value, scale)
             return value
         return jax.tree_util.tree_map_with_path(leaf, tree)

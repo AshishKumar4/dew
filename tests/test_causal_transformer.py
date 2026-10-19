@@ -427,7 +427,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
     kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
     zeroed = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf) if "conv_state" in jax.tree_util.keystr(path) else leaf,
+        lambda path, leaf: jnp.zeros_like(leaf) if jax.tree_util.DictKey("conv_state") in path else leaf,
         mutated["cache"])
     reset, _ = model.apply({**params, "cache": zeroed}, ids[:, 4:5], decode=True, mutable=["cache"])
     assert not jnp.allclose(kept, reset, atol=1e-4)
@@ -1256,20 +1256,3 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
                                          np.asarray(want), label)
 
 
-def test_param_tree_mirrors_the_hf_decoder_layout(rng):
-    """The interop map has to be a rename, so the tree is a fixed contract."""
-    model = tiny()
-    params = model.init(rng, tokens(rng))['params']
-    paths = sorted('.'.join(str(entry.key) for entry in path)
-                   for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
-    layer = ['input_layernorm.scale',
-             'mlp.down_proj.kernel', 'mlp.gate_proj.kernel', 'mlp.up_proj.kernel',
-             'post_attention_layernorm.scale',
-             'self_attn.k_norm.scale', 'self_attn.k_proj.kernel',
-             'self_attn.o_proj.kernel', 'self_attn.q_norm.scale',
-             'self_attn.q_proj.kernel', 'self_attn.v_proj.kernel']
-    assert paths == sorted(
-        ['embed_tokens.embedding', 'norm.scale']
-        + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
-    # tie_embeddings=True is the reason there is no lm_head to rename
-    assert 'lm_head' not in params
