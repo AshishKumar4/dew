@@ -48,9 +48,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, rescale_to
-from ..gemma4_moe import Gemma4Experts
-from ..gpt_oss import GptOssMLP
+from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
@@ -896,9 +894,11 @@ class CausalTransformer(Float32Products, nn.Module):
     def feedforward_factories(self):
         """Build the three feed-forward factories a layer can use.
 
-        Returns the dense gated MLP, the routed experts and Gemma 4's parallel
-        branch, each a partial that the block calls with a name. A model with
-        no mixture gets only the first, and None for the other two.
+        Returns the dense gated MLP, the routed experts in its place and the
+        branch beside it, each a partial that the block calls with a name; the
+        mixture builds the routed one (`Mixture.build`) and places it
+        (`Mixture.beside_dense`). A model with no mixture gets only the first,
+        and None for the other two.
         """
         init_std, output_init_std = self.init_stds
         # Every gated MLP in the model shares the activation and the clamp:
@@ -909,61 +909,19 @@ class CausalTransformer(Float32Products, nn.Module):
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.products)
         mixture = self.mixture
-        if self.mlp == 'swigluoai' and (mixture is None or mixture.shared_features
-                                        or len(self.sparse_layers) != self.num_layers):
-            raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+        if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
+            raise ValueError('swigluoai requires routed experts on every layer')
         if mixture is None:
             return gated_mlp, None, None
-        expert_features = (self.hidden_features if mixture.expert_features is None
-                           else mixture.expert_features)
-        parallel = None if not mixture.parallel else functools.partial(
-            Gemma4Experts,
-            num_experts=mixture.experts,
-            top_k=mixture.top_k,
-            hidden_features=expert_features,
-            out_features=self.emb_features,
-            activation=self.mlp,
-            implementation=mixture.implementation,
-            dispatch=mixture.dispatch,
-            capacity_factor=mixture.capacity_factor,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype,
-            precision=self.products)
-        if self.mlp == 'swigluoai':
-            # GPT OSS's experts and router are its own (`GptOssMLP`): a knob they do not read is refused.
-            plain = Mixture(experts=mixture.experts)
-            ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
-                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
-                                         'expert_features', 'hash_layers', 'latent_features', 'latent_norm',
-                                         'media_bias')
-                       if getattr(mixture, name) != getattr(plain, name)]
-            ignored += ['swiglu_limit'] if self.swiglu_limit is not None else []
-            if ignored:
-                raise ValueError(f"swigluoai's experts take no {', '.join(ignored)}: GPT OSS routes with its "
-                                 f"own biased softmax and clamps at 7.0")
-            routed = functools.partial(
-                GptOssMLP, hidden_size=self.emb_features,
-                intermediate_size=self.hidden_features,
-                num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
-                implementation=mixture.implementation,
-                dispatch=mixture.dispatch,
-                capacity_factor=mixture.capacity_factor,
-                dtype=self.dtype, precision=self.products)
-        elif mixture.parallel:
-            # The branch rides beside every sparse layer's dense feed-forward.
-            routed = None
-        else:
-            routed = mixture.build(
-                out_features=self.emb_features, hidden_features=expert_features, activation=self.mlp,
-                dense=gated_mlp, swiglu_limit=self.swiglu_limit,
-                init_std=init_std, output_init_std=output_init_std,
-                norm=functools.partial(
-                    RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                    scale_after_cast=self.scale_after_cast, dtype=self.dtype),
-                dtype=self.dtype,
-                precision=self.products)
+        # The dense width is read only where the experts take it: layers that differ in it have none.
+        width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
+        built = mixture.build(
+            out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
+            swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
+            norm_eps=self.norm_eps, scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.products)
+        # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
+        routed, parallel = (None, built) if mixture.beside_dense else (built, None)
         return gated_mlp, routed, parallel
 
     @nn.nowrap
@@ -2336,6 +2294,15 @@ class CausalTransformer(Float32Products, nn.Module):
                                                                    if backprop_steps is None
                                                                    else backprop_steps),
                                                    remat=self.loop.remat if remat is None else remat))
+
+    @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
+        coefficients clamped to `altup.coef_clip`, as the reference clamps its stored weight before
+        a training forward (`clamped_predictions`); the updated parameters as they are."""
+        if updated or self.altup is None or self.altup.coef_clip is None:
+            return params
+        return clamped_predictions(params, self.altup.coef_clip)
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
