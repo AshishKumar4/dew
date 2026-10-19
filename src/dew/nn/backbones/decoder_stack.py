@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core.scope import subtract_filters
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -341,16 +340,18 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
         return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
+    probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
-        # Applied in a scope of its own, a run writes exactly the collections
-        # its caller opened (DSpark's `prediction_inputs` among them), which a
-        # layer reads to choose what it records; the loop carries them back out.
-        scope = run.scope
-        assert scope is not None
-        opened = subtract_filters(scope.mutable, ('params', 'streaming'))
+        state = held(run)
+        cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
+        first_slice = None if inputs is None else inputs.layer(0)
+        opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
+                         cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
+                         first_slice, store=store, train=train, decode=decode,
+                         attention_metadata=attention_metadata)
 
         def layer(read, state, cache, hidden, per_layer_slice, *, run=run, opened=opened, store=store):
             variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
@@ -359,14 +360,13 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                 per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
             return hidden, dict(changed)
 
-        cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         if count == 1:
             following = first_of(index + 1, x)
-            x, changed = layer(staged, held(run), cached, x, None if inputs is None else inputs.layer(0))
+            x, changed = layer(staged, state, cached, x, first_slice)
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
-                banks, staged, held(run), cached, x, inputs, layer, count,
+                banks, staged, state, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
                 reader=run.variables.get('streaming', {}).get('bank'))
         staged = following
@@ -374,6 +374,33 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             for name, value in tree.items():
                 run.put_variable(collection, name, value)
     return x
+
+
+def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, list[str]]], read, state,
+            cache, hidden, per_layer_slice, *, store, train: bool, decode: bool,
+            attention_metadata) -> list[str]:
+    """The collections a run applied in a scope of its own opens: those its caller
+    opened that a layer of it writes, DSpark's `prediction_inputs` among them,
+    which a layer reads to choose what it records, and the ones the caller holds
+    (`state`), which it reads as it writes them; the loop carries them back out.
+
+    What a layer writes with every collection open is read off an abstract run of
+    the run's first layer. Layers of equal specs run the same program, so each
+    spec runs once, recorded in `probed`.
+    """
+    written = next((names for seen, names in probed if seen == spec), None)
+    if written is None:
+        variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
+        # A provider writes its keys and values into the store it is given: the
+        # abstract run writes into a copy, so nothing it traces leaves it.
+        _, changed = jax.eval_shape(lambda variables: run.apply(
+            variables, hidden, mutable=True, train=train, decode=decode,
+            kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
+            attention_metadata=attention_metadata), variables)
+        written = list(changed)
+        probed.append((spec, written))
+    return sorted(name for name in {*written, *state} if name not in ('params', 'streaming')
+                  and run.is_mutable_collection(name))
 
 
 def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):

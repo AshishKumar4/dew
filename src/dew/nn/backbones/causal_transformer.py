@@ -2059,15 +2059,14 @@ class CausalTransformer(nn.Module):
         dtype the stage before returns. Under a bf16 policy the dense
         feed-forward returns fp32, so the loops use fp32 from the start. The
         first layer runs abstractly in its own scope (no cache, nothing sown,
-        placeholder RNG keys), and a banked store answers from its first
-        bank's first row without fetching it.
+        a placeholder 'params' key, which flax draws any other stream from),
+        and a banked store answers from its first bank's first row without
+        fetching it.
         """
-        layer, scope = self.layers[0], self.layers[0].scope
-        assert scope is not None
-        rngs = {name: jax.random.key(0) for name in scope.rngs}
+        layer = self.layers[0]
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=True, rngs=rngs,
+            held, x, mutable=True, rngs={'params': jax.random.key(0)},
             train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
