@@ -1056,10 +1056,6 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(
                 f"num_v_heads ({self.num_v_heads}) must be a multiple of "
                 f"num_k_heads ({self.num_k_heads})")
-        if self.conv_kernel < 2:
-            raise ValueError(
-                "the causal conv needs a history, so a kernel of at least 2, "
-                f"got {self.conv_kernel}")
         if self.gate_activation not in ('silu', 'sigmoid'):
             raise ValueError(
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
@@ -1218,6 +1214,8 @@ class DepthwiseConv1d(nn.Module):
 
     @nn.compact
     def __call__(self) -> tuple[jax.Array, jax.Array | None]:
+        if self.kernel < 1:
+            raise ValueError(f"a causal conv takes at least one tap, got {self.kernel}")
         weight = self.param('weight', normal_kernel(self.init_std, nn.initializers.lecun_normal())[
             'kernel_init'], (self.features, 1, self.kernel))
         bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
