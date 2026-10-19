@@ -179,29 +179,59 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 2, 128)])
-def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, shape):
+@pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128"])
+def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
     """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
     reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
-    unweighted norms round it; its output and input gradient within the float64 gate of XLA's."""
-    def unweighted(implementation, x):
-        return attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation)
+    unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
+    within the float64 gate of XLA's, random rows and a row of 1.5 under a cotangent of ones, whose two
+    gradient contributions cancel."""
+    def unweighted(x):
+        return attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")
 
-    x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
-    seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
-    compare((functools.partial(unweighted, "xla"), functools.partial(unweighted, "pallas"),
-             functools.partial(unweighted, "xla")), (x,), seed, ("y", "x"))
+    def fused(x):
+        return norm_swiglu.rms_norm(x, None, 1e-6, x.dtype, offset=False, after_cast=False,
+                                    inverse_rounded=True)
+
+    kind, shape = case.split("-")
+    shape = tuple(int(size) for size in shape.split("x"))
+    if kind == "aligned":
+        x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
+    else:
+        x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
+        seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
+    compare((unweighted, fused, unweighted), (x,), seed, ("y", "x"))
 
 
-def test_an_unweighted_norm_takes_the_fused_kernel_where_its_row_names_it():
+@pytest.mark.parametrize("composes", [False, True])
+def test_an_unweighted_norm_takes_the_fused_kernel_where_a_staged_jvp_survives_it(monkeypatch, composes):
     """Traced for an A100, whose row names the fused RMSNorm, `unweighted_rmsnorm` (Mamba2's,
-    Nemotron-H's, DeepSeek-V4's and GLM-5's) reports the kernel, not a refusal."""
+    Nemotron-H's, DeepSeek-V4's and GLM-5's) takes the kernel where this jax composes its linear
+    tangent (`generation.linear_tangents_compose`), else the portable norm, which a jvp of a jit
+    that staged it reaches; on either route that jvp is the portable norm's, and a gradient runs
+    the route's own backward."""
     from dew.nn.kernels import generation
 
+    monkeypatch.setattr(generation, "linear_tangents_compose", lambda: composes)
+    x = jax.random.normal(jax.random.key(28), (4, 64)).astype(jnp.bfloat16)
+    tangent = jax.random.normal(jax.random.key(29), (4, 64)).astype(jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as found:
-        jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(jnp.ones((4, 64), jnp.bfloat16))
+        jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(x)
     (route,) = [route for route in found if route.choice == "rms_norm"]
-    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
+    assert route.kernel == ("pallas" if composes else "xla") and route.preferred == "pallas"
+
+    def norm(implementation):
+        return jax.jit(lambda x: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation))
+
+    staged = jax.jvp(norm("pallas"), (x,), (tangent,))
+    portable = jax.jvp(norm("xla"), (x,), (tangent,))
+    np.testing.assert_array_equal(np.asarray(staged[1]), np.asarray(portable[1]))
+
+    def pulled(x):
+        return jax.grad(lambda x: norm("pallas")(x).astype(jnp.float32).sum())(x)
+
+    assert ("rms_norm_backward" in kernels(pulled, x)) == composes
+    assert pulled(x).dtype == x.dtype
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
