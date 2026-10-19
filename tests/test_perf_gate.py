@@ -229,8 +229,9 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
 
 
 def test_a_head_that_grows_its_compile_by_more_than_a_quarter_regresses(gate):
-    """A step's compile row is gated by `COMPILE_FLOOR`: a fifth more compile time over steady rounds is
-    level, a third more regresses, a third less is faster; its step row keeps the 2% floor."""
+    """A step's compile row fails a head that grows it by more than the materiality `COMPILE_FLOOR` names:
+    a fifth more over steady rounds is level, a third more regresses, a third less is faster; its step
+    row keeps the 2% floor."""
     compile_row = next(row for row in gate.BATTERY if row.name == "compile lm-dense 4x1024")
     step_row = next(row for row in gate.BATTERY if row.name == "step lm-dense 4x1024")
     base = [60.0, 60.5, 61.0]

@@ -48,9 +48,10 @@ from environments import CACHE, Unlocked, environment, machine_lock
 FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
 COMPILE_FLOOR = 0.25
-"""A step's compile time is gated by a change of a quarter: it moves more than a step's time from round
-to round, and a head that grows it that much holds a GPU idle where it used to compute (a decode module
-grown to compile for 48 minutes held a billed H100 at 0%)."""
+"""The least growth of a step's compile time the gate fails a head for: not a noise allowance (the rounds'
+spread still widens the band as for any row) but the materiality the project's rule names, "a head that
+grows it materially needs a reason" (BIBLE, compile time is performance), set at a quarter with the owner
+on 2026-10-19."""
 
 DIT = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_ratio": 4}
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
@@ -146,6 +147,12 @@ class Probe:
         return self.rows[0].tool
 
 
+def _stepped(out: Path) -> tuple:
+    """A step's time and the time its program took to compile."""
+    [step] = json.loads(out.read_text())
+    return step["ms_per_step"], step["compile_seconds"]
+
+
 def _served(out: Path) -> tuple:
     """Each slot count's best repeat, then its median repeat. A host-bound
     row's noise only ever slows it (32 slots spread 33% by median)."""
@@ -177,8 +184,7 @@ PROBES = [
              Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR)),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
-            lambda _, out: (json.loads(out.read_text())[0]["ms_per_step"],
-                            json.loads(out.read_text())[0]["compile_seconds"]))
+            lambda _, out: _stepped(out))
       for name, case in STEP_CASES.items()],
     # A process for each forward, so a module one tree lacks costs that row alone.
     *[Probe((Row(name, "ms", "benchmark_forward.py"),),
