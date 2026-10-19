@@ -367,6 +367,7 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
 
 
 @pytest.mark.gpu
+@pytest.mark.mesh(devices=1)
 def test_a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
     """A run `prepare_process` readies with no directory of its own caches under the user's cache
     directory, and its GPU compile writes the autotuner's picks to this jaxlib's own directory there
