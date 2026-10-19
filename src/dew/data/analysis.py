@@ -579,13 +579,14 @@ def _states_its_targets(pipeline: Pipeline) -> bool:
     """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
     valid targets count, so a weight from them holds its share of the targets (`token_weights`):
     a source that states them, whose stages only order, repeat and place those rows
-    (`_KEEPS_TARGETS`). A step still to run over them, a random crop or a filter, before its repeat
-    or after it, or a slice, limit or token split that takes a part of them, delivers other rows
-    than the stated ones, so that corpus's targets are counted as its rows arrive
-    (`TokenDeficit`)."""
-    source = pipeline.source
+    (`_KEEPS_TARGETS`), and after its repeat may take a window of the repeated rows, as a phase
+    does. A step still to run over them, a random crop or a filter, before its repeat or after
+    it, or a slice, limit or token split that takes a part of one epoch, delivers other rows than
+    the stated ones, so that corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
+    source, at = pipeline.source, _until(pipeline.stages, (Repeat,))
     return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
-            and all(isinstance(stage, _KEEPS_TARGETS) for stage in pipeline.stages))
+            and all(isinstance(stage, _KEEPS_TARGETS) for stage in pipeline.stages[:at])
+            and all(isinstance(stage, (*_KEEPS_TARGETS, Slice, Limit)) for stage in pipeline.stages[at:]))
 
 
 _KEEPS_TARGETS = (Shuffle, Repeat, Prefetch, Workers, Interleave, Artifact)
