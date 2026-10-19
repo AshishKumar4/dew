@@ -223,7 +223,8 @@ def test_a_dry_run_writes_nothing_it_would_keep(fake):
 def test_ssh_config_refuses_a_block_without_its_end_marker_and_keeps_the_file(fake):
     """The TPU's ~/.ssh/config block lies between its two markers. A file holding the start marker
     without the end one is refused, and every entry in it is kept as it was; with the end marker
-    back, the block is replaced and the entries after it are kept."""
+    back, the block is replaced and the entries after it are kept. An end marker on the file's last
+    line, with no newline after it, closes the block too."""
     fake.offer("slice", "us-central2-b")
     config = Path(os.environ["HOME"]) / ".ssh" / "config"
     config.parent.mkdir()
@@ -236,6 +237,9 @@ def test_ssh_config_refuses_a_block_without_its_end_marker_and_keeps_the_file(fa
     config.write_text(block + "# end dew tpu slice\n" + other)
     assert run("ssh-config", "slice") == 0
     assert other in config.read_text() and config.read_text().count("# dew tpu slice") == 1
+    config.write_text(other + block + "# end dew tpu slice")
+    assert run("ssh-config", "slice") == 0
+    assert config.read_text().startswith(other) and config.read_text().count("# dew tpu slice") == 1
 
 
 def test_delete_removes_the_queued_resource_that_holds_the_node(fake):
