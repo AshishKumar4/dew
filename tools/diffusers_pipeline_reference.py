@@ -165,7 +165,7 @@ def widened_modules():
     return [importlib.import_module(name) for name in names]
 
 
-def truth(root, output):
+def truth(root, destination):
     """Each saved Flax task rerun in float64 (see the module docstring)."""
     from unittest.mock import patch
     from diffusers import FlaxDDIMScheduler
@@ -244,7 +244,7 @@ def truth(root, output):
     finally:
         for item in patches:
             item.stop()
-    np.savez_compressed(output, **arrays)
+    np.savez_compressed(destination, **arrays)
 
 
 if __name__ == "__main__":
