@@ -761,6 +761,13 @@ class Objective(ABC, Generic[Loss, Effects]):
     def _check_validation_loss(self) -> None:
         """Refuse a validation loss this objective cannot define, before fit places its state."""
 
+    @property
+    def defines_validation_loss(self) -> bool:
+        """Whether `validation_loss` scores held-out rows, which a validation pass then records
+        whatever else reads it; an objective that cannot define one refuses it
+        (`_check_validation_loss`) and says False."""
+        return True
+
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
                  rows: int | tuple[int, ...] = 0) -> Ratio:

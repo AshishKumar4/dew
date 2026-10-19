@@ -153,6 +153,10 @@ class FlowGRPOObjective(DiffusionObjective):
             "Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
             "with an explicit Best, or pass no validation data")
 
+    @property
+    def defines_validation_loss(self) -> bool:
+        return False
+
     def _walk(self, params: Variables, batch: Batch) -> Walk:
         """The walk of the denoiser this batch's conditions select, guided as
         the rollout's walk was: over its `rollout_steps` points, a

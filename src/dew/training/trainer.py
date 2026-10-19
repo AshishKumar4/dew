@@ -1983,8 +1983,10 @@ class Trainer(Generic[Loss, Effects]):
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
-            # The loss is scored where it ranks the run's checkpoints, or the state it holds.
-            loss = ((self.checkpoints is not None or plan.held_best) and not plan.best
+            # The loss is recorded wherever the objective defines one, and is scored where it ranks
+            # the run's checkpoints or the state it holds, which preflight checks it can.
+            ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
+            loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports))
@@ -2012,14 +2014,16 @@ class Trainer(Generic[Loss, Effects]):
     def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool, loss: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
 
-        A validation pass hands its batches to metrics, to the preview and,
+        A validation pass records the objective's validation loss where it
+        defines one, and hands its batches to metrics, to the preview and,
         under a checkpointer, or with `loss` where its loss ranks the state a
         run holds (`_FitPlan.held_best`), to the loss that ranks the run's
-        steps. Scheduled with none of them, it would open nothing and report
-        nothing, so the contradiction is refused before the run does any work.
+        steps. Only an objective with no validation loss (Flow-GRPO's) and
+        none of the rest would open nothing and report nothing, and that
+        contradiction is refused before the run does any work.
         """
-        ranked = self.checkpoints is not None or loss
-        if not suite.metrics and not ranked and not (preview and self.tracker is not None):
+        read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
+        if not suite.metrics and not read and not (preview and self.tracker is not None):
             raise ValueError(
                 f"{name} is scored every {suite.every} steps and nothing consumes it: "
                 + ("preview=True needs a tracker to receive the samples; "
