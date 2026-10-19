@@ -167,9 +167,6 @@ test = [
     # same weights, and its tolerances were measured against this release;
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
-    # tests/test_tools.py runs tools/run_tutorials.py, which executes the
-    # tutorials through a Jupyter kernel of this interpreter.
-    "dewml[notebooks]",
 ]
 # Run mutation tests in CI, one source module at a time. Pin the operators so
 # two reports describe the same mutation population.
@@ -189,8 +186,11 @@ tensorboard = ["tensorboard"]
 hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
-# The live site's container (site/live/container/setup-managed.sh): its bridge's WebSocket release.
-live = ["websockets==17.1"]
+# The live site's container (site/live/container/setup-managed.sh), beside the streaming and profile
+# extras: its bridge's WebSocket release, the kernel gateway and IPython kernel its contexts run, and
+# ipywidgets, without which tqdm warns in a kernel that it falls back to text bars. The test extra
+# holds it, so locks/cpu.txt, which the container installs under, pins every one.
+live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
 delta = ["deltalake>=1.0"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
@@ -225,7 +225,7 @@ serve = ["starlette>=0.40", "uvicorn>=0.30"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
-# dew.data.images.albumentations: an albumentations pipeline as a seeded random step.
+# dew.data.images.Albumentations: an albumentations pipeline as a seeded random step.
 augment = ["albumentations>=2"]
 # Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
@@ -236,7 +236,7 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
 ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
-# The tutorial notebooks' environment (.github/workflows/tutorials.yml).
+# The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 tutorials = ["dewml[streaming,interop,plots,notebooks]"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]

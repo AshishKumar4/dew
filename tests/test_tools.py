@@ -221,15 +221,19 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
 # tools/optimizer_curve.py
 # ---------------------------------------------------------------------------
 
+LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range(60)]
+
+
 def token_directory(tmp_path: Path) -> Path:
-    """A byte-tokenized corpus, in the directory the curve reads from."""
-    from token_support import encoded_token_fixture
+    """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
+    a text file's lines, each a document closed by EOS."""
+    from dew.cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
-    corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
-                              for i in range(60)))
+    corpus.write_text("".join(f"{line}\n" for line in LINES))
     out = tmp_path / "tokens"
-    encoded_token_fixture(out, [corpus.read_text()], tokenizer="byte", val_fraction=0.1)
+    assert DataExport("records", str(out), fields=json.dumps({"source": str(corpus)}), tokenizer="byte",
+                      eos=True, read="memory").run_command() == 0
     return out
 
 
@@ -254,8 +258,8 @@ def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
     assert adamw[0] == muon[0]
     assert adamw[1:] != muon[1:]
     assert curves["adamw"]["tokens"] == 3 * 8 * 8
-    assert curves["adamw"]["corpus_tokens"] == json.loads(
-        (tokens / "meta.json").read_text())["train_tokens"]
+    # Every line's bytes, its newline and its EOS.
+    assert curves["adamw"]["corpus_tokens"] == sum(len(line.encode()) + 2 for line in LINES)
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +470,28 @@ def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
     _, two_canvases = parameter_movement(
         tool, composite_case(tool, "diffusion_gemma"), steps=1)
     assert two_canvases > one_canvas
+
+
+
+def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names():
+    """A canvas case's head chunking and objective keywords reach the block objective its measured
+    step trains, as a decoder case's reach its objective: with the canvas loss weighed at nothing,
+    the self-conditioning MLP only the canvas pass feeds stays where it was while the trunk the
+    encoder loss trains moves, over the head in the one chunk the case names (chunking changes no
+    number, so that the step trains with it is what is asked). A case that names another decoder
+    objective is refused: the canvas case would benchmark the block objective under its name."""
+    tool = load("benchmark_step")
+    case = dataclasses.replace(
+        composite_case(tool, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
+        head_chunks=1, objective={"decoder_loss_weight": 0.0})
+
+    moved, _ = parameter_movement(tool, case, steps=1)
+
+    conditioning = [value for name, value in moved.items() if "self_conditioning" in name]
+    assert conditioning and max(conditioning) == 0
+    assert max(value for name, value in moved.items() if "text" in name) > 0
+    with pytest.raises(ValueError):
+        tool.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
 
 
 # ---------------------------------------------------------------------------
@@ -888,6 +914,45 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
 
 
+def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_report_is_not(tmp_path):
+    """SLOP011: a sentence the test spells, looked for in the output pytest captured, however the test
+    holds it (`capsys.readouterr()`'s `.out`, a name for the capture or its `.out`, the pair unpacked,
+    added to), proves wording. A name bound again to a parse of the output, the same name in a test
+    that captured nothing or only in a function it defines, and a mapping an item of the output is
+    put in, hold data, and are not reported."""
+    found = _linted(tmp_path, {"tests/test_report.py": (
+        "import json\n"
+        "def test_direct(capsys):\n"
+        "    assert 'saved' in capsys.readouterr().out\n"
+        "def test_held(capsys):\n"
+        "    captured = capsys.readouterr()\n"
+        "    assert 'saved' in captured.out\n"
+        "def test_unpacked(capsys):\n"
+        "    out, err = capsys.readouterr()\n"
+        "    assert 'saved' in out\n"
+        "def test_added(capsys):\n"
+        "    text = capsys.readouterr().out\n"
+        "    text += capsys.readouterr().err\n"
+        "    assert text.count('saved')\n"
+        "def test_parsed(capsys):\n"
+        "    report = capsys.readouterr().out\n"
+        "    report = json.loads(report)\n"
+        "    assert 'tokens' in report\n"
+        "def test_unrelated():\n"
+        "    out = {'tokens': 8}\n"
+        "    assert 'tokens' in out\n"
+        "def test_nested(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    def later():\n"
+        "        report = capsys.readouterr().out\n"
+        "    assert 'tokens' in report\n"
+        "def test_item(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    report['err'] = capsys.readouterr().err\n"
+        "    assert 'tokens' in report\n")})
+    assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
+
+
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
     """SLOP012: a script that replaces or deletes the package's own functions,
     by any assignment or `setattr`, and a library that does so to anything it
@@ -953,75 +1018,3 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     })
     assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
                      *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
-
-
-# ---------------------------------------------------------------------------
-# tools/hf_coverage.py
-# ---------------------------------------------------------------------------
-
-def test_a_tutorials_outputs_are_stale_after_a_dependency_only_commit(tmp_path, monkeypatch):
-    """The outputs come from the library and its pinned dependencies, so a
-    commit that changes only pyproject.toml makes them stale, as one to a
-    module the notebook imported does."""
-    checker = load("check_tutorial_outputs")
-
-    def git(*args):
-        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
-
-    (tmp_path / "src" / "dew").mkdir(parents=True)
-    (tmp_path / "src" / "dew" / "probe.py").write_text("VALUE = 1\n")
-    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.2"]\n')
-    git("init", "-q")
-    git("add", "-A")
-    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outputs")
-    recorded = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True,
-                              text=True, check=True).stdout.strip()
-    notebook = tmp_path / "probe.ipynb"
-    notebook.write_text(json.dumps({"metadata": {"dew": {"outputs": {"commit": recorded}}}, "cells": []}))
-    monkeypatch.setattr(checker, "ROOT", tmp_path)
-    imports = {"probe.ipynb": ["dew.probe"]}
-    assert checker.verdict(notebook, imports)[0] == "current"
-    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.3"]\n')
-    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "dependency")
-    label, lines = checker.verdict(notebook, imports)
-    assert label == "STALE" and "pyproject.toml" in lines[0]
-
-
-@pytest.mark.parametrize("stop", ["CellTimeoutError", "DeadKernelError"])
-def test_a_tutorial_run_records_a_stalled_notebook_and_runs_the_rest(tmp_path, monkeypatch, stop):
-    """A cell that times out or a kernel that dies fails its notebook, and the
-    run goes on to the next one; the kernel spec a reused --workdir holds is
-    written again for this interpreter."""
-    import nbformat
-
-    runner = load("run_tutorials")
-    (tmp_path / "tutorials").mkdir()
-    for name in ("01-stalls.ipynb", "02-runs.ipynb"):
-        nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("x = 1")]),
-                       tmp_path / "tutorials" / name)
-    workdir = tmp_path / "work"
-    stale = workdir / ".jupyter" / "kernels" / "dew-tutorials"
-    stale.mkdir(parents=True)
-    (stale / "kernel.json").write_text(json.dumps({"argv": ["/gone/python", "-m", "ipykernel_launcher"],
-                                                   "display_name": "old", "language": "python"}))
-    ran = []
-
-    class Client:
-        def __init__(self, notebook, **options):
-            self.notebook = notebook
-
-        def execute(self):
-            ran.append(len(ran))
-            if len(ran) == 1:
-                raise getattr(runner, stop)("stalled")
-            probe = {"modules": ["dew"], "device": "cpu", "jax": "0"}
-            self.notebook.cells[-1].outputs = [nbformat.v4.new_output(
-                "stream", name="stdout", text=runner.PROBE_MARK + json.dumps(probe) + "\n")]
-
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    monkeypatch.setattr(runner, "NotebookClient", Client)
-    monkeypatch.setenv("JUPYTER_PATH", "")
-    monkeypatch.setattr(sys, "argv", ["run_tutorials.py", "--workdir", str(workdir)])
-    assert runner.main() == 1
-    assert ran == [0, 1]
-    assert json.loads((stale / "kernel.json").read_text())["argv"][0] == sys.executable

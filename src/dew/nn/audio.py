@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +21,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.weights import ParamTree, placed
 from dew.registry import from_record
 
 from .activations import activation
@@ -29,6 +30,9 @@ from .conv import Conv
 from .sharding import logical_axes
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 
 @struct.dataclass
@@ -113,12 +117,6 @@ def _inputs(features, mask, width: int) -> tuple[jax.Array, jax.Array]:
     if mask.shape != features.shape[:2] or mask.dtype != jnp.bool_:
         raise ValueError("input_features_mask must be bool [B, T], True for valid frames")
     return features, mask
-
-
-def _activation(x, name: str = "silu"):
-    if name not in ("silu", "gelu", "gelu_pytorch_tanh", "relu"):
-        raise ValueError(f"audio hidden_act {name!r} has no implementation")
-    return activation(name)(x)
 
 
 def _clip(x, bound: float):
@@ -391,7 +389,7 @@ class AudioFeedForward(nn.Module):
     def __call__(self, x):
         residual = x
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="pre_layer_norm")(_clip(x, self.clipping))
-        x = _activation(self.linear(self.width * 4, name="ffw_layer_1")(x), self.activation)
+        x = activation(self.activation)(self.linear(self.width * 4, name="ffw_layer_1")(x))
         x = self.linear(self.width, name="ffw_layer_2")(x)
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="post_layer_norm")(_clip(x, self.clipping))
         return residual + x * self.residual_weight
@@ -427,7 +425,7 @@ class AudioLightConv(nn.Module):
             name="depthwise_conv1d",
         )(x)
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="conv_norm")(_clip(x, self.clipping))
-        return residual + self.linear(self.width, name="linear_end")(_activation(x, self.activation))
+        return residual + self.linear(self.width, name="linear_end")(activation(self.activation)(x))
 
 
 class Gemma3nConformerAttention(nn.Module):
@@ -622,8 +620,9 @@ def audio_weights(
     config: Gemma3nAudio | Gemma4Audio,
     *,
     param_dtype: str = "float32",
-) -> ParamTree:
-    """Translate reference weights into params and frozen clipping constants.
+) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Translate reference weights into params and frozen clipping constants, with the layouts
+    that write each tensor back from them (`placed`).
 
     Prefix stripping belongs to the shared wrapper loader. Parameters use the
     requested storage precision; clipping state stays FP32. Integer tensors
@@ -642,8 +641,8 @@ def audio_weights(
         seen.add(path)
         return path
 
-    placed = translate_parameters(tensors, path_of, param_dtype)
+    tree, layouts = placed(tensors, path_of, param_dtype)
     missing = expected.keys() - seen
     if missing:
         raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")
-    return placed
+    return tree, layouts

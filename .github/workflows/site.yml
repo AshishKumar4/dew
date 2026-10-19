@@ -1,20 +1,18 @@
 # Builds dewml.dev on every change to what it is made of, and fails on a broken
 # link, a notebook without its outputs, a public module without an API page or
-# a registered model family the model list does not name. On main it deploys
-# the site (unless the SITE_DEPLOY repository variable is 'paused'), and rebuilds the live-execution image on the pushed Dew commit. A
-# ci/** push builds and checks it beside CI, and main deploys that build of
-# the same commit rather than building it again.
+# a registered model family the model list does not name. A ci/** push builds
+# and checks it beside CI and keeps the build as its artifact `site`.
 #
-# Deploying needs the repository secret CLOUDFLARE_API_TOKEN, a token for the
-# account that holds dewml.dev with Workers Scripts, Containers and Workers
-# Routes edit rights. Without it the deploy jobs skip.
+# Deploys are manual, from that artifact of the commit main is at:
+#   gh run download <run> -n site -D site/dist && (cd site && pnpm run deploy)
+#   (cd site && node live/deploy.mjs <commit> -- --secrets-file <live secrets>)
 
 name: Site
 
 on:
   push:
     # ci/** is where a branch goes for its own run before it lands.
-    branches: [ "main", "ci/**" ]
+    branches: [ "ci/**" ]
     paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
   pull_request:
     branches: [ "main" ]
@@ -34,28 +32,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/ci/') }}
 
 jobs:
-  # The run that built and checked this commit on another push, which leaves
-  # the build as its artifact only once every check passed: main deploys it.
-  proven:
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-    outputs:
-      run: ${{ steps.find.outputs.run }}
-    steps:
-    - id: find
-      if: github.event_name == 'push'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=site&per_page=100" \
-          --jq "[.artifacts[] | select(.workflow_run.head_sha == \"$GITHUB_SHA\" and (.expired | not))][0].workflow_run.id // empty")
-        echo "run=$run" >> "$GITHUB_OUTPUT"
-        if [ -n "$run" ]; then echo "built in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
-
   build:
-    needs: proven
-    if: needs.proven.outputs.run == '' && !inputs.run_cells
+    if: ${{ !inputs.run_cells }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -92,57 +70,6 @@ jobs:
         name: site
         path: site/dist
         retention-days: 7
-
-  deploy:
-    needs: [proven, build]
-    # After this run's build, or the proven run's in its place.
-    # The repository variable SITE_DEPLOY pauses deploys while main carries a change
-    # whose pages are still being reworked: set it to 'paused', and back to unset to resume.
-    if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SITE_DEPLOY != 'paused' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-    defaults:
-      run:
-        working-directory: site
-    # The token reaches only the two deploy steps, not the install scripts or the actions.
-    steps:
-    - uses: actions/checkout@v4
-    - id: token
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      run: echo "present=${{ env.CLOUDFLARE_API_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
-    - uses: pnpm/action-setup@v4
-      if: steps.token.outputs.present == 'true'
-      with:
-        package_json_file: site/package.json
-    - uses: actions/setup-node@v4
-      if: steps.token.outputs.present == 'true'
-      with:
-        node-version: 22
-        cache: pnpm
-        cache-dependency-path: site/pnpm-lock.yaml
-    - if: steps.token.outputs.present == 'true'
-      run: pnpm install --frozen-lockfile
-    - uses: actions/download-artifact@v4
-      if: steps.token.outputs.present == 'true'
-      with:
-        name: site
-        path: site/dist
-        run-id: ${{ needs.proven.outputs.run || github.run_id }}
-        github-token: ${{ github.token }}
-    - name: Deploy dewml.dev and the www redirect
-      if: steps.token.outputs.present == 'true'
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      run: pnpm run deploy
-    - name: Rebuild the live kernel on this commit
-      if: steps.token.outputs.present == 'true'
-      env:
-        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      run: node live/deploy.mjs "$GITHUB_SHA"
 
   # Run on a deployed page: every landing cell that runs on the live pool, pressed as a visitor
   # would, each screenshotted once it finishes (scripts/run-cells.mjs).

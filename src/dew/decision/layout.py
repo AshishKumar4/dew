@@ -21,11 +21,12 @@ import json
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard
 
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from typing_extensions import get_protocol_members
 
 from dew import records
 from dew.data.text import HFTokenizer, Tokenizer
@@ -33,10 +34,14 @@ from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
 
 class TokenizerSpecials(Protocol):
-    """What `Specials.of` reads off a transformers tokenizer: its special
-    tokens' ids, each None where it has none, and an id's token text."""
+    """What `Specials.of` reads off a tokenizer, as a transformers tokenizer
+    holds it: its special tokens' ids, each None where it has none, and an id's
+    token text."""
 
     @property
     def cls_token_id(self) -> int | None: ...
@@ -52,6 +57,13 @@ class TokenizerSpecials(Protocol):
     def pad_token_id(self) -> int | None: ...
 
     def convert_ids_to_tokens(self, ids: int, /) -> str | list[str]: ...
+
+
+def _holds_specials(tokenizer: "Tokenizer | TokenizerSpecials | PreTrainedTokenizerBase"
+                    ) -> TypeGuard[TokenizerSpecials]:
+    """Whether `tokenizer` answers what `TokenizerSpecials` declares. Each member is read, not
+    looked up statically, since a transformers tokenizer answers its ids through `__getattr__`."""
+    return all(hasattr(tokenizer, name) for name in get_protocol_members(TokenizerSpecials))
 
 
 class _Same:
@@ -101,18 +113,17 @@ class Specials:
 
     @classmethod
     def of(cls, tokenizer: Tokenizer | TokenizerSpecials) -> "Specials":
-        """Return a Hugging Face tokenizer's own special tokens, read off the
-        transformers tokenizer itself or the one an `HFTokenizer` loads.
+        """Return a tokenizer's own special tokens, read off any tokenizer that
+        holds them as `TokenizerSpecials` declares, a transformers tokenizer or
+        the one an `HFTokenizer` loads among them.
 
         That is [CLS] or its start token, [SEP] or its end token, [MASK] (or else its
         end token) as the marker, and its padding token or else its end token.
         """
-        from transformers import PreTrainedTokenizerBase
-
         hf = tokenizer.tokenizer if isinstance(tokenizer, HFTokenizer) else tokenizer
-        if not isinstance(hf, PreTrainedTokenizerBase):
-            raise ValueError("Specials.of reads a Hugging Face tokenizer's special tokens; "
-                             "give a ByteTokenizer's Specials explicitly")
+        if not _holds_specials(hf):
+            raise ValueError(f"Specials.of reads a tokenizer's special tokens, which this "
+                             f"{type(hf).__name__} does not hold; give its Specials explicitly")
 
         def first(*names: str) -> int | None:
             ids = [getattr(hf, name) for name in names]
@@ -205,6 +216,12 @@ def _conversation(state: JSON) -> bool:
             return False
 
 
+def _least(name: str, value: int, least: int) -> None:
+    """Refuse a layout budget `name` that is not an integer of at least `least` tokens."""
+    if type(value) is not int or value < least:
+        raise ValueError(f"a layout's {name} is a whole number of at least {least} tokens, got {value!r}")
+
+
 def _slots(count: int, order: Sequence[int] | None) -> list[int]:
     slots = list(range(count)) if order is None else [int(slot) for slot in order]
     if sorted(slots) != list(range(count)):
@@ -230,6 +247,9 @@ class Layout:
     max_len: int = 512
     joint: ClassVar[bool] = False
     """Whether every question of a request shares one row, rather than one row each."""
+
+    def __post_init__(self) -> None:
+        _least("max_len", self.max_len, 1)
     image: ClassVar[str | None] = None
     """The text that stands for one image where a row holds a request's images,
     which the backbone's processor expands; None where a row holds none."""
@@ -309,6 +329,11 @@ class QuestionLayout(Layout):
     head_max_len: int = 192
     option_tokens: int = 48
     parallel: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _least("head_max_len", self.head_max_len, 1)
+        _least("option_tokens", self.option_tokens, 1)
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -467,6 +492,11 @@ class JointLayout(Layout):
     max_len: int = 16384
     max_state_tokens: int | None = None
     joint: ClassVar[bool] = True
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.max_state_tokens is not None:
+            _least("max_state_tokens", self.max_state_tokens, 0)
     image: ClassVar[str | None] = "<|vision_start|><|image_pad|><|vision_end|>"
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:

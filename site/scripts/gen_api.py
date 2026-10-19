@@ -50,8 +50,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
               "dew.data.sources.grain", "dew.data.sources.iterator", "dew.data.sources.codec",
               "dew.data.sources.urls", "dew.data.sources.av_utils",
               "dew.data.steps.generic", "dew.data.steps.text", "dew.data.steps.windows", "dew.data.steps.chat",
-              "dew.data.steps.image", "dew.data.steps.video", "dew.data.chat", "dew.data.images", "dew.data.tokens",
-              "dew.data.text", "dew.data.video", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
+              "dew.data.chat", "dew.data.images", "dew.data.tokens", "dew.data.text", "dew.data.video",
+              "dew.data.audio", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
               "dew.data.image_codec"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
@@ -73,7 +73,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                          "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile"]),
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
+                   "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.

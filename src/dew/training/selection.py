@@ -49,19 +49,14 @@ class Best:
                              ('weights_only', weights_only), ('split', split), ('_source', source)):
             object.__setattr__(self, field, value)
 
-    def resolved(self, metrics: Sequence[Metric], shown: Mapping[str, Shown],
-                 splits: Sequence[str] = ("val",)) -> Best:
-        """This selection bound to the metric it names among `metrics`, with its direction from how
-        that metric is `shown` where it names none, and the split it ranks: `train` for a training
-        scalar, else the one of `splits` it names or the only one."""
+    def resolved(self, scored: Mapping[str, Sequence[Metric]]) -> Best:
+        """This selection bound to the split it ranks and the metric it names there: `train` for a
+        training scalar, else the split of `scored` (each split's metrics) it names, by `split` or as
+        its recorded name's prefix, or the only one, and the metric it names among that split's own,
+        so each suite's instance of one metric is its own. Its direction, where it names none, is how
+        that metric itself declares it is shown."""
         selection = self
         metric = selection._source
-        if metric is None:
-            name = selection.metric.removeprefix((selection.split or 'val') + '/')
-            metric = next((declared for declared in metrics if declared.name == name), None)
-            if metric is None:
-                raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
-            selection = dataclasses.replace(selection, _source=metric)
         if isinstance(metric, TrainingScalar):
             if selection.mode is None:
                 if metric.shown.better is None:
@@ -70,10 +65,27 @@ class Best:
                     selection, mode="max" if metric.shown.better == "higher" else "min"
                 )
             return dataclasses.replace(selection, split='train')
+        splits = tuple(scored)
+        if metric is None and selection.split is None and selection.metric.partition('/')[0] in scored:
+            selection = dataclasses.replace(selection, split=selection.metric.partition('/')[0])
+        if selection.split is None:
+            if len(splits) != 1 and (metric is None or isinstance(metric, Metric)):
+                raise ValueError("Best(metric, split=...) is required with several validation splits")
+            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
+        elif selection.split not in scored:
+            raise ValueError(f"unknown validation split {selection.split!r}")
+        if metric is None:
+            assert selection.split is not None
+            name = selection.metric.removeprefix(f"{selection.split}/")
+            metric = next((declared for declared in scored[selection.split] if declared.name == name), None)
+            if metric is None:
+                raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
+            selection = dataclasses.replace(selection, _source=metric)
         if isinstance(metric, Metric):
-            if not any(metric is declared for declared in metrics):
+            assert selection.split is not None
+            if not any(metric is declared for declared in scored[selection.split]):
                 raise ValueError("best must be a metric object passed in metrics")
-            declared = shown.get(metric.name)
+            declared = _declared_shown(metric)
             better = None if declared is None else declared.better
             if selection.mode is None:
                 if better not in ('higher', 'lower'):
@@ -81,10 +93,10 @@ class Best:
                         "best metric has no declared direction; use Best(metric, mode='min' or 'max')"
                     )
                 selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
-        if selection.split is None:
-            if len(splits) != 1 and isinstance(metric, Metric):
-                raise ValueError("Best(metric, split=...) is required with several validation splits")
-            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
-        elif selection.split not in splits:
-            raise ValueError(f"unknown validation split {selection.split!r}")
         return selection
+
+
+def _declared_shown(metric: Metric) -> Shown | None:
+    """How `metric` itself declares it is shown, which the Metric protocol leaves optional, so it is
+    read at this boundary."""
+    return getattr(metric, "shown", None)

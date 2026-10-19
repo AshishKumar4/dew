@@ -24,7 +24,7 @@ from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
 
 from ..dataset import Records
-from .base import Read, Shard, ShardManifest, preparing
+from .base import Read, ShardManifest, _indexed_manifest, preparing
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -401,23 +401,7 @@ class TFDS(Dataset):
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
-        rows = self.records("indexed")
-        shards = tuple(
-            Shard(
-                f"{self.describe()}:{start}",
-                str(self.builder.data_path),
-                start,
-                min(start + self.shard_rows, len(rows)),
-                min(self.shard_rows, len(rows) - start),
-            )
-            for start in range(0, len(rows), self.shard_rows)
-        )
-        return ShardManifest(shards, self._read_shard)
-
-    def _read_shard(self, shard: Shard):
-        import grain.python as grain
-
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
+        return _indexed_manifest(self, self.describe(), str(self.builder.data_path), self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:
         import tensorflow_datasets as tfds

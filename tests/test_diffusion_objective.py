@@ -110,23 +110,23 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
                                   built(["", ""], key=2).host().images)
 
 
-def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(monkeypatch):
+def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(tmp_path):
     """A masked process; a solver given by name, one that refuses the schedule
     (the sigma integrators hold only where alpha is 1, which the VP cosine is
     not), or one without the real terminal grid's target; and a model that
     cannot run on the inputs (SimpleMMDiT runs its text as a second stream
     through every block, so it declares `RequiresText`): each is refused when
     the objective is built, before a step and before its alignment encoder's
-    weights load from the Hub."""
+    weights load. The encoder's source is a directory holding no checkpoint,
+    whose read raises OSError, so a read before the refusal would raise that
+    instead."""
     from dew.diffusion.discrete import MDLM
-    from dew.interop import sources
     from dew.objectives.diffusion import Alignment
     from dew.sampling import RK4, UniPC
 
-    def fetched(*args, **kwargs):
-        raise AssertionError("the alignment encoder's weights loaded before the refusal")
-
-    monkeypatch.setattr(sources, "snapshot", fetched)
+    alignment = Alignment(source=str(tmp_path))
+    with pytest.raises(OSError):
+        alignment.network(None)
 
     flow, unconditional = presets.Flow(), InputSpec(Field("image", (RES, RES, 3)))
     mmdit = SimpleMMDiT(patch_size=2, emb_features=8, num_layers=1, num_heads=2)
@@ -138,7 +138,7 @@ def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(mon
             (ValueError, "sigma=0 target", Zero(), flow, {"solver": unipc, "steps": 7}),
             (ValueError, "unconditionally", mmdit, flow, {})):
         with pytest.raises(error):
-            DiffusionObjective(model, process, unconditional, alignment=Alignment(), **settings)
+            DiffusionObjective(model, process, unconditional, alignment=alignment, **settings)
     DiffusionObjective(Zero(), presets.Karras(), unconditional, solver=RK4())
 
 

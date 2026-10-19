@@ -34,6 +34,28 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
 jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
+def bundle(node) -> str:
+    """The shared cache's bundle of `node`'s test file in this execution partition (`remote_cache.bundle`)."""
+    return remote_cache.bundle(node.nodeid, node.config.getoption("ci_group", None),
+                               os.environ.get("PYTEST_XDIST_WORKER"))
+
+
+def pytest_collectstart(collector):
+    if _remote is not None and isinstance(collector, pytest.Module):
+        _remote.opened(bundle(collector))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Each file's programs join its bundle of the shared cache, written back after each run of its
+    tests, every program they used so far."""
+    if _remote is not None:
+        _remote.opened(bundle(item))
+    yield
+    if _remote is not None and (nextitem is None or bundle(nextitem) != bundle(item)):
+        _remote.closed(bundle(item))
+
+
 def pytest_sessionfinish(session, exitstatus):
     if _remote is not None:
         _remote.drain()
@@ -61,6 +83,13 @@ def own_rung_records(monkeypatch, tmp_path_factory):
     shares one compilation cache, beside which a run records its step's
     rung, and a rung one test forces would be another's floor."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
+
+
+@pytest.fixture(autouse=True)
+def own_hub_answers(monkeypatch, tmp_path_factory):
+    """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
+    stand-in answered is not another's offline record."""
+    monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
 
 
 @pytest.fixture(autouse=True, scope="module")

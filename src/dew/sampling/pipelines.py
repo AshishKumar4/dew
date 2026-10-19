@@ -24,9 +24,11 @@ from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Variables, thaw
+from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.guidance import CFG, Guidance, guidance_modules
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
@@ -135,6 +137,29 @@ class Images(Generic[ArrayT]):
         return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 
+@dataclass(frozen=True)
+class ImageSettings:
+    """What a text-to-image run records beside its model, and its task is built with
+    (`TextToImage.from_objective`, `TextToImage.from_run`): the process, the solver, the
+    guidance and the step count, and the records of the input encoders
+    (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
+    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for."""
+
+    process: Process
+    inputs: JSON
+    autoencoder: JSON
+    solver: Solver
+    guidance: Guidance | None
+    sampling_steps: int
+    # dewml/hybrid-dit-176m's published record predates the field.
+    end_to_end: JSON = None
+
+    def __post_init__(self) -> None:
+        from dew.records import integer
+
+        integer(self.sampling_steps, "sampling_steps")
+
+
 @dataclass(frozen=True, eq=False)
 class TextToImage:
     """Generates images from text prompts with a trained diffusion model and its encoders.
@@ -204,6 +229,7 @@ class TextToImage:
         from dew.objectives.diffusion.objective import without_loss_heads
 
         autoencoder, variables = objective.published_autoencoder(variables)
+        # The live encoders and autoencoder need no record (`task_settings` writes theirs for a save).
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver)
@@ -231,18 +257,18 @@ class TextToImage:
         Dew the run's record may import (`TextGeneration.from_run`).
         """
         from dew.config import ModelConfig
-        from dew.diffusion.process import Process
-        from dew.inference.tasks import run_record
+        from dew.inference.tasks import run_record, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.records import integer, json_value, record as fields, text
-        from dew.registry import from_record, objectives, solvers
+        from dew.records import record as fields, text
+        from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step, trust)
+        settings = saved_settings(record, ImageSettings)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
-        inputs_record = fields(record['inputs'], 'inputs')
-        autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
-                                                                               'autoencoder')
+        inputs_record = fields(settings.inputs, 'inputs')
+        autoencoder_record = None if settings.autoencoder is None else fields(settings.autoencoder,
+                                                                              'autoencoder')
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
             config = config.with_dtype(compute)
@@ -258,7 +284,7 @@ class TextToImage:
             directory, ema=ema, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
             parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
         inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
-        end_to_end = record.get('end_to_end')
+        end_to_end = settings.end_to_end
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
             from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
@@ -267,16 +293,8 @@ class TextToImage:
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
-        solver_record = fields(record['solver'], 'solver')
-        solver = solvers.build(text(solver_record['class'], 'solver class'),
-                                fields(solver_record['fields'], 'solver fields'))
-        recorded = json_value(record['guidance'], 'guidance')
-        guidance = None if recorded is None else from_record(Guidance, recorded, dtypes=False)
-        process = from_record(Process, json_value(record['process'], 'process'), dtypes=False)
-        return cls(config.build(), process,
-                   inputs, without_loss_heads(params), autoencoder,
-                   steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, solver=solver)
+        return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
+                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -636,7 +654,8 @@ class TextToImage:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        initial_state, spatial = _image_start(plan.sharding)(
+        options = () if self.autoencoder is None else tuple(compiler_options(self.autoencoder.model).items())
+        initial_state, spatial = _image_start(plan.sharding, options)(
             self.autoencoder, process, settled.shape, self.variables,
             plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
             settled.posterior, start)
@@ -684,10 +703,12 @@ class TextToImage:
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
             initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
-            generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish,
-                                         self.final_denoise, decode, solver, chosen,
-                                         np.asarray(grid, np.float32), initial, self.variables,
-                                         prepared.conditions, prepared.unconditional, prepared.noise, walk)
+            models = (self.model, *guidance_modules(chosen),
+                      *(() if self.autoencoder is None else (self.autoencoder.model,)))
+            walked = _run(plan.sharding, tuple(compiler_options(*models).items()))
+            generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
+                               solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
+                               prepared.conditions, prepared.unconditional, prepared.noise, walk)
         return replace(generated, rows=plan.rows)
 
 
@@ -750,7 +771,9 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
 
 
 @functools.cache
-def _image_start(rows: jax.sharding.NamedSharding | None):
+def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The image a walk starts from over `rows`, compiled with the autoencoder's own XLA `options`
+    (`dew.nn.kernels.options.compiler_options`)."""
     def prepare(autoencoder, process, shape, params, samples, keys, encode_key, start):
         spatial = {}
         pixels = samples.get("image")
@@ -776,7 +799,8 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
             )
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
-                   in_shardings=(None, rows, rows, None, None), out_shardings=rows)
+                   in_shardings=(None, rows, rows, None, None), out_shardings=rows,
+                   compiler_options=dict(options))
 
 
 
@@ -824,7 +848,10 @@ def _initial(rows: jax.sharding.NamedSharding | None):
 
 
 @functools.cache
-def _run(rows: jax.sharding.NamedSharding | None):
+def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
+    its autoencoder (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never
+    share it."""
     # Rebinding weights must not change the static compilation identity, nor a
     # solver's or guidance's numbers, nor the grid's values: the solver and the
     # guidance are pytrees whose structure is static and whose numbers (a
@@ -844,4 +871,5 @@ def _run(rows: jax.sharding.NamedSharding | None):
             images = finish(params, images)
         return Images(images, latents=latents)
     return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5),
-                   in_shardings=(None, None, None, None, None, rows, None, rows, None), out_shardings=rows)
+                   in_shardings=(None, None, None, None, None, rows, None, rows, None), out_shardings=rows,
+                   compiler_options=dict(options))

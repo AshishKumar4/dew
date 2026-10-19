@@ -6,18 +6,17 @@ import dataclasses
 import logging
 import math
 import threading
-import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
-from typing import overload
+from typing import TypeGuard, overload
 
 import grain.experimental as gx
 import grain.python as pygrain
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Record, Rejected
-from dew.records import integer, integers, record
+from dew.records import boolean, integer, integers, record
 
 _log = logging.getLogger(__name__)
 
@@ -73,11 +72,10 @@ class CorpusCounts:
 @dataclasses.dataclass(frozen=True)
 class SearchBudget:
     consecutive: int = 10_000
-    seconds: float | None = 60.0
     warn_over: float = 0.01
 
     def __post_init__(self) -> None:
-        if self.consecutive < 1 or (self.seconds is not None and self.seconds <= 0):
+        if self.consecutive < 1:
             raise ValueError("rejection search budgets must be positive")
         if not 0 <= self.warn_over <= 1:
             raise ValueError("warn_over is a share between zero and one")
@@ -90,10 +88,9 @@ class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, budget: SearchBudget, tokens: Callable[[Batch], int] | None):
         self.counts, self.budget, self.tokens = counts, budget, tokens
         self.consecutive = 0
-        self.started: float | None = None
         self.warned = False
 
-    def __call__(self, element: Batch | Rejected) -> bool:
+    def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         reason = element.reason if isinstance(element, Rejected) else None
         if reason is None and self.tokens is not None and not isinstance(element, Rejected):
@@ -107,14 +104,11 @@ class _KeepAccepted:
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
             self._probe()
-            self.consecutive, self.started = 0, None
+            self.consecutive = 0
             return True
         self.counts.rejected[reason] += 1
         self.consecutive += 1
         self._probe()
-        now = time.monotonic()
-        if self.started is None:
-            self.started = now
         if (
             not self.warned
             and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over
@@ -126,9 +120,7 @@ class _KeepAccepted:
                 reason,
             )
             self.warned = True
-        if self.consecutive >= self.budget.consecutive or (
-            self.budget.seconds is not None and now - self.started >= self.budget.seconds
-        ):
+        if self.consecutive >= self.budget.consecutive:
             raise ValueError(
                 f"corpus {self.counts.name}: rejection search budget exhausted after "
                 f"{self.consecutive} consecutive rejections ({reason}); "
@@ -181,21 +173,11 @@ class Chunked(pygrain.IterDataset[Record]):
 
 
 class _AcceptedIterator(_CountedIterator[Batch]):
-    _read: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch]
+    _read: pygrain.DatasetIterator[Batch]
 
-    def __init__(
-        self,
-        parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
-        predicate: _KeepAccepted,
-    ):
+    def __init__(self, parent: pygrain.DatasetIterator[Batch], predicate: _KeepAccepted):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
-
-    def __next__(self) -> Batch:
-        value = next(self._read)
-        if isinstance(value, Rejected):
-            raise RuntimeError("Grain filter delivered a rejected record")
-        return value
 
     def get_state(self) -> Mapping[str, object]:
         return {
@@ -207,7 +189,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
     def set_state(self, state: Mapping[str, object]) -> None:
         super().set_state(state)
         self._predicate.consecutive = integer(state["consecutive"], "consecutive")
-        self._predicate.started = None
         self._predicate.warned = bool(state["warned"])
 
 
@@ -295,6 +276,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
                 )
             ],
             "delivered": list(self._delivered),
+            "primed": self._primed,
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -313,7 +295,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         self._delivered = list(delivered)
         self._pending = [None for _ in self._reads]
         self._pending_states = [None for _ in self._reads]
-        self._primed = False
+        # A corpus whose first row was read ahead is restored to before it, and reads it when chosen.
+        self._primed = boolean(state["primed"], "primed")
 
     def close(self) -> None:
         for parent in self._reads:
@@ -436,7 +419,9 @@ class _PrimedRead(pygrain.DatasetIterator[Batch]):
     """One corpus of a mix. The mix captures every corpus's position for each
     record it gives (a packer captures it before each record), and only the
     corpus that gave the record moved, so a corpus captures its position again
-    only after it reads or is restored."""
+    only after it reads or is restored. The position records whether the mix
+    had read every corpus's first row ahead, so a restored mix reads each
+    corpus on from it and starts none again."""
 
     def __init__(self, group: _PrimeReads, index: int):
         super().__init__(group.parents[index])
@@ -452,14 +437,14 @@ class _PrimedRead(pygrain.DatasetIterator[Batch]):
             before = self._group.before
             self._state = (before[self._index] if self._index in before
                            else self._group.parents[self._index].get_state())
-        return self._state
+        return {"parent": self._state, "primed": self._group.done}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._state = None
-        self._group.parents[self._index].set_state(state)
+        self._group.parents[self._index].set_state(record(state["parent"], "primed corpus"))
         self._group.pending.pop(self._index, None)
         self._group.before.pop(self._index, None)
-        self._group.done = False
+        self._group.done = boolean(state["primed"], "primed")
 
     def close(self) -> None:
         self._group.parents[self._index].close()
@@ -488,28 +473,63 @@ class PrimedMix(pygrain.IterDataset[Batch]):
 
 
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
-    """Read per-corpus counters through Grain's nested iterator checkpoints."""
-    counted: dict[str, CorpusCounts] = {}
+    """Read per-corpus counters through Grain's nested iterator checkpoints.
 
-    def visit(branch):
+    Within one iterator a corpus's counters are its stages': the outermost
+    counts what it accepted, the deepest what was attempted, and each its own
+    rejections. The iterators Grain interleaves, its worker processes or a
+    corpus's shards, each read records of their own, so their counts add,
+    a shard waiting past the cycle (a future state) included."""
+
+    def visit(branch) -> dict[str, CorpusCounts]:
+        counted: dict[str, CorpusCounts] = {}
         if isinstance(branch, Mapping):
             corpus, stored = branch.get("corpus"), branch.get("counts")
             if isinstance(corpus, str) and isinstance(stored, Mapping):
-                parsed = CorpusCounts(corpus)
-                parsed.restore(stored)
-                if corpus not in counted:
-                    counted[corpus] = CorpusCounts(corpus, accepted=parsed.accepted)
-                combined = counted[corpus]
-                combined.attempted = max(combined.attempted, parsed.attempted)
-                combined.truncated = max(combined.truncated, parsed.truncated)
-                combined.chunks = max(combined.chunks, parsed.chunks)
-                combined.chunk_records = max(combined.chunk_records, parsed.chunk_records)
-                combined.rejected.update(parsed.rejected)
-            for child in branch.values():
-                visit(child)
+                counted[corpus] = CorpusCounts(corpus)
+                counted[corpus].restore(stored)
+            interleaved = branch.get("iterators_in_use_states")
+            if isinstance(interleaved, list):
+                # A restored interleave keeps the positions of shards past its cycle as future states.
+                future = branch.get("future_states") or {}
+                independent: dict[str, CorpusCounts] = {}
+                for child in (*interleaved, *(future.values() if isinstance(future, Mapping) else ())):
+                    for counts in visit(child).values():
+                        _added(independent, counts)
+                _nested(counted, independent)
+            for name, child in branch.items():
+                if name not in ("iterators_in_use_states", "future_states"):
+                    _nested(counted, visit(child))
         elif isinstance(branch, (tuple, list)):
             for child in branch:
-                visit(child)
+                _nested(counted, visit(child))
+        return counted
 
-    visit(state)
-    return counted
+    return visit(state)
+
+
+def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts]) -> None:
+    """Fold the counters of a corpus's inner stages into its outer ones', in one iterator."""
+    for corpus, counts in inner.items():
+        if corpus not in counted:
+            counted[corpus] = counts
+            continue
+        combined = counted[corpus]
+        combined.attempted = max(combined.attempted, counts.attempted)
+        combined.truncated = max(combined.truncated, counts.truncated)
+        combined.chunks = max(combined.chunks, counts.chunks)
+        combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
+        combined.rejected.update(counts.rejected)
+
+
+def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
+    """Add a corpus's counts from an iterator that read records of its own."""
+    if counts.name not in counted:
+        counted[counts.name] = CorpusCounts(counts.name)
+    combined = counted[counts.name]
+    combined.attempted += counts.attempted
+    combined.accepted += counts.accepted
+    combined.truncated += counts.truncated
+    combined.chunks += counts.chunks
+    combined.chunk_records += counts.chunk_records
+    combined.rejected.update(counts.rejected)

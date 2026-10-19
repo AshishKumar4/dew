@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Generic, Self
 
 import jax.numpy as jnp
@@ -40,13 +41,14 @@ from dew.nn.text_encoders import (
     translate_t5_config,
 )
 from dew.objectives.base import FROZEN, Variables
-from dew.registry import dtype_name, encoders, resolve_dtype
+from dew.registry import dtype_name, encoders, import_path, resolve_dtype
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.processors import AutoAudioProcessor
+    from dew.data.processors import FeatureExtractor
+    from dew.data.text import PinnedTokenizer
 
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
@@ -126,6 +128,11 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     def to_json(self) -> dict:
         """Return the keyword fields that `from_pretrained` rebuilds this encoder from."""
 
+    def dependencies(self) -> Mapping[str, object]:
+        """What `tokenize` makes of raw data depends on: the encoder and the fields it is
+        rebuilt from, which hold its context length and its checkpoint's revision."""
+        return {"class": import_path(type(self)), "fields": self.to_json()}
+
 
 def rebuild(name: str, fields: Mapping[str, object], *,
             params: Variables | None = None) -> ConditionEncoder:
@@ -143,6 +150,15 @@ def rebuild(name: str, fields: Mapping[str, object], *,
         raise ValueError(f"the {name} record names no checkpoint to rebuild from")
     rest = {key: value for key, value in fields.items() if key != "checkpoint"}
     return encoders[name].from_pretrained(checkpoint, **rest, params=params)
+
+
+def _pinned_tokenizer(checkpoint: str, revision: str | None) -> PinnedTokenizer:
+    """A text tower's tokenizer files resolved once (`pin_tokenizer`): a local directory as it is,
+    a Hub repo at `revision`, so the tokenizer read and its recorded hashes are one set of files."""
+    from dew.data.text import pin_tokenizer
+
+    hub = revision is not None and not Path(checkpoint).is_dir()
+    return pin_tokenizer(f"{checkpoint}@{revision}" if hub else checkpoint)
 
 
 @dataclass(frozen=True, eq=False)
@@ -166,6 +182,8 @@ class _TextTower(ConditionEncoder[str, TextContext]):
     transformer: CLIPTextTransformer | T5EncoderTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
+    tokenizer_files: PinnedTokenizer
+    """The files `tokenizer` was read from, resolved once (`_pinned_tokenizer`)."""
     dtype: Dtype | None = None
 
     revision: str | None = None
@@ -194,6 +212,11 @@ class _TextTower(ConditionEncoder[str, TextContext]):
     def recorded(self) -> dict:
         """The fields this tower records beyond the ones every tower has."""
         return {}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the tokenizer files it reads, so a tokenizer
+        that moved under an unpinned checkpoint name changes the identity too."""
+        return {**super().dependencies(), "tokenizer": self.tokenizer_files.snapshot}
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.context,
@@ -239,13 +262,12 @@ class CLIPText(_TextTower):
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
                         revision: str | None = None, param_dtype: str = "float32",
                         params: Variables | None = None) -> CLIPText:
-        from dew.data.text import load_tokenizer
-
         dtype = resolve_dtype(dtype)
         transformer, variables = bind_text_tower("CLIP text", translate_config, _text_path, checkpoint,
                                                  revision, params, dtype, param_dtype)
+        pinned = _pinned_tokenizer(checkpoint, revision)
         return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
-                   tokenizer=load_tokenizer(checkpoint, revision=revision),
+                   tokenizer=pinned.transformers(), tokenizer_files=pinned,
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property
@@ -273,13 +295,12 @@ class T5Text(_TextTower):
                         revision: str | None = None,
                         max_length: int = 256, param_dtype: str = "float32",
                         params: Variables | None = None) -> T5Text:
-        from dew.data.text import load_tokenizer
-
         dtype = resolve_dtype(dtype)
         transformer, variables = bind_text_tower("T5", translate_t5_config, _t5_path, checkpoint, revision,
                                                  params, dtype, param_dtype, validate=t5_embedding)
+        pinned = _pinned_tokenizer(checkpoint, revision)
         return cls(checkpoint=checkpoint, transformer=transformer, params=variables,
-                   tokenizer=load_tokenizer(checkpoint, revision=revision),
+                   tokenizer=pinned.transformers(), tokenizer_files=pinned,
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property
@@ -395,7 +416,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
     Every waveform is cut or zero-padded to `seconds`, so every clip has the
     same length, including the constant the unconditional branch is encoded
-    from. A run's batches carry the waveform under the condition's field (a
+    from, and the checkpoint's feature extractor (`extractor`) reads them at
+    its own sampling rate and padding, as Whisper's pads to 30 seconds. A
+    run's batches carry the waveform under the condition's field (a
     clip's `audio`), which the objective encodes through `tokenize` on the host
     (`InputSpec.encode_fields`), so this encoder reads no captions.
     """
@@ -404,7 +427,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     seconds: float
     module: JittableModule
     params: Variables
-    audio: AutoAudioProcessor
+    extractor: FeatureExtractor
     dtype: Dtype | None = None
     param_dtype: str = "float32"
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
@@ -414,7 +437,6 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
                         dtype=None, param_dtype: str = "float32",
                         params: Variables | None = None) -> HFAudio:
-        from dew.data.processors import AutoAudioProcessor
         from dew.interop.pickles import host_view
         from dew.interop.torchax_fallback import INSTALL
 
@@ -422,7 +444,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             import torch
             from torch.nn.utils import parametrize
             from torchax.interop import JittableModule, extract_all_buffers
-            from transformers import AutoConfig, AutoModel
+            from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
         except ImportError as error:
             raise ImportError(
                 f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
@@ -449,18 +471,20 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # Torch's copies are no longer read: the forward runs on the arrays above.
         torch.nn.Module.to(model, "meta")
         return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
-                   audio=AutoAudioProcessor(modelname=checkpoint), dtype=resolve_dtype(dtype),
+                   extractor=AutoFeatureExtractor.from_pretrained(checkpoint), dtype=resolve_dtype(dtype),
                    param_dtype=param_dtype)
 
     @property
     def input_name(self) -> str:
         """The name of the extractor's array that the model reads."""
-        return self.audio.processor.model_input_names[0]
+        return self.extractor.model_input_names[0]
 
     @property
     def samples(self) -> int:
         """The number of samples every waveform is cut or padded to."""
-        return round(self.seconds * self.audio.sampling_rate)
+        from dew.data.processors import sampling_rate
+
+        return round(self.seconds * sampling_rate(self.extractor))
 
     def waveform(self, row: AudioRow) -> np.ndarray:
         """Return one row as a float32 waveform `samples` long.
@@ -479,7 +503,10 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         return np.pad(wave, (0, self.samples - len(wave)))
 
     def tokenize(self, texts: Sequence[AudioRow]) -> dict[str, np.ndarray]:
-        features = self.audio([self.waveform(row) for row in texts])
+        from dew.data.processors import sampling_rate
+
+        waveforms = [self.waveform(row) for row in texts]
+        features = self.extractor(waveforms, sampling_rate=sampling_rate(self.extractor), return_tensors="np")
         return {self.input_name: np.asarray(features[self.input_name], np.float32)}
 
     def encode(self, params, tokens) -> TextContext:

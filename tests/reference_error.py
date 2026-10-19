@@ -259,10 +259,12 @@ transpose, which the kernel's gradient runs, is one too."""
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
                      "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
-                     "name"})
+                     "name", "psum", "psum_invariant", "reduce_scatter", "all_gather", "all_gather_invariant",
+                     "all_to_all", "ppermute", "pvary"})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter) and moved, by a remat name (`checkpoint_name`) too.
+added to a parameter, devices' partials) and moved, by a remat name
+(`checkpoint_name`) or a collective too.
 A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
@@ -270,9 +272,10 @@ scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
                    "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A body that runs elsewhere, a
-shard_map's per-device program or a Pallas kernel, is one operation, its
-outputs their own size."""
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A
+shard_map's per-device program is too, on each device's blocks (`_mapped`).
+A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
+their own size."""
 
 
 def float64_forward(module, variables, *args, **kwargs):
@@ -367,7 +370,7 @@ def _carried(equation) -> list[int]:
     if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
         return []
     floats = [index for index, var in enumerate(operands) if _real(var)]
-    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
+    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond", "shard_map"):
         return floats
     if name == "reduce_sum":
         # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
@@ -402,6 +405,8 @@ def _applied(equation, inputs, given, wanted: bool):
         return _scanned(params, inputs, given)
     if wanted and name == "while":
         return _looped(params, inputs, given)
+    if wanted and name == "shard_map":
+        return _mapped(params, inputs, given)
     if wanted and name == "cond":
         branch = params["branches"][int(inputs[0])]
         return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
@@ -471,6 +476,20 @@ def _looped(params, inputs, given):
         carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
                                         [*body_terms, *carry_terms])
     return carry, carry_terms
+
+
+def _mapped(params, inputs, given):
+    """A shard_map's outputs and energies (`float64_terms`), its program evaluated
+    op by op on each device's blocks, as the map runs it: an expert layer's
+    dispatch (`dew.nn.moe`), whose grouped matmul and its transpose sum."""
+    body, specs, out_specs = params["jaxpr"], tuple(params["in_specs"]), tuple(params["out_specs"])
+
+    def program(values, energies):
+        return tuple(map(tuple, _evaluated(body.jaxpr, body.consts, values, energies)))
+
+    return jax.shard_map(program, mesh=params["mesh"], in_specs=(specs, specs),
+                         out_specs=(out_specs, out_specs), axis_names=params["newly_manual_axes"],
+                         check_vma=params["check_vma"])(tuple(inputs), tuple(given))
 
 
 def _or_zero(energy, value):

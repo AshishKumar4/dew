@@ -66,6 +66,7 @@ from ..inputs import (
     LayerInputs,
     PredictionPhase,
     coordinates as build_coordinates,
+    coordinates_of,
 )
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -622,18 +623,27 @@ class CausalTransformer(nn.Module):
 
     def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
-        cannot apply them."""
-        mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
-               or self.logits_scaling != 1.0 or self.initializer_range is not None)
-        if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
-                    or (self.mixture is not None and self.mixture.parallel)
-                    or self.mlp == 'swigluoai' or self.laurel_rank is not None
-                    or self.altup is not None or self.per_layer_input_dim):
+        cannot apply them.
+
+        `embedding_multiplier` and `logits_scaling` act at the root, on the embeddings before the
+        first layer (`scaled_embeddings`) and on the final states, so any stack of blocks takes
+        them; prediction depths and the DSpark drafter embed their own tokens unscaled and score
+        their own states. `residual_multiplier` and `initializer_range` act inside lm-engine's
+        dense and routed blocks."""
+        root = self.embedding_multiplier != 1.0 or self.logits_scaling != 1.0
+        block = self.residual_multiplier != 1.0 or self.initializer_range is not None
+        if (root or block) and (self.num_nextn_predict_layers or self.dspark is not None):
             raise ValueError(
-                "embedding_multiplier, residual_multiplier, logits_scaling and "
-                "initializer_range are lm-engine's dense and routed blocks; prediction "
-                "depths, hyper-connection streams, Gemma 4's parallel experts, gpt-oss "
-                "experts, LAuReL, AltUp and per-layer inputs do not carry them")
+                "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
+                "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
+        if block and (self.hyper_connections is not None
+                      or (self.mixture is not None and self.mixture.parallel)
+                      or self.mlp == 'swigluoai' or self.laurel_rank is not None
+                      or self.altup is not None or self.per_layer_input_dim):
+            raise ValueError(
+                "residual_multiplier and initializer_range are lm-engine's dense and routed "
+                "blocks; hyper-connection streams, Gemma 4's parallel experts, gpt-oss experts, "
+                "LAuReL, AltUp and per-layer inputs do not carry them")
         if self.logits_scaling <= 0 or (self.initializer_range is not None
                                         and self.initializer_range <= 0):
             raise ValueError("logits_scaling and initializer_range are positive")
@@ -972,8 +982,7 @@ class CausalTransformer(nn.Module):
     def _layer_flops(self, lengths, counter) -> float:
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
         loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
@@ -1020,8 +1029,8 @@ class CausalTransformer(nn.Module):
     def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer()
-        blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
+        blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
+                                         BlockWiring())
         count = 0.0
         rows = self._prediction_rows(lengths, prediction_lengths)
         for block, (inputs, outputs) in zip(blocks, rows, strict=True):
@@ -1115,8 +1124,7 @@ class CausalTransformer(nn.Module):
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
-        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        mixer_spec = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
@@ -1418,7 +1426,8 @@ class CausalTransformer(nn.Module):
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
                                    attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions)
+                                   image_groups=image_groups, rotary_positions=rotary_positions,
+                                   coordinates=coordinates)
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
@@ -1703,20 +1712,21 @@ class CausalTransformer(nn.Module):
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             coordinates)
-        if attention_metadata is not None and attention_metadata.coordinates is not None:
-            positions = attention_metadata.coordinates.positions
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
         x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
-            places = positions
+            # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
+            # caller gave them in; a cached call's continue from its cache's cursor.
+            tokens_at = coordinates_of(attention_metadata, *tokens.shape)
+            places = tokens_at.positions
             if places is None:
-                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
-                         if decode else None)
-                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
+                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
                 places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+                # A first cached call finds no cursor yet: its tokens start the row.
+                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
@@ -1779,8 +1789,8 @@ class CausalTransformer(nn.Module):
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
                 "call would attend across documents; prefill each document into a row of its own")
         engram_ids = (None if self.engram is None else self.engram_hashes(
-            tokens, attention_mask, None if coordinates is None else coordinates.positions, decode,
-            media_mask))
+            tokens, None if coordinates is None else coordinates.valid,
+            None if coordinates is None else coordinates.positions, decode, media_mask))
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):
@@ -2147,12 +2157,13 @@ class CausalTransformer(nn.Module):
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
         product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
-        holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
-        head = {} if self.tie_embeddings else self.lm_head.variables["params"]
-        if self.head_transform is not None or set(head) - {"kernel"}:
+        None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
+        parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
+        adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
+        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
@@ -2287,19 +2298,29 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, or a layer
-        whose mixer kind declares no `mixed_step`."""
+        whose mixer, over the context it is built with, would not run the mixed
+        call as the separate calls would (`MixerBase.mixed_refusal`)."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
-        default = self.mixer if self.mixer is not None else AttentionMixer()
-        for index, layer_type in enumerate(self.per_layer_types):
-            mixer = self.kind_of(layer_type).mixer or default
-            if not mixer.mixed_step:
-                return f"layer {index}'s cache is {type(mixer).__name__}'s, which a mixed step does not run"
+        types = self.per_layer_types
+        default = self.layer_mixer
+        for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
+            refusal = (spec.kind.mixer or default).mixed_refusal(
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
+            if refusal is not None:
+                return f"layer {index}: {refusal}"
         return None
+
+    @property
+    def layer_mixer(self) -> MixerBase:
+        """The mixer a layer whose kind names none builds: the model's own, else
+        attention rotated or not by its position embedding."""
+        return self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
 
     @property
     def declared_mixers(self) -> tuple[MixerBase, ...]:
